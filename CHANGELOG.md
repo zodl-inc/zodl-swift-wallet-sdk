@@ -141,6 +141,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose network differs from the round's and a snapshot height that is not NU6.3, and `extractNcRoot`
   returns the Ironwood root. Two regression tests seed a `TreeState` carrying *both* pools and
   assert the Ironwood one wins, so the wrong-pool read cannot return unnoticed.
+- `proposeTransfer` and `proposeSendMax` now throw
+  `ZcashError.synchronizerSendMemoToTransparentAddress` when a memo accompanies a
+  TEX recipient, matching the existing behavior for transparent recipients.
+  Previously a memo aimed at a TEX address reached the rust backend and failed
+  with a generic `ZcashError.rust*` error instead.
 
 # 3.0.0 - 2026-08-19
 
