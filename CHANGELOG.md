@@ -35,9 +35,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network — a modified-mainnet chain votes with mainnet hotkeys and address
   HRPs — so `open` fails if that network has not been configured yet.
 - `MaxSpendMode`: describes how a "spend max" request should be evaluated,
-  either targeting only currently-spendable funds (`maxSpendable`) or the
-  wallet's entire balance (`everything`, which fails if any funds are
-  unspendable or the wallet is unsynced).
+  either targeting only currently-spendable funds (`maxSpendable`) or all
+  non-dust funds in the wallet (`everything`, which excludes dust notes valued
+  at or below the ZIP-317 marginal fee from selection and fails only if non-dust
+  funds are unspendable or the wallet is unsynced).
 - `Proposal.totalSpendValue()`: the total value a proposal spends across all
   of its steps, before its fee is deducted — each step's inputs minus its
   non-ephemeral proposed change. Ephemeral (ZIP-320) change is spent by a
