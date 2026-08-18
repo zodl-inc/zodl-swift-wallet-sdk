@@ -6,6 +6,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- Migration runs are now sized PER ACCOUNT, by how the account signs. The contract is the
+  `keySource` an account was created or imported with (`prepare(with:walletBirthday:name:keySource:)`,
+  `importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`), until
+  now a free-form client tag the SDK never read:
+  - An account whose `keySource` is `"keystone"` (compared case-insensitively — the tag zodl-ios
+    stamps on a Keystone import) has every migration run sized to what a Keystone signs in ONE
+    QR-scanned round (96 Orchard-family actions: 16 per note-preparation transaction, 3 per
+    transfer) instead of to a fixed note count. A run's action count follows the wallet's
+    fragmentation, so the previous flat 50-notes-per-run cap could still need several signing
+    ceremonies inside what the UI presents as one run. `proposeMigrationTransfers`,
+    `estimateMigrationRuns`, `isNoteSplitNeeded`, `prepareNoteSplit`, `residualAfterMigration` and
+    `restartCurrentMigrationStep` all plan and preview under this sizing: expect MORE runs on a
+    large or fragmented wallet, each with `MigrationRunEstimate.Run.keystoneSigningSessions == 1` (a
+    run exceeds one round only when even a one-note run would, which no smaller run can fix).
+  - Every other account (including a `nil` `keySource`) is signed in process, where a signing round
+    has no per-interaction cost to bound, and keeps note-cap sizing — with the per-run cap raised
+    from the engine's Keystone-oriented 50 notes to 200: FEWER runs (and so fewer background
+    sync/broadcast campaigns) for the same wallet, at the cost of a longer single planning and
+    proving pass. `Run.keystoneSigningSessions` is still reported for these runs, as what a
+    Keystone would need for a run of that shape, for comparison only.
+
+  No call-site edit is needed. A host that imports a Keystone account under a different `keySource`
+  must switch to `"keystone"` to get one-round runs.
+
 # 4.0.0 - 2026-08-19
 
 ## Added
