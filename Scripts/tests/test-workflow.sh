@@ -33,14 +33,62 @@ test_build_ffi_workflow_force_path_passes_force_overwrite_flag() {
         grep -qF -- '--force-overwrite-existing-release "$VERSION"' "$(_workflow_file)"
 }
 
-# Every `${{ }}` in the file must be a single `KEY: ${{ ... }}` line inside an
-# `env:` block -- never text spliced into a `run:` script. This is a
-# regression guard: it would fail if a future change went back to writing
-# `run: ./foo ${{ github.event.inputs.x }}`.
-test_build_ffi_workflow_interpolations_are_env_assignments_only() {
-    local offending
-    offending="$(grep -n '\${{' "$(_workflow_file)" |
-        grep -vE '^[0-9]+: *[A-Za-z_]+: \$\{\{ [^}]+ \}\}$')"
-    assert_eq "" "$offending" \
-        "every \${{ }} in build-ffi.yml is an env: key assignment, none inside run:"
+# Report every `${{ }}` that reaches a `run:` script -- spliced into a one-line
+# `run:`, or sitting in its block scalar. Those are the injection vectors: the
+# runner expands them into shell text before bash sees the script. An
+# expression anywhere else (an `env:` value, a `with:` input, a cache `key:`)
+# is consumed by the runner or by an action, never by the shell, so it is not
+# reported. A `run:` block ends at the first non-blank line indented no deeper
+# than the `run:` key itself.
+_run_script_interpolations() {
+    awk '
+        /^[[:space:]]*(- )?run:/ {
+            in_run = 1
+            run_indent = index($0, "run:") - 1
+            if ($0 ~ /\$\{\{/) printf "%d: %s\n", NR, $0
+            next
+        }
+        in_run {
+            if ($0 ~ /^[[:space:]]*$/) next
+            if (match($0, /[^[:space:]]/) - 1 <= run_indent) { in_run = 0; next }
+            if ($0 ~ /\$\{\{/) printf "%d: %s\n", NR, $0
+        }
+    ' "$1"
+}
+
+test_build_ffi_workflow_interpolates_nothing_into_run_scripts() {
+    assert_eq "" "$(_run_script_interpolations "$(_workflow_file)")" \
+        "no \${{ }} in build-ffi.yml reaches a run: script"
+}
+
+# The guard above is a grep that is supposed to find nothing, so a scanner that
+# silently matched nothing would pass it forever. Point it at a workflow that
+# does splice an expression into `run:` and require it to notice.
+test_run_script_interpolation_scanner_detects_an_injection() {
+    local f; f="$SCRATCH/injected-workflow.yml"
+    cat > "$f" <<'YAML'
+jobs:
+  build:
+    steps:
+      - name: Safe input, not shell text
+        uses: ./.github/actions/authorize
+        with:
+          app-id: ${{ secrets.APP_ID }}
+      - name: Safe cache key, not shell text
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v1-
+      - name: Reads its input the safe way
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: ./Scripts/build.sh "$VERSION"
+      - name: Splices its input into the script
+        run: |
+          ./Scripts/build.sh ${{ github.event.inputs.version }}
+YAML
+    assert_eq "20:           ./Scripts/build.sh \${{ github.event.inputs.version }}" \
+        "$(_run_script_interpolations "$f")" \
+        "the scanner flags the run: splice and nothing else"
 }
