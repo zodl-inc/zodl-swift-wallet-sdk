@@ -205,6 +205,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself never touches.
 
 ### Changed
+
+- The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
+  only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
+  root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
+  trademark clarifications.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
