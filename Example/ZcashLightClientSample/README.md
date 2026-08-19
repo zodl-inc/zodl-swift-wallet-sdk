@@ -1,5 +1,5 @@
 # iOS demo app 
-This is a demo app that exercises code in https://github.com/zcash/ZcashLightClientKit, which has all the iOS-related functionalities necessary to build a mobile Zcash shielded wallet. 
+This is a demo app that exercises code in https://github.com/zodl-inc/zcash-swift-wallet-sdk, which has all the iOS-related functionalities necessary to build a mobile Zcash shielded wallet. 
 
 It relies on [Lightwalletd](https://github.com/zcash/lightwalletd), a backend service that provides a bandwidth-efficient interface to the Zcash blockchain. There is an equivalent [Android demo app](https://github.com/zcash/zcash-android-wallet-sdk/). 
 
