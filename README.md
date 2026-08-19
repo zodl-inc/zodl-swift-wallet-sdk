@@ -1,13 +1,14 @@
 # Zcash iOS Framework
 
-[![Build Status](https://travis-ci.org/zcash/ZcashLightClientKit.svg?branch=master)](https://travis-ci.org/zcash/ZcashLightClientKit)
+[![Build Status](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml)
 
 
-A Zcash Lightweight Client SDK for iOS
-This is an alpha build and is currently under active development. Please be advised of the following:
+A Zcash Lightweight Client SDK for iOS, maintained by the Zcash Open Development
+Lab (ZODL). It originated as the Electric Coin Company's ZcashLightClientKit; ECC
+neither maintains nor reviews this fork. It is under active development. Please be
+advised of the following:
 
 - This code currently is not audited by an external security auditor, use it at your own risk
-- The code **has not been subjected to thorough review** by engineers at the Electric Coin Company
 - We **are actively changing** the codebase and adding features where/when needed
 
 🔒 Security Warnings
@@ -15,16 +16,26 @@ This is an alpha build and is currently under active development. Please be advi
 - The Zcash iOS Wallet SDK is experimental and a work in progress. Use it at your own risk.
 - Developers using this SDK must familiarize themselves with the current [threat
   model](https://zcash.readthedocs.io/en/latest/rtd_pages/wallet_threat_model.html), especially the known weaknesses described there.
+- To report a security vulnerability, follow [SECURITY.md](SECURITY.md). Do not open a public
+  issue.
 
 # Installation
 
 ## Swift Package Manager
 
-Add a package with the source "https://github.com/zcash/ZcashLightClientKit.git" and from version `0.14.0-beta` onwards in either Xcode's GUI or in your `Package.swift` file.
+Add a package with the source "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git" in
+either Xcode's GUI or in your `Package.swift` file. The library product is named
+`ZcashLightClientKit`:
 
-### Beta version support for Xcode projects
+```swift
+dependencies: [
+    .package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "3.0.0")
+]
+```
 
-If you want to include a beta version of `ZCashLightClientKit` in an Xcode project e.g `0.14.0-beta` you will need to specify it with the commit sha instead as it does not appear that Xcode supports 'meta data' from semantic version strings for swift packages (at the time of writing).
+### Pre-release version support for Xcode projects
+
+If you want to include a pre-release version e.g. `3.1.0-rc.1` in an Xcode project you will need to specify it with the commit sha instead, as it does not appear that Xcode supports 'meta data' from semantic version strings for swift packages (at the time of writing).
 
 # FFI Development
 
@@ -133,4 +144,25 @@ Examples can be found in the [Demo App](/Example/ZcashLightClientSample).
 
 # License
 
-MIT
+Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+
+ZODL ZcashLightClientKit is free software, licensed under the GNU Affero General
+Public License, version 3 only (AGPL-3.0-only). See [LICENSE](LICENSE).
+
+In short: you may use, study, modify, and redistribute ZODL ZcashLightClientKit,
+but if you incorporate it into an application, the complete source of that
+application must be made available under the AGPL to its users, including users
+who interact with it over a network.
+
+If those terms don't fit your project, **commercial licenses are available** —
+see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). Official Zodl builds
+distributed through the Apple App Store are released by Znewco under separate
+terms; no App Store distribution permission is granted to AGPL licensees — see
+[LICENSE-EXCEPTIONS.md](LICENSE-EXCEPTIONS.md).
+
+ZODL ZcashLightClientKit is derived from ZcashLightClientKit, Copyright (c) 2020
+Zcash, which was made available under the MIT License; that license is
+reproduced in [LICENSE-MIT](LICENSE-MIT). It also depends on the Zcash Rust
+crates (librustzcash and related) and other third-party libraries, which are
+separately licensed by their respective copyright holders and are not covered by
+this notice.
