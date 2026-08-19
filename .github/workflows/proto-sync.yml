@@ -19,6 +19,7 @@ on:
       - 'CHANGELOG.md'
       - 'CONTRIBUTING.md'
       - 'responsible_disclosure.md'
+      - 'SECURITY.md'
       - 'SWIFTLINT.md'
       - 'docs/**'
 

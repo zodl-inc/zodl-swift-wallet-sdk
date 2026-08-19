@@ -206,8 +206,8 @@ hand-written `swift` command:
 because its Swift matrix entry needs `build-mode: manual` and a full FFI build.
 
 The `paths-ignore` list is specific: `README.md`, `CHANGELOG.md`,
-`CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `docs/**`, and
-the issue and PR templates. `proto-sync.yml` also ignores the
+`CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `SECURITY.md`,
+`docs/**`, and the issue and PR templates. `proto-sync.yml` also ignores the
 licensing files — `LICENSE`, `LICENSE-MIT`, `LICENSE-EXCEPTIONS.md`,
 `COMMERCIAL-LICENSE.md` — which `swift.yml` deliberately does not, so a
 licensing-only PR still runs the required build check. This file is **not** on
