@@ -39,7 +39,7 @@ You **must** run `init-local-ffi.sh` before opening the project in Xcode. Withou
 
 ```bash
 # Clone the repository
-git clone https://github.com/zcash/zcash-swift-wallet-sdk
+git clone https://github.com/zodl-inc/zcash-swift-wallet-sdk
 cd zcash-swift-wallet-sdk
 
 # Initialize local FFI (builds from source)

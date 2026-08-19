@@ -1,13 +1,13 @@
 [package]
 name = "libzcashlc"
-version = "2.8.0-rc.2"
+version = "3.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
   "Kris Nuttycombe<kris@nutty.land>",
   "Francisco Gindre",
 ]
-license = "MIT"
+license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.90"
 build = "rust/build.rs"

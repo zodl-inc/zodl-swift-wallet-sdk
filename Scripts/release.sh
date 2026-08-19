@@ -13,7 +13,7 @@
 #   8. Publishes the GitHub release
 #
 # Arguments:
-#   <remote>   The git remote pointing to zcash/zcash-swift-wallet-sdk
+#   <remote>   The git remote pointing to the release repository
 #              (e.g., 'origin' or 'upstream')
 #   <version>  The version to release (e.g., '2.5.0')
 #
@@ -58,7 +58,9 @@ if ! git remote get-url "$UPSTREAM_REMOTE" &>/dev/null; then
     git remote -v
     exit 1
 fi
-REPO="zcash/zcash-swift-wallet-sdk"
+# Release onto the repo the workflow runs in (GITHUB_REPOSITORY in Actions), so forks can
+# publish their own releases — the hardcoded upstream 403s under a fork's CI token.
+REPO="${GITHUB_REPOSITORY:-zodl-inc/zcash-swift-wallet-sdk}"
 PRODUCTS_DIR="BuildSupport/products"
 
 # SemVer: a hyphen in the version (e.g. 2.6.0-alpha.1) marks a pre-release
@@ -111,19 +113,23 @@ echo "=== Step 1/6: Build and upload draft release ==="
 
 # Read release info written by prepare-release.sh
 source "$PRODUCTS_DIR/release.env"
+: "${DOWNLOAD_URL:?release.env did not define DOWNLOAD_URL}"
+: "${CHECKSUM:?release.env did not define CHECKSUM}"
 
 echo ""
 echo "=== Step 2/6: Updating Package.swift ==="
 
 # Update the binaryTarget URL and checksum in Package.swift
+# Anchor on the xcframework filename, not the repository path: the release repo
+# follows GITHUB_REPOSITORY, so the URL already in Package.swift may name another one.
 sed -i.bak -E \
-    -e "s|(url: \"https://github.com/${REPO}/releases/download/)[^\"]+(/libzcashlc.xcframework.zip\")|\1${VERSION}\2|" \
+    -e "s|url: \"[^\"]*/libzcashlc\.xcframework\.zip\"|url: \"${DOWNLOAD_URL}\"|" \
     -e "s|(checksum: \")[^\"]+(\")|\1${CHECKSUM}\2|" \
     Package.swift
 rm -f Package.swift.bak
 
 # Verify the update worked
-if ! grep -q "download/${VERSION}/libzcashlc.xcframework.zip" Package.swift; then
+if ! grep -qF "url: \"${DOWNLOAD_URL}\"" Package.swift; then
     echo "Error: Failed to update Package.swift URL"
     git checkout Package.swift
     exit 1

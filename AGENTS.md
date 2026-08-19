@@ -207,9 +207,12 @@ hand-written `swift` command:
 because its Swift matrix entry needs `build-mode: manual` and a full FFI build.
 
 The `paths-ignore` list is specific: `README.md`, `CHANGELOG.md`,
-`CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `docs/**`, and
-the issue and PR templates (`proto-sync.yml` also ignores `LICENSE`). This file
-is **not** on it, so a change to `AGENTS.md` alone still triggers a full build.
+`CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `SECURITY.md`,
+`docs/**`, and the issue and PR templates. `proto-sync.yml` also ignores the
+licensing files — `LICENSE`, `LICENSE-MIT`, `LICENSE-EXCEPTIONS.md`,
+`COMMERCIAL-LICENSE.md` — which `swift.yml` deliberately does not, so a
+licensing-only PR still runs the required build check. This file is **not** on
+the list, so a change to `AGENTS.md` alone still triggers a full build.
 
 `make lint` runs `swiftlint lint --quiet`. Adding `--strict` promotes warnings
 to errors, so a clean `swiftlint lint --strict` is a superset of whatever CI

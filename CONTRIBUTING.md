@@ -10,7 +10,8 @@ Please read it before you start participating.
 * [Reporting Non Security Issues](#reporting-other-issues)
 * [Release and Maintenance Branches](#release-and-maintenance-branches)
 * [Commit Messages](#commit-messages)
-* [Developers Certificate of Origin](#developers-certificate-of-origin)
+* [Contributor License Agreement](#contributor-license-agreement)
+* [Licensing Questions](#licensing-questions)
 
 ## Asking Questions
 
@@ -21,7 +22,11 @@ label.
 
 ## Reporting Security Issues
 
-If you have discovered an issue with this code that could present a security hazard or wish to discuss a sensitive issue with our security team, please contact security@z.cash [security.asc](https://z.cash/gpg-pubkeys/security.asc). Key fingerprint = AF85 0445 546C 18B7 86F9 2C62 88FB 8B86 D8B5 A68C
+Do not report security issues through the public issue tracker. `SECURITY.md`
+carries the disclosure policy: the severity rubric, what is explicitly not
+considered a vulnerability, and the two reporting routes — a Signal group with
+the named maintainers for critical vulnerabilities, and GitHub's "Report a
+Vulnerability" feature for everything else.
 
 ## Reporting Non Security Issues
 
@@ -48,7 +53,11 @@ This information will help us review and fix your issue faster.
 
 We **love** pull requests!
 
-All contributions _will_ be licensed under the MIT license.
+ZODL ZcashLightClientKit is licensed under the GNU Affero General Public
+License, version 3 only (AGPL-3.0-only), and is also offered under commercial
+terms. Every contribution requires a signed Contributor License Agreement
+before it can be merged; see [Contributor License
+Agreement](#contributor-license-agreement) below.
 
 Code/comments should adhere to the following rules:
 
@@ -284,32 +293,24 @@ Let the machines do their work.
 
 
 
-## Developer's Certificate of Origin 1.1
+## Contributor License Agreement
 
-By making a contribution to this project, I certify that:
+ZODL ZcashLightClientKit is dual-licensed: it is available to everyone under
+the AGPL-3.0-only, and under separately negotiated commercial terms for parties
+who cannot accept the AGPL's conditions (see `COMMERCIAL-LICENSE.md`). Offering
+both requires that the copyright in the work stay undivided, so accepted
+contributions require a signed Contributor License Agreement assigning or
+broadly licensing the contribution to Znewco, Inc.
 
-- (a) The contribution was created in whole or in part by me and I
-      have the right to submit it under the open source license
-      indicated in the file; or
+No contribution of any size, including typo and documentation fixes, will be
+merged without one. Open your pull request as usual; a maintainer will point you
+at the current agreement before review concludes.
 
-- (b) The contribution is based upon previous work that, to the best
-      of my knowledge, is covered under an appropriate open source
-      license and I have the right under that license to submit that
-      work with modifications, whether created in whole or in part
-      by me, under the same open source license (unless I am
-      permitted to submit under a different license), as indicated
-      in the file; or
+## Licensing Questions
 
-- (c) The contribution was provided directly to me by some other
-      person who certified (a), (b) or (c) and I have not modified
-      it.
-
-- (d) I understand and agree that this project and the contribution
-      are public and that a record of the contribution (including all
-      personal information I submit with it, including my sign-off) is
-      maintained indefinitely and may be redistributed consistent with
-      this project or the open source license(s) involved.
-
-
+For questions about using ZODL ZcashLightClientKit under the AGPL, or about
+commercial licensing, see `COMMERCIAL-LICENSE.md`. For how the AGPL interacts
+with App Store distribution, with the MIT-licensed upstream this work derives
+from, and with Znewco's trademarks, see `LICENSE-EXCEPTIONS.md`.
 
 This contribution guide is inspired on great projects like [AlamoFire](https://github.com/Alamofire/Foundation/blob/master/CONTRIBUTING.md) and [CocoaPods](https://github.com/CocoaPods/CocoaPods/blob/master/CONTRIBUTING.md)
