@@ -133,4 +133,25 @@ Examples can be found in the [Demo App](/Example/ZcashLightClientSample).
 
 # License
 
-MIT
+Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+
+ZODL ZcashLightClientKit is free software, licensed under the GNU Affero General
+Public License, version 3 only (AGPL-3.0-only). See [LICENSE](LICENSE).
+
+In short: you may use, study, modify, and redistribute ZODL ZcashLightClientKit,
+but if you incorporate it into an application, the complete source of that
+application must be made available under the AGPL to its users, including users
+who interact with it over a network.
+
+If those terms don't fit your project, **commercial licenses are available** —
+see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). Official Zodl builds
+distributed through the Apple App Store are released by Znewco under separate
+terms; no App Store distribution permission is granted to AGPL licensees — see
+[LICENSE-EXCEPTIONS.md](LICENSE-EXCEPTIONS.md).
+
+ZODL ZcashLightClientKit is derived from ZcashLightClientKit, Copyright (c) 2020
+Zcash, which was made available under the MIT License; that license is
+reproduced in [LICENSE-MIT](LICENSE-MIT). It also depends on the Zcash Rust
+crates (librustzcash and related) and other third-party libraries, which are
+separately licensed by their respective copyright holders and are not covered by
+this notice.

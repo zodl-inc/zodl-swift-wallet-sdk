@@ -6,10 +6,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-Changes are relative to `2.8.0-rc.3`.
-
 ## Changed
-
+- The SDK is now licensed under the GNU Affero General Public License, version 3 only
+  (AGPL-3.0-only) instead of the MIT License. An application that incorporates it must make the
+  complete corresponding source of that application available under the AGPL to its users,
+  including users who interact with it over a network, and no permission is granted to distribute
+  such an application through the Apple App Store or any other channel whose terms are
+  incompatible with the AGPL. A commercial license is available for applications that cannot meet
+  those conditions; see `COMMERCIAL-LICENSE.md`. `LICENSE-EXCEPTIONS.md` covers App Store
+  distribution, the MIT-licensed upstream this work derives from (reproduced in `LICENSE-MIT`),
+  and trademark use.
 - The migration sync gate is now BEHAVIOR-BASED, and its post-broadcast privacy buffer is gone
   along with `Synchronizer.migrationPrivacySyncBufferDuration` (the protocol requirement and its
   protocol-extension default): any reference stops compiling, and there is nothing to replace it
@@ -28,8 +34,7 @@ Changes are relative to `2.8.0-rc.3`.
   build load unchanged: the buffer field is read and ignored, and an in-flight marker beside it
   still counts.
 
-- The librustzcash family rides an interim git pin — the `kris/tmp-respread-plus-adapter-2` branch
-  head (rev `fa3e1de5`), librustzcash main merged with two PRs this SDK consumes together:
+- The librustzcash family rides an interim git pin — the (rev `fa3e1de5`).
   librustzcash #2927, the scanned-chain-tip overdue re-spread (the released overdue step lands on
   scanned chain data, and the re-spread fires only when more of the schedule is due behind it, so a
   wallet driven in short foreground sessions can actually prove and broadcast the released step

@@ -7,7 +7,7 @@ authors = [
   "Kris Nuttycombe<kris@nutty.land>",
   "Francisco Gindre",
 ]
-license = "MIT"
+license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.90"
 build = "rust/build.rs"
