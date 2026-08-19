@@ -13,14 +13,11 @@ This issue tracker is only for technical issues related to Zcash iOS SDK.
 General Zcash questions are best directed to the
 Zcash Forum: https://forum.zcashcommunity.com/
 
-For reporting security vulnerabilities or for sensitive discussions with our
-security team, please email security@z.cash . You can use this GPG key to send
-an encrypted message:
-    https://z.cash/gpg-pubkeys/security.asc
-    fingerprint: AF85 0445 546C 18B7 86F9  2C62 88FB 8B86 D8B5 A68C
-
-The key and fingerprint are duplicated on our Public Keys page:
-https://z.cash/support/pubkeys.html
+Do not report security vulnerabilities here. SECURITY.md carries the disclosure
+policy and the reporting routes: a Signal group with the named maintainers for
+critical vulnerabilities, and GitHub's "Report a Vulnerability" feature for
+everything else:
+    https://github.com/zodl-inc/zcash-swift-wallet-sdk/security/advisories
 -->
 
 ### Describe the issue
