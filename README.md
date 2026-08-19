@@ -1,13 +1,14 @@
 # Zcash iOS Framework
 
-[![Build Status](https://travis-ci.org/zcash/ZcashLightClientKit.svg?branch=master)](https://travis-ci.org/zcash/ZcashLightClientKit)
+[![Build Status](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml)
 
 
-A Zcash Lightweight Client SDK for iOS
-This is an alpha build and is currently under active development. Please be advised of the following:
+A Zcash Lightweight Client SDK for iOS, maintained by the Zcash Open Development
+Lab (ZODL). It originated as the Electric Coin Company's ZcashLightClientKit; ECC
+neither maintains nor reviews this fork. It is under active development. Please be
+advised of the following:
 
 - This code currently is not audited by an external security auditor, use it at your own risk
-- The code **has not been subjected to thorough review** by engineers at the Electric Coin Company
 - We **are actively changing** the codebase and adding features where/when needed
 
 🔒 Security Warnings
@@ -22,11 +23,19 @@ This is an alpha build and is currently under active development. Please be advi
 
 ## Swift Package Manager
 
-Add a package with the source "https://github.com/zcash/ZcashLightClientKit.git" and from version `0.14.0-beta` onwards in either Xcode's GUI or in your `Package.swift` file.
+Add a package with the source "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git" in
+either Xcode's GUI or in your `Package.swift` file. The library product is named
+`ZcashLightClientKit`:
 
-### Beta version support for Xcode projects
+```swift
+dependencies: [
+    .package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "3.0.0")
+]
+```
 
-If you want to include a beta version of `ZCashLightClientKit` in an Xcode project e.g `0.14.0-beta` you will need to specify it with the commit sha instead as it does not appear that Xcode supports 'meta data' from semantic version strings for swift packages (at the time of writing).
+### Pre-release version support for Xcode projects
+
+If you want to include a pre-release version e.g. `3.1.0-rc.1` in an Xcode project you will need to specify it with the commit sha instead, as it does not appear that Xcode supports 'meta data' from semantic version strings for swift packages (at the time of writing).
 
 # FFI Development
 

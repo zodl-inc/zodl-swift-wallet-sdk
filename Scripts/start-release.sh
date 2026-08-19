@@ -21,7 +21,7 @@
 # Usage:
 #   ./Scripts/start-release.sh [options] <remote> <version> [<revision>]
 #
-#   <remote>    git remote for zcash/zcash-swift-wallet-sdk, e.g. upstream
+#   <remote>    git remote for the release repository, e.g. upstream
 #   <version>   version being released, e.g. 2.7.1
 #   <revision>  commit or branch holding the changes to release
 #               (default: current HEAD, which should be a maint/ branch)
@@ -41,6 +41,10 @@ set -euo pipefail
 # Tags and release branches carry no `v` prefix in this repository (2.7.0-rc.1,
 # release/3.0.0), unlike the sibling Android SDK. Maintenance branches do.
 readonly TAG_PREFIX=""
+
+# The repository the release PR is opened against: the one the workflow runs in
+# (GITHUB_REPOSITORY in Actions), so forks release onto themselves.
+readonly REPO="${GITHUB_REPOSITORY:-zodl-inc/zcash-swift-wallet-sdk}"
 
 usage() { sed -n '2,38p' "$0" | sed 's|^# \{0,1\}||'; exit "${1:-1}"; }
 
@@ -199,7 +203,7 @@ Next:
 EOF
 $PUSH_REVIEW || echo "  git push -u ${REMOTE} ${REVIEW_BRANCH}"
 cat <<EOF
-  gh pr create --repo zcash/zcash-swift-wallet-sdk \\
+  gh pr create --repo ${REPO} \\
       --base ${RELEASE_BRANCH} --head ${REVIEW_BRANCH} \\
       --title "Release zcash-swift-wallet-sdk ${VERSION}"
 
