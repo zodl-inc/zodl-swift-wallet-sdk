@@ -199,6 +199,8 @@ cmd_start() {
     local previous="" issue="" remote version revision rev_sha prev_tag
     local release_branch candidate_branch b today pr_body_file
 
+    local -a positional=()
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue)    issue="${2:?--issue needs an issue number}"; shift 2 ;;
@@ -206,9 +208,11 @@ cmd_start() {
             --dry-run)  DRY_RUN=true; shift ;;
             -h|--help)  usage_start; return 0 ;;
             --*)        usage_start >&2; die "unknown option '$1'" ;;
-            *)          break ;;
+            *)          positional+=("$1"); shift ;;
         esac
     done
+    # Options may appear anywhere, including after the positionals.
+    set -- ${positional[@]+"${positional[@]}"}
 
     if [ $# -lt 2 ]; then
         usage_start >&2
@@ -515,6 +519,8 @@ EOF
 cmd_artifacts() {
     local force=false verify=true version
 
+    local -a positional=()
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --force-overwrite-existing-release) force=true; shift ;;
@@ -522,9 +528,11 @@ cmd_artifacts() {
             --dry-run) DRY_RUN=true; shift ;;
             -h|--help) usage_artifacts; return 0 ;;
             --*)       usage_artifacts >&2; die "unknown option '$1'" ;;
-            *)         break ;;
+            *)         positional+=("$1"); shift ;;
         esac
     done
+    # Options may appear anywhere, including after the positionals.
+    set -- ${positional[@]+"${positional[@]}"}
 
     if [ $# -lt 1 ]; then
         usage_artifacts >&2
@@ -660,6 +668,8 @@ cmd_build() {
     local artifacts="local" rebuild=false verify=true remote version
     local candidate_branch pr_number checksum is_draft behind current_branch
 
+    local -a positional=()
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --artifacts) artifacts="${2:?--artifacts needs local or ci}"; shift 2 ;;
@@ -668,9 +678,11 @@ cmd_build() {
             --dry-run)   DRY_RUN=true; shift ;;
             -h|--help)   usage_build; return 0 ;;
             --*)         usage_build >&2; die "unknown option '$1'" ;;
-            *)           break ;;
+            *)           positional+=("$1"); shift ;;
         esac
     done
+    # Options may appear anywhere, including after the positionals.
+    set -- ${positional[@]+"${positional[@]}"}
 
     case "$artifacts" in
         local|ci) ;;
