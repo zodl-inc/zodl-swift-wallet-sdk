@@ -684,7 +684,8 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
 /// Keystone signs in ONE QR-scanned round — the 96-action ``MigrationSigningBudget/keystone``
 /// budget — so its runs are smaller and more numerous, and each ``Run/keystoneSigningSessions`` is
 /// 1 unless even a one-note run overflows the round; every other account is signed in process, has
-/// no per-round cost to bound, and is sized by a 200-note cap — fewer, larger runs. The same
+/// no per-round cost to bound, and is sized by the default 50-note cap — fewer, larger runs. The
+/// same
 /// sizing drives `proposeMigrationTransfers`, so this estimate always describes the runs that get
 /// planned.
 ///

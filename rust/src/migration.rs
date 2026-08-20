@@ -713,10 +713,11 @@ fn plan_and_cache(
 /// The run is bounded the way [`run_sizing`] bounds it for THIS account — one Keystone signing
 /// round for a Keystone-tagged account, the in-process note cap for every other — and
 /// [`zcashlc_migration_estimate_runs`] previews under the same value from the same seam, so a
-/// preview always describes the runs that get planned. The engine's `plan_migration` default (the
-/// crate's flat 50-note cap) is deliberately not used here: a Keystone-tagged wallet fragmented
-/// enough that its 50-note run needs several QR-scanned rounds is exactly what that default cannot
-/// express (see `zcash_pool_migration::signing_rounds`'s module doc).
+/// preview always describes the runs that get planned. An in-process account resolves to exactly
+/// the engine's `plan_migration` default (the crate's flat 50-note cap); the seam exists for the
+/// Keystone-tagged account, whose one-round bound no note cap can express — a wallet fragmented
+/// enough that its 50-note run needs several QR-scanned rounds (see
+/// `zcash_pool_migration::signing_rounds`'s module doc).
 fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
     let sizing = run_sizing(&ctx.wallet, ctx.account)?;
     let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
@@ -4604,7 +4605,7 @@ mod tests {
     use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
     use zcash_pool_migration::signing_rounds::min_signing_rounds;
 
-    use crate::migration_engine::ZODL_MAX_PREPARED_NOTES_PER_RUN;
+    use zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN;
     use zcash_pool_migration::engine::RunSizing;
     use zcash_pool_migration::signing_rounds::RunSigningCapacity;
 
@@ -6991,8 +6992,8 @@ mod tests {
 
     /// Everything that is not Keystone-tagged — no tag, the platform's own `zashi` tag, an
     /// unrelated tag, a near-miss of the Keystone tag — is signed in process, where a signing round
-    /// has no per-interaction cost to bound, so it keeps note-cap sizing at the raised in-process
-    /// cap.
+    /// has no per-interaction cost to bound, so it keeps the crate's default note-cap sizing,
+    /// unchanged from before per-account sizing existed.
     #[test]
     fn run_sizing_is_the_in_process_note_cap_for_every_other_account() {
         for (i, tag) in [None, Some("zashi"), Some("ledger"), Some("keystone2")]
@@ -7003,7 +7004,7 @@ mod tests {
             let (account_bytes, _usk) = create_fixture_account_with_usk_and_key_source(&path, tag);
             assert_eq!(
                 fixture_run_sizing(&path, &account_bytes).expect("the sizing resolves"),
-                RunSizing::Notes(ZODL_MAX_PREPARED_NOTES_PER_RUN),
+                RunSizing::Notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN),
                 "an account tagged {tag:?} signs in process and keeps note-cap sizing"
             );
             let _ = std::fs::remove_file(&path);
@@ -7027,30 +7028,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The in-process cap is deliberately far above the crate's Keystone-oriented default: that
-    /// default bounds a run for a signer with a per-round budget, which an in-process signer does
-    /// not have, so a larger cap only means fewer runs for the same wallet.
-    #[test]
-    fn in_process_note_cap_is_two_hundred_and_above_the_crate_default() {
-        assert_eq!(ZODL_MAX_PREPARED_NOTES_PER_RUN.get(), 200);
-        assert!(
-            ZODL_MAX_PREPARED_NOTES_PER_RUN
-                > zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN,
-            "the in-process cap must exceed the crate's per-run default"
-        );
-    }
-
     /// The estimate and the plan share one sizing seam (`run_sizing`), and it is per account: a
     /// Keystone-tagged account is sized to what one QR-scanned round signs — so on a wallet whose
     /// note-cap run would take several rounds, EVERY Keystone-sized run fits one — while the same
-    /// wallet held by an in-process account is sized by the 200-note cap and needs more than one
+    /// wallet held by an in-process account is sized by the crate's default 50-note cap and needs
+    /// more than one
     /// round in some run, in fewer runs. Nothing about the funding differs between the two
     /// accounts; only the tag does.
     #[test]
     fn migration_estimate_runs_sizes_a_keystone_account_to_one_signing_round_per_run() {
-        // 1,000,000 ZEC in a single note: about a hundred cap-sized (10,000 ZEC) crossings under
-        // the in-process 200-note cap, needing several layered preparation transactions —
-        // hundreds of actions, so several Keystone rounds in ONE run — while the Keystone sizing
+        // 1,000,000 ZEC in a single note: about a hundred cap-sized (10,000 ZEC) crossings, split
+        // into runs of up to 50 under the crate's default cap, each needing layered preparation
+        // transactions — hundreds of actions, so several Keystone rounds in ONE run — while the
+        // Keystone sizing
         // caps each run at the largest note count keeping `16 * preparations + 3 * transfers <= 96`.
         const FUNDING_ZAT: u64 = 100_000_000_000_000;
 

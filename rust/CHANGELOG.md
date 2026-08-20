@@ -217,8 +217,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `key_source`: an account tagged `keystone` (case-insensitive) is sized to one 96-action Keystone
   signing round per run (upstream `plan_migration_sized_with` /
   `estimate_migration_runs_sized_with` under `RunSizing::Signer(RunSigningCapacity::KEYSTONE)`);
-  every other account keeps note-cap sizing with the per-run cap raised from the crate's 50-note
-  default to 200 (`RunSizing::Notes(200)`). Signatures and `#[repr(C)]` shapes are unchanged;
+  every other account keeps the crate's default note-cap sizing
+  (`RunSizing::Notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN)`, 50 notes per run), so its runs are
+  unchanged. Signatures and `#[repr(C)]` shapes are unchanged;
   `FfiRunEstimate::keystone_rounds` is 1 for every run of a Keystone-tagged account (more only when
   a one-note run already overflows a round). Planning and estimating take the sizing from one seam,
   so an estimate always describes the runs that get planned. Built on `zcash_pool_migration`'s

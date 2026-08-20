@@ -26,13 +26,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     through more preparation transactions in total than under the old flat cap, so the total ZIP 317
     fees paid over all runs are somewhat higher.
   - Every other account (including a `nil` `keySource`) is signed in process, where a signing round
-    has no per-interaction cost to bound, and keeps note-cap sizing — with the per-run cap raised
-    from the engine's Keystone-oriented 50 notes to 200: FEWER runs (and so fewer background
-    sync/broadcast campaigns) for the same wallet, at the cost of a longer single planning and
-    proving pass, a proportionally longer per-run transfer schedule
-    (`MigrationSchedule.estimatedDurationHours` grows with the run), and note reservations held for
-    that whole schedule. `Run.keystoneSigningSessions` is still reported for these runs, as what a
-    Keystone would need for a run of that shape, for comparison only.
+    has no per-interaction cost to bound, and keeps the 50-note-per-run cap sizing it had before:
+    runs, schedules and fees are unchanged for these accounts. `Run.keystoneSigningSessions` is
+    still reported for their runs, as what a Keystone would need for a run of that shape, for
+    comparison only.
 
   No call-site edit is needed. A host that imported a Keystone account under a different `keySource`
   must re-import it under `"keystone"` to get one-round runs — there is no API to re-tag an existing

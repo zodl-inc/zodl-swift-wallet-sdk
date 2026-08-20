@@ -148,7 +148,7 @@ public protocol Synchronizer: AnyObject {
     ///   One value is meaningful to the SDK: `"keystone"` (compared case-insensitively) marks an account
     ///   whose transactions a Keystone hardware wallet signs, and sizes every Orchard→Ironwood migration
     ///   run of that account to one 96-action QR signing round (see ``MigrationRunEstimate``); any other
-    ///   value, or `nil`, is signed in process and sized by the 200-note per-run cap.
+    ///   value, or `nil`, is signed in process and sized by the default 50-note per-run cap.
     /// - Note: The init flow (new / restore / existing) is DERIVED by the SDK — an existing account is
     ///   opened, a `nil` birthday creates a new wallet, a past birthday restores from it. A deliberate
     ///   re-scan/resync is the separate `rewind(_:)` action, not an init mode.
@@ -430,7 +430,7 @@ public protocol Synchronizer: AnyObject {
     ///   One value is meaningful to the SDK: `"keystone"` (compared case-insensitively) marks an account
     ///   whose transactions a Keystone hardware wallet signs, and sizes every Orchard→Ironwood migration
     ///   run of that account to one 96-action QR signing round (see ``MigrationRunEstimate``); any other
-    ///   value, or `nil`, is signed in process and sized by the 200-note per-run cap.
+    ///   value, or `nil`, is signed in process and sized by the default 50-note per-run cap.
     ///   - birthday: custom optional BlochHeight representing birthday of the imported account.
     // swiftlint:disable:next function_parameter_count
     func importAccount(
@@ -943,7 +943,7 @@ public protocol Synchronizer: AnyObject {
     /// completed run this is the "does anything remain" answer of the sequential-runs contract.
     /// - Parameter accountUUID: the account to propose a migration schedule for.
     /// - Note: The run is sized per account — to one 96-action Keystone signing round for a
-    ///   `keySource == "keystone"` account, to a 200-note cap for every other — see
+    ///   `keySource == "keystone"` account, to the default 50-note cap for every other — see
     ///   ``MigrationRunEstimate`` and ``estimateMigrationRuns(accountUUID:)``.
     func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
@@ -1019,7 +1019,7 @@ public protocol Synchronizer: AnyObject {
     /// ``MigrationRunEstimate/totalKeystoneSigningSessions`` the signer-interaction count under
     /// the 96-action Keystone budget (see ``MigrationRunEstimate`` for why count-based session
     /// math undercounts). Runs are sized PER ACCOUNT — one Keystone round each for a
-    /// `keySource == "keystone"` account, a 200-note cap for every other — by the same seam
+    /// `keySource == "keystone"` account, the default 50-note cap for every other — by the same seam
     /// ``proposeMigrationTransfers(accountUUID:)`` plans under, so the estimate describes the runs
     /// that get planned.
     /// - Parameter accountUUID: the account to estimate for.

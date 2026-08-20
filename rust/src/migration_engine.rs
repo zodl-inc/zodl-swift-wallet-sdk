@@ -41,8 +41,6 @@
 //! anchor for transfers, preparation anchor for preparations) in [`crate::migration_finalize`],
 //! and takes the account's Orchard viewing key from [`stored_orchard_fvk`].
 
-use std::num::NonZeroUsize;
-
 use anyhow::anyhow;
 use orchard::keys::FullViewingKey;
 use rand::rngs::OsRng;
@@ -53,6 +51,7 @@ use zcash_client_sqlite::pool_migration::orchard_ironwood::{
 };
 use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN;
 use zcash_pool_migration::engine::RunSizing;
 use zcash_pool_migration::signing_rounds::RunSigningCapacity;
 use zcash_pool_migration::wallet::WalletMigration;
@@ -139,19 +138,6 @@ pub(crate) fn stored_orchard_fvk(
         .ok_or_else(|| anyhow!("the account's viewing key has no Orchard component"))
 }
 
-/// The per-run prepared-note cap for an account whose migration transactions this SDK signs in
-/// process — every account that is not Keystone-tagged (see [`run_sizing`]).
-///
-/// Well above the crate's [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] default of 50. That default
-/// bounds a run's transaction and proving cost for a signer that must sign it within a per-round
-/// action budget (Keystone); an in-process signer has no such round to bound, so a larger cap only
-/// means fewer runs — and so fewer background sync/broadcast campaigns — for the same wallet, at
-/// the cost of a longer single planning and proving pass. Named as the Android SDK names it, so
-/// the two SDKs plan identical runs over identical wallets.
-///
-/// [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`]: zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN
-pub(crate) const ZODL_MAX_PREPARED_NOTES_PER_RUN: NonZeroUsize = NonZeroUsize::new(200).unwrap();
-
 /// The `key_source` tag that marks an account whose transactions a Keystone hardware wallet signs,
 /// compared case-insensitively. It is the tag the platform layers stamp on a Keystone import
 /// (zodl-ios stamps it in `AddHWWalletStore` and reads it back as `WalletAccount.vendor`;
@@ -166,8 +152,10 @@ pub(crate) const KEYSTONE_KEY_SOURCE: &str = "keystone";
 /// ONE interaction, [`RunSigningCapacity::KEYSTONE`] (96 actions per QR-scanned round): a run's
 /// actions are `16 * preparations + 3 * transfers` and the preparation count follows the wallet's
 /// fragmentation, so a fixed note cap alone cannot promise a single round. Every other account is
-/// signed in process, where a round has no per-interaction cost to bound, so it keeps note-cap
-/// sizing at [`ZODL_MAX_PREPARED_NOTES_PER_RUN`].
+/// signed in process, where a round has no per-interaction cost to bound, so it keeps the crate's
+/// default note-cap sizing, [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] — exactly the bound
+/// `plan_migration` itself applies, so these accounts plan the same runs as before per-account
+/// sizing existed.
 ///
 /// A hard error when the account is unknown, like every other account-row read here; an account
 /// without a `key_source`, or with any other tag, is an in-process signer.
@@ -182,7 +170,7 @@ pub(crate) fn run_sizing(
     Ok(if is_keystone {
         RunSizing::Signer(RunSigningCapacity::KEYSTONE)
     } else {
-        RunSizing::Notes(ZODL_MAX_PREPARED_NOTES_PER_RUN)
+        RunSizing::Notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN)
     })
 }
 
