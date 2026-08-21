@@ -57,7 +57,9 @@ extension BlockScannerImpl: BlockScanner {
             let scanSummary: ScanSummary
             let scanStartTime = Date()
             do {
-                // Directly correlated with `BlockDownloader` ranges.
+                // Directly correlated with `BlockDownloader` ranges. The blocks of this range were just
+                // fetched over the direct connection, so routing the tree state for the same height over
+                // Tor would cost a circuit per batch without hiding anything the server has not seen.
                 let fromState = try await service.getTreeState(BlockID(height: startHeight - 1), mode: .direct)
 
                 scanSummary = try await self.rustBackend.scanBlocks(fromHeight: Int32(startHeight), fromState: fromState, limit: batchSize)
