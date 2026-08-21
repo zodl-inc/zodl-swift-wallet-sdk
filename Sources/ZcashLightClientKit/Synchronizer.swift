@@ -984,8 +984,9 @@ public protocol Synchronizer: AnyObject {
     func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws
 
     /// What the WHOLE migration of `accountUUID` leaves in Orchard: the value remaining after the
-    /// last run — below the smallest self-funding note, plus the last preparation's change — under
-    /// the account's own run sizing; `nil` when nothing remains. The same value as
+    /// last run — below the smallest self-funding note, plus the last preparation's change; or the
+    /// whole spendable balance when the wallet's notes cannot fund any canonical split, so nothing
+    /// migrates — under the account's own run sizing; `nil` when nothing remains. The same value as
     /// ``estimateMigrationRuns(accountUUID:)``'s ``MigrationRunEstimate/finalResidual`` (with zero
     /// mapped to `nil`), and never a single run's leftover: on a balance that takes several runs
     /// the next run's leftover is mostly the balance the later runs migrate. Read fresh from the

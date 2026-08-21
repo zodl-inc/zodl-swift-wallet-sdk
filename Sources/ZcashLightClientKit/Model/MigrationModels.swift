@@ -753,7 +753,9 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     /// sub-quantum balance) — a legitimate estimate, not an error.
     public let runs: [Run]
     /// The value left in Orchard after the last run — below the smallest self-funding note, so it
-    /// never migrates. `.zero` when the balance divides exactly into self-funding notes and fees.
+    /// never migrates; or the whole spendable balance when the wallet's notes cannot fund any
+    /// canonical split (a zero-run estimate). `.zero` when the balance divides exactly into
+    /// self-funding notes and fees.
     public let finalResidual: Zatoshi
 
     /// Creates a `MigrationRunEstimate`.

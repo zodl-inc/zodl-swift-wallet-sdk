@@ -2176,8 +2176,9 @@ pub struct FfiMigrationRunEstimate {
     pub runs: *mut FfiRunEstimate,
     pub runs_len: usize,
     /// The value (zatoshi) left in the source pool after the last run — below the smallest
-    /// self-funding note, so it never migrates. Zero when the balance divides exactly into
-    /// self-funding notes and fees.
+    /// self-funding note, so it never migrates; the whole spendable balance when the wallet's
+    /// notes cannot fund any canonical split (a zero-run estimate). Zero when the balance divides
+    /// exactly into self-funding notes and fees.
     pub final_residual: i64,
 }
 
@@ -3384,7 +3385,8 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
 }
 
 /// The value (zatoshi) the WHOLE migration leaves in Orchard — what stays after the LAST run: the
-/// remainder below the smallest self-funding note plus the last preparation's change — under the
+/// remainder below the smallest self-funding note plus the last preparation's change, or the
+/// whole spendable balance when the wallet's notes cannot fund any canonical split — under the
 /// account's own run sizing (see [`estimate_runs`]). It is exactly the `final_residual`
 /// [`zcashlc_migration_estimate_runs`] reports and never a single run's leftover, which for a run
 /// sized below the balance is mostly the balance the NEXT runs migrate. Read fresh from the live

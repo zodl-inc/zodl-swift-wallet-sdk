@@ -52,10 +52,11 @@ What to re-check in a migration UI for a Keystone account:
   single-run balance reads the same value as before while the run is pending or in flight — but
   once a run completes, the call now reports the dust that remains where it previously reported
   `nil`, so re-test a `Complete` screen that showed a residual card or a "Lock balance" offer only
-  for a non-`nil` value: it now has one. Offer `lockMigrationResidual(accountUUID:)` only once
-  `proposeMigrationTransfers(accountUUID:)` returns the empty schedule — the lock takes every
-  spendable note. A host that already holds an estimate can read its `finalResidual` instead of
-  paying for a second multi-run estimate.
+  for a non-`nil` value: it now has one. A balance whose canonical split the wallet's notes cannot
+  fund now reads the whole spendable balance as the remainder, where the old read threw. Offer
+  `lockMigrationResidual(accountUUID:)` only once `proposeMigrationTransfers(accountUUID:)`
+  returns the empty schedule — the lock takes every spendable note. A host that already holds an
+  estimate can read its `finalResidual` instead of paying for a second multi-run estimate.
 
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
