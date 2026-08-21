@@ -977,11 +977,23 @@ public protocol Synchronizer: AnyObject {
     ///     matches `TxId.id`, not the reversed display-hex order produced by `Data.toHexStringTxId()`).
     func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws
 
-    /// The leftover Orchard balance a migration of `accountUUID` would not cross, when large enough
-    /// to be worth offering the user a choice about; `nil` when there is no such residual.
+    /// What the WHOLE migration of `accountUUID` leaves in Orchard: the value remaining after the
+    /// last run — below the smallest self-funding note, plus the last preparation's change — under
+    /// the account's own run sizing; `nil` when nothing remains. The same value as
+    /// ``estimateMigrationRuns(accountUUID:)``'s ``MigrationRunEstimate/finalResidual`` (with zero
+    /// mapped to `nil`), and never a single run's leftover: on a balance that takes several runs
+    /// the next run's leftover is mostly the balance the later runs migrate. Read fresh from the
+    /// live spendable balance on every call; while a run is in flight, the notes it holds reserved
+    /// and its not-yet-mined preparation change are outside that balance, so the figure previews
+    /// what stays after the runs that FOLLOW it and settles once the run completes. Offer
+    /// ``lockMigrationResidual(accountUUID:)`` against it only once
+    /// ``proposeMigrationTransfers(accountUUID:)`` returns the empty schedule: the lock takes every
+    /// spendable note, not just this remainder.
     /// - Parameter accountUUID: the account to check.
-    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
-    ///   chain tip known) this throws rather than returning `nil`.
+    /// - Note: Costs one planning pass per remaining run — the multi-run estimate this is read
+    ///   from — so on a large or fragmented balance it is not a per-frame read. Requires at least
+    ///   one completed sync: on a wallet that has never completed a sync (no chain tip known) this
+    ///   throws rather than returning `nil`.
     func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi?
 
     /// Locks every currently-spendable, not-already-locked legacy-Orchard note of `accountUUID`
@@ -991,6 +1003,10 @@ public protocol Synchronizer: AnyObject {
     /// lock never expires on its own). Locked value leaves `PoolBalance.spendableValue` but stays
     /// in `PoolBalance.lockedValue`, and therefore in the account's total balance — locked funds
     /// never vanish from app-visible sums.
+    /// Offer it only once ``proposeMigrationTransfers(accountUUID:)`` returns the empty schedule: it
+    /// locks EVERY spendable note, so on a balance that still has runs to go it would lock what those
+    /// runs should migrate — ``residualAfterMigration(accountUUID:)`` says how much genuinely
+    /// remains, not whether the runs are done.
     /// - Parameter accountUUID: the account whose residual should be locked.
     /// - Note: `Zatoshi(0)` is a legitimate result (nothing was spendable, or everything spendable
     ///   was already locked). Idempotent-additive: already-locked notes are excluded from

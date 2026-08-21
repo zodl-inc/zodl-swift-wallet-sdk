@@ -744,6 +744,38 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
     }
 }
 
+/// The multi-run estimate for the account's live spendable balance, under the sizing
+/// [`planning_inputs`] answers for THIS account — the one computation behind both
+/// [`zcashlc_migration_estimate_runs`] and [`zcashlc_migration_residual_after_migration`], so
+/// the residual the latter reports is always the `final_residual` of the runs the former previews.
+///
+/// `Ok(None)` is the zero-run answer for the engine's own `NothingToMigrate`; the estimator
+/// itself answers an empty balance with the zero-run estimate, so the arm should not fire. A
+/// wallet that knows no chain tip (never synced) is a hard error, as for every planning read: the
+/// spendable-note snapshot is taken at the tip. A pure peek: nothing is cached, so a proposal the
+/// user is reviewing is never superseded. Costs one planning pass per remaining run (plus, for a
+/// Keystone-tagged account, the sizing search each run) — it is the estimate.
+fn estimate_runs(ctx: &mut CallCtx) -> anyhow::Result<Option<engine::MigrationRunEstimate>> {
+    let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
+    let backend =
+        account_migration_with(&ctx.wallet, ctx.account, inputs.ufvk, &mut ctx.store_conn)?;
+    let mut rng = OsRng;
+    match engine::estimate_migration_runs_sized_with(
+        &default_portfolio(),
+        inputs.sizing,
+        &ctx.network,
+        &backend,
+        &mut rng,
+    ) {
+        Ok(estimate) => Ok(Some(estimate)),
+        // The estimator answers a zero balance with the zero-run estimate rather than this
+        // error, so this arm should never fire; map it to the same zero-run answer anyway,
+        // for symmetry with the propose path's empty schedule.
+        Err(engine::MigrationError::NothingToMigrate) => Ok(None),
+        Err(e) => Err(anyhow!("Error estimating migration runs: {e}")),
+    }
+}
+
 /// The row set the platform sees for a plan's transfer schedule: `(engine tx id, crossing amount,
 /// broadcast height, expiry height)`, sorted chronologically by broadcast height.
 ///
@@ -3350,10 +3382,21 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
     unwrap_exc_or_null(res)
 }
 
-/// The residual (zatoshi) that stays in Orchard after the migration: the note split's change,
-/// below the migratable dust floor. Pre-commit this is read from a fresh preview; post-commit
-/// from the stored run. Returns `-1` for "none" (and on error — see `zcashlc_last_error_message`;
-/// the Swift layer disambiguates).
+/// The value (zatoshi) the WHOLE migration leaves in Orchard — what stays after the LAST run: the
+/// remainder below the smallest self-funding note plus the last preparation's change — under the
+/// account's own run sizing (see [`estimate_runs`]). It is exactly the `final_residual`
+/// [`zcashlc_migration_estimate_runs`] reports and never a single run's leftover, which for a run
+/// sized below the balance is mostly the balance the NEXT runs migrate. Read fresh from the live
+/// spendable balance on every call — before the first run, between runs and after the last one
+/// alike; the stored run is not consulted. While a run is in flight, the notes it holds reserved
+/// and its not-yet-mined preparation change are outside the spendable balance, so the figure
+/// previews what stays after the runs that FOLLOW it and settles once the run completes.
+///
+/// Returns `-1` for "none" — an empty wallet, or a balance that migrates exactly — and on error
+/// (see `zcashlc_last_error_message`; the Swift layer disambiguates). A wallet that has never
+/// synced knows no chain tip to plan against and reports an error, as every planning read does.
+/// A pure peek: nothing is cached, so a proposal under review is never superseded. Costs one
+/// planning pass per remaining run, like the estimate it is read from.
 ///
 /// # Safety
 /// See [`open`].
@@ -3366,22 +3409,11 @@ pub unsafe extern "C" fn zcashlc_migration_residual_after_migration(
 ) -> i64 {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        {
-            let store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
-            if let Some(state) = store
-                .get_migration()
-                .map_err(|e| anyhow!("migration store read failed: {e}"))?
-            {
-                if !state.is_terminal() {
-                    return Ok(state.denominations().change().map_or(-1, zat_to_i64));
-                }
+        Ok(match estimate_runs(&mut ctx)? {
+            Some(estimate) if estimate.final_residual() > Zatoshis::ZERO => {
+                zat_to_i64(estimate.final_residual())
             }
-        }
-        // `compute_plan`, NOT `plan_and_cache`: this is a pure peek — caching its throwaway plan
-        // would supersede the handle of a proposal the user is currently reviewing.
-        Ok(match compute_plan(&mut ctx)? {
-            Some((plan, _)) => plan.denominations().change().map_or(-1, zat_to_i64),
-            None => -1,
+            _ => -1,
         })
     });
     unwrap_exc_or(res, -1)
@@ -3504,7 +3536,7 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
 /// STRUCTURE, not just its total value (each run is decomposed with the real planners, and the
 /// notes a run spends plus the residuals it leaves form the next run's structure).
 ///
-/// Each run is bounded the way `crate::migration_engine::run_sizing` bounds it for THIS account —
+/// Each run is bounded the way `crate::migration_engine::planning_inputs` sizes THIS account —
 /// one 96-action Keystone signing round for a Keystone-tagged account (`key_source` `"keystone"`,
 /// case-insensitive), the in-process note cap for every other — the same value, from the same
 /// seam, that every planning entry point (`zcashlc_migration_propose_transfers` and the note-split
@@ -3513,8 +3545,11 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
 /// Keystone-tagged account (more only when even a one-note run overflows a round, which no smaller
 /// run can fix), and, for an in-process account, what a Keystone would need for that run's shape —
 /// a comparison figure. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
-/// (`runs_len == 0`) — a legitimate result, not an error. NULL signals an error (see
-/// `zcashlc_last_error_message`).
+/// (`runs_len == 0`) — a legitimate result, not an error. The estimate walks the runs with the
+/// real planners, so it costs one
+/// planning pass per run — plus a sizing search per run for a Keystone-tagged account, whose runs
+/// are more numerous. `zcashlc_migration_residual_after_migration` is read from this same estimate
+/// (see [`estimate_runs`]). NULL signals an error (see `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_run_estimate`].
@@ -3527,24 +3562,7 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 ) -> *mut FfiMigrationRunEstimate {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
-        let backend =
-            account_migration_with(&ctx.wallet, ctx.account, inputs.ufvk, &mut ctx.store_conn)?;
-        let mut rng = OsRng;
-        let estimate = match engine::estimate_migration_runs_sized_with(
-            &default_portfolio(),
-            inputs.sizing,
-            &ctx.network,
-            &backend,
-            &mut rng,
-        ) {
-            Ok(estimate) => Some(estimate),
-            // The estimator answers a zero balance with the zero-run estimate rather than this
-            // error, so this arm should never fire; map it to the same zero-run answer anyway,
-            // for symmetry with the propose path's empty schedule.
-            Err(engine::MigrationError::NothingToMigrate) => None,
-            Err(e) => return Err(anyhow!("Error estimating migration runs: {e}")),
-        };
+        let estimate = estimate_runs(&mut ctx)?;
         let (runs, final_residual) = match &estimate {
             Some(est) => (
                 est.runs()
@@ -7218,6 +7236,212 @@ mod tests {
             proposed_transfers < 50,
             "a Keystone-sized run over this fixture must be smaller than the crate's flat 50-note \
              default would make it; got {proposed_transfers} transfers"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A fixture wallet at `prefix` holding one account tagged `key_source`, funded with a single
+    /// `value_zat` Orchard note and brought to chain tip 3,600,000 — the state every planning and
+    /// estimating FFI test in this section starts from. Returns the path, the account's uuid
+    /// bytes and its Orchard-era spending key bytes.
+    fn funded_fixture(
+        prefix: &str,
+        key_source: Option<&str>,
+        value_zat: u64,
+    ) -> (PathBuf, [u8; 16], Vec<u8>) {
+        let path = init_fixture_db(prefix);
+        let (account_bytes, usk_bytes) =
+            create_fixture_account_with_usk_and_key_source(&path, key_source);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, value_zat);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        (path, account_bytes, usk_bytes)
+    }
+
+    /// `(migratable, crossings)` per run, in run order, plus the final residual — as
+    /// `zcashlc_migration_estimate_runs` reports them for `account_bytes`.
+    fn ffi_estimate(path: &std::path::Path, account_bytes: &[u8; 16]) -> (Vec<(i64, u32)>, i64) {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ptr = unsafe {
+            zcashlc_migration_estimate_runs(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(!ptr.is_null(), "the estimate must succeed");
+        let est = unsafe { &*ptr };
+        let runs = unsafe { std::slice::from_raw_parts(est.runs, est.runs_len) }
+            .iter()
+            .map(|run| (run.migratable, run.crossings))
+            .collect::<Vec<_>>();
+        let final_residual = est.final_residual;
+        unsafe { zcashlc_free_migration_run_estimate(ptr) };
+        (runs, final_residual)
+    }
+
+    /// What `zcashlc_migration_residual_after_migration` answers for `account_bytes`, with the
+    /// last-error channel cleared first and asserted clear after: `-1` here means "none", never
+    /// an error.
+    fn ffi_residual(path: &std::path::Path, account_bytes: &[u8; 16]) -> i64 {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        crate::zcashlc_clear_last_error();
+        let residual = unsafe {
+            zcashlc_migration_residual_after_migration(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(
+            crate::zcashlc_last_error_length(),
+            0,
+            "the residual read must not set an error"
+        );
+        residual
+    }
+
+    /// The residual is what the WHOLE migration leaves behind, not the next run's leftover: for a
+    /// Keystone account whose balance takes several one-round runs, the two differ by almost the
+    /// entire balance, and the host's "Lock balance" offer is built from this number.
+    #[test]
+    fn migration_residual_reports_the_whole_migration_remainder_for_a_keystone_account() {
+        const FUNDING_ZAT: u64 = 100_000_000_000_000;
+        let (path, account_bytes, _usk) =
+            funded_fixture("zcashlc_residual_keystone", Some("keystone"), FUNDING_ZAT);
+        let (runs, final_residual) = ffi_estimate(&path, &account_bytes);
+        assert!(
+            runs.len() > 1,
+            "the fixture must need several Keystone-sized runs to discriminate; got {}",
+            runs.len()
+        );
+        let residual = ffi_residual(&path, &account_bytes);
+        assert_eq!(
+            residual,
+            if final_residual > 0 {
+                final_residual
+            } else {
+                -1
+            },
+            "the residual must be the estimate's final residual (zero reported as -1)"
+        );
+        // What the per-run answer used to be: the balance minus what the FIRST run crosses.
+        let first_run_leftover = FUNDING_ZAT as i64 - runs[0].0;
+        assert!(
+            residual < first_run_leftover / 100,
+            "the residual must be a remainder, not the balance the later runs migrate: \
+             residual {residual} vs first-run leftover {first_run_leftover}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// For a balance that migrates in ONE run — every in-process account in practice — the value
+    /// is unchanged: the plan's own change is `total - funding notes - preparation fees`, which is
+    /// exactly what stays after that run, so it equals the estimate's final residual.
+    #[test]
+    fn migration_residual_matches_the_estimate_and_the_plan_for_a_single_run_account() {
+        // 1,234.56789012 ZEC: a few dozen canonical {1,2,5}·10^k parts, well under the 50-note cap.
+        const FUNDING_ZAT: u64 = 123_456_789_012;
+        let (path, account_bytes, _usk) =
+            funded_fixture("zcashlc_residual_single_run", None, FUNDING_ZAT);
+        let (runs, final_residual) = ffi_estimate(&path, &account_bytes);
+        assert_eq!(
+            runs.len(),
+            1,
+            "the fixture must migrate in one run for this pin to mean anything; got {runs:?}"
+        );
+        let residual = ffi_residual(&path, &account_bytes);
+        assert_eq!(
+            residual,
+            if final_residual > 0 {
+                final_residual
+            } else {
+                -1
+            },
+            "the residual must be the estimate's final residual"
+        );
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture wallet opens");
+        let (plan, _) = compute_plan(&mut ctx)
+            .expect("planning must succeed")
+            .expect("the funded account has a plan");
+        assert_eq!(
+            residual,
+            plan.denominations().change().map_or(-1, zat_to_i64),
+            "for a single-run balance the whole-migration residual is the run's own change"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An empty wallet has no residual: `-1` without an error, in step with the zero-run
+    /// estimate. The fixture knows a chain tip, as every synced wallet does: the spendable-note
+    /// snapshot every planning read starts from is taken at the tip, empty or not.
+    #[test]
+    fn migration_residual_is_none_for_an_empty_wallet() {
+        let path = init_fixture_db("zcashlc_residual_empty_wallet");
+        let (account_bytes, _usk) =
+            create_fixture_account_with_usk_and_key_source(&path, Some("keystone"));
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    3_600_000,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        assert_eq!(ffi_residual(&path, &account_bytes), -1);
+        let (runs, final_residual) = ffi_estimate(&path, &account_bytes);
+        assert!(runs.is_empty(), "an empty wallet estimates zero runs");
+        assert_eq!(final_residual, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A wallet that has never synced knows no chain tip to plan against: the read is an ERROR
+    /// (`-1` with the last-error channel set), never a silent "no residual" — the contract the
+    /// Swift layer documents, and the one the plan-based read had before.
+    #[test]
+    fn migration_residual_reports_an_error_without_a_chain_tip() {
+        let path = init_fixture_db("zcashlc_residual_no_chain_tip");
+        let (account_bytes, _usk) =
+            create_fixture_account_with_usk_and_key_source(&path, Some("keystone"));
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        crate::zcashlc_clear_last_error();
+        let residual = unsafe {
+            zcashlc_migration_residual_after_migration(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(residual, -1);
+        assert!(
+            crate::zcashlc_last_error_length() > 0,
+            "a wallet without a chain tip must report an error, not a missing residual"
         );
         let _ = std::fs::remove_file(&path);
     }

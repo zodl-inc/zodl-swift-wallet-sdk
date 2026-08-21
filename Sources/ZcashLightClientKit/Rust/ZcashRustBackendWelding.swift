@@ -569,8 +569,12 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer
 
-    /// The leftover Orchard balance a migration would not cross, when it is large enough to be
-    /// worth offering the user a choice about; `nil` when there is no such residual.
+    /// What the WHOLE migration leaves in Orchard: the value remaining after the last run, under
+    /// the account's own run sizing — the same `finalResidual` `estimateMigrationRuns(accountUUID:)`
+    /// reports, with zero mapped to `nil` — never a single run's leftover. Read fresh from the live
+    /// spendable balance on every call; while a run is in flight it previews what stays after the
+    /// runs that follow it and settles once that run completes. Costs one planning pass per
+    /// remaining run.
     ///
     /// - Throws: `rustMigrationResidualAfterMigration` if the rust layer returns an error. In
     ///   particular, on a wallet that has never completed a sync (no chain tip known) this throws

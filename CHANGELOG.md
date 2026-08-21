@@ -34,6 +34,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   No call-site edit is needed. A host that imported a Keystone account under a different `keySource`
   must re-import it under `"keystone"` to get one-round runs — there is no API to re-tag an existing
   account.
+- `residualAfterMigration(accountUUID:)` now reports what the WHOLE migration leaves in Orchard —
+  the remainder after the last run, the same value as
+  `estimateMigrationRuns(accountUUID:).finalResidual` (`nil` when it is zero) — instead of what the
+  NEXT run alone would leave. The two differ only on a balance that takes more than one run, where
+  the old figure was mostly the balance the later runs migrate; for a single-run balance (every
+  in-process account today) the value is unchanged. It is read fresh from the live spendable
+  balance on every call and no longer from the stored run: while a run is in flight it previews
+  what stays after the runs that follow the current one and settles once that run completes. It is
+  computed from the same multi-run estimate as `estimateMigrationRuns`, so it costs one planning
+  pass per remaining run instead of one. A "Lock balance" offer built from it belongs only after
+  `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks every
+  spendable Orchard note, not just the residual. No call-site edit is needed.
 
 # 4.0.0 - 2026-08-19
 

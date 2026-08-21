@@ -623,11 +623,14 @@ actor OrchardMigration {
         try await welding.migrationRecordImmediateRun(txid: txid, for: accountUUID)
     }
 
-    /// The leftover Orchard balance a migration would not cross, when large enough to be worth
-    /// offering the user a choice about; `nil` when there is no such residual.
+    /// What the whole migration leaves in Orchard — the remainder after the last run, the same
+    /// value as ``estimateMigrationRuns()``'s `finalResidual` with zero mapped to `nil`; never a
+    /// single run's leftover. A straight delegation to the welding read, bound to this actor's own
+    /// account.
     ///
-    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
-    ///   chain tip known) this throws rather than returning `nil`.
+    /// - Note: Costs one planning pass per remaining run. Requires at least one completed sync: on
+    ///   a wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `nil`.
     func residualAfterMigration() async throws -> Zatoshi? {
         try await welding.migrationResidualAfterMigration(for: accountUUID)
     }

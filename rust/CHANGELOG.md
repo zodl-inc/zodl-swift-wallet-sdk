@@ -224,6 +224,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a one-note run already overflows a round). Planning and estimating take the sizing from one seam,
   so an estimate always describes the runs that get planned. Built on `zcash_pool_migration`'s
   signer-capacity sizing (librustzcash #2962 + #2970).
+- `zcashlc_migration_residual_after_migration` now returns the value the WHOLE migration leaves in
+  the source pool — the `final_residual` that `zcashlc_migration_estimate_runs` reports for the
+  same wallet (`-1` when it is zero) — instead of the next run's own leftover, and no longer reads
+  the stored run: before, during and after a run alike it is computed from the live spendable
+  balance. On a balance that takes more than one run the old value was mostly what the later runs
+  migrate; on a single-run balance the value is unchanged. It costs one planning pass per remaining
+  run, like the estimate.
 - The `zcashlc_voting_*` FFI is compiled again, against the Ironwood (NU6.3)
   dependency stack. It had been gated behind `#[cfg(zcash_voting)]` on the
   grounds that `zcash_voting` could not resolve against the Ironwood `orchard`
