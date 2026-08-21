@@ -671,7 +671,7 @@ public class SDKSynchronizer: Synchronizer {
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
         try throwIfUnprepared()
-        return try await blockProcessor.refreshUTXOs(tAddress: address, startHeight: height)
+        return try await blockProcessor.refreshUTXOs(tAddress: address, startHeight: height, mode: await sdkFlags.ifTor(.uniqueTor))
     }
 
     public func getAccountsBalances() async throws -> [AccountUUID: AccountBalance] {

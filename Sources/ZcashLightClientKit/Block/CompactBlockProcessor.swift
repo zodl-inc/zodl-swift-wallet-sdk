@@ -933,14 +933,17 @@ extension CompactBlockProcessor {
 }
 
 extension CompactBlockProcessor {
-    func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight) async throws -> RefreshedUTXOs {
+    func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight, mode: ServiceMode) async throws -> RefreshedUTXOs {
         let dataDb = self.config.dataDb
 
-        // ServiceMode to resolve
+        guard mode == .direct else {
+            return try await refreshUTXOsOverTor(tAddress: tAddress, dataDb: dataDb, mode: mode)
+        }
+
         let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: tAddress.stringEncoded,
             startHeight: startHeight,
-            mode: .direct
+            mode: mode
         )
         var utxos: [UnspentTransactionOutputEntity] = []
 
@@ -952,6 +955,27 @@ extension CompactBlockProcessor {
         } catch {
             throw error
         }
+    }
+
+    /// The Tor lookup is account-scoped on the FFI side: it starts at the address's exposure height
+    /// (or the account birthday when that is unknown) rather than at a caller-supplied height, and it
+    /// stores the UTXOs itself, so there are no entities to hand back. An address no account exposed
+    /// has nothing to fetch.
+    private func refreshUTXOsOverTor(tAddress: TransparentAddress, dataDb: URL, mode: ServiceMode) async throws -> RefreshedUTXOs {
+        guard let accountUUID = try await rustBackend.accountUUID(owning: tAddress) else {
+            logger.info("refreshUTXOs: the address is not a receiver of any account, nothing to fetch.")
+            return (inserted: [], skipped: [])
+        }
+
+        _ = try await service.fetchUTXOsByAddress(
+            address: tAddress.stringEncoded,
+            dbData: dataDb.osStr(),
+            networkType: config.network.networkType,
+            accountUUID: accountUUID,
+            mode: mode
+        )
+
+        return (inserted: [], skipped: [])
     }
 
     private func storeUTXOs(_ utxos: [UnspentTransactionOutputEntity], in dataDb: URL) async -> RefreshedUTXOs {

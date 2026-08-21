@@ -224,17 +224,25 @@ enum Dependencies {
 
         container.register(type: UTXOFetcher.self, isSingleton: true) { di in
             let blockDownloaderService = di.resolve(BlockDownloaderService.self)
-            let utxoFetcherConfig = UTXOFetcherConfig(walletBirthdayProvider: config.walletBirthdayProvider)
+            let service = di.resolve(LightWalletService.self)
+            let utxoFetcherConfig = UTXOFetcherConfig(
+                walletBirthdayProvider: config.walletBirthdayProvider,
+                dataDb: config.dataDb,
+                networkType: config.network.networkType
+            )
             let rustBackend = di.resolve(ZcashRustBackendWelding.self)
             let metrics = di.resolve(SDKMetrics.self)
             let logger = di.resolve(Logger.self)
+            let sdkFlags = di.resolve(SDKFlags.self)
 
             return UTXOFetcherImpl(
                 blockDownloaderService: blockDownloaderService,
+                service: service,
                 config: utxoFetcherConfig,
                 rustBackend: rustBackend,
                 metrics: metrics,
-                logger: logger
+                logger: logger,
+                sdkFlags: sdkFlags
             )
         }
 

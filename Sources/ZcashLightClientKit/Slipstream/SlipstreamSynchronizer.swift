@@ -1142,11 +1142,33 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // ── UTXO refresh ──────────────────────────────────────────────────────────
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let mode = await sdkFlags.ifTor(.uniqueTor)
+
+        // Same contract as CompactBlockProcessor.refreshUTXOs: the Tor lookup is account-scoped on
+        // the FFI side, starts at the address's exposure height (or the account birthday) rather
+        // than at `height`, and stores the UTXOs itself, so it has no entities to hand back.
+        guard mode == .direct else {
+            guard let accountUUID = try await initializer.rustBackend.accountUUID(owning: address) else {
+                return RefreshedUTXOs(inserted: [], skipped: [])
+            }
+
+            _ = try await initializer.lightWalletService.fetchUTXOsByAddress(
+                address: address.stringEncoded,
+                dbData: initializer.dataDbURL.osStr(),
+                networkType: initializer.network.networkType,
+                accountUUID: accountUUID,
+                mode: mode
+            )
+
+            return RefreshedUTXOs(inserted: [], skipped: [])
+        }
+
         // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
         let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: address.stringEncoded,
             startHeight: height,
-            mode: .direct
+            mode: mode
         )
         var utxos: [UnspentTransactionOutputEntity] = []
         for try await utxo in stream {
