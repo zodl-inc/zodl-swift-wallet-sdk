@@ -158,6 +158,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # 4.0.0 - 2026-08-19
 
 ## Added
+- `PaymentURIParser` and typed `PaymentURIRequest` results provide Rust-backed parsing and
+  validation for Bitcoin, Ethereum, Litecoin, and Solana payment request URIs.
 - The shielded voting surface (`VotingRustBackend`, the public `Voting*` types,
   `PirSnapshotResolver`/`PirSnapshotProbing`/`HTTPPirSnapshotProbe`, and the
   `zcashlc_voting_*` FFI) is restored on the Ironwood (NU6.3) stack, having been

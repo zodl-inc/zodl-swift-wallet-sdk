@@ -107,6 +107,7 @@ mod migration_finalize;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
+mod payment_uri;
 mod retained_marks;
 mod tor;
 mod voting;
