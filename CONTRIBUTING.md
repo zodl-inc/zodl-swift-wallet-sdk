@@ -10,7 +10,8 @@ Please read it before you start participating.
 * [Reporting Non Security Issues](#reporting-other-issues)
 * [Release and Maintenance Branches](#release-and-maintenance-branches)
 * [Commit Messages](#commit-messages)
-* [Developers Certificate of Origin](#developers-certificate-of-origin)
+* [Contributor License Agreement](#contributor-license-agreement)
+* [Licensing Questions](#licensing-questions)
 
 ## Asking Questions
 
@@ -21,7 +22,11 @@ label.
 
 ## Reporting Security Issues
 
-If you have discovered an issue with this code that could present a security hazard or wish to discuss a sensitive issue with our security team, please contact security@z.cash [security.asc](https://z.cash/gpg-pubkeys/security.asc). Key fingerprint = AF85 0445 546C 18B7 86F9 2C62 88FB 8B86 D8B5 A68C
+Do not report security issues through the public issue tracker. `SECURITY.md`
+carries the disclosure policy: the severity rubric, what is explicitly not
+considered a vulnerability, and the two reporting routes — a Signal group with
+the named maintainers for critical vulnerabilities, and GitHub's "Report a
+Vulnerability" feature for everything else.
 
 ## Reporting Non Security Issues
 
@@ -48,7 +53,11 @@ This information will help us review and fix your issue faster.
 
 We **love** pull requests!
 
-All contributions _will_ be licensed under the MIT license.
+ZODL ZcashLightClientKit is licensed under the GNU Affero General Public
+License, version 3 only (AGPL-3.0-only), and is also offered under commercial
+terms. Every contribution requires a signed Contributor License Agreement
+before it can be merged; see [Contributor License
+Agreement](#contributor-license-agreement) below.
 
 Code/comments should adhere to the following rules:
 
@@ -80,7 +89,7 @@ already running an older version without shipping them unrelated trunk work.
 | `main` | permanent | Development trunk. New feature work lands here. |
 | `maint/vX.Y.x` | permanent | One per supported release line. Fixes to released versions land here. |
 | `release/X.Y.Z` | one release | Cut from the previous release tag. The base of the release PR, and what gets tagged. |
-| `review/X.Y.Z` | one release | Release preparation: version bumps, CHANGELOG promotion, final review. |
+| `candidate/X.Y.Z` | one release | Cut from the revision being released. Carries the release preparation commits, and is the head of the release PR. |
 
 ### Basing a bug fix
 
@@ -113,38 +122,69 @@ main          ───●───────────────●──
 
 ### Cutting a release
 
-`./Scripts/start-release.sh <remote> <version>` performs steps 1 through 4:
-it works out which release this one follows, creates and pushes the release
-branch, creates the review branch, and promotes the CHANGELOG. Pass
-`--dry-run` first to see what it will do. It does not touch `Package.swift` --
-the binary target's URL and checksum are written later by
-`Scripts/release.sh`, once the xcframework exists. The steps below are what it
-automates, and what to do by hand if a release needs to deviate.
+A release happens in two phases, with a human reading the pull request in
+between. Both are driven by `./Scripts/prepare-release.sh`; pass `--dry-run` to
+either to see what it will do without changing anything.
+
+**Phase one** — `./Scripts/prepare-release.sh start --issue <N> <remote> <version>`:
 
 1. Create `release/X.Y.Z` **from the previous release tag** and push it to
    upstream. It starts out identical to the last release.
-2. Create `review/X.Y.Z` from the maintenance branch that contains all of the
-   changes to be released.
-3. Open a pull request **on the public repository** from `review/X.Y.Z` into
-   `release/X.Y.Z`.
-4. Make the release preparation commits on `review/X.Y.Z` — version bumps,
-   CHANGELOG promotion, and anything else the release needs. The review branch,
-   not the release branch, is where this work happens.
-5. Merge the pull request, then tag the result `X.Y.Z`.
+2. Create `candidate/X.Y.Z` from the maintenance branch that contains all of
+   the changes to be released.
+3. Promote the CHANGELOG's `Unreleased` section to `X.Y.Z`.
+4. Open a **draft** pull request **on the public repository** from
+   `candidate/X.Y.Z` into `release/X.Y.Z`.
 
-Basing the release branch on the previous release tag is what makes the pull
-request worth reviewing: its diff is exactly what users receive relative to the
-last release, rather than the intervening development history.
+Review that pull request. Its diff is exactly what users receive relative to
+the last release, rather than the intervening development history — which is
+the whole reason the release branch is based on the previous release tag.
+
+**Phase two** — `./Scripts/prepare-release.sh build <remote> <version>`:
+
+5. Bump the recorded version in `Cargo.toml`, `Cargo.lock` and
+   `BuildSupport/platform-Info.plist`.
+6. Build the XCFramework; verify the SDK builds and passes `OfflineTests`
+   against it; then upload it as a draft GitHub release. `--artifacts ci` does
+   all of that on a runner instead of locally; `--skip-verify` skips the
+   build-and-test check.
+7. Rewrite `Package.swift`'s binary target to point at that release.
+8. Extend `candidate/X.Y.Z` with both commits, comment on the pull request, and
+   mark it ready for review.
+
+Each step of phase two checks whether it has already run, so re-running it
+after a failure resumes rather than starting over.
+
+9. Merge the pull request, then run `./Scripts/release.sh <remote> X.Y.Z` from
+   `release/X.Y.Z`. It requires that branch to be identical to its counterpart
+   on `<remote>` — only what merged there may be tagged, and a pushed tag
+   cannot be recalled — then verifies the checksum in `Package.swift` against
+   the uploaded asset, signs the tag `X.Y.Z`, pushes it, and publishes the
+   release. The tag is the only thing pushed.
+
+A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
+pre-release on GitHub, both on the draft created in step 6 and on the published
+release in step 9. That bit is what keeps a release candidate from being served
+as `latest` to everyone who asks the API for the newest release.
+
+The artifact build alone is available as
+`./Scripts/prepare-release.sh artifacts <version>`. It touches no git or
+pull-request state, which is what lets `.github/workflows/build-ffi.yml` run it
+with only `contents: write`. Its
+`--force-overwrite-existing-release` replaces the assets of a *draft* release
+only: `Package.swift` pins the checksum of whatever a published release
+carries, and SwiftPM checks it on every fetch, so replacing that asset breaks
+the build of every consumer that has already resolved the version.
 
 ```
 tag X.Y.W  (previous release)
       │
       └──▶  release/X.Y.Z  ●──────────────────────────────●  tag X.Y.Z
                                                           ▲
-                                                          │  PR: review ──▶ release
+                                                          │  PR: candidate ──▶ release
                                                           │
-        review/X.Y.Z   ●────●────●────────────────────────┘
-                       ▲     version bumps, CHANGELOG promotion
+     candidate/X.Y.Z   ●────●────●────────────────────────┘
+                       ▲     CHANGELOG, version bump, XCFramework
                        │
                        │  branch from maint
 maint/vX.Y.x ──●────●──┴────────────────────────▶
@@ -284,32 +324,24 @@ Let the machines do their work.
 
 
 
-## Developer's Certificate of Origin 1.1
+## Contributor License Agreement
 
-By making a contribution to this project, I certify that:
+ZODL ZcashLightClientKit is dual-licensed: it is available to everyone under
+the AGPL-3.0-only, and under separately negotiated commercial terms for parties
+who cannot accept the AGPL's conditions (see `COMMERCIAL-LICENSE.md`). Offering
+both requires that the copyright in the work stay undivided, so accepted
+contributions require a signed Contributor License Agreement assigning or
+broadly licensing the contribution to Znewco, Inc.
 
-- (a) The contribution was created in whole or in part by me and I
-      have the right to submit it under the open source license
-      indicated in the file; or
+No contribution of any size, including typo and documentation fixes, will be
+merged without one. Open your pull request as usual; a maintainer will point you
+at the current agreement before review concludes.
 
-- (b) The contribution is based upon previous work that, to the best
-      of my knowledge, is covered under an appropriate open source
-      license and I have the right under that license to submit that
-      work with modifications, whether created in whole or in part
-      by me, under the same open source license (unless I am
-      permitted to submit under a different license), as indicated
-      in the file; or
+## Licensing Questions
 
-- (c) The contribution was provided directly to me by some other
-      person who certified (a), (b) or (c) and I have not modified
-      it.
-
-- (d) I understand and agree that this project and the contribution
-      are public and that a record of the contribution (including all
-      personal information I submit with it, including my sign-off) is
-      maintained indefinitely and may be redistributed consistent with
-      this project or the open source license(s) involved.
-
-
+For questions about using ZODL ZcashLightClientKit under the AGPL, or about
+commercial licensing, see `COMMERCIAL-LICENSE.md`. For how the AGPL interacts
+with App Store distribution, with the MIT-licensed upstream this work derives
+from, and with Znewco's trademarks, see `LICENSE-EXCEPTIONS.md`.
 
 This contribution guide is inspired on great projects like [AlamoFire](https://github.com/Alamofire/Foundation/blob/master/CONTRIBUTING.md) and [CocoaPods](https://github.com/CocoaPods/CocoaPods/blob/master/CONTRIBUTING.md)

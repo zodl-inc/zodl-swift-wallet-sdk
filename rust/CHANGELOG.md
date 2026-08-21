@@ -205,6 +205,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself never touches.
 
 ### Changed
+
+- The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
+  only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
+  root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
+  trademark clarifications.
 - The `zcashlc_voting_*` FFI is compiled again, against the Ironwood (NU6.3)
   dependency stack. It had been gated behind `#[cfg(zcash_voting)]` on the
   grounds that `zcash_voting` could not resolve against the Ironwood `orchard`

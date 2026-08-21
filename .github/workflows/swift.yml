@@ -9,6 +9,7 @@ on:
       - 'CHANGELOG.md'
       - 'CONTRIBUTING.md'
       - 'responsible_disclosure.md'
+      - 'SECURITY.md'
       - 'SWIFTLINT.md'
       - 'docs/**'
 
@@ -27,6 +28,9 @@ jobs:
 
     - name: Select Xcode version
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+
+    - name: Run release-script tests
+      run: make test-scripts
 
     # Generate a hash of all Rust source files for cache key
     - name: Generate FFI source hash
@@ -52,9 +56,9 @@ jobs:
         app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
         app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY }}
 
-    # Only set up Rust if we need to build FFI
+    # Needed unconditionally: even on an FFI cache hit, the Rust test step below
+    # compiles the crate's test profile and so needs the toolchain.
     - name: Setup Rust
-      if: steps.cache-ffi.outputs.cache-hit != 'true'
       uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
       with:
         toolchain: stable
@@ -94,6 +98,13 @@ jobs:
     # Verify xcframework exists (whether from cache or fresh build)
     - name: Verify XCFramework
       run: make verify-ffi
+
+    # The Rust unit tests cover the FFI layer below the Swift package, so no
+    # `swift test` filter reaches them. Without this step a failing Rust test
+    # can sit on a branch indefinitely.
+    - name: Run Rust unit tests
+      timeout-minutes: 30
+      run: make test-rust
 
     # Set up LocalPackages so Package.swift auto-detects the local build
     - name: Configure local FFI for CI
