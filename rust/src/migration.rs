@@ -7015,14 +7015,23 @@ mod tests {
     }
 
     /// Everything that is not Keystone-tagged — no tag, the platform's own `zashi` tag, an
-    /// unrelated tag, a near-miss of the Keystone tag — is signed in process, where a signing round
-    /// has no per-interaction cost to bound, so it keeps the crate's default note-cap sizing,
-    /// unchanged from before per-account sizing existed.
+    /// unrelated tag, a near-miss of the Keystone tag (a suffix, a leading space, a product
+    /// name) — is signed in process, where a signing round has no per-interaction cost to bound,
+    /// so it keeps the crate's default note-cap sizing, unchanged from before per-account sizing
+    /// existed. The match is exact up to ASCII case: nothing is trimmed or prefix-matched, which
+    /// is why hosts stamp `Account.keystoneKeySource` rather than a display string.
     #[test]
     fn run_sizing_is_the_in_process_note_cap_for_every_other_account() {
-        for (i, tag) in [None, Some("zashi"), Some("ledger"), Some("keystone2")]
-            .into_iter()
-            .enumerate()
+        for (i, tag) in [
+            None,
+            Some("zashi"),
+            Some("ledger"),
+            Some("keystone2"),
+            Some(" keystone"),
+            Some("keystone pro"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let path = init_fixture_db(&format!("zcashlc_run_sizing_in_process_{i}"));
             let (account_bytes, _usk) = create_fixture_account_with_usk_and_key_source(&path, tag);
@@ -7442,6 +7451,110 @@ mod tests {
         assert!(
             crate::zcashlc_last_error_length() > 0,
             "a wallet without a chain tip must report an error, not a missing residual"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every planning entry point behind `compute_plan` plans the run the estimate previews first:
+    /// the note-split preview mints exactly that run's funding notes, Keystone-sized.
+    #[test]
+    fn migration_prepare_note_split_sizes_a_keystone_account_to_one_signing_round() {
+        let (path, account_bytes, _usk) = funded_fixture(
+            "zcashlc_prepare_note_split_keystone",
+            Some("keystone"),
+            100_000_000_000_000,
+        );
+        let (runs, _) = ffi_estimate(&path, &account_bytes);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ptr = unsafe {
+            zcashlc_migration_prepare_note_split(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "a funded Keystone account must propose a note split"
+        );
+        let outputs = unsafe { &*ptr }.output_values_len;
+        unsafe { zcashlc_free_migration_note_split_proposal(ptr) };
+        assert_eq!(
+            outputs as u32, runs[0].1,
+            "the note split must mint exactly the crossings the estimate previews for run one"
+        );
+        assert!(
+            outputs < 50,
+            "a Keystone-sized split must stay below the crate's flat 50-note default; got {outputs}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The split-needed peek plans under the same sizing: a single large note needs splitting,
+    /// and the peek answers without touching the last-error channel.
+    #[test]
+    fn migration_is_note_split_needed_is_true_for_a_keystone_sized_run() {
+        let (path, account_bytes, _usk) = funded_fixture(
+            "zcashlc_is_note_split_needed_keystone",
+            Some("keystone"),
+            100_000_000_000_000,
+        );
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        crate::zcashlc_clear_last_error();
+        let needed = unsafe {
+            zcashlc_migration_is_note_split_needed(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert_eq!(
+            crate::zcashlc_last_error_length(),
+            0,
+            "the peek must not set an error"
+        );
+        assert!(
+            needed,
+            "a single 1,000,000 ZEC note must be split before it migrates"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The restart lane re-plans under the account's CURRENT sizing — with no stored run the
+    /// engine's cancel is a no-op and the fresh plan is the Keystone-sized run the estimate
+    /// previews — which is also how a run committed under an earlier sizing is brought onto it.
+    #[test]
+    fn migration_restart_step_replans_a_keystone_account_under_one_signing_round() {
+        let (path, account_bytes, _usk) = funded_fixture(
+            "zcashlc_restart_step_keystone",
+            Some("keystone"),
+            100_000_000_000_000,
+        );
+        let (runs, _) = ffi_estimate(&path, &account_bytes);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ptr = unsafe {
+            zcashlc_migration_restart_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "restarting a funded Keystone account must yield a schedule"
+        );
+        let transfers = unsafe { &*ptr }.transfers_len;
+        unsafe { zcashlc_free_migration_schedule(ptr) };
+        assert_eq!(
+            transfers as u32, runs[0].1,
+            "the restarted schedule must carry exactly the crossings the estimate previews for run one"
+        );
+        assert!(
+            transfers < 50,
+            "a Keystone-sized restart must stay below the crate's flat 50-note default; got {transfers}"
         );
         let _ = std::fs::remove_file(&path);
     }
