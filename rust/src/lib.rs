@@ -516,6 +516,54 @@ pub unsafe extern "C" fn zcashlc_get_account(
     unwrap_exc_or_null(res)
 }
 
+/// Returns the account that exposed the given transparent address as one of its receivers, or
+/// the [`ffi::Account::NOT_FOUND`] sentinel value if no account of the wallet did.
+///
+/// Only a transparent address is accepted; any other address kind is an error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+/// - Call [`zcashlc_free_account`] to free the memory associated with the returned pointer
+///   when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_account_for_transparent_address(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    address: *const c_char,
+) -> *mut ffi::Account {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+
+        let addr = match Address::decode(&network, addr_str) {
+            Some(addr @ Address::Transparent(_)) => addr,
+            Some(_) => return Err(anyhow!("Expected a transparent address")),
+            None => return Err(anyhow!("Invalid address for this network")),
+        };
+
+        let account = match db_data.find_account_for_address(&network, &addr)? {
+            Some(account_uuid) => db_data.get_account(account_uuid)?,
+            None => None,
+        };
+
+        Ok(Box::into_raw(Box::new(
+            account.map_or(ffi::Account::NOT_FOUND, |account| {
+                ffi::Account::from_account(&account, &network)
+            }),
+        )))
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Adds the next available account-level spend authority, given the current set of [ZIP 316]
 /// account identifiers known, to the wallet database.
 ///

@@ -4370,6 +4370,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - getAccount
+
+    var getAccountForTransparentAddressThrowableError: Error?
+    var getAccountForTransparentAddressCallsCount = 0
+    var getAccountForTransparentAddressCalled: Bool {
+        return getAccountForTransparentAddressCallsCount > 0
+    }
+    var getAccountForTransparentAddressReceivedAddress: TransparentAddress?
+    var getAccountForTransparentAddressReturnValue: Account?
+    var getAccountForTransparentAddressClosure: ((TransparentAddress) async throws -> Account?)?
+
+    func getAccount(forTransparentAddress address: TransparentAddress) async throws -> Account? {
+        if let error = getAccountForTransparentAddressThrowableError {
+            throw error
+        }
+        getAccountForTransparentAddressCallsCount += 1
+        getAccountForTransparentAddressReceivedAddress = address
+        if let closure = getAccountForTransparentAddressClosure {
+            return try await closure(address)
+        } else {
+            return getAccountForTransparentAddressReturnValue
+        }
+    }
+
     // MARK: - getVerifiedTransparentBalance
 
     var getVerifiedTransparentBalanceAccountUUIDThrowableError: Error?

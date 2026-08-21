@@ -962,7 +962,7 @@ extension CompactBlockProcessor {
     /// stores the UTXOs itself, so there are no entities to hand back. An address no account exposed
     /// has nothing to fetch.
     private func refreshUTXOsOverTor(tAddress: TransparentAddress, dataDb: URL, mode: ServiceMode) async throws -> RefreshedUTXOs {
-        guard let accountUUID = try await rustBackend.accountUUID(owning: tAddress) else {
+        guard let accountUUID = try await rustBackend.getAccount(forTransparentAddress: tAddress)?.id else {
             logger.info("refreshUTXOs: the address is not a receiver of any account, nothing to fetch.")
             return (inserted: [], skipped: [])
         }

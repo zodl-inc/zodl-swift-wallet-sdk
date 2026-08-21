@@ -8,6 +8,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_get_account_for_transparent_address` returns the account that exposed a transparent
+  address as one of its receivers, as an `FfiAccount` to be released with `zcashlc_free_account`,
+  or the not-found sentinel when no account of the wallet did. A non-transparent address is an
+  error.
 - `zcashlc_get_transaction`, `zcashlc_free_transaction_data`, and `FfiTransactionData` expose the
   serialized bytes and expiry height available for any wallet-store transaction without depending
   on the transaction-history projection.

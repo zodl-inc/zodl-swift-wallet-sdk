@@ -1149,7 +1149,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // the FFI side, starts at the address's exposure height (or the account birthday) rather
         // than at `height`, and stores the UTXOs itself, so it has no entities to hand back.
         guard mode == .direct else {
-            guard let accountUUID = try await initializer.rustBackend.accountUUID(owning: address) else {
+            guard let accountUUID = try await initializer.rustBackend.getAccount(forTransparentAddress: address)?.id else {
                 return RefreshedUTXOs(inserted: [], skipped: [])
             }
 
