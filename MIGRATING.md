@@ -1,5 +1,57 @@
 # Migrating from previous versions to _Unreleased_
 
+## Migration runs are sized per account — stamp `Account.keystoneKeySource` on a Keystone import
+
+The SDK now reads the `keySource` an account was created or imported with. An account tagged
+`Account.keystoneKeySource` (`"keystone"`, compared case-insensitively) has every Orchard→Ironwood
+migration run sized to one 96-action Keystone QR signing round; every other account, `nil`
+included, keeps the 50-note-per-run sizing it had. No signature changes, but a host that derives
+the tag from a display string should switch to the constant, because any other value silently
+selects the in-process sizing:
+
+```swift
+// Before: a lowercased display string — one localization away from "not a Keystone account".
+let accountUUID = try await synchronizer.importAccount(
+    ufvk: ufvk,
+    seedFingerprint: seedFingerprint,
+    zip32AccountIndex: accountIndex,
+    purpose: .spending,
+    name: name,
+    keySource: String(localizable: .accountsKeystone).lowercased(),
+    birthday: birthday
+)
+
+// After: the SDK's own constant.
+let accountUUID = try await synchronizer.importAccount(
+    ufvk: ufvk,
+    seedFingerprint: seedFingerprint,
+    zip32AccountIndex: accountIndex,
+    purpose: .spending,
+    name: name,
+    keySource: Account.keystoneKeySource,
+    birthday: birthday
+)
+```
+
+An account already imported under another tag cannot be re-tagged; re-import it under the constant.
+
+What to re-check in a migration UI for a Keystone account:
+
+- **More, smaller runs.** `estimateMigrationRuns(accountUUID:)` reports more runs on a large or
+  fragmented balance, each with `Run.keystoneSigningSessions == 1`; the total preparation fees and
+  the wall-clock migration (each run carries its own broadcast spread) grow with the run count.
+  Copy that promised one scan per migration should promise one scan per run.
+- **In-flight runs keep their shape.** A run committed before the upgrade was planned under the
+  flat cap and may still need several rounds; `restartCurrentMigrationStep(accountUUID:)` cancels
+  it and re-plans under the new sizing.
+- **`residualAfterMigration(accountUUID:)` now means the whole migration's remainder.** It equals
+  `estimateMigrationRuns(accountUUID:).finalResidual` (zero → `nil`), not what the next run alone
+  leaves; on a multi-run balance the old figure was mostly the balance the later runs migrate.
+  Offer `lockMigrationResidual(accountUUID:)` against it only once
+  `proposeMigrationTransfers(accountUUID:)` returns the empty schedule — the lock takes every
+  spendable note. A single-run balance (every in-process account today) reads the same value as
+  before.
+
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
 `VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE

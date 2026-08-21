@@ -12,9 +12,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `keySource` an account was created or imported with (`prepare(with:walletBirthday:name:keySource:)`,
   `importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`), until
   now a free-form client tag the SDK never read:
-  - An account whose `keySource` is `"keystone"` (compared case-insensitively — the tag zodl-ios
-    stamps on a Keystone import) has every migration run sized to what a Keystone signs in ONE
-    QR-scanned round (96 Orchard-family actions: 16 per note-preparation transaction, 3 per
+  - An account whose `keySource` is the new `Account.keystoneKeySource` (`"keystone"`, compared
+    case-insensitively) has every migration run it plans from now on sized to what a Keystone signs
+    in ONE QR-scanned round (96 Orchard-family actions: 16 per note-preparation transaction, 3 per
     transfer) instead of to a fixed note count. A run's action count follows the wallet's
     fragmentation, so the previous flat 50-notes-per-run cap could still need several signing
     ceremonies inside what the UI presents as one run. `proposeMigrationTransfers`,
@@ -24,16 +24,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run exceeds one round only when even a one-note run would, which no smaller run can fix).
     Because each smaller run re-consolidates its own funding notes, the whole balance migrates
     through more preparation transactions in total than under the old flat cap, so the total ZIP 317
-    fees paid over all runs are somewhat higher.
+    fees paid over all runs are somewhat higher — and because runs are sequential and each carries
+    its own ZIP 318 broadcast spread, the wall-clock time to migrate the whole balance grows with
+    the run count (`MigrationSchedule.estimatedDurationHours` describes one run). A run committed
+    before this change keeps the shape it was planned with until it completes;
+    `restartCurrentMigrationStep` cancels it and re-plans under the new sizing.
   - Every other account (including a `nil` `keySource`) is signed in process, where a signing round
     has no per-interaction cost to bound, and keeps the 50-note-per-run cap sizing it had before:
     runs, schedules and fees are unchanged for these accounts. `Run.keystoneSigningSessions` is
     still reported for their runs, as what a Keystone would need for a run of that shape, for
-    comparison only.
+    comparison only. Tagging a seed-derived account created through `prepare(...)` with
+    `Account.keystoneKeySource` is accepted but buys nothing: it signs in process regardless and
+    only gets the smaller, costlier runs.
 
-  No call-site edit is needed. A host that imported a Keystone account under a different `keySource`
-  must re-import it under `"keystone"` to get one-round runs — there is no API to re-tag an existing
-  account.
+  No call-site edit is needed, but stamp `Account.keystoneKeySource` rather than a display string:
+  a host that imports a Keystone account under any other `keySource` gets the in-process sizing
+  with no error, and must re-import the account under the constant to get one-round runs — there is
+  no API to re-tag an existing account. `estimateMigrationRuns` and `residualAfterMigration` walk
+  the runs with the real planners, so they cost one planning pass per run (plus a per-run sizing
+  search for a Keystone account) and are not per-frame reads on a large or fragmented balance.
 - `residualAfterMigration(accountUUID:)` now reports what the WHOLE migration leaves in Orchard —
   the remainder after the last run, the same value as
   `estimateMigrationRuns(accountUUID:).finalResidual` (`nil` when it is zero) — instead of what the

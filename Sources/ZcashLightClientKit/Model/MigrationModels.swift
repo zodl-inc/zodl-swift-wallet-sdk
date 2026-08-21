@@ -680,14 +680,13 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
 /// and transactions), so the two can be compared before anything is planned or committed.
 ///
 /// A run's capacity is PER ACCOUNT, decided by how the account signs: an account created or
-/// imported with `keySource == "keystone"` (compared case-insensitively) is sized to what a
-/// Keystone signs in ONE QR-scanned round — the 96-action ``MigrationSigningBudget/keystone``
-/// budget — so its runs are smaller and more numerous, and each ``Run/keystoneSigningSessions`` is
-/// 1 unless even a one-note run overflows the round; every other account is signed in process, has
-/// no per-round cost to bound, and is sized by the default 50-note cap — fewer, larger runs. The
-/// same
-/// sizing drives `proposeMigrationTransfers`, so this estimate always describes the runs that get
-/// planned.
+/// imported with ``Account/keystoneKeySource`` as its `keySource` (`"keystone"`, compared
+/// case-insensitively) is sized to what a Keystone signs in ONE QR-scanned round — the 96-action
+/// ``MigrationSigningBudget/keystone`` budget — so its runs are smaller and more numerous, and each
+/// ``Run/keystoneSigningSessions`` is 1 unless even a one-note run overflows the round; every other
+/// account is signed in process, has no per-round cost to bound, and is sized by the default
+/// 50-note cap — fewer, larger runs. The same sizing drives `proposeMigrationTransfers`, so this
+/// estimate always describes the runs that get planned.
 ///
 /// External-signer workload is expressed in ACTIONS, not transaction counts: a preparation
 /// transaction weighs 16 Orchard-family actions and a transfer 3, so per-run ``Run/actions`` is
@@ -721,7 +720,7 @@ public struct MigrationRunEstimate: Equatable, Sendable {
         /// The number of signing rounds this run needs from a Keystone-class external signer
         /// (``MigrationSigningBudget/keystone``, 96 actions per round), computed by the upstream
         /// optimal `MinRounds` packing — see the type doc for why a count-based ceiling
-        /// undercounts this. For a `keySource == "keystone"` account the run is sized to fit one
+        /// undercounts this. For an ``Account/keystoneKeySource`` account the run is sized to fit one
         /// round, so this is 1 (more only when even a one-note run overflows); for an in-process
         /// account it is what a Keystone would need for a run of this shape — a comparison figure.
         public let keystoneSigningSessions: Int

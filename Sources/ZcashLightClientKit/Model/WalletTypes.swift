@@ -20,6 +20,21 @@ public struct Account: Equatable, Hashable, Codable, Identifiable {
     public let uivk: UnifiedIncomingViewingKey?
 }
 
+extension Account {
+    /// The `keySource` that marks an account whose transactions a Keystone hardware wallet signs.
+    /// Pass it as the `keySource` of
+    /// `Synchronizer.importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`
+    /// when importing a Keystone account: the SDK compares it case-insensitively and sizes every
+    /// Orchard→Ironwood migration run of such an account to one 96-action QR signing round (see
+    /// ``MigrationRunEstimate``). Any other value, or `nil`, means the account signs in process and
+    /// keeps the default 50-note-per-run sizing — stamp this constant, not a display string, because
+    /// any other spelling selects the in-process sizing with no error and an account cannot be
+    /// re-tagged later. A seed-derived account created through
+    /// `Synchronizer.prepare(with:walletBirthday:name:keySource:)` always signs in process, so
+    /// tagging it only shrinks its runs: more runs and more preparation fees for nothing in return.
+    public static let keystoneKeySource = "keystone"
+}
+
 public struct UnifiedSpendingKey: Equatable, Undescribable {
     let network: NetworkType
     let bytes: [UInt8]

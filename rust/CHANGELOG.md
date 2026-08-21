@@ -213,17 +213,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pool-migration planning and estimating entry points — `zcashlc_migration_propose_transfers`,
   `zcashlc_migration_prepare_note_split`, `zcashlc_migration_is_note_split_needed`,
   `zcashlc_migration_residual_after_migration`, `zcashlc_migration_restart_step` and
-  `zcashlc_migration_estimate_runs` — now size each run PER ACCOUNT, from the account row's
-  `key_source`: an account tagged `keystone` (case-insensitive) is sized to one 96-action Keystone
-  signing round per run (upstream `plan_migration_sized_with` /
-  `estimate_migration_runs_sized_with` under `RunSizing::Signer(RunSigningCapacity::KEYSTONE)`);
-  every other account keeps the crate's default note-cap sizing
-  (`RunSizing::Notes(MIGRATION_MAX_PREPARED_NOTES_PER_RUN)`, 50 notes per run), so its runs are
-  unchanged. Signatures and `#[repr(C)]` shapes are unchanged;
-  `FfiRunEstimate::keystone_rounds` is 1 for every run of a Keystone-tagged account (more only when
-  a one-note run already overflows a round). Planning and estimating take the sizing from one seam,
-  so an estimate always describes the runs that get planned. Built on `zcash_pool_migration`'s
-  signer-capacity sizing (librustzcash #2962 + #2970).
+  `zcashlc_migration_estimate_runs` — now size each run PER ACCOUNT, from the `key_source` the
+  account row was created or imported with: an account tagged `keystone` (compared
+  case-insensitively; nothing is trimmed or prefix-matched) has each run sized to what a Keystone
+  signs in one 96-action signing round (16 actions per preparation transaction, 3 per transfer),
+  so it plans more, smaller runs on a large or fragmented balance; every other account, an absent
+  tag included, keeps the 50-note per-run sizing it had, so its runs are unchanged. Signatures and
+  `#[repr(C)]` shapes are unchanged. `FfiRunEstimate::keystone_rounds` is 1 for every run of a
+  `keystone` account (more only when even a one-note run overflows a round, which no smaller run
+  can fix) and, for every other account, what a Keystone would need for a run of that shape. The
+  estimate describes the runs the planning calls plan, under the same per-account sizing. A run
+  committed before this change keeps its planned shape until it completes or
+  `zcashlc_migration_restart_step` re-plans it. Estimating costs one planning pass per run, plus a
+  sizing search per run for a `keystone` account.
 - `zcashlc_migration_residual_after_migration` now returns the value the WHOLE migration leaves in
   the source pool — the `final_residual` that `zcashlc_migration_estimate_runs` reports for the
   same wallet (`-1` when it is zero) — instead of the next run's own leftover, and no longer reads
