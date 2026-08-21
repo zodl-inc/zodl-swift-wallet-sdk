@@ -114,7 +114,8 @@ use zcash_pool_migration::state::{
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
 use crate::migration_engine::{
-    AdapterError, MigrationWallet, account_migration, account_store, run_sizing, stored_orchard_fvk,
+    AdapterError, MigrationWallet, account_migration, account_migration_with, account_store,
+    planning_inputs, stored_orchard_fvk,
 };
 use crate::migration_finalize;
 use crate::migration_plan_cache;
@@ -710,21 +711,23 @@ fn plan_and_cache(
 /// replacing the cached plan would invalidate the handle of a proposal the user is currently
 /// reviewing, failing its later commit with `MIGRATION_PLAN_STALE` for no user-visible reason.
 ///
-/// The run is bounded the way [`run_sizing`] bounds it for THIS account — one Keystone signing
-/// round for a Keystone-tagged account, the in-process note cap for every other — and
+/// The run is bounded the way [`planning_inputs`] sizes THIS account — one Keystone signing round
+/// for a Keystone-tagged account, the in-process note cap for every other — and
 /// [`zcashlc_migration_estimate_runs`] previews under the same value from the same seam, so a
 /// preview always describes the runs that get planned. An in-process account resolves to exactly
 /// the engine's `plan_migration` default (the crate's flat 50-note cap); the seam exists for the
 /// Keystone-tagged account, whose one-round bound no note cap can express — a wallet fragmented
 /// enough that its 50-note run needs several QR-scanned rounds (see
-/// `zcash_pool_migration::signing_rounds`'s module doc).
+/// `zcash_pool_migration::signing_rounds`'s module doc). The sizing and the viewing key come from
+/// one account-row read.
 fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
-    let sizing = run_sizing(&ctx.wallet, ctx.account)?;
-    let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
+    let backend =
+        account_migration_with(&ctx.wallet, ctx.account, inputs.ufvk, &mut ctx.store_conn)?;
     let mut rng = OsRng;
     match engine::plan_migration_sized_with(
         &default_portfolio(),
-        sizing,
+        inputs.sizing,
         &ctx.network,
         &backend,
         &mut rng,
@@ -3524,12 +3527,13 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 ) -> *mut FfiMigrationRunEstimate {
     let res = catch_panic(|| {
         let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
-        let sizing = run_sizing(&ctx.wallet, ctx.account)?;
-        let backend = account_migration(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+        let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
+        let backend =
+            account_migration_with(&ctx.wallet, ctx.account, inputs.ufvk, &mut ctx.store_conn)?;
         let mut rng = OsRng;
         let estimate = match engine::estimate_migration_runs_sized_with(
             &default_portfolio(),
-            sizing,
+            inputs.sizing,
             &ctx.network,
             &backend,
             &mut rng,
@@ -6954,8 +6958,9 @@ mod tests {
 
     // ----- Per-account run sizing (MOB-1732: Keystone runs sized by signing-round capacity) -----
 
-    /// Opens the fixture wallet at `path` exactly as an FFI entry point does and answers
-    /// [`crate::migration_engine::run_sizing`] for `account_bytes`.
+    /// Opens the fixture wallet at `path` exactly as an FFI entry point does and answers the run
+    /// sizing [`crate::migration_engine::planning_inputs`] resolves for `account_bytes` — the one
+    /// account-row read every planning and estimating call makes.
     fn fixture_run_sizing(
         path: &std::path::Path,
         account_bytes: &[u8; 16],
@@ -6970,7 +6975,8 @@ mod tests {
             )
         }
         .expect("the fixture wallet opens");
-        crate::migration_engine::run_sizing(&ctx.wallet, ctx.account)
+        crate::migration_engine::planning_inputs(&ctx.wallet, ctx.account)
+            .map(|inputs| inputs.sizing)
     }
 
     /// The tag is matched case-insensitively: it is what the platform layer stamps on a Keystone
@@ -7024,6 +7030,40 @@ mod tests {
         assert!(
             err.to_string().contains("unknown account"),
             "unexpected error message: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The sizing and the stored viewing key come out of ONE account-row read: the key
+    /// `planning_inputs` hands the adapter is the account's stored key, the same one
+    /// `stored_ufvk` reads, so a planning call no longer pays for the row twice.
+    #[test]
+    fn planning_inputs_reads_the_stored_viewing_key_with_the_sizing() {
+        let path = init_fixture_db("zcashlc_planning_inputs_ufvk");
+        let (account_bytes, _usk) =
+            create_fixture_account_with_usk_and_key_source(&path, Some("keystone"));
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture wallet opens");
+        let inputs = crate::migration_engine::planning_inputs(&ctx.wallet, ctx.account)
+            .expect("the planning inputs resolve");
+        assert_eq!(
+            inputs.sizing,
+            RunSizing::Signer(RunSigningCapacity::KEYSTONE)
+        );
+        let stored = crate::migration_engine::stored_ufvk(&ctx.wallet, ctx.account)
+            .expect("the stored key resolves");
+        assert_eq!(
+            inputs.ufvk.encode(&ctx.network),
+            stored.encode(&ctx.network),
+            "the planning inputs must carry the account's stored unified full viewing key"
         );
         let _ = std::fs::remove_file(&path);
     }
