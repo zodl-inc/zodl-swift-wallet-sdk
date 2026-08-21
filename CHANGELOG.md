@@ -21,6 +21,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transparent receivers during enhancement now go over Tor, one circuit per address, instead of
   over the direct gRPC connection; the transactions found are decrypted and stored exactly as
   before. With Tor disabled nothing changes.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) probes
+  the candidate servers over Tor when Tor is enabled, each on its own circuit, as
+  `SDKSynchronizer`'s already did.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see

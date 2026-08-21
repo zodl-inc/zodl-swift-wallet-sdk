@@ -1737,20 +1737,24 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
     /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// `ValidateServerAction`. Delegates to ephemeral connections — same pattern as
+    /// `SDKSynchronizer`, including its Tor policy: with Tor enabled each candidate is probed on
+    /// its own circuit.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = LightWalletGRPCService(endpoint: endpoint)
+                    let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+                    let mode = await sdkFlags.ifTor(.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
                     let start = DispatchTime.now()
-                    let info = try? await service.getInfo(mode: .direct)
+                    let info = try? await service.getInfo(mode: mode)
                     let elapsed = DispatchTime.now().secondsSince(start)
                     await service.closeConnections()
                     guard let info else { return nil }
