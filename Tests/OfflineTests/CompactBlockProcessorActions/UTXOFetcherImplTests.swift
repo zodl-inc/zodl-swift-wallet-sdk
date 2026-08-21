@@ -1,5 +1,10 @@
 //
 //  UTXOFetcherImplTests.swift
+//  ZcashLightClientKit
+//
+//  Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+//  Licensed under the GNU Affero General Public License, version 3 only (AGPL-3.0-only).
+//  See LICENSE, LICENSE-EXCEPTIONS.md and COMMERCIAL-LICENSE.md in this repository.
 //
 //  Verifies the transport `UTXOFetcherImpl` picks for the sync-time UTXO discovery: with Tor
 //  enabled every transparent receiver is looked up through the FFI's Tor path on a circuit of its
