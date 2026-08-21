@@ -652,7 +652,7 @@ actor OrchardMigration {
 
     /// The multi-run ("rounds") estimate for migrating the whole spendable Orchard balance. A
     /// straight delegation to the welding estimate call, bound to this actor's own account; the
-    /// zero-run estimate is a legitimate answer, not an error.
+    /// zero-run estimate is a legitimate answer, not an error. Costs one planning pass per run.
     func estimateMigrationRuns() async throws -> MigrationRunEstimate {
         try await welding.estimateMigrationRuns(accountUUID: accountUUID)
     }

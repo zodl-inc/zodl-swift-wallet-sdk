@@ -1182,7 +1182,10 @@ public protocol Synchronizer: AnyObject {
     ///
     /// The old plan is no longer valid: the engine discards it and derives a new one, which a
     /// follow-up ``signAndStoreMigrationSchedule(accountUUID:_:usk:)`` (or PCZT store) then signs and
-    /// persists.
+    /// persists. The fresh plan is sized the way the account is sized NOW — one Keystone signing
+    /// round per run for an ``Account/keystoneKeySource`` account — which also makes this the way
+    /// to bring a run committed under an earlier sizing onto the current one: a run keeps the shape
+    /// it was planned with until it completes or is restarted here.
     /// - Parameter accountUUID: the account to restart.
     func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule
 

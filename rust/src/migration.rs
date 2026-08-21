@@ -7095,20 +7095,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The estimate and the plan share one sizing seam (`run_sizing`), and it is per account: a
-    /// Keystone-tagged account is sized to what one QR-scanned round signs — so on a wallet whose
+    /// The estimate and the plan share one sizing seam (`planning_inputs`), and it is per account:
+    /// a Keystone-tagged account is sized to what one QR-scanned round signs — so on a wallet whose
     /// note-cap run would take several rounds, EVERY Keystone-sized run fits one — while the same
     /// wallet held by an in-process account is sized by the crate's default 50-note cap and needs
-    /// more than one
-    /// round in some run, in fewer runs. Nothing about the funding differs between the two
-    /// accounts; only the tag does.
+    /// more than one round in some run, in fewer runs. Nothing about the funding differs between
+    /// the two accounts; only the tag does.
     #[test]
     fn migration_estimate_runs_sizes_a_keystone_account_to_one_signing_round_per_run() {
         // 1,000,000 ZEC in a single note: about a hundred cap-sized (10,000 ZEC) crossings, split
         // into runs of up to 50 under the crate's default cap, each needing layered preparation
         // transactions — hundreds of actions, so several Keystone rounds in ONE run — while the
-        // Keystone sizing
-        // caps each run at the largest note count keeping `16 * preparations + 3 * transfers <= 96`.
+        // Keystone sizing caps each run at the largest note count keeping
+        // `16 * preparations + 3 * transfers <= 96`.
         const FUNDING_ZAT: u64 = 100_000_000_000_000;
 
         // `(crossings, actions, keystone_rounds)` per run, in run order.
