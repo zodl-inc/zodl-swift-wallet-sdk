@@ -224,17 +224,55 @@ final class BlockEnhancerImplTests: XCTestCase {
 
     private let transparentAddress = "t1dRJRY7GmyeykJnMH38mdQoaZtFhn1QmGz"
 
-    private func makeAddressRequest() -> TransactionDataRequest {
-        .transactionsInvolvingAddress(
-            TransactionsInvolvingAddress(
-                address: transparentAddress,
-                blockRangeStart: 663100,
-                blockRangeEnd: 663201,
-                requestAt: nil,
-                txStatusFilter: .mined,
-                outputStatusFilter: .all
-            )
+    private func makeAddressRequestBody(
+        blockRangeEnd: UInt32? = 663201,
+        requestAt: Date? = nil,
+        outputStatusFilter: OutputStatusFilter = .all
+    ) -> TransactionsInvolvingAddress {
+        TransactionsInvolvingAddress(
+            address: transparentAddress,
+            blockRangeStart: 663100,
+            blockRangeEnd: blockRangeEnd,
+            requestAt: requestAt,
+            txStatusFilter: .mined,
+            outputStatusFilter: outputStatusFilter
         )
+    }
+
+    private func makeAddressRequest() -> TransactionDataRequest {
+        .transactionsInvolvingAddress(makeAddressRequestBody())
+    }
+
+    func testLastHeightConvertsTheExclusiveEndToTheServersInclusiveEnd() {
+        XCTAssertEqual(BlockEnhancerImpl.lastHeight(of: makeAddressRequestBody(blockRangeEnd: 663201)), 663200)
+        XCTAssertNil(BlockEnhancerImpl.lastHeight(of: makeAddressRequestBody(blockRangeEnd: nil)))
+    }
+
+    /// Request shapes the enhancer cannot serve yet are reported as unhandled without touching
+    /// either transport, so the backend can re-issue them later.
+    func testUnsupportedAddressRequestShapesFetchNothing() async throws {
+        let unsupported: [TransactionsInvolvingAddress] = [
+            makeAddressRequestBody(blockRangeEnd: nil),
+            makeAddressRequestBody(requestAt: Date()),
+            makeAddressRequestBody(outputStatusFilter: .unspent)
+        ]
+
+        for request in unsupported {
+            let service = LightWalletServiceMock()
+            let enhancer = makeEnhancer(
+                rustBackend: ZcashRustBackendWeldingMock(),
+                downloader: BlockDownloaderServiceMock(),
+                repository: TransactionRepositoryMock(),
+                service: service,
+                torEnabled: true
+            )
+
+            let handled = try await enhancer.fetchTransactionsInvolvingAddress(request)
+
+            XCTAssertFalse(handled)
+            XCTAssertFalse(service.getTaddressTransactionsModeCalled)
+            XCTAssertFalse(service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeCalled)
+        }
     }
 
     /// With Tor enabled the address history must be fetched and stored through the FFI's Tor path,

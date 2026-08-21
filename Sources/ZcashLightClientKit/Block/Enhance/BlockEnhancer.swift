@@ -67,6 +67,81 @@ struct BlockEnhancerImpl {
     let networkType: NetworkType
 }
 
+extension BlockEnhancerImpl {
+    /// The last block height to ask the server for: the request's `blockRangeEnd` is exclusive
+    /// while the server's range is inclusive. `nil` when the request has no end.
+    static func lastHeight(of request: TransactionsInvolvingAddress) -> BlockHeight? {
+        request.blockRangeEnd.map { BlockHeight($0) - 1 }
+    }
+
+    /// Serves one `transactionsInvolvingAddress` request. Returns `false` when the request has a
+    /// shape the enhancer does not support yet, in which case nothing is fetched and the backend
+    /// re-issues the request on a later cycle.
+    ///
+    /// On the direct connection the transactions stream through here and are filtered by the
+    /// request's status filter before being stored. Over Tor the FFI runs the same query on a
+    /// circuit dedicated to the address and stores every returned transaction itself, mined or
+    /// not, so the status filter is not applied: a mined-only request over a historical range gets
+    /// no mempool rows anyway, and a row stored as unmined is reconciled when the transaction is
+    /// mined.
+    func fetchTransactionsInvolvingAddress(_ tia: TransactionsInvolvingAddress) async throws -> Bool {
+        // TODO: [#1554] Remove this guard once lightwalletd servers support open-ended ranges.
+        guard let lastHeight = Self.lastHeight(of: tia) else {
+            logger.error("transactionsInvolvingAddress \(tia) is missing blockRangeEnd, ignoring the request.")
+            return false
+        }
+
+        // TODO: [#1551] Support this.
+        if tia.requestAt != nil {
+            logger.error("transactionsInvolvingAddress \(tia) has requestAt set, ignoring the unsupported request.")
+            return false
+        }
+
+        // TODO: [#1552] Support the OutputStatusFilter
+        if tia.outputStatusFilter == .unspent {
+            return false
+        }
+
+        let address = TransparentAddress(validatedEncoding: tia.address)
+        let mode = await sdkFlags.ifTor(ServiceMode.addressGroup(prefix: "taddr", address: address))
+
+        guard mode == .direct else {
+            _ = try await service.updateTransparentAddressTransactions(
+                address: tia.address,
+                start: BlockHeight(tia.blockRangeStart),
+                end: lastHeight,
+                dbData: dataDb.osStr(),
+                networkType: networkType,
+                mode: mode
+            )
+            return true
+        }
+
+        var filter = TransparentAddressBlockFilter()
+        filter.address = tia.address
+        filter.range = BlockRange(startHeight: Int(tia.blockRangeStart), endHeight: lastHeight)
+
+        let stream = try service.getTaddressTransactions(filter, mode: mode)
+
+        for try await rawTransaction in stream {
+            let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)
+            ? nil : UInt32(rawTransaction.height)
+
+            // Ignore transactions that don't match the status filter.
+            if (tia.txStatusFilter == .mined && minedHeight == nil) || (tia.txStatusFilter == .mempool && minedHeight != nil) {
+                continue
+            }
+
+            _ = try await rustBackend.decryptAndStoreTransaction(
+                txBytes: rawTransaction.data.bytes,
+                minedHeight: minedHeight
+            )
+        }
+
+        return true
+    }
+}
+
 extension BlockEnhancerImpl: BlockEnhancer {
     /// Reports a sent transaction that has just transitioned from unmined to mined through
     /// `didEnhance` — the upstream producer of `SynchronizerEvent.minedTransaction`
@@ -193,67 +268,7 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             retry = false
 
                         case .transactionsInvolvingAddress(let tia):
-                            // TODO: [#1554] Remove this guard once lightwalletd servers support open-ended ranges.
-                            guard let blockRangeEnd = tia.blockRangeEnd else {
-                                logger.error("transactionsInvolvingAddress \(tia) is missing blockRangeEnd, ignoring the request.")
-                                retry = false
-                                continue
-                            }
-
-                            // TODO: [#1551] Support this.
-                            if tia.requestAt != nil {
-                                logger.error("transactionsInvolvingAddress \(tia) has requestAt set, ignoring the unsupported request.")
-                                retry = false
-                                continue
-                            }
-
-                            // TODO: [#1552] Support the OutputStatusFilter
-                            if tia.outputStatusFilter == .unspent {
-                                retry = false
-                                continue
-                            }
-
-                            // The request's end is exclusive; the server's range is inclusive.
-                            let lastHeight = Int(blockRangeEnd) - 1
-                            let address = TransparentAddress(validatedEncoding: tia.address)
-                            let mode = await sdkFlags.ifTor(ServiceMode.addressGroup(prefix: "taddr", address: address))
-
-                            if mode == .direct {
-                                var filter = TransparentAddressBlockFilter()
-                                filter.address = tia.address
-                                filter.range = BlockRange(startHeight: Int(tia.blockRangeStart), endHeight: lastHeight)
-
-                                let stream = try service.getTaddressTransactions(filter, mode: mode)
-
-                                for try await rawTransaction in stream {
-                                    let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)
-                                    ? nil : UInt32(rawTransaction.height)
-
-                                    // Ignore transactions that don't match the status filter.
-                                    if (tia.txStatusFilter == .mined && minedHeight == nil) || (tia.txStatusFilter == .mempool && minedHeight != nil) {
-                                        continue
-                                    }
-
-                                    _ = try await rustBackend.decryptAndStoreTransaction(
-                                        txBytes: rawTransaction.data.bytes,
-                                        minedHeight: minedHeight
-                                    )
-                                }
-                            } else {
-                                // Over Tor the FFI runs the same query and stores every returned
-                                // transaction itself, mined or not, so the status filter is not
-                                // applied: a mined-only request over a historical range gets no
-                                // mempool rows anyway, and a row stored as unmined is reconciled
-                                // when the transaction is mined.
-                                _ = try await service.updateTransparentAddressTransactions(
-                                    address: tia.address,
-                                    start: BlockHeight(tia.blockRangeStart),
-                                    end: lastHeight,
-                                    dbData: dataDb.osStr(),
-                                    networkType: networkType,
-                                    mode: mode
-                                )
-                            }
+                            _ = try await fetchTransactionsInvolvingAddress(tia)
                             retry = false
                         }
                     } catch {
