@@ -807,7 +807,8 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     /// A SUM, never a re-packing across runs: a later run's transactions spend notes an earlier
     /// run must mine first, so each run is signed on its own and any spare capacity in a run's
     /// last round goes unused. For an ``Account/keystoneKeySource`` account every run is sized to
-    /// one round, so this equals ``runCount``; for an in-process account — which never interacts
+    /// one round, so this equals ``runCount`` (more only when even a one-note run overflows the
+    /// round, which no smaller run can fix); for an in-process account — which never interacts
     /// with a Keystone — it is the comparison figure the per-run sessions are.
     public var totalKeystoneSigningSessions: Int {
         runs.reduce(0) { $0 + $1.keystoneSigningSessions }

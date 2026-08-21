@@ -706,10 +706,11 @@ fn plan_and_cache(
 }
 
 /// Computes a fresh preview plan WITHOUT caching it — the read-only building block behind
-/// [`plan_and_cache`], used directly by pure peek queries (`zcashlc_migration_is_note_split_needed`,
-/// `zcashlc_migration_residual_after_migration`'s pre-commit branch) that must NOT cache:
-/// replacing the cached plan would invalidate the handle of a proposal the user is currently
-/// reviewing, failing its later commit with `MIGRATION_PLAN_STALE` for no user-visible reason.
+/// [`plan_and_cache`], used directly by the pure peek `zcashlc_migration_is_note_split_needed`,
+/// which must NOT cache: replacing the cached plan would invalidate the handle of a proposal the
+/// user is currently reviewing, failing its later commit with `MIGRATION_PLAN_STALE` for no
+/// user-visible reason. (The residual peek reads the multi-run estimate instead — see
+/// [`estimate_runs`].)
 ///
 /// The run is bounded the way [`planning_inputs`] sizes THIS account — one Keystone signing round
 /// for a Keystone-tagged account, the in-process note cap for every other — and
@@ -3546,10 +3547,10 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
 /// run can fix), and, for an in-process account, what a Keystone would need for that run's shape —
 /// a comparison figure. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
 /// (`runs_len == 0`) — a legitimate result, not an error. The estimate walks the runs with the
-/// real planners, so it costs one
-/// planning pass per run — plus a sizing search per run for a Keystone-tagged account, whose runs
-/// are more numerous. `zcashlc_migration_residual_after_migration` is read from this same estimate
-/// (see [`estimate_runs`]). NULL signals an error (see `zcashlc_last_error_message`).
+/// real planners, so it costs one planning pass per run — plus a sizing search per run for a
+/// Keystone-tagged account, whose runs are more numerous.
+/// `zcashlc_migration_residual_after_migration` is read from this same estimate (see
+/// [`estimate_runs`]). NULL signals an error (see `zcashlc_last_error_message`).
 ///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_run_estimate`].
@@ -4622,14 +4623,13 @@ mod tests {
     use rand::rngs::StdRng;
     use zcash_client_backend::data_api::WalletWrite;
     use zcash_pool_migration::denomination::DenominationPlan;
+    use zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN;
+    use zcash_pool_migration::engine::RunSizing;
     use zcash_pool_migration::engine::{MigrationLockOwner, MigrationStatus};
     use zcash_pool_migration::preparation::PreparationPlan;
     use zcash_pool_migration::scheduling::{self, AnchorBucketInterval, SchedulingParams};
-    use zcash_pool_migration::signing_rounds::min_signing_rounds;
-
-    use zcash_pool_migration::denomination::MIGRATION_MAX_PREPARED_NOTES_PER_RUN;
-    use zcash_pool_migration::engine::RunSizing;
     use zcash_pool_migration::signing_rounds::RunSigningCapacity;
+    use zcash_pool_migration::signing_rounds::min_signing_rounds;
 
     fn zat(v: u64) -> Zatoshis {
         Zatoshis::from_u64(v).unwrap()
@@ -7490,8 +7490,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The split-needed peek plans under the same sizing: a single large note needs splitting,
-    /// and the peek answers without touching the last-error channel.
+    /// The split-needed peek plans through the same seam, but its boolean cannot expose the
+    /// sizing: a single large note needs splitting under either sizing. This pins the answer and
+    /// error-freedom only; the note-split and restart tests around it carry the sizing
+    /// discrimination.
     #[test]
     fn migration_is_note_split_needed_is_true_for_a_keystone_sized_run() {
         let (path, account_bytes, _usk) = funded_fixture(

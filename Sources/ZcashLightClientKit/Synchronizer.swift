@@ -997,9 +997,11 @@ public protocol Synchronizer: AnyObject {
     /// spendable note, not just this remainder.
     /// - Parameter accountUUID: the account to check.
     /// - Note: Costs one planning pass per remaining run — the multi-run estimate this is read
-    ///   from — so on a large or fragmented balance it is not a per-frame read. Requires at least
-    ///   one completed sync: on a wallet that has never completed a sync (no chain tip known) this
-    ///   throws rather than returning `nil`.
+    ///   from — so on a large or fragmented balance it is not a per-frame read; a host that already
+    ///   holds an ``estimateMigrationRuns(accountUUID:)`` result can read its
+    ///   ``MigrationRunEstimate/finalResidual`` instead of paying for a second one. Requires at
+    ///   least one completed sync: on a wallet that has never completed a sync (no chain tip known)
+    ///   this throws rather than returning `nil`.
     func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi?
 
     /// Locks every currently-spendable, not-already-locked legacy-Orchard note of `accountUUID`

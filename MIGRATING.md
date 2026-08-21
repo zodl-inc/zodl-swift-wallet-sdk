@@ -33,7 +33,9 @@ let accountUUID = try await synchronizer.importAccount(
 )
 ```
 
-An account already imported under another tag cannot be re-tagged; re-import it under the constant.
+An account already imported under another tag cannot be re-tagged, and importing the same viewing
+key again is rejected as a collision: delete the account (`deleteAccount(_:)`) and import it again
+under the constant, accepting the rescan from its birthday.
 
 What to re-check in a migration UI for a Keystone account:
 
@@ -46,11 +48,14 @@ What to re-check in a migration UI for a Keystone account:
   it and re-plans under the new sizing.
 - **`residualAfterMigration(accountUUID:)` now means the whole migration's remainder.** It equals
   `estimateMigrationRuns(accountUUID:).finalResidual` (zero → `nil`), not what the next run alone
-  leaves; on a multi-run balance the old figure was mostly the balance the later runs migrate.
-  Offer `lockMigrationResidual(accountUUID:)` against it only once
+  leaves; on a multi-run balance the old figure was mostly the balance the later runs migrate. A
+  single-run balance reads the same value as before while the run is pending or in flight — but
+  once a run completes, the call now reports the dust that remains where it previously reported
+  `nil`, so re-test a `Complete` screen that showed a residual card or a "Lock balance" offer only
+  for a non-`nil` value: it now has one. Offer `lockMigrationResidual(accountUUID:)` only once
   `proposeMigrationTransfers(accountUUID:)` returns the empty schedule — the lock takes every
-  spendable note. A single-run balance (every in-process account today) reads the same value as
-  before.
+  spendable note. A host that already holds an estimate can read its `finalResidual` instead of
+  paying for a second multi-run estimate.
 
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 

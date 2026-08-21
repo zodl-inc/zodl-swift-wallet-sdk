@@ -46,15 +46,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `residualAfterMigration(accountUUID:)` now reports what the WHOLE migration leaves in Orchard —
   the remainder after the last run, the same value as
   `estimateMigrationRuns(accountUUID:).finalResidual` (`nil` when it is zero) — instead of what the
-  NEXT run alone would leave. The two differ only on a balance that takes more than one run, where
-  the old figure was mostly the balance the later runs migrate; for a single-run balance (every
-  in-process account today) the value is unchanged. It is read fresh from the live spendable
-  balance on every call and no longer from the stored run: while a run is in flight it previews
-  what stays after the runs that follow the current one and settles once that run completes. It is
-  computed from the same multi-run estimate as `estimateMigrationRuns`, so it costs one planning
-  pass per remaining run instead of one. A "Lock balance" offer built from it belongs only after
-  `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks every
-  spendable Orchard note, not just the residual. No call-site edit is needed.
+  NEXT run alone would leave. It is read fresh from the live spendable balance on every call and no
+  longer from the stored run. What changes, moment by moment:
+  - On a balance that takes more than one run, the old figure was mostly the balance the later
+    runs migrate; the new one is the remainder after all of them.
+  - On a single-run balance the value is unchanged before and during the run.
+  - After a run completes, the call now reports the dust that remains (the live spendable balance
+    once nothing more can migrate) where it previously reported `nil` — a `Complete` screen that
+    showed a residual card or a "Lock balance" offer only for a non-`nil` value now has one.
+  - A balance whose canonical split the wallet's notes cannot fund now reports the whole spendable
+    balance as the remainder, where the old read threw.
+  - While a run is in flight it previews what stays after the runs that follow the current one
+    (the run's reserved notes and unmined preparation change are outside the spendable balance)
+    and settles once that run completes.
+  It is computed from the same multi-run estimate as `estimateMigrationRuns`, so it costs one
+  planning pass per remaining run instead of one; a host that already holds an estimate should read
+  its `finalResidual` rather than pay for a second one. A "Lock balance" offer built from it belongs
+  only after `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks
+  every spendable Orchard note, not just the residual. No call-site edit is needed.
 
 # 4.0.0 - 2026-08-19
 
