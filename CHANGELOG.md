@@ -17,6 +17,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists; and `refreshUTXOs(address:from:)` queries from the address's exposure height (or the
   account birthday when that is unknown) instead of `from`, and does nothing for an address no
   account of the wallet exposed. With Tor disabled nothing changes.
+- With Tor enabled, the transaction-history lookups the wallet backend requests for its
+  transparent receivers during enhancement now go over Tor, one circuit per address, instead of
+  over the direct gRPC connection; the transactions found are decrypted and stored exactly as
+  before. With Tor disabled nothing changes.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see

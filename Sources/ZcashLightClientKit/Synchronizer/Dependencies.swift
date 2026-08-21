@@ -218,7 +218,9 @@ enum Dependencies {
                 metrics: metrics,
                 service: service,
                 logger: logger,
-                sdkFlags: sdkFlags
+                sdkFlags: sdkFlags,
+                dataDb: config.dataDb,
+                networkType: config.network.networkType
             )
         }
 

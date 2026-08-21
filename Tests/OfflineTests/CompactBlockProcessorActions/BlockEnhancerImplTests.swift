@@ -58,16 +58,20 @@ final class BlockEnhancerImplTests: XCTestCase {
     private func makeEnhancer(
         rustBackend: ZcashRustBackendWeldingMock,
         downloader: BlockDownloaderServiceMock,
-        repository: TransactionRepositoryMock
+        repository: TransactionRepositoryMock,
+        service: LightWalletServiceMock = LightWalletServiceMock(),
+        torEnabled: Bool = false
     ) -> BlockEnhancerImpl {
         BlockEnhancerImpl(
             blockDownloaderService: downloader,
             rustBackend: rustBackend,
             transactionRepository: repository,
             metrics: SDKMetricsImpl(),
-            service: LightWalletServiceMock(),
+            service: service,
             logger: OSLogger(logLevel: .debug),
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: SDKFlags(torEnabled: torEnabled, exchangeRateEnabled: false),
+            dataDb: URL(fileURLWithPath: "/tmp/data.db"),
+            networkType: .testnet
         )
     }
 
@@ -214,5 +218,77 @@ final class BlockEnhancerImplTests: XCTestCase {
             5,
             "a failing status write is retried up to maxRetries within the cycle before being logged as exhausted"
         )
+    }
+
+    // MARK: - Transparent-address history
+
+    private let transparentAddress = "t1dRJRY7GmyeykJnMH38mdQoaZtFhn1QmGz"
+
+    private func makeAddressRequest() -> TransactionDataRequest {
+        .transactionsInvolvingAddress(
+            TransactionsInvolvingAddress(
+                address: transparentAddress,
+                blockRangeStart: 663100,
+                blockRangeEnd: 663201,
+                requestAt: nil,
+                txStatusFilter: .mined,
+                outputStatusFilter: .all
+            )
+        )
+    }
+
+    /// With Tor enabled the address history must be fetched and stored through the FFI's Tor path,
+    /// on a circuit dedicated to that address, and the direct gRPC stream must never be opened.
+    func testAddressHistoryGoesOverTorWhenEnabled() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        let downloader = BlockDownloaderServiceMock()
+        let repository = TransactionRepositoryMock()
+        let service = LightWalletServiceMock()
+
+        rustBackend.transactionDataRequestsReturnValue = [makeAddressRequest()]
+        repository.findInLimitKindReturnValue = []
+        service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeClosure = { _, _, _, _, _, _ in .notFound }
+
+        _ = try await makeEnhancer(rustBackend: rustBackend, downloader: downloader, repository: repository, service: service, torEnabled: true)
+            .enhance(at: 663100...663200) { _ in }
+
+        XCTAssertFalse(service.getTaddressTransactionsModeCalled, "the direct gRPC stream must not be used with Tor enabled")
+        XCTAssertEqual(service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeCallsCount, 1)
+
+        let arguments = try XCTUnwrap(service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeReceivedArguments)
+        XCTAssertEqual(arguments.address, transparentAddress)
+        XCTAssertEqual(arguments.start, 663100)
+        XCTAssertEqual(arguments.end, 663200, "the request's exclusive end must become the server's inclusive end")
+        XCTAssertEqual(arguments.networkType, .testnet)
+        XCTAssertEqual(arguments.mode, .torInGroup("taddr-\(transparentAddress)"))
+    }
+
+    /// With Tor disabled the direct gRPC stream is still the path, and the Tor-only FFI entry point
+    /// is left alone.
+    func testAddressHistoryStaysDirectWhenTorDisabled() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        let downloader = BlockDownloaderServiceMock()
+        let repository = TransactionRepositoryMock()
+        let service = LightWalletServiceMock()
+
+        rustBackend.transactionDataRequestsReturnValue = [makeAddressRequest()]
+        rustBackend.decryptAndStoreTransactionTxBytesMinedHeightClosure = { _, _ in Data() }
+        repository.findInLimitKindReturnValue = []
+        service.getTaddressTransactionsModeClosure = { _, _ in
+            AsyncThrowingStream { continuation in
+                var rawTransaction = RawTransaction()
+                rawTransaction.data = Data([0x01])
+                rawTransaction.height = 663150
+                continuation.yield(rawTransaction)
+                continuation.finish()
+            }
+        }
+
+        _ = try await makeEnhancer(rustBackend: rustBackend, downloader: downloader, repository: repository, service: service, torEnabled: false)
+            .enhance(at: 663100...663200) { _ in }
+
+        XCTAssertEqual(service.getTaddressTransactionsModeCallsCount, 1)
+        XCTAssertFalse(service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeCalled)
+        XCTAssertEqual(rustBackend.decryptAndStoreTransactionTxBytesMinedHeightCallsCount, 1)
     }
 }
