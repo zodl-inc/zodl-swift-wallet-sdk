@@ -20,6 +20,16 @@ public struct PaymentURIAmount: Equatable {
     }
 }
 
+/// An interactive Solana Pay transaction-request link validated by the Rust payment URI parser.
+public struct PaymentURILink: Equatable {
+    /// The canonical link text supplied by the payment request.
+    public let value: String
+
+    init(validated value: String) {
+        self.value = value
+    }
+}
+
 /// A network encoded by a Bitcoin or Litecoin address.
 public enum PaymentURINetwork: Equatable {
     case mainnet
@@ -53,7 +63,7 @@ public enum PaymentURIRequest: Equatable {
     case ethereum(Eip681TransactionRequest)
     case litecoin(UTXOPaymentURIRequest)
     case solanaTransfer(SolanaPayTransferRequest)
-    case solanaTransaction(URL)
+    case solanaTransaction(PaymentURILink)
 }
 
 /// Errors returned by ``PaymentURIParser``.

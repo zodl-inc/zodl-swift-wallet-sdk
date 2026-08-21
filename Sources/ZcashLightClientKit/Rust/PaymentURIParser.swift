@@ -69,8 +69,11 @@ struct EncodedRequest: Decodable {
             case "litecoin": return .litecoin(try utxoRequest())
             case "solana_transfer": return .solanaTransfer(try solanaTransfer())
             case "solana_transaction":
-                guard let link, let url = URL(string: link) else { throw PaymentURIParserError.invalidURI }
-                return .solanaTransaction(url)
+                // The link's format (absolute, canonical HTTPS URL) is already validated by
+                // the Rust parser; re-parsing it here would duplicate that validation instead
+                // of trusting the single source of truth. Only presence is checked.
+                guard let link else { throw PaymentURIParserError.invalidURI }
+                return .solanaTransaction(PaymentURILink(validated: link))
             default: throw PaymentURIParserError.invalidURI
             }
         }

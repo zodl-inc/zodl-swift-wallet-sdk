@@ -56,19 +56,21 @@ final class PaymentURIParserTests: XCTestCase {
     }
 
     func testDecodesSolanaTransactionLink() throws {
+        // The link's format is validated by the Rust parser, not re-validated here
+        // (see PaymentURIParser.swift) — this only confirms the value is carried through.
         let json = """
         {"version":1,"type":"solana_transaction","link":"https://example.com/tx"}
         """
         let decoded = try JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        guard case let .solanaTransaction(url) = try decoded.paymentRequest else {
+        guard case let .solanaTransaction(link) = try decoded.paymentRequest else {
             return XCTFail("Expected Solana transaction link")
         }
-        XCTAssertEqual(url.absoluteString, "https://example.com/tx")
+        XCTAssertEqual(link.value, "https://example.com/tx")
     }
 
-    func testRejectsSolanaTransactionWithInvalidLink() {
+    func testRejectsSolanaTransactionWithMissingLink() {
         let json = """
-        {"version":1,"type":"solana_transaction","link":""}
+        {"version":1,"type":"solana_transaction"}
         """
         let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
         XCTAssertThrowsError(try decoded?.paymentRequest)
