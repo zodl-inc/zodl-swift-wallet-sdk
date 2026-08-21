@@ -5,6 +5,10 @@ import libzcashlc
 public enum PaymentURIParser {
     /// Parses and validates a payment request URI.
     public static func parse(_ input: String) throws -> PaymentURIRequest {
+        // A null byte would truncate the string at the FFI boundary (`CStr::from_ptr`
+        // stops at the first NUL), so the Rust parser would silently validate only a
+        // prefix of `input` instead of the whole string.
+        guard !input.utf8.contains(0) else { throw PaymentURIParserError.invalidURI }
         guard let result = zcashlc_payment_uri_parse([CChar](input.utf8CString)) else {
             zcashlc_clear_last_error()
             throw PaymentURIParserError.invalidURI
@@ -20,7 +24,7 @@ public enum PaymentURIParser {
     private static let encodedVersion = 1
 }
 
-private struct EncodedRequest: Decodable {
+struct EncodedRequest: Decodable {
     let version: Int
     let type: String
     let address: String?
