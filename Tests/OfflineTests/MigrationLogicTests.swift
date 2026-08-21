@@ -1,12 +1,12 @@
 //
 //  MigrationLogicTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import Combine
 import XCTest
 @testable import TestUtils
-@_spi(Testing) @testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 /// Pure-logic tests for the app-facing migration layer: sync-gate math and file round-trip,
 /// endpoint resolution, broadcast-result mapping, and the reschedule accessor's delegation to the

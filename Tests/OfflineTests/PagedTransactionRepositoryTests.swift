@@ -1,13 +1,13 @@
 //
 //  PagedTransactionRepositoryTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 12/6/19.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class PagedTransactionRepositoryTests: XCTestCase {
     var pagedTransactionRepository: PaginatedTransactionRepository!

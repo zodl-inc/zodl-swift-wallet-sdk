@@ -8,7 +8,7 @@
 
 import Foundation
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 class TransactionsDataSource: NSObject {
     enum TransactionType {

@@ -111,7 +111,7 @@ jobs:
       run: make configure-local-ffi
 
     # Build the Swift package
-    - name: Build ZcashLightClientKit Swift Package
+    - name: Build ZODLSwiftWalletSDK Swift Package
       timeout-minutes: 15
       run: make build SWIFT_BUILD_FLAGS=-v
 

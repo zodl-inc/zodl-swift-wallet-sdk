@@ -9,7 +9,7 @@
 import Combine
 import Foundation
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 // swiftlint:disable force_try force_cast
 

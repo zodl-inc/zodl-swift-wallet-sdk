@@ -36,7 +36,7 @@
 		0DA1C4CF27D11D9500E5006E /* KRProgressHUD in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B227D11D9500E5006E /* KRProgressHUD */; };
 		0DA1C4D027D11D9500E5006E /* MnemonicSwift in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B427D11D9500E5006E /* MnemonicSwift */; };
 		0DA1C4D127D11D9500E5006E /* PaginatedTableView in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B627D11D9500E5006E /* PaginatedTableView */; };
-		0DA1C4D227D11D9500E5006E /* ZcashLightClientKit in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B127D11D9500E5006E /* ZcashLightClientKit */; };
+		0DA1C4D227D11D9500E5006E /* ZODLSwiftWalletSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B127D11D9500E5006E /* ZODLSwiftWalletSDK */; };
 		0DA1C4D327D11D9500E5006E /* NotificationBubbles in Frameworks */ = {isa = PBXBuildFile; productRef = 0DA1C4B827D11D9500E5006E /* NotificationBubbles */; };
 		0DA1C4D527D11D9500E5006E /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 0D907F1E2322CC5B00D641FE /* LaunchScreen.storyboard */; };
 		0DA1C4D627D11D9500E5006E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0D907F1C2322CC5B00D641FE /* Assets.xcassets */; };
@@ -56,7 +56,7 @@
 		9EEFA3BF2C380DB900467ABC /* TestServersViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EEFA3BE2C380DB900467ABC /* TestServersViewController.swift */; };
 		9EEFA3C02C380DB900467ABC /* TestServersViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EEFA3BE2C380DB900467ABC /* TestServersViewController.swift */; };
 		F94912632790D7C4004BB3DE /* ZcashLightClientSample-Mainnet-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = F94912622790D7C4004BB3DE /* ZcashLightClientSample-Mainnet-Info.plist */; };
-		F9D63D1F27CD114A00F4DC5F /* ZcashLightClientKit in Frameworks */ = {isa = PBXBuildFile; productRef = F9D63D1E27CD114A00F4DC5F /* ZcashLightClientKit */; };
+		F9D63D1F27CD114A00F4DC5F /* ZODLSwiftWalletSDK in Frameworks */ = {isa = PBXBuildFile; productRef = F9D63D1E27CD114A00F4DC5F /* ZODLSwiftWalletSDK */; };
 		F9D63D2227CD125300F4DC5F /* KRProgressHUD in Frameworks */ = {isa = PBXBuildFile; productRef = F9D63D2127CD125300F4DC5F /* KRProgressHUD */; };
 		F9D63D2527CD12AA00F4DC5F /* MnemonicSwift in Frameworks */ = {isa = PBXBuildFile; productRef = F9D63D2427CD12AA00F4DC5F /* MnemonicSwift */; };
 		F9D63D2927CD131300F4DC5F /* PaginatedTableView in Frameworks */ = {isa = PBXBuildFile; productRef = F9D63D2827CD131300F4DC5F /* PaginatedTableView */; };
@@ -108,7 +108,7 @@
 		9EEFA3BE2C380DB900467ABC /* TestServersViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestServersViewController.swift; sourceTree = "<group>"; };
 		EBA186B246C4205F9BF71EED /* Pods_ZcashLightClientSample.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_ZcashLightClientSample.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		F94912622790D7C4004BB3DE /* ZcashLightClientSample-Mainnet-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "ZcashLightClientSample-Mainnet-Info.plist"; sourceTree = SOURCE_ROOT; };
-		F9D63D1D27CD103E00F4DC5F /* ZcashLightClientKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ZcashLightClientKit; path = ../..; sourceTree = "<group>"; };
+		F9D63D1D27CD103E00F4DC5F /* ZODLSwiftWalletSDK */ = {isa = PBXFileReference; lastKnownFileType = folder; name = zodl-swift-wallet-sdk; path = ../..; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -119,7 +119,7 @@
 				F9D63D2227CD125300F4DC5F /* KRProgressHUD in Frameworks */,
 				F9D63D2527CD12AA00F4DC5F /* MnemonicSwift in Frameworks */,
 				F9D63D2927CD131300F4DC5F /* PaginatedTableView in Frameworks */,
-				F9D63D1F27CD114A00F4DC5F /* ZcashLightClientKit in Frameworks */,
+				F9D63D1F27CD114A00F4DC5F /* ZODLSwiftWalletSDK in Frameworks */,
 				F9D63D2C27CD132800F4DC5F /* NotificationBubbles in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -138,7 +138,7 @@
 				0DA1C4CF27D11D9500E5006E /* KRProgressHUD in Frameworks */,
 				0DA1C4D027D11D9500E5006E /* MnemonicSwift in Frameworks */,
 				0DA1C4D127D11D9500E5006E /* PaginatedTableView in Frameworks */,
-				0DA1C4D227D11D9500E5006E /* ZcashLightClientKit in Frameworks */,
+				0DA1C4D227D11D9500E5006E /* ZODLSwiftWalletSDK in Frameworks */,
 				0DA1C4D327D11D9500E5006E /* NotificationBubbles in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -326,7 +326,7 @@
 		F9D63D1C27CD103E00F4DC5F /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				F9D63D1D27CD103E00F4DC5F /* ZcashLightClientKit */,
+				F9D63D1D27CD103E00F4DC5F /* ZODLSwiftWalletSDK */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -349,7 +349,7 @@
 			);
 			name = ZcashLightClientSample;
 			packageProductDependencies = (
-				F9D63D1E27CD114A00F4DC5F /* ZcashLightClientKit */,
+				F9D63D1E27CD114A00F4DC5F /* ZODLSwiftWalletSDK */,
 				F9D63D2127CD125300F4DC5F /* KRProgressHUD */,
 				F9D63D2427CD12AA00F4DC5F /* MnemonicSwift */,
 				F9D63D2827CD131300F4DC5F /* PaginatedTableView */,
@@ -392,7 +392,7 @@
 			);
 			name = "ZcashLightClientSample-Mainnet";
 			packageProductDependencies = (
-				0DA1C4B127D11D9500E5006E /* ZcashLightClientKit */,
+				0DA1C4B127D11D9500E5006E /* ZODLSwiftWalletSDK */,
 				0DA1C4B227D11D9500E5006E /* KRProgressHUD */,
 				0DA1C4B427D11D9500E5006E /* MnemonicSwift */,
 				0DA1C4B627D11D9500E5006E /* PaginatedTableView */,
@@ -972,9 +972,9 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		0DA1C4B127D11D9500E5006E /* ZcashLightClientKit */ = {
+		0DA1C4B127D11D9500E5006E /* ZODLSwiftWalletSDK */ = {
 			isa = XCSwiftPackageProductDependency;
-			productName = ZcashLightClientKit;
+			productName = ZODLSwiftWalletSDK;
 		};
 		0DA1C4B227D11D9500E5006E /* KRProgressHUD */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -996,9 +996,9 @@
 			package = 0DA1C4B927D11D9500E5006E /* XCRemoteSwiftPackageReference "NotificationBubbles" */;
 			productName = NotificationBubbles;
 		};
-		F9D63D1E27CD114A00F4DC5F /* ZcashLightClientKit */ = {
+		F9D63D1E27CD114A00F4DC5F /* ZODLSwiftWalletSDK */ = {
 			isa = XCSwiftPackageProductDependency;
-			productName = ZcashLightClientKit;
+			productName = ZODLSwiftWalletSDK;
 		};
 		F9D63D2127CD125300F4DC5F /* KRProgressHUD */ = {
 			isa = XCSwiftPackageProductDependency;

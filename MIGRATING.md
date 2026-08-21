@@ -1,5 +1,49 @@
 # Migrating from previous versions to _Unreleased_
 
+## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
+
+The package, its library product, and its module are renamed. There is no compatibility product
+under the old name, so every import site changes. The `package:` argument of
+`.product(name:package:)` is derived by SwiftPM from the repository URL, which is unchanged.
+
+Before:
+
+```swift
+// Package.swift
+.product(name: "ZcashLightClientKit", package: "zcash-swift-wallet-sdk")
+```
+
+```swift
+import ZcashLightClientKit
+@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
+
+let height: ZcashLightClientKit.BlockHeight = 1
+```
+
+After:
+
+```swift
+// Package.swift
+.product(name: "ZODLSwiftWalletSDK", package: "zcash-swift-wallet-sdk")
+```
+
+```swift
+import ZODLSwiftWalletSDK
+@testable import ZODLSwiftWalletSDK
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
+
+let height: ZODLSwiftWalletSDK.BlockHeight = 1
+```
+
+If your dependency uses the explicit-name form, `.package(name: "ZcashLightClientKit", url: …)`,
+drop the `name:` argument or set it to `"zodl-swift-wallet-sdk"`.
+
+Two strings that were derived from the old module name change at runtime: a `ZcashError`
+bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM resource bundle
+is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
+rather than on either string.
+
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
 `VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE

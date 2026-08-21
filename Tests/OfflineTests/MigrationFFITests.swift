@@ -25,7 +25,7 @@
 import XCTest
 import libzcashlc
 @testable import TestUtils
-@_spi(Testing) @testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 final class MigrationFFITests: XCTestCase {
     var dbData: URL!

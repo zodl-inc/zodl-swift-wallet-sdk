@@ -1,12 +1,12 @@
 //
 //  MockTransactionRepository.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 12/6/19.
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 enum MockTransactionRepositoryError: Error {
     case notImplemented
@@ -77,15 +77,15 @@ extension MockTransactionRepository: TransactionRepository {
         []
     }
 
-    func findForResubmission(upTo: ZcashLightClientKit.BlockHeight) async throws -> [ZcashLightClientKit.ZcashTransaction.Overview] {
+    func findForResubmission(upTo: ZODLSwiftWalletSDK.BlockHeight) async throws -> [ZODLSwiftWalletSDK.ZcashTransaction.Overview] {
         []
     }
 
-    func getTransactionOutputs(for rawID: Data) async throws -> [ZcashLightClientKit.ZcashTransaction.Output] {
+    func getTransactionOutputs(for rawID: Data) async throws -> [ZODLSwiftWalletSDK.ZcashTransaction.Output] {
         []
     }
 
-    func findPendingTransactions(latestHeight: ZcashLightClientKit.BlockHeight, offset: Int, limit: Int) async throws -> [ZcashTransaction.Overview] {
+    func findPendingTransactions(latestHeight: ZODLSwiftWalletSDK.BlockHeight, offset: Int, limit: Int) async throws -> [ZcashTransaction.Overview] {
         []
     }
 
@@ -111,7 +111,7 @@ extension MockTransactionRepository: TransactionRepository {
         scannedHeight
     }
 
-    func firstUnenhancedHeight() throws -> ZcashLightClientKit.BlockHeight? {
+    func firstUnenhancedHeight() throws -> ZODLSwiftWalletSDK.BlockHeight? {
         nil
     }
 
@@ -203,7 +203,7 @@ extension MockTransactionRepository: TransactionRepository {
         return transaction
     }
 
-    func find(offset: Int, limit: Int, kind: TransactionKind) throws -> [ZcashLightClientKit.ZcashTransaction.Overview] {
+    func find(offset: Int, limit: Int, kind: TransactionKind) throws -> [ZODLSwiftWalletSDK.ZcashTransaction.Overview] {
         throw MockTransactionRepositoryError.notImplemented
     }
 
@@ -223,11 +223,11 @@ extension MockTransactionRepository: TransactionRepository {
         throw MockTransactionRepositoryError.notImplemented
     }
 
-    func findMemos(for rawID: Data) throws -> [ZcashLightClientKit.Memo] {
+    func findMemos(for rawID: Data) throws -> [ZODLSwiftWalletSDK.Memo] {
         throw MockTransactionRepositoryError.notImplemented
     }
 
-    func findMemos(for transaction: ZcashLightClientKit.ZcashTransaction.Overview) throws -> [ZcashLightClientKit.Memo] {
+    func findMemos(for transaction: ZODLSwiftWalletSDK.ZcashTransaction.Overview) throws -> [ZODLSwiftWalletSDK.Memo] {
         throw MockTransactionRepositoryError.notImplemented
     }
 

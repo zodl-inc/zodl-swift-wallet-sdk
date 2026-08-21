@@ -1,10 +1,10 @@
 //
 //  VotingConfirmVoteSubmissionTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Builds a round identifier that satisfies the Rust round-parameter validation,
 /// which requires 64 lowercase hex characters encoding a canonical Pallas field

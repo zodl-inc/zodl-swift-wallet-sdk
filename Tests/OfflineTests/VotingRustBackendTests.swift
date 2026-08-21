@@ -1,11 +1,11 @@
 //
 //  VotingRustBackendTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 import SQLite3
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 // Shared fixtures for tests that round-trip persisted voting recovery state
 // through the Rust voting database.

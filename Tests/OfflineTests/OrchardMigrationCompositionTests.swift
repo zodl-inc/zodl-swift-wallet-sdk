@@ -14,7 +14,7 @@
 
 import XCTest
 @testable import TestUtils
-@_spi(Testing) @testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 final class OrchardMigrationCompositionTests: ZcashTestCase {
     private let accountA = AccountUUID(id: [UInt8](repeating: 0x33, count: 16))
