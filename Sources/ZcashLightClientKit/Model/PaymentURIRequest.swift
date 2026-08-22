@@ -1,5 +1,12 @@
 import Foundation
 
+// Public model types decoded from librustzcash's `payment_uri` crate. Covers Bitcoin/Litecoin
+// on-chain transfers (the on-chain subset of BIP 321 / legacy BIP 21), EIP-681 Ethereum requests
+// (native and ERC-20 transfers; other ABI calls decode as `.unrecognised`), and Solana Pay
+// native/SPL-token transfers and interactive transaction-request links. All actual protocol
+// parsing and validation happens in the Rust crate (see PaymentURIParser.swift); these types
+// only carry its already-validated, versioned JSON result.
+
 /// A cross-chain address validated by the Rust payment URI parser.
 public struct PaymentURIAddress: Equatable {
     /// The canonical address text supplied by the payment request.

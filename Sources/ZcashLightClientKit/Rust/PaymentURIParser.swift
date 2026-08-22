@@ -1,7 +1,15 @@
 import Foundation
 import libzcashlc
 
-/// Rust-backed parser for supported cross-chain payment request URIs.
+/// Rust-backed parser for supported cross-chain payment request URIs, backed by librustzcash's
+/// `payment_uri` crate. Covers Bitcoin/Litecoin on-chain transfers (the on-chain subset of
+/// [BIP 321](https://github.com/bitcoin/bips/blob/master/bip-0321.mediawiki) / legacy
+/// [BIP 21](https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki)), EIP-681 Ethereum
+/// requests (native and ERC-20 transfers; other ABI calls decode as `.unrecognised`), and
+/// [Solana Pay](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md)
+/// native/SPL-token transfers and interactive transaction-request links. All actual protocol
+/// parsing and validation happens in the Rust crate; this type only decodes its versioned JSON
+/// result into the Swift model types in `PaymentURIRequest.swift`.
 public enum PaymentURIParser {
     /// Parses and validates a payment request URI.
     public static func parse(_ input: String) throws -> PaymentURIRequest {
