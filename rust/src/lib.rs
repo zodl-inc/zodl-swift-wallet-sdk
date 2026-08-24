@@ -104,10 +104,6 @@ mod migration_plan_cache;
 mod migration_turnstile;
 mod retained_marks;
 mod tor;
-// Voting is gated off on this line: the `zcash_voting` dependency is commented out in
-// Cargo.toml (see there), so the module and its `zcashlc_voting_*` symbols are not compiled.
-// The sources are retained so the surface can be reinstated by re-enabling the dependency.
-#[cfg(zcash_voting)]
 mod voting;
 
 #[cfg(target_vendor = "apple")]
