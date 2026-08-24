@@ -34,6 +34,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   custom (regtest) network takes its voting identity from the registered base
   network — a modified-mainnet chain votes with mainnet hotkeys and address
   HRPs — so `open` fails if that network has not been configured yet.
+- `MaxSpendMode`: describes how a "spend max" request should be evaluated,
+  either targeting only currently-spendable funds (`maxSpendable`) or all
+  non-dust funds in the wallet (`everything`, which excludes dust notes valued
+  at or below the ZIP-317 marginal fee from selection and fails only if non-dust
+  funds are unspendable or the wallet is unsynced).
+- `Proposal.totalSpendValue()`: the total value a proposal spends across all
+  of its steps, before its fee is deducted — each step's inputs minus its
+  non-ephemeral proposed change. Ephemeral (ZIP-320) change is spent by a
+  later step of the same proposal rather than retained by the wallet, so it
+  is not deducted. Combined with the existing `totalFeeRequired()`, callers
+  can derive the maximum amount a "spend max" proposal sends to its
+  recipient as `totalSpendValue() - totalFeeRequired()`.
 
 - Two thin passthroughs to `zcash_voting` operations the SDK previously made callers assemble by
   hand. `VotingRustBackend.confirmVoteSubmission(roundId:bundleIndex:proposalId:txHash:eventsJson:)`
@@ -102,6 +114,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ciphertext1`/`ciphertext2` are base64 `String`s; `VotingSharePayload` is removed; and
   `VotingVoteCommit` no longer carries `sharePayloads`, because payloads built before the vote's
   tree position is confirmed are provisional and must not be submitted.
+- `Synchronizer` gained the required method `proposeSendMax(accountUUID:recipient:memo:mode:)` —
+  plus matching `ClosureSynchronizer` and `CombineSynchronizer` entries — with no default
+  implementation: any external conformer or test double of these protocols must now implement it.
+  It proposes a transaction that spends the maximum amount available in the account to a single
+  recipient, using `MaxSpendMode` to control how much of the balance is targeted; no `amount` is
+  passed, since the fee is already accounted for by the returned proposal. The proposal draws on
+  shielded funds only (Sapling, Orchard, Ironwood) — transparent balance is never selected and must
+  be shielded first (see `proposeShielding`). Sending a memo to a transparent recipient still throws
+  `ZcashError.synchronizerSendMemoToTransparentAddress`, same as `proposeTransfer`. Failures surface
+  as the existing `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`).
 
 ## Fixed
 
@@ -117,6 +139,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose network differs from the round's and a snapshot height that is not NU6.3, and `extractNcRoot`
   returns the Ironwood root. Two regression tests seed a `TreeState` carrying *both* pools and
   assert the Ironwood one wins, so the wrong-pool read cannot return unnoticed.
+- `proposeTransfer` and `proposeSendMax` now throw
+  `ZcashError.synchronizerSendMemoToTransparentAddress` when a memo accompanies a
+  TEX recipient, matching the existing behavior for transparent recipients.
+  Previously a memo aimed at a TEX address reached the rust backend and failed
+  with a generic `ZcashError.rust*` error instead.
 
 # 3.0.0 - 2026-08-19
 

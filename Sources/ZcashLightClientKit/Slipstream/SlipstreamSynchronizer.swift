@@ -880,9 +880,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         amount: Zatoshi,
         memo: Memo?
     ) async throws -> Proposal {
-        if case Recipient.transparent = recipient, memo != nil {
-            throw ZcashError.synchronizerSendMemoToTransparentAddress
+        // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeTransfer`'s
+        // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
+        // without this check an unprepared call would fall straight through to the rust
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
         }
+        try recipient.ensureMemoIsAllowed(memo)
         return try await transactionEncoder.proposeTransfer(
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
@@ -891,8 +896,37 @@ public actor SlipstreamSynchronizer: Synchronizer {
         )
     }
 
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode
+    ) async throws -> Proposal {
+        // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeSendMax`'s
+        // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
+        // without this check an unprepared call would fall straight through to the rust
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
+        }
+        try recipient.ensureMemoIsAllowed(memo)
+        return try await transactionEncoder.proposeSendMax(
+            accountUUID: accountUUID,
+            recipient: recipient.stringEncoded,
+            memoBytes: memo?.asMemoBytes(),
+            mode: mode
+        )
+    }
+
     public func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
-        try await transactionEncoder.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
+        // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeOrchardToIronwoodMigration`'s
+        // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
+        // without this check an unprepared call would fall straight through to the rust
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
+        }
+        return try await transactionEncoder.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
     }
 
     public func proposeShielding(
@@ -901,6 +935,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
         memo: Memo,
         transparentReceiver: TransparentAddress? = nil
     ) async throws -> Proposal? {
+        // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeShielding`'s
+        // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
+        // without this check an unprepared call would fall straight through to the rust
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
+        }
         return try await transactionEncoder.proposeShielding(
             accountUUID: accountUUID,
             shieldingThreshold: shieldingThreshold,
@@ -913,6 +954,17 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
+        // Parity with `start()`'s guard above and with `SDKSynchronizer.proposefulfillingPaymentURI`'s
+        // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
+        // without this check an unprepared call would fall straight through to the rust
+        // backend instead of failing with the documented `synchronizerNotPrepared`. Placed before
+        // the `do` block (rather than as its first statement, where `SDKSynchronizer` puts its own
+        // copy) so the guard's throw bypasses the `rustCreateToAddress` remapping below -- it is
+        // not a rust error to remap, and the two placements are externally identical since neither
+        // catch clause matches `synchronizerNotPrepared`.
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
+        }
         do {
             return try await transactionEncoder.proposeFulfillingPaymentFromURI(
                 uri,
