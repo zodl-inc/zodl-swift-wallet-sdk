@@ -569,8 +569,10 @@ protocol ZcashRustBackendWelding {
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer
 
-    /// The leftover Orchard balance a migration would not cross, when it is large enough to be
-    /// worth offering the user a choice about; `nil` when there is no such residual.
+    /// What the WHOLE migration leaves in Orchard: the same `finalResidual`
+    /// `estimateMigrationRuns(accountUUID:)` reports, with zero mapped to `nil`, never a single
+    /// run's leftover. Read fresh from the live spendable balance; costs one planning pass per
+    /// remaining run.
     ///
     /// - Throws: `rustMigrationResidualAfterMigration` if the rust layer returns an error. In
     ///   particular, on a wallet that has never completed a sync (no chain tip known) this throws
@@ -600,7 +602,10 @@ protocol ZcashRustBackendWelding {
     /// migration RUNS ("rounds") it takes, and for each run both what it migrates and what
     /// preparing it costs — including the signer ACTION workload and the precomputed Keystone
     /// signing-round count (see `MigrationRunEstimate`) — before anything is planned or
-    /// committed. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
+    /// committed. Runs are sized per account — one Keystone signing round each for an account whose
+    /// `keySource` is `Account.keystoneKeySource`, the default 50-note cap for every other — by the
+    /// same seam the planning calls use, so the estimate describes the runs that get planned. Costs
+    /// one planning pass per run. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
     /// (`runCount == 0`), a legitimate answer, not an error.
     /// - Throws: `rustMigrationEstimateRuns` if the rust layer returns an error.
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
@@ -760,7 +765,8 @@ protocol ZcashRustBackendWelding {
 
     /// Cancels the stored run (its pre-signed transactions are abandoned; already-broadcast ones
     /// are unaffected on-chain), clears the invalid marks, and previews a fresh schedule against
-    /// the live balance for the re-confirm lane.
+    /// the live balance for the re-confirm lane, sized the way the account is sized now — which is
+    /// also how a run planned under an earlier sizing moves onto the current one.
     /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
     func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
 

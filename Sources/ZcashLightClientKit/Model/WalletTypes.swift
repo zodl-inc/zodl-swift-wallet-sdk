@@ -20,6 +20,13 @@ public struct Account: Equatable, Hashable, Codable, Identifiable {
     public let uivk: UnifiedIncomingViewingKey?
 }
 
+extension Account {
+    /// The `keySource` marking an account a Keystone hardware wallet signs, compared
+    /// case-insensitively. It sizes that account's Orchard→Ironwood migration runs to one 96-action
+    /// QR signing round; any other value, or `nil`, keeps the default 50-note-per-run sizing.
+    public static let keystoneKeySource = "keystone"
+}
+
 public struct UnifiedSpendingKey: Equatable, Undescribable {
     let network: NetworkType
     let bytes: [UInt8]

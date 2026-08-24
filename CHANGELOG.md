@@ -6,6 +6,65 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- Migration runs are now sized PER ACCOUNT, by how the account signs. The contract is the
+  `keySource` an account was created or imported with (`prepare(with:walletBirthday:name:keySource:)`,
+  `importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`), until
+  now a free-form client tag the SDK never read:
+  - An account whose `keySource` is the new `Account.keystoneKeySource` (`"keystone"`, compared
+    case-insensitively) has every migration run it plans from now on sized to what a Keystone signs
+    in ONE QR-scanned round (96 Orchard-family actions: 16 per note-preparation transaction, 3 per
+    transfer) instead of to a fixed note count. A run's action count follows the wallet's
+    fragmentation, so the previous flat 50-notes-per-run cap could still need several signing
+    ceremonies inside what the UI presents as one run. `proposeMigrationTransfers`,
+    `estimateMigrationRuns`, `isNoteSplitNeeded`, `prepareNoteSplit`, `residualAfterMigration` and
+    `restartCurrentMigrationStep` all plan and preview under this sizing: expect MORE runs on a
+    large or fragmented wallet, each with `MigrationRunEstimate.Run.keystoneSigningSessions == 1` (a
+    run exceeds one round only when even a one-note run would, which no smaller run can fix).
+    Because each smaller run re-consolidates its own funding notes, the whole balance migrates
+    through more preparation transactions in total than under the old flat cap, so the total ZIP 317
+    fees paid over all runs are somewhat higher — and because runs are sequential and each carries
+    its own ZIP 318 broadcast spread, the wall-clock time to migrate the whole balance grows with
+    the run count (`MigrationSchedule.estimatedDurationHours` describes one run). A run committed
+    before this change keeps the shape it was planned with until it completes;
+    `restartCurrentMigrationStep` cancels it and re-plans under the new sizing.
+  - Every other account (including a `nil` `keySource`) is signed in process, where a signing round
+    has no per-interaction cost to bound, and keeps the 50-note-per-run cap sizing it had before:
+    runs, schedules and fees are unchanged for these accounts. `Run.keystoneSigningSessions` is
+    still reported for their runs, as what a Keystone would need for a run of that shape, for
+    comparison only. Tagging a seed-derived account created through `prepare(...)` with
+    `Account.keystoneKeySource` is accepted but buys nothing: it signs in process regardless and
+    only gets the smaller, costlier runs.
+
+  No call-site edit is needed, but stamp `Account.keystoneKeySource` rather than a display string:
+  a host that imports a Keystone account under any other `keySource` gets the in-process sizing
+  with no error, and must re-import the account under the constant to get one-round runs — there is
+  no API to re-tag an existing account. `estimateMigrationRuns` and `residualAfterMigration` walk
+  the runs with the real planners, so they cost one planning pass per run (plus a per-run sizing
+  search for a Keystone account) and are not per-frame reads on a large or fragmented balance.
+- `residualAfterMigration(accountUUID:)` now reports what the WHOLE migration leaves in Orchard —
+  the remainder after the last run, the same value as
+  `estimateMigrationRuns(accountUUID:).finalResidual` (`nil` when it is zero) — instead of what the
+  NEXT run alone would leave. It is read fresh from the live spendable balance on every call and no
+  longer from the stored run. What changes, moment by moment:
+  - On a balance that takes more than one run, the old figure was mostly the balance the later
+    runs migrate; the new one is the remainder after all of them.
+  - On a single-run balance the value is unchanged before and during the run.
+  - After a run completes, the call now reports the dust that remains (the live spendable balance
+    once nothing more can migrate) where it previously reported `nil` — a `Complete` screen that
+    showed a residual card or a "Lock balance" offer only for a non-`nil` value now has one.
+  - A balance whose canonical split the wallet's notes cannot fund now reports the whole spendable
+    balance as the remainder, where the old read threw.
+  - While a run is in flight it previews what stays after the runs that follow the current one
+    (the run's reserved notes and unmined preparation change are outside the spendable balance)
+    and settles once that run completes.
+  It is computed from the same multi-run estimate as `estimateMigrationRuns`, so it costs one
+  planning pass per remaining run instead of one; a host that already holds an estimate should read
+  its `finalResidual` rather than pay for a second one. A "Lock balance" offer built from it belongs
+  only after `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks
+  every spendable Orchard note, not just the residual. No call-site edit is needed.
+
 # 4.0.0 - 2026-08-19
 
 ## Added
