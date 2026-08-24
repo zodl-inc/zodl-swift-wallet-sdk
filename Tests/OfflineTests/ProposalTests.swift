@@ -1,0 +1,150 @@
+//
+//  ProposalTests.swift
+//  ZODLSwiftWalletSDK
+//
+//  Created by Michal Fousek on 2026-07-29.
+//
+
+import XCTest
+@testable import TestUtils
+@testable import ZODLSwiftWalletSDK
+
+final class ProposalTests: XCTestCase {
+    // MARK: - totalSpendValue()
+
+    func testTotalSpendValueWithInputsOnly() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [1_000_000, 500_000], changeValues: [], fee: 10_000)
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(1_000_000 + 500_000))
+    }
+
+    func testTotalSpendValueWithInputsAndChangeSubtractsTheChange() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [1_000_000], changeValues: [200_000], fee: 10_000)
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(1_000_000 - 200_000))
+    }
+
+    func testTotalSpendValueWithMultipleChangeOutputsInAStep() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [1_000_000], changeValues: [120_000, 80_000], fee: 10_000)
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(1_000_000 - 120_000 - 80_000))
+    }
+
+    func testTotalSpendValueSumsAcrossMultipleSteps() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [1_000_000], changeValues: [100_000], fee: 5_000),
+                FfiProposalFixtures.Step(inputValues: [300_000, 200_000], changeValues: [50_000], fee: 5_000)
+            ]
+        )
+
+        let expected = Zatoshi((1_000_000 - 100_000) + (300_000 + 200_000 - 50_000))
+        XCTAssertEqual(proposal.totalSpendValue(), expected)
+    }
+
+    func testTotalSpendValueIgnoresInputsThatAreNotReceivedOutputs() throws {
+        let inputs = [
+            FfiProposalFixtures.receivedOutputInput(1_000_000),
+            FfiProposalFixtures.priorStepOutputInput(stepIndex: 0, paymentIndex: 0),
+            FfiProposalFixtures.priorStepChangeInput(stepIndex: 0, changeIndex: 0)
+        ]
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputs: inputs, changeValues: [], fee: 10_000)
+            ]
+        )
+
+        // Only the `receivedOutput` input draws new value from the wallet; the prior-step
+        // references must not be double-counted.
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(1_000_000))
+    }
+
+    func testTotalSpendValueIsZeroWhenThereAreNoSteps() throws {
+        let proposal = FfiProposalFixtures.makeProposal(steps: [])
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi.zero)
+    }
+
+    // MARK: - Relationship with totalFeeRequired()
+
+    func testMaxSendableAmountIsTotalSpendValueMinusTotalFeeRequired() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [2_000_000], changeValues: [], fee: 15_000)
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalFeeRequired(), Zatoshi(15_000))
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(2_000_000))
+
+        let maxSendable = proposal.totalSpendValue() - proposal.totalFeeRequired()
+        XCTAssertEqual(maxSendable, Zatoshi(2_000_000 - 15_000))
+    }
+
+    func testMaxSendableAmountAcrossMultipleStepsWithChange() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(inputValues: [1_000_000], changeValues: [50_000], fee: 10_000),
+                FfiProposalFixtures.Step(inputValues: [500_000], changeValues: [], fee: 5_000)
+            ]
+        )
+
+        let maxSendable = proposal.totalSpendValue() - proposal.totalFeeRequired()
+
+        XCTAssertEqual(maxSendable, Zatoshi((1_000_000 - 50_000 - 10_000) + (500_000 - 5_000)))
+    }
+
+    // MARK: - Ephemeral (ZIP-320) change
+
+    func testTotalSpendValueForZip320TwoStepProposalExcludesEphemeralChange() throws {
+        // Step 0 shields no new value: it spends wallet funds into a transparent ephemeral
+        // output that only exists to fund step 1's payment to the TEX recipient. Step 1's
+        // input is a `priorStepChange` reference to that ephemeral output, not a fresh spend.
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(
+                    inputValues: [1_000_000],
+                    changeValues: [FfiProposalFixtures.ChangeValue(value: 985_000, isEphemeral: true)],
+                    fee: 15_000
+                ),
+                FfiProposalFixtures.Step(
+                    inputs: [FfiProposalFixtures.priorStepChangeInput(stepIndex: 0, changeIndex: 0)],
+                    changeValues: [],
+                    fee: 10_000
+                )
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(1_000_000))
+        XCTAssertEqual(proposal.totalSpendValue() - proposal.totalFeeRequired(), Zatoshi(975_000))
+    }
+
+    func testTotalSpendValueWithMixedChangeSubtractsOnlyNonEphemeralChange() throws {
+        let proposal = FfiProposalFixtures.makeProposal(
+            steps: [
+                FfiProposalFixtures.Step(
+                    inputValues: [1_000_000],
+                    changeValues: [
+                        FfiProposalFixtures.ChangeValue(value: 200_000, isEphemeral: false),
+                        FfiProposalFixtures.ChangeValue(value: 700_000, isEphemeral: true)
+                    ],
+                    fee: 15_000
+                )
+            ]
+        )
+
+        XCTAssertEqual(proposal.totalSpendValue(), Zatoshi(800_000))
+    }
+}

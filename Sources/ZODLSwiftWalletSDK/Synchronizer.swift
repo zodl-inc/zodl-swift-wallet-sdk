@@ -145,6 +145,9 @@ public protocol Synchronizer: AnyObject {
     ///   SDK then picks a reorg-safe recent height). Ignored when an account already exists.
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
+    ///   ``Account/keystoneKeySource`` is the one value the SDK reads. An account created here is
+    ///   seed-derived and always signs in process, so the tag belongs on a Keystone import instead;
+    ///   here it only shrinks the migration runs for nothing in return.
     /// - Note: The init flow (new / restore / existing) is DERIVED by the SDK — an existing account is
     ///   opened, a `nil` birthday creates a new wallet, a past birthday restores from it. A deliberate
     ///   re-scan/resync is the separate `rewind(_:)` action, not an init mode.
@@ -212,6 +215,34 @@ public protocol Synchronizer: AnyObject {
         recipient: Recipient,
         amount: Zatoshi,
         memo: Memo?
+    ) async throws -> Proposal
+
+    /// Creates a proposal that spends the maximum amount available in the given account to a single recipient.
+    ///
+    /// Unlike `proposeTransfer`, no `amount` is passed: the proposal is constructed to spend as much of the
+    /// account's balance as `mode` allows, with the fee already accounted for by the proposal itself. The amount
+    /// the recipient actually receives is `proposal.totalSpendValue() - proposal.totalFeeRequired()`.
+    ///
+    /// The proposal draws on shielded funds only (Sapling, Orchard, Ironwood); transparent balance is never
+    /// selected and must be shielded first — see `proposeShielding`.
+    ///
+    /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
+    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`). There is currently no dedicated typed error for
+    /// the nothing-to-send case, so a caller that wants to special-case an empty wallet should check the
+    /// spendable balance before calling this method.
+    ///
+    /// - Parameter accountUUID: the account from which to spend funds.
+    /// - Parameter recipient: the recipient's address.
+    /// - Parameter memo: an optional memo to include as part of the proposal's transactions. Use `nil` when sending to transparent receivers otherwise the function will throw an error.
+    /// - Parameter mode: how much of the account's balance the proposal should target spending. See `MaxSpendMode`.
+    ///
+    /// If `prepare()` hasn't already been called since creation of the synchronizer instance or since the last wipe then this method throws
+    /// `SynchronizerErrors.notPrepared`.
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode
     ) async throws -> Proposal
 
     /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
@@ -395,6 +426,8 @@ public protocol Synchronizer: AnyObject {
     ///   - purpose: of the account, either `spending` or `viewOnly`
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
+    ///   Pass ``Account/keystoneKeySource`` for a Keystone account: it sizes that account's
+    ///   migration runs to one QR signing round. An account cannot be re-tagged afterwards.
     ///   - birthday: custom optional BlochHeight representing birthday of the imported account.
     // swiftlint:disable:next function_parameter_count
     func importAccount(
@@ -906,6 +939,7 @@ public protocol Synchronizer: AnyObject {
     /// `ZcashError.migrationPlanStale`. An EMPTY schedule means there is nothing to migrate; after a
     /// completed run this is the "does anything remain" answer of the sequential-runs contract.
     /// - Parameter accountUUID: the account to propose a migration schedule for.
+    /// - Note: The run is sized per account — see ``estimateMigrationRuns(accountUUID:)``.
     func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
     /// Proposes the immediate (single-transaction) migration: an ordinary send-max that spends ALL
@@ -938,11 +972,17 @@ public protocol Synchronizer: AnyObject {
     ///     matches `TxId.id`, not the reversed display-hex order produced by `Data.toHexStringTxId()`).
     func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws
 
-    /// The leftover Orchard balance a migration of `accountUUID` would not cross, when large enough
-    /// to be worth offering the user a choice about; `nil` when there is no such residual.
+    /// What the WHOLE migration of `accountUUID` leaves in Orchard, `nil` when nothing remains:
+    /// the same value as ``estimateMigrationRuns(accountUUID:)``'s
+    /// ``MigrationRunEstimate/finalResidual`` (zero mapped to `nil`), never a single run's leftover.
+    /// Read fresh from the live spendable balance on every call, so while a run is in flight it
+    /// previews what stays after the runs that FOLLOW it.
     /// - Parameter accountUUID: the account to check.
-    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
-    ///   chain tip known) this throws rather than returning `nil`.
+    /// - Note: Costs one planning pass per remaining run, so it is not a per-frame read; a host that
+    ///   already holds an ``estimateMigrationRuns(accountUUID:)`` result should read its
+    ///   ``MigrationRunEstimate/finalResidual`` instead. Requires at least one completed sync: on a
+    ///   wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `nil`.
     func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi?
 
     /// Locks every currently-spendable, not-already-locked legacy-Orchard note of `accountUUID`
@@ -952,6 +992,8 @@ public protocol Synchronizer: AnyObject {
     /// lock never expires on its own). Locked value leaves `PoolBalance.spendableValue` but stays
     /// in `PoolBalance.lockedValue`, and therefore in the account's total balance — locked funds
     /// never vanish from app-visible sums.
+    /// Offer it only once ``proposeMigrationTransfers(accountUUID:)`` returns the empty schedule: it
+    /// locks EVERY spendable note, so with runs still to go it would lock what those runs migrate.
     /// - Parameter accountUUID: the account whose residual should be locked.
     /// - Note: `Zatoshi(0)` is a legitimate result (nothing was spendable, or everything spendable
     ///   was already locked). Idempotent-additive: already-locked notes are excluded from
@@ -979,10 +1021,14 @@ public protocol Synchronizer: AnyObject {
     /// ``MigrationRunEstimate/totalActions`` is the signing workload and
     /// ``MigrationRunEstimate/totalKeystoneSigningSessions`` the signer-interaction count under
     /// the 96-action Keystone budget (see ``MigrationRunEstimate`` for why count-based session
-    /// math undercounts).
+    /// math undercounts). Runs are sized PER ACCOUNT — one Keystone round each for an
+    /// ``Account/keystoneKeySource`` account, the default 50-note cap for every other — by the same
+    /// seam ``proposeMigrationTransfers(accountUUID:)`` plans under, so the estimate describes the
+    /// runs that get planned.
     /// - Parameter accountUUID: the account to estimate for.
     /// - Note: The zero-run estimate (`runCount == 0`, a zero or fully sub-quantum balance) is a
-    ///   legitimate answer, not an error.
+    ///   legitimate answer, not an error. Walks the runs with the real planners, so it costs one
+    ///   planning pass per run and is not a per-frame read.
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
 
     /// Pre-signs and persists every transfer in `schedule` in the migration engine for `accountUUID`
@@ -1116,7 +1162,8 @@ public protocol Synchronizer: AnyObject {
     ///
     /// The old plan is no longer valid: the engine discards it and derives a new one, which a
     /// follow-up ``signAndStoreMigrationSchedule(accountUUID:_:usk:)`` (or PCZT store) then signs and
-    /// persists.
+    /// persists. The fresh plan is sized the way the account is sized NOW, which is also how a run
+    /// committed under an earlier sizing moves onto the current one.
     /// - Parameter accountUUID: the account to restart.
     func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule
 

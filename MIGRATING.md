@@ -44,6 +44,64 @@ bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM
 is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
 rather than on either string.
 
+## Migration runs are sized per account — stamp `Account.keystoneKeySource` on a Keystone import
+
+The SDK now reads the `keySource` an account was created or imported with. An account tagged
+`Account.keystoneKeySource` (`"keystone"`, compared case-insensitively) has every Orchard→Ironwood
+migration run sized to one 96-action Keystone QR signing round; every other account, `nil`
+included, keeps the 50-note-per-run sizing it had. No signature changes, but a host that derives
+the tag from a display string should switch to the constant, because any other value silently
+selects the in-process sizing:
+
+```swift
+// Before: a lowercased display string — one localization away from "not a Keystone account".
+let accountUUID = try await synchronizer.importAccount(
+    ufvk: ufvk,
+    seedFingerprint: seedFingerprint,
+    zip32AccountIndex: accountIndex,
+    purpose: .spending,
+    name: name,
+    keySource: String(localizable: .accountsKeystone).lowercased(),
+    birthday: birthday
+)
+
+// After: the SDK's own constant.
+let accountUUID = try await synchronizer.importAccount(
+    ufvk: ufvk,
+    seedFingerprint: seedFingerprint,
+    zip32AccountIndex: accountIndex,
+    purpose: .spending,
+    name: name,
+    keySource: Account.keystoneKeySource,
+    birthday: birthday
+)
+```
+
+An account already imported under another tag cannot be re-tagged, and importing the same viewing
+key again is rejected as a collision: delete the account (`deleteAccount(_:)`) and import it again
+under the constant, accepting the rescan from its birthday.
+
+What to re-check in a migration UI for a Keystone account:
+
+- **More, smaller runs.** `estimateMigrationRuns(accountUUID:)` reports more runs on a large or
+  fragmented balance, each with `Run.keystoneSigningSessions == 1`; the total preparation fees and
+  the wall-clock migration (each run carries its own broadcast spread) grow with the run count.
+  Copy that promised one scan per migration should promise one scan per run.
+- **In-flight runs keep their shape.** A run committed before the upgrade was planned under the
+  flat cap and may still need several rounds; `restartCurrentMigrationStep(accountUUID:)` cancels
+  it and re-plans under the new sizing.
+- **`residualAfterMigration(accountUUID:)` now means the whole migration's remainder.** It equals
+  `estimateMigrationRuns(accountUUID:).finalResidual` (zero → `nil`), not what the next run alone
+  leaves; on a multi-run balance the old figure was mostly the balance the later runs migrate. A
+  single-run balance reads the same value as before while the run is pending or in flight — but
+  once a run completes, the call now reports the dust that remains where it previously reported
+  `nil`, so re-test a `Complete` screen that showed a residual card or a "Lock balance" offer only
+  for a non-`nil` value: it now has one. A balance whose canonical split the wallet's notes cannot
+  fund now reads the whole spendable balance as the remainder, where the old read threw. Offer
+  `lockMigrationResidual(accountUUID:)` only once `proposeMigrationTransfers(accountUUID:)`
+  returns the empty schedule — the lock takes every spendable note. A host that already holds an
+  estimate can read its `finalResidual` instead of paying for a second multi-run estimate.
+
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
 `VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE
@@ -744,6 +802,17 @@ Anything that resolves the custom network id before that registration — e.g. a
 **different** custom network later in the same process is a configuration bug: the newest values win
 process-globally while earlier instances keep their own per-instance state (checkpoint sources,
 constants), so the two desynchronize — the registration call reports this (and asserts in debug).
+
+## `Synchronizer` gained `proposeSendMax`
+
+`Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` each gained a new required method,
+`proposeSendMax(accountUUID:recipient:memo:mode:)`, alongside the existing `proposeTransfer`. It
+proposes a transaction that spends the maximum amount available in the account — as much as the new
+`MaxSpendMode` allows — to a single recipient. The proposal draws on shielded funds only (Sapling,
+Orchard, Ironwood); transparent balance is never selected and must be shielded first (see
+`proposeShielding`). Unlike `proposeTransfer`, no `amount` is passed; the fee is already accounted
+for by the returned proposal. Any external conformer of these protocols must implement the new
+method.
 
 # Migrating from previous versions to v2.8.0-rc.1
 

@@ -210,6 +210,31 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
   trademark clarifications.
+- The pool-migration planning and estimating entry points — `zcashlc_migration_propose_transfers`,
+  `zcashlc_migration_prepare_note_split`, `zcashlc_migration_is_note_split_needed`,
+  `zcashlc_migration_residual_after_migration`, `zcashlc_migration_restart_step` and
+  `zcashlc_migration_estimate_runs` — now size each run PER ACCOUNT, from the `key_source` the
+  account row was created or imported with: an account tagged `keystone` (compared
+  case-insensitively; nothing is trimmed or prefix-matched) has each run sized to what a Keystone
+  signs in one 96-action signing round (16 actions per preparation transaction, 3 per transfer),
+  so it plans more, smaller runs on a large or fragmented balance; every other account, an absent
+  tag included, keeps the 50-note per-run sizing it had, so its runs are unchanged. Signatures and
+  `#[repr(C)]` shapes are unchanged. `FfiRunEstimate::keystone_rounds` is 1 for every run of a
+  `keystone` account (more only when even a one-note run overflows a round, which no smaller run
+  can fix) and, for every other account, what a Keystone would need for a run of that shape. The
+  estimate describes the runs the planning calls plan, under the same per-account sizing. A run
+  committed before this change keeps its planned shape until it completes or
+  `zcashlc_migration_restart_step` re-plans it. Estimating costs one planning pass per run, plus a
+  sizing search per run for a `keystone` account.
+- `zcashlc_migration_residual_after_migration` now returns the value the WHOLE migration leaves in
+  the source pool — the `final_residual` that `zcashlc_migration_estimate_runs` reports for the
+  same wallet (`-1` when it is zero) — instead of the next run's own leftover, and no longer reads
+  the stored run: before, during and after a run alike it is computed from the live spendable
+  balance. On a balance that takes more than one run the old value was mostly what the later runs
+  migrate; on a single-run balance the value is unchanged before and during the run, while after
+  the run completes the remaining dust is now reported where `-1` was returned before, and a
+  balance whose canonical split the notes cannot fund now reports the whole spendable balance where
+  the call used to fail. It costs one planning pass per remaining run, like the estimate.
 - The `zcashlc_voting_*` FFI is compiled again, against the Ironwood (NU6.3)
   dependency stack. It had been gated behind `#[cfg(zcash_voting)]` on the
   grounds that `zcash_voting` could not resolve against the Ironwood `orchard`
