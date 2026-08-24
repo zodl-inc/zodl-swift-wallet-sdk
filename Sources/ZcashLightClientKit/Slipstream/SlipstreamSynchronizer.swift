@@ -1679,7 +1679,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             .map { $0.endpoint }
     }
 
-    /// Slipstream benchmarks by a single `getInfo` round trip per candidate —
+    /// Slipstream benchmarks by a single timed round trip per candidate —
     /// `fetchThresholdSeconds` and `nBlocksToFetch` are accepted for protocol conformance but
     /// unused, because this conformer has no block-fetch phase.
     public func evaluateServerSwitch(
@@ -1699,9 +1699,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
     }
 
-    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
-    /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
-    /// and the loose synced-height check — all skipped for custom networks, mirroring
+    /// Ranks `endpoints` by the round-trip time of a `latestBlockHeight` call, ascending (best
+    /// first), timed on the connection an untimed `getInfo` established. The `getInfo` answer goes
+    /// through the same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus
+    /// branch id, and the loose synced-height check — all skipped for custom networks, mirroring
     /// `ValidateServerAction`. Delegates to ephemeral connections — same pattern as
     /// `SDKSynchronizer`, including its Tor policy: with Tor enabled each candidate is probed on
     /// its own circuit.
@@ -1717,13 +1718,23 @@ public actor SlipstreamSynchronizer: Synchronizer {
             for endpoint in endpoints {
                 group.addTask {
                     let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
-                    let mode = await sdkFlags.ifTor(.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
+                    let mode = await sdkFlags.ifTor(.defaultTor)
+
+                    // The first call carries the connection setup — over Tor a whole circuit —
+                    // which says nothing about the server, so it only fetches the info the health
+                    // checks below run on, untimed. The ranking times a second round trip on the
+                    // connection that call established.
+                    guard let info = try? await service.getInfo(mode: mode) else {
+                        await service.closeConnections()
+                        return nil
+                    }
+
                     let start = DispatchTime.now()
-                    let info = try? await service.getInfo(mode: mode)
+                    let height = try? await service.latestBlockHeight(mode: mode)
                     let elapsed = DispatchTime.now().secondsSince(start)
                     await service.closeConnections()
-                    guard let info else { return nil }
-                    return (endpoint, elapsed, info)
+
+                    return height == nil ? nil : (endpoint, elapsed, info)
                 }
             }
 
