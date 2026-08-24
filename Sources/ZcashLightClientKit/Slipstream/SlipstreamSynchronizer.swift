@@ -1143,54 +1143,19 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let mode = await sdkFlags.ifTor(.uniqueTor)
 
-        // Same contract as CompactBlockProcessor.refreshUTXOs: the Tor lookup is account-scoped on
-        // the FFI side, starts at the address's exposure height (or the account birthday) rather
-        // than at `height`, and stores the UTXOs itself, so it has no entities to hand back.
-        guard mode == .direct else {
-            guard let accountUUID = try await initializer.rustBackend.getAccount(forTransparentAddress: address)?.id else {
-                return RefreshedUTXOs(inserted: [], skipped: [])
-            }
-
-            _ = try await initializer.lightWalletService.fetchUTXOsByAddress(
-                address: address.stringEncoded,
-                dbData: initializer.dataDbURL.osStr(),
-                networkType: initializer.network.networkType,
-                accountUUID: accountUUID,
-                mode: mode
-            )
-
-            return RefreshedUTXOs(inserted: [], skipped: [])
-        }
-
-        // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
-        let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: address.stringEncoded,
-            startHeight: height,
-            mode: mode
+        // The same implementation CompactBlockProcessor.refreshUTXOs delegates to, built per call
+        // so a server switch is honoured.
+        let refresher = UTXORefresher(
+            blockDownloaderService: initializer.blockDownloaderService,
+            service: initializer.lightWalletService,
+            rustBackend: initializer.rustBackend,
+            dataDb: initializer.dataDbURL,
+            networkType: initializer.network.networkType,
+            logger: initializer.logger
         )
-        var utxos: [UnspentTransactionOutputEntity] = []
-        for try await utxo in stream {
-            utxos.append(utxo)
-        }
-        var inserted: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await initializer.rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-                inserted.append(utxo)
-            } catch {
-                skipped.append(utxo)
-            }
-        }
-        return RefreshedUTXOs(inserted: inserted, skipped: skipped)
+
+        return try await refresher.refresh(address: address, startHeight: height, mode: await sdkFlags.ifTor(.uniqueTor))
     }
 
     // ── Exchange rate ─────────────────────────────────────────────────────────

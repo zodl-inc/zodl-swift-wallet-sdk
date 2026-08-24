@@ -934,70 +934,17 @@ extension CompactBlockProcessor {
 
 extension CompactBlockProcessor {
     func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight, mode: ServiceMode) async throws -> RefreshedUTXOs {
-        let dataDb = self.config.dataDb
-
-        guard mode == .direct else {
-            return try await refreshUTXOsOverTor(tAddress: tAddress, dataDb: dataDb, mode: mode)
-        }
-
-        let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: tAddress.stringEncoded,
-            startHeight: startHeight,
-            mode: mode
-        )
-        var utxos: [UnspentTransactionOutputEntity] = []
-
-        do {
-            for try await utxo in stream {
-                utxos.append(utxo)
-            }
-            return await storeUTXOs(utxos, in: dataDb)
-        } catch {
-            throw error
-        }
-    }
-
-    /// The Tor lookup is account-scoped on the FFI side: it starts at the address's exposure height
-    /// (or the account birthday when that is unknown) rather than at a caller-supplied height, and it
-    /// stores the UTXOs itself, so there are no entities to hand back. An address no account exposed
-    /// has nothing to fetch.
-    private func refreshUTXOsOverTor(tAddress: TransparentAddress, dataDb: URL, mode: ServiceMode) async throws -> RefreshedUTXOs {
-        guard let accountUUID = try await rustBackend.getAccount(forTransparentAddress: tAddress)?.id else {
-            logger.info("refreshUTXOs: the address is not a receiver of any account, nothing to fetch.")
-            return (inserted: [], skipped: [])
-        }
-
-        _ = try await service.fetchUTXOsByAddress(
-            address: tAddress.stringEncoded,
-            dbData: dataDb.osStr(),
+        // Built per call so a server switch, which replaces the services held here, is honoured.
+        let refresher = UTXORefresher(
+            blockDownloaderService: blockDownloaderService,
+            service: service,
+            rustBackend: rustBackend,
+            dataDb: config.dataDb,
             networkType: config.network.networkType,
-            accountUUID: accountUUID,
-            mode: mode
+            logger: logger
         )
 
-        return (inserted: [], skipped: [])
-    }
-
-    private func storeUTXOs(_ utxos: [UnspentTransactionOutputEntity], in dataDb: URL) async -> RefreshedUTXOs {
-        var refreshed: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-
-                refreshed.append(utxo)
-            } catch {
-                logger.info("failed to put utxo - error: \(error)")
-                skipped.append(utxo)
-            }
-        }
-        return (inserted: refreshed, skipped: skipped)
+        return try await refresher.refresh(address: tAddress, startHeight: startHeight, mode: mode)
     }
 }
 
