@@ -81,6 +81,20 @@ pub enum ErrorKind {
     NoteMismatch = 20,
 }
 
+/// The two amounts describing an [`ErrorKind::InsufficientFunds`] condition.
+///
+/// A struct rather than a `(Zatoshis, Zatoshis)` pair because both fields have the same type.
+/// A positional pair can be swapped silently at either end of the FFI, and the resulting report
+/// would tell the user they need less than they already hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortfall {
+    /// The balance that could actually be spent when the proposal was attempted. This can be
+    /// below the balance the wallet is displaying, for instance while notes await confirmations.
+    pub available: Zatoshis,
+    /// What the payment needed, fee included.
+    pub required: Zatoshis,
+}
+
 /// A failure that has been classified and stripped of sensitive detail.
 ///
 /// Stored in `LAST_ERROR` as an `anyhow::Error`, which preserves the concrete type, so
@@ -88,17 +102,29 @@ pub enum ErrorKind {
 /// parsing the message back out.
 #[derive(Clone, Debug)]
 pub struct ClassifiedError {
+    /// The condition, for callers that branch rather than display.
     kind: ErrorKind,
+    /// The redacted, constant text. Never interpolated from a value.
     message: &'static str,
+    /// The FFI entry point this failure came from, as a short constant such as
+    /// `"propose_transfer"`. It names the call site rather than describing the failure, and it
+    /// is the prefix of the [`Display`](fmt::Display) rendering, which is what the legacy
+    /// `zcashlc_last_error_message` path returns. It carries no wallet data, so it is safe to
+    /// include in a report submitted off the device.
     context: &'static str,
-    /// `(available, required)`, set only for [`ErrorKind::InsufficientFunds`]. These reach the
-    /// wallet as typed values and never enter `message`.
-    amounts: Option<(Zatoshis, Zatoshis)>,
+    /// The amounts, set only for [`ErrorKind::InsufficientFunds`]. These reach the wallet as
+    /// typed values and never enter `message`.
+    amounts: Option<Shortfall>,
 }
 
 impl ClassifiedError {
-    /// A classification that carries no amounts. `message` must be a constant, never
-    /// interpolated from a value under attacker or wallet control.
+    /// A classification that carries no amounts.
+    ///
+    /// `context` names the FFI entry point the failure came from, as a short constant such as
+    /// `"propose_transfer"`; it prefixes the [`Display`](fmt::Display) rendering so a legacy
+    /// one-string report still says WHERE the failure happened. `message` must be a constant,
+    /// never interpolated from a value under attacker or wallet control. Both are
+    /// `&'static str` so that neither can be built by `format!` from a runtime value.
     pub fn new(context: &'static str, kind: ErrorKind, message: &'static str) -> Self {
         Self {
             kind,
@@ -108,19 +134,31 @@ impl ClassifiedError {
         }
     }
 
+    /// The condition this failure was classified as, for callers that branch on it.
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
+    /// The redacted message: a constant owned by this module, carrying no amount, address, note
+    /// identifier or txid, and safe to include in a report submitted off the device.
     pub fn message(&self) -> &'static str {
         self.message
     }
 
-    pub fn amounts(&self) -> Option<(Zatoshis, Zatoshis)> {
+    /// The spendable balance and the amount required, present only when [`Self::kind`] is
+    /// [`ErrorKind::InsufficientFunds`] and `None` for every other condition.
+    ///
+    /// These are deliberately NOT redacted: they exist for the wallet to render to the user
+    /// whose own balance they describe. They never enter [`Self::message`], so redacting the
+    /// message and reporting these are not in tension.
+    pub fn amounts(&self) -> Option<Shortfall> {
         self.amounts
     }
 
     /// Classifies a wallet error from proposal construction or transaction creation.
+    ///
+    /// `context` names the FFI entry point the failure came from, as described on
+    /// [`Self::new`].
     ///
     /// Total by construction: `WalletError` is `#[non_exhaustive]`, and a variant added upstream
     /// falls to the catch-all as [`ErrorKind::Unclassified`] rather than failing to compile or,
@@ -185,7 +223,10 @@ impl ClassifiedError {
                     kind: ErrorKind::InsufficientFunds,
                     message: "the spendable balance does not cover this payment and its fee",
                     context,
-                    amounts: Some((*available, *required)),
+                    amounts: Some(Shortfall {
+                        available: *available,
+                        required: *required,
+                    }),
                 };
             }
             WalletError::ScanRequired => (
@@ -252,22 +293,30 @@ impl std::error::Error for ClassifiedError {}
 /// The classification of the most recent error, for callers that need to branch on the
 /// condition instead of showing a string.
 ///
-/// `message` is heap-allocated and the whole value must be freed by calling
-/// [`zcashlc_free_error_report`].
+/// This value owns heap allocations; see the safety documentation below for how to release it.
 ///
 /// # Safety
 ///
-/// - `message` is a non-null, null-terminated UTF-8 string, redacted and safe to include in an
-///   error report submitted off the device.
-/// - `available` and `required` are zatoshi amounts, and are set only when `kind` is
-///   [`ErrorKind::InsufficientFunds`]; both are `-1` otherwise. They are NOT redacted, because
-///   they are for the wallet to render to the user whose balance they describe.
+/// - The value must be freed by passing it to [`zcashlc_free_error_report`], which releases the
+///   whole value together with every allocation it owns. Do not free any field on its own, and
+///   do not release the value by any other means.
+/// - Every field is valid to read until the value is freed, and none may be read afterwards.
+/// - `message` is non-null and points to a null-terminated UTF-8 string.
 #[repr(C)]
 pub struct ErrorReport {
     /// An [`ErrorKind`] discriminant.
     pub kind: u32,
+    /// The redacted message: it carries no amount, address, note identifier or txid, so it is
+    /// safe to include in an error report submitted off the device.
     pub message: *mut c_char,
+    /// The spendable balance in zatoshis, or `-1` when `kind` is not
+    /// [`ErrorKind::InsufficientFunds`].
+    ///
+    /// This is NOT redacted, because it is for the wallet to render to the user whose own
+    /// balance it describes.
     pub available: i64,
+    /// The amount required in zatoshis, fee included, or `-1` when `kind` is not
+    /// [`ErrorKind::InsufficientFunds`]. Not redacted, for the same reason as `available`.
     pub required: i64,
 }
 
@@ -291,11 +340,15 @@ pub extern "C" fn zcashlc_take_last_error_report() -> *mut ErrorReport {
 
     let report = match err.downcast_ref::<ClassifiedError>() {
         Some(classified) => {
-            let (available, required) = classified
-                .amounts()
-                .map_or((NO_AMOUNT, NO_AMOUNT), |(available, required)| {
-                    (u64::from(available) as i64, u64::from(required) as i64)
-                });
+            let (available, required) =
+                classified
+                    .amounts()
+                    .map_or((NO_AMOUNT, NO_AMOUNT), |shortfall| {
+                        (
+                            u64::from(shortfall.available) as i64,
+                            u64::from(shortfall.required) as i64,
+                        )
+                    });
 
             ErrorReport {
                 kind: classified.kind() as u32,
@@ -371,7 +424,13 @@ mod tests {
         );
 
         assert_eq!(e.kind(), ErrorKind::InsufficientFunds);
-        assert_eq!(e.amounts(), Some((available, required)));
+        assert_eq!(
+            e.amounts(),
+            Some(Shortfall {
+                available,
+                required
+            })
+        );
 
         // The whole point: the wallet gets the numbers, the report does not.
         let rendered = e.to_string();
