@@ -246,6 +246,7 @@ final class BlockEnhancerImplTests: XCTestCase {
     func testLastHeightConvertsTheExclusiveEndToTheServersInclusiveEnd() {
         XCTAssertEqual(BlockEnhancerImpl.lastHeight(of: makeAddressRequestBody(blockRangeEnd: 663201)), 663200)
         XCTAssertNil(BlockEnhancerImpl.lastHeight(of: makeAddressRequestBody(blockRangeEnd: nil)))
+        XCTAssertNil(BlockEnhancerImpl.lastHeight(of: makeAddressRequestBody(blockRangeEnd: 0)), "an end of zero is not a usable range")
     }
 
     /// Request shapes the enhancer cannot serve yet are reported as unhandled without touching
@@ -253,6 +254,7 @@ final class BlockEnhancerImplTests: XCTestCase {
     func testUnsupportedAddressRequestShapesFetchNothing() async throws {
         let unsupported: [TransactionsInvolvingAddress] = [
             makeAddressRequestBody(blockRangeEnd: nil),
+            makeAddressRequestBody(blockRangeEnd: 0),
             makeAddressRequestBody(requestAt: Date()),
             makeAddressRequestBody(outputStatusFilter: .unspent)
         ]
@@ -299,6 +301,28 @@ final class BlockEnhancerImplTests: XCTestCase {
         XCTAssertEqual(arguments.end, 663200, "the request's exclusive end must become the server's inclusive end")
         XCTAssertEqual(arguments.networkType, .testnet)
         XCTAssertEqual(arguments.mode, .torInGroup("taddr-\(transparentAddress)"))
+    }
+
+    /// A service answering `.torRequired` did nothing, so the request must not be reported as
+    /// served: the error lets the enhance cycle retry it instead of dropping it for good.
+    func testTorRequiredAnswerIsAnError() async throws {
+        let service = LightWalletServiceMock()
+        service.updateTransparentAddressTransactionsAddressStartEndDbDataNetworkTypeModeClosure = { _, _, _, _, _, _ in .torRequired }
+
+        let enhancer = makeEnhancer(
+            rustBackend: ZcashRustBackendWeldingMock(),
+            downloader: BlockDownloaderServiceMock(),
+            repository: TransactionRepositoryMock(),
+            service: service,
+            torEnabled: true
+        )
+
+        do {
+            _ = try await enhancer.fetchTransactionsInvolvingAddress(makeAddressRequestBody())
+            XCTFail("a service without a Tor connection must not mark the request as served")
+        } catch ZcashError.serviceTorRequired {
+            XCTAssertFalse(service.getTaddressTransactionsModeCalled)
+        }
     }
 
     /// With Tor disabled the direct gRPC stream is still the path, and the Tor-only FFI entry point

@@ -69,31 +69,39 @@ struct BlockEnhancerImpl {
 
 extension BlockEnhancerImpl {
     /// The last block height to ask the server for: the request's `blockRangeEnd` is exclusive
-    /// while the server's range is inclusive. `nil` when the request has no end.
+    /// while the server's range is inclusive. `nil` when the request has no end, and also for an
+    /// end of zero, which no valid range has and which would otherwise turn into an open-ended
+    /// query on one path and an invalid height on the other.
     static func lastHeight(of request: TransactionsInvolvingAddress) -> BlockHeight? {
-        request.blockRangeEnd.map { BlockHeight($0) - 1 }
+        guard let blockRangeEnd = request.blockRangeEnd, blockRangeEnd > 0 else {
+            return nil
+        }
+
+        return BlockHeight(blockRangeEnd) - 1
     }
 
     /// Serves one `transactionsInvolvingAddress` request. Returns `false` when the request has a
     /// shape the enhancer does not support yet, in which case nothing is fetched and the backend
-    /// re-issues the request on a later cycle.
+    /// re-issues the request on a later cycle. The request is never described in the logs: it
+    /// names a receiver of the wallet.
     ///
     /// On the direct connection the transactions stream through here and are filtered by the
     /// request's status filter before being stored. Over Tor the FFI runs the same query on a
     /// circuit dedicated to the address and stores every returned transaction itself, mined or
     /// not, so the status filter is not applied: a mined-only request over a historical range gets
     /// no mempool rows anyway, and a row stored as unmined is reconciled when the transaction is
-    /// mined.
+    /// mined. A service answering `.torRequired` has no Tor connection to offer, which is an error
+    /// here rather than a request silently marked as served.
     func fetchTransactionsInvolvingAddress(_ tia: TransactionsInvolvingAddress) async throws -> Bool {
         // TODO: [#1554] Remove this guard once lightwalletd servers support open-ended ranges.
         guard let lastHeight = Self.lastHeight(of: tia) else {
-            logger.error("transactionsInvolvingAddress \(tia) is missing blockRangeEnd, ignoring the request.")
+            logger.error("transactionsInvolvingAddress request has no usable blockRangeEnd, ignoring the request.")
             return false
         }
 
         // TODO: [#1551] Support this.
         if tia.requestAt != nil {
-            logger.error("transactionsInvolvingAddress \(tia) has requestAt set, ignoring the unsupported request.")
+            logger.error("transactionsInvolvingAddress request has requestAt set, ignoring the unsupported request.")
             return false
         }
 
@@ -106,7 +114,7 @@ extension BlockEnhancerImpl {
         let mode = await sdkFlags.ifTor(ServiceMode.addressGroup(prefix: "taddr", address: address))
 
         guard mode == .direct else {
-            _ = try await service.updateTransparentAddressTransactions(
+            let result = try await service.updateTransparentAddressTransactions(
                 address: tia.address,
                 start: BlockHeight(tia.blockRangeStart),
                 end: lastHeight,
@@ -114,6 +122,11 @@ extension BlockEnhancerImpl {
                 networkType: networkType,
                 mode: mode
             )
+
+            guard result != .torRequired else {
+                throw ZcashError.serviceTorRequired
+            }
+
             return true
         }
 
@@ -268,7 +281,9 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             retry = false
 
                         case .transactionsInvolvingAddress(let tia):
-                            _ = try await fetchTransactionsInvolvingAddress(tia)
+                            if try await fetchTransactionsInvolvingAddress(tia) == false {
+                                logger.warn("BlockEnhancer [\(reqID)] type=\(typeName) request shape not supported yet, skipped")
+                            }
                             retry = false
                         }
                     } catch {
