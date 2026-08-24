@@ -6,6 +6,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `ZcashError.serviceTorRequired` (`ZTSRV0006`), thrown by the transparent-address paths that must
+  go over Tor — the sync-cycle UTXO discovery, `refreshUTXOs(address:from:)` and transparent-history
+  enhancement — when the service in use has no Tor connection to offer. Previously such a call did
+  nothing and reported success.
+
 ## Changed
 
 - With Tor enabled, the transparent UTXO queries that still went over the direct gRPC connection
@@ -16,7 +23,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefreshedUTXOs` returned by `refreshUTXOs(address:from:)` carry empty `inserted` and `skipped`
   lists; and `refreshUTXOs(address:from:)` queries from the address's exposure height (or the
   account birthday when that is unknown) instead of `from`, and does nothing for an address no
-  account of the wallet exposed. With Tor disabled nothing changes.
+  account of the wallet exposed. A receiver whose Tor lookup fails is skipped, logged without
+  being named, and retried on the next sync cycle; the discovery fails only when every receiver
+  failed. With Tor disabled nothing changes.
 - With Tor enabled, the transaction-history lookups the wallet backend requests for its
   transparent receivers during enhancement now go over Tor, one circuit per address, instead of
   over the direct gRPC connection; the transactions found are decrypted and stored exactly as

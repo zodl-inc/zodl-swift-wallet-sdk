@@ -108,6 +108,9 @@ enum ZcashErrorDefinition {
     /// TorClient is called but SDKFlags are set as Tor disabled
     // sourcery: code="ZTSRV0005"
     case torNotEnabled
+    /// A call that must go over Tor reached a LightWalletService that cannot provide a Tor connection
+    // sourcery: code="ZTSRV0006"
+    case serviceTorRequired
 
     // MARK: SQLite connection
 

@@ -57,6 +57,8 @@ public enum ZcashErrorCode: String {
     case torClientUnavailable = "ZTSRV0004"
     /// TorClient is called but SDKFlags are set as Tor disabled
     case torNotEnabled = "ZTSRV0005"
+    /// A call that must go over Tor reached a LightWalletService that cannot provide a Tor connection
+    case serviceTorRequired = "ZTSRV0006"
     /// SimpleConnectionProvider init of Connection failed.
     case simpleConnectionProvider = "ZSCPC0001"
     /// Downloaded file with sapling spending parameters isn't valid.

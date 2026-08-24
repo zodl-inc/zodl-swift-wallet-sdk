@@ -50,11 +50,21 @@ final class UTXOFetcherImplTests: XCTestCase {
         )
     }
 
+    private func makeLogger() -> LoggerMock {
+        let logger = LoggerMock()
+        logger.debugFileFunctionLineClosure = { _, _, _, _ in }
+        logger.infoFileFunctionLineClosure = { _, _, _, _ in }
+        logger.warnFileFunctionLineClosure = { _, _, _, _ in }
+        logger.errorFileFunctionLineClosure = { _, _, _, _ in }
+        return logger
+    }
+
     private func makeFetcher(
         downloader: BlockDownloaderServiceMock,
         service: LightWalletServiceMock,
         rustBackend: ZcashRustBackendWeldingMock,
-        torEnabled: Bool
+        torEnabled: Bool,
+        logger: Logger = OSLogger(logLevel: .debug)
     ) -> UTXOFetcherImpl {
         UTXOFetcherImpl(
             blockDownloaderService: downloader,
@@ -66,7 +76,7 @@ final class UTXOFetcherImplTests: XCTestCase {
             ),
             rustBackend: rustBackend,
             metrics: SDKMetricsImpl(),
-            logger: OSLogger(logLevel: .debug),
+            logger: logger,
             sdkFlags: SDKFlags(torEnabled: torEnabled, exchangeRateEnabled: false)
         )
     }
@@ -95,12 +105,14 @@ final class UTXOFetcherImplTests: XCTestCase {
         )
         XCTAssertFalse(rustBackend.putUnspentTransparentOutputTxidIndexScriptValueHeightCalled, "the FFI stores the UTXOs itself on the Tor path")
 
-        let recorded = calls.all
-        XCTAssertEqual(recorded.map(\.address), [firstAddress.stringEncoded, secondAddress.stringEncoded])
+        // The lookups run concurrently, so the calls are compared in address order.
+        let recorded = calls.all.sorted { $0.address < $1.address }
+        let expected = [firstAddress, secondAddress].sorted { $0.stringEncoded < $1.stringEncoded }
+        XCTAssertEqual(recorded.map(\.address), expected.map(\.stringEncoded))
         XCTAssertEqual(recorded.map(\.accountUUID), [TestsData.mockedAccountUUID, TestsData.mockedAccountUUID])
         XCTAssertEqual(
             recorded.map(\.mode),
-            [.torInGroup("utxo-\(firstAddress.stringEncoded)"), .torInGroup("utxo-\(secondAddress.stringEncoded)")],
+            expected.map { ServiceMode.torInGroup("utxo-\($0.stringEncoded)") },
             "each receiver gets a circuit of its own"
         )
         XCTAssertEqual(progress, [0.5, 1.0])
@@ -108,7 +120,38 @@ final class UTXOFetcherImplTests: XCTestCase {
         XCTAssertTrue(result.skipped.isEmpty)
     }
 
-    func testTorEnabledFailsClosedWhenTheTorLookupFails() async throws {
+    /// One failing receiver must not stop the others from being queried, on this cycle or the next.
+    func testTorEnabledContinuesPastAFailingReceiver() async throws {
+        let downloader = BlockDownloaderServiceMock()
+        let service = LightWalletServiceMock()
+        let rustBackend = ZcashRustBackendWeldingMock()
+        let logger = makeLogger()
+        let queried = Recorder<String>()
+
+        rustBackend.listAccountsReturnValue = [makeAccount()]
+        rustBackend.listTransparentReceiversAccountUUIDReturnValue = [firstAddress, secondAddress]
+        service.fetchUTXOsByAddressAddressDbDataNetworkTypeAccountUUIDModeClosure = { [firstAddress] address, _, _, _, _ in
+            queried.record(address)
+            if address == firstAddress.stringEncoded {
+                throw ZcashError.torServiceUnresolvedMode
+            }
+            return .notFound
+        }
+
+        var progress: [Float] = []
+        let result = try await makeFetcher(downloader: downloader, service: service, rustBackend: rustBackend, torEnabled: true, logger: logger)
+            .fetch { progress.append($0) }
+
+        XCTAssertEqual(Set(queried.all), [firstAddress.stringEncoded, secondAddress.stringEncoded], "the receiver after the failing one is still queried")
+        XCTAssertEqual(progress, [0.5, 1.0])
+        XCTAssertTrue(result.inserted.isEmpty)
+        XCTAssertTrue(logger.errorFileFunctionLineCalled, "the skipped receiver is logged")
+        XCTAssertFalse(downloader.fetchUnspentTransactionOutputsTAddressesStartHeightModeCalled)
+    }
+
+    /// When every receiver fails there is nothing to continue with, and the failure surfaces so the
+    /// processor retries the action instead of reporting a completed discovery.
+    func testTorEnabledFailsClosedWhenEveryTorLookupFails() async throws {
         let downloader = BlockDownloaderServiceMock()
         let service = LightWalletServiceMock()
         let rustBackend = ZcashRustBackendWeldingMock()
@@ -125,6 +168,27 @@ final class UTXOFetcherImplTests: XCTestCase {
             XCTFail("a failing Tor lookup must surface as an error, never as a direct retry")
         } catch ZcashError.unspentTransactionFetcherStream {
             XCTAssertFalse(downloader.fetchUnspentTransactionOutputsTAddressesStartHeightModeCalled)
+        }
+    }
+
+    /// A service that answers `.torRequired` did nothing; that is a failed lookup, not a fetched one.
+    func testTorEnabledTreatsTorRequiredAsAFailedLookup() async throws {
+        let downloader = BlockDownloaderServiceMock()
+        let service = LightWalletServiceMock()
+        let rustBackend = ZcashRustBackendWeldingMock()
+
+        rustBackend.listAccountsReturnValue = [makeAccount()]
+        rustBackend.listTransparentReceiversAccountUUIDReturnValue = [firstAddress]
+        service.fetchUTXOsByAddressAddressDbDataNetworkTypeAccountUUIDModeClosure = { _, _, _, _, _ in .torRequired }
+
+        do {
+            _ = try await makeFetcher(downloader: downloader, service: service, rustBackend: rustBackend, torEnabled: true)
+                .fetch { _ in }
+            XCTFail("a service without a Tor connection must not pass as a completed discovery")
+        } catch ZcashError.unspentTransactionFetcherStream(let underlying) {
+            guard case ZcashError.serviceTorRequired = underlying else {
+                return XCTFail("expected serviceTorRequired, got \(type(of: underlying))")
+            }
         }
     }
 
