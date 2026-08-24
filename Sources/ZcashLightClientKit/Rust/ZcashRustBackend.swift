@@ -241,7 +241,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return validAccount
     }
 
-    // DB-READ: find_account_for_address + get_account — no SQL writes anywhere in their bodies.
+    // DB-READ (audited 2026-08-24): find_account_for_address + get_account — no SQL writes anywhere
+    // in their bodies.
     func getAccount(forTransparentAddress address: TransparentAddress) async throws -> Account? {
         let accountPtr: UnsafeMutablePointer<FfiAccount>? = zcashlc_get_account_for_transparent_address(
             dbData.0,

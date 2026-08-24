@@ -32,6 +32,11 @@ pub struct Account {
 }
 
 impl Account {
+    /// The account's uuid bytes; all zeros for [`Account::NOT_FOUND`].
+    pub(crate) fn uuid_bytes(&self) -> [u8; 16] {
+        self.uuid_bytes
+    }
+
     pub(crate) const NOT_FOUND: Account = Account {
         uuid_bytes: [0u8; 16],
         account_name: ptr::null_mut(),

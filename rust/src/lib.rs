@@ -4842,6 +4842,99 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 mod tests {
     use super::*;
 
+    /// The lookup resolves a receiver the wallet exposed to its account, answers the not-found
+    /// sentinel for a transparent address it never exposed, and refuses an address that is not
+    /// transparent at all.
+    #[test]
+    fn account_lookup_by_transparent_address() {
+        use rand::rngs::OsRng;
+        use secrecy::SecretVec;
+        use std::ffi::CString;
+        use zcash_client_backend::data_api::{
+            Account as _, AccountBirthday, WalletRead, WalletWrite,
+        };
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wallet.sqlite");
+        let path_bytes = path.to_str().expect("utf-8 path").as_bytes();
+        let init = unsafe {
+            zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+
+        let mut db = WalletDb::for_path(&path, MAIN_NETWORK, SystemClock, OsRng)
+            .expect("the wallet database must open");
+        let seed = SecretVec::new(vec![7u8; 32]);
+        let treestate = TreeState {
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        };
+        let birthday = AccountBirthday::from_treestate(treestate, None)
+            .expect("the fixture treestate must convert to a birthday");
+        let (account, _usk) = db
+            .create_account("fixture", &seed, &birthday, None)
+            .expect("account creation must succeed");
+        let receivers = db
+            .get_transparent_receivers(account, true, true)
+            .expect("the receivers must be listed");
+        let (receiver, _) = receivers
+            .iter()
+            .next()
+            .expect("a fresh account exposes a transparent receiver");
+        let exposed = CString::new(receiver.encode(&MAIN_NETWORK)).expect("c string");
+
+        let lookup = |address: &CString| unsafe {
+            zcashlc_get_account_for_transparent_address(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                NETWORK_ID_MAINNET,
+                address.as_ptr(),
+            )
+        };
+
+        let found = lookup(&exposed);
+        assert!(!found.is_null(), "an exposed receiver resolves");
+        assert_eq!(
+            unsafe { (*found).uuid_bytes() },
+            account.expose_uuid().into_bytes()
+        );
+        unsafe { ffi::zcashlc_free_account(found) };
+
+        let unknown = CString::new("t1dRJRY7GmyeykJnMH38mdQoaZtFhn1QmGz").expect("c string");
+        let not_found = lookup(&unknown);
+        assert!(!not_found.is_null(), "an unknown receiver is not an error");
+        assert_eq!(
+            unsafe { (*not_found).uuid_bytes() },
+            [0u8; 16],
+            "an unknown receiver answers the not-found sentinel"
+        );
+        unsafe { ffi::zcashlc_free_account(not_found) };
+
+        let shielded = CString::new(
+            "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9sly",
+        )
+        .expect("c string");
+        assert!(
+            lookup(&shielded).is_null(),
+            "a non-transparent address is refused"
+        );
+        let garbage = CString::new("not-an-address").expect("c string");
+        assert!(
+            lookup(&garbage).is_null(),
+            "an undecodable string is refused"
+        );
+    }
+
     /// Only the production network gets the ZIP 318 grid, whose anonymity set depends on every
     /// wallet sharing it. Testnet gets the shortened grid, so a migration passes through anchor
     /// boundaries fast enough to be exercised.
