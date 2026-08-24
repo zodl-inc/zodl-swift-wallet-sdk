@@ -712,15 +712,11 @@ fn plan_and_cache(
 /// user-visible reason. (The residual peek reads the multi-run estimate instead — see
 /// [`estimate_runs`].)
 ///
-/// The run is bounded the way [`planning_inputs`] sizes THIS account — one Keystone signing round
-/// for a Keystone-tagged account, the in-process note cap for every other — and
+/// The run is bounded the way [`planning_inputs`] sizes THIS account, and
 /// [`zcashlc_migration_estimate_runs`] previews under the same value from the same seam, so a
-/// preview always describes the runs that get planned. An in-process account resolves to exactly
-/// the engine's `plan_migration` default (the crate's flat 50-note cap); the seam exists for the
-/// Keystone-tagged account, whose one-round bound no note cap can express — a wallet fragmented
-/// enough that its 50-note run needs several QR-scanned rounds (see
-/// `zcash_pool_migration::signing_rounds`'s module doc). The sizing and the viewing key come from
-/// one account-row read.
+/// preview always describes the runs that get planned. An in-process account resolves to the
+/// engine's `plan_migration` default; the seam exists for the Keystone-tagged account, whose
+/// one-round bound no note cap can express. Sizing and viewing key come from one account-row read.
 fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, BlockHeight)>> {
     let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
     let backend =
@@ -750,12 +746,11 @@ fn compute_plan(ctx: &mut CallCtx) -> anyhow::Result<Option<(MigrationPlan, Bloc
 /// [`zcashlc_migration_estimate_runs`] and [`zcashlc_migration_residual_after_migration`], so
 /// the residual the latter reports is always the `final_residual` of the runs the former previews.
 ///
-/// `Ok(None)` is the zero-run answer for the engine's own `NothingToMigrate`; the estimator
-/// itself answers an empty balance with the zero-run estimate, so the arm should not fire. A
-/// wallet that knows no chain tip (never synced) is a hard error, as for every planning read: the
-/// spendable-note snapshot is taken at the tip. A pure peek: nothing is cached, so a proposal the
-/// user is reviewing is never superseded. Costs one planning pass per remaining run (plus, for a
-/// Keystone-tagged account, the sizing search each run) — it is the estimate.
+/// `Ok(None)` is the zero-run answer for the engine's own `NothingToMigrate`; the estimator itself
+/// answers an empty balance with the zero-run estimate, so the arm should not fire. A wallet that
+/// knows no chain tip (never synced) is a hard error, as for every planning read. A pure peek:
+/// nothing is cached, so a proposal under review is never superseded. Costs one planning pass per
+/// remaining run.
 fn estimate_runs(ctx: &mut CallCtx) -> anyhow::Result<Option<engine::MigrationRunEstimate>> {
     let inputs = planning_inputs(&ctx.wallet, ctx.account)?;
     let backend =
@@ -2159,10 +2154,9 @@ pub struct FfiRunEstimate {
     /// total actions per round, `SigningRoundBudget::KEYSTONE`), computed by the optimal
     /// `MinRounds` packing. Count-based `ceil(transaction_count / max_transactions_per_session)`
     /// UNDERCOUNTS this: 6 preparations (96 actions) plus 1 transfer (3 actions) is 99 actions —
-    /// one Keystone round over — so it needs 2 rounds, not 1. For a Keystone-tagged account the
-    /// run is SIZED to one round (see `zcashlc_migration_estimate_runs`), so this is 1 unless even
-    /// a one-note run overflows the budget; for an in-process account it is what a Keystone would
-    /// need for a run of this shape — a comparison figure, not a plan.
+    /// one Keystone round over — so it needs 2 rounds, not 1. For a Keystone-tagged account the run
+    /// is SIZED to one round, so this is 1 unless even a one-note run overflows the budget; for an
+    /// in-process account it is a comparison figure, not a plan.
     pub keystone_rounds: u32,
 }
 
@@ -3384,22 +3378,17 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
     unwrap_exc_or_null(res)
 }
 
-/// The value (zatoshi) the WHOLE migration leaves in Orchard — what stays after the LAST run: the
-/// remainder below the smallest self-funding note plus the last preparation's change, or the
-/// whole spendable balance when the wallet's notes cannot fund any canonical split — under the
-/// account's own run sizing (see [`estimate_runs`]). It is exactly the `final_residual`
-/// [`zcashlc_migration_estimate_runs`] reports and never a single run's leftover, which for a run
-/// sized below the balance is mostly the balance the NEXT runs migrate. Read fresh from the live
-/// spendable balance on every call — before the first run, between runs and after the last one
-/// alike; the stored run is not consulted. While a run is in flight, the notes it holds reserved
-/// and its not-yet-mined preparation change are outside the spendable balance, so the figure
-/// previews what stays after the runs that FOLLOW it and settles once the run completes.
+/// The value (zatoshi) the WHOLE migration leaves in Orchard — exactly the `final_residual`
+/// [`zcashlc_migration_estimate_runs`] reports, never a single run's leftover, which for a run
+/// sized below the balance is mostly what the NEXT runs migrate. Read fresh from the live spendable
+/// balance on every call; the stored run is not consulted. While a run is in flight its reserved
+/// notes and unmined preparation change sit outside that balance, so the figure previews what stays
+/// after the runs that FOLLOW it.
 ///
 /// Returns `-1` for "none" — an empty wallet, or a balance that migrates exactly — and on error
 /// (see `zcashlc_last_error_message`; the Swift layer disambiguates). A wallet that has never
-/// synced knows no chain tip to plan against and reports an error, as every planning read does.
-/// A pure peek: nothing is cached, so a proposal under review is never superseded. Costs one
-/// planning pass per remaining run, like the estimate it is read from.
+/// synced knows no chain tip to plan against and reports an error. A pure peek: nothing is cached.
+/// Costs one planning pass per remaining run, like the estimate it is read from.
 ///
 /// # Safety
 /// See [`open`].
@@ -3539,18 +3528,12 @@ pub unsafe extern "C" fn zcashlc_migration_unlock_residual(
 /// STRUCTURE, not just its total value (each run is decomposed with the real planners, and the
 /// notes a run spends plus the residuals it leaves form the next run's structure).
 ///
-/// Each run is bounded the way `crate::migration_engine::planning_inputs` sizes THIS account —
-/// one 96-action Keystone signing round for a Keystone-tagged account (`key_source` `"keystone"`,
-/// case-insensitive), the in-process note cap for every other — the same value, from the same
-/// seam, that every planning entry point (`zcashlc_migration_propose_transfers` and the note-split
-/// and peek calls behind `compute_plan`) plans under, so this preview describes the runs that get
-/// planned. `keystone_rounds` is still reported per run under the Keystone budget: 1 for a
-/// Keystone-tagged account (more only when even a one-note run overflows a round, which no smaller
-/// run can fix), and, for an in-process account, what a Keystone would need for that run's shape —
-/// a comparison figure. A zero (or fully sub-quantum) balance yields the ZERO-RUN estimate
-/// (`runs_len == 0`) — a legitimate result, not an error. The estimate walks the runs with the
-/// real planners, so it costs one planning pass per run — plus a sizing search per run for a
-/// Keystone-tagged account, whose runs are more numerous.
+/// Each run is bounded the way `crate::migration_engine::planning_inputs` sizes THIS account, from
+/// the same seam every planning entry point plans under, so this preview describes the runs that
+/// get planned. `keystone_rounds` is still reported per run under the Keystone budget: 1 for a
+/// Keystone-tagged account, and for an in-process account a comparison figure — what a Keystone
+/// would need for that run's shape. A zero (or fully sub-quantum) balance yields the ZERO-RUN
+/// estimate (`runs_len == 0`), a legitimate result, not an error. Costs one planning pass per run.
 /// `zcashlc_migration_residual_after_migration` is read from this same estimate (see
 /// [`estimate_runs`]). NULL signals an error (see `zcashlc_last_error_message`).
 ///
@@ -4840,11 +4823,9 @@ mod tests {
         create_fixture_account_with_usk_and_key_source(path, None)
     }
 
-    /// [`create_fixture_account_with_usk`] with the account row's `key_source` set to
-    /// `key_source` — the tag [`crate::migration_engine::run_sizing`] reads (`"keystone"` marks a
-    /// Keystone-signed account). The seed-derived account stands in for the UFVK-imported one a
-    /// real Keystone account is: sizing consults the tag alone, and holding a spending key is what
-    /// lets the fixture fund the account through [`fund_fixture_account_with_orchard_notes`].
+    /// [`create_fixture_account_with_usk`] with the account row's `key_source` set. The
+    /// seed-derived account stands in for the UFVK-imported one a real Keystone account is: sizing
+    /// consults the tag alone, and the spending key is what lets the fixture fund the account.
     fn create_fixture_account_with_usk_and_key_source(
         path: &std::path::Path,
         key_source: Option<&str>,
@@ -6978,9 +6959,8 @@ mod tests {
 
     // ----- Per-account run sizing (MOB-1732: Keystone runs sized by signing-round capacity) -----
 
-    /// Opens the fixture wallet at `path` exactly as an FFI entry point does and answers the run
-    /// sizing [`crate::migration_engine::planning_inputs`] resolves for `account_bytes` — the one
-    /// account-row read every planning and estimating call makes.
+    /// Opens the fixture wallet at `path` as an FFI entry point does and answers the run sizing
+    /// [`crate::migration_engine::planning_inputs`] resolves for `account_bytes`.
     fn fixture_run_sizing(
         path: &std::path::Path,
         account_bytes: &[u8; 16],
@@ -6999,8 +6979,8 @@ mod tests {
             .map(|inputs| inputs.sizing)
     }
 
-    /// The tag is matched case-insensitively: it is what the platform layer stamps on a Keystone
-    /// import, and a wallet that capitalizes it differently is still signing through a Keystone.
+    /// The tag is matched case-insensitively: a wallet that capitalizes it differently is still
+    /// signing through a Keystone.
     #[test]
     fn run_sizing_is_one_keystone_round_for_a_keystone_tagged_account() {
         for (i, tag) in ["keystone", "Keystone", "KEYSTONE"].into_iter().enumerate() {
@@ -7016,12 +6996,10 @@ mod tests {
         }
     }
 
-    /// Everything that is not Keystone-tagged — no tag, the platform's own `zashi` tag, an
-    /// unrelated tag, a near-miss of the Keystone tag (a suffix, a leading space, a product
-    /// name) — is signed in process, where a signing round has no per-interaction cost to bound,
-    /// so it keeps the crate's default note-cap sizing, unchanged from before per-account sizing
-    /// existed. The match is exact up to ASCII case: nothing is trimmed or prefix-matched, which
-    /// is why hosts stamp `Account.keystoneKeySource` rather than a display string.
+    /// Everything not Keystone-tagged — no tag, another tag, or a near-miss (suffix, leading
+    /// space, product name) — keeps the crate's default note-cap sizing. The match is exact up to
+    /// ASCII case: nothing is trimmed or prefix-matched, which is why hosts stamp the constant
+    /// rather than a display string.
     #[test]
     fn run_sizing_is_the_in_process_note_cap_for_every_other_account() {
         for (i, tag) in [
@@ -7046,9 +7024,7 @@ mod tests {
         }
     }
 
-    /// An account the wallet does not know cannot be sized: a hard error, like every other
-    /// account-row read in the migration layer, never a silent default that would plan a run for
-    /// nobody.
+    /// An account the wallet does not know cannot be sized: a hard error, never a silent default.
     #[test]
     fn run_sizing_rejects_an_unknown_account() {
         let path = init_fixture_db("zcashlc_run_sizing_unknown_account");
@@ -7063,9 +7039,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The sizing and the stored viewing key come out of ONE account-row read: the key
-    /// `planning_inputs` hands the adapter is the account's stored key, the same one
-    /// `stored_ufvk` reads, so a planning call no longer pays for the row twice.
+    /// Sizing and stored viewing key come out of ONE account-row read: the key `planning_inputs`
+    /// yields is the same one `stored_ufvk` reads.
     #[test]
     fn planning_inputs_reads_the_stored_viewing_key_with_the_sizing() {
         let path = init_fixture_db("zcashlc_planning_inputs_ufvk");
@@ -7097,19 +7072,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The estimate and the plan share one sizing seam (`planning_inputs`), and it is per account:
-    /// a Keystone-tagged account is sized to what one QR-scanned round signs — so on a wallet whose
-    /// note-cap run would take several rounds, EVERY Keystone-sized run fits one — while the same
-    /// wallet held by an in-process account is sized by the crate's default 50-note cap and needs
-    /// more than one round in some run, in fewer runs. Nothing about the funding differs between
-    /// the two accounts; only the tag does.
+    /// Two identically funded wallets, differing only in the tag: the Keystone-tagged one fits
+    /// EVERY run in one round, the in-process one takes fewer, larger runs and needs more than one
+    /// round in some of them.
     #[test]
     fn migration_estimate_runs_sizes_a_keystone_account_to_one_signing_round_per_run() {
-        // 1,000,000 ZEC in a single note: about a hundred cap-sized (10,000 ZEC) crossings, split
-        // into runs of up to 50 under the crate's default cap, each needing layered preparation
-        // transactions — hundreds of actions, so several Keystone rounds in ONE run — while the
-        // Keystone sizing caps each run at the largest note count keeping
-        // `16 * preparations + 3 * transfers <= 96`.
+        // 1,000,000 ZEC in a single note: about a hundred cap-sized crossings. Under the default
+        // 50-note cap one run runs to hundreds of actions — several Keystone rounds; the Keystone
+        // sizing instead caps a run at `16 * preparations + 3 * transfers <= 96`.
         const FUNDING_ZAT: u64 = 100_000_000_000_000;
 
         // `(crossings, actions, keystone_rounds)` per run, in run order.
@@ -7180,12 +7150,10 @@ mod tests {
         );
     }
 
-    /// The sizing is one value, read once per call at BOTH planning sites, so the run
-    /// `zcashlc_migration_propose_transfers` plans for a Keystone-tagged account is the run
-    /// `zcashlc_migration_estimate_runs` previews as its first: same wallet, same tag, same
-    /// crossing count. A half-reverted call site — one of the two planning under the crate's flat
-    /// 50-note default again — breaks the equality (50 against 16 on this fixture), which the
-    /// estimate-only test above cannot see.
+    /// Propose and estimate read the sizing from the same seam, so the run proposed for a
+    /// Keystone-tagged account is the run the estimate previews first. A half-reverted call site —
+    /// one of the two back on the flat 50-note default — breaks the equality (50 against 16 here),
+    /// which the estimate-only test above cannot see.
     #[test]
     fn migration_propose_transfers_plans_the_run_the_estimate_previews_for_a_keystone_account() {
         let path = init_fixture_db("zcashlc_propose_matches_estimate_keystone");
@@ -7250,10 +7218,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A fixture wallet at `prefix` holding one account tagged `key_source`, funded with a single
-    /// `value_zat` Orchard note and brought to chain tip 3,600,000 — the state every planning and
-    /// estimating FFI test in this section starts from. Returns the path, the account's uuid
-    /// bytes and its Orchard-era spending key bytes.
+    /// A fixture wallet at `prefix` with one account tagged `key_source`, funded with a single
+    /// `value_zat` Orchard note and brought to chain tip 3,600,000 — where every planning and
+    /// estimating FFI test below starts. Returns the path, the account uuid and the spending key.
     fn funded_fixture(
         prefix: &str,
         key_source: Option<&str>,
@@ -7302,8 +7269,7 @@ mod tests {
     }
 
     /// What `zcashlc_migration_residual_after_migration` answers for `account_bytes`, with the
-    /// last-error channel cleared first and asserted clear after: `-1` here means "none", never
-    /// an error.
+    /// last-error channel cleared first and asserted clear after, so `-1` means "none", not error.
     fn ffi_residual(path: &std::path::Path, account_bytes: &[u8; 16]) -> i64 {
         let path_bytes = path.to_str().unwrap().as_bytes();
         crate::zcashlc_clear_last_error();
@@ -7323,9 +7289,9 @@ mod tests {
         residual
     }
 
-    /// The residual is what the WHOLE migration leaves behind, not the next run's leftover: for a
-    /// Keystone account whose balance takes several one-round runs, the two differ by almost the
-    /// entire balance, and the host's "Lock balance" offer is built from this number.
+    /// The residual is what the WHOLE migration leaves behind, not the next run's leftover: over
+    /// several one-round runs the two differ by almost the entire balance, and the host's
+    /// "Lock balance" offer is built from this number.
     #[test]
     fn migration_residual_reports_the_whole_migration_remainder_for_a_keystone_account() {
         const FUNDING_ZAT: u64 = 100_000_000_000_000;
@@ -7357,8 +7323,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// For a balance that migrates in ONE run — every in-process account in practice — the value
-    /// is unchanged: the plan's own change is `total - funding notes - preparation fees`, which is
+    /// For a balance that migrates in ONE run the value is unchanged: the plan's own change is
     /// exactly what stays after that run, so it equals the estimate's final residual.
     #[test]
     fn migration_residual_matches_the_estimate_and_the_plan_for_a_single_run_account() {
@@ -7403,9 +7368,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// An empty wallet has no residual: `-1` without an error, in step with the zero-run
-    /// estimate. The fixture knows a chain tip, as every synced wallet does: the spendable-note
-    /// snapshot every planning read starts from is taken at the tip, empty or not.
+    /// An empty wallet has no residual: `-1` without an error, in step with the zero-run estimate.
     #[test]
     fn migration_residual_is_none_for_an_empty_wallet() {
         let path = init_fixture_db("zcashlc_residual_empty_wallet");
@@ -7431,8 +7394,7 @@ mod tests {
     }
 
     /// A wallet that has never synced knows no chain tip to plan against: the read is an ERROR
-    /// (`-1` with the last-error channel set), never a silent "no residual" — the contract the
-    /// Swift layer documents, and the one the plan-based read had before.
+    /// (`-1` with the last-error channel set), never a silent "no residual".
     #[test]
     fn migration_residual_reports_an_error_without_a_chain_tip() {
         let path = init_fixture_db("zcashlc_residual_no_chain_tip");
@@ -7493,9 +7455,8 @@ mod tests {
     }
 
     /// The split-needed peek plans through the same seam, but its boolean cannot expose the
-    /// sizing: a single large note needs splitting under either sizing. This pins the answer and
-    /// error-freedom only; the note-split and restart tests around it carry the sizing
-    /// discrimination.
+    /// sizing — a single large note needs splitting either way. Pins the answer and error-freedom
+    /// only; the tests around it carry the sizing discrimination.
     #[test]
     fn migration_is_note_split_needed_is_true_for_a_keystone_sized_run() {
         let (path, account_bytes, _usk) = funded_fixture(
@@ -7526,8 +7487,7 @@ mod tests {
     }
 
     /// The restart lane re-plans under the account's CURRENT sizing — with no stored run the
-    /// engine's cancel is a no-op and the fresh plan is the Keystone-sized run the estimate
-    /// previews — which is also how a run committed under an earlier sizing is brought onto it.
+    /// cancel is a no-op and the fresh plan is the Keystone-sized run the estimate previews.
     #[test]
     fn migration_restart_step_replans_a_keystone_account_under_one_signing_round() {
         let (path, account_bytes, _usk) = funded_fixture(

@@ -679,13 +679,10 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
 /// migrates (the note-split crossings) and what preparing it costs (the note-preparation layers
 /// and transactions), so the two can be compared before anything is planned or committed.
 ///
-/// A run's capacity is PER ACCOUNT, decided by how the account signs: an account created or
-/// imported with ``Account/keystoneKeySource`` as its `keySource` (`"keystone"`, compared
-/// case-insensitively) is sized to what a Keystone signs in ONE QR-scanned round — the 96-action
-/// ``MigrationSigningBudget/keystone`` budget — so its runs are smaller and more numerous, and each
-/// ``Run/keystoneSigningSessions`` is 1 unless even a one-note run overflows the round; every other
-/// account is signed in process, has no per-round cost to bound, and is sized by the default
-/// 50-note cap — fewer, larger runs. The same sizing drives `proposeMigrationTransfers`, so this
+/// A run's capacity is PER ACCOUNT, decided by how the account signs: an ``Account/keystoneKeySource``
+/// account is sized to the 96-action ``MigrationSigningBudget/keystone`` budget — one QR-scanned
+/// round — so its runs are smaller and more numerous; every other account signs in process and is
+/// sized by the default 50-note cap. The same sizing drives `proposeMigrationTransfers`, so this
 /// estimate always describes the runs that get planned.
 ///
 /// External-signer workload is expressed in ACTIONS, not transaction counts: a preparation
@@ -720,9 +717,9 @@ public struct MigrationRunEstimate: Equatable, Sendable {
         /// The number of signing rounds this run needs from a Keystone-class external signer
         /// (``MigrationSigningBudget/keystone``, 96 actions per round), computed by the upstream
         /// optimal `MinRounds` packing — see the type doc for why a count-based ceiling
-        /// undercounts this. For an ``Account/keystoneKeySource`` account the run is sized to fit one
-        /// round, so this is 1 (more only when even a one-note run overflows); for an in-process
-        /// account it is what a Keystone would need for a run of this shape — a comparison figure.
+        /// undercounts this. For an ``Account/keystoneKeySource`` account the run is sized to fit
+        /// one round, so this is 1 (more only when even a one-note run overflows); for an in-process
+        /// account it is a comparison figure — what a Keystone would need for a run of this shape.
         public let keystoneSigningSessions: Int
 
         /// Creates a `Run`.
@@ -809,9 +806,7 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     /// A SUM, never a re-packing across runs: a later run's transactions spend notes an earlier
     /// run must mine first, so each run is signed on its own and any spare capacity in a run's
     /// last round goes unused. For an ``Account/keystoneKeySource`` account every run is sized to
-    /// one round, so this equals ``runCount`` (more only when even a one-note run overflows the
-    /// round, which no smaller run can fix); for an in-process account — which never interacts
-    /// with a Keystone — it is the comparison figure the per-run sessions are.
+    /// one round, so this equals ``runCount``.
     public var totalKeystoneSigningSessions: Int {
         runs.reduce(0) { $0 + $1.keystoneSigningSessions }
     }

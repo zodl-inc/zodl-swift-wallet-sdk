@@ -145,14 +145,9 @@ public protocol Synchronizer: AnyObject {
     ///   SDK then picks a reorg-safe recent height). Ignored when an account already exists.
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
-    ///   One value is meaningful to the SDK: ``Account/keystoneKeySource`` (`"keystone"`, compared
-    ///   case-insensitively) marks an account whose transactions a Keystone hardware wallet signs, and
-    ///   sizes every Orchard→Ironwood migration run of that account to one 96-action QR signing round
-    ///   (see ``MigrationRunEstimate``). An account created here is derived from the seed and always
-    ///   signs in process, so the tag belongs on a Keystone import
-    ///   (``importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)``);
-    ///   on a seed-derived account it only shrinks the runs — more runs and more preparation fees
-    ///   for nothing in return. Any other value, or `nil`, keeps the default 50-note per-run sizing.
+    ///   ``Account/keystoneKeySource`` is the one value the SDK reads. An account created here is
+    ///   seed-derived and always signs in process, so the tag belongs on a Keystone import instead;
+    ///   here it only shrinks the migration runs for nothing in return.
     /// - Note: The init flow (new / restore / existing) is DERIVED by the SDK — an existing account is
     ///   opened, a `nil` birthday creates a new wallet, a past birthday restores from it. A deliberate
     ///   re-scan/resync is the separate `rewind(_:)` action, not an init mode.
@@ -431,12 +426,8 @@ public protocol Synchronizer: AnyObject {
     ///   - purpose: of the account, either `spending` or `viewOnly`
     ///   - name: name of the account.
     ///   - keySource: custom optional string for clients, used for example to help identify the type of the account.
-    ///   One value is meaningful to the SDK: ``Account/keystoneKeySource`` (`"keystone"`, compared
-    ///   case-insensitively) marks an account whose transactions a Keystone hardware wallet signs, and
-    ///   sizes every Orchard→Ironwood migration run of that account to one 96-action QR signing round
-    ///   (see ``MigrationRunEstimate``); any other value, or `nil`, is signed in process and sized by
-    ///   the default 50-note per-run cap. Stamp the constant, not a display string: any other spelling
-    ///   selects the in-process sizing with no error, and an account cannot be re-tagged later.
+    ///   Pass ``Account/keystoneKeySource`` for a Keystone account: it sizes that account's
+    ///   migration runs to one QR signing round. An account cannot be re-tagged afterwards.
     ///   - birthday: custom optional BlochHeight representing birthday of the imported account.
     // swiftlint:disable:next function_parameter_count
     func importAccount(
@@ -948,9 +939,7 @@ public protocol Synchronizer: AnyObject {
     /// `ZcashError.migrationPlanStale`. An EMPTY schedule means there is nothing to migrate; after a
     /// completed run this is the "does anything remain" answer of the sequential-runs contract.
     /// - Parameter accountUUID: the account to propose a migration schedule for.
-    /// - Note: The run is sized per account — to one 96-action Keystone signing round for an
-    ///   ``Account/keystoneKeySource`` account, to the default 50-note cap for every other — see
-    ///   ``MigrationRunEstimate`` and ``estimateMigrationRuns(accountUUID:)``.
+    /// - Note: The run is sized per account — see ``estimateMigrationRuns(accountUUID:)``.
     func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
     /// Proposes the immediate (single-transaction) migration: an ordinary send-max that spends ALL
@@ -983,26 +972,17 @@ public protocol Synchronizer: AnyObject {
     ///     matches `TxId.id`, not the reversed display-hex order produced by `Data.toHexStringTxId()`).
     func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws
 
-    /// What the WHOLE migration of `accountUUID` leaves in Orchard: the value remaining after the
-    /// last run — below the smallest self-funding note, plus the last preparation's change; or the
-    /// whole spendable balance when the wallet's notes cannot fund any canonical split, so nothing
-    /// migrates — under the account's own run sizing; `nil` when nothing remains. The same value as
-    /// ``estimateMigrationRuns(accountUUID:)``'s ``MigrationRunEstimate/finalResidual`` (with zero
-    /// mapped to `nil`), and never a single run's leftover: on a balance that takes several runs
-    /// the next run's leftover is mostly the balance the later runs migrate. Read fresh from the
-    /// live spendable balance on every call; while a run is in flight, the notes it holds reserved
-    /// and its not-yet-mined preparation change are outside that balance, so the figure previews
-    /// what stays after the runs that FOLLOW it and settles once the run completes. Offer
-    /// ``lockMigrationResidual(accountUUID:)`` against it only once
-    /// ``proposeMigrationTransfers(accountUUID:)`` returns the empty schedule: the lock takes every
-    /// spendable note, not just this remainder.
+    /// What the WHOLE migration of `accountUUID` leaves in Orchard, `nil` when nothing remains:
+    /// the same value as ``estimateMigrationRuns(accountUUID:)``'s
+    /// ``MigrationRunEstimate/finalResidual`` (zero mapped to `nil`), never a single run's leftover.
+    /// Read fresh from the live spendable balance on every call, so while a run is in flight it
+    /// previews what stays after the runs that FOLLOW it.
     /// - Parameter accountUUID: the account to check.
-    /// - Note: Costs one planning pass per remaining run — the multi-run estimate this is read
-    ///   from — so on a large or fragmented balance it is not a per-frame read; a host that already
-    ///   holds an ``estimateMigrationRuns(accountUUID:)`` result can read its
-    ///   ``MigrationRunEstimate/finalResidual`` instead of paying for a second one. Requires at
-    ///   least one completed sync: on a wallet that has never completed a sync (no chain tip known)
-    ///   this throws rather than returning `nil`.
+    /// - Note: Costs one planning pass per remaining run, so it is not a per-frame read; a host that
+    ///   already holds an ``estimateMigrationRuns(accountUUID:)`` result should read its
+    ///   ``MigrationRunEstimate/finalResidual`` instead. Requires at least one completed sync: on a
+    ///   wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `nil`.
     func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi?
 
     /// Locks every currently-spendable, not-already-locked legacy-Orchard note of `accountUUID`
@@ -1013,9 +993,7 @@ public protocol Synchronizer: AnyObject {
     /// in `PoolBalance.lockedValue`, and therefore in the account's total balance — locked funds
     /// never vanish from app-visible sums.
     /// Offer it only once ``proposeMigrationTransfers(accountUUID:)`` returns the empty schedule: it
-    /// locks EVERY spendable note, so on a balance that still has runs to go it would lock what those
-    /// runs should migrate — ``residualAfterMigration(accountUUID:)`` says how much genuinely
-    /// remains, not whether the runs are done.
+    /// locks EVERY spendable note, so with runs still to go it would lock what those runs migrate.
     /// - Parameter accountUUID: the account whose residual should be locked.
     /// - Note: `Zatoshi(0)` is a legitimate result (nothing was spendable, or everything spendable
     ///   was already locked). Idempotent-additive: already-locked notes are excluded from
@@ -1045,13 +1023,12 @@ public protocol Synchronizer: AnyObject {
     /// the 96-action Keystone budget (see ``MigrationRunEstimate`` for why count-based session
     /// math undercounts). Runs are sized PER ACCOUNT — one Keystone round each for an
     /// ``Account/keystoneKeySource`` account, the default 50-note cap for every other — by the same
-    /// seam ``proposeMigrationTransfers(accountUUID:)`` plans under, so the estimate describes the runs
-    /// that get planned.
+    /// seam ``proposeMigrationTransfers(accountUUID:)`` plans under, so the estimate describes the
+    /// runs that get planned.
     /// - Parameter accountUUID: the account to estimate for.
     /// - Note: The zero-run estimate (`runCount == 0`, a zero or fully sub-quantum balance) is a
-    ///   legitimate answer, not an error. The estimate walks the runs with the real planners, so it
-    ///   costs one planning pass per run — plus a sizing search per run for a Keystone account, whose
-    ///   runs are more numerous — and on a large or fragmented balance it is not a per-frame read.
+    ///   legitimate answer, not an error. Walks the runs with the real planners, so it costs one
+    ///   planning pass per run and is not a per-frame read.
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
 
     /// Pre-signs and persists every transfer in `schedule` in the migration engine for `accountUUID`
@@ -1185,10 +1162,8 @@ public protocol Synchronizer: AnyObject {
     ///
     /// The old plan is no longer valid: the engine discards it and derives a new one, which a
     /// follow-up ``signAndStoreMigrationSchedule(accountUUID:_:usk:)`` (or PCZT store) then signs and
-    /// persists. The fresh plan is sized the way the account is sized NOW — one Keystone signing
-    /// round per run for an ``Account/keystoneKeySource`` account — which also makes this the way
-    /// to bring a run committed under an earlier sizing onto the current one: a run keeps the shape
-    /// it was planned with until it completes or is restarted here.
+    /// persists. The fresh plan is sized the way the account is sized NOW, which is also how a run
+    /// committed under an earlier sizing moves onto the current one.
     /// - Parameter accountUUID: the account to restart.
     func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule
 

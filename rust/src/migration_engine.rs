@@ -22,12 +22,11 @@
 //! - [`account_migration`] is the two together: the adapter every engine call that needs
 //!   `MigrationBackend` / `MigrationCrypto` (planning, estimating, committing, rebuilding) is
 //!   handed.
-//! - [`run_sizing`] is how one run of the account is bounded — by what a Keystone signs in one
-//!   QR-scanned round, or by the in-process note cap — decided by the account row's `key_source`
-//!   tag; [`planning_inputs`] reads that tag and the stored key in ONE row lookup for the planning
-//!   and estimating calls. It is the one seam every planning AND estimating call takes its bound
-//!   from, so a preview always describes the runs that get planned; the engine leaves the choice to
-//!   the wallet because only the wallet knows who signs.
+//! - [`run_sizing`] bounds one run of the account, from the account row's `key_source` tag;
+//!   [`planning_inputs`] reads that tag and the stored key in ONE row lookup. Every planning AND
+//!   estimating call takes its bound from this seam, so a preview always describes the runs that
+//!   get planned. The engine leaves the choice to the wallet because only the wallet knows who
+//!   signs.
 //!
 //! There is no spending key in this module, and no way to give the adapter one — [`WalletMigration`]
 //! holds viewing authority and offers no constructor that takes more. The engine's two signing
@@ -97,8 +96,7 @@ pub(crate) fn account_store<'a>(
 }
 
 /// The account row `account` names, or a hard error when the wallet does not know it — the one
-/// lookup every account-derived input in this module (the stored viewing key, the run sizing)
-/// starts from, so the two can never disagree about what an unknown account looks like.
+/// lookup every account-derived input in this module starts from.
 fn stored_account(
     wallet: &MigrationWallet,
     account: AccountUuid,
@@ -109,10 +107,8 @@ fn stored_account(
         .ok_or_else(|| anyhow!("unknown account"))
 }
 
-/// The unified full viewing key a stored account row holds, or the hard error every key-needing
-/// path reports when it holds none: nothing downstream can proceed without one, and deferring to
-/// whichever engine call first needs the Orchard component would report the same condition later
-/// and less clearly.
+/// The unified full viewing key a stored account row holds, or a hard error when it holds none:
+/// nothing downstream can proceed without one.
 fn row_ufvk(
     row: &<MigrationWallet as WalletRead>::Account,
 ) -> anyhow::Result<UnifiedFullViewingKey> {
@@ -146,28 +142,21 @@ pub(crate) fn stored_orchard_fvk(
         .ok_or_else(|| anyhow!("the account's viewing key has no Orchard component"))
 }
 
-/// The `key_source` tag that marks an account whose transactions a Keystone hardware wallet signs,
-/// compared case-insensitively. It is the tag the platform layers stamp on a Keystone import
-/// (zodl-ios stamps it in `AddHWWalletStore` and reads it back as `WalletAccount.vendor`;
-/// `AccountDataSource.importKeystoneAccount` on Android), and the only account-level signal this
-/// SDK has that a run's signing carries a per-round QR cost.
+/// The `key_source` tag the platform layers stamp on a Keystone import, compared
+/// case-insensitively. It is the only account-level signal this SDK has that a run's signing
+/// carries a per-round QR cost. Mirrored in Swift as `Account.keystoneKeySource`.
 pub(crate) const KEYSTONE_KEY_SOURCE: &str = "keystone";
 
 /// How one migration run of an account with `source` is bounded — the sizing every planning and
-/// estimating call passes to the engine, so a preview describes exactly the runs that get planned.
+/// estimating call passes to the engine.
 ///
-/// A Keystone-tagged account (see [`KEYSTONE_KEY_SOURCE`]) is sized to what its signer signs in
-/// ONE interaction, [`RunSigningCapacity::KEYSTONE`] (96 actions per QR-scanned round): a run's
-/// actions are `16 * preparations + 3 * transfers` and the preparation count follows the wallet's
-/// fragmentation, so a fixed note cap alone cannot promise a single round. Every other account is
-/// signed in process, where a round has no per-interaction cost to bound, so it keeps the crate's
-/// default note-cap sizing, [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`] — exactly the bound
-/// `plan_migration` itself applies, so these accounts plan the same runs as before per-account
-/// sizing existed. An account without a `key_source`, or with any other tag, is an in-process
-/// signer.
-///
-/// Pure: the account row is read by [`planning_inputs`], which resolves this together with the
-/// stored viewing key from one lookup.
+/// A Keystone-tagged account (see [`KEYSTONE_KEY_SOURCE`]) is sized to
+/// [`RunSigningCapacity::KEYSTONE`], 96 actions per QR-scanned round. A run's actions are
+/// `16 * preparations + 3 * transfers` and the preparation count follows the wallet's
+/// fragmentation, so a fixed note cap alone cannot promise a single round. Every other account —
+/// no tag, or any other tag — signs in process, where a round has no per-interaction cost to
+/// bound, and keeps the crate's default [`MIGRATION_MAX_PREPARED_NOTES_PER_RUN`]: exactly the
+/// bound `plan_migration` applies, so those accounts plan the runs they always did.
 pub(crate) fn run_sizing(source: &AccountSource) -> RunSizing {
     let is_keystone = source
         .key_source()
@@ -179,19 +168,16 @@ pub(crate) fn run_sizing(source: &AccountSource) -> RunSizing {
     }
 }
 
-/// Everything a planning or estimating call derives from the account row, read in ONE lookup:
-/// the run sizing ([`run_sizing`]) and the stored unified full viewing key ([`stored_ufvk`]).
-/// `compute_plan` and `estimate_runs` in [`crate::migration`] build their adapter from `ufvk`
-/// through [`account_migration_with`], so one call reads the row once instead of once for the
-/// sizing and again for the key.
+/// Everything a planning or estimating call derives from the account row, read in ONE lookup: the
+/// run sizing and the stored unified full viewing key. Callers build their adapter from `ufvk`
+/// through [`account_migration_with`], so the row is read once, not once per input.
 pub(crate) struct PlanningInputs {
     pub sizing: RunSizing,
     pub ufvk: UnifiedFullViewingKey,
 }
 
-/// The [`PlanningInputs`] of `account`: a hard error when the wallet does not know the account
-/// ("unknown account") or its row holds no unified full viewing key — the same two errors
-/// [`stored_ufvk`] reports, from the same lookup.
+/// The [`PlanningInputs`] of `account`. Reports the same two errors as [`stored_ufvk`] — unknown
+/// account, or a row with no unified full viewing key — from the same lookup.
 pub(crate) fn planning_inputs(
     wallet: &MigrationWallet,
     account: AccountUuid,
@@ -220,9 +206,8 @@ pub(crate) fn account_migration<'a>(
     account_migration_with(wallet, account, ufvk, store_conn)
 }
 
-/// [`account_migration`] for a caller that already holds the account's stored viewing key — the
-/// planning and estimating entry points, which read it through [`planning_inputs`] alongside the
-/// run sizing and must not pay for the account row a second time.
+/// [`account_migration`] for a caller that already holds the account's stored viewing key, so the
+/// planning and estimating entry points do not pay for the account row twice.
 pub(crate) fn account_migration_with<'a>(
     wallet: &'a MigrationWallet,
     account: AccountUuid,
