@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 4.1.0 - 2026-08-25
+
 ## Changed
 
 - Migration runs are now sized PER ACCOUNT, by how the account signs. The contract is the
