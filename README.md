@@ -1,6 +1,6 @@
 # Zcash iOS Framework
 
-[![Build Status](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml)
+[![Build Status](https://github.com/zodl-inc/zodl-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zodl-swift-wallet-sdk/actions/workflows/swift.yml)
 
 
 A Zcash Lightweight Client SDK for iOS, maintained by the Zcash Open Development
@@ -23,21 +23,21 @@ advised of the following:
 
 ## Swift Package Manager
 
-Add a package with the source "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git" in
+Add a package with the source "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git" in
 either Xcode's GUI or in your `Package.swift` file. The package is named
 `zodl-swift-wallet-sdk` and its library product and module are `ZODLSwiftWalletSDK`.
-The `package:` argument of `.product(name:package:)` is the last path component of the
-repository URL, not the package name:
+SwiftPM derives the `package:` argument of `.product(name:package:)` from the last path
+component of the repository URL, which now matches the package name:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "3.0.0")
+    .package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "3.0.0")
 ],
 targets: [
     .target(
         name: "MyWallet",
         dependencies: [
-            .product(name: "ZODLSwiftWalletSDK", package: "zcash-swift-wallet-sdk")
+            .product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
         ]
     )
 ]

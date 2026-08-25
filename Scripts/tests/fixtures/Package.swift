@@ -4,7 +4,7 @@ import PackageDescription
 let targets: [Target] = [
     .binaryTarget(
         name: "libzcashlc",
-        url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk/releases/download/2.7.0-rc.3/libzcashlc.xcframework.zip",
+        url: "https://github.com/zcash/zcash-swift-wallet-sdk/releases/download/2.7.0-rc.3/libzcashlc.xcframework.zip",
         checksum: "0000000000000000000000000000000000000000000000000000000000000000"
     )
 ]

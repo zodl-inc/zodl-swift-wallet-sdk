@@ -123,7 +123,7 @@ test_package_swift_checksum_reads_checksum() {
 test_rewrite_package_swift_sets_url_and_checksum() {
     local f sum; f="$(fixture Package.swift)"
     sum="1111111111111111111111111111111111111111111111111111111111111111"
-    rewrite_package_swift "$f" zodl-inc/zcash-swift-wallet-sdk 2.7.1 "$sum"
+    rewrite_package_swift "$f" zodl-inc/zodl-swift-wallet-sdk 2.7.1 "$sum"
     assert_eq "2.7.1" "$(package_swift_url_version "$f")" "rewrite_package_swift sets the URL version"
     assert_eq "$sum" "$(package_swift_checksum "$f")" "rewrite_package_swift sets the checksum"
 }
@@ -137,7 +137,7 @@ test_rewrite_package_swift_sets_owner() {
     assert_file_contains "$f" \
         "https://github.com/nuttycom/zcash-swift-wallet-sdk/releases/download/2.7.1/libzcashlc.xcframework.zip" \
         "rewrite_package_swift rewrites the repository owner"
-    assert_file_lacks "$f" "zodl-inc/zcash-swift-wallet-sdk/releases" \
+    assert_file_lacks "$f" "zcash/zcash-swift-wallet-sdk/releases" \
         "rewrite_package_swift leaves no stale owner"
 }
 
@@ -145,6 +145,6 @@ test_rewrite_package_swift_fails_without_binary_target() {
     local f; f="$SCRATCH/no-target.swift"
     printf 'let package = Package(name: "X")\n' > "$f"
     assert_fails "rewrite_package_swift with no binary target" \
-        rewrite_package_swift "$f" zodl-inc/zcash-swift-wallet-sdk 2.7.1 \
+        rewrite_package_swift "$f" zodl-inc/zodl-swift-wallet-sdk 2.7.1 \
         1111111111111111111111111111111111111111111111111111111111111111
 }

@@ -2,14 +2,18 @@
 
 ## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
 
-The package, its library product, and its module are renamed. There is no compatibility product
-under the old name, so every import site changes. The `package:` argument of
-`.product(name:package:)` is derived by SwiftPM from the repository URL, which is unchanged.
+The package, its library product, and its module are renamed, and the repository has moved to
+`https://github.com/zodl-inc/zodl-swift-wallet-sdk`. There is no compatibility product under the
+old name, so every import site changes. SwiftPM derives the `package:` argument of
+`.product(name:package:)` from the last path component of the URL you declare, so update
+`.package(url:)` and `package:` together. GitHub redirects the old URL; a manifest that keeps it
+must keep `package: "zcash-swift-wallet-sdk"` to match.
 
 Before:
 
 ```swift
 // Package.swift
+.package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "4.0.0")
 .product(name: "ZcashLightClientKit", package: "zcash-swift-wallet-sdk")
 ```
 
@@ -25,7 +29,8 @@ After:
 
 ```swift
 // Package.swift
-.product(name: "ZODLSwiftWalletSDK", package: "zcash-swift-wallet-sdk")
+.package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "4.0.0")
+.product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
 ```
 
 ```swift

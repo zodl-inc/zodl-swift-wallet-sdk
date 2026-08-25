@@ -12,7 +12,7 @@
 PLIST="BuildSupport/platform-Info.plist"
 PRODUCTS_DIR="BuildSupport/products"
 ZIP_FILE="libzcashlc.xcframework.zip"
-DEFAULT_REPO="zodl-inc/zcash-swift-wallet-sdk"
+DEFAULT_REPO="zodl-inc/zodl-swift-wallet-sdk"
 
 # Set by each subcommand's argument parsing.
 DRY_RUN="${DRY_RUN:-false}"

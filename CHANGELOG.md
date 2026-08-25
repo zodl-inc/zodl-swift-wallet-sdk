@@ -13,11 +13,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Every `import ZcashLightClientKit` — including the `@testable` and `@_spi(Testing)` forms —
   and every module-qualified name such as `ZcashLightClientKit.BlockHeight` stops compiling
   until it says `ZODLSwiftWalletSDK`. In `Package.swift`, `.product(name: "ZcashLightClientKit", …)`
-  becomes `.product(name: "ZODLSwiftWalletSDK", …)`; the `package:` argument is unaffected,
-  because SwiftPM derives it from the repository URL rather than from the package name, and the
-  repository URL has not changed. A dependency declared with the explicit
-  `.package(name: "ZcashLightClientKit", url: …)` form must drop that `name:` or set it to
-  `"zodl-swift-wallet-sdk"`. There is no compatibility product under the old name.
+  becomes `.product(name: "ZODLSwiftWalletSDK", …)`. The repository is now
+  `https://github.com/zodl-inc/zodl-swift-wallet-sdk`: update `.package(url:)` to it and, because
+  SwiftPM derives the `package:` argument from the URL's last path component, set
+  `package: "zodl-swift-wallet-sdk"` in the same edit (GitHub redirects the old URL, and a
+  manifest that keeps it keeps `package: "zcash-swift-wallet-sdk"`). A dependency declared with
+  the explicit `.package(name: "ZcashLightClientKit", url: …)` form must drop that `name:` or
+  set it to `"zodl-swift-wallet-sdk"`. There is no compatibility product under the old name.
   Two runtime strings follow the module: a `ZcashError` bridged to `NSError` now reports the
   domain `ZODLSwiftWalletSDK.ZcashError` instead of `ZcashLightClientKit.ZcashError`, and the
   SPM resource bundle is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle` instead of
