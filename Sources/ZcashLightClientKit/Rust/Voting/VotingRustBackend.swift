@@ -349,6 +349,8 @@ extension VotingRustBackend {
     ///
     /// Safety: keep `progress` thread-safe, non-blocking, and limited to
     /// reporting state outside this backend.
+    ///
+    /// Holds the interactive proving QoS boost for the duration of the call.
     // swiftlint:disable:next function_parameter_count
     public func commitVote(
         roundId: String,
@@ -362,6 +364,8 @@ extension VotingRustBackend {
         singleShare: Bool,
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> VotingVoteCommit {
+        Self.beginInteractiveProvingBoost()
+        defer { Self.endInteractiveProvingBoost() }
         try requireOpenDatabase()
 
         let draft = VoteCommitDraft(
@@ -376,7 +380,7 @@ extension VotingRustBackend {
             singleShare: singleShare
         )
 
-        return try await Task.detached { [self] in
+        return try await Task.detached(priority: .userInitiated) { [self] in
             try syncCommitVote(draft, progress: progress)
         }.value
     }
@@ -592,6 +596,26 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Interactive proving QoS boost
+
+extension VotingRustBackend {
+    /// Raises every proving-pool worker from its resting utility QoS to
+    /// user-initiated for the duration of an interactive proving session.
+    /// Refcounted in the FFI; every begin must be paired with an end.
+    static func beginInteractiveProvingBoost() {
+        zcashlc_proving_interactive_begin()
+    }
+
+    static func endInteractiveProvingBoost() {
+        zcashlc_proving_interactive_end()
+    }
+
+    /// Outstanding interactive proving sessions (diagnostics and tests).
+    static func interactiveProvingBoostCount() -> Int32 {
+        zcashlc_proving_interactive_active()
+    }
+}
+
 // MARK: - Foundation helpers (static)
 
 extension VotingRustBackend {
@@ -601,6 +625,10 @@ extension VotingRustBackend {
     /// startup (off the main actor) to avoid a multi-second pause inside the
     /// first proving call.
     public static func warmProvingCaches() throws {
+        // The proving pool's workers idle at utility QoS; hold the interactive
+        // boost so keygen's rayon-parallel sections run at user-initiated speed.
+        beginInteractiveProvingBoost()
+        defer { endInteractiveProvingBoost() }
         let result = zcashlc_voting_warm_proving_caches()
         guard result == 0 else {
             throw VotingRustBackendError.rustError(
@@ -1754,6 +1782,8 @@ extension VotingRustBackend {
     /// Do not call back into this `VotingRustBackend` from `progress`. Rust may
     /// invoke the callback while the database-handle lock is held, so re-entering
     /// this backend can deadlock.
+    ///
+    /// Holds the interactive proving QoS boost for the duration of the call.
     public func buildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],
@@ -1762,6 +1792,8 @@ extension VotingRustBackend {
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> VotingDelegationProofResult {
+        Self.beginInteractiveProvingBoost()
+        defer { Self.endInteractiveProvingBoost() }
         try requireOpenDatabase()
 
         guard params.keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
@@ -1779,7 +1811,7 @@ extension VotingRustBackend {
         // caller's executor for the full duration. `VotingRustBackend` is
         // `@unchecked Sendable`, the lock keeps `withHandle` correct, and
         // `notes`/byte arrays cross the boundary by value.
-        return try await Task.detached { [self] in
+        return try await Task.detached(priority: .userInitiated) { [self] in
             try syncBuildAndProveDelegation(
                 params,
                 pirServerUrl: pirServerUrl,

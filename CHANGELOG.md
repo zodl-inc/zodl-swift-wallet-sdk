@@ -6,6 +6,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- Voting proving now runs at interactive priority while a user is waiting on it.
+  `VotingRustBackend.commitVote`, `buildAndProveDelegation` and `warmProvingCaches` hold
+  a scoped QoS boost that raises the shared rayon proving pool's workers from their
+  resting UTILITY QoS to USER_INITIATED for the duration of the call (refcounted;
+  released on scope exit, including throws), and the two async entry points detach at
+  `.userInitiated`. Background proving — the migration prove sweep and the overnight
+  BGTask path — keeps the existing utility demotion untouched outside those windows.
+  New FFI: `zcashlc_proving_interactive_begin` / `zcashlc_proving_interactive_end` /
+  `zcashlc_proving_interactive_active`.
+
 # 4.1.0 - 2026-08-25
 
 ## Changed
