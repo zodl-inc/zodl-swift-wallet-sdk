@@ -833,7 +833,10 @@ mod tests {
         );
 
         let after = call_get_sighash(db, round_id, &secret, &test_seed_fingerprint());
-        assert!(after.is_null(), "unsigned setup must be gone after the reset");
+        assert!(
+            after.is_null(),
+            "unsigned setup must be gone after the reset"
+        );
         assert_eq!(
             unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
             1,
