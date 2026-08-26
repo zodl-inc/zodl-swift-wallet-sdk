@@ -402,11 +402,13 @@ verify_against_local_ffi() {
     run make configure-local-ffi
     run make build
     run make test-offline
+    run ./Scripts/set-ffi-mode.sh release
 
-    # Leave the tree as we found it. LocalPackages/ is gitignored, but its mere
-    # presence switches Package.swift from the released binary target to the
-    # local one, so leaving it behind would silently change what the operator's
-    # next build links against.
+    # configure-local-ffi flipped the tracked Package.swift to the local FFI,
+    # so flip it back to the released binary. require_clean_tree at the start
+    # of the run guarantees the committed state was release mode, so this is
+    # an exact restoration. Then remove LocalPackages/ if this run created it,
+    # so the operator's next build links what they had before.
     if [ "$had_local_packages" = "false" ]; then
         run rm -rf LocalPackages
     else
