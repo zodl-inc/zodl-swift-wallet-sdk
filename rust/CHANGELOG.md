@@ -203,6 +203,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (single-transaction) lane is built entirely on the general-purpose
   `zcashlc_propose_send_max_transfer` (called with `orchard_only: true`) instead, which the engine
   itself never touches.
+- `zcashlc_proving_interactive_begin`, `zcashlc_proving_interactive_end`, and
+  `zcashlc_proving_interactive_active` apply a refcounted, scoped QoS boost to the global rayon
+  proving pool, for callers waiting on an interactive proof (e.g. a voting signature) rather than
+  background proving. On Apple platforms, `_begin` raises every pool worker to `USER_INITIATED` QoS
+  on the 0→1 session edge; `_end` releases the boost on the 1→0 edge and is a saturating no-op when
+  called without a matching `_begin`; `_active` reports the number of outstanding sessions. Workers
+  keep their resting `UTILITY` QoS outside an interactive session, so background proving (the
+  migration prove sweep, the overnight BGTask path) stays unaffected. Non-Apple targets track the
+  session refcount but apply no QoS override.
 
 ### Changed
 
