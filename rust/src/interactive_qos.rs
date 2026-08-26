@@ -116,7 +116,7 @@ pub(crate) fn register_current_thread() {
     }
     let thread = unsafe { pthread_self() };
     CORE.lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .register_worker(thread, logged_start_override);
 }
 
@@ -164,7 +164,7 @@ fn logged_start_override(worker: usize) -> usize {
 /// `zcashlc_proving_interactive_end`.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_proving_interactive_begin() {
-    let mut core = CORE.lock().unwrap();
+    let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     #[cfg(target_vendor = "apple")]
     {
         let sessions = core.begin(logged_start_override);
@@ -184,7 +184,7 @@ pub extern "C" fn zcashlc_proving_interactive_begin() {
 /// outstanding session ends; calling without a matching begin is a no-op.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_proving_interactive_end() {
-    let mut core = CORE.lock().unwrap();
+    let mut core = CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     #[cfg(target_vendor = "apple")]
     {
         let had_sessions = core.active() > 0;
@@ -212,7 +212,12 @@ pub extern "C" fn zcashlc_proving_interactive_end() {
 /// and test visibility only.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_proving_interactive_active() -> i32 {
-    i32::try_from(CORE.lock().unwrap().active()).unwrap_or(i32::MAX)
+    i32::try_from(
+        CORE.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active(),
+    )
+    .unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
