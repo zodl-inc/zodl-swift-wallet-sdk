@@ -1779,6 +1779,35 @@ extension VotingRustBackend {
         return bytes
     }
 
+    /// Deletes one bundle's persisted Keystone signature, so the bundle
+    /// becomes eligible again for ``resetSessionState(roundId:)``'s guarded
+    /// cleanup, which otherwise leaves bundles with a stored Keystone
+    /// signature untouched.
+    ///
+    /// Deleting a missing row succeeds.
+    ///
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/rustError`` if the underlying delete
+    ///   fails.
+    public func clearKeystoneSignature(roundId: String, bundleIndex: UInt32) throws {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_clear_keystone_signature(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`clear_keystone_signature` failed")
+                )
+            }
+        }
+    }
+
     /// Get the delegation submission payload for an externally produced
     /// signature.
     ///

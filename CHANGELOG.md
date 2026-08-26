@@ -33,6 +33,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round ID and bundle index, scoped to the already-open wallet database — the previous
   keys-taking form never shipped and has been removed. Throws when delegation setup is
   incomplete (e.g. after an interrupted build).
+- `VotingRustBackend.clearKeystoneSignature(roundId:bundleIndex:)` — deletes one bundle's
+  persisted Keystone signature, so a wallet that discards a stale signature can clear and
+  rebuild that bundle's setup via `resetSessionState(roundId:)`, which otherwise leaves
+  bundles with a stored Keystone signature untouched. Deleting a missing row succeeds.
 
 # 4.1.0 - 2026-08-25
 

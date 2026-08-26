@@ -318,6 +318,50 @@ pub unsafe extern "C" fn zcashlc_voting_get_keystone_signatures(
     unwrap_exc_or_null(res)
 }
 
+/// Deletes one bundle's persisted Keystone signature.
+///
+/// Deleting the signature makes the bundle eligible again for
+/// `zcashlc_voting_reset_session_state`'s guarded cleanup, which otherwise
+/// leaves bundles with a stored Keystone signature untouched. For wallets
+/// discarding a signature that no longer matches the bundle's stored
+/// delegation setup.
+///
+/// Returns 0 on success (including when no row exists to delete), -1 on
+/// error.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_clear_keystone_signature(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        handle
+            .db
+            .conn()
+            .execute(
+                "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+                rusqlite::named_params! {
+                    ":round_id": round_id_str,
+                    ":wallet_id": handle.db.wallet_id(),
+                    ":bundle_index": bundle_index as i64,
+                },
+            )
+            .map_err(|e| anyhow!("clear_keystone_signature failed: {}", e))?;
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// Clear retryable recovery state for a round without erasing recorded
 /// confirmations.
 ///
@@ -643,6 +687,84 @@ mod tests {
         }
 
         unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn clear_keystone_signature_deletes_one_bundles_row() {
+        let db = open_memory_db();
+        let round_id = b"round";
+        insert_round_and_bundle(db, "round");
+        let sig = [1u8; KEYSTONE_SIGNATURE_LEN];
+        let sighash = [2u8; PCZT_SIGHASH_LEN];
+        let rk = [3u8; RANDOMIZED_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_store_keystone_signature(
+                    db,
+                    round_id.as_ptr(),
+                    round_id.len(),
+                    0,
+                    sig.as_ptr(),
+                    sig.len(),
+                    sighash.as_ptr(),
+                    sighash.len(),
+                    rk.as_ptr(),
+                    rk.len(),
+                )
+            },
+            0
+        );
+
+        let before: Vec<serde_json::Value> = decode_boxed_json(unsafe {
+            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
+        });
+        assert_eq!(before.len(), 1, "signature must be listed before the clear");
+
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(db, round_id.as_ptr(), round_id.len(), 0)
+        };
+        assert_eq!(rc, 0);
+
+        let after: Vec<serde_json::Value> = decode_boxed_json(unsafe {
+            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
+        });
+        assert!(
+            after.is_empty(),
+            "bundle 0's signature must be gone after the clear"
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn clear_keystone_signature_on_missing_row_succeeds() {
+        let db = open_memory_db();
+        let round_id = b"round";
+        insert_round_and_bundle(db, "round");
+
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(db, round_id.as_ptr(), round_id.len(), 0)
+        };
+        assert_eq!(
+            rc, 0,
+            "clearing a bundle with no stored signature must still succeed"
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn clear_keystone_signature_rejects_null_db() {
+        let round_id = b"round";
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(
+                std::ptr::null_mut(),
+                round_id.as_ptr(),
+                round_id.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, -1);
     }
 
     /// Stores the delegation tx hash, vote tx hash, and a Keystone signature

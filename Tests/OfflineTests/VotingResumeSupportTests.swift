@@ -71,6 +71,13 @@ final class VotingResumeSupportTests: XCTestCase {
         }
     }
 
+    func test_clearKeystoneSignature_onUnknownRound_succeeds() throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+
+        XCTAssertNoThrow(try backend.clearKeystoneSignature(roundId: resumeMissingRoundId, bundleIndex: 0))
+    }
+
     // MARK: - Helpers
 
     private func makeTempDbPath() -> String {
