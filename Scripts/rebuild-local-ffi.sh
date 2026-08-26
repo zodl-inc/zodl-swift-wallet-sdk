@@ -20,6 +20,16 @@ if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"
 fi
 
+# Refuse to rebuild what the manifest will not link: in release mode the
+# freshly built framework would sit in LocalPackages/ unused, which reads
+# as "my Rust changes do nothing".
+. Scripts/lib/release-lib.sh
+if [[ "$(package_swift_ffi_mode Package.swift)" != "local" ]]; then
+    echo "error: Package.swift is in release FFI mode; a local rebuild would not be linked." >&2
+    echo "       Run ./Scripts/init-local-ffi.sh (or 'make configure-local-ffi') first." >&2
+    exit 1
+fi
+
 # Parse a target (ios-sim|ios-device|macos) + optional --gpu (v0.3 GPU Orchard offload
 # build; links wgpu via the libzcashlc `gpu` feature). Runtime opt-in: ZCASH_GPU_SUBTREE.
 # --universal (macos, ios-sim): build BOTH archs of the slice and lipo them — REQUIRED

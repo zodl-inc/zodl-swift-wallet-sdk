@@ -1,16 +1,16 @@
 #!/bin/bash
-# Remove local FFI development environment and switch back to release binary
+# Switch back to the released FFI binary and remove the local development
+# environment. Safe to run repeatedly and in any half-switched state.
 # Usage: ./Scripts/reset-local-ffi.sh
 
 set -e
 cd "$(dirname "$0")/.."
 
-if [[ ! -d "LocalPackages" ]]; then
-    echo "LocalPackages/ does not exist. Already using the release binary."
-    exit 0
+./Scripts/set-ffi-mode.sh release
+
+if [[ -d "LocalPackages" ]]; then
+    rm -rf LocalPackages/
+    echo "Removed LocalPackages/."
 fi
 
-rm -rf LocalPackages/
-echo "Removed LocalPackages/. Package.swift will now use the release binary."
-echo ""
-echo "If using Xcode, you may need to: File > Packages > Reset Package Caches"
+echo "Package.swift now uses the released FFI binary."
