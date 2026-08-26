@@ -351,11 +351,41 @@ pub unsafe extern "C" fn zcashlc_voting_clear_recovery_state(
     unwrap_exc_or(res, -1)
 }
 
+/// Drops the round's cached vote tree and clears locally prepared unsigned
+/// delegation setup fields so an interrupted Keystone signing request can be
+/// rebuilt. Bundles that already have a Keystone signature, a stored
+/// delegation tx hash, or a recorded VAN position are preserved.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_reset_session_state(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        voting::precompute::reset_voting_session_state(&handle.db, &round_id_str)
+            .map_err(|e| anyhow!("reset_voting_session_state failed: {}", e))?;
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;
     use crate::voting::db::zcashlc_voting_db_free;
+    use crate::voting::delegation::zcashlc_voting_get_bundle_count;
     use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
     use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
     use serde::de::DeserializeOwned;
@@ -761,5 +791,31 @@ mod tests {
         assert!(keystone_sigs.is_empty());
 
         unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn reset_session_state_clears_unsigned_setup_and_keeps_bundles() {
+        let db = open_memory_db();
+        insert_round_and_bundle(db, "round");
+        let round_id = b"round";
+        assert_eq!(
+            unsafe { zcashlc_voting_reset_session_state(db, round_id.as_ptr(), round_id.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
+            1
+        );
+    }
+
+    #[test]
+    fn reset_session_state_rejects_null_db() {
+        let round_id = b"round";
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_reset_session_state(std::ptr::null_mut(), round_id.as_ptr(), round_id.len())
+            },
+            -1
+        );
     }
 }

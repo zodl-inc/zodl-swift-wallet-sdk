@@ -215,6 +215,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
+- `zcashlc_voting_reset_session_state(db, round_id, round_id_len) -> i32` clears one round's
+  cached vote tree state and locally prepared unsigned delegation setup fields so an
+  interrupted Keystone signing request can be rebuilt. Bundles with a stored Keystone
+  signature, a stored delegation tx hash, or a recorded VAN position are untouched, unlike
+  `zcashlc_voting_clear_round`. Returns 0 on success, -1 on error. No existing call sites
+  change.
 
 ### Changed
 
