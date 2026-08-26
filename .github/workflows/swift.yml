@@ -26,6 +26,16 @@ jobs:
         persist-credentials: false
       timeout-minutes: 1
 
+    # The committed manifest must select the released FFI binary: consumers
+    # cannot resolve the package with the local-FFI flag set. The "Configure
+    # local FFI for CI" step below flips the runner's working copy only.
+    - name: Verify Package.swift is committed in release FFI mode
+      run: |
+        if ! grep -qE '^let useLocalFFI = false$' Package.swift; then
+          echo "::error file=Package.swift::Package.swift must be committed with 'let useLocalFFI = false'. Run ./Scripts/set-ffi-mode.sh release and amend the commit."
+          exit 1
+        fi
+
     - name: Select Xcode version
       run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
 
@@ -106,7 +116,7 @@ jobs:
       timeout-minutes: 30
       run: make test-rust
 
-    # Set up LocalPackages so Package.swift auto-detects the local build
+    # Stage LocalPackages and flip Package.swift to link the just-built FFI
     - name: Configure local FFI for CI
       run: make configure-local-ffi
 
