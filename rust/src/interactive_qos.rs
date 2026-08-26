@@ -10,11 +10,14 @@
 //! demotion survives untouched outside those windows.
 //!
 //! Sessions are refcounted: `begin` boosts on the 0→1 edge, `end` releases on
-//! the 1→0 edge, and an unmatched `end` is a saturating no-op. Workers are
-//! recorded once, from the pool's `start_handler`; a thread that registers
-//! while a session is already active is only picked up by the next session,
-//! which is fine because the pool is fully built during
-//! `zcashlc_init_on_load`, long before any proving session can begin.
+//! the 1→0 edge, and an unmatched `end` is a saturating no-op. While a session
+//! is open the boost is pool-wide: every job the pool runs — including any
+//! background proving that overlaps the session — executes on boosted workers.
+//! Workers are recorded from the pool's `start_handler`; `build_global()` does
+//! NOT wait for start handlers, so registration may still be in flight when
+//! the first session begins. Registration is therefore self-correcting: a
+//! worker that registers while a session is active has its override started
+//! immediately and released with everyone else's on the session's last end.
 
 use std::sync::Mutex;
 
@@ -33,8 +36,14 @@ impl BoostCore {
         }
     }
 
-    fn register_worker(&mut self, thread: usize) {
+    fn register_worker(&mut self, thread: usize, start_override: impl Fn(usize) -> usize) {
         self.workers.push(thread);
+        if self.sessions > 0 {
+            let token = start_override(thread);
+            if token != 0 {
+                self.overrides.push(token);
+            }
+        }
     }
 
     /// Returns the new session count. `start_override` runs once per worker on
@@ -90,7 +99,9 @@ pub(crate) fn register_current_thread() {
         fn pthread_self() -> usize;
     }
     let thread = unsafe { pthread_self() };
-    CORE.lock().unwrap().register_worker(thread);
+    CORE.lock()
+        .unwrap()
+        .register_worker(thread, start_qos_override);
 }
 
 /// Raise `worker` to USER_INITIATED QoS, returning the override token (0 if
@@ -157,8 +168,8 @@ mod tests {
     #[test]
     fn begin_boosts_each_worker_once_and_refcounts_sessions() {
         let mut core = BoostCore::new();
-        core.register_worker(11);
-        core.register_worker(22);
+        core.register_worker(11, |_| 0);
+        core.register_worker(22, |_| 0);
 
         let started = RefCell::new(Vec::new());
         let start = |worker: usize| {
@@ -180,7 +191,7 @@ mod tests {
     #[test]
     fn end_without_begin_is_a_saturating_no_op() {
         let mut core = BoostCore::new();
-        core.register_worker(11);
+        core.register_worker(11, |_| 0);
 
         let stop_calls = RefCell::new(0usize);
         assert_eq!(core.end(|_| { *stop_calls.borrow_mut() += 1 }), 0);
@@ -191,8 +202,8 @@ mod tests {
     #[test]
     fn failed_override_tokens_are_not_released() {
         let mut core = BoostCore::new();
-        core.register_worker(11);
-        core.register_worker(22);
+        core.register_worker(11, |_| 0);
+        core.register_worker(22, |_| 0);
 
         core.begin(|worker| if worker == 11 { 0 } else { 2022 });
         let ended = RefCell::new(Vec::new());
@@ -201,23 +212,22 @@ mod tests {
     }
 
     #[test]
-    fn workers_registered_mid_session_join_the_next_session() {
+    fn workers_registered_mid_session_are_boosted_immediately() {
         let mut core = BoostCore::new();
-        core.register_worker(11);
-
         let started = RefCell::new(Vec::new());
         let start = |worker: usize| {
             started.borrow_mut().push(worker);
             worker + 1000
         };
+        core.register_worker(11, &start);
+        assert!(started.borrow().is_empty());
         core.begin(&start);
-        core.register_worker(22);
-        assert_eq!(*started.borrow(), vec![11]);
-        core.end(|_| ());
+        core.register_worker(22, &start);
+        assert_eq!(*started.borrow(), vec![11, 22]);
 
-        core.begin(&start);
-        assert_eq!(*started.borrow(), vec![11, 11, 22]);
-        core.end(|_| ());
+        let ended = RefCell::new(Vec::new());
+        core.end(|token| ended.borrow_mut().push(token));
+        assert_eq!(*ended.borrow(), vec![1011, 1022]);
     }
 
     #[cfg(target_vendor = "apple")]
