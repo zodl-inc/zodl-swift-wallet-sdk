@@ -21,28 +21,51 @@ _hook_repo() {
     printf '%s\n' "$dir"
 }
 
+# Run the hook with cwd set to $1. A `( cd ... )` subshell rather than
+# `env -C`: `-C` is a BSD-env extension (FreeBSD 14.2+, Nov 2024) that
+# macos-15 -- the image swift.yml's CI runs on -- predates, so it is not
+# portable enough for a test this suite must run there. Wrapped in a function
+# because assert_succeeds/assert_fails invoke their argument list as "$@",
+# and a bare subshell cannot be handed to them as data -- only a function or
+# external command can.
+_run_hook_in() {
+    local dir="$1"
+    ( cd "$dir" && "$REPO_ROOT/Scripts/hooks/pre-commit" )
+}
+
+# Same, but with the escape hatch set for the hook process. The assignment is
+# written literally here (not forwarded through "$@") because bash only
+# recognizes a NAME=value word as an environment assignment when it is a
+# literal token in the source at parse time -- one produced by expanding a
+# positional parameter is just an ordinary argument, so forwarding it would
+# leave the variable unset and the hook would see none of it.
+_run_hook_in_with_override() {
+    local dir="$1"
+    ( cd "$dir" && ZODL_ALLOW_LOCAL_FFI_COMMIT=1 "$REPO_ROOT/Scripts/hooks/pre-commit" )
+}
+
 test_hook_rejects_staged_local_mode() {
     local dir; dir="$(_hook_repo true)"
     assert_fails "hook with staged useLocalFFI = true" \
-        env -C "$dir" "$REPO_ROOT/Scripts/hooks/pre-commit"
+        _run_hook_in "$dir"
 }
 
 test_hook_allows_staged_release_mode() {
     local dir; dir="$(_hook_repo false)"
     assert_succeeds "hook with staged useLocalFFI = false" \
-        env -C "$dir" "$REPO_ROOT/Scripts/hooks/pre-commit"
+        _run_hook_in "$dir"
 }
 
 test_hook_ignores_unstaged_local_mode() {
     local dir; dir="$(_hook_repo none)"
     assert_succeeds "hook with local-mode worktree but unstaged Package.swift" \
-        env -C "$dir" "$REPO_ROOT/Scripts/hooks/pre-commit"
+        _run_hook_in "$dir"
 }
 
 test_hook_escape_hatch() {
     local dir; dir="$(_hook_repo true)"
     assert_succeeds "hook with ZODL_ALLOW_LOCAL_FFI_COMMIT=1" \
-        env -C "$dir" ZODL_ALLOW_LOCAL_FFI_COMMIT=1 "$REPO_ROOT/Scripts/hooks/pre-commit"
+        _run_hook_in_with_override "$dir"
 }
 
 _installer_repo() {
