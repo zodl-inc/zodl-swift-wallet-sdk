@@ -393,7 +393,10 @@ mod tests {
     use crate::voting::db::zcashlc_voting_db_free;
     use crate::voting::delegation::zcashlc_voting_get_bundle_count;
     use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
+    use crate::voting::test_helpers::{
+        TEST_ROUND_ID, call_get_sighash, insert_round_and_bundle, open_memory_db,
+        plant_signing_request, test_seed_fingerprint, valid_stored_secret,
+    };
     use serde::de::DeserializeOwned;
 
     fn decode_boxed_json<T: DeserializeOwned>(ptr: *mut crate::ffi::BoxedSlice) -> T {
@@ -799,25 +802,33 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
-    /// Round-trips `zcashlc_voting_reset_session_state` through the FFI and
-    /// confirms the bundle survives it. `insert_round_and_bundle`'s fixture
-    /// bundle has no unsigned setup columns populated, so this does not
-    /// verify that those columns are actually cleared — it is a round-trip +
-    /// preservation smoke test; `zcash_voting` owns the clearing coverage.
+    /// Round-trip proof that the reset actually clears the unsigned delegation
+    /// setup: a planted signing request answers the sighash readback before the
+    /// reset and no longer does after, while the bundle row itself survives.
     #[test]
     fn reset_session_state_clears_unsigned_setup_and_keeps_bundles() {
         let db = open_memory_db();
-        insert_round_and_bundle(db, "round");
-        let round_id = b"round";
+        plant_signing_request(db, &[0u8; 32]);
+        let secret = valid_stored_secret();
+
+        let round_id = TEST_ROUND_ID.as_bytes();
+        let before = call_get_sighash(db, round_id, &secret, &test_seed_fingerprint());
+        assert!(!before.is_null(), "setup must be present before the reset");
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(before) };
+
         assert_eq!(
             unsafe { zcashlc_voting_reset_session_state(db, round_id.as_ptr(), round_id.len()) },
-            0
-        );
-        assert_eq!(
-            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
-            1
+            0,
+            "reset must succeed"
         );
 
+        let after = call_get_sighash(db, round_id, &secret, &test_seed_fingerprint());
+        assert!(after.is_null(), "unsigned setup must be gone after the reset");
+        assert_eq!(
+            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
+            1,
+            "bundle rows must survive the reset"
+        );
         unsafe { zcashlc_voting_db_free(db) };
     }
 
