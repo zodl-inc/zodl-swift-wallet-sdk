@@ -178,11 +178,15 @@ pub unsafe extern "C" fn zcashlc_voting_sign_delegation_request(
 
 /// Loads the stored ZIP-244 sighash of one delegation bundle's persisted PCZT.
 ///
-/// This is a pure readback: unlike `zcashlc_voting_sign_delegation_request`,
-/// wallet seed material is never touched, no key is derived, and nothing is
-/// signed. The crate call loads `alpha` into the request struct internally,
+/// This is a pure readback: unlike `zcashlc_voting_sign_delegation_request`, no
+/// wallet seed material is touched and nothing is signed. An Orchard address is
+/// still derived from `hotkey_stored_secret` in order to reconstruct the
+/// `DelegationKeys` the request is loaded through, so this call is not free of
+/// key derivation — it is free of *wallet account* key derivation and of
+/// signing. The crate call loads `alpha` into the request struct internally,
 /// but it never crosses the FFI boundary — only the sighash is serialized
-/// back. It exists so a wallet holding a signature produced out of band (e.g.
+/// back.
+/// It exists so a wallet holding a signature produced out of band (e.g.
 /// by a Keystone hardware signer) can re-fetch the exact sighash the bundle's
 /// delegation setup persisted and check it against the signature before
 /// trusting it, without repeating the signing-specific validation the sign
@@ -637,5 +641,40 @@ mod tests {
         );
 
         assert!(result.is_null());
+    }
+
+    /// Positive control for the readback: the same planted fixture the negative
+    /// tests use must return the sighash that was stored, which is what proves
+    /// they fail on the missing setup rather than on a broken plant.
+    #[test]
+    fn get_delegation_signing_sighash_returns_planted_sighash() {
+        let db = open_memory_db();
+        plant_signing_request(db, &[0u8; 32]);
+        let secret = valid_stored_secret();
+
+        let result = call_get_sighash(
+            db,
+            TEST_ROUND_ID.as_bytes(),
+            &secret,
+            &test_seed_fingerprint(),
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+        assert!(!result.is_null(), "planted request must yield a sighash");
+        let bytes = unsafe { (*result).as_slice() }.to_vec();
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(result) };
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("sighash json");
+        let sighash: Vec<u8> = json
+            .as_array()
+            .expect("sighash array")
+            .iter()
+            .map(|v| u8::try_from(v.as_u64().expect("byte")).expect("byte range"))
+            .collect();
+        assert_eq!(
+            sighash,
+            PLANTED_SIGHASH.to_vec(),
+            "returned sighash must echo the stored one"
+        );
     }
 }
