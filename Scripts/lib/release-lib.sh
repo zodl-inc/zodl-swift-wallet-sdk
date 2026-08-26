@@ -329,3 +329,23 @@ require_gh_auth() {
 # this rather than a hardcoded slug, so a rehearsal against a fork stays inside
 # the fork instead of reaching the canonical repository.
 repo_for_remote() { repo_slug_from_url "$(git remote get-url "$1")"; }
+
+# Install the pre-commit guard that rejects committing Package.swift in
+# local-FFI mode. cwd must be the repository root. A pre-commit hook this
+# repo does not own is left alone (warning), so a developer's own hook
+# setup is never clobbered; our own older copy is refreshed in place.
+install_local_ffi_hook() {
+    local hooks_dir hook src marker
+    marker="zodl-swift-wallet-sdk local-FFI guard"
+    src="Scripts/hooks/pre-commit"
+    hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null)" || return 0
+    hook="$hooks_dir/pre-commit"
+    if [ -f "$hook" ] && ! grep -qF "$marker" "$hook"; then
+        warn "a pre-commit hook already exists at $hook; not installing the local-FFI guard." \
+             "Append the check from $src yourself if you want it."
+        return 0
+    fi
+    mkdir -p "$hooks_dir"
+    cp "$src" "$hook"
+    chmod +x "$hook"
+}

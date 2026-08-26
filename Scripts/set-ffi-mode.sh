@@ -32,3 +32,5 @@ if ! set_package_swift_ffi_mode Package.swift "$MODE"; then
     exit 1
 fi
 echo "Package.swift FFI mode: $MODE"
+
+install_local_ffi_hook

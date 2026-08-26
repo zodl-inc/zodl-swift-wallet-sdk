@@ -1,0 +1,27 @@
+#!/bin/bash
+# zodl-swift-wallet-sdk local-FFI guard
+#
+# Installed by Scripts/set-ffi-mode.sh; the committed source of truth is
+# Scripts/hooks/pre-commit. Rejects a commit whose STAGED Package.swift
+# selects the local FFI build: package consumers cannot resolve that state,
+# and CI rejects it. Committing other files while the working tree is in
+# local mode stays allowed — only the staged manifest matters.
+#
+# Deliberate override: ZODL_ALLOW_LOCAL_FFI_COMMIT=1 git commit ...
+
+if [ "${ZODL_ALLOW_LOCAL_FFI_COMMIT:-0}" = "1" ]; then
+    exit 0
+fi
+
+if git diff --cached --name-only | grep -qx "Package.swift"; then
+    if git show :Package.swift 2>/dev/null | grep -qE '^let useLocalFFI = true$'; then
+        echo "error: the staged Package.swift has 'let useLocalFFI = true' (local FFI mode)." >&2
+        echo "       Consumers cannot resolve the package in that state, and CI rejects it." >&2
+        echo "       Unstage it:            git restore --staged Package.swift" >&2
+        echo "       Flip the mode back:    ./Scripts/set-ffi-mode.sh release" >&2
+        echo "       Intentional override:  ZODL_ALLOW_LOCAL_FFI_COMMIT=1 git commit ..." >&2
+        exit 1
+    fi
+fi
+
+exit 0
