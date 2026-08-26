@@ -1310,6 +1310,28 @@ extension VotingRustBackend {
             }
         }
     }
+
+    /// Clears the round's cached vote tree and locally prepared UNSIGNED
+    /// delegation setup fields so an interrupted Keystone signing request can
+    /// be rebuilt; bundles with a Keystone signature, a stored delegation tx
+    /// hash, or a recorded VAN position are preserved.
+    ///
+    /// This is the safe per-round cleanup for resuming an interrupted voting
+    /// session — unlike `clearRound`, it never destroys delegation material an
+    /// on-chain registration may depend on.
+    public func resetSessionState(roundId: String) throws {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_reset_session_state(dbh, buf.baseAddress, UInt(buf.count))
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`reset_session_state` failed")
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Share delegation tracking
@@ -1703,6 +1725,66 @@ extension VotingRustBackend {
         }
         defer { zcashlc_free_boxed_slice(ptr) }
         return try decodeJSON(from: ptr)
+    }
+
+    /// Returns the stored ZIP-244 sighash of the bundle's persisted delegation
+    /// PCZT, so a caller can verify a persisted Keystone signature still
+    /// matches the bundle's delegation data before trusting it.
+    ///
+    /// Throws when delegation setup is incomplete for the bundle.
+    public func getDelegationSigningSighash(
+        roundId: String,
+        bundleIndex: UInt32,
+        keys: VotingDelegationKeyInputs
+    ) throws -> Data {
+        guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
+            )
+        }
+
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let roundNameBytes = [UInt8](keys.roundName.utf8)
+
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
+                keys.fvk.withUnsafeBufferPointer { fvkBuf in
+                    keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
+                        keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                zcashlc_voting_get_delegation_signing_sighash(
+                                    dbh,
+                                    ridBuf.baseAddress,
+                                    UInt(ridBuf.count),
+                                    bundleIndex,
+                                    fvkBuf.baseAddress,
+                                    UInt(fvkBuf.count),
+                                    secretBuf.baseAddress,
+                                    UInt(secretBuf.count),
+                                    fpBuf.baseAddress,
+                                    UInt(fpBuf.count),
+                                    keys.accountIndex,
+                                    nameBuf.baseAddress,
+                                    UInt(nameBuf.count)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`get_delegation_signing_sighash` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        let bytes: [UInt8] = try decodeJSON(from: ptr)
+        guard bytes.count == 32 else {
+            throw VotingRustBackendError.invalidData("sighash must be 32 bytes")
+        }
+        return Data(bytes)
     }
 
     /// Get the delegation submission payload for an externally produced

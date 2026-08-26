@@ -16,6 +16,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proving that overlaps an interactive proving call is temporarily raised with it; outside
   those windows — including during `warmProvingCaches()`, which deliberately stays at the
   pool's resting priority — background proving keeps the existing utility demotion.
+- `VotingRustBackend.resetSessionState(roundId:)` — clears a round's cached vote tree and
+  locally prepared UNSIGNED delegation setup fields so an interrupted Keystone signing
+  request can be rebuilt, while preserving bundles that already have a Keystone signature,
+  a stored delegation tx hash, or a recorded VAN position. This is the safe per-round
+  cleanup for resuming an interrupted voting session: unlike `clearRound(roundId:)`, it
+  never destroys delegation material that an on-chain registration may already depend on.
+- `VotingRustBackend.getDelegationSigningSighash(roundId:bundleIndex:keys:)` — returns the
+  stored ZIP-244 sighash of the bundle's persisted delegation PCZT, so a wallet can verify
+  that a persisted Keystone signature still matches the bundle's delegation data before
+  trusting it. Throws when delegation setup is incomplete (e.g. after an interrupted
+  build). No existing call sites need changes.
 
 # 4.1.0 - 2026-08-25
 
