@@ -1321,9 +1321,9 @@ extension VotingRustBackend {
     /// on-chain registration may depend on.
     ///
     /// - Throws: ``VotingRustBackendError/invalidData`` if `roundId` is empty.
-    ///   The crate treats an empty round ID as a different, account-wide reset
-    ///   of every round's cached tree client; this wrapper promises per-round
-    ///   semantics only, so it rejects that input instead of forwarding it.
+    ///   This wrapper rejects the empty id up front, matching the FFI, which
+    ///   also refuses it rather than resetting every round's cached tree
+    ///   client account-wide.
     public func resetSessionState(roundId: String) throws {
         guard !roundId.isEmpty else {
             throw VotingRustBackendError.invalidData("roundId must not be empty")
