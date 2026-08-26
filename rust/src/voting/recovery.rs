@@ -405,7 +405,7 @@ mod tests {
     use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
     use crate::voting::test_helpers::{
         TEST_ROUND_ID, call_get_sighash, insert_round_and_bundle, open_memory_db,
-        plant_signing_request, test_seed_fingerprint, valid_stored_secret,
+        plant_signing_request,
     };
     use serde::de::DeserializeOwned;
 
@@ -819,10 +819,9 @@ mod tests {
     fn reset_session_state_clears_unsigned_setup_and_keeps_bundles() {
         let db = open_memory_db();
         plant_signing_request(db, &[0u8; 32]);
-        let secret = valid_stored_secret();
 
         let round_id = TEST_ROUND_ID.as_bytes();
-        let before = call_get_sighash(db, round_id, &secret, &test_seed_fingerprint());
+        let before = call_get_sighash(db, round_id);
         assert!(!before.is_null(), "setup must be present before the reset");
         unsafe { crate::ffi::zcashlc_free_boxed_slice(before) };
 
@@ -832,7 +831,7 @@ mod tests {
             "reset must succeed"
         );
 
-        let after = call_get_sighash(db, round_id, &secret, &test_seed_fingerprint());
+        let after = call_get_sighash(db, round_id);
         assert!(
             after.is_null(),
             "unsigned setup must be gone after the reset"

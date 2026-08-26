@@ -1735,66 +1735,36 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
-    /// Returns the stored ZIP-244 sighash of the bundle's persisted delegation
-    /// PCZT, so a caller can verify a persisted Keystone signature still
-    /// matches the bundle's delegation data before trusting it.
+    /// Keyless readback of the stored ZIP-244 sighash of the bundle's
+    /// persisted delegation PCZT, scoped to the open wallet.
     ///
-    /// - Parameters:
-    ///   - keys: the same ``VotingDelegationKeyInputs`` used to build and prove
-    ///     this bundle. The crate loads the signing request through them.
+    /// Used to verify a persisted Keystone signature still matches the
+    /// bundle's delegation data before trusting it.
+    ///
     /// - Returns: the 32-byte ZIP-244 sighash. Pass it to
     ///   ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``
     ///   alongside the matching signature, exactly as
     ///   ``VotingDelegationSignature/sighash`` is.
     /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
-    ///   open; ``VotingRustBackendError/invalidData`` if the seed fingerprint is
-    ///   the wrong length, or if the returned sighash is not exactly 32 bytes;
-    ///   ``VotingRustBackendError/rustError`` if delegation setup is incomplete
-    ///   for the bundle (its PCZT setup has not run), or the supplied keys'
-    ///   network does not match the round.
-    public func getDelegationSigningSighash(
-        roundId: String,
-        bundleIndex: UInt32,
-        keys: VotingDelegationKeyInputs
-    ) throws -> [UInt8] {
-        guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-
+    ///   open; ``VotingRustBackendError/rustError`` if delegation setup is
+    ///   incomplete for the bundle (its PCZT setup has not run, or a later
+    ///   step wiped the stored sighash); ``VotingRustBackendError/invalidData``
+    ///   if the returned sighash is not exactly 32 bytes.
+    public func getStoredPcztSighash(roundId: String, bundleIndex: UInt32) throws -> [UInt8] {
         let roundIdBytes = [UInt8](roundId.utf8)
-        let roundNameBytes = [UInt8](keys.roundName.utf8)
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                keys.fvk.withUnsafeBufferPointer { fvkBuf in
-                    keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                        keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                zcashlc_voting_get_delegation_signing_sighash(
-                                    dbh,
-                                    ridBuf.baseAddress,
-                                    UInt(ridBuf.count),
-                                    bundleIndex,
-                                    fvkBuf.baseAddress,
-                                    UInt(fvkBuf.count),
-                                    secretBuf.baseAddress,
-                                    UInt(secretBuf.count),
-                                    fpBuf.baseAddress,
-                                    UInt(fpBuf.count),
-                                    keys.accountIndex,
-                                    nameBuf.baseAddress,
-                                    UInt(nameBuf.count)
-                                )
-                            }
-                        }
-                    }
-                }
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_get_stored_pczt_sighash(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
             }
             guard let ptr else {
                 throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_delegation_signing_sighash` failed")
+                    lastErrorMessage(fallback: "`get_stored_pczt_sighash` failed")
                 )
             }
             return ptr

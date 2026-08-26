@@ -1,9 +1,9 @@
 use zcash_voting as voting;
 use zcash_voting::storage::queries;
 
-use super::constants::{ORCHARD_FVK_LEN, SEED_FINGERPRINT_LEN};
+use super::constants::SEED_FINGERPRINT_LEN;
 use super::db::{VotingDatabaseHandle, zcashlc_voting_db_open, zcashlc_voting_set_wallet_id};
-use super::signing::zcashlc_voting_get_delegation_signing_sighash;
+use super::signing::zcashlc_voting_get_stored_pczt_sighash;
 
 pub(crate) fn open_memory_db() -> *mut VotingDatabaseHandle {
     let path = b":memory:";
@@ -109,33 +109,13 @@ pub(crate) fn plant_signing_request(db: *mut VotingDatabaseHandle, alpha: &[u8; 
     .expect("plant delegation signing data");
 }
 
-/// Marshals the same delegation-key inputs as `call_sign`, minus the seed
-/// pair, for the pure-readback FFI under test.
+/// Thin wrapper around `zcashlc_voting_get_stored_pczt_sighash` for bundle 0,
+/// the only bundle index these tests exercise. The readback takes no
+/// delegation-key inputs, so unlike `call_sign` there is nothing here to
+/// marshal beyond the round id.
 pub(crate) fn call_get_sighash(
     db: *mut VotingDatabaseHandle,
     round_id: &[u8],
-    hotkey_secret: &[u8],
-    seed_fingerprint: &[u8],
 ) -> *mut crate::ffi::BoxedSlice {
-    // Same placeholder rationale as `call_sign`: the FVK rides through
-    // `DelegationKeys` unvalidated and unread on this readback path too.
-    let fvk = [0u8; ORCHARD_FVK_LEN];
-    let round_name = b"NU6.3 voting round";
-    unsafe {
-        zcashlc_voting_get_delegation_signing_sighash(
-            db,
-            round_id.as_ptr(),
-            round_id.len(),
-            0,
-            fvk.as_ptr(),
-            fvk.len(),
-            hotkey_secret.as_ptr(),
-            hotkey_secret.len(),
-            seed_fingerprint.as_ptr(),
-            seed_fingerprint.len(),
-            0,
-            round_name.as_ptr(),
-            round_name.len(),
-        )
-    }
+    unsafe { zcashlc_voting_get_stored_pczt_sighash(db, round_id.as_ptr(), round_id.len(), 0) }
 }

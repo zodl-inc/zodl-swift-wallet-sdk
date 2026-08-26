@@ -25,12 +25,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Throws `VotingRustBackendError.invalidData` if `roundId` is empty, since the underlying
   call treats an empty round ID as an account-wide reset of every round's cached tree
   client rather than this round's alone.
-- `VotingRustBackend.getDelegationSigningSighash(roundId:bundleIndex:keys:)` — returns the
-  stored ZIP-244 sighash of the bundle's persisted delegation PCZT as `[UInt8]`, matching
-  the rest of the voting API surface (`VotingDelegationSignature.sighash`,
+- `VotingRustBackend.getStoredPcztSighash(roundId:bundleIndex:)` — returns the stored
+  ZIP-244 sighash of the bundle's persisted delegation PCZT as `[UInt8]`, matching the rest
+  of the voting API surface (`VotingDelegationSignature.sighash`,
   `getDelegationSubmission(...sighash:)`), so a wallet can verify that a persisted Keystone
-  signature still matches the bundle's delegation data before trusting it. Throws when
-  delegation setup is incomplete (e.g. after an interrupted build).
+  signature still matches the bundle's delegation data before trusting it. Takes only the
+  round ID and bundle index, scoped to the already-open wallet database — the previous
+  keys-taking form never shipped and has been removed. Throws when delegation setup is
+  incomplete (e.g. after an interrupted build).
 
 # 4.1.0 - 2026-08-25
 

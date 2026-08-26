@@ -224,11 +224,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A zero-length `round_id` is rejected with `-1` (per-round semantics require a
   non-empty id; `zcashlc_voting_reset_tree_client` remains the way to drop every
   round's cached tree client).
-- `zcashlc_voting_get_delegation_signing_sighash` returns the stored ZIP-244 sighash of a
-  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`), or
-  null when delegation setup is incomplete for the bundle. It takes the same parameters as
-  `zcashlc_voting_sign_delegation_request` minus the trailing `seed`/`seed_len` pair. No
-  existing call sites change.
+- `zcashlc_voting_get_stored_pczt_sighash` returns the stored ZIP-244 sighash of a
+  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`),
+  or null when delegation setup is incomplete for the bundle. It takes only the round
+  id and bundle index, scoped to the handle's wallet id — no delegation-key inputs.
+  (It replaces a keys-taking form of the same readback that never shipped in a release.)
 
 ### Changed
 
