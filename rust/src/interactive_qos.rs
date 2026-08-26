@@ -75,31 +75,48 @@ impl BoostCore {
 
 static CORE: Mutex<BoostCore> = Mutex::new(BoostCore::new());
 
-#[cfg(target_vendor = "apple")]
-mod darwin {
-    use core::ffi::{c_int, c_uint};
-
-    pub const QOS_CLASS_USER_INITIATED: c_uint = 0x19;
-
-    // `pthread_t` and `pthread_override_t` are opaque pointers on Darwin;
-    // they are stored pointer-width and never dereferenced on the Rust side.
-    unsafe extern "C" {
-        pub fn pthread_self() -> usize;
-        pub fn pthread_override_qos_class_start_np(
-            thread: usize,
-            qos_class: c_uint,
-            relative_priority: c_int,
-        ) -> usize;
-        pub fn pthread_override_qos_class_end_np(qos_override: usize) -> c_int;
-    }
-}
-
 /// Record the calling thread as a proving-pool worker. Call from the rayon
 /// `start_handler` only.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn register_current_thread() {
-    let thread = unsafe { darwin::pthread_self() };
+    // `pthread_t` is an opaque pointer on Darwin; stored pointer-width and
+    // never dereferenced on the Rust side. Declared function-local (as
+    // `zcashlc_init_on_load` already does for `pthread_set_qos_class_self_np`
+    // in lib.rs) rather than at module scope: a module-scope `pub` extern
+    // block here is picked up by cbindgen's header scan and leaks into the
+    // generated public C header, where it collides with the system's own
+    // <pthread.h> prototype for the same symbol.
+    unsafe extern "C" {
+        fn pthread_self() -> usize;
+    }
+    let thread = unsafe { pthread_self() };
     CORE.lock().unwrap().register_worker(thread);
+}
+
+/// Raise `worker` to USER_INITIATED QoS, returning the override token (0 if
+/// the OS rejected the override).
+#[cfg(target_vendor = "apple")]
+fn start_qos_override(worker: usize) -> usize {
+    // Function-local for the same reason as `register_current_thread`.
+    unsafe extern "C" {
+        fn pthread_override_qos_class_start_np(
+            thread: usize,
+            qos_class: core::ffi::c_uint,
+            relative_priority: core::ffi::c_int,
+        ) -> usize;
+    }
+    const QOS_CLASS_USER_INITIATED: core::ffi::c_uint = 0x19;
+    unsafe { pthread_override_qos_class_start_np(worker, QOS_CLASS_USER_INITIATED, 0) }
+}
+
+/// Release a QoS override token returned by `start_qos_override`.
+#[cfg(target_vendor = "apple")]
+fn end_qos_override(qos_override: usize) {
+    // Function-local for the same reason as `register_current_thread`.
+    unsafe extern "C" {
+        fn pthread_override_qos_class_end_np(qos_override: usize) -> core::ffi::c_int;
+    }
+    let _ = unsafe { pthread_override_qos_class_end_np(qos_override) };
 }
 
 /// Begin an interactive proving session, boosting every recorded pool worker
@@ -109,9 +126,7 @@ pub(crate) fn register_current_thread() {
 pub extern "C" fn zcashlc_proving_interactive_begin() {
     let mut core = CORE.lock().unwrap();
     #[cfg(target_vendor = "apple")]
-    core.begin(|worker| unsafe {
-        darwin::pthread_override_qos_class_start_np(worker, darwin::QOS_CLASS_USER_INITIATED, 0)
-    });
+    core.begin(start_qos_override);
     #[cfg(not(target_vendor = "apple"))]
     core.begin(|_| 0);
 }
@@ -122,9 +137,7 @@ pub extern "C" fn zcashlc_proving_interactive_begin() {
 pub extern "C" fn zcashlc_proving_interactive_end() {
     let mut core = CORE.lock().unwrap();
     #[cfg(target_vendor = "apple")]
-    core.end(|token| unsafe {
-        let _ = darwin::pthread_override_qos_class_end_np(token);
-    });
+    core.end(end_qos_override);
     #[cfg(not(target_vendor = "apple"))]
     core.end(|_| ());
 }
@@ -210,18 +223,21 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn qos_override_start_and_end_succeed_on_a_real_thread() {
-        let thread = unsafe { super::darwin::pthread_self() };
-        let token = unsafe {
-            super::darwin::pthread_override_qos_class_start_np(
-                thread,
-                super::darwin::QOS_CLASS_USER_INITIATED,
-                0,
-            )
-        };
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_override_qos_class_start_np(
+                thread: usize,
+                qos_class: core::ffi::c_uint,
+                relative_priority: core::ffi::c_int,
+            ) -> usize;
+            fn pthread_override_qos_class_end_np(qos_override: usize) -> core::ffi::c_int;
+        }
+        const QOS_CLASS_USER_INITIATED: core::ffi::c_uint = 0x19;
+
+        let thread = unsafe { pthread_self() };
+        let token =
+            unsafe { pthread_override_qos_class_start_np(thread, QOS_CLASS_USER_INITIATED, 0) };
         assert_ne!(token, 0);
-        assert_eq!(
-            unsafe { super::darwin::pthread_override_qos_class_end_np(token) },
-            0
-        );
+        assert_eq!(unsafe { pthread_override_qos_class_end_np(token) }, 0);
     }
 }
