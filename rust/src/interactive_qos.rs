@@ -320,6 +320,41 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
+    fn local_pool_workers_register_and_boost_with_real_overrides() {
+        use std::sync::{Arc, Mutex};
+
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+        }
+
+        let core = Arc::new(Mutex::new(BoostCore::new()));
+        let registrar = Arc::clone(&core);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .start_handler(move |_| {
+                let thread = unsafe { pthread_self() };
+                registrar
+                    .lock()
+                    .unwrap()
+                    .register_worker(thread, super::logged_start_override);
+            })
+            .build()
+            .expect("local test pool");
+        // A broadcast job runs on every worker, and a worker only takes jobs
+        // after its start handler finished — so registration is complete here.
+        pool.broadcast(|_| ());
+
+        let mut core = core.lock().unwrap();
+        assert_eq!(core.worker_count(), 2);
+        core.begin(super::logged_start_override);
+        assert_eq!(core.override_count(), 2);
+        core.end(super::end_qos_override);
+        assert_eq!(core.leaked_override_count(), 0);
+        assert_eq!(core.override_count(), 0);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
     fn qos_override_start_and_end_succeed_on_a_real_thread() {
         unsafe extern "C" {
             fn pthread_self() -> usize;
