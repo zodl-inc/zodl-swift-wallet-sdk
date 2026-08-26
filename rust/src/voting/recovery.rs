@@ -358,6 +358,11 @@ pub unsafe extern "C" fn zcashlc_voting_clear_recovery_state(
 ///
 /// Returns 0 on success, -1 on error.
 ///
+/// A zero-length `round_id` is rejected with `-1`: the underlying cache reset
+/// would otherwise silently act on every round on this handle. Per-round
+/// semantics require a non-empty id; to drop every round's cached tree client
+/// deliberately, use `zcashlc_voting_reset_tree_client`.
+///
 /// # Safety
 ///
 /// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
@@ -373,6 +378,11 @@ pub unsafe extern "C" fn zcashlc_voting_reset_session_state(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        if round_id_str.is_empty() {
+            return Err(anyhow!(
+                "reset_session_state requires a non-empty round_id; use zcashlc_voting_reset_tree_client to drop every round's cached tree client"
+            ));
+        }
         handle
             .tree_sync
             .reset(&round_id_str)
@@ -845,5 +855,20 @@ mod tests {
             },
             -1
         );
+    }
+
+    #[test]
+    fn reset_session_state_rejects_empty_round_id() {
+        let db = open_memory_db();
+        insert_round_and_bundle(db, "round");
+        let rc = unsafe { zcashlc_voting_reset_session_state(db, std::ptr::null(), 0) };
+        assert_eq!(rc, -1, "empty round_id must be rejected");
+        let round_id = b"round";
+        assert_eq!(
+            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
+            1,
+            "rejection must leave the round untouched"
+        );
+        unsafe { zcashlc_voting_db_free(db) };
     }
 }
