@@ -287,7 +287,7 @@ set_package_swift_ffi_mode() {
     esac
     grep -qE '^let useLocalFFI = (true|false)$' "$file" || return 1
     sed -i.bak -E \
-        "s|^let useLocalFFI = (true\|false)\$|let useLocalFFI = ${want}|" \
+        "s/^let useLocalFFI = (true|false)\$/let useLocalFFI = ${want}/" \
         "$file"
     rm -f "${file}.bak"
     grep -qE "^let useLocalFFI = ${want}\$" "$file"

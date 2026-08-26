@@ -26,7 +26,8 @@ fi
 . Scripts/lib/release-lib.sh
 if [[ "$(package_swift_ffi_mode Package.swift)" != "local" ]]; then
     echo "error: Package.swift is in release FFI mode; a local rebuild would not be linked." >&2
-    echo "       Run ./Scripts/init-local-ffi.sh (or 'make configure-local-ffi') first." >&2
+    echo "       If LocalPackages/ is already set up, run ./Scripts/set-ffi-mode.sh local;" >&2
+    echo "       otherwise run ./Scripts/init-local-ffi.sh (or 'make configure-local-ffi')." >&2
     exit 1
 fi
 

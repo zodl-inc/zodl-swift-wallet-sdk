@@ -8,6 +8,7 @@ _hook_repo() {
     mkdir -p "$dir"
     (
         cd "$dir" || exit 1
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
         git init -q
         if [ "$flag" = "none" ]; then
             printf 'let useLocalFFI = true\n' > Package.swift
@@ -30,7 +31,8 @@ _hook_repo() {
 # external command can.
 _run_hook_in() {
     local dir="$1"
-    ( cd "$dir" && "$REPO_ROOT/Scripts/hooks/pre-commit" )
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null &&
+        "$REPO_ROOT/Scripts/hooks/pre-commit" )
 }
 
 # Same, but with the escape hatch set for the hook process. The assignment is
@@ -41,7 +43,8 @@ _run_hook_in() {
 # leave the variable unset and the hook would see none of it.
 _run_hook_in_with_override() {
     local dir="$1"
-    ( cd "$dir" && ZODL_ALLOW_LOCAL_FFI_COMMIT=1 "$REPO_ROOT/Scripts/hooks/pre-commit" )
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null &&
+        ZODL_ALLOW_LOCAL_FFI_COMMIT=1 "$REPO_ROOT/Scripts/hooks/pre-commit" )
 }
 
 test_hook_rejects_staged_local_mode() {
@@ -73,13 +76,14 @@ _installer_repo() {
     dir="$SCRATCH/installrepo-$RANDOM"
     mkdir -p "$dir/Scripts/hooks"
     cp "$REPO_ROOT/Scripts/hooks/pre-commit" "$dir/Scripts/hooks/pre-commit"
-    ( cd "$dir" && git init -q )
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null && git init -q )
     printf '%s\n' "$dir"
 }
 
 test_installer_installs_hook() {
     local dir; dir="$(_installer_repo)"
-    ( cd "$dir" && install_local_ffi_hook ) || _fail "installer failed"
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null &&
+        install_local_ffi_hook ) || _fail "installer failed"
     _assertions=$((_assertions + 1))
     [ -x "$dir/.git/hooks/pre-commit" ] || _fail "hook not installed executable"
 }
@@ -87,7 +91,8 @@ test_installer_installs_hook() {
 test_installer_preserves_foreign_hook() {
     local dir; dir="$(_installer_repo)"
     printf '#!/bin/sh\nexit 0\n' > "$dir/.git/hooks/pre-commit"
-    ( cd "$dir" && install_local_ffi_hook 2>/dev/null )
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null &&
+        install_local_ffi_hook 2>/dev/null )
     assert_file_lacks "$dir/.git/hooks/pre-commit" "zodl-swift-wallet-sdk local-FFI guard" \
         "installer leaves a foreign pre-commit hook untouched"
 }
@@ -96,7 +101,8 @@ test_installer_updates_own_hook() {
     local dir; dir="$(_installer_repo)"
     printf '#!/bin/sh\n# zodl-swift-wallet-sdk local-FFI guard (old)\nexit 0\n' \
         > "$dir/.git/hooks/pre-commit"
-    ( cd "$dir" && install_local_ffi_hook )
+    ( cd "$dir" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null &&
+        install_local_ffi_hook )
     assert_file_contains "$dir/.git/hooks/pre-commit" "git diff --cached" \
         "installer refreshes a hook it owns"
 }
