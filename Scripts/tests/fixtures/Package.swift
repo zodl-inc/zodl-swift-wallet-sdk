@@ -1,6 +1,8 @@
 // swift-tools-version:5.6
 import PackageDescription
 
+let useLocalFFI = false
+
 let targets: [Target] = [
     .binaryTarget(
         name: "libzcashlc",

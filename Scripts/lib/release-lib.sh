@@ -257,6 +257,42 @@ rewrite_package_swift() {
     grep -qF "$url" "$file" && grep -qF "checksum: \"${checksum}\"" "$file"
 }
 
+# The FFI mode the manifest selects: `local` (links LocalPackages/) or
+# `release` (links the released binary). Non-zero when the manifest has no
+# recognizable flag line, so callers fail loudly instead of guessing.
+#
+# The mode is a literal in Package.swift rather than a filesystem probe:
+# SwiftPM caches the result of evaluating a manifest keyed by the manifest's
+# bytes (plus package path and toolchain), so a mode change must change the
+# bytes to be visible to the cache.
+package_swift_ffi_mode() {
+    if grep -qE '^let useLocalFFI = true$' "$1"; then
+        printf 'local\n'
+    elif grep -qE '^let useLocalFFI = false$' "$1"; then
+        printf 'release\n'
+    else
+        return 1
+    fi
+}
+
+# Rewrite the flag literal. Verified before returning, like
+# rewrite_package_swift: a silent no-match would leave the caller convinced
+# the mode changed when it did not.
+set_package_swift_ffi_mode() {
+    local file="$1" mode="$2" want
+    case "$mode" in
+        local) want="true" ;;
+        release) want="false" ;;
+        *) return 1 ;;
+    esac
+    grep -qE '^let useLocalFFI = (true|false)$' "$file" || return 1
+    sed -i.bak -E \
+        "s|^let useLocalFFI = (true\|false)\$|let useLocalFFI = ${want}|" \
+        "$file"
+    rm -f "${file}.bak"
+    grep -qE "^let useLocalFFI = ${want}\$" "$file"
+}
+
 # ----------------------------------------------------------------- preflight
 
 require_clean_tree() {
