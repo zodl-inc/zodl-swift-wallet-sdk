@@ -221,6 +221,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature, a stored delegation tx hash, or a recorded VAN position are untouched, unlike
   `zcashlc_voting_clear_round`. Returns 0 on success, -1 on error. No existing call sites
   change.
+- `zcashlc_voting_get_delegation_signing_sighash` returns the stored ZIP-244 sighash of a
+  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`), or
+  null when delegation setup is incomplete for the bundle. It takes the same parameters as
+  `zcashlc_voting_sign_delegation_request` minus the trailing `seed`/`seed_len` pair. No
+  existing call sites change.
 
 ### Changed
 

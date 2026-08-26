@@ -176,6 +176,88 @@ pub unsafe extern "C" fn zcashlc_voting_sign_delegation_request(
     unwrap_exc_or_null(res)
 }
 
+/// Loads the stored ZIP-244 sighash of one delegation bundle's persisted PCZT.
+///
+/// This is a pure readback: unlike `zcashlc_voting_sign_delegation_request`,
+/// it never touches wallet seed material, derives a spend key, decodes the
+/// spend-auth randomizer, or signs anything. It exists so a wallet holding a
+/// signature produced out of band (e.g. by a Keystone hardware signer) can
+/// re-fetch the exact sighash the bundle's delegation setup persisted and
+/// check it against the signature before trusting it, without repeating the
+/// signing-specific validation the sign entry point performs.
+///
+/// `fvk_bytes`, `hotkey_stored_secret`, `seed_fingerprint`, `account_index`
+/// and `round_name` are the same delegation-key inputs
+/// `zcashlc_voting_sign_delegation_request` takes, minus its trailing
+/// `seed`/`seed_len` pair: this function loads the signing request through
+/// the same `DelegationKeys` value but stops before any seed-backed step.
+///
+/// Returns JSON-encoded `[u8; 32]` (the stored sighash) as `*mut
+/// FfiBoxedSlice`, or null on error — including when delegation setup is
+/// incomplete for the bundle (e.g. `build_pczt` never ran, so
+/// `pczt_sighash`/`alpha` were never stored, or a later step wiped them) or
+/// when the supplied keys do not match the round.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - For every `(ptr, len)` byte argument (`round_id`, `fvk_bytes`,
+///   `hotkey_stored_secret`, `seed_fingerprint`, `round_name`): if `len > 0`
+///   then `ptr` must be non-null and valid for reads for `len` bytes; if
+///   `len == 0`, `ptr` is ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_get_delegation_signing_sighash(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+    fvk_bytes: *const u8,
+    fvk_bytes_len: usize,
+    hotkey_stored_secret: *const u8,
+    hotkey_stored_secret_len: usize,
+    seed_fingerprint: *const u8,
+    seed_fingerprint_len: usize,
+    account_index: u32,
+    round_name: *const u8,
+    round_name_len: usize,
+) -> *mut crate::ffi::BoxedSlice {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let fvk = unsafe { bytes_from_ptr(fvk_bytes, fvk_bytes_len) }?;
+        let hotkey_secret =
+            unsafe { bytes_from_ptr(hotkey_stored_secret, hotkey_stored_secret_len) }?;
+        let seed_fp_bytes = unsafe { bytes_from_ptr(seed_fingerprint, seed_fingerprint_len) }?;
+        let seed_fp_32: [u8; SEED_FINGERPRINT_LEN] = seed_fp_bytes.try_into().map_err(|_| {
+            anyhow!(
+                "seed_fingerprint must be {} bytes, got {}",
+                SEED_FINGERPRINT_LEN,
+                seed_fp_bytes.len()
+            )
+        })?;
+        let round_name_str = unsafe { str_from_ptr(round_name, round_name_len) }?;
+
+        let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_secret, handle.network)
+            .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
+        let keys = voting::delegate::DelegationKeys::with_voting_hotkey(
+            fvk.to_vec(),
+            &hotkey,
+            seed_fp_32,
+            account_index,
+            round_name_str,
+        )
+        .map_err(|e| anyhow!("failed to build delegation keys: {}", e))?;
+
+        let request =
+            voting::delegate::signing_request(&handle.db, &round_id_str, bundle_index, &keys)
+                .map_err(|e| anyhow!("signing_request failed: {}", e))?;
+        json_to_boxed_slice(&request.sighash.to_vec())
+    });
+    unwrap_exc_or_null(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +548,10 @@ mod tests {
         );
 
         unsafe { zcashlc_voting_db_free(db) };
-        assert!(!result.is_null(), "matching seed and planted request must sign");
+        assert!(
+            !result.is_null(),
+            "matching seed and planted request must sign"
+        );
         let bytes = unsafe { (*result).as_slice() }.to_vec();
         unsafe { crate::ffi::zcashlc_free_boxed_slice(result) };
 
@@ -483,5 +568,69 @@ mod tests {
             PLANTED_SIGHASH.to_vec(),
             "returned sighash must echo the stored one"
         );
+    }
+
+    /// Marshals the same delegation-key inputs as `call_sign`, minus the seed
+    /// pair, for the pure-readback FFI under test.
+    fn call_get_sighash(
+        db: *mut VotingDatabaseHandle,
+        round_id: &[u8],
+        hotkey_secret: &[u8],
+        seed_fingerprint: &[u8],
+    ) -> *mut crate::ffi::BoxedSlice {
+        // Same placeholder rationale as `call_sign`: the FVK rides through
+        // `DelegationKeys` unvalidated and unread on this readback path too.
+        let fvk = [0u8; ORCHARD_FVK_LEN];
+        let round_name = b"NU6.3 voting round";
+        unsafe {
+            zcashlc_voting_get_delegation_signing_sighash(
+                db,
+                round_id.as_ptr(),
+                round_id.len(),
+                0,
+                fvk.as_ptr(),
+                fvk.len(),
+                hotkey_secret.as_ptr(),
+                hotkey_secret.len(),
+                seed_fingerprint.as_ptr(),
+                seed_fingerprint.len(),
+                0,
+                round_name.as_ptr(),
+                round_name.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn get_delegation_signing_sighash_errors_when_setup_missing() {
+        let db = open_memory_db();
+        // Round and bundle exist, but no PCZT build ever stored a sighash or
+        // alpha for the bundle, so the signing request cannot be assembled.
+        insert_round_and_bundle(db, TEST_ROUND_ID);
+        let secret = valid_stored_secret();
+
+        let result = call_get_sighash(
+            db,
+            TEST_ROUND_ID.as_bytes(),
+            &secret,
+            &test_seed_fingerprint(),
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn get_delegation_signing_sighash_rejects_null_db() {
+        let secret = valid_stored_secret();
+
+        let result = call_get_sighash(
+            std::ptr::null_mut(),
+            TEST_ROUND_ID.as_bytes(),
+            &secret,
+            &test_seed_fingerprint(),
+        );
+
+        assert!(result.is_null());
     }
 }
