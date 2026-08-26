@@ -1319,7 +1319,15 @@ extension VotingRustBackend {
     /// This is the safe per-round cleanup for resuming an interrupted voting
     /// session — unlike `clearRound`, it never destroys delegation material an
     /// on-chain registration may depend on.
+    ///
+    /// - Throws: ``VotingRustBackendError/invalidData`` if `roundId` is empty.
+    ///   The crate treats an empty round ID as a different, account-wide reset
+    ///   of every round's cached tree client; this wrapper promises per-round
+    ///   semantics only, so it rejects that input instead of forwarding it.
     public func resetSessionState(roundId: String) throws {
+        guard !roundId.isEmpty else {
+            throw VotingRustBackendError.invalidData("roundId must not be empty")
+        }
         let roundIdBytes = [UInt8](roundId.utf8)
         try withHandle { dbh in
             let result = roundIdBytes.withUnsafeBufferPointer { buf in
@@ -1731,12 +1739,24 @@ extension VotingRustBackend {
     /// PCZT, so a caller can verify a persisted Keystone signature still
     /// matches the bundle's delegation data before trusting it.
     ///
-    /// Throws when delegation setup is incomplete for the bundle.
+    /// - Parameters:
+    ///   - keys: the same ``VotingDelegationKeyInputs`` used to build and prove
+    ///     this bundle. The crate loads the signing request through them.
+    /// - Returns: the 32-byte ZIP-244 sighash. Pass it to
+    ///   ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``
+    ///   alongside the matching signature, exactly as
+    ///   ``VotingDelegationSignature/sighash`` is.
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/invalidData`` if the seed fingerprint is
+    ///   the wrong length, or if the returned sighash is not exactly 32 bytes;
+    ///   ``VotingRustBackendError/rustError`` if delegation setup is incomplete
+    ///   for the bundle (its PCZT setup has not run), or the supplied keys'
+    ///   network does not match the round.
     public func getDelegationSigningSighash(
         roundId: String,
         bundleIndex: UInt32,
         keys: VotingDelegationKeyInputs
-    ) throws -> Data {
+    ) throws -> [UInt8] {
         guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
             throw VotingRustBackendError.invalidData(
                 "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
@@ -1781,10 +1801,12 @@ extension VotingRustBackend {
         }
         defer { zcashlc_free_boxed_slice(ptr) }
         let bytes: [UInt8] = try decodeJSON(from: ptr)
-        guard bytes.count == 32 else {
-            throw VotingRustBackendError.invalidData("sighash must be 32 bytes")
+        guard bytes.count == votingPcztSighashByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
+            )
         }
-        return Data(bytes)
+        return bytes
     }
 
     /// Get the delegation submission payload for an externally produced

@@ -22,11 +22,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a stored delegation tx hash, or a recorded VAN position. This is the safe per-round
   cleanup for resuming an interrupted voting session: unlike `clearRound(roundId:)`, it
   never destroys delegation material that an on-chain registration may already depend on.
+  Throws `VotingRustBackendError.invalidData` if `roundId` is empty, since the underlying
+  call treats an empty round ID as an account-wide reset of every round's cached tree
+  client rather than this round's alone.
 - `VotingRustBackend.getDelegationSigningSighash(roundId:bundleIndex:keys:)` — returns the
-  stored ZIP-244 sighash of the bundle's persisted delegation PCZT, so a wallet can verify
-  that a persisted Keystone signature still matches the bundle's delegation data before
-  trusting it. Throws when delegation setup is incomplete (e.g. after an interrupted
-  build). No existing call sites need changes.
+  stored ZIP-244 sighash of the bundle's persisted delegation PCZT as `[UInt8]`, matching
+  the rest of the voting API surface (`VotingDelegationSignature.sighash`,
+  `getDelegationSubmission(...sighash:)`), so a wallet can verify that a persisted Keystone
+  signature still matches the bundle's delegation data before trusting it. Throws when
+  delegation setup is incomplete (e.g. after an interrupted build).
 
 # 4.1.0 - 2026-08-25
 

@@ -179,12 +179,14 @@ pub unsafe extern "C" fn zcashlc_voting_sign_delegation_request(
 /// Loads the stored ZIP-244 sighash of one delegation bundle's persisted PCZT.
 ///
 /// This is a pure readback: unlike `zcashlc_voting_sign_delegation_request`,
-/// it never touches wallet seed material, derives a spend key, decodes the
-/// spend-auth randomizer, or signs anything. It exists so a wallet holding a
-/// signature produced out of band (e.g. by a Keystone hardware signer) can
-/// re-fetch the exact sighash the bundle's delegation setup persisted and
-/// check it against the signature before trusting it, without repeating the
-/// signing-specific validation the sign entry point performs.
+/// wallet seed material is never touched, no key is derived, and nothing is
+/// signed. The crate call loads `alpha` into the request struct internally,
+/// but it never crosses the FFI boundary — only the sighash is serialized
+/// back. It exists so a wallet holding a signature produced out of band (e.g.
+/// by a Keystone hardware signer) can re-fetch the exact sighash the bundle's
+/// delegation setup persisted and check it against the signature before
+/// trusting it, without repeating the signing-specific validation the sign
+/// entry point performs.
 ///
 /// `fvk_bytes`, `hotkey_stored_secret`, `seed_fingerprint`, `account_index`
 /// and `round_name` are the same delegation-key inputs
@@ -196,7 +198,10 @@ pub unsafe extern "C" fn zcashlc_voting_sign_delegation_request(
 /// FfiBoxedSlice`, or null on error — including when delegation setup is
 /// incomplete for the bundle (e.g. `build_pczt` never ran, so
 /// `pczt_sighash`/`alpha` were never stored, or a later step wiped them) or
-/// when the supplied keys do not match the round.
+/// when the supplied keys' network does not match the round's stored
+/// network. Only the network is validated against the round at this layer;
+/// account index, seed fingerprint, fvk, and round name are not checked
+/// against stored state.
 ///
 /// # Safety
 ///

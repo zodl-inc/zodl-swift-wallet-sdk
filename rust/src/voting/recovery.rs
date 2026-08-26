@@ -373,8 +373,14 @@ pub unsafe extern "C" fn zcashlc_voting_reset_session_state(
         let handle =
             unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
         let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        voting::precompute::reset_voting_session_state(&handle.db, &round_id_str)
-            .map_err(|e| anyhow!("reset_voting_session_state failed: {}", e))?;
+        handle
+            .tree_sync
+            .reset(&round_id_str)
+            .map_err(|e| anyhow!("reset_session_state failed: {}", e))?;
+        handle
+            .db
+            .clear_unsigned_delegation_setup_fields(&round_id_str)
+            .map_err(|e| anyhow!("reset_session_state failed: {}", e))?;
         Ok(0)
     });
     unwrap_exc_or(res, -1)
@@ -793,6 +799,11 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
+    /// Round-trips `zcashlc_voting_reset_session_state` through the FFI and
+    /// confirms the bundle survives it. `insert_round_and_bundle`'s fixture
+    /// bundle has no unsigned setup columns populated, so this does not
+    /// verify that those columns are actually cleared — it is a round-trip +
+    /// preservation smoke test; `zcash_voting` owns the clearing coverage.
     #[test]
     fn reset_session_state_clears_unsigned_setup_and_keeps_bundles() {
         let db = open_memory_db();
@@ -806,6 +817,8 @@ mod tests {
             unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
             1
         );
+
+        unsafe { zcashlc_voting_db_free(db) };
     }
 
     #[test]
@@ -813,7 +826,11 @@ mod tests {
         let round_id = b"round";
         assert_eq!(
             unsafe {
-                zcashlc_voting_reset_session_state(std::ptr::null_mut(), round_id.as_ptr(), round_id.len())
+                zcashlc_voting_reset_session_state(
+                    std::ptr::null_mut(),
+                    round_id.as_ptr(),
+                    round_id.len(),
+                )
             },
             -1
         );

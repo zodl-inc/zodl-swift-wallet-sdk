@@ -43,6 +43,22 @@ final class VotingResumeSupportTests: XCTestCase {
         XCTAssertNoThrow(try backend.resetSessionState(roundId: resumeMissingRoundId))
     }
 
+    func test_resetSessionState_emptyRoundId_throwsInvalidData() throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+
+        XCTAssertThrowsError(try backend.resetSessionState(roundId: "")) { error in
+            guard case VotingRustBackendError.invalidData(let message) = error else {
+                XCTFail("expected .invalidData, got \(error.localizedDescription)")
+                return
+            }
+            XCTAssertTrue(
+                message.contains("roundId"),
+                "unexpected message: \(message)"
+            )
+        }
+    }
+
     func test_getDelegationSigningSighash_missingRound_throwsRustError() throws {
         let backend = try makeOpenBackend()
         defer { backend.close() }
