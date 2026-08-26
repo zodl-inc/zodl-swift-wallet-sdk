@@ -21,7 +21,8 @@ final class InteractiveProvingQoSTests: XCTestCase {
         XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
     }
 
-    func testCommitVoteReleasesBoostWhenDatabaseIsNotOpen() async {
+    // Early validation throws happen before the boost is taken; the count must never move.
+    func testCommitVoteDoesNotTakeBoostOnEarlyThrow() async {
         let backend = VotingRustBackend()
         let witness = VotingVanWitness(authPath: [], position: 0, anchorHeight: 0)
         do {
@@ -38,6 +39,7 @@ final class InteractiveProvingQoSTests: XCTestCase {
             )
             XCTFail("commitVote without an open database must throw")
         } catch {
+            XCTAssertEqual(error as? VotingRustBackendError, VotingRustBackendError.databaseNotOpen)
             XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
         }
     }
