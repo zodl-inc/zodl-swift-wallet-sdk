@@ -614,6 +614,19 @@ extension VotingRustBackend {
     static func interactiveProvingBoostCount() -> Int32 {
         zcashlc_proving_interactive_active()
     }
+
+    /// Runs `body` under the pool-wide interactive proving boost, releasing it
+    /// on every exit path. The FFI end is refcounted and saturating, but a
+    /// missing end pins the pool at user-initiated for the process lifetime —
+    /// route every boost through this helper instead of pairing the raw
+    /// begin/end statics by hand.
+    static func withInteractiveProvingBoost<T>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        beginInteractiveProvingBoost()
+        defer { endInteractiveProvingBoost() }
+        return try await body()
+    }
 }
 
 // MARK: - Foundation helpers (static)
