@@ -25,6 +25,7 @@ struct BoostCore {
     workers: Vec<usize>,
     sessions: usize,
     overrides: Vec<usize>,
+    leaked_overrides: usize,
 }
 
 impl BoostCore {
@@ -33,6 +34,7 @@ impl BoostCore {
             workers: Vec::new(),
             sessions: 0,
             overrides: Vec::new(),
+            leaked_overrides: 0,
         }
     }
 
@@ -64,17 +66,31 @@ impl BoostCore {
 
     /// Returns the new session count. `end_override` runs once per stored
     /// token on the 1→0 edge only; an unmatched call is a saturating no-op.
-    fn end(&mut self, end_override: impl Fn(usize)) -> usize {
+    fn end(&mut self, end_override: impl Fn(usize) -> bool) -> usize {
         if self.sessions == 0 {
             return 0;
         }
         self.sessions -= 1;
         if self.sessions == 0 {
             for token in self.overrides.drain(..) {
-                end_override(token);
+                if !end_override(token) {
+                    self.leaked_overrides += 1;
+                }
             }
         }
         self.sessions
+    }
+
+    fn override_count(&self) -> usize {
+        self.overrides.len()
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn leaked_override_count(&self) -> usize {
+        self.leaked_overrides
     }
 
     fn active(&self) -> usize {
@@ -101,7 +117,7 @@ pub(crate) fn register_current_thread() {
     let thread = unsafe { pthread_self() };
     CORE.lock()
         .unwrap()
-        .register_worker(thread, start_qos_override);
+        .register_worker(thread, logged_start_override);
 }
 
 /// Raise `worker` to USER_INITIATED QoS, returning the override token (0 if
@@ -120,14 +136,27 @@ fn start_qos_override(worker: usize) -> usize {
     unsafe { pthread_override_qos_class_start_np(worker, QOS_CLASS_USER_INITIATED, 0) }
 }
 
-/// Release a QoS override token returned by `start_qos_override`.
+/// Release a QoS override token returned by `start_qos_override`. Returns
+/// whether the OS accepted the release; a refused release leaves the worker
+/// boosted for the process lifetime.
 #[cfg(target_vendor = "apple")]
-fn end_qos_override(qos_override: usize) {
+fn end_qos_override(qos_override: usize) -> bool {
     // Function-local for the same reason as `register_current_thread`.
     unsafe extern "C" {
         fn pthread_override_qos_class_end_np(qos_override: usize) -> core::ffi::c_int;
     }
-    let _ = unsafe { pthread_override_qos_class_end_np(qos_override) };
+    unsafe { pthread_override_qos_class_end_np(qos_override) == 0 }
+}
+
+/// `start_qos_override` plus a visible failure: a worker the OS refuses to
+/// boost would otherwise vanish silently from the session.
+#[cfg(target_vendor = "apple")]
+fn logged_start_override(worker: usize) -> usize {
+    let token = start_qos_override(worker);
+    if token == 0 {
+        tracing::warn!(worker, "interactive QoS override start rejected by the OS");
+    }
+    token
 }
 
 /// Begin an interactive proving session, boosting every recorded pool worker
@@ -137,7 +166,16 @@ fn end_qos_override(qos_override: usize) {
 pub extern "C" fn zcashlc_proving_interactive_begin() {
     let mut core = CORE.lock().unwrap();
     #[cfg(target_vendor = "apple")]
-    core.begin(start_qos_override);
+    {
+        let sessions = core.begin(logged_start_override);
+        if sessions == 1 {
+            tracing::debug!(
+                boosted = core.override_count(),
+                workers = core.worker_count(),
+                "interactive proving boost applied"
+            );
+        }
+    }
     #[cfg(not(target_vendor = "apple"))]
     core.begin(|_| 0);
 }
@@ -148,9 +186,26 @@ pub extern "C" fn zcashlc_proving_interactive_begin() {
 pub extern "C" fn zcashlc_proving_interactive_end() {
     let mut core = CORE.lock().unwrap();
     #[cfg(target_vendor = "apple")]
-    core.end(end_qos_override);
+    {
+        let had_sessions = core.active() > 0;
+        let sessions = core.end(|token| {
+            let released = end_qos_override(token);
+            if !released {
+                tracing::warn!(
+                    "interactive QoS override release failed; worker stays boosted for process lifetime"
+                );
+            }
+            released
+        });
+        if had_sessions && sessions == 0 {
+            tracing::debug!(
+                leaked_total = core.leaked_override_count(),
+                "interactive proving boost released"
+            );
+        }
+    }
     #[cfg(not(target_vendor = "apple"))]
-    core.end(|_| ());
+    core.end(|_| true);
 }
 
 /// Number of interactive proving sessions currently outstanding. Diagnostic
@@ -181,7 +236,10 @@ mod tests {
         assert_eq!(*started.borrow(), vec![11, 22]);
 
         let ended = RefCell::new(Vec::new());
-        let stop = |token: usize| ended.borrow_mut().push(token);
+        let stop = |token: usize| {
+            ended.borrow_mut().push(token);
+            true
+        };
         assert_eq!(core.end(&stop), 1);
         assert!(ended.borrow().is_empty());
         assert_eq!(core.end(&stop), 0);
@@ -194,7 +252,13 @@ mod tests {
         core.register_worker(11, |_| 0);
 
         let stop_calls = RefCell::new(0usize);
-        assert_eq!(core.end(|_| { *stop_calls.borrow_mut() += 1 }), 0);
+        assert_eq!(
+            core.end(|_| {
+                *stop_calls.borrow_mut() += 1;
+                true
+            }),
+            0
+        );
         assert_eq!(*stop_calls.borrow(), 0);
         assert_eq!(core.active(), 0);
     }
@@ -207,7 +271,10 @@ mod tests {
 
         core.begin(|worker| if worker == 11 { 0 } else { 2022 });
         let ended = RefCell::new(Vec::new());
-        core.end(|token| ended.borrow_mut().push(token));
+        core.end(|token| {
+            ended.borrow_mut().push(token);
+            true
+        });
         assert_eq!(*ended.borrow(), vec![2022]);
     }
 
@@ -226,8 +293,24 @@ mod tests {
         assert_eq!(*started.borrow(), vec![11, 22]);
 
         let ended = RefCell::new(Vec::new());
-        core.end(|token| ended.borrow_mut().push(token));
+        core.end(|token| {
+            ended.borrow_mut().push(token);
+            true
+        });
         assert_eq!(*ended.borrow(), vec![1011, 1022]);
+    }
+
+    #[test]
+    fn failed_release_counts_a_leak_and_keeps_sessions_consistent() {
+        let mut core = BoostCore::new();
+        core.register_worker(11, |_| 0);
+        core.register_worker(22, |_| 0);
+        core.begin(|worker| worker + 1000);
+        assert_eq!(core.override_count(), 2);
+        assert_eq!(core.end(|token| token != 1011), 0);
+        assert_eq!(core.leaked_override_count(), 1);
+        assert_eq!(core.override_count(), 0);
+        assert_eq!(core.active(), 0);
     }
 
     #[cfg(target_vendor = "apple")]
