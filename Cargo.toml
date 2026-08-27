@@ -151,7 +151,7 @@ lto = true
 # Historical delegation recovery is being released on the maintained 3.0.x
 # line. Keep the public dependency at 3.0.0 until 3.0.1 is tagged while
 # pinning this SDK PR to the exact reviewed recovery revision.
-zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "ecab34c012c0dca3eae97978bf633ae858a51ce7" }
+zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "997b4dcd3ef45a4c5ba56edaba704cf9826a0104" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
