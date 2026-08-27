@@ -88,6 +88,40 @@ pub unsafe extern "C" fn zcashlc_voting_get_delegation_tx_hash(
     unwrap_exc_or_null(res)
 }
 
+/// Load bundle indices whose delegation VAN position is already confirmed locally.
+///
+/// Returns a JSON-encoded `Vec<u32>` in bundle order. This is durable resume state,
+/// including forensic recoveries whose original transaction hash was lost.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_get_confirmed_delegation_bundle_indices(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+) -> *mut crate::ffi::BoxedSlice {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let bundle_indices = handle
+            .db
+            .delegation_phases(&round_id_str)
+            .map_err(|e| anyhow!("get confirmed delegation bundles failed: {e}"))?
+            .into_iter()
+            .filter_map(|(bundle_index, phase)| {
+                (phase == voting::phases::DelegationPhase::Confirmed).then_some(bundle_index)
+            })
+            .collect::<Vec<_>>();
+        json_to_boxed_slice(&bundle_indices)
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Persist the on-chain transaction hash of a submitted vote.
 ///
 /// # Safety
@@ -411,6 +445,39 @@ mod tests {
         };
         let actual: Option<String> = decode_boxed_json(result);
         assert_eq!(actual.as_deref(), Some("delegation-tx"));
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn confirmed_delegation_bundle_indices_include_persisted_van_without_tx_hash() {
+        let db = open_memory_db();
+        let round_id = b"round";
+        insert_round_and_bundle(db, "round");
+
+        let before = unsafe {
+            zcashlc_voting_get_confirmed_delegation_bundle_indices(
+                db,
+                round_id.as_ptr(),
+                round_id.len(),
+            )
+        };
+        assert!(decode_boxed_json::<Vec<u32>>(before).is_empty());
+
+        let handle = unsafe { db.as_ref() }.expect("voting db handle");
+        handle
+            .db
+            .store_van_position("round", 0, 26)
+            .expect("store VAN position");
+
+        let after = unsafe {
+            zcashlc_voting_get_confirmed_delegation_bundle_indices(
+                db,
+                round_id.as_ptr(),
+                round_id.len(),
+            )
+        };
+        assert_eq!(decode_boxed_json::<Vec<u32>>(after), vec![0]);
 
         unsafe { zcashlc_voting_db_free(db) };
     }

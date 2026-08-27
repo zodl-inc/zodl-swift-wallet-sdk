@@ -651,6 +651,28 @@ final class VotingRustBackendTests: XCTestCase {
         )
     }
 
+    func test_confirmedDelegationBundleIndices_includeVanWithoutTxHash() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
+
+        try createRoundWithBundle(backend, roundId: roundTripRoundId)
+        XCTAssertEqual(
+            try backend.getConfirmedDelegationBundleIndices(roundId: roundTripRoundId),
+            []
+        )
+
+        try backend.storeVanPosition(
+            roundId: roundTripRoundId,
+            bundleIndex: roundTripBundleIndex,
+            position: 26
+        )
+
+        XCTAssertEqual(
+            try backend.getConfirmedDelegationBundleIndices(roundId: roundTripRoundId),
+            [roundTripBundleIndex]
+        )
+    }
+
     func test_storeDelegationTxHash_throwsRustError_whenBundleMissing() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }

@@ -13,7 +13,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_voting_recover_delegation_from_forensic_evidence` passes a nonempty
   secret-bearing bundle subset into the crate-owned atomic repair and reports
   the exact recovered indices. The FFI performs no voting database writes
-  itself.
+  itself. `zcashlc_voting_get_confirmed_delegation_bundle_indices` exposes the
+  crate-owned confirmed phases needed to resume after a wallet restart.
 - `zcashlc_get_transaction`, `zcashlc_free_transaction_data`, and `FfiTransactionData` expose the
   serialized bytes and expiry height available for any wallet-store transaction without depending
   on the transaction-history projection.

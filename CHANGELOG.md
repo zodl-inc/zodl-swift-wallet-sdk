@@ -13,7 +13,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forensically recovered VAN randomness. The recovery revalidates the hotkey,
   authenticated round context, on-chain commitments, and local database state
   in Rust; it reports the exact restored bundle indices and leaves unsubmitted
-  bundles to the normal delegation flow.
+  bundles to the normal delegation flow. Wallets can also reload the durable
+  confirmed bundle indices after a restart, including recovered bundles that
+  no longer have their original transaction hash.
 
 ## Changed
 

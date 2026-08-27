@@ -1113,6 +1113,29 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
+    /// Load bundle indices whose delegation VAN position is already confirmed locally.
+    /// This includes forensic recoveries that cannot retain their original transaction hash.
+    public func getConfirmedDelegationBundleIndices(roundId: String) throws -> [UInt32] {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_get_confirmed_delegation_bundle_indices(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count)
+                )
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`get_confirmed_delegation_bundle_indices` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try decodeJSON(from: ptr)
+    }
+
     /// Persist the on-chain transaction hash for a submitted vote.
     public func storeVoteTxHash(
         roundId: String,
