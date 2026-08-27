@@ -6,6 +6,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- Voting proving now runs at interactive priority while a user is waiting on it.
+  `VotingRustBackend.commitVote` and `buildAndProveDelegation` raise the shared rayon
+  proving pool's workers from their resting UTILITY QoS to USER_INITIATED for the duration
+  of the proving call itself (refcounted; released on every exit path) and detach the
+  proving work at `.userInitiated`. The boost is pool-wide while it is held, so background
+  proving that overlaps an interactive proving call is temporarily raised with it; outside
+  those windows — including during `warmProvingCaches()`, which deliberately stays at the
+  pool's resting priority — background proving keeps the existing utility demotion.
+
 # 4.1.0 - 2026-08-25
 
 ## Changed
