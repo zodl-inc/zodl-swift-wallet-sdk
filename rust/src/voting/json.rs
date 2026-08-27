@@ -1,9 +1,118 @@
 use serde::{Deserialize, Serialize};
 use zcash_voting as voting;
 
+use anyhow::{Result, anyhow};
+
 // =============================================================================
 // Serde-compatible types for JSON serialization across the FFI boundary
 // =============================================================================
+
+/// Public, root-validated vote-tree leaf returned to Swift for forensic
+/// candidate discovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonVerifiedVoteTreeLeaf {
+    pub position: u32,
+    pub commitment: Vec<u8>,
+}
+
+impl From<voting::VerifiedVoteTreeLeaf> for JsonVerifiedVoteTreeLeaf {
+    fn from(leaf: voting::VerifiedVoteTreeLeaf) -> Self {
+        Self {
+            position: leaf.position,
+            commitment: leaf.commitment.to_vec(),
+        }
+    }
+}
+
+/// Complete vote-tree snapshot after `zcash_voting` has recomputed the
+/// advertised root.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonVerifiedVoteTreeSnapshot {
+    pub anchor_height: u32,
+    pub root: Vec<u8>,
+    pub leaves: Vec<JsonVerifiedVoteTreeLeaf>,
+}
+
+impl From<voting::VerifiedVoteTreeSnapshot> for JsonVerifiedVoteTreeSnapshot {
+    fn from(snapshot: voting::VerifiedVoteTreeSnapshot) -> Self {
+        Self {
+            anchor_height: snapshot.anchor_height,
+            root: snapshot.root.to_vec(),
+            leaves: snapshot.leaves.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// One secret-bearing forensic bundle supplied by the application.
+///
+/// This type intentionally omits `Debug`: `van_comm_rand` is the historical
+/// secret this recovery path exists to restore.
+#[derive(Deserialize)]
+pub struct JsonForensicDelegationBundle {
+    pub bundle_index: u32,
+    pub total_note_value: u64,
+    pub address_index: u32,
+    pub van_comm_rand: Vec<u8>,
+    pub van_commitment: Vec<u8>,
+    pub van_leaf_position: u32,
+    pub delegation_tx_hash: Option<String>,
+}
+
+impl JsonForensicDelegationBundle {
+    /// Convert the wire shape explicitly because this is a partial,
+    /// security-sensitive boundary rather than a lossless domain conversion.
+    pub fn into_validated_core(self) -> Result<voting::ForensicDelegationBundle> {
+        Ok(voting::ForensicDelegationBundle {
+            bundle_index: self.bundle_index,
+            total_note_value: self.total_note_value,
+            address_index: self.address_index,
+            van_comm_rand: exact_32(self.van_comm_rand, "van_comm_rand")?,
+            van_commitment: exact_32(self.van_commitment, "van_commitment")?,
+            van_leaf_position: self.van_leaf_position,
+            delegation_tx_hash: self.delegation_tx_hash,
+        })
+    }
+}
+
+/// Secret-bearing request accepted by the narrow forensic recovery FFI.
+///
+/// This type intentionally omits `Debug` so callers cannot accidentally log
+/// the voting hotkey or recovered commitment randomness.
+#[derive(Deserialize)]
+pub struct JsonForensicDelegationRecoveryRequest {
+    pub expected_chain_id: String,
+    pub expected_round_params: voting::VotingRoundParams,
+    pub node_url: String,
+    pub hotkey_stored_secret: Vec<u8>,
+    pub bundles: Vec<JsonForensicDelegationBundle>,
+}
+
+/// Public result of an atomic forensic delegation repair.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonForensicDelegationRecovery {
+    pub anchor_height: u32,
+    pub tree_root: Vec<u8>,
+    pub bundle_count: u32,
+    pub already_recovered: bool,
+}
+
+impl From<voting::ForensicDelegationRecovery> for JsonForensicDelegationRecovery {
+    fn from(recovery: voting::ForensicDelegationRecovery) -> Self {
+        Self {
+            anchor_height: recovery.anchor_height,
+            tree_root: recovery.tree_root.to_vec(),
+            bundle_count: recovery.bundle_count,
+            already_recovered: recovery.already_recovered,
+        }
+    }
+}
+
+fn exact_32(bytes: Vec<u8>, field: &str) -> Result<[u8; 32]> {
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("{field} must be exactly 32 bytes, got {len}"))
+}
 
 /// JSON-serializable NoteInfo.
 #[derive(Clone, Debug, Serialize, Deserialize)]

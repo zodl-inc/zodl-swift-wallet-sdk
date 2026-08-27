@@ -566,6 +566,47 @@ final class VotingRustBackendTests: XCTestCase {
 
     // MARK: - Recovery state
 
+    func test_verifiedVoteTreeSnapshotRejectsInvalidRoundBeforeNetwork() {
+        XCTAssertThrowsError(
+            try VotingRustBackend.verifiedVoteTreeSnapshot(
+                roundId: "invalid",
+                nodeUrl: "http://127.0.0.1:1"
+            )
+        ) { error in
+            guard case VotingRustBackendError.rustError = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    func test_forensicRecoveryRejectsIncompleteBatchBeforeNetwork() throws {
+        let backend = try makeReadyBackend()
+        defer { backend.close() }
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let request = VotingForensicDelegationRecoveryRequest(
+            expectedChainId: "vote-chain-1",
+            expectedRoundParams: VotingForensicRoundParameters(
+                voteRoundId: roundTripRoundId,
+                snapshotHeight: roundTripSnapshotHeight,
+                eaPk: roundTripRoundParameter,
+                ncRoot: roundTripRoundParameter,
+                nullifierImtRoot: roundTripRoundParameter
+            ),
+            nodeUrl: "http://127.0.0.1:1",
+            hotkeyStoredSecret: hotkey.storedSecret,
+            bundles: []
+        )
+
+        XCTAssertThrowsError(try backend.recoverDelegationFromForensicEvidence(request)) { error in
+            guard case VotingRustBackendError.rustError(let message) = error else {
+                XCTFail("expected .rustError, got \(error.localizedDescription)")
+                return
+            }
+            XCTAssertTrue(message.contains("forensic recovery must contain"), message)
+        }
+    }
+
     func test_delegationTxHash_roundTrips() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }

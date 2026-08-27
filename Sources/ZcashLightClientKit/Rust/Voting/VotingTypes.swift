@@ -416,6 +416,170 @@ public struct VotingVanWitness: Codable, Sendable {
     }
 }
 
+// MARK: - Historical delegation recovery
+
+/// One public leaf from a vote-tree snapshot whose advertised Merkle root was
+/// independently recomputed by `zcash_voting`.
+public struct VotingVerifiedVoteTreeLeaf: Codable, Equatable, Sendable {
+    public let position: UInt32
+    public let commitment: [UInt8]
+
+    public init(position: UInt32, commitment: [UInt8]) {
+        self.position = position
+        self.commitment = commitment
+    }
+}
+
+/// Complete public vote-tree state safe to use as the target set for forensic
+/// recovery candidate discovery.
+public struct VotingVerifiedVoteTreeSnapshot: Codable, Equatable, Sendable {
+    public let anchorHeight: UInt32
+    public let root: [UInt8]
+    public let leaves: [VotingVerifiedVoteTreeLeaf]
+
+    enum CodingKeys: String, CodingKey {
+        case anchorHeight = "anchor_height"
+        case root, leaves
+    }
+
+    public init(anchorHeight: UInt32, root: [UInt8], leaves: [VotingVerifiedVoteTreeLeaf]) {
+        self.anchorHeight = anchorHeight
+        self.root = root
+        self.leaves = leaves
+    }
+}
+
+/// Authenticated round parameters used to prove that forensic evidence belongs
+/// to the same round already stored in the voting database.
+public struct VotingForensicRoundParameters: Codable, Equatable, Sendable {
+    public let voteRoundId: String
+    public let snapshotHeight: UInt64
+    public let eaPk: [UInt8]
+    public let ncRoot: [UInt8]
+    public let nullifierImtRoot: [UInt8]
+
+    enum CodingKeys: String, CodingKey {
+        case voteRoundId = "vote_round_id"
+        case snapshotHeight = "snapshot_height"
+        case eaPk = "ea_pk"
+        case ncRoot = "nc_root"
+        case nullifierImtRoot = "nullifier_imt_root"
+    }
+
+    public init(
+        voteRoundId: String,
+        snapshotHeight: UInt64,
+        eaPk: [UInt8],
+        ncRoot: [UInt8],
+        nullifierImtRoot: [UInt8]
+    ) {
+        self.voteRoundId = voteRoundId
+        self.snapshotHeight = snapshotHeight
+        self.eaPk = eaPk
+        self.ncRoot = ncRoot
+        self.nullifierImtRoot = nullifierImtRoot
+    }
+}
+
+/// One bundle reconstructed from preserved database bytes.
+///
+/// The recovered VAN randomness is secret state, so this value conforms to
+/// `Undescribable` and must not be logged.
+public struct VotingForensicDelegationBundle: Codable, Equatable, Sendable, Undescribable {
+    public let bundleIndex: UInt32
+    public let totalNoteValue: UInt64
+    public let addressIndex: UInt32
+    public let vanCommRand: [UInt8]
+    public let vanCommitment: [UInt8]
+    public let vanLeafPosition: UInt32
+    public let delegationTxHash: String?
+
+    enum CodingKeys: String, CodingKey {
+        case bundleIndex = "bundle_index"
+        case totalNoteValue = "total_note_value"
+        case addressIndex = "address_index"
+        case vanCommRand = "van_comm_rand"
+        case vanCommitment = "van_commitment"
+        case vanLeafPosition = "van_leaf_position"
+        case delegationTxHash = "delegation_tx_hash"
+    }
+
+    public init(
+        bundleIndex: UInt32,
+        totalNoteValue: UInt64,
+        addressIndex: UInt32,
+        vanCommRand: [UInt8],
+        vanCommitment: [UInt8],
+        vanLeafPosition: UInt32,
+        delegationTxHash: String?
+    ) {
+        self.bundleIndex = bundleIndex
+        self.totalNoteValue = totalNoteValue
+        self.addressIndex = addressIndex
+        self.vanCommRand = vanCommRand
+        self.vanCommitment = vanCommitment
+        self.vanLeafPosition = vanLeafPosition
+        self.delegationTxHash = delegationTxHash
+    }
+}
+
+/// Complete input for the historical delegation recovery seam.
+///
+/// `expectedChainId` and `expectedRoundParams` must come from the authenticated
+/// round configuration. The request conforms to `Undescribable` because it
+/// carries both the voting hotkey secret and recovered VAN randomness.
+public struct VotingForensicDelegationRecoveryRequest: Encodable, Sendable, Undescribable {
+    public let expectedChainId: String
+    public let expectedRoundParams: VotingForensicRoundParameters
+    public let nodeUrl: String
+    public let hotkeyStoredSecret: [UInt8]
+    public let bundles: [VotingForensicDelegationBundle]
+
+    enum CodingKeys: String, CodingKey {
+        case expectedChainId = "expected_chain_id"
+        case expectedRoundParams = "expected_round_params"
+        case nodeUrl = "node_url"
+        case hotkeyStoredSecret = "hotkey_stored_secret"
+        case bundles
+    }
+
+    public init(
+        expectedChainId: String,
+        expectedRoundParams: VotingForensicRoundParameters,
+        nodeUrl: String,
+        hotkeyStoredSecret: [UInt8],
+        bundles: [VotingForensicDelegationBundle]
+    ) {
+        self.expectedChainId = expectedChainId
+        self.expectedRoundParams = expectedRoundParams
+        self.nodeUrl = nodeUrl
+        self.hotkeyStoredSecret = hotkeyStoredSecret
+        self.bundles = bundles
+    }
+}
+
+/// Public receipt for an atomic historical delegation repair.
+public struct VotingForensicDelegationRecovery: Codable, Equatable, Sendable {
+    public let anchorHeight: UInt32
+    public let treeRoot: [UInt8]
+    public let bundleCount: UInt32
+    public let alreadyRecovered: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case anchorHeight = "anchor_height"
+        case treeRoot = "tree_root"
+        case bundleCount = "bundle_count"
+        case alreadyRecovered = "already_recovered"
+    }
+
+    public init(anchorHeight: UInt32, treeRoot: [UInt8], bundleCount: UInt32, alreadyRecovered: Bool) {
+        self.anchorHeight = anchorHeight
+        self.treeRoot = treeRoot
+        self.bundleCount = bundleCount
+        self.alreadyRecovered = alreadyRecovered
+    }
+}
+
 // MARK: - Keystone signature record (JSON)
 
 /// A persisted Keystone-produced PCZT signature for a delegation bundle.

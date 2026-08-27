@@ -200,6 +200,37 @@ extension VotingRustBackend {
 // MARK: - Vote-tree sync
 
 extension VotingRustBackend {
+    /// Download every public vote-tree leaf for a round and return them only
+    /// after `zcash_voting` has recomputed the advertised Merkle root.
+    ///
+    /// This snapshot is intended only to constrain historical forensic scans;
+    /// it does not mutate the voting database.
+    public static func verifiedVoteTreeSnapshot(
+        roundId: String,
+        nodeUrl: String
+    ) throws -> VotingVerifiedVoteTreeSnapshot {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        let urlBytes = [UInt8](nodeUrl.utf8)
+
+        let ptr = roundIdBytes.withUnsafeBufferPointer { roundIdBuffer in
+            urlBytes.withUnsafeBufferPointer { urlBuffer in
+                zcashlc_voting_verified_vote_tree_snapshot(
+                    roundIdBuffer.baseAddress,
+                    UInt(roundIdBuffer.count),
+                    urlBuffer.baseAddress,
+                    UInt(urlBuffer.count)
+                )
+            }
+        }
+        guard let ptr else {
+            throw VotingRustBackendError.rustError(
+                staticLastErrorMessage(fallback: "`verified_vote_tree_snapshot` failed")
+            )
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try staticDecodeJSON(from: ptr)
+    }
+
     /// Sync the vote commitment tree from a chain node.
     ///
     /// Returns the latest synced block height.
@@ -272,6 +303,36 @@ extension VotingRustBackend {
                 throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`reset_tree_client` failed"))
             }
         }
+    }
+
+    /// Restore the minimal delegation rows needed to resume a historically
+    /// stranded vote after `zcash_voting` validates the complete recovered
+    /// batch against the hotkey, authenticated round context, and a freshly
+    /// downloaded root-validated public tree.
+    ///
+    /// This is intentionally not a general delegation API. It rejects partial,
+    /// conflicting, already-voted, or ordinary current state.
+    public func recoverDelegationFromForensicEvidence(
+        _ request: VotingForensicDelegationRecoveryRequest
+    ) throws -> VotingForensicDelegationRecovery {
+        let requestBytes = [UInt8](try JSONEncoder().encode(request))
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr = requestBytes.withUnsafeBufferPointer { requestBuffer in
+                zcashlc_voting_recover_delegation_from_forensic_evidence(
+                    dbh,
+                    requestBuffer.baseAddress,
+                    UInt(requestBuffer.count)
+                )
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`recover_delegation_from_forensic_evidence` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try decodeJSON(from: ptr)
     }
 }
 
