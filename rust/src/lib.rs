@@ -92,6 +92,9 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::fingerprint::SeedFingerprint;
 
+/// cbindgen:ignore
+#[cfg(target_vendor = "apple")]
+mod darwin_qos;
 mod derivation;
 mod eip681;
 mod ext_schema;
@@ -314,21 +317,14 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // user-interactive work preempt it. Thread count is deliberately unchanged. Interactive
     // proving sessions (voting) temporarily override the workers to USER_INITIATED via
     // interactive_qos.
-    #[cfg(target_vendor = "apple")]
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(
-            qos_class: core::ffi::c_uint,
-            relative_priority: core::ffi::c_int,
-        ) -> core::ffi::c_int;
-    }
-    #[cfg(target_vendor = "apple")]
-    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
-
     let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
     #[cfg(target_vendor = "apple")]
     let pool_builder = pool_builder.start_handler(|_| {
         unsafe {
-            let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+            let _ = crate::darwin_qos::pthread_set_qos_class_self_np(
+                crate::darwin_qos::QOS_CLASS_UTILITY,
+                0,
+            );
         }
         // Recorded so an interactive proving session (voting) can temporarily
         // override these workers to USER_INITIATED; see interactive_qos.

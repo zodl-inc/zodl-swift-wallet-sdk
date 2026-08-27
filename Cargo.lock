@@ -2946,6 +2946,7 @@ dependencies = [
  "http",
  "http-body-util",
  "incrementalmerkletree",
+ "libc",
  "log-panics",
  "nonempty",
  "once_cell",
