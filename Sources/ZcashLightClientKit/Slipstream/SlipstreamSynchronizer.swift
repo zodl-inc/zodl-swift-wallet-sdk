@@ -731,7 +731,21 @@ public actor SlipstreamSynchronizer: Synchronizer {
         guard let summary = await engine.walletSummary() else { return nil }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
-            return summary.withSpendableMasked()
+            let masked = summary.withSpendableMasked()
+            // The mask zeroes spendable across every pool, so the wallet reads as fully pending
+            // while it holds. It is transient by design and was previously silent, which makes a
+            // one-off "funds stuck pending / cannot send max" report impossible to diagnose after
+            // the fact. Log the deciding facts and the value moved.
+            initializer.logger.info(
+                """
+                [#1591] stale-tip mask APPLIED — spendable hidden until the tip refreshes. \
+                tipFresh=\(snap.map { String($0.tipFresh) } ?? "nil (engine mid-close)") \
+                isRecovering=\(snap.map { String($0.isRecovering) } ?? "nil") \
+                spendable \(summary.accountBalances.values.reduce(Zatoshi.zero) { $0 + $1.shieldedSpendableValue }.decimalString()) \
+                → 0 across \(masked.accountBalances.count) account(s)
+                """
+            )
+            return masked
         }
         return summary
     }
