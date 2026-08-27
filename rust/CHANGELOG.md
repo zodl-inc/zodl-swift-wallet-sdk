@@ -208,7 +208,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proving pool, for callers waiting on an interactive proof (e.g. a voting signature) rather than
   background proving. On Apple platforms, `_begin` raises every pool worker to `USER_INITIATED` QoS
   on the 0→1 session edge; `_end` releases the boost on the 1→0 edge and is a saturating no-op when
-  called without a matching `_begin`; `_active` reports the number of outstanding sessions. The boost is pool-wide while a session is open: background proving that overlaps a session
+  called without a matching `_begin`; `_active` reports the number of outstanding sessions.
+  The boost is pool-wide while a session is open: background proving that overlaps a session
   runs boosted with it. Outside sessions workers keep their resting `UTILITY` QoS, so the
   migration prove sweep and the overnight BGTask path are unaffected except during an overlap.
   Failed override starts and releases are logged through `tracing`, and a failed release is

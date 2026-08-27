@@ -101,6 +101,7 @@ final class InteractiveProvingQoSTests: XCTestCase {
             )
             XCTFail("commitVote for an uninitialized round must throw from the Rust layer")
         } catch {
+            XCTAssertNotEqual(error as? VotingRustBackendError, VotingRustBackendError.databaseNotOpen)
             XCTAssertNotNil(error as? VotingRustBackendError)
             XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
         }
