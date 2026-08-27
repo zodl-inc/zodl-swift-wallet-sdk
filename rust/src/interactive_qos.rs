@@ -22,9 +22,17 @@
 use std::sync::Mutex;
 
 struct BoostCore {
+    /// pthread handles of every registered proving-pool worker, in
+    /// registration order. Never pruned: global-pool workers live for the
+    /// process lifetime.
     workers: Vec<usize>,
+    /// Outstanding interactive sessions — the begin/end refcount.
     sessions: usize,
+    /// Override tokens (`pthread_override_t` handles) for the currently
+    /// boosted workers. Empty whenever `sessions == 0`.
     overrides: Vec<usize>,
+    /// Releases the OS refused; those workers stay boosted for the process
+    /// lifetime, counted so diagnostics can see it happened.
     leaked_overrides: usize,
 }
 
@@ -48,9 +56,12 @@ impl BoostCore {
         }
     }
 
-    /// Returns the new session count. `start_override` runs once per worker on
-    /// the 0→1 edge only; a returned 0 (null token) means the OS rejected the
-    /// override for that worker and nothing is stored for release.
+    /// Returns the new session count. `start_override` runs once per worker
+    /// on the 0→1 edge only and returns that worker's override token — the
+    /// `pthread_override_t` handle the OS hands back, required to end
+    /// exactly that override later. A returned 0 (null token) means the OS
+    /// rejected the override for that worker and nothing is stored for
+    /// release.
     fn begin(&mut self, start_override: impl Fn(usize) -> usize) -> usize {
         self.sessions += 1;
         if self.sessions == 1 {
