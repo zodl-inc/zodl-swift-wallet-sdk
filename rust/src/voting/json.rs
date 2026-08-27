@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zcash_voting as voting;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 // =============================================================================
 // Serde-compatible types for JSON serialization across the FFI boundary
@@ -92,6 +92,7 @@ pub struct JsonForensicDelegationRecovery {
     pub anchor_height: u32,
     pub tree_root: Vec<u8>,
     pub bundle_count: u32,
+    pub recovered_bundle_indices: Vec<u32>,
     pub already_recovered: bool,
 }
 
@@ -101,6 +102,7 @@ impl From<voting::ForensicDelegationRecovery> for JsonForensicDelegationRecovery
             anchor_height: recovery.anchor_height,
             tree_root: recovery.tree_root.to_vec(),
             bundle_count: recovery.bundle_count,
+            recovered_bundle_indices: recovery.recovered_bundle_indices,
             already_recovered: recovery.already_recovered,
         }
     }

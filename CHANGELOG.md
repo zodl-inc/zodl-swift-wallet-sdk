@@ -9,11 +9,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Added
 
 - A narrow historical voting recovery API can fetch a root-validated public
-  vote tree and atomically restore a complete delegation bundle batch from
+  vote tree and atomically restore the recoverable delegation bundle subset from
   forensically recovered VAN randomness. The recovery revalidates the hotkey,
   authenticated round context, on-chain commitments, and local database state
-  in Rust; it rejects partial or conflicting evidence and is not a replacement
-  for the normal delegation flow.
+  in Rust; it reports the exact restored bundle indices and leaves unsubmitted
+  bundles to the normal delegation flow.
 
 ## Changed
 

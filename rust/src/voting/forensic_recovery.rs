@@ -47,13 +47,13 @@ pub unsafe extern "C" fn zcashlc_voting_verified_vote_tree_snapshot(
     unwrap_exc_or_null(res)
 }
 
-/// Validate a complete recovered delegation batch against the stored round,
-/// voting hotkey, and a freshly root-validated public tree, then atomically
-/// install only the minimal state required to resume voting.
+/// Validate a recovered delegation subset against the stored round, voting
+/// hotkey, and a freshly root-validated public tree, then atomically install
+/// only the minimal state required to resume voting.
 ///
 /// This is a historical recovery seam, not an alternative delegation path.
-/// The request must contain the authenticated round context and every bundle
-/// from the original delegation batch.
+/// The request must contain the authenticated round context and a nonempty,
+/// strictly ordered subset of the original delegation batch.
 ///
 /// Returns JSON-encoded `JsonForensicDelegationRecovery`, or null on error.
 ///
@@ -199,25 +199,34 @@ mod tests {
             .db
             .create_round(voting::Network::Testnet, &params, None)
             .expect("create recovery round");
-        voting::storage::queries::insert_bundle(&handle.db.conn(), ROUND_ID, WALLET_ID, 0, &[50])
-            .expect("insert local bundle");
-        handle
-            .db
-            .conn()
-            .execute(
-                "UPDATE bundles
-                 SET van_comm_rand = ?1, gov_comm = ?2,
-                     total_note_value = ?3, address_index = 0
-                 WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = 0",
-                rusqlite::params![
-                    [100u8; 32],
-                    [200u8; 32],
-                    voting::BALLOT_DIVISOR,
-                    ROUND_ID,
-                    WALLET_ID,
-                ],
+        for bundle_index in 0..3 {
+            voting::storage::queries::insert_bundle(
+                &handle.db.conn(),
+                ROUND_ID,
+                WALLET_ID,
+                bundle_index,
+                &[u64::from(bundle_index) + 50],
             )
-            .expect("stage unsigned delegation fields");
+            .expect("insert local bundle");
+            handle
+                .db
+                .conn()
+                .execute(
+                    "UPDATE bundles
+                     SET van_comm_rand = ?1, gov_comm = ?2,
+                         total_note_value = ?3, address_index = 0
+                     WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = ?6",
+                    rusqlite::params![
+                        [100u8; 32],
+                        [200u8; 32],
+                        voting::BALLOT_DIVISOR,
+                        ROUND_ID,
+                        WALLET_ID,
+                        bundle_index,
+                    ],
+                )
+                .expect("stage unsigned delegation fields");
+        }
         handle
             .db
             .conn()
@@ -278,6 +287,7 @@ mod tests {
 
         assert_eq!(recovery.anchor_height, 5);
         assert_eq!(recovery.bundle_count, 1);
+        assert_eq!(recovery.recovered_bundle_indices, vec![0]);
         assert!(!recovery.already_recovered);
         assert_eq!(
             recovery.tree_root,
@@ -293,8 +303,17 @@ mod tests {
                 .iter()
                 .filter(|step| matches!(step, voting::session::NextStep::CastVote { .. }))
                 .count(),
-            1
+            3
         );
+        let delegation_indices = plan
+            .next_steps
+            .iter()
+            .filter_map(|step| match step {
+                voting::session::NextStep::Delegate { bundle_index } => Some(*bundle_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(delegation_indices, vec![1, 2]);
         assert_eq!(
             handle.db.ballot_intents(ROUND_ID).expect("ballot intents"),
             vec![(2, voting::session::Decision::Choice(1))]
@@ -309,6 +328,18 @@ mod tests {
             )
             .expect("count stale proofs");
         assert_eq!(proof_count, 0);
+        let local_bundle_count: i64 = handle
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2
+                   AND note_positions_blob IS NOT NULL",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+                |row| row.get(0),
+            )
+            .expect("count preserved local bundles");
+        assert_eq!(local_bundle_count, 3);
 
         unsafe { zcashlc_voting_db_free(db) };
     }

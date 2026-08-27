@@ -523,7 +523,7 @@ public struct VotingForensicDelegationBundle: Codable, Equatable, Sendable, Unde
     }
 }
 
-/// Complete input for the historical delegation recovery seam.
+/// Input for one atomic historical delegation subset recovery.
 ///
 /// `expectedRoundParams` must come from the authenticated round configuration.
 /// The request conforms to `Undescribable` because it carries both the voting
@@ -559,19 +559,28 @@ public struct VotingForensicDelegationRecovery: Codable, Equatable, Sendable {
     public let anchorHeight: UInt32
     public let treeRoot: [UInt8]
     public let bundleCount: UInt32
+    public let recoveredBundleIndices: [UInt32]
     public let alreadyRecovered: Bool
 
     enum CodingKeys: String, CodingKey {
         case anchorHeight = "anchor_height"
         case treeRoot = "tree_root"
         case bundleCount = "bundle_count"
+        case recoveredBundleIndices = "recovered_bundle_indices"
         case alreadyRecovered = "already_recovered"
     }
 
-    public init(anchorHeight: UInt32, treeRoot: [UInt8], bundleCount: UInt32, alreadyRecovered: Bool) {
+    public init(
+        anchorHeight: UInt32,
+        treeRoot: [UInt8],
+        bundleCount: UInt32,
+        recoveredBundleIndices: [UInt32],
+        alreadyRecovered: Bool
+    ) {
         self.anchorHeight = anchorHeight
         self.treeRoot = treeRoot
         self.bundleCount = bundleCount
+        self.recoveredBundleIndices = recoveredBundleIndices
         self.alreadyRecovered = alreadyRecovered
     }
 }

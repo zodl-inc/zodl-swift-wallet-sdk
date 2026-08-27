@@ -10,9 +10,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `zcashlc_voting_verified_vote_tree_snapshot` exposes only public vote-tree
   leaves after `zcash_voting` recomputes the advertised root, and
-  `zcashlc_voting_recover_delegation_from_forensic_evidence` passes a complete
-  secret-bearing recovery request into the crate-owned atomic repair. The FFI
-  performs no voting database writes itself.
+  `zcashlc_voting_recover_delegation_from_forensic_evidence` passes a nonempty
+  secret-bearing bundle subset into the crate-owned atomic repair and reports
+  the exact recovered indices. The FFI performs no voting database writes
+  itself.
 - `zcashlc_get_transaction`, `zcashlc_free_transaction_data`, and `FfiTransactionData` expose the
   serialized bytes and expiry height available for any wallet-store transaction without depending
   on the transaction-history projection.

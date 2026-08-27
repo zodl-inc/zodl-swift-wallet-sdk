@@ -306,11 +306,11 @@ extension VotingRustBackend {
     }
 
     /// Restore the minimal delegation rows needed to resume a historically
-    /// stranded vote after `zcash_voting` validates the complete recovered
-    /// batch against the hotkey, authenticated round context, and a freshly
+    /// stranded vote after `zcash_voting` validates the recovered subset
+    /// against the hotkey, authenticated round context, and a freshly
     /// downloaded root-validated public tree.
     ///
-    /// This is intentionally not a general delegation API. It rejects partial,
+    /// This is intentionally not a general delegation API. It rejects empty,
     /// conflicting, already-voted, or ordinary current state.
     public func recoverDelegationFromForensicEvidence(
         _ request: VotingForensicDelegationRecoveryRequest

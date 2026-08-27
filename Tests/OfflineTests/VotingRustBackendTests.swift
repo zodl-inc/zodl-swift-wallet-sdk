@@ -580,7 +580,7 @@ final class VotingRustBackendTests: XCTestCase {
         }
     }
 
-    func test_forensicRecoveryRejectsIncompleteBatchBeforeNetwork() throws {
+    func test_forensicRecoveryRejectsEmptySubsetBeforeNetwork() throws {
         let backend = try makeReadyBackend()
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
@@ -604,6 +604,23 @@ final class VotingRustBackendTests: XCTestCase {
             }
             XCTAssertTrue(message.contains("forensic recovery must contain"), message)
         }
+    }
+
+    func test_forensicRecoveryReceiptDecodesRecoveredBundleIndices() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "anchor_height": 42,
+            "tree_root": [UInt8](repeating: 0x07, count: votingFieldElementByteCount),
+            "bundle_count": 2,
+            "recovered_bundle_indices": [0, 2],
+            "already_recovered": false
+        ])
+
+        let receipt = try JSONDecoder().decode(VotingForensicDelegationRecovery.self, from: data)
+
+        XCTAssertEqual(receipt.anchorHeight, 42)
+        XCTAssertEqual(receipt.bundleCount, 2)
+        XCTAssertEqual(receipt.recoveredBundleIndices, [0, 2])
+        XCTAssertFalse(receipt.alreadyRecovered)
     }
 
     func test_delegationTxHash_roundTrips() throws {
