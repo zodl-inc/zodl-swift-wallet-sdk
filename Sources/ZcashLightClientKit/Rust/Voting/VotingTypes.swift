@@ -525,18 +525,16 @@ public struct VotingForensicDelegationBundle: Codable, Equatable, Sendable, Unde
 
 /// Complete input for the historical delegation recovery seam.
 ///
-/// `expectedChainId` and `expectedRoundParams` must come from the authenticated
-/// round configuration. The request conforms to `Undescribable` because it
-/// carries both the voting hotkey secret and recovered VAN randomness.
+/// `expectedRoundParams` must come from the authenticated round configuration.
+/// The request conforms to `Undescribable` because it carries both the voting
+/// hotkey secret and recovered VAN randomness.
 public struct VotingForensicDelegationRecoveryRequest: Encodable, Sendable, Undescribable {
-    public let expectedChainId: String
     public let expectedRoundParams: VotingForensicRoundParameters
     public let nodeUrl: String
     public let hotkeyStoredSecret: [UInt8]
     public let bundles: [VotingForensicDelegationBundle]
 
     enum CodingKeys: String, CodingKey {
-        case expectedChainId = "expected_chain_id"
         case expectedRoundParams = "expected_round_params"
         case nodeUrl = "node_url"
         case hotkeyStoredSecret = "hotkey_stored_secret"
@@ -544,13 +542,11 @@ public struct VotingForensicDelegationRecoveryRequest: Encodable, Sendable, Unde
     }
 
     public init(
-        expectedChainId: String,
         expectedRoundParams: VotingForensicRoundParameters,
         nodeUrl: String,
         hotkeyStoredSecret: [UInt8],
         bundles: [VotingForensicDelegationBundle]
     ) {
-        self.expectedChainId = expectedChainId
         self.expectedRoundParams = expectedRoundParams
         self.nodeUrl = nodeUrl
         self.hotkeyStoredSecret = hotkeyStoredSecret

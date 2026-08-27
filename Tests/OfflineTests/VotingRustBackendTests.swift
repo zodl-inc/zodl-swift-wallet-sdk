@@ -585,7 +585,6 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let request = VotingForensicDelegationRecoveryRequest(
-            expectedChainId: "vote-chain-1",
             expectedRoundParams: VotingForensicRoundParameters(
                 voteRoundId: roundTripRoundId,
                 snapshotHeight: roundTripSnapshotHeight,

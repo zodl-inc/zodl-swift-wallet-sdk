@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zcash_voting as voting;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 // =============================================================================
 // Serde-compatible types for JSON serialization across the FFI boundary
@@ -80,7 +80,6 @@ impl JsonForensicDelegationBundle {
 /// the voting hotkey or recovered commitment randomness.
 #[derive(Deserialize)]
 pub struct JsonForensicDelegationRecoveryRequest {
-    pub expected_chain_id: String,
     pub expected_round_params: voting::VotingRoundParams,
     pub node_url: String,
     pub hotkey_stored_secret: Vec<u8>,

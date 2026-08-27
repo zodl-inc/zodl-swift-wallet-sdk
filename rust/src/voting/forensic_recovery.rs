@@ -82,7 +82,6 @@ pub unsafe extern "C" fn zcashlc_voting_recover_delegation_from_forensic_evidenc
             .map_err(|e| anyhow!("invalid forensic recovery request JSON: {e}"))?;
 
         let JsonForensicDelegationRecoveryRequest {
-            expected_chain_id,
             expected_round_params,
             node_url,
             hotkey_stored_secret,
@@ -103,7 +102,6 @@ pub unsafe extern "C" fn zcashlc_voting_recover_delegation_from_forensic_evidenc
             handle.db.as_ref(),
             voting::RecoverDelegationFromForensicEvidenceParams {
                 voting_hotkey: &hotkey,
-                expected_chain_id: &expected_chain_id,
                 expected_network: handle.network,
                 expected_round_params: &expected_round_params,
                 node_url: &node_url,
