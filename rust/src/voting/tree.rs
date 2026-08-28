@@ -82,7 +82,9 @@ pub unsafe extern "C" fn zcashlc_voting_generate_van_witness(
 }
 
 /// Drop the in-memory TreeClient so the next `sync_vote_tree()` call
-/// creates a fresh one.
+/// creates a fresh one. A zero-length `round_id` drops every round's
+/// cached tree client on this handle; a non-empty id drops only that
+/// round's.
 ///
 /// Returns 0 on success, -1 on error.
 ///

@@ -1310,6 +1310,36 @@ extension VotingRustBackend {
             }
         }
     }
+
+    /// Clears the round's cached vote tree and locally prepared UNSIGNED
+    /// delegation setup fields so an interrupted Keystone signing request can
+    /// be rebuilt; bundles with a Keystone signature, a stored delegation tx
+    /// hash, or a recorded VAN position are preserved.
+    ///
+    /// This is the safe per-round cleanup for resuming an interrupted voting
+    /// session — unlike `clearRound`, it never destroys delegation material an
+    /// on-chain registration may depend on.
+    ///
+    /// - Throws: ``VotingRustBackendError/invalidData`` if `roundId` is empty.
+    ///   This wrapper rejects the empty id up front, matching the FFI, which
+    ///   also refuses it rather than resetting every round's cached tree
+    ///   client account-wide.
+    public func resetSessionState(roundId: String) throws {
+        guard !roundId.isEmpty else {
+            throw VotingRustBackendError.invalidData("roundId must not be empty")
+        }
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_reset_session_state(dbh, buf.baseAddress, UInt(buf.count))
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`reset_session_state` failed")
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Share delegation tracking
@@ -1703,6 +1733,79 @@ extension VotingRustBackend {
         }
         defer { zcashlc_free_boxed_slice(ptr) }
         return try decodeJSON(from: ptr)
+    }
+
+    /// Keyless readback of the stored ZIP-244 sighash of the bundle's
+    /// persisted delegation PCZT, scoped to the open wallet.
+    ///
+    /// Used to verify a persisted Keystone signature still matches the
+    /// bundle's delegation data before trusting it.
+    ///
+    /// - Returns: the 32-byte ZIP-244 sighash. Pass it to
+    ///   ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``
+    ///   alongside the matching signature, exactly as
+    ///   ``VotingDelegationSignature/sighash`` is.
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/rustError`` if delegation setup is
+    ///   incomplete for the bundle (its PCZT setup has not run, or a later
+    ///   step wiped the stored sighash); ``VotingRustBackendError/invalidData``
+    ///   if the returned sighash is not exactly 32 bytes.
+    public func getStoredPcztSighash(roundId: String, bundleIndex: UInt32) throws -> [UInt8] {
+        let roundIdBytes = [UInt8](roundId.utf8)
+
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_get_stored_pczt_sighash(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`get_stored_pczt_sighash` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        let bytes: [UInt8] = try decodeJSON(from: ptr)
+        guard bytes.count == votingPcztSighashByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
+            )
+        }
+        return bytes
+    }
+
+    /// Deletes one bundle's persisted Keystone signature, so the bundle
+    /// becomes eligible again for ``resetSessionState(roundId:)``'s guarded
+    /// cleanup, which otherwise leaves bundles with a stored Keystone
+    /// signature untouched.
+    ///
+    /// Deleting a missing row succeeds.
+    ///
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/rustError`` if the underlying delete
+    ///   fails.
+    public func clearKeystoneSignature(roundId: String, bundleIndex: UInt32) throws {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_clear_keystone_signature(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`clear_keystone_signature` failed")
+                )
+            }
+        }
     }
 
     /// Get the delegation submission payload for an externally produced

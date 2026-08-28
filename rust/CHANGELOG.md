@@ -215,6 +215,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
+- `zcashlc_voting_reset_session_state(db, round_id, round_id_len) -> i32` clears one round's
+  cached vote tree state and locally prepared unsigned delegation setup fields so an
+  interrupted Keystone signing request can be rebuilt. Bundles with a stored Keystone
+  signature, a stored delegation tx hash, or a recorded VAN position are untouched, unlike
+  `zcashlc_voting_clear_round`. Returns 0 on success, -1 on error. No existing call sites
+  change.
+  A zero-length `round_id` is rejected with `-1` (per-round semantics require a
+  non-empty id; `zcashlc_voting_reset_tree_client` remains the way to drop every
+  round's cached tree client).
+- `zcashlc_voting_get_stored_pczt_sighash` returns the stored ZIP-244 sighash of a
+  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`),
+  or null when delegation setup is incomplete for the bundle. It takes only the round
+  id and bundle index, scoped to the handle's wallet id — no delegation-key inputs.
+  (It replaces a keys-taking form of the same readback that never shipped in a release.)
+- `zcashlc_voting_clear_keystone_signature` deletes one bundle's persisted Keystone
+  signature (0 on success, including when no row exists; -1 on error). Deleting the
+  signature makes the bundle eligible again for `zcashlc_voting_reset_session_state`'s
+  guarded cleanup, so a wallet that discards a stale signature can clear and rebuild
+  that bundle's delegation setup.
 
 ### Changed
 

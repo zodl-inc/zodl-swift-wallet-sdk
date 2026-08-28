@@ -176,72 +176,62 @@ pub unsafe extern "C" fn zcashlc_voting_sign_delegation_request(
     unwrap_exc_or_null(res)
 }
 
+/// Keyless readback of the stored ZIP-244 sighash for `(round_id,
+/// bundle_index)`, scoped to the handle's wallet id.
+///
+/// Replaces the former `zcashlc_voting_get_delegation_signing_sighash`, which
+/// took the same delegation-key inputs as the signing entry point purely to
+/// reconstruct `DelegationKeys` and validate the round's network — the keys
+/// never influenced the returned bytes. This form skips that reconstruction
+/// entirely: `alpha` is not read, only the stored `pczt_sighash`. It exists so
+/// a wallet holding a signature produced out of band (e.g. by a Keystone
+/// hardware signer) can verify it against the bundle's stored setup without
+/// supplying any delegation-key inputs.
+///
+/// Returns JSON-encoded `[u8; 32]` (the stored sighash) as `*mut
+/// FfiBoxedSlice`, or null on error — including when delegation setup is
+/// incomplete for the bundle (`pczt_sighash` was never stored, or a later
+/// step wiped it).
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_get_stored_pczt_sighash(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+) -> *mut crate::ffi::BoxedSlice {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+
+        let sighash = voting::storage::queries::load_pczt_sighash(
+            &handle.db.conn(),
+            &round_id_str,
+            &handle.db.wallet_id(),
+            bundle_index,
+        )
+        .map_err(|e| anyhow!("load_pczt_sighash failed: {}", e))?;
+        json_to_boxed_slice(&sighash)
+    });
+    unwrap_exc_or_null(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use zcash_voting::storage::queries;
-
     use crate::voting::constants::ORCHARD_FVK_LEN;
     use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
-
-    /// Must match the wallet id `test_helpers::open_memory_db` registers, or the
-    /// planted rows are invisible to the handle under test.
-    const TEST_WALLET_ID: &str = "wallet";
-    const TEST_ROUND_ID: &str = "round";
-    const TEST_SEED: [u8; 32] = [1u8; 32];
-    const PLANTED_SIGHASH: [u8; 32] = [9u8; 32];
-
-    fn test_seed_fingerprint() -> [u8; SEED_FINGERPRINT_LEN] {
-        zip32::fingerprint::SeedFingerprint::from_seed(&TEST_SEED)
-            .expect("32-byte seed is valid for ZIP-32")
-            .to_bytes()
-    }
-
-    /// A stored hotkey secret that `zcash_voting` accepts, produced the same way
-    /// a wallet would produce it rather than by guessing at the encoding.
-    fn valid_stored_secret() -> Vec<u8> {
-        voting::hotkey::generate_random_voting_hotkey(voting::Network::Mainnet)
-            .expect("generate hotkey")
-            .stored_secret()
-            .to_vec()
-    }
-
-    /// Plant the round, bundle, and stored PCZT signing fields (`pczt_sighash`,
-    /// `alpha`) that `delegate::signing_request` loads, without running the
-    /// proving pipeline that stores them in production. Only the two loaded
-    /// fields and the crate-validated `tx1_effects` need real shapes; the other
-    /// delegation blobs are inert 32-byte placeholders.
-    fn plant_signing_request(db: *mut VotingDatabaseHandle, alpha: &[u8; 32]) {
-        insert_round_and_bundle(db, TEST_ROUND_ID);
-        let handle = unsafe { db.as_ref() }.expect("db handle");
-        let conn = handle.db.conn();
-        let mut tx1_effects = vec![0u8; voting::tx1::TX1_EFFECTS_LEN];
-        tx1_effects[0] = voting::tx1::TX1_EFFECTS_VERSION;
-        queries::store_delegation_data(
-            &conn,
-            TEST_ROUND_ID,
-            TEST_WALLET_ID,
-            0,
-            &[0u8; 32], // van_comm_rand
-            &[],        // dummy_nullifiers
-            &[0u8; 32], // rho_signed
-            &[],        // padded_cmx
-            &[0u8; 32], // nf_signed
-            &[0u8; 32], // cmx_new
-            alpha,
-            &[0u8; 32], // rseed_signed
-            &[0u8; 32], // rseed_output
-            &[0u8; 32], // gov_comm
-            65_000_000, // total_note_value
-            0,          // address_index
-            &[],        // padded_note_secrets
-            &PLANTED_SIGHASH,
-            &tx1_effects,
-        )
-        .expect("plant delegation signing data");
-    }
+    use crate::voting::test_helpers::{
+        PLANTED_SIGHASH, TEST_ROUND_ID, TEST_SEED, call_get_sighash, insert_round_and_bundle,
+        open_memory_db, plant_signing_request, test_seed_fingerprint, valid_stored_secret,
+    };
 
     fn call_sign(
         db: *mut VotingDatabaseHandle,
@@ -466,13 +456,65 @@ mod tests {
         );
 
         unsafe { zcashlc_voting_db_free(db) };
-        assert!(!result.is_null(), "matching seed and planted request must sign");
+        assert!(
+            !result.is_null(),
+            "matching seed and planted request must sign"
+        );
         let bytes = unsafe { (*result).as_slice() }.to_vec();
         unsafe { crate::ffi::zcashlc_free_boxed_slice(result) };
 
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("signature json");
         assert_eq!(json["sig"].as_array().expect("sig array").len(), 64);
         let sighash: Vec<u8> = json["sighash"]
+            .as_array()
+            .expect("sighash array")
+            .iter()
+            .map(|v| u8::try_from(v.as_u64().expect("byte")).expect("byte range"))
+            .collect();
+        assert_eq!(
+            sighash,
+            PLANTED_SIGHASH.to_vec(),
+            "returned sighash must echo the stored one"
+        );
+    }
+
+    #[test]
+    fn get_stored_pczt_sighash_errors_when_setup_missing() {
+        let db = open_memory_db();
+        // Round and bundle exist, but no PCZT build ever stored a sighash or
+        // alpha for the bundle, so the signing request cannot be assembled.
+        insert_round_and_bundle(db, TEST_ROUND_ID);
+
+        let result = call_get_sighash(db, TEST_ROUND_ID.as_bytes());
+
+        unsafe { zcashlc_voting_db_free(db) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn get_stored_pczt_sighash_rejects_null_db() {
+        let result = call_get_sighash(std::ptr::null_mut(), TEST_ROUND_ID.as_bytes());
+
+        assert!(result.is_null());
+    }
+
+    /// Positive control for the readback: the same planted fixture the negative
+    /// tests use must return the sighash that was stored, which is what proves
+    /// they fail on the missing setup rather than on a broken plant.
+    #[test]
+    fn get_stored_pczt_sighash_returns_planted_sighash() {
+        let db = open_memory_db();
+        plant_signing_request(db, &[0u8; 32]);
+
+        let result = call_get_sighash(db, TEST_ROUND_ID.as_bytes());
+
+        unsafe { zcashlc_voting_db_free(db) };
+        assert!(!result.is_null(), "planted request must yield a sighash");
+        let bytes = unsafe { (*result).as_slice() }.to_vec();
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(result) };
+
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("sighash json");
+        let sighash: Vec<u8> = json
             .as_array()
             .expect("sighash array")
             .iter()

@@ -16,6 +16,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proving that overlaps an interactive proving call is temporarily raised with it; outside
   those windows — including during `warmProvingCaches()`, which deliberately stays at the
   pool's resting priority — background proving keeps the existing utility demotion.
+- `VotingRustBackend.resetSessionState(roundId:)` — clears a round's cached vote tree and
+  locally prepared UNSIGNED delegation setup fields so an interrupted Keystone signing
+  request can be rebuilt, while preserving bundles that already have a Keystone signature,
+  a stored delegation tx hash, or a recorded VAN position. This is the safe per-round
+  cleanup for resuming an interrupted voting session: unlike `clearRound(roundId:)`, it
+  never destroys delegation material that an on-chain registration may already depend on.
+  Throws `VotingRustBackendError.invalidData` if `roundId` is empty, since the underlying
+  call treats an empty round ID as an account-wide reset of every round's cached tree
+  client rather than this round's alone.
+- `VotingRustBackend.getStoredPcztSighash(roundId:bundleIndex:)` — returns the stored
+  ZIP-244 sighash of the bundle's persisted delegation PCZT as `[UInt8]`, matching the rest
+  of the voting API surface (`VotingDelegationSignature.sighash`,
+  `getDelegationSubmission(...sighash:)`), so a wallet can verify that a persisted Keystone
+  signature still matches the bundle's delegation data before trusting it. Takes only the
+  round ID and bundle index, scoped to the already-open wallet database — the previous
+  keys-taking form never shipped and has been removed. Throws when delegation setup is
+  incomplete (e.g. after an interrupted build).
+- `VotingRustBackend.clearKeystoneSignature(roundId:bundleIndex:)` — deletes one bundle's
+  persisted Keystone signature, so a wallet that discards a stale signature can clear and
+  rebuild that bundle's setup via `resetSessionState(roundId:)`, which otherwise leaves
+  bundles with a stored Keystone signature untouched. Deleting a missing row succeeds.
 
 # 4.1.0 - 2026-08-25
 
