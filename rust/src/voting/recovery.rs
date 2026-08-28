@@ -445,7 +445,9 @@ mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;
     use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::delegation::zcashlc_voting_get_bundle_count;
+    use crate::voting::delegation::{
+        zcashlc_voting_get_bundle_count, zcashlc_voting_store_van_position,
+    };
     use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
     use crate::voting::test_helpers::{
         TEST_ROUND_ID, call_get_sighash, insert_round_and_bundle, open_memory_db,
@@ -963,6 +965,51 @@ mod tests {
             1,
             "bundle rows must survive the reset"
         );
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    /// A recorded VAN leaf position is registration evidence on its own:
+    /// `store_van_position` can record one before any delegation tx hash is
+    /// stored. The reset must leave such a bundle's delegation setup intact —
+    /// alpha cannot be regenerated, so clearing it would orphan the on-chain
+    /// registration permanently.
+    #[test]
+    fn reset_session_state_keeps_setup_for_bundle_with_van_position_only() {
+        let db = open_memory_db();
+        plant_signing_request(db, &[0u8; 32]);
+        let round_id = TEST_ROUND_ID.as_bytes();
+
+        // Only the VAN position marks the registration: no delegation tx
+        // hash, no Keystone signature.
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_store_van_position(db, round_id.as_ptr(), round_id.len(), 0, 7)
+            },
+            0,
+            "recording the VAN position must succeed"
+        );
+
+        assert_eq!(
+            unsafe { zcashlc_voting_reset_session_state(db, round_id.as_ptr(), round_id.len()) },
+            0,
+            "reset must succeed"
+        );
+
+        let after = call_get_sighash(db, round_id);
+        assert!(
+            !after.is_null(),
+            "a bundle whose only registration evidence is its VAN position must keep its delegation setup"
+        );
+        let kept = unsafe { (*after).as_slice() }.to_vec();
+        unsafe { zcashlc_free_boxed_slice(after) };
+        let sighash: Vec<u8> =
+            serde_json::from_slice(&kept).expect("sighash readback decodes as JSON bytes");
+        assert_eq!(
+            sighash,
+            crate::voting::test_helpers::PLANTED_SIGHASH.to_vec(),
+            "the preserved setup must echo the planted sighash"
+        );
+
         unsafe { zcashlc_voting_db_free(db) };
     }
 
