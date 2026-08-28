@@ -75,6 +75,14 @@ pre-release on GitHub. The text transforms and predicates these scripts are
 built from live in `Scripts/lib/release-lib.sh` and are covered by
 `make test-scripts`, which `make check` includes.
 
+After the tag is out, merge `release/X.Y.Z` back into its `maint/vX.Y.x` branch
+and forward along the chain. Do not cherry-pick: a tag that is not reachable
+from a live branch stops being part of the history it shipped from. The
+`Release Merged Back` workflow reports any tagged release branch missing from
+its line, on every pull request into a maintenance branch or `main`. It is
+advisory and never blocks; run it locally with
+`REMOTE=<remote> ./.github/scripts/check-release-merged-back.sh`.
+
 ## Architecture
 
 ### Two-layer wallet
