@@ -608,6 +608,27 @@ class SlipstreamOfflineTests: ZcashTestCase {
         XCTAssertTrue(state.accountsBalances.isEmpty)
     }
 
+    /// A cold synchronizer keeps the database-backed balance available separately from the
+    /// freshness-masked balance used for transaction decisions.
+    func testInitialStateColdPreservesLocalBalanceSnapshot() {
+        let account = AccountUUID(id: [UInt8](repeating: 1, count: 16))
+        let localBalance = AccountBalance(
+            saplingBalance: .zero,
+            orchardBalance: .zero,
+            unshielded: Zatoshi(200)
+        )
+        let state = SlipstreamSynchronizer.initialState(
+            snapshot: nil,
+            accountsBalances: [:],
+            localAccountsBalances: [account: localBalance],
+            fullyScannedHeight: nil,
+            syncSessionID: UUID()
+        )
+
+        XCTAssertTrue(state.accountsBalances.isEmpty)
+        XCTAssertEqual(state.localAccountsBalances, [account: localBalance])
+    }
+
     /// A ZERO snapshot (fresh wallet: engine seeded nothing — no tip, no floor) stays cold
     /// `.disconnected`, preserving the prior fresh-wallet cold-launch behaviour.
     func testInitialStateColdWhenSnapshotUnseeded() {

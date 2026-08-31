@@ -678,6 +678,10 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.getWalletSummary()?.accountBalances ?? [:]
     }
 
+    public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
+        try await initializer.rustBackend.getLocalAccountBalances()
+    }
+
     /// Fetches the latest ZEC-USD exchange rate.
     public func refreshExchangeRateUSD() {
         Task {
@@ -1633,9 +1637,13 @@ public class SDKSynchronizer: Synchronizer {
     // MARK: notify state
 
     private func snapshotState(status: InternalSyncStatus) async -> SynchronizerState {
-        await SynchronizerState(
+        let summaries = try? await initializer.rustBackend.getWalletSummaryWithLocalBalances()
+        let visibleBalances = summaries?.summary?.accountBalances ?? [:]
+        let localBalances = summaries?.localBalances ?? visibleBalances
+        return await SynchronizerState(
             syncSessionID: syncSession.value,
-            accountsBalances: (try? await getAccountsBalances()) ?? [:],
+            accountsBalances: visibleBalances,
+            localAccountsBalances: localBalances,
             internalSyncStatus: status,
             latestBlockHeight: latestBlocksDataProvider.latestBlockHeight,
             fullyScannedHeight: latestBlocksDataProvider.fullyScannedHeight

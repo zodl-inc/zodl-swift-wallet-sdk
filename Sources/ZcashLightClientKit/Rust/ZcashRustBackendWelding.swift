@@ -202,6 +202,15 @@ protocol ZcashRustBackendWelding {
     /// Returns the account balances and sync status of the wallet.
     func getWalletSummary() async throws -> WalletSummary?
 
+    /// Returns the freshness-masked summary and its unmasked local balances from one database read.
+    func getWalletSummaryWithLocalBalances() async throws -> (
+        summary: WalletSummary?,
+        localBalances: [AccountUUID: AccountBalance]
+    )
+
+    /// Returns the locally persisted account balances without chain-tip freshness masking.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]
+
     /// Returns a list of suggested scan ranges based upon the current wallet state.
     ///
     /// This method should only be used in cases where the `CompactBlock` data that will be
@@ -905,6 +914,18 @@ protocol ZcashRustBackendWelding {
 }
 
 extension ZcashRustBackendWelding {
+    func getWalletSummaryWithLocalBalances() async throws -> (
+        summary: WalletSummary?,
+        localBalances: [AccountUUID: AccountBalance]
+    ) {
+        let summary = try await getWalletSummary()
+        return (summary, summary?.accountBalances ?? [:])
+    }
+
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
+        try await getWalletSummary()?.accountBalances ?? [:]
+    }
+
     func migrationAdvanceStep(
         for account: AccountUUID,
         estimatedTip: BlockHeight?

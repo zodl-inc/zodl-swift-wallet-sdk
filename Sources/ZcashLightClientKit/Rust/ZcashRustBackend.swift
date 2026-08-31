@@ -1218,6 +1218,28 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
     // DB-READ (audited 2026-08-03): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
     // across its whole body; the sdkFlags await sits after the FFI window.
     func getWalletSummary() async throws -> WalletSummary? {
+        try await getWalletSummaryWithLocalBalances().summary
+    }
+
+    func getWalletSummaryWithLocalBalances() async throws -> (
+        summary: WalletSummary?,
+        localBalances: [AccountUUID: AccountBalance]
+    ) {
+        guard let localSummary = try getUnmaskedWalletSummary() else { return (nil, [:]) }
+
+        // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
+        if await !sdkFlags.chainTipUpdated {
+            return (localSummary.withSpendableMasked(), localSummary.accountBalances)
+        }
+
+        return (localSummary, localSummary.accountBalances)
+    }
+
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
+        try getUnmaskedWalletSummary()?.accountBalances ?? [:]
+    }
+
+    private func getUnmaskedWalletSummary() throws -> WalletSummary? {
         let summaryPtr = zcashlc_get_wallet_summary(dbData.0, dbData.1, networkType.networkId, confirmationsPolicy.toBackend())
 
         guard let summaryPtr else {
@@ -1227,14 +1249,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         defer { zcashlc_free_wallet_summary(summaryPtr) }
 
         // C → Swift mapping shared with the unified wallet-summary path (WalletSummary+FFI.swift).
-        guard let summary = WalletSummary.fromFFI(summaryPtr) else { return nil }
-
-        // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
-        if await !sdkFlags.chainTipUpdated {
-            return summary.withSpendableMasked()
-        }
-
-        return summary
+        return WalletSummary.fromFFI(summaryPtr)
     }
 
     // DB-READ (audited 2026-08-03): suggest_scan_ranges — single SELECT on scan_queue; no
