@@ -763,3 +763,108 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 }
+
+/// One carved bundle, as the wallet client recovered it from a wiped database.
+///
+/// Deserialised rather than passed as a C array because the count varies and a
+/// repeated-struct ABI would have to be kept in step by hand on both sides;
+/// the rest of this FFI already moves structured data as JSON.
+///
+/// `van_comm_rand` and `gov_comm` are lowercase hex, matching how round and
+/// transaction identifiers already cross this boundary.
+#[derive(serde::Deserialize)]
+struct JsonCarvedBundle {
+    bundle_index: u32,
+    van_comm_rand: String,
+    gov_comm: String,
+    total_note_value: u64,
+    #[serde(default)]
+    delegation_tx_hash: Option<String>,
+}
+
+fn decode_field(hex_str: &str, field: &str) -> anyhow::Result<[u8; 32]> {
+    // Decoded by hand: `hex` is a dev-dependency of this crate, and a new
+    // runtime dependency for sixteen lines is not a trade worth making.
+    if hex_str.len() != 64 {
+        return Err(anyhow!(
+            "{field} must be 64 hex characters, got {}",
+            hex_str.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair = &hex_str[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|e| anyhow!("{field} is not valid hex: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Restores delegation state the wallet carved out of a wiped database.
+///
+/// The wipe destroyed `van_comm_rand`, which is sampled from `OsRng` and was
+/// writable through no exported call -- which is exactly why it was terminal.
+/// The client can now recover it from freed pages and the write-ahead log, and
+/// this is the door back in.
+///
+/// `bundles_json` is an array of objects:
+///
+/// ```json
+/// [{"bundle_index": 0,
+///   "van_comm_rand": "<64 hex chars>",
+///   "gov_comm": "<64 hex chars>",
+///   "total_note_value": 130000000,
+///   "delegation_tx_hash": "<hex or null>"}]
+/// ```
+///
+/// A null `delegation_tx_hash` is legitimate: it is stored only after
+/// submission returns, so its absence usually means nothing was broadcast.
+///
+/// Returns the number of bundles whose secrets were written, which is 0 when
+/// they were already present -- the call is idempotent, and recovery runs on
+/// every cold launch. Returns -1 on error.
+///
+/// # Safety
+///
+/// `db` must be a valid `VotingDatabaseHandle`; the pointers must reference
+/// initialised buffers of the given lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_restore_carved_delegation(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundles_json: *const u8,
+    bundles_json_len: usize,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let json = unsafe { str_from_ptr(bundles_json, bundles_json_len) }?;
+
+        let parsed: Vec<JsonCarvedBundle> = serde_json::from_str(&json)
+            .map_err(|e| anyhow!("carved bundles are not valid JSON: {}", e))?;
+
+        let bundles = parsed
+            .into_iter()
+            .map(|b| {
+                Ok(voting::carved_delegation::CarvedBundle {
+                    bundle_index: b.bundle_index,
+                    van_comm_rand: decode_field(&b.van_comm_rand, "van_comm_rand")?,
+                    gov_comm: decode_field(&b.gov_comm, "gov_comm")?,
+                    total_note_value: b.total_note_value,
+                    delegation_tx_hash: b.delegation_tx_hash,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let outcome = handle
+            .db
+            .restore_carved_delegation(&round_id_str, &bundles)
+            .map_err(|e| anyhow!("restore_carved_delegation failed: {}", e))?;
+
+        Ok(i32::try_from(outcome.restored).unwrap_or(i32::MAX))
+    });
+    unwrap_exc_or(res, -1)
+}
