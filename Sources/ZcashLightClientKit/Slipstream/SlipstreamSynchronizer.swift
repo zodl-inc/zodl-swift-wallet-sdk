@@ -1624,11 +1624,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// 6. Store `endpoint` in `currentEndpoint`.
     /// 7. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
-        // F2: No-op on identical endpoint — avoids an unnecessary restart.
-        // Compare host, port and TLS flag (all three must match to be the same server).
-        if endpoint.host == currentEndpoint.host
-            && endpoint.port == currentEndpoint.port
-            && endpoint.secure == currentEndpoint.secure {
+        // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
+        // host, port and TLS flag must all match (`isSameServer`).
+        if endpoint.isSameServer(as: currentEndpoint) {
             initializer.logger.debug(
                 "switchTo: endpoint unchanged (\(endpoint.host):\(endpoint.port)) — no-op",
                 file: #file, function: #function, line: #line
@@ -1703,57 +1701,84 @@ public actor SlipstreamSynchronizer: Synchronizer {
             .map { $0.endpoint }
     }
 
+    /// Slipstream benchmarks by a single `getInfo` round trip per candidate —
+    /// `fetchThresholdSeconds` and `nBlocksToFetch` are accepted for protocol conformance but
+    /// unused, because this conformer has no block-fetch phase.
     public func evaluateServerSwitch(
         current: LightWalletEndpoint,
         candidates: [LightWalletEndpoint],
-        fetchThresholdSeconds: Double,
-        nBlocksToFetch: UInt64,
+        fetchThresholdSeconds _: Double,
+        nBlocksToFetch _: UInt64,
         network: NetworkType
     ) async -> LightWalletEndpoint? {
-        let ranked = await measureEndpoints(endpoints: candidates, network: network)
-
-        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked, thresholds: .roundTrip)
-
-        let scores = ranked
-            .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }
-            .joined(separator: ", ")
-        initializer.logger.info(
-            "[evaluateServerSwitch] current=\(current.host):\(current.port) ranked=[\(scores)] -> \(outcome.logDescription)"
-        )
-
-        return outcome.endpointToSwitchTo
+        await ServerSwitchDecision.evaluate(
+            current: current,
+            candidates: candidates,
+            thresholds: .roundTrip,
+            logger: initializer.logger
+        ) { endpoints in
+            await self.measureEndpoints(endpoints: endpoints, network: network)
+        }
     }
 
-    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first).
-    /// Delegate to ephemeral gRPC connections — same pattern as SDKSynchronizer.
+    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
+    /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
+    /// and the loose synced-height check — all skipped for custom networks, mirroring
+    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
     // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
-        var results: [(LightWalletEndpoint, TimeInterval)] = []
-        await withTaskGroup(of: (LightWalletEndpoint, TimeInterval)?.self) { group in
+        var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+
+        await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
                     let service = LightWalletGRPCService(endpoint: endpoint)
-                    let start = Date().timeIntervalSince1970
+                    let start = DispatchTime.now()
                     let info = try? await service.getInfo(mode: .direct)
-                    let elapsed = Date().timeIntervalSince1970 - start
-                    guard let info,
-                        (info.chainName == "main" && network == .mainnet) ||
-                        (info.chainName == "test" && network == .testnet) else {
-                        return nil
-                    }
-                    return (endpoint, elapsed)
+                    let elapsed = DispatchTime.now().secondsSince(start)
+                    await service.closeConnections()
+                    guard let info else { return nil }
+                    return (endpoint, elapsed, info)
                 }
             }
+
+            let isCustomNetwork = initializer.network.customActivationHeights != nil
+
             for await result in group {
-                if let result { results.append(result) }
+                guard let (endpoint, elapsed, info) = result, elapsed > 0 else { continue }
+
+                if !isCustomNetwork {
+                    guard (info.chainName == "main" && network == .mainnet)
+                        || (info.chainName == "test" && network == .testnet)
+                        || (info.chainName == "regtest" && network == .regtest) else {
+                        continue
+                    }
+
+                    guard
+                        let localBranchID = try? initializer.rustBackend.consensusBranchIdFor(
+                            height: Int32(info.blockHeight)
+                        ),
+                        let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID),
+                        remoteBranchID == localBranchID
+                    else {
+                        continue
+                    }
+                }
+
+                // Rule out servers that are syncing, stuck, or probably on the wrong fork.
+                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate.
+                guard info.blockHeight + ZcashSDK.syncedThresholdBlocks >= info.estimatedHeight else {
+                    continue
+                }
+
+                results.append(ServerSwitchDecision.MeasuredEndpoint(endpoint: endpoint, score: elapsed))
             }
         }
-        return results
-            .sorted { $0.1 < $1.1 }
-            .map { ServerSwitchDecision.MeasuredEndpoint(endpoint: $0.0, score: $0.1) }
+
+        return results.sorted { $0.score < $1.score }
     }
 
     // ── Birthday / timestamp ──────────────────────────────────────────────────

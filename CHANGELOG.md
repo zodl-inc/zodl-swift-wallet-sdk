@@ -30,6 +30,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task is cancelled.
 - Server-benchmark timings use a monotonic clock, so a wall-clock adjustment mid-measurement can
   no longer produce negative or nonsense scores.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) now
+  applies the same health checks as `SDKSynchronizer`: a consensus-branch-id check and a
+  synced-height check rule out servers on the wrong fork or far behind the chain tip, and
+  regtest chain names are accepted on the regtest network. Previously a stalled server that
+  answered `getInfo` quickly could rank first.
 
 # 4.1.0 - 2026-09-01
 
