@@ -81,7 +81,7 @@ extension MaxSpendMode {
     }
 }
 
-struct ZcashRustBackend: ZcashRustBackendWelding {
+struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     let confirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultTransferPolicy()
     let shieldingConfirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultShieldingPolicy()
 
@@ -1215,12 +1215,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    // DB-READ (audited 2026-08-03): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
-    // across its whole body; the sdkFlags await sits after the FFI window.
+    // DB-READ (audited 2026-09-01): delegates to getWalletSummaryWithLocalBalances(), whose
+    // get_wallet_summary FFI read is audited below; performs no direct database access here.
     func getWalletSummary() async throws -> WalletSummary? {
         try await getWalletSummaryWithLocalBalances().summary
     }
 
+    // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL;
+    // the sdkFlags await occurs after getUnmaskedWalletSummary() closes its FFI window.
     func getWalletSummaryWithLocalBalances() async throws -> (
         summary: WalletSummary?,
         localBalances: [AccountUUID: AccountBalance]
@@ -1235,10 +1237,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return (localSummary, localSummary.accountBalances)
     }
 
+    // DB-READ (audited 2026-09-01): delegates to getUnmaskedWalletSummary(), whose
+    // get_wallet_summary FFI read is audited below; performs no writes.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
         try getUnmaskedWalletSummary()?.accountBalances ?? [:]
     }
 
+    // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
+    // across its whole body; the summary pointer is freed before this function returns.
     private func getUnmaskedWalletSummary() throws -> WalletSummary? {
         let summaryPtr = zcashlc_get_wallet_summary(dbData.0, dbData.1, networkType.networkId, confirmationsPolicy.toBackend())
 

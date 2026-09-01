@@ -319,12 +319,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // still come from the unified summary (recovery-safe at every phase, D-1/E-1).
         let snap = await engine.snapshot()
         currentlyRecovering = snap?.isRecovering == 1
-        let summaries = await unifiedWalletSummaries()
-        let summary = summaries?.visible
+        let summaries = await walletBalanceSnapshots()
+        let summary = summaries.visible
         stateSubject.send(SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: summary?.accountBalances ?? [:],
-            localAccountsBalances: summaries?.local.accountBalances,
+            localAccountsBalances: summaries.local ?? [:],
             fullyScannedHeight: summary?.fullyScannedHeight,
             syncSessionID: UUID()
         ))
@@ -382,6 +382,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stateSubject.send(SynchronizerState(
             syncSessionID: UUID(),
             accountsBalances: latestState.accountsBalances,
+            localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: .syncing(
                 Float(snap?.progressPermille ?? 0) / 1000,
                 (snap?.spendableHint ?? 0) != 0
@@ -428,6 +429,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: latestState.accountsBalances,
+                localAccountsBalances: latestState.localAccountsBalances,
                 internalSyncStatus: .stopped,
                 latestBlockHeight: latestState.latestBlockHeight
             ))
@@ -455,6 +457,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stateSubject.send(SynchronizerState(
             syncSessionID: latestState.syncSessionID,
             accountsBalances: latestState.accountsBalances,
+            localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: status,
             latestBlockHeight: latestState.latestBlockHeight
         ))
@@ -513,8 +516,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [E-3] A plain local: the host-side summary CACHE is gone with the warm-start
         // machinery it fed (the engine serves its own cache; a nil here only means
         // "engine mid-close", and every consumer falls back to `latestState`).
-        let summaries = await unifiedWalletSummaries()
-        let summary = summaries?.visible
+        let summaries = await walletBalanceSnapshots()
+        let summary = summaries.visible
 
         // ── State-dispatch: Syncing vs Done vs other ──────────────────────────
         // Progress + spendability come from the snapshot (blessed `progressPermille` +
@@ -547,7 +550,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: summary?.accountBalances ?? latestState.accountsBalances,
-                localAccountsBalances: summaries?.local.accountBalances ?? latestState.localAccountsBalances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: .synced,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
@@ -565,7 +568,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: summary?.accountBalances ?? latestState.accountsBalances,
-                localAccountsBalances: summaries?.local.accountBalances ?? latestState.localAccountsBalances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: .syncing(surfacedProgress, spendable),
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
@@ -590,7 +593,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: balances,
-                localAccountsBalances: summaries?.local.accountBalances ?? latestState.localAccountsBalances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: newStatus,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: fullyScannedHeight,
@@ -732,14 +735,22 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// (E-2); only the 3-line transform stays host-side (the C `AccountBalance` cannot express
     /// the awaiting-resolution shift). Recovery balances are never masked — parity with the
     /// old path, where the recovery display bypassed the legacy summary's mask entirely.
-    /// A nil snapshot (engine mid-close) masks conservatively: never over-show spendable.
-    private func unifiedWalletSummaries() async -> (visible: WalletSummary, local: WalletSummary)? {
-        guard let summary = await engine.walletSummary() else { return nil }
+    /// The visible summary is engine-owned and recovery-safe. The local snapshot always comes
+    /// directly from the shared wallet database and is display-only; it remains available while
+    /// the engine handle is closed during server replacement.
+    private func walletBalanceSnapshots() async -> (
+        visible: WalletSummary?,
+        local: [AccountUUID: AccountBalance]?
+    ) {
+        let summary = await engine.walletSummary()
+        let provider = initializer.rustBackend as? LocalBalanceProviding
+        let local = try? await provider?.getLocalAccountBalances()
+        guard let summary else { return (nil, local) }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
-            return (summary.withSpendableMasked(), summary)
+            return (summary.withSpendableMasked(), local)
         }
-        return (summary, summary)
+        return (summary, local)
     }
 
     // ── Accounts / Balances ────────────────────────────────────────────────────
@@ -748,12 +759,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [v2.1 Phase 2] ONE call, correct at every phase: the engine resolves recovery
         // (Σ-reconciled view values) vs normal (upstream passthrough) inside the unified
         // summary FFI and rations the expensive walk itself — no host-side branching.
-        let summaries = await unifiedWalletSummaries()
-        return summaries?.visible.accountBalances ?? [:]
+        let summaries = await walletBalanceSnapshots()
+        return summaries.visible?.accountBalances ?? [:]
     }
 
-    public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
-        await engine.walletSummary()?.accountBalances ?? [:]
+    public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        guard latestState.internalSyncStatus.isPrepared else { return nil }
+        guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
+        return try await provider.getLocalAccountBalances()
     }
 
     public func listAccounts() async throws -> [Account] {

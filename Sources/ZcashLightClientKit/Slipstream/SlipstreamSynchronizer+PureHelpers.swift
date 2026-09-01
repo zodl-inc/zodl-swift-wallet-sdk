@@ -28,7 +28,7 @@ extension SlipstreamSynchronizer {
     static func initialState(
         snapshot: SlipstreamSnapshot?,
         accountsBalances: [AccountUUID: AccountBalance],
-        localAccountsBalances: [AccountUUID: AccountBalance]? = nil,
+        localAccountsBalances: [AccountUUID: AccountBalance],
         fullyScannedHeight: BlockHeight?,
         syncSessionID: UUID
     ) -> SynchronizerState {

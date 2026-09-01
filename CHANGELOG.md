@@ -12,8 +12,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
   the last account balances stored in the wallet database without chain-tip freshness masking.
-  Wallet apps can keep a stale balance visible while they replace networking. Existing balance
-  APIs keep their current masking behavior.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
 ## Changed
 

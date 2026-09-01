@@ -601,6 +601,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         let state = SlipstreamSynchronizer.initialState(
             snapshot: nil,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             fullyScannedHeight: nil,
             syncSessionID: UUID()
         )
@@ -629,6 +630,49 @@ class SlipstreamOfflineTests: ZcashTestCase {
         XCTAssertEqual(state.localAccountsBalances, [account: localBalance])
     }
 
+    func testInitialStateWarmKeepsMaskedAndLocalBalancesDistinct() {
+        let account = AccountUUID(id: [UInt8](repeating: 2, count: 16))
+        let localBalance = AccountBalance(
+            saplingBalance: PoolBalance(
+                spendableValue: Zatoshi(300),
+                changePendingConfirmation: .zero,
+                valuePendingSpendability: .zero
+            ),
+            orchardBalance: .zero,
+            unshielded: Zatoshi(200)
+        )
+        let maskedBalance = AccountBalance(
+            saplingBalance: PoolBalance(
+                spendableValue: .zero,
+                changePendingConfirmation: .zero,
+                valuePendingSpendability: Zatoshi(300)
+            ),
+            orchardBalance: .zero,
+            unshielded: .zero,
+            awaitingResolution: Zatoshi(200)
+        )
+        let snapshot = SlipstreamSnapshot(
+            chainTip: 3_000_000,
+            fetchedBlocks: 0,
+            scannedBlocks: 0,
+            enhancedTxs: 0,
+            currentRangeEnd: 0,
+            state: 0,
+            progressPermille: 999
+        )
+        let state = SlipstreamSynchronizer.initialState(
+            snapshot: snapshot,
+            accountsBalances: [account: maskedBalance],
+            localAccountsBalances: [account: localBalance],
+            fullyScannedHeight: 2_999_990,
+            syncSessionID: UUID()
+        )
+
+        XCTAssertEqual(state.accountsBalances, [account: maskedBalance])
+        XCTAssertEqual(state.localAccountsBalances, [account: localBalance])
+        XCTAssertNotEqual(state.accountsBalances, state.localAccountsBalances)
+    }
+
     /// A ZERO snapshot (fresh wallet: engine seeded nothing — no tip, no floor) stays cold
     /// `.disconnected`, preserving the prior fresh-wallet cold-launch behaviour.
     func testInitialStateColdWhenSnapshotUnseeded() {
@@ -639,6 +683,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         let state = SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             fullyScannedHeight: nil,
             syncSessionID: UUID()
         )
@@ -657,6 +702,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         let state = SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             fullyScannedHeight: 2_999_990,
             syncSessionID: UUID()
         )
@@ -683,6 +729,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         let state = SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             fullyScannedHeight: nil,
             syncSessionID: UUID()
         )

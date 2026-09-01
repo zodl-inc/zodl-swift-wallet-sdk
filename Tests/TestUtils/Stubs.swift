@@ -153,6 +153,7 @@ extension SynchronizerState {
         SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .syncing(0, false),
             latestBlockHeight: 222222,
             fullyScannedHeight: 0

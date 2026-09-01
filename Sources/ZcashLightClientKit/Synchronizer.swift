@@ -66,6 +66,7 @@ public struct SynchronizerState: Equatable {
         SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .unprepared,
             latestBlockHeight: .zero,
             fullyScannedHeight: .zero
@@ -75,7 +76,7 @@ public struct SynchronizerState: Equatable {
     init(
         syncSessionID: UUID,
         accountsBalances: [AccountUUID: AccountBalance],
-        localAccountsBalances: [AccountUUID: AccountBalance]? = nil,
+        localAccountsBalances: [AccountUUID: AccountBalance],
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
         fullyScannedHeight: BlockHeight = .zero,
@@ -83,7 +84,7 @@ public struct SynchronizerState: Equatable {
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
-        self.localAccountsBalances = localAccountsBalances ?? accountsBalances
+        self.localAccountsBalances = localAccountsBalances
         self.internalSyncStatus = internalSyncStatus
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
@@ -426,8 +427,10 @@ public protocol Synchronizer: AnyObject {
     ///
     /// These values can be stale until synchronization refreshes the chain tip. They are intended
     /// for preserving an already-known balance while networking is being initialized or replaced,
-    /// not as the sole authorization for constructing a transaction.
-    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]
+    /// not as the sole authorization for constructing a transaction. Returns `nil` before the
+    /// synchronizer is prepared, after it is wiped, or when an alternate implementation does not
+    /// support durable snapshots.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]?
 
     /// Fetches the latest ZEC-USD exchange rate and updates `exchangeRateUSDSubject`.
     func refreshExchangeRateUSD()
@@ -1486,10 +1489,10 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
-    /// Falls back to the ordinary balance API for alternate synchronizer implementations. SDK
-    /// synchronizers override this to expose their unmasked, database-backed snapshot.
-    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
-        try await getAccountsBalances()
+    /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
+    /// source-compatible and report that the capability is unavailable.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        nil
     }
 
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
