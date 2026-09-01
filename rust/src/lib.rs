@@ -92,10 +92,14 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::fingerprint::SeedFingerprint;
 
+/// cbindgen:ignore
+#[cfg(target_vendor = "apple")]
+mod darwin_qos;
 mod derivation;
 mod eip681;
 mod ext_schema;
 mod ffi;
+mod interactive_qos;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
@@ -298,7 +302,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-02.v0.13-proved-tx-wallet-persistence",
+        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
         "tracing initialized (zcash_client_backend capped at WARN)"
     );
 
@@ -310,21 +314,21 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // this pool for seconds per proof; at default priority that starves the UI (an app-open
     // prove sweep froze interactive screens for the sweep's whole duration). UTILITY keeps
     // full-width proving when the device is idle (the overnight BGTask path) while letting
-    // user-interactive work preempt it. Thread count is deliberately unchanged.
-    #[cfg(target_vendor = "apple")]
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(
-            qos_class: core::ffi::c_uint,
-            relative_priority: core::ffi::c_int,
-        ) -> core::ffi::c_int;
-    }
-    #[cfg(target_vendor = "apple")]
-    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
-
+    // user-interactive work preempt it. Thread count is deliberately unchanged. Interactive
+    // proving sessions (voting) temporarily override the workers to USER_INITIATED via
+    // interactive_qos.
     let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
     #[cfg(target_vendor = "apple")]
-    let pool_builder = pool_builder.start_handler(|_| unsafe {
-        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    let pool_builder = pool_builder.start_handler(|_| {
+        unsafe {
+            let _ = crate::darwin_qos::pthread_set_qos_class_self_np(
+                crate::darwin_qos::QOS_CLASS_UTILITY,
+                0,
+            );
+        }
+        // Recorded so an interactive proving session (voting) can temporarily
+        // override these workers to USER_INITIATED; see interactive_qos.
+        crate::interactive_qos::register_current_thread();
     });
     pool_builder.build_global().expect("Only initialized once");
 
