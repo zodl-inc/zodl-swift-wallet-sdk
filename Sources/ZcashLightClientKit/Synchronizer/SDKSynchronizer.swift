@@ -894,7 +894,7 @@ public class SDKSynchronizer: Synchronizer {
             network: network
         )
 
-        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked)
+        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked, thresholds: .blockFetch)
 
         let scores = ranked
             .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }

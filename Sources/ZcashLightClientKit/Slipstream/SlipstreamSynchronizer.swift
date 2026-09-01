@@ -1712,7 +1712,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     ) async -> LightWalletEndpoint? {
         let ranked = await measureEndpoints(endpoints: candidates, network: network)
 
-        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked)
+        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked, thresholds: .roundTrip)
 
         let scores = ranked
             .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }
