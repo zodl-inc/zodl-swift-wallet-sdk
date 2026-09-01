@@ -14,11 +14,10 @@
 # Apple Silicon anyway, so local iteration is faster. They always build the aarch64
 # targets regardless of host architecture.
 #
-# This creates LocalPackages/ with a locally-built xcframework.
-# Package.swift automatically detects LocalPackages/ and switches
-# from the release binary to the local build.
+# This creates LocalPackages/ with a locally-built xcframework and flips the
+# useLocalFFI switch in Package.swift so the SDK links it.
 #
-# To switch back to the release binary: rm -rf LocalPackages/
+# To switch back to the release binary: ./Scripts/reset-local-ffi.sh
 
 set -e
 cd "$(dirname "$0")/.."
@@ -45,8 +44,8 @@ Options:
   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
   --cached      Download the pre-built release XCFramework instead of building.
 
-Creates LocalPackages/ with a locally-built xcframework. Package.swift detects
-LocalPackages/ and uses it instead of the released binary.
+Creates LocalPackages/ with a locally-built xcframework and flips the
+useLocalFFI switch in Package.swift so the SDK links it.
 USAGEEOF
     exit 1
 }
@@ -260,10 +259,11 @@ fi
 
 # Create local SPM package wrapper
 cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
+./Scripts/set-ffi-mode.sh local
 
 echo ""
 echo "Local FFI initialized at LocalPackages/"
-echo "Package.swift will automatically use the local build."
+echo "Package.swift now selects the local build (useLocalFFI = true)."
 echo ""
 echo "Next steps:"
 echo "  1. Open ZcashSDK.xcworkspace in Xcode (or run: swift build)"
@@ -277,4 +277,4 @@ if [[ "$BUILD_MODE" == "arm" ]]; then
     echo "      arch, or ./Scripts/init-local-ffi.sh (no flags) for the full 5-architecture build."
 fi
 echo ""
-echo "To switch back to the release binary: rm -rf LocalPackages/"
+echo "To switch back to the release binary: ./Scripts/reset-local-ffi.sh"

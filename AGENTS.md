@@ -42,18 +42,18 @@ Test targets are grouped by external dependencies:
 
 ## Rust FFI development
 
-The Rust code in `rust/` is compiled into the `libzcashlc` XCFramework. Two modes, switched automatically by `Package.swift` based on whether `LocalPackages/Package.swift` exists:
+The Rust code in `rust/` is compiled into the `libzcashlc` XCFramework. Two modes, selected by the `useLocalFFI` literal in `Package.swift` — the FFI scripts flip it; never flip or commit it by hand (the committed state is `false`, and CI enforces that):
 
 - **Binary release mode** (default): `.binaryTarget` in `Package.swift` pulls the XCFramework zip from the GitHub Release referenced there (URL + checksum).
-- **Local FFI mode**: `LocalPackages/` acts as a path-dependency override. The workspace's `FFIBuilder` target auto-rebuilds on Xcode builds.
+- **Local FFI mode**: `LocalPackages/` acts as a path-dependency override. The workspace's `FFIBuilder` target auto-rebuilds on Xcode builds. Selected by `useLocalFFI = true`, which the scripts set.
 
 Scripts:
 
-- `./Scripts/init-local-ffi.sh` — one-time setup; default builds all 5 architectures and creates `LocalPackages/`. The **`--arm-*`** flags build an arm64-only subset instead, skipping the x86_64 slices and so finishing faster on Apple Silicon: **`--arm-macos`** for the macOS slice (good for `swift build` / `swift test` on the Mac), **`--arm-ios`** for the iOS simulator and device slices, **`--arm-all`** for all three. Building for a slice you did not include then fails until you build it. Use `--cached` only when your branch has no FFI changes relative to the release.
+- `./Scripts/init-local-ffi.sh` — one-time setup; default builds all 5 architectures, creates `LocalPackages/`, and flips the switch. The **`--arm-*`** flags build an arm64-only subset instead, skipping the x86_64 slices and so finishing faster on Apple Silicon: **`--arm-macos`** for the macOS slice (good for `swift build` / `swift test` on the Mac), **`--arm-ios`** for the iOS simulator and device slices, **`--arm-all`** for all three. Building for a slice you did not include then fails until you build it. Use `--cached` only when your branch has no FFI changes relative to the release.
 - `./Scripts/rebuild-local-ffi.sh [ios-sim|ios-device|macos]` — fast single-arch incremental rebuild after Rust edits. `ios-sim` is default.
-- `./Scripts/reset-local-ffi.sh` — remove `LocalPackages/` and switch back to the release binary.
+- `./Scripts/reset-local-ffi.sh` — flip the switch back to the release binary and remove `LocalPackages/`.
 
-For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, run the full `init-local-ffi.sh` before PRing — `rebuild-local-ffi.sh` only covers one arch.
+For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. If headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, run the full `init-local-ffi.sh` before PRing — `rebuild-local-ffi.sh` only covers one arch.
 
 The `Makefile` wraps these (`make ffi-macos`, `make ffi-all`, `make init-ffi`, `make rebuild-ffi`, `make reset-ffi`, `make configure-local-ffi`); CI calls the targets, so prefer them over the scripts directly. `make help` lists everything.
 

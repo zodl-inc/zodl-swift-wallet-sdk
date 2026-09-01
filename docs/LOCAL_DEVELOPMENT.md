@@ -10,13 +10,14 @@ However, if you need to modify the Rust code in `rust/`, you'll need to set up l
 
 ## How It Works
 
-`Package.swift` automatically detects the presence of `LocalPackages/Package.swift` (created by the init script). When it exists, the SDK builds against your locally-built FFI instead of downloading the release binary. When it doesn't exist, the release binary is used as usual.
+`Package.swift` selects the FFI with an explicit switch: `let useLocalFFI = false` (the committed state) links the pre-built release binary; `true` links your locally built FFI in `LocalPackages/`. The scripts flip the switch for you:
 
-This means switching modes is as simple as:
-- **Enable local FFI:** `./Scripts/init-local-ffi.sh`
-- **Disable local FFI:** `rm -rf LocalPackages/` (or `./Scripts/reset-local-ffi.sh`)
+- **Enable local FFI:** `./Scripts/init-local-ffi.sh` (builds the FFI, creates `LocalPackages/`, flips the switch)
+- **Disable local FFI:** `./Scripts/reset-local-ffi.sh` (flips the switch back, removes `LocalPackages/`)
 
-No manual `Package.swift` edits are needed.
+Never flip or commit the switch by hand — a commit with `useLocalFFI = true` cannot be resolved by package consumers, and CI rejects it. `init-local-ffi.sh` installs a pre-commit hook that blocks such commits locally (bypass deliberately with `ZODL_ALLOW_LOCAL_FFI_COMMIT=1`).
+
+The switch is a literal in the manifest rather than a filesystem probe because SwiftPM (and Xcode) cache the evaluated manifest keyed by the file's bytes: a mode change has to change the bytes, or builds silently keep the previous mode from the cache. This also means switching modes needs no cache resetting — Xcode picks the new mode up on the next resolution.
 
 ## Prerequisites
 
@@ -77,8 +78,6 @@ You can open the project two ways:
   open Package.swift
   ```
 
-If Xcode was already open before you ran `init-local-ffi.sh`, reset package caches: File > Packages > Reset Package Caches.
-
 ### Development Loop
 
 ```bash
@@ -100,8 +99,6 @@ vim rust/src/lib.rs
 ./Scripts/reset-local-ffi.sh
 ```
 
-If using Xcode, you may also need to reset package caches: File > Packages > Reset Package Caches.
-
 ## Scripts Reference
 
 ### `init-local-ffi.sh`
@@ -119,13 +116,13 @@ One-time setup that creates the local development environment.
 This script:
 - Builds the full XCFramework (all 5 architectures), an arm64-only subset (`--arm-*`, faster on Apple Silicon since it skips the x86_64 slices), or downloads a pre-built one
 - Creates `LocalPackages/` with an SPM wrapper package
-- `Package.swift` automatically detects `LocalPackages/` and switches to local mode
+- Flips the `useLocalFFI` switch in `Package.swift` to link it
 
 The `--arm-*` flags always build the `aarch64-*` targets regardless of host architecture. They produce an XCFramework containing only the requested arm64 slices, so building for an x86_64 simulator/Mac (or a slice you didn't include) will fail until you build it — run `rebuild-local-ffi.sh <target>` or a full `init-local-ffi.sh` to add the missing slices. Any unrecognized flag prints usage and exits without building.
 
 ### `rebuild-local-ffi.sh`
 
-Fast incremental rebuild for the current development target. Requires `init-local-ffi.sh` to have been run first.
+Fast incremental rebuild for the current development target. Requires `init-local-ffi.sh` to have been run first. Refuses to run while `Package.swift` is in release mode, since the rebuilt framework would not be linked.
 
 ```bash
 ./Scripts/rebuild-local-ffi.sh [target]
@@ -142,7 +139,7 @@ Targets:
 
 ### `reset-local-ffi.sh`
 
-Removes `LocalPackages/` and switches back to the release binary.
+Flips the `useLocalFFI` switch back to the release binary and removes `LocalPackages/`.
 
 ```bash
 ./Scripts/reset-local-ffi.sh
@@ -169,7 +166,7 @@ The XCFramework contains three platform slices:
 
 ### Local Package Override
 
-The `LocalPackages` directory contains a Swift package named `libzcashlc` with the same product name as the binary target in `Package.swift`. When `Package.swift` detects that `LocalPackages/Package.swift` exists, it adds `LocalPackages` as a path dependency and uses it instead of the `.binaryTarget` declaration. This switching is automatic — no manual edits to `Package.swift` are needed.
+The `LocalPackages` directory contains a Swift package named `libzcashlc` with the same product name as the binary target in `Package.swift`. When `useLocalFFI` is true, `Package.swift` adds `LocalPackages` as a path dependency and uses it instead of the `.binaryTarget` declaration. The scripts flip that switch; never edit or commit it by hand.
 
 ## Automatic FFI Rebuilds
 
@@ -186,7 +183,7 @@ The shared `ZcashLightClientKit` scheme in `ZcashSDK.xcworkspace` includes `FFIB
 
 ### Xcode can't resolve packages / shows 404 error
 
-This means `LocalPackages/` doesn't exist and SPM is trying to download the release binary. Run `./Scripts/init-local-ffi.sh` to set up local development, then reset package caches in Xcode: File > Packages > Reset Package Caches.
+This means `Package.swift` is in release mode (`useLocalFFI = false`) and SPM is trying to download a release binary that does not exist for this branch. Run `./Scripts/init-local-ffi.sh` to build and select the local FFI. The reverse failure — "LocalPackages does not contain a Package.swift" — means the flag is true but `LocalPackages/` is missing; run `./Scripts/init-local-ffi.sh` or `./Scripts/set-ffi-mode.sh release`.
 
 ### Xcode doesn't pick up FFI changes
 
@@ -215,9 +212,7 @@ rm -rf target/Headers
 
 ### Xcode uses wrong FFI after switching modes
 
-After running `init-local-ffi.sh` or `reset-local-ffi.sh`, Xcode may need to re-resolve packages:
-1. File > Packages > Reset Package Caches
-2. If that doesn't help, close and reopen the workspace
+This should no longer happen: mode switches edit `Package.swift`, which invalidates SwiftPM's manifest cache by content. If Xcode still shows the old mode, it predates this mechanism — reset once via File > Packages > Reset Package Caches.
 
 ### FFIBuilder fails on first workspace open
 

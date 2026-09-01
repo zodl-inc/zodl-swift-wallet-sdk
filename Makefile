@@ -65,9 +65,15 @@ info: ## Print the resolved toolchain and FFI state
 	@printf "XCFramework:  "; \
 		if [ -d "$(XCFRAMEWORK)" ]; then echo "$(XCFRAMEWORK)"; \
 		else echo "<not built; run make ffi-macos>"; fi
+	@printf "FFI mode:     "; \
+		if grep -qE '^let useLocalFFI = true$$' Package.swift; then \
+			echo "local (Package.swift links LocalPackages/)"; \
+		elif grep -qE '^let useLocalFFI = false$$' Package.swift; then \
+			echo "release (Package.swift links the released binary)"; \
+		else echo "unknown (no useLocalFFI line in Package.swift)"; fi
 	@printf "LocalPackages:"; \
-		if [ -d LocalPackages ]; then echo " present (local FFI in use)"; \
-		else echo " absent (Package.swift uses the released FFI)"; fi
+		if [ -d LocalPackages ]; then echo " present"; \
+		else echo " absent"; fi
 
 # The FFI targets produce an Apple XCFramework, which only Xcode can do.
 .PHONY: require-macos
@@ -110,8 +116,7 @@ check-all: build-all test ## Build everything from source and run the offline te
 clean: ## Clean the SwiftPM build directory
 	$(SWIFT) package clean
 
-# reset-ffi last: it removes LocalPackages/, which would otherwise survive as a
-# stale copy that Package.swift keeps linking after everything else is gone.
+# reset-ffi last: it flips Package.swift back to the released binary and removes LocalPackages/, leaving the tree in the committed state.
 .PHONY: clean-all
 clean-all: clean clean-ffi clean-rust reset-ffi ## Clean all artifacts and reset the FFI mode
 
@@ -219,8 +224,7 @@ verify-ffi: ## Check the XCFramework exists and show its contents
 	@echo "XCFramework contents:"
 	@ls -la $(XCFRAMEWORK)/
 
-# Package.swift auto-detects LocalPackages/ and links the local FFI instead of
-# the released binary target.
+# Stage the locally built XCFramework in LocalPackages/ and flip the useLocalFFI switch in Package.swift to link it.
 .PHONY: configure-local-ffi
 configure-local-ffi: verify-ffi ## Point Package.swift at the locally built FFI
 	mkdir -p LocalPackages
@@ -230,7 +234,7 @@ configure-local-ffi: verify-ffi ## Point Package.swift at the locally built FFI
 	rm -rf LocalPackages/$(notdir $(XCFRAMEWORK))
 	cp -R $(XCFRAMEWORK) LocalPackages/
 	cp $(BUILD_SUPPORT)/LocalPackages-Package.swift LocalPackages/Package.swift
-	@echo "LocalPackages created; Package.swift will use the local FFI"
+	./$(SCRIPTS)/set-ffi-mode.sh local
 
 .PHONY: clean-ffi
 clean-ffi: ## Clean the FFI build artifacts

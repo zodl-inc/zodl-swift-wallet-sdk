@@ -1,13 +1,23 @@
 // swift-tools-version:5.6
 import PackageDescription
-import Foundation
 
-// Automatically detect local FFI development mode.
-// When LocalPackages/Package.swift exists (created by Scripts/init-local-ffi.sh),
-// the SDK builds against the locally-built FFI instead of the pre-built binary
-// from GitHub Releases. Run `rm -rf LocalPackages` to switch back.
-let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-let useLocalFFI = FileManager.default.fileExists(atPath: packageDir + "/LocalPackages/Package.swift")
+// Local FFI development switch.
+//
+// `false` — the committed state: the SDK links the pre-built libzcashlc
+// XCFramework from the GitHub release named below. `true`: the SDK links the
+// locally built FFI in LocalPackages/ instead.
+//
+// The switch is a literal rather than a filesystem probe because SwiftPM
+// caches the result of evaluating this manifest keyed by the manifest's
+// bytes (plus package path and toolchain). A mode change therefore has to
+// change this file's bytes, or every build keeps seeing the previously
+// cached mode.
+//
+// Toggled by `make configure-local-ffi`, `Scripts/init-local-ffi.sh`, and
+// `Scripts/reset-local-ffi.sh` (directly: `Scripts/set-ffi-mode.sh`). Do not
+// flip it by hand, and never commit `true` — consumers cannot resolve the
+// package in that state, and CI rejects it.
+let useLocalFFI = false
 
 var dependencies: [Package.Dependency] = [
     .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.24.2"),

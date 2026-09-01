@@ -257,6 +257,42 @@ rewrite_package_swift() {
     grep -qF "$url" "$file" && grep -qF "checksum: \"${checksum}\"" "$file"
 }
 
+# The FFI mode the manifest selects: `local` (links LocalPackages/) or
+# `release` (links the released binary). Non-zero when the manifest has no
+# recognizable flag line, so callers fail loudly instead of guessing.
+#
+# The mode is a literal in Package.swift rather than a filesystem probe:
+# SwiftPM caches the result of evaluating a manifest keyed by the manifest's
+# bytes (plus package path and toolchain), so a mode change must change the
+# bytes to be visible to the cache.
+package_swift_ffi_mode() {
+    if grep -qE '^let useLocalFFI = true$' "$1"; then
+        printf 'local\n'
+    elif grep -qE '^let useLocalFFI = false$' "$1"; then
+        printf 'release\n'
+    else
+        return 1
+    fi
+}
+
+# Rewrite the flag literal. Verified before returning, like
+# rewrite_package_swift: a silent no-match would leave the caller convinced
+# the mode changed when it did not.
+set_package_swift_ffi_mode() {
+    local file="$1" mode="$2" want
+    case "$mode" in
+        local) want="true" ;;
+        release) want="false" ;;
+        *) return 1 ;;
+    esac
+    grep -qE '^let useLocalFFI = (true|false)$' "$file" || return 1
+    sed -i.bak -E \
+        "s/^let useLocalFFI = (true|false)\$/let useLocalFFI = ${want}/" \
+        "$file"
+    rm -f "${file}.bak"
+    grep -qE "^let useLocalFFI = ${want}\$" "$file"
+}
+
 # ----------------------------------------------------------------- preflight
 
 require_clean_tree() {
@@ -293,3 +329,23 @@ require_gh_auth() {
 # this rather than a hardcoded slug, so a rehearsal against a fork stays inside
 # the fork instead of reaching the canonical repository.
 repo_for_remote() { repo_slug_from_url "$(git remote get-url "$1")"; }
+
+# Install the pre-commit guard that rejects committing Package.swift in
+# local-FFI mode. cwd must be the repository root. A pre-commit hook this
+# repo does not own is left alone (warning), so a developer's own hook
+# setup is never clobbered; our own older copy is refreshed in place.
+install_local_ffi_hook() {
+    local hooks_dir hook src marker
+    marker="zodl-swift-wallet-sdk local-FFI guard"
+    src="Scripts/hooks/pre-commit"
+    hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null)" || return 0
+    hook="$hooks_dir/pre-commit"
+    if [ -f "$hook" ] && ! grep -qF "$marker" "$hook"; then
+        warn "a pre-commit hook already exists at $hook; not installing the local-FFI guard." \
+             "Append the check from $src yourself if you want it."
+        return 0
+    fi
+    mkdir -p "$hooks_dir"
+    cp "$src" "$hook"
+    chmod +x "$hook"
+}
