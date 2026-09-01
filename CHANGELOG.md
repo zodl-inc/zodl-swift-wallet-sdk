@@ -4,6 +4,16 @@ All notable changes to this library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## Changed
+
+- `Synchronizer.evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`
+  benchmarks the candidates and decides whether switching away from the current endpoint is worth a
+  synchronizer teardown, returning the endpoint to switch to or `nil` to stay. The winner must beat
+  the current server by at least 200 ms and 25% of its score unless the current server fails the
+  health checks entirely. `evaluateBestOf` is unchanged.
+
 # 4.1.0 - 2026-09-01
 
 ## Added

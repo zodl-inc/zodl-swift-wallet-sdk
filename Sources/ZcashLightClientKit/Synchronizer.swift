@@ -513,6 +513,25 @@ public protocol Synchronizer: AnyObject {
         network: NetworkType
     ) async -> [LightWalletEndpoint]
 
+    /// Benchmarks `candidates` the same way as `evaluateBestOf` and decides whether switching
+    /// away from `current` is worth the synchronizer teardown. Hysteresis: the winner must beat
+    /// the current server's score by a meaningful margin (absolute AND relative) unless the
+    /// current server failed the health checks entirely.
+    /// - Parameters:
+    ///    - current: The endpoint the wallet uses right now (identified by host and port).
+    ///    - candidates: Endpoints to benchmark. All of them are fully evaluated.
+    ///    - fetchThresholdSeconds: Per-endpoint cap for the block-fetch phase.
+    ///    - nBlocksToFetch: Number of blocks to stream in the fetch phase.
+    ///    - network: Mainnet or testnet.
+    /// - Returns: The endpoint to switch to, or nil when staying on `current` is the right call.
+    func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint?
+
     /// Takes a given date and finds out the closes checkpoint's height for it.
     /// Each checkpoint has a timestamp stored so it can be used for the calculations.
     func estimateBirthdayHeight(for date: Date) -> BlockHeight

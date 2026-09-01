@@ -1697,8 +1697,40 @@ public actor SlipstreamSynchronizer: Synchronizer {
         kServers: Int = 3,
         network: NetworkType = .mainnet
     ) async -> [LightWalletEndpoint] {
-        // Delegate to ephemeral gRPC connections — same pattern as SDKSynchronizer.
-        // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+        let measured = await measureEndpoints(endpoints: endpoints, network: network)
+        return measured
+            .prefix(kServers)
+            .map { $0.endpoint }
+    }
+
+    public func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? {
+        let ranked = await measureEndpoints(endpoints: candidates, network: network)
+
+        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked)
+
+        let scores = ranked
+            .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }
+            .joined(separator: ", ")
+        initializer.logger.info(
+            "[evaluateServerSwitch] current=\(current.host):\(current.port) ranked=[\(scores)] -> \(outcome.logDescription)"
+        )
+
+        return outcome.endpointToSwitchTo
+    }
+
+    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first).
+    /// Delegate to ephemeral gRPC connections — same pattern as SDKSynchronizer.
+    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    private func measureEndpoints(
+        endpoints: [LightWalletEndpoint],
+        network: NetworkType
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [(LightWalletEndpoint, TimeInterval)] = []
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval)?.self) { group in
             for endpoint in endpoints {
@@ -1721,8 +1753,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
         return results
             .sorted { $0.1 < $1.1 }
-            .prefix(kServers)
-            .map { $0.0 }
+            .map { ServerSwitchDecision.MeasuredEndpoint(endpoint: $0.0, score: $0.1) }
     }
 
     // ── Birthday / timestamp ──────────────────────────────────────────────────

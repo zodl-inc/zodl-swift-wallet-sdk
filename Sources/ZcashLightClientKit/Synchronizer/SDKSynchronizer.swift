@@ -860,7 +860,6 @@ public class SDKSynchronizer: Synchronizer {
     ///    - nBlocksToFetch: The number of blocks expected to be downloaded from the stream, with the time compared to `fetchThresholdSeconds`. The default is 100.
     ///    - kServers: The expected number of endpoints in the output. The default is 3.
     ///    - network: Mainnet or testnet. The default is mainnet.
-    // swiftlint:disable:next cyclomatic_complexity
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
         fetchThresholdSeconds: Double = 60.0,
@@ -868,6 +867,53 @@ public class SDKSynchronizer: Synchronizer {
         kServers: Int = 3,
         network: NetworkType = .mainnet
     ) async -> [LightWalletEndpoint] {
+        await evaluateEndpoints(
+            endpoints: endpoints,
+            fetchThresholdSeconds: fetchThresholdSeconds,
+            nBlocksToFetch: nBlocksToFetch,
+            kServers: kServers,
+            network: network
+        ).map { $0.endpoint }
+    }
+
+    public func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? {
+        // Every candidate is fully evaluated (kServers = all): "current is missing from the
+        // results" must mean the current server is unhealthy, never that it lost a top-k
+        // spot by a few milliseconds — that distinction is what the decision rests on.
+        let ranked = await evaluateEndpoints(
+            endpoints: candidates,
+            fetchThresholdSeconds: fetchThresholdSeconds,
+            nBlocksToFetch: nBlocksToFetch,
+            kServers: candidates.count,
+            network: network
+        )
+
+        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked)
+
+        let scores = ranked
+            .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }
+            .joined(separator: ", ")
+        logger.info(
+            "[evaluateServerSwitch] current=\(current.host):\(current.port) ranked=[\(scores)] -> \(outcome.logDescription)"
+        )
+
+        return outcome.endpointToSwitchTo
+    }
+
+    // swiftlint:disable:next cyclomatic_complexity
+    private func evaluateEndpoints(
+        endpoints: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        kServers: Int,
+        network: NetworkType
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         struct Service {
             let originalEndpoint: LightWalletEndpoint
             let service: LightWalletGRPCService
@@ -1043,7 +1089,10 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         let finalResult = sortedServers.map {
-            $0.value.service.originalEndpoint
+            ServerSwitchDecision.MeasuredEndpoint(
+                endpoint: $0.value.service.originalEndpoint,
+                score: $0.value.blockTime
+            )
         }
 
         return finalResult
