@@ -19,10 +19,11 @@ enum ServerSwitchDecision {
         let score: TimeInterval
     }
 
-    /// The gates a candidate must clear to justify a switch. Scores have no fixed unit across
-    /// benchmarks — `SDKSynchronizer` ranks by the time to stream a batch of blocks (seconds)
-    /// while `SlipstreamSynchronizer` ranks by a single `getInfo` round trip (milliseconds) —
-    /// so each benchmark picks the preset calibrated for its own scale.
+    /// The gates a candidate must clear to justify a switch. Scores are always seconds, but
+    /// their scale differs per benchmark — `SDKSynchronizer` ranks by the time to stream a
+    /// batch of blocks (whole seconds) while `SlipstreamSynchronizer` ranks by a single
+    /// `getInfo` round trip (small fractions of a second) — so each benchmark picks the
+    /// preset calibrated for its own scale.
     struct Thresholds {
         /// Minimum absolute score improvement worth a switch.
         let minAbsoluteImprovement: TimeInterval

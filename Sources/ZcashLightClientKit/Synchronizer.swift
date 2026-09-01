@@ -533,7 +533,7 @@ public protocol Synchronizer: AnyObject {
     ///    - candidates: Endpoints to benchmark alongside `current`.
     ///    - fetchThresholdSeconds: Per-endpoint cap for the block-fetch phase, where the conformer has one.
     ///    - nBlocksToFetch: Number of blocks to stream in the fetch phase, where the conformer has one.
-    ///    - network: Mainnet or testnet.
+    ///    - network: The network the candidate servers must serve — mainnet, testnet, or regtest.
     /// - Returns: The endpoint to switch to, or nil when staying on `current` is the right call.
     func evaluateServerSwitch(
         current: LightWalletEndpoint,
