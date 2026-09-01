@@ -4,7 +4,7 @@ All notable changes to this library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-# Unreleased
+# 4.1.0 - 2026-09-01
 
 ## Added
 
@@ -37,8 +37,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted Keystone signature, so a wallet that discards a stale signature can clear and
   rebuild that bundle's setup via `resetSessionState(roundId:)`, which otherwise leaves
   bundles with a stored Keystone signature untouched. Deleting a missing row succeeds.
-
-# 4.1.0 - 2026-08-25
 
 ## Changed
 
