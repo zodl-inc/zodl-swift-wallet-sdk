@@ -69,9 +69,9 @@ Delegating the decision logic is not required; a stub returning `nil` preserves 
 func evaluateServerSwitch(
     current: LightWalletEndpoint,
     candidates: [LightWalletEndpoint],
-    fetchThresholdSeconds: UInt32,
-    nBlocksToFetch: UInt32,
-    network: ZcashNetwork
+    fetchThresholdSeconds: Double,
+    nBlocksToFetch: UInt64,
+    network: NetworkType
 ) async -> LightWalletEndpoint? {
     return nil
 }

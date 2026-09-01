@@ -876,6 +876,11 @@ public class SDKSynchronizer: Synchronizer {
         ).map { $0.endpoint }
     }
 
+    /// The block-fetch phase of a switch evaluation is bounded to this many fastest-latency
+    /// candidates (plus the current server, which is always retained) — mirroring
+    /// `evaluateBestOf`'s default `kServers` instead of fetching from the entire list.
+    private static let serverSwitchTopK = 3
+
     public func evaluateServerSwitch(
         current: LightWalletEndpoint,
         candidates: [LightWalletEndpoint],
@@ -883,27 +888,24 @@ public class SDKSynchronizer: Synchronizer {
         nBlocksToFetch: UInt64,
         network: NetworkType
     ) async -> LightWalletEndpoint? {
-        // Every candidate is fully evaluated (kServers = all): "current is missing from the
-        // results" must mean the current server is unhealthy, never that it lost a top-k
-        // spot by a few milliseconds — that distinction is what the decision rests on.
-        let ranked = await evaluateEndpoints(
-            endpoints: candidates,
-            fetchThresholdSeconds: fetchThresholdSeconds,
-            nBlocksToFetch: nBlocksToFetch,
-            kServers: candidates.count,
-            network: network
-        )
-
-        let outcome = ServerSwitchDecision.decide(current: current, ranked: ranked, thresholds: .blockFetch)
-
-        let scores = ranked
-            .map { "\($0.endpoint.host):\($0.endpoint.port)=\(Int($0.score * 1000))ms" }
-            .joined(separator: ", ")
-        logger.info(
-            "[evaluateServerSwitch] current=\(current.host):\(current.port) ranked=[\(scores)] -> \(outcome.logDescription)"
-        )
-
-        return outcome.endpointToSwitchTo
+        // The driver always measures the current server (appending it when the caller's list
+        // omits it) and re-probes it once before treating a missing score as unhealthy, so a
+        // single transient failure cannot force an ungated switch.
+        await ServerSwitchDecision.evaluate(
+            current: current,
+            candidates: candidates,
+            thresholds: .blockFetch,
+            logger: logger
+        ) { endpoints in
+            await self.evaluateEndpoints(
+                endpoints: endpoints,
+                fetchThresholdSeconds: fetchThresholdSeconds,
+                nBlocksToFetch: nBlocksToFetch,
+                kServers: Self.serverSwitchTopK,
+                network: network,
+                mustInclude: current
+            )
+        }
     }
 
     // swiftlint:disable:next cyclomatic_complexity
@@ -912,7 +914,8 @@ public class SDKSynchronizer: Synchronizer {
         fetchThresholdSeconds: Double,
         nBlocksToFetch: UInt64,
         kServers: Int,
-        network: NetworkType
+        network: NetworkType,
+        mustInclude: LightWalletEndpoint? = nil
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         struct Service {
             let originalEndpoint: LightWalletEndpoint
@@ -938,7 +941,9 @@ public class SDKSynchronizer: Synchronizer {
             Service(
                 originalEndpoint: $0,
                 service: LightWalletGRPCServiceOverTor(endpoint: $0, tor: torClient),
-                url: "\($0.host):\($0.port)"
+                // The scheme-qualified form so endpoints differing only in the TLS flag —
+                // distinct servers under `isSameServer` — cannot collide on one key.
+                url: $0.urlString
             )
         }
 
@@ -949,19 +954,19 @@ public class SDKSynchronizer: Synchronizer {
         await withTaskGroup(of: CheckResult.self) { group in
             for service in services {
                 group.addTask {
-                    let startTime = Date().timeIntervalSince1970
+                    let startTime = DispatchTime.now()
 
                     // called when performance of servers is evaluated
                     let mode = await sdkFlagsRef.ifTor(ServiceMode.torInGroup("SDKSynchronizer.evaluateBestOf(\(service.originalEndpoint))"))
 
                     let info = try? await service.service.getInfo(mode: mode)
-                    let markTime = Date().timeIntervalSince1970
+                    let markTime = DispatchTime.now()
                     // called when performance of servers is evaluated
                     let latestBlockHeight = try? await service.service.latestBlockHeight(mode: mode)
-                    let endTime = Date().timeIntervalSince1970
+                    let endTime = DispatchTime.now()
 
-                    let getInfoTime = markTime - startTime
-                    let latestBlockHeightTime = endTime - markTime
+                    let getInfoTime = markTime.secondsSince(startTime)
+                    let latestBlockHeightTime = endTime.secondsSince(markTime)
                     let mean = (getInfoTime + latestBlockHeightTime) / 2
 
                     return CheckResult(
@@ -1036,12 +1041,30 @@ public class SDKSynchronizer: Synchronizer {
             sortedKOnly.forEach {
                 checkResults[$0.key] = $0.value
             }
+
+            // The switch decision needs the current server's own measurement, so it is
+            // retained past the top-k cut whenever it passed the health checks — losing a
+            // top-k spot by a few milliseconds must never read as "unhealthy".
+            if let mustInclude {
+                let retained = tmpResults.first {
+                    $0.value.service.originalEndpoint.isSameServer(as: mustInclude)
+                }
+                if let retained, checkResults[retained.key] == nil {
+                    checkResults[retained.key] = retained.value
+                }
+            }
         }
 
         // Sequential part
         var blockResults: [String: CheckResult] = [:]
 
         for serviceDict in checkResults {
+            // A cancelled benchmark must stop opening connections; the partial results are
+            // safe because the caller treats an incomplete ranking as "stay".
+            if Task.isCancelled {
+                break
+            }
+
             guard let info = serviceDict.value.info else {
                 continue
             }
@@ -1060,27 +1083,49 @@ public class SDKSynchronizer: Synchronizer {
                     mode: .direct
                 )
 
-                let startTime = Date().timeIntervalSince1970
+                let startTime = DispatchTime.now()
                 var endTime = startTime
+                var blocksReceived: UInt64 = 0
                 for try await _ in stream {
-                    endTime = Date().timeIntervalSince1970
-                    if endTime - startTime >= fetchThresholdSeconds {
+                    blocksReceived += 1
+                    endTime = DispatchTime.now()
+                    if endTime.secondsSince(startTime) >= fetchThresholdSeconds {
                         break
                     }
                 }
 
-                let blockTime = endTime - startTime
+                let blockTime = endTime.secondsSince(startTime)
+                let isCurrentServer = mustInclude.map {
+                    serviceDict.value.service.originalEndpoint.isSameServer(as: $0)
+                } ?? false
 
-                // rule out servers that can't fetch `nBlocksToFetch` blocks under fetchThresholdSeconds
-                if blockTime < fetchThresholdSeconds {
+                // Rule out servers that cannot deliver `nBlocksToFetch` blocks under
+                // `fetchThresholdSeconds` — including streams that end early or empty, whose
+                // near-zero elapsed time would otherwise win the ranking outright. The
+                // current server keeps a censored score past the threshold so the switch
+                // decision stays gated instead of reading a near-miss as "unhealthy".
+                if let score = ServerSwitchDecision.blockFetchScore(
+                    elapsed: blockTime,
+                    blocksReceived: blocksReceived,
+                    requiredBlocks: nBlocksToFetch,
+                    threshold: fetchThresholdSeconds,
+                    retainOverThreshold: isCurrentServer
+                ) {
                     var value = serviceDict.value
-                    value.blockTime = blockTime
+                    value.blockTime = score
 
                     blockResults[serviceDict.key] = value
                 }
             } catch {
                 continue
             }
+        }
+
+        // The benchmark owns these connections; close them deterministically instead of
+        // leaving teardown to deinit after the result arrays release. `stop()` is a no-op
+        // for services that never opened a channel.
+        for service in services {
+            await service.service.closeConnections()
         }
 
         // return what's left
