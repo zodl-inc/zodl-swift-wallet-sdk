@@ -318,6 +318,50 @@ pub unsafe extern "C" fn zcashlc_voting_get_keystone_signatures(
     unwrap_exc_or_null(res)
 }
 
+/// Deletes one bundle's persisted Keystone signature.
+///
+/// Deleting the signature makes the bundle eligible again for
+/// `zcashlc_voting_reset_session_state`'s guarded cleanup, which otherwise
+/// leaves bundles with a stored Keystone signature untouched. For wallets
+/// discarding a signature that no longer matches the bundle's stored
+/// delegation setup.
+///
+/// Returns 0 on success (including when no row exists to delete), -1 on
+/// error.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_clear_keystone_signature(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+    bundle_index: u32,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        handle
+            .db
+            .conn()
+            .execute(
+                "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+                rusqlite::named_params! {
+                    ":round_id": round_id_str,
+                    ":wallet_id": handle.db.wallet_id(),
+                    ":bundle_index": bundle_index as i64,
+                },
+            )
+            .map_err(|e| anyhow!("clear_keystone_signature failed: {}", e))?;
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// Clear retryable recovery state for a round without erasing recorded
 /// confirmations.
 ///
@@ -351,13 +395,64 @@ pub unsafe extern "C" fn zcashlc_voting_clear_recovery_state(
     unwrap_exc_or(res, -1)
 }
 
+/// Drops the round's cached vote tree and clears locally prepared unsigned
+/// delegation setup fields so an interrupted Keystone signing request can be
+/// rebuilt. Bundles that already have a Keystone signature, a stored
+/// delegation tx hash, or a recorded VAN position are preserved.
+///
+/// Returns 0 on success, -1 on error.
+///
+/// A zero-length `round_id` is rejected with `-1`: the underlying cache reset
+/// would otherwise silently act on every round on this handle. Per-round
+/// semantics require a non-empty id; to drop every round's cached tree client
+/// deliberately, use `zcashlc_voting_reset_tree_client`.
+///
+/// # Safety
+///
+/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
+/// - `round_id` must be a valid UTF-8 pointer with its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_reset_session_state(
+    db: *mut VotingDatabaseHandle,
+    round_id: *const u8,
+    round_id_len: usize,
+) -> i32 {
+    let db = AssertUnwindSafe(db);
+    let res = catch_panic(|| {
+        let handle =
+            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
+        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        if round_id_str.is_empty() {
+            return Err(anyhow!(
+                "reset_session_state requires a non-empty round_id; use zcashlc_voting_reset_tree_client to drop every round's cached tree client"
+            ));
+        }
+        handle
+            .tree_sync
+            .reset(&round_id_str)
+            .map_err(|e| anyhow!("reset_session_state failed: {}", e))?;
+        handle
+            .db
+            .clear_unsigned_delegation_setup_fields(&round_id_str)
+            .map_err(|e| anyhow!("reset_session_state failed: {}", e))?;
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;
     use crate::voting::db::zcashlc_voting_db_free;
+    use crate::voting::delegation::{
+        zcashlc_voting_get_bundle_count, zcashlc_voting_store_van_position,
+    };
     use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
+    use crate::voting::test_helpers::{
+        TEST_ROUND_ID, call_get_sighash, insert_round_and_bundle, open_memory_db,
+        plant_signing_request,
+    };
     use serde::de::DeserializeOwned;
 
     fn decode_boxed_json<T: DeserializeOwned>(ptr: *mut crate::ffi::BoxedSlice) -> T {
@@ -596,6 +691,84 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
+    #[test]
+    fn clear_keystone_signature_deletes_one_bundles_row() {
+        let db = open_memory_db();
+        let round_id = b"round";
+        insert_round_and_bundle(db, "round");
+        let sig = [1u8; KEYSTONE_SIGNATURE_LEN];
+        let sighash = [2u8; PCZT_SIGHASH_LEN];
+        let rk = [3u8; RANDOMIZED_KEY_LEN];
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_store_keystone_signature(
+                    db,
+                    round_id.as_ptr(),
+                    round_id.len(),
+                    0,
+                    sig.as_ptr(),
+                    sig.len(),
+                    sighash.as_ptr(),
+                    sighash.len(),
+                    rk.as_ptr(),
+                    rk.len(),
+                )
+            },
+            0
+        );
+
+        let before: Vec<serde_json::Value> = decode_boxed_json(unsafe {
+            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
+        });
+        assert_eq!(before.len(), 1, "signature must be listed before the clear");
+
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(db, round_id.as_ptr(), round_id.len(), 0)
+        };
+        assert_eq!(rc, 0);
+
+        let after: Vec<serde_json::Value> = decode_boxed_json(unsafe {
+            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
+        });
+        assert!(
+            after.is_empty(),
+            "bundle 0's signature must be gone after the clear"
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn clear_keystone_signature_on_missing_row_succeeds() {
+        let db = open_memory_db();
+        let round_id = b"round";
+        insert_round_and_bundle(db, "round");
+
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(db, round_id.as_ptr(), round_id.len(), 0)
+        };
+        assert_eq!(
+            rc, 0,
+            "clearing a bundle with no stored signature must still succeed"
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn clear_keystone_signature_rejects_null_db() {
+        let round_id = b"round";
+        let rc = unsafe {
+            zcashlc_voting_clear_keystone_signature(
+                std::ptr::null_mut(),
+                round_id.as_ptr(),
+                round_id.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, -1);
+    }
+
     /// Stores the delegation tx hash, vote tx hash, and a Keystone signature
     /// that the clear-recovery tests start from.
     fn store_recovery_fixture(db: *mut VotingDatabaseHandle, round_id: &[u8]) {
@@ -760,6 +933,113 @@ mod tests {
         });
         assert!(keystone_sigs.is_empty());
 
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    /// Round-trip proof that the reset actually clears the unsigned delegation
+    /// setup: a planted signing request answers the sighash readback before the
+    /// reset and no longer does after, while the bundle row itself survives.
+    #[test]
+    fn reset_session_state_clears_unsigned_setup_and_keeps_bundles() {
+        let db = open_memory_db();
+        plant_signing_request(db, &[0u8; 32]);
+
+        let round_id = TEST_ROUND_ID.as_bytes();
+        let before = call_get_sighash(db, round_id);
+        assert!(!before.is_null(), "setup must be present before the reset");
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(before) };
+
+        assert_eq!(
+            unsafe { zcashlc_voting_reset_session_state(db, round_id.as_ptr(), round_id.len()) },
+            0,
+            "reset must succeed"
+        );
+
+        let after = call_get_sighash(db, round_id);
+        assert!(
+            after.is_null(),
+            "unsigned setup must be gone after the reset"
+        );
+        assert_eq!(
+            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
+            1,
+            "bundle rows must survive the reset"
+        );
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    /// A recorded VAN leaf position is registration evidence on its own:
+    /// `store_van_position` can record one before any delegation tx hash is
+    /// stored. The reset must leave such a bundle's delegation setup intact —
+    /// alpha cannot be regenerated, so clearing it would orphan the on-chain
+    /// registration permanently.
+    #[test]
+    fn reset_session_state_keeps_setup_for_bundle_with_van_position_only() {
+        let db = open_memory_db();
+        plant_signing_request(db, &[0u8; 32]);
+        let round_id = TEST_ROUND_ID.as_bytes();
+
+        // Only the VAN position marks the registration: no delegation tx
+        // hash, no Keystone signature.
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_store_van_position(db, round_id.as_ptr(), round_id.len(), 0, 7)
+            },
+            0,
+            "recording the VAN position must succeed"
+        );
+
+        assert_eq!(
+            unsafe { zcashlc_voting_reset_session_state(db, round_id.as_ptr(), round_id.len()) },
+            0,
+            "reset must succeed"
+        );
+
+        let after = call_get_sighash(db, round_id);
+        assert!(
+            !after.is_null(),
+            "a bundle whose only registration evidence is its VAN position must keep its delegation setup"
+        );
+        let kept = unsafe { (*after).as_slice() }.to_vec();
+        unsafe { zcashlc_free_boxed_slice(after) };
+        let sighash: Vec<u8> =
+            serde_json::from_slice(&kept).expect("sighash readback decodes as JSON bytes");
+        assert_eq!(
+            sighash,
+            crate::voting::test_helpers::PLANTED_SIGHASH.to_vec(),
+            "the preserved setup must echo the planted sighash"
+        );
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn reset_session_state_rejects_null_db() {
+        let round_id = b"round";
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_reset_session_state(
+                    std::ptr::null_mut(),
+                    round_id.as_ptr(),
+                    round_id.len(),
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn reset_session_state_rejects_empty_round_id() {
+        let db = open_memory_db();
+        insert_round_and_bundle(db, "round");
+        let rc = unsafe { zcashlc_voting_reset_session_state(db, std::ptr::null(), 0) };
+        assert_eq!(rc, -1, "empty round_id must be rejected");
+        let round_id = b"round";
+        assert_eq!(
+            unsafe { zcashlc_voting_get_bundle_count(db, round_id.as_ptr(), round_id.len()) },
+            1,
+            "rejection must leave the round untouched"
+        );
         unsafe { zcashlc_voting_db_free(db) };
     }
 }

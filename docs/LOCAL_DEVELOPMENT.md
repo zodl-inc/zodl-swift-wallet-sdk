@@ -57,9 +57,10 @@ The `--cached` flag downloads a pre-built release instead of building from sourc
 For faster iteration on Apple Silicon you can build only the arm64 slices you need, skipping the x86_64 simulator/Mac slices you can't run there anyway:
 
 ```bash
-./Scripts/init-local-ffi.sh --arm-macos # macOS (swift build / swift test on the Mac)
-./Scripts/init-local-ffi.sh --arm-ios   # iOS simulator + device
-./Scripts/init-local-ffi.sh --arm-all   # iOS simulator + device + macOS
+./Scripts/init-local-ffi.sh --arm-macos     # macOS (swift build / swift test on the Mac)
+./Scripts/init-local-ffi.sh --arm-ios       # iOS simulator + device
+./Scripts/init-local-ffi.sh --arm-simulator # iOS simulator only
+./Scripts/init-local-ffi.sh --arm-all       # iOS simulator + device + macOS
 ```
 
 Building for a slice you didn't include will fail until you build it (via `rebuild-local-ffi.sh` or a full `init-local-ffi.sh`).
@@ -109,11 +110,12 @@ If using Xcode, you may also need to reset package caches: File > Packages > Res
 One-time setup that creates the local development environment.
 
 ```bash
-./Scripts/init-local-ffi.sh             # Build from source, all 5 architectures (recommended)
-./Scripts/init-local-ffi.sh --arm-macos # arm64 macOS slice only
-./Scripts/init-local-ffi.sh --arm-ios   # arm64 iOS simulator + device slices
-./Scripts/init-local-ffi.sh --arm-all   # arm64 iOS simulator + device + macOS slices
-./Scripts/init-local-ffi.sh --cached    # Download pre-built release
+./Scripts/init-local-ffi.sh                 # Build from source, all 5 architectures (recommended)
+./Scripts/init-local-ffi.sh --arm-macos     # arm64 macOS slice only
+./Scripts/init-local-ffi.sh --arm-ios       # arm64 iOS simulator + device slices
+./Scripts/init-local-ffi.sh --arm-simulator # arm64 iOS simulator slice only
+./Scripts/init-local-ffi.sh --arm-all       # arm64 iOS simulator + device + macOS slices
+./Scripts/init-local-ffi.sh --cached        # Download pre-built release
 ```
 
 This script:

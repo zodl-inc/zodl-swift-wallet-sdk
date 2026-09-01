@@ -73,5 +73,28 @@ fn main() {
         .generate()
     {
         b.write_to_file("target/Headers/zcashlc.h");
+
+        // The generated header is the SDK's public C surface. Two regression
+        // classes must fail HERE, at the Rust edit, not later as a Swift build
+        // error against a rebuilt slice: an item-scope extern block leaking
+        // system prototypes into the header (cbindgen re-emits those — see
+        // darwin_qos's cbindgen:ignore), and the interactive-proving entry
+        // points vanishing.
+        let header = std::fs::read_to_string("target/Headers/zcashlc.h")
+            .expect("generated zcashlc.h should be readable");
+        assert!(
+            !header.contains("pthread"),
+            "generated zcashlc.h leaks pthread declarations; a cbindgen:ignore suppression regressed"
+        );
+        for symbol in [
+            "zcashlc_proving_interactive_begin",
+            "zcashlc_proving_interactive_end",
+            "zcashlc_proving_interactive_active",
+        ] {
+            assert!(
+                header.contains(symbol),
+                "generated zcashlc.h is missing `{symbol}`"
+            );
+        }
     }
 }

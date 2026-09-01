@@ -20,6 +20,13 @@ public struct Account: Equatable, Hashable, Codable, Identifiable {
     public let uivk: UnifiedIncomingViewingKey?
 }
 
+extension Account {
+    /// The `keySource` marking an account a Keystone hardware wallet signs, compared
+    /// case-insensitively. It sizes that account's Orchard→Ironwood migration runs to one 96-action
+    /// QR signing round; any other value, or `nil`, keeps the default 50-note-per-run sizing.
+    public static let keystoneKeySource = "keystone"
+}
+
 public struct UnifiedSpendingKey: Equatable, Undescribable {
     let network: NetworkType
     let bytes: [UInt8]
@@ -349,6 +356,22 @@ public enum Recipient: Equatable, StringEncoded {
             case .unified: return (.unified(UnifiedAddress(validatedEncoding: encoded, networkType: metadata.networkType)), metadata.networkType)
             case .tex: return (.tex(TexAddress(validatedEncoding: encoded)), metadata.networkType)
             }
+        }
+    }
+}
+
+extension Recipient {
+    /// Memos can only ride in shielded outputs, so a memo aimed at a transparent or TEX
+    /// recipient must be rejected before the request reaches the FFI, where it would only
+    /// surface as an opaque rust error.
+    func ensureMemoIsAllowed(_ memo: Memo?) throws {
+        guard memo != nil else { return }
+
+        switch self {
+        case .transparent, .tex:
+            throw ZcashError.synchronizerSendMemoToTransparentAddress
+        case .sapling, .unified:
+            break
         }
     }
 }

@@ -607,7 +607,7 @@ actor OrchardMigration {
         )
         let proposal = Proposal(inner: ffiProposal)
         let fee = proposal.totalFeeRequired()
-        let amount = OrchardMigration.sweptPaymentValue(of: ffiProposal) - fee
+        let amount = proposal.totalSpendValue() - fee
         return ImmediateMigrationProposal(proposal: proposal, amount: amount, fee: fee)
     }
 
@@ -623,11 +623,13 @@ actor OrchardMigration {
         try await welding.migrationRecordImmediateRun(txid: txid, for: accountUUID)
     }
 
-    /// The leftover Orchard balance a migration would not cross, when large enough to be worth
-    /// offering the user a choice about; `nil` when there is no such residual.
+    /// What the whole migration leaves in Orchard — ``estimateMigrationRuns()``'s `finalResidual`
+    /// with zero mapped to `nil`, never a single run's leftover. A straight delegation to the
+    /// welding read, bound to this actor's own account.
     ///
-    /// - Note: Requires at least one completed sync. On a wallet that has never completed a sync (no
-    ///   chain tip known) this throws rather than returning `nil`.
+    /// - Note: Costs one planning pass per remaining run. Requires at least one completed sync: on
+    ///   a wallet that has never completed a sync (no chain tip known) this throws rather than
+    ///   returning `nil`.
     func residualAfterMigration() async throws -> Zatoshi? {
         try await welding.migrationResidualAfterMigration(for: accountUUID)
     }
@@ -649,7 +651,7 @@ actor OrchardMigration {
 
     /// The multi-run ("rounds") estimate for migrating the whole spendable Orchard balance. A
     /// straight delegation to the welding estimate call, bound to this actor's own account; the
-    /// zero-run estimate is a legitimate answer, not an error.
+    /// zero-run estimate is a legitimate answer, not an error. Costs one planning pass per run.
     func estimateMigrationRuns() async throws -> MigrationRunEstimate {
         try await welding.estimateMigrationRuns(accountUUID: accountUUID)
     }
@@ -994,24 +996,5 @@ extension OrchardMigration {
             nextIndex += size
         }
         return sessions
-    }
-
-    /// The net value swept by an immediate-migration `FfiProposal` before its fee is subtracted:
-    /// the total value of the notes it consumes, minus any declared change. A send-max proposal
-    /// declares no change (there is nothing left to return), so this is ordinarily just the input
-    /// total; the change subtraction is defensive rather than load-bearing.
-    private static func sweptPaymentValue(of proposal: FfiProposal) -> Zatoshi {
-        proposal.steps.reduce(Zatoshi.zero) { total, step in
-            let stepInput = step.inputs.reduce(Zatoshi.zero) { inputTotal, input in
-                guard case .receivedOutput(let output) = input.value else {
-                    return inputTotal
-                }
-                return inputTotal + Zatoshi(Int64(output.value))
-            }
-            let stepChange = step.balance.proposedChange.reduce(Zatoshi.zero) { changeTotal, change in
-                changeTotal + Zatoshi(Int64(change.value))
-            }
-            return total + stepInput - stepChange
-        }
     }
 }

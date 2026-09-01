@@ -92,10 +92,14 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::fingerprint::SeedFingerprint;
 
+/// cbindgen:ignore
+#[cfg(target_vendor = "apple")]
+mod darwin_qos;
 mod derivation;
 mod eip681;
 mod ext_schema;
 mod ffi;
+mod interactive_qos;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
@@ -298,7 +302,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-02.v0.13-proved-tx-wallet-persistence",
+        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
         "tracing initialized (zcash_client_backend capped at WARN)"
     );
 
@@ -310,21 +314,21 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // this pool for seconds per proof; at default priority that starves the UI (an app-open
     // prove sweep froze interactive screens for the sweep's whole duration). UTILITY keeps
     // full-width proving when the device is idle (the overnight BGTask path) while letting
-    // user-interactive work preempt it. Thread count is deliberately unchanged.
-    #[cfg(target_vendor = "apple")]
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(
-            qos_class: core::ffi::c_uint,
-            relative_priority: core::ffi::c_int,
-        ) -> core::ffi::c_int;
-    }
-    #[cfg(target_vendor = "apple")]
-    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
-
+    // user-interactive work preempt it. Thread count is deliberately unchanged. Interactive
+    // proving sessions (voting) temporarily override the workers to USER_INITIATED via
+    // interactive_qos.
     let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
     #[cfg(target_vendor = "apple")]
-    let pool_builder = pool_builder.start_handler(|_| unsafe {
-        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    let pool_builder = pool_builder.start_handler(|_| {
+        unsafe {
+            let _ = crate::darwin_qos::pthread_set_qos_class_self_np(
+                crate::darwin_qos::QOS_CLASS_UTILITY,
+                0,
+            );
+        }
+        // Recorded so an interactive proving session (voting) can temporarily
+        // override these workers to USER_INITIATED; see interactive_qos.
+        crate::interactive_qos::register_current_thread();
     });
     pool_builder.build_global().expect("Only initialized once");
 
@@ -4804,7 +4808,7 @@ pub struct SlipstreamHandle {
     summary_refresh_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// [#1806] Last successfully-read recovery-balance nets (account-uuid bytes → reconciled
     /// net zatoshi), used ONLY as a fallback when the bounded (250 ms) read of
-    /// `slipstream_v_recovery_balance` is contended — so a momentarily-locked view never
+    /// `ext_slipstream_v_recovery_balance` is contended — so a momentarily-locked view never
     /// nulls the whole summary. `None` until the first successful read; see
     /// [`zcashlc_slipstream_wallet_summary`].
     recovery_nets_cache: std::sync::Mutex<Option<std::collections::HashMap<[u8; 16], i64>>>,
@@ -5944,7 +5948,7 @@ fn decide_summary_serving(
 /// an outgoing spend is `spent_note_count > 0` (mirrors librustzcash's spent-notes clause),
 /// unmined is `mined_height IS NULL`, and the view's own `expired_unmined` flag supplies
 /// tx-expiry (mirrors `tx_unexpired_condition`). The returned UUIDs match the account keys of
-/// `slipstream_v_recovery_balance`.
+/// `ext_slipstream_v_recovery_balance`.
 fn read_unmined_spend_accounts_conn(
     conn: &rusqlite::Connection,
 ) -> anyhow::Result<std::collections::HashSet<[u8; 16]>> {
@@ -6082,7 +6086,7 @@ fn serve_wallet_summary(
             let mut nets: std::collections::HashMap<[u8; 16], i64> =
                 std::collections::HashMap::new();
             let mut stmt = conn
-                .prepare("SELECT account_uuid, balance_zat FROM slipstream_v_recovery_balance")
+                .prepare("SELECT account_uuid, balance_zat FROM ext_slipstream_v_recovery_balance")
                 .map_err(|e| anyhow!("recovery balance prepare: {}", e))?;
             let mut rows = stmt
                 .query([])
@@ -6170,7 +6174,7 @@ fn serve_wallet_summary(
 /// - **Recovering** (the recent-first restore backfill; `snapshot.is_recovering == 1`) →
 ///   the upstream summary's per-account balances are REPLACED, because upstream balances
 ///   "may overestimate" mid-restore by documented design (a receipt is counted before its
-///   spend is scanned). The replacement is the engine-owned `slipstream_v_recovery_balance`
+///   spend is scanned). The replacement is the engine-owned `ext_slipstream_v_recovery_balance`
 ///   (Σ of FINAL, reconciled tx deltas — never over-shows, converges to the true total),
 ///   surfaced per the SDK's field-validated Direction-B mapping: the whole clamped net as
 ///   orchard spendable, everything else zero. Progress/heights fields pass through.
@@ -6900,5 +6904,41 @@ mod slipstream_anchor_retention_tests {
             nu6_3: None,
         };
         assert_eq!(slipstream_anchor_retention_floor(&no_nu63), None);
+    }
+}
+
+/// Guards the engine-owned view names this crate and the Swift layer hard-code.
+///
+/// Both read paths fail SILENTLY by design — the recovery-balance read below falls back to
+/// an empty map ("zeroes every balance — safe") and Swift's reconcile read swallows a missing
+/// view as the legitimate non-engine case. So a view rename in the engine does not surface as
+/// an error; it surfaces as zeroed balances and phantom transactions. That is precisely how
+/// the pre-`ext_` names survived unnoticed once the engine's `ExtSchemaInit` migration renamed
+/// them. These assertions turn the next such rename into a failing test naming the file to fix.
+#[cfg(test)]
+mod engine_schema_names_tests {
+    /// The view `TransactionSQLDAO.unreconciledTxids()` reads from Swift. The engine exports
+    /// this name, so bind to it rather than trusting our copy of the string.
+    #[test]
+    fn reconcile_view_name_matches_the_swift_query() {
+        assert_eq!(
+            slipstream_core::reconcile::RECONCILE_VIEW_NAME,
+            "ext_slipstream_v_tx_reconciled",
+            "the engine renamed the reconciliation view; update the query in \
+             Sources/ZcashLightClientKit/DAO/TransactionDao.swift to match"
+        );
+    }
+
+    /// The view `serve_wallet_summary` reads for recovery nets. The engine exports no name
+    /// constant for it, so assert against the DDL it does export.
+    #[test]
+    fn recovery_balance_view_name_matches_our_query() {
+        assert!(
+            slipstream_core::reconcile::RECOVERY_BALANCE_VIEW_SQL
+                .contains("ext_slipstream_v_recovery_balance"),
+            "the engine renamed the recovery-balance view; update the query in \
+             resolve_recovery_nets to match. Engine DDL: {}",
+            slipstream_core::reconcile::RECOVERY_BALANCE_VIEW_SQL
+        );
     }
 }

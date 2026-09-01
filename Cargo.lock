@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -2946,6 +2946,7 @@ dependencies = [
  "http",
  "http-body-util",
  "incrementalmerkletree",
+ "libc",
  "log-panics",
  "nonempty",
  "once_cell",
@@ -8453,8 +8454,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "slipstream-core"
-version = "0.6.4"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=ab89ada45f2ef893a05fcefa0ead99f87d848a4e#ab89ada45f2ef893a05fcefa0ead99f87d848a4e"

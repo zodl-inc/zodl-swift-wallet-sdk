@@ -203,6 +203,37 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (single-transaction) lane is built entirely on the general-purpose
   `zcashlc_propose_send_max_transfer` (called with `orchard_only: true`) instead, which the engine
   itself never touches.
+- `zcashlc_proving_interactive_begin`, `zcashlc_proving_interactive_end`, and
+  `zcashlc_proving_interactive_active` apply a refcounted, scoped QoS boost to the global rayon
+  proving pool, for callers waiting on an interactive proof (e.g. a voting signature) rather than
+  background proving. On Apple platforms, `_begin` raises every pool worker to `USER_INITIATED` QoS
+  on the 0→1 session edge; `_end` releases the boost on the 1→0 edge and is a saturating no-op when
+  called without a matching `_begin`; `_active` reports the number of outstanding sessions.
+  The boost is pool-wide while a session is open: background proving that overlaps a session
+  runs boosted with it. Outside sessions workers keep their resting `UTILITY` QoS, so the
+  migration prove sweep and the overnight BGTask path are unaffected except during an overlap.
+  Failed override starts and releases are logged through `tracing`, and a failed release is
+  counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
+  session refcount but apply no QoS override.
+- `zcashlc_voting_reset_session_state(db, round_id, round_id_len) -> i32` clears one round's
+  cached vote tree state and locally prepared unsigned delegation setup fields so an
+  interrupted Keystone signing request can be rebuilt. Bundles with a stored Keystone
+  signature, a stored delegation tx hash, or a recorded VAN position are untouched, unlike
+  `zcashlc_voting_clear_round`. Returns 0 on success, -1 on error. No existing call sites
+  change.
+  A zero-length `round_id` is rejected with `-1` (per-round semantics require a
+  non-empty id; `zcashlc_voting_reset_tree_client` remains the way to drop every
+  round's cached tree client).
+- `zcashlc_voting_get_stored_pczt_sighash` returns the stored ZIP-244 sighash of a
+  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`),
+  or null when delegation setup is incomplete for the bundle. It takes only the round
+  id and bundle index, scoped to the handle's wallet id — no delegation-key inputs.
+  (It replaces a keys-taking form of the same readback that never shipped in a release.)
+- `zcashlc_voting_clear_keystone_signature` deletes one bundle's persisted Keystone
+  signature (0 on success, including when no row exists; -1 on error). Deleting the
+  signature makes the bundle eligible again for `zcashlc_voting_reset_session_state`'s
+  guarded cleanup, so a wallet that discards a stale signature can clear and rebuild
+  that bundle's delegation setup.
 
 ### Changed
 
@@ -210,6 +241,31 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
   trademark clarifications.
+- The pool-migration planning and estimating entry points — `zcashlc_migration_propose_transfers`,
+  `zcashlc_migration_prepare_note_split`, `zcashlc_migration_is_note_split_needed`,
+  `zcashlc_migration_residual_after_migration`, `zcashlc_migration_restart_step` and
+  `zcashlc_migration_estimate_runs` — now size each run PER ACCOUNT, from the `key_source` the
+  account row was created or imported with: an account tagged `keystone` (compared
+  case-insensitively; nothing is trimmed or prefix-matched) has each run sized to what a Keystone
+  signs in one 96-action signing round (16 actions per preparation transaction, 3 per transfer),
+  so it plans more, smaller runs on a large or fragmented balance; every other account, an absent
+  tag included, keeps the 50-note per-run sizing it had, so its runs are unchanged. Signatures and
+  `#[repr(C)]` shapes are unchanged. `FfiRunEstimate::keystone_rounds` is 1 for every run of a
+  `keystone` account (more only when even a one-note run overflows a round, which no smaller run
+  can fix) and, for every other account, what a Keystone would need for a run of that shape. The
+  estimate describes the runs the planning calls plan, under the same per-account sizing. A run
+  committed before this change keeps its planned shape until it completes or
+  `zcashlc_migration_restart_step` re-plans it. Estimating costs one planning pass per run, plus a
+  sizing search per run for a `keystone` account.
+- `zcashlc_migration_residual_after_migration` now returns the value the WHOLE migration leaves in
+  the source pool — the `final_residual` that `zcashlc_migration_estimate_runs` reports for the
+  same wallet (`-1` when it is zero) — instead of the next run's own leftover, and no longer reads
+  the stored run: before, during and after a run alike it is computed from the live spendable
+  balance. On a balance that takes more than one run the old value was mostly what the later runs
+  migrate; on a single-run balance the value is unchanged before and during the run, while after
+  the run completes the remaining dust is now reported where `-1` was returned before, and a
+  balance whose canonical split the notes cannot fund now reports the whole spendable balance where
+  the call used to fail. It costs one planning pass per remaining run, like the estimate.
 - The `zcashlc_voting_*` FFI is compiled again, against the Ironwood (NU6.3)
   dependency stack. It had been gated behind `#[cfg(zcash_voting)]` on the
   grounds that `zcash_voting` could not resolve against the Ironwood `orchard`

@@ -675,10 +675,15 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
 /// migration RUNS ("rounds"), as returned by
 /// `ZcashRustBackendWelding.estimateMigrationRuns(accountUUID:)`.
 ///
-/// A balance beyond one run's capacity (the note cap times the maximum denomination) migrates
-/// over several runs; each run carries BOTH what it migrates (the note-split crossings) and what
-/// preparing it costs (the note-preparation layers and transactions), so the two can be compared
-/// before anything is planned or committed.
+/// A balance beyond one run's capacity migrates over several runs; each run carries BOTH what it
+/// migrates (the note-split crossings) and what preparing it costs (the note-preparation layers
+/// and transactions), so the two can be compared before anything is planned or committed.
+///
+/// A run's capacity is PER ACCOUNT, decided by how the account signs: an ``Account/keystoneKeySource``
+/// account is sized to the 96-action ``MigrationSigningBudget/keystone`` budget — one QR-scanned
+/// round — so its runs are smaller and more numerous; every other account signs in process and is
+/// sized by the default 50-note cap. The same sizing drives `proposeMigrationTransfers`, so this
+/// estimate always describes the runs that get planned.
 ///
 /// External-signer workload is expressed in ACTIONS, not transaction counts: a preparation
 /// transaction weighs 16 Orchard-family actions and a transfer 3, so per-run ``Run/actions`` is
@@ -712,7 +717,9 @@ public struct MigrationRunEstimate: Equatable, Sendable {
         /// The number of signing rounds this run needs from a Keystone-class external signer
         /// (``MigrationSigningBudget/keystone``, 96 actions per round), computed by the upstream
         /// optimal `MinRounds` packing — see the type doc for why a count-based ceiling
-        /// undercounts this.
+        /// undercounts this. For an ``Account/keystoneKeySource`` account the run is sized to fit
+        /// one round, so this is 1 (more only when even a one-note run overflows); for an in-process
+        /// account it is a comparison figure — what a Keystone would need for a run of this shape.
         public let keystoneSigningSessions: Int
 
         /// Creates a `Run`.
@@ -743,7 +750,9 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     /// sub-quantum balance) — a legitimate estimate, not an error.
     public let runs: [Run]
     /// The value left in Orchard after the last run — below the smallest self-funding note, so it
-    /// never migrates. `.zero` when the balance divides exactly into self-funding notes and fees.
+    /// never migrates; or the whole spendable balance when the wallet's notes cannot fund any
+    /// canonical split (a zero-run estimate). `.zero` when the balance divides exactly into
+    /// self-funding notes and fees.
     public let finalResidual: Zatoshi
 
     /// Creates a `MigrationRunEstimate`.
@@ -796,7 +805,8 @@ public struct MigrationRunEstimate: Equatable, Sendable {
     ///
     /// A SUM, never a re-packing across runs: a later run's transactions spend notes an earlier
     /// run must mine first, so each run is signed on its own and any spare capacity in a run's
-    /// last round goes unused.
+    /// last round goes unused. For an ``Account/keystoneKeySource`` account every run is sized to
+    /// one round, so this equals ``runCount``.
     public var totalKeystoneSigningSessions: Int {
         runs.reduce(0) { $0 + $1.keystoneSigningSessions }
     }
