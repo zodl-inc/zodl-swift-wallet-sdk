@@ -957,24 +957,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposefulfillingPaymentURI`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
-        // backend instead of failing with the documented `synchronizerNotPrepared`. Placed before
-        // the `do` block (rather than as its first statement, where `SDKSynchronizer` puts its own
-        // copy) so the guard's throw bypasses the `rustCreateToAddress` remapping below -- it is
-        // not a rust error to remap, and the two placements are externally identical since neither
-        // catch clause matches `synchronizerNotPrepared`.
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
-        do {
-            return try await transactionEncoder.proposeFulfillingPaymentFromURI(
-                uri,
-                accountUUID: accountUUID
-            )
-        } catch ZcashError.rustCreateToAddress(let error) {
-            throw ZcashError.rustProposeTransferFromURI(error)
-        } catch {
-            throw error
-        }
+
+        return try await transactionEncoder.proposeFulfillingPaymentFromURI(
+            uri,
+            accountUUID: accountUUID
+        )
     }
 
     public func createProposedTransactions(

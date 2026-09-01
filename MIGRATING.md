@@ -146,6 +146,54 @@ from the delegation submission (the vote chain derives the signing digest itself
 `tx1Effects` is present. A host that base64-encoded these fields itself before putting them on the
 wire must stop and send the strings as they arrive.
 
+## Proposal errors carry `RedactedRustError` instead of `String`
+
+`ZcashError.rustCreateToAddress`, `.rustProposeTransferFromURI`, and `.rustProposeSendMaxTransfer`
+now carry a `RedactedRustError` rather than a `String`. Pattern matches that bind the payload stop
+compiling; read `.message` for the text, or better, switch on `.kind`:
+
+```swift
+// Before
+catch ZcashError.rustCreateToAddress(let message) {
+    show(message)
+}
+
+// After
+catch ZcashError.rustCreateToAddress(let error) {
+    show(error.message)          // redacted, safe to put in a support ticket
+}
+```
+
+The type change is what makes the message safe to display and to submit. `ZcashError.detail` (and
+therefore `errorDescription`) renders an associated value only when it is a `RedactedRustError`, so
+a raw rust string — which may still contain an amount or an address — cannot reach a user-visible
+description by accident.
+
+Three things move at the same time:
+
+- **Proposal failures no longer throw `.rustCreateToAddress`.** That case now means only "signing an
+  already-confirmed proposal failed". Building a proposal throws `.rustProposeTransfer`,
+  `.rustProposeTransferFromURI`, `.rustProposeSendMaxTransfer`, or
+  `.rustProposeOrchardToIronwoodMigration` depending on the entry point. A host that caught
+  `.rustCreateToAddress` to cover "sending failed" must catch the proposal cases too.
+- **Two conditions get their own cases**, because they are states of a healthy wallet rather than
+  errors, and a host should render them as such:
+
+  ```swift
+  catch ZcashError.rustProposalScanRequired {
+      show("Still syncing. Try again once your wallet has caught up.")
+  } catch ZcashError.rustProposalInsufficientFunds(let available, let required) {
+      show("You can spend \(available.decimalString()) ZEC; this needs \(required.decimalString()).")
+  }
+  ```
+
+  `available` is the SPENDABLE balance, which can be below the balance being displayed while notes
+  await confirmations. That gap is the likeliest explanation for a wallet that says it holds more
+  than it will send.
+- **`ZcashError` gains `detail: String?`**, appended to `errorDescription` in parentheses when
+  present. Any snapshot test pinning the exact `localizedDescription` of one of the affected cases
+  needs updating.
+
 ## The SDK-side migration state machine is removed — `migrationAdvanceStep` replaces it
 
 The public 5-state `MigrationState` enum, `MigrationAttentionReason`, and

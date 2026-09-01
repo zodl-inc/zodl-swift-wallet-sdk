@@ -92,10 +92,15 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::fingerprint::SeedFingerprint;
 
+/// cbindgen:ignore
+#[cfg(target_vendor = "apple")]
+mod darwin_qos;
 mod derivation;
 mod eip681;
+mod error_report;
 mod ext_schema;
 mod ffi;
+mod interactive_qos;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
@@ -109,6 +114,7 @@ mod voting;
 #[cfg(target_vendor = "apple")]
 mod os_log;
 
+use crate::error_report::{ClassifiedError, ErrorKind};
 use crate::tor::TorRuntime;
 
 fn unwrap_exc_or<T>(exc: Result<T, ()>, def: T) -> T {
@@ -298,7 +304,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-02.v0.13-proved-tx-wallet-persistence",
+        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
         "tracing initialized (zcash_client_backend capped at WARN)"
     );
 
@@ -310,21 +316,21 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // this pool for seconds per proof; at default priority that starves the UI (an app-open
     // prove sweep froze interactive screens for the sweep's whole duration). UTILITY keeps
     // full-width proving when the device is idle (the overnight BGTask path) while letting
-    // user-interactive work preempt it. Thread count is deliberately unchanged.
-    #[cfg(target_vendor = "apple")]
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(
-            qos_class: core::ffi::c_uint,
-            relative_priority: core::ffi::c_int,
-        ) -> core::ffi::c_int;
-    }
-    #[cfg(target_vendor = "apple")]
-    const QOS_CLASS_UTILITY: core::ffi::c_uint = 0x11;
-
+    // user-interactive work preempt it. Thread count is deliberately unchanged. Interactive
+    // proving sessions (voting) temporarily override the workers to USER_INITIATED via
+    // interactive_qos.
     let pool_builder = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("zc-rayon-{}", i));
     #[cfg(target_vendor = "apple")]
-    let pool_builder = pool_builder.start_handler(|_| unsafe {
-        let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    let pool_builder = pool_builder.start_handler(|_| {
+        unsafe {
+            let _ = crate::darwin_qos::pthread_set_qos_class_self_np(
+                crate::darwin_qos::QOS_CLASS_UTILITY,
+                0,
+            );
+        }
+        // Recorded so an interactive proving session (voting) can temporarily
+        // override these workers to USER_INITIATED; see interactive_qos.
+        crate::interactive_qos::register_current_thread();
     });
     pool_builder.build_global().expect("Only initialized once");
 
@@ -2329,34 +2335,62 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
 ) -> *mut ffi::BoxedSlice {
+    const CONTEXT: &str = "propose_transfer";
+
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
-        let value = Zatoshis::from_nonnegative_i64(value)
-            .map_err(|_| anyhow!("Invalid amount, out of range"))?;
+        let value = Zatoshis::from_nonnegative_i64(value).map_err(|_| {
+            ClassifiedError::new(
+                CONTEXT,
+                ErrorKind::InvalidAmount,
+                "the requested amount is negative or out of range",
+            )
+        })?;
 
-        let to: ZcashAddress = to
-            .parse()
-            .map_err(|e| anyhow!("Can't parse recipient address: {}", e))?;
+        let to: ZcashAddress = to.parse().map_err(|e| {
+            debug!("{CONTEXT}: recipient address did not parse: {e}");
+            ClassifiedError::new(
+                CONTEXT,
+                ErrorKind::InvalidRecipient,
+                "the recipient address could not be parsed",
+            )
+        })?;
 
         let memo = if memo.is_null() {
             Ok(None)
         } else {
             MemoBytes::from_bytes(unsafe { slice::from_raw_parts(memo, 512) })
                 .map(Some)
-                .map_err(|e| anyhow!("Invalid MemoBytes: {}", e))
+                .map_err(|e| {
+                    debug!("{CONTEXT}: memo rejected: {e}");
+                    ClassifiedError::new(CONTEXT, ErrorKind::InvalidMemo, "the memo was rejected")
+                })
         }?;
 
         let (change_strategy, input_selector) = zip317_helper(None);
 
         let req = TransactionRequest::new(vec![
-            Payment::new(to, Some(value), memo, None, None, vec![])
-                .map_err(|e| anyhow!("Unable to construct payment: {}.", e))?,
+            Payment::new(to, Some(value), memo, None, None, vec![]).map_err(|e| {
+                debug!("{CONTEXT}: payment could not be constructed: {e}");
+                ClassifiedError::new(
+                    CONTEXT,
+                    ErrorKind::InvalidPaymentRequest,
+                    "the payment could not be constructed",
+                )
+            })?,
         ])
-        .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
+        .map_err(|e| {
+            debug!("{CONTEXT}: transaction request could not be constructed: {e:?}");
+            ClassifiedError::new(
+                CONTEXT,
+                ErrorKind::InvalidPaymentRequest,
+                "the transaction request could not be constructed",
+            )
+        })?;
 
         let spend_policy = SpendPolicy::default();
         let lock_inputs = None;
@@ -2373,7 +2407,10 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             lock_inputs,
             proposed_version,
         )
-        .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+        .map_err(|e| {
+            debug!("{CONTEXT} failed: {e}");
+            ClassifiedError::classify(CONTEXT, &e)
+        })?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2418,6 +2455,8 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     confirmations_policy: ffi::ConfirmationsPolicy,
     orchard_only: bool,
 ) -> *mut ffi::BoxedSlice {
+    const CONTEXT: &str = "propose_send_max_transfer";
+
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
@@ -2425,16 +2464,24 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
 
-        let to: ZcashAddress = to
-            .parse()
-            .map_err(|e| anyhow!("Can't parse recipient address: {}", e))?;
+        let to: ZcashAddress = to.parse().map_err(|e| {
+            debug!("{CONTEXT}: recipient address did not parse: {e}");
+            ClassifiedError::new(
+                CONTEXT,
+                ErrorKind::InvalidRecipient,
+                "the recipient address could not be parsed",
+            )
+        })?;
 
         let memo = if memo.is_null() {
             Ok(None)
         } else {
             MemoBytes::from_bytes(unsafe { slice::from_raw_parts(memo, 512) })
                 .map(Some)
-                .map_err(|e| anyhow!("Invalid MemoBytes: {}", e))
+                .map_err(|e| {
+                    debug!("{CONTEXT}: memo rejected: {e}");
+                    ClassifiedError::new(CONTEXT, ErrorKind::InvalidMemo, "the memo was rejected")
+                })
         }?;
 
         let mode = match mode {
@@ -2477,7 +2524,10 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             &locked_input_policy,
             lock_inputs,
         )
-        .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+        .map_err(|e| {
+            debug!("{CONTEXT} failed: {e}");
+            ClassifiedError::classify(CONTEXT, &e)
+        })?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2559,6 +2609,8 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
 ) -> *mut ffi::BoxedSlice {
+    const CONTEXT: &str = "propose_transfer_from_uri";
+
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
@@ -2568,8 +2620,14 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
 
         let (change_strategy, input_selector) = zip317_helper(None);
 
-        let req = TransactionRequest::from_uri(payment_uri_str)
-            .map_err(|e| anyhow!("Error creating transaction request: {:?}", e))?;
+        let req = TransactionRequest::from_uri(payment_uri_str).map_err(|e| {
+            debug!("{CONTEXT}: payment URI did not parse: {e:?}");
+            ClassifiedError::new(
+                CONTEXT,
+                ErrorKind::InvalidPaymentRequest,
+                "the payment URI could not be parsed",
+            )
+        })?;
 
         let spend_policy = SpendPolicy::default();
         let lock_inputs = None;
@@ -2586,7 +2644,10 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             lock_inputs,
             proposed_version,
         )
-        .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+        .map_err(|e| {
+            debug!("{CONTEXT} failed: {e}");
+            ClassifiedError::classify(CONTEXT, &e)
+        })?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2869,13 +2930,22 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     output_params_len: usize,
     network_id: u32,
 ) -> *mut ffi::TxIds {
+    const CONTEXT: &str = "create_proposed_transactions";
+
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
-                .map_err(|e| anyhow!("Invalid proposal: {}", e))?
+                .map_err(|e| {
+                    debug!("{CONTEXT}: proposal did not decode: {e}");
+                    ClassifiedError::new(
+                        CONTEXT,
+                        ErrorKind::ProposalInvalid,
+                        "the proposal could not be decoded",
+                    )
+                })?
                 .try_into_standard_proposal(&network, &db_data)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
         let spend_params = Path::new(OsStr::from_bytes(unsafe {
@@ -2898,7 +2968,10 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             &proposal,
             expiry_height,
         )
-        .map_err(|e| anyhow!("Error while sending funds: {}", e))?;
+        .map_err(|e| {
+            debug!("{CONTEXT} failed: {e}");
+            ClassifiedError::classify(CONTEXT, &e)
+        })?;
 
         Ok(ffi::TxIds::ptr_from_vec(
             txids.into_iter().map(|txid| *txid.as_ref()).collect(),

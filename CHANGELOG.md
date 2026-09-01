@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+Changes are relative to `4.1.0`.
+
 ## Changed
 
 - The Swift package is renamed from `ZcashLightClientKit` to `zodl-swift-wallet-sdk`, and
@@ -25,6 +27,42 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SPM resource bundle is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle` instead of
   `ZcashLightClientKit_ZcashLightClientKit.bundle`; code that matched either literal must be
   updated. See MIGRATING.md.
+
+# 4.1.0 - 2026-09-01
+
+## Added
+
+- Voting proving now runs at interactive priority while a user is waiting on it.
+  `VotingRustBackend.commitVote` and `buildAndProveDelegation` raise the shared rayon
+  proving pool's workers from their resting UTILITY QoS to USER_INITIATED for the duration
+  of the proving call itself (refcounted; released on every exit path) and detach the
+  proving work at `.userInitiated`. The boost is pool-wide while it is held, so background
+  proving that overlaps an interactive proving call is temporarily raised with it; outside
+  those windows — including during `warmProvingCaches()`, which deliberately stays at the
+  pool's resting priority — background proving keeps the existing utility demotion.
+- `VotingRustBackend.resetSessionState(roundId:)` — clears a round's cached vote tree and
+  locally prepared UNSIGNED delegation setup fields so an interrupted Keystone signing
+  request can be rebuilt, while preserving bundles that already have a Keystone signature,
+  a stored delegation tx hash, or a recorded VAN position. This is the safe per-round
+  cleanup for resuming an interrupted voting session: unlike `clearRound(roundId:)`, it
+  never destroys delegation material that an on-chain registration may already depend on.
+  Throws `VotingRustBackendError.invalidData` if `roundId` is empty, since the underlying
+  call treats an empty round ID as an account-wide reset of every round's cached tree
+  client rather than this round's alone.
+- `VotingRustBackend.getStoredPcztSighash(roundId:bundleIndex:)` — returns the stored
+  ZIP-244 sighash of the bundle's persisted delegation PCZT as `[UInt8]`, matching the rest
+  of the voting API surface (`VotingDelegationSignature.sighash`,
+  `getDelegationSubmission(...sighash:)`), so a wallet can verify that a persisted Keystone
+  signature still matches the bundle's delegation data before trusting it. Takes only the
+  round ID and bundle index, scoped to the already-open wallet database — the previous
+  keys-taking form never shipped and has been removed. Throws when delegation setup is
+  incomplete (e.g. after an interrupted build).
+- `VotingRustBackend.clearKeystoneSignature(roundId:bundleIndex:)` — deletes one bundle's
+  persisted Keystone signature, so a wallet that discards a stale signature can clear and
+  rebuild that bundle's setup via `resetSessionState(roundId:)`, which otherwise leaves
+  bundles with a stored Keystone signature untouched. Deleting a missing row succeeds.
+
+## Changed
 
 - Migration runs are now sized PER ACCOUNT, by how the account signs. The contract is the
   `keySource` an account was created or imported with (`prepare(with:walletBirthday:name:keySource:)`,
@@ -82,6 +120,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `finalResidual` rather than pay for a second one. A "Lock balance" offer built from it belongs
   only after `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks
   every spendable Orchard note, not just the residual. No call-site edit is needed.
+- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
+  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
+  `errorDescription` printed only the static sentence "Error from rust layer when calling
+  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
+  never rendered, so a user's error report named no cause and did not even say whether the failure
+  happened while BUILDING a proposal or while signing an already-confirmed one.
+
+  The rust layer now classifies these failures instead of flattening them into a string, and each
+  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
+  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
+  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
+  which now covers only the signing step. Two conditions a wallet should render itself rather than
+  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
+  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
+  amounts as `Zatoshi`.
+
+  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
+  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
+  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
+  and `errorDescription` appends it when present. See MIGRATING.md.
+
+  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
+  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
+  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
+  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
+  device at `debug!` level.
 
 # 4.0.0 - 2026-08-19
 

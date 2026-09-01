@@ -7,6 +7,7 @@
 #   --arm-macos   Build only the arm64 macOS slice (aarch64-apple-darwin).
 #   --arm-ios     Build only the arm64 iOS slices: simulator (aarch64-apple-ios-sim)
 #                 and device (aarch64-apple-ios).
+#   --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
 #   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
 #   --cached      Download the pre-built release XCFramework instead of building.
 #
@@ -42,6 +43,7 @@ Options:
   (no option)   Build the full XCFramework (all 5 architectures) from your rust/.
   --arm-macos   Build only the arm64 macOS slice (aarch64-apple-darwin).
   --arm-ios     Build only the arm64 iOS slices: simulator + device.
+  --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
   --cached      Download the pre-built release XCFramework instead of building.
 
@@ -167,6 +169,10 @@ case "${1:-}" in
     --arm-ios)
         BUILD_MODE="arm"
         ARM_TARGETS=(ios-sim ios-device)
+        ;;
+    --arm-simulator)
+        BUILD_MODE="arm"
+        ARM_TARGETS=(ios-sim)
         ;;
     --arm-all)
         BUILD_MODE="arm"

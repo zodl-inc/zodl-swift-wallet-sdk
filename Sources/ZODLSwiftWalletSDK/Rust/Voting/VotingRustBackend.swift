@@ -349,6 +349,8 @@ extension VotingRustBackend {
     ///
     /// Safety: keep `progress` thread-safe, non-blocking, and limited to
     /// reporting state outside this backend.
+    ///
+    /// Holds the interactive proving QoS boost while the proof itself runs.
     // swiftlint:disable:next function_parameter_count
     public func commitVote(
         roundId: String,
@@ -376,9 +378,14 @@ extension VotingRustBackend {
             singleShare: singleShare
         )
 
-        return try await Task.detached { [self] in
-            try syncCommitVote(draft, progress: progress)
-        }.value
+        // Boost only the proving itself: holding the pool-wide override across
+        // the cheap validation above would promote unrelated pool work (e.g. an
+        // overlapping background prove sweep) while nothing interactive runs yet.
+        return try await Self.withInteractiveProvingBoost {
+            try await Task.detached(priority: .userInitiated) { [self] in
+                try syncCommitVote(draft, progress: progress)
+            }.value
+        }
     }
 
     /// Record the transaction that carried a vote on chain.
@@ -592,14 +599,50 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Interactive proving QoS boost
+
+extension VotingRustBackend {
+    /// Raises every proving-pool worker from its resting utility QoS to
+    /// user-initiated for the duration of an interactive proving session.
+    /// Refcounted in the FFI; every begin must be paired with an end.
+    static func beginInteractiveProvingBoost() {
+        zcashlc_proving_interactive_begin()
+    }
+
+    static func endInteractiveProvingBoost() {
+        zcashlc_proving_interactive_end()
+    }
+
+    /// Outstanding interactive proving sessions (diagnostics and tests).
+    static func interactiveProvingBoostCount() -> Int32 {
+        zcashlc_proving_interactive_active()
+    }
+
+    /// Runs `body` under the pool-wide interactive proving boost, releasing it
+    /// on every exit path. The FFI end is refcounted and saturating, but a
+    /// missing end pins the pool at user-initiated for the process lifetime —
+    /// route every boost through this helper instead of pairing the raw
+    /// begin/end statics by hand.
+    static func withInteractiveProvingBoost<T>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        beginInteractiveProvingBoost()
+        defer { endInteractiveProvingBoost() }
+        return try await body()
+    }
+}
+
 // MARK: - Foundation helpers (static)
 
 extension VotingRustBackend {
     /// Warm process-lifetime proving-key caches used by voting proofs.
     ///
-    /// Safe to call multiple times; subsequent calls are cheap. Call once at app
-    /// startup (off the main actor) to avoid a multi-second pause inside the
-    /// first proving call.
+    /// Safe to call multiple times; subsequent calls are cheap. Call when
+    /// entering a flow that will prove interactively (off the main actor) so
+    /// the first proving call does not pay the multi-second keygen. Runs at
+    /// the pool's resting priority: warm-up is background work, and if a user
+    /// submits before it finishes, the proving call's own boost covers the
+    /// keygen remainder.
     public static func warmProvingCaches() throws {
         let result = zcashlc_voting_warm_proving_caches()
         guard result == 0 else {
@@ -1267,6 +1310,36 @@ extension VotingRustBackend {
             }
         }
     }
+
+    /// Clears the round's cached vote tree and locally prepared UNSIGNED
+    /// delegation setup fields so an interrupted Keystone signing request can
+    /// be rebuilt; bundles with a Keystone signature, a stored delegation tx
+    /// hash, or a recorded VAN position are preserved.
+    ///
+    /// This is the safe per-round cleanup for resuming an interrupted voting
+    /// session — unlike `clearRound`, it never destroys delegation material an
+    /// on-chain registration may depend on.
+    ///
+    /// - Throws: ``VotingRustBackendError/invalidData`` if `roundId` is empty.
+    ///   This wrapper rejects the empty id up front, matching the FFI, which
+    ///   also refuses it rather than resetting every round's cached tree
+    ///   client account-wide.
+    public func resetSessionState(roundId: String) throws {
+        guard !roundId.isEmpty else {
+            throw VotingRustBackendError.invalidData("roundId must not be empty")
+        }
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_reset_session_state(dbh, buf.baseAddress, UInt(buf.count))
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`reset_session_state` failed")
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Share delegation tracking
@@ -1662,6 +1735,79 @@ extension VotingRustBackend {
         return try decodeJSON(from: ptr)
     }
 
+    /// Keyless readback of the stored ZIP-244 sighash of the bundle's
+    /// persisted delegation PCZT, scoped to the open wallet.
+    ///
+    /// Used to verify a persisted Keystone signature still matches the
+    /// bundle's delegation data before trusting it.
+    ///
+    /// - Returns: the 32-byte ZIP-244 sighash. Pass it to
+    ///   ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``
+    ///   alongside the matching signature, exactly as
+    ///   ``VotingDelegationSignature/sighash`` is.
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/rustError`` if delegation setup is
+    ///   incomplete for the bundle (its PCZT setup has not run, or a later
+    ///   step wiped the stored sighash); ``VotingRustBackendError/invalidData``
+    ///   if the returned sighash is not exactly 32 bytes.
+    public func getStoredPcztSighash(roundId: String, bundleIndex: UInt32) throws -> [UInt8] {
+        let roundIdBytes = [UInt8](roundId.utf8)
+
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_get_stored_pczt_sighash(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`get_stored_pczt_sighash` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        let bytes: [UInt8] = try decodeJSON(from: ptr)
+        guard bytes.count == votingPcztSighashByteCount else {
+            throw VotingRustBackendError.invalidData(
+                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
+            )
+        }
+        return bytes
+    }
+
+    /// Deletes one bundle's persisted Keystone signature, so the bundle
+    /// becomes eligible again for ``resetSessionState(roundId:)``'s guarded
+    /// cleanup, which otherwise leaves bundles with a stored Keystone
+    /// signature untouched.
+    ///
+    /// Deleting a missing row succeeds.
+    ///
+    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
+    ///   open; ``VotingRustBackendError/rustError`` if the underlying delete
+    ///   fails.
+    public func clearKeystoneSignature(roundId: String, bundleIndex: UInt32) throws {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        try withHandle { dbh in
+            let result = roundIdBytes.withUnsafeBufferPointer { buf in
+                zcashlc_voting_clear_keystone_signature(
+                    dbh,
+                    buf.baseAddress,
+                    UInt(buf.count),
+                    bundleIndex
+                )
+            }
+            guard result == 0 else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`clear_keystone_signature` failed")
+                )
+            }
+        }
+    }
+
     /// Get the delegation submission payload for an externally produced
     /// signature.
     ///
@@ -1754,6 +1900,8 @@ extension VotingRustBackend {
     /// Do not call back into this `VotingRustBackend` from `progress`. Rust may
     /// invoke the callback while the database-handle lock is held, so re-entering
     /// this backend can deadlock.
+    ///
+    /// Holds the interactive proving QoS boost while the proof itself runs.
     public func buildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],
@@ -1779,14 +1927,16 @@ extension VotingRustBackend {
         // caller's executor for the full duration. `VotingRustBackend` is
         // `@unchecked Sendable`, the lock keeps `withHandle` correct, and
         // `notes`/byte arrays cross the boundary by value.
-        return try await Task.detached { [self] in
-            try syncBuildAndProveDelegation(
-                params,
-                pirServerUrl: pirServerUrl,
-                pirLayout: pirLayout,
-                progress: progress
-            )
-        }.value
+        return try await Self.withInteractiveProvingBoost {
+            try await Task.detached(priority: .userInitiated) { [self] in
+                try syncBuildAndProveDelegation(
+                    params,
+                    pirServerUrl: pirServerUrl,
+                    pirLayout: pirLayout,
+                    progress: progress
+                )
+            }.value
+        }
     }
 
     /// Validate a PIR-fetched IMT non-membership proof bytewise.
