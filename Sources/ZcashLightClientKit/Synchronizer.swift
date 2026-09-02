@@ -58,6 +58,21 @@ public struct SynchronizerState: Equatable {
     /// backend's `recovery_progress`; `false` for light catch-ups and once fully synced.
     public var isRecovering: Bool
 
+    /// True while the [#1591] stale-tip mask is hiding spendable value: every pool's
+    /// `spendableValue` in `accountsBalances` has been forced to zero and shifted into
+    /// `valuePendingSpendability` because the engine has not yet confirmed a fresh chain tip.
+    ///
+    /// This is the only signal that separates "the wallet cannot spend this" from "the SDK is not
+    /// willing to say yet". A zero spendable balance cannot: an empty wallet, funds still
+    /// confirming, and this mask all produce one. A client that shows a determinate "working it
+    /// out" affordance — a spinner, a held error — must gate on this and must not infer it from a
+    /// zero balance, which would leave the affordance up indefinitely in the other two cases.
+    ///
+    /// Bounded: it clears as soon as the engine refreshes the tip, which is what makes it safe to
+    /// drive a spinner from. Always `false` on the legacy `SDKSynchronizer` path, which applies its
+    /// mask inside `ZcashRustBackend.getWalletSummary()` and does not report it here.
+    public var isSpendableMasked: Bool
+
     /// Represents a synchronizer that has made zero progress hasn't done a sync attempt
     public static var zero: SynchronizerState {
         SynchronizerState(
@@ -75,7 +90,8 @@ public struct SynchronizerState: Equatable {
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
         fullyScannedHeight: BlockHeight = .zero,
-        isRecovering: Bool = false
+        isRecovering: Bool = false,
+        isSpendableMasked: Bool = false
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
@@ -83,6 +99,7 @@ public struct SynchronizerState: Equatable {
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
         self.isRecovering = isRecovering
+        self.isSpendableMasked = isSpendableMasked
         self.syncStatus = internalSyncStatus.mapToSyncStatus()
     }
 }

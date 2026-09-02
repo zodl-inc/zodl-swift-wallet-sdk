@@ -25,11 +25,15 @@ extension SlipstreamSynchronizer {
     /// engine — a TRIVIAL mapping of the truthful-from-open snapshot (progress, recovery,
     /// spendability, persisted tip) plus the unified summary's balances. A zero snapshot
     /// (fresh wallet: no tip, no floor) emits cold `.disconnected`, as before.
+    /// - Parameter isSpendableMasked: whether the [#1591] mask was applied to `accountsBalances`.
+    ///   Passed in rather than re-derived from `snapshot` so the mask predicate keeps a single
+    ///   definition, in `unifiedWalletSummary()`, which is what produced these balances.
     static func initialState(
         snapshot: SlipstreamSnapshot?,
         accountsBalances: [AccountUUID: AccountBalance],
         fullyScannedHeight: BlockHeight?,
-        syncSessionID: UUID
+        syncSessionID: UUID,
+        isSpendableMasked: Bool
     ) -> SynchronizerState {
         guard let snap = snapshot, snap.chainTip != 0 || snap.progressPermille != 0 else {
             return SynchronizerState(
@@ -37,6 +41,7 @@ extension SlipstreamSynchronizer {
                 accountsBalances: [:],
                 internalSyncStatus: .disconnected,
                 latestBlockHeight: .zero
+                // Balances are dropped entirely here, so nothing is being hidden: `false`.
             )
         }
         return SynchronizerState(
@@ -45,7 +50,8 @@ extension SlipstreamSynchronizer {
             internalSyncStatus: .syncing(Float(snap.progressPermille) / 1000, snap.spendableHint != 0),
             latestBlockHeight: BlockHeight(snap.chainTip),
             fullyScannedHeight: fullyScannedHeight ?? .zero,
-            isRecovering: snap.isRecovering == 1
+            isRecovering: snap.isRecovering == 1,
+            isSpendableMasked: isSpendableMasked
         )
     }
 
