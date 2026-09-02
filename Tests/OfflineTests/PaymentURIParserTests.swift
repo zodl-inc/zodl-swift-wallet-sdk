@@ -35,7 +35,7 @@ final class PaymentURIParserTests: XCTestCase {
 
     func testRejectsMalformedRequest() {
         XCTAssertThrowsError(try PaymentURIParser.parse("bitcoin:not-an-address")) { error in
-            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.invalidAddress))
         }
     }
 
@@ -45,7 +45,7 @@ final class PaymentURIParserTests: XCTestCase {
         XCTAssertThrowsError(
             try PaymentURIParser.parse("bitcoin:1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo?amount=42&amount=42")
         ) { error in
-            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.duplicateParameter))
         }
     }
 
@@ -55,7 +55,7 @@ final class PaymentURIParserTests: XCTestCase {
                 "bitcoin:1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo?req-somethingyoudontunderstand=50"
             )
         ) { error in
-            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.unsupportedRequiredParameter))
         }
     }
 
@@ -88,8 +88,8 @@ final class PaymentURIParserTests: XCTestCase {
     }
 
     func testDecodesSolanaTransactionLink() throws {
-        // The link's format is validated by the Rust parser, not re-validated here
-        // (see PaymentURIParser.swift) — this only confirms the value is carried through.
+        // The link is re-validated in Swift (see PaymentURIParser.swift): the crate's own check
+        // leaves everything after the authority unverified and runs on the decoded payload.
         let json = """
         {"version":1,"type":"solana_transaction","link":"https://example.com/tx"}
         """
@@ -140,5 +140,120 @@ final class PaymentURIParserTests: XCTestCase {
         XCTAssertThrowsError(try decoded?.paymentRequest) { error in
             XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
         }
+    }
+
+    // MARK: - Coverage gaps closed after review
+
+    func testErc20CarriesTheTransferValue() throws {
+        // uint256=1000000 must survive the decimal -> hex conversion. Asserted numerically so a
+        // change of case or zero-padding in the envelope doesn't fail the test spuriously.
+        let erc20 = try PaymentURIParser.parse(
+            "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/transfer" +
+            "?address=0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359&uint256=1000000"
+        )
+        guard case let .ethereum(.erc20(request)) = erc20 else { return XCTFail("Expected ERC-20") }
+        let digits = request.valueHex.dropFirst(2)
+        XCTAssertTrue(request.valueHex.hasPrefix("0x"))
+        XCTAssertEqual(UInt64(digits, radix: 16), 1_000_000)
+        XCTAssertEqual(request.schemaPrefix, "ethereum")
+        XCTAssertFalse(request.hasPay)
+        XCTAssertNil(request.chainId)
+    }
+
+    func testNativeRequestCarriesSchemaPrefixAndPayFlag() throws {
+        let native = try PaymentURIParser.parse(
+            "ethereum:pay-0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359@1?value=1"
+        )
+        guard case let .ethereum(.native(request)) = native else { return XCTFail("Expected native") }
+        XCTAssertEqual(request.schemaPrefix, "ethereum")
+        XCTAssertTrue(request.hasPay)
+        XCTAssertEqual(request.chainId, 1)
+    }
+
+    func testSolanaTransferCarriesEveryOptionalField() throws {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        let reference = "mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN"
+        let solana = try PaymentURIParser.parse(
+            "solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=0.01&spl-token=\(mint)" +
+            "&reference=\(reference)&label=Shop&message=Order%20123&memo=note"
+        )
+        guard case let .solanaTransfer(request) = solana else { return XCTFail("Expected transfer") }
+        XCTAssertEqual(request.splToken?.value, mint)
+        XCTAssertEqual(request.references.map(\.value), [reference])
+        XCTAssertEqual(request.label, "Shop")
+        XCTAssertEqual(request.message, "Order 123")
+        XCTAssertEqual(request.memo, "note")
+    }
+
+    func testDecodesNonMainnetNetworks() throws {
+        // The testnet/regtest arms of `utxoRequest()` had no coverage: every existing address
+        // was mainnet, so a mis-mapped arm could not fail a test.
+        let testnet = try PaymentURIParser.parse("bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")
+        guard case let .bitcoin(request) = testnet else { return XCTFail("Expected Bitcoin") }
+        XCTAssertEqual(request.network, .testnet)
+
+        let regtest = try PaymentURIParser.parse("bitcoin:bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+        guard case let .bitcoin(regtestRequest) = regtest else { return XCTFail("Expected Bitcoin") }
+        XCTAssertEqual(regtestRequest.network, .regtest)
+
+        let litecoin = try PaymentURIParser.parse("litecoin:tltc1qw508d6qejxtdg4y5r3zarvary0c5xw7klfsuq0")
+        guard case let .litecoin(litecoinRequest) = litecoin else { return XCTFail("Expected Litecoin") }
+        XCTAssertEqual(litecoinRequest.network, .testnet)
+    }
+
+    func testParsesSolanaTransactionLinkThroughTheFFI() throws {
+        // Previously exercised only through hand-written JSON the crate never emits.
+        let request = try PaymentURIParser.parse("solana:https://example.com/tx")
+        guard case let .solanaTransaction(link) = request else { return XCTFail("Expected link") }
+        XCTAssertEqual(link.value, "https://example.com/tx")
+    }
+
+    func testParsesUnrecognisedEthereumRequestThroughTheFFI() throws {
+        let request = try PaymentURIParser.parse(
+            "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/approve" +
+            "?address=0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359&uint256=1"
+        )
+        guard case .ethereum(.unrecognised) = request else { return XCTFail("Expected unrecognised") }
+    }
+
+    func testRejectsTransactionLinkWithEmbeddedCredentials() {
+        // https://trusted.example.com@evil.test/pay — a length-truncating display shows the
+        // trusted-looking prefix while the request targets the host after the "@".
+        let json = """
+        {"version":1,"type":"solana_transaction","link":"https://trusted.example.com@evil.test/pay"}
+        """
+        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
+        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+        }
+    }
+
+    func testRejectsNonHTTPSTransactionLink() {
+        let json = """
+        {"version":1,"type":"solana_transaction","link":"http://example.com/tx"}
+        """
+        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
+        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+        }
+    }
+
+    func testUnsupportedSchemeIsClassified() {
+        XCTAssertThrowsError(try PaymentURIParser.parse("near:alice.near")) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.unsupportedScheme))
+        }
+    }
+
+    func testResultTypesAreConstructableByConsumers() {
+        // Guards the public inits a dependency double needs; without them these types could only
+        // be built inside the module.
+        let request = UTXOPaymentURIRequest(
+            address: PaymentURIAddress(value: "1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo"),
+            network: .mainnet,
+            amount: PaymentURIAmount(value: "1.5"),
+            label: nil,
+            message: nil
+        )
+        XCTAssertEqual(PaymentURIRequest.bitcoin(request), .bitcoin(request))
     }
 }

@@ -18,18 +18,50 @@ public enum PaymentURIParser {
         // prefix of `input` instead of the whole string.
         guard !input.utf8.contains(0) else { throw PaymentURIParserError.invalidURI }
         guard let result = zcashlc_payment_uri_parse([CChar](input.utf8CString)) else {
-            zcashlc_clear_last_error()
-            throw PaymentURIParserError.invalidURI
+            // The Rust side puts a fixed classification token in the last-error slot, so the ten
+            // crate error variants no longer collapse into one value. Reading it also separates a
+            // genuine parser panic -- which `catch_panic` writes to the same slot -- from an
+            // ordinary bad URI; that used to reach the caller as a rejected scan and was never
+            // surfaced. The tokens carry no caller input.
+            let reported = lastErrorMessage(fallback: "")
+            guard let token = reported.components(separatedBy: rejectionPrefix).last,
+                  reported.hasPrefix(rejectionPrefix),
+                  let reason = PaymentURIRejection(rawValue: token) else {
+                throw PaymentURIParserError.parserFailure(reported)
+            }
+            throw PaymentURIParserError.rejected(reason)
         }
         defer { zcashlc_string_free(result) }
 
         let data = Data(bytes: result, count: strlen(result))
-        let decoded = try JSONDecoder().decode(EncodedRequest.self, from: data)
-        guard decoded.version == encodedVersion else { throw PaymentURIParserError.invalidURI }
+
+        // The version is read from a minimal envelope first. Decoding the whole payload up front
+        // let a `DecodingError` escape an API documented to throw only `PaymentURIParserError`,
+        // and -- worse -- it threw before the version check, so a v2 envelope that retyped a field
+        // failed as a malformed URI rather than as the version drift this field exists to catch.
+        guard let envelope = try? JSONDecoder().decode(EncodedVersion.self, from: data) else {
+            throw PaymentURIParserError.invalidEnvelope
+        }
+        guard envelope.version == encodedVersion else {
+            throw PaymentURIParserError.unsupportedEnvelope(version: envelope.version)
+        }
+        guard let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: data) else {
+            throw PaymentURIParserError.invalidEnvelope
+        }
         return try decoded.paymentRequest
     }
 
     private static let encodedVersion = 1
+}
+
+/// Prefix the Rust side puts before a classification token, so a token can be told apart from a
+/// panic message that lands in the same last-error slot.
+private let rejectionPrefix = "payment URI rejected: "
+
+/// Just the envelope version, decoded before the payload so that a version mismatch is reported
+/// as one even when the payload's own shape changed in the same revision.
+private struct EncodedVersion: Decodable {
+    let version: Int
 }
 
 struct EncodedRequest: Decodable {
@@ -77,10 +109,15 @@ struct EncodedRequest: Decodable {
             case "litecoin": return .litecoin(try utxoRequest())
             case "solana_transfer": return .solanaTransfer(try solanaTransfer())
             case "solana_transaction":
-                // The link's format (absolute, canonical HTTPS URL) is already validated by
-                // the Rust parser; re-parsing it here would duplicate that validation instead
-                // of trusting the single source of truth. Only presence is checked.
-                guard let link else { throw PaymentURIParserError.invalidURI }
+                // The crate's `is_https_url` only checks that the string splits on "://", that the
+                // scheme is https, and that the authority is non-empty and whitespace-free --
+                // everything after the authority is unchecked. It also runs on the percent-DECODED
+                // payload while the reject-on-query guard tests the RAW one, so a decoded link can
+                // carry a query the guard never saw, or a userinfo "@" that makes a hostile host
+                // display as a trusted one. This re-validates rather than trusting that.
+                guard let link, let url = URL(string: link), url.isCanonicalHTTPS else {
+                    throw PaymentURIParserError.invalidURI
+                }
                 return .solanaTransaction(PaymentURILink(validated: link))
             default: throw PaymentURIParserError.invalidURI
             }
@@ -150,5 +187,18 @@ struct EncodedRequest: Decodable {
             message: message,
             memo: memo
         )
+    }
+}
+
+private extension URL {
+    /// An absolute `https://` URL with a real host and no embedded credentials.
+    ///
+    /// Rejects the userinfo form (`https://trusted.example.com@evil.test/pay`), where a display
+    /// that truncates on length shows the trusted-looking prefix while the request goes to the
+    /// host after the `@`.
+    var isCanonicalHTTPS: Bool {
+        guard scheme?.lowercased() == "https" else { return false }
+        guard let host, !host.isEmpty else { return false }
+        return user == nil && password == nil
     }
 }
