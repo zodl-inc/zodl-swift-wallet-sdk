@@ -316,6 +316,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
+- `ErrorKind::AnchorNotFound` (`21`): `zcashlc_take_last_error_report` reports it when creating
+  transactions from a proposal (`zcashlc_create_proposed_transactions`) fails because the wallet
+  has not scanned to a height it can anchor them on. Such failures were reported as
+  `ProposalInvalid` (`17`).
 
 ### Changed
 
