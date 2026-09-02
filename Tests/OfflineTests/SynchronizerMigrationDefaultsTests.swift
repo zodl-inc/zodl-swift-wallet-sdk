@@ -395,6 +395,14 @@ private final class NonMigratingSynchronizer: Synchronizer {
         network: NetworkType
     ) async -> [LightWalletEndpoint] { Self.unused() }
 
+    func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? { Self.unused() }
+
     func estimateBirthdayHeight(for date: Date) -> BlockHeight { Self.unused() }
     func estimateTimestamp(for height: BlockHeight) -> TimeInterval? { Self.unused() }
     func tor(enabled: Bool) async throws { Self.unused() }

@@ -4,6 +4,38 @@ All notable changes to this library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## Changed
+
+- `Synchronizer` gained a new requirement:
+  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
+  custom `Synchronizer` conformer or test double stops compiling until it implements it — see
+  `MIGRATING.md` for a drop-in stub. The method benchmarks the candidates (always including the
+  current endpoint, appending it when the caller's list omits it) and returns the endpoint worth
+  switching to, or `nil` to stay. A switch requires beating the current server's score on both an
+  absolute and a relative gate; the gates are bypassed only when the current server fails the
+  benchmark twice in a row. On `SDKSynchronizer` the block-fetch phase is bounded to the three
+  fastest candidates by latency plus the current server — never the whole list — so network cost
+  does not grow with the number of candidates. A call whose surrounding task is cancelled returns
+  `nil`.
+
+## Fixed
+
+- The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
+  endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
+  stream previously recorded a near-zero time and won the ranking outright.
+- The server benchmark closes its per-endpoint gRPC connections when evaluation finishes instead
+  of leaving teardown to object lifetime, and stops opening new connections once its surrounding
+  task is cancelled.
+- Server-benchmark timings use a monotonic clock, so a wall-clock adjustment mid-measurement can
+  no longer produce negative or nonsense scores.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) now
+  applies the same health checks as `SDKSynchronizer`: a consensus-branch-id check and a
+  synced-height check rule out servers on the wrong fork or far behind the chain tip, and
+  regtest chain names are accepted on the regtest network. Previously a stalled server that
+  answered `getInfo` quickly could rank first.
+
 # 4.1.0 - 2026-09-01
 
 ## Added
