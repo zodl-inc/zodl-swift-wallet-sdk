@@ -2423,6 +2423,26 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - evaluateServerSwitch
+
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount = 0
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCalled: Bool {
+        return evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount > 0
+    }
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReceivedArguments: (current: LightWalletEndpoint, candidates: [LightWalletEndpoint], fetchThresholdSeconds: Double, nBlocksToFetch: UInt64, network: NetworkType)?
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReturnValue: LightWalletEndpoint?
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkClosure: ((LightWalletEndpoint, [LightWalletEndpoint], Double, UInt64, NetworkType) async -> LightWalletEndpoint?)?
+
+    func evaluateServerSwitch(current: LightWalletEndpoint, candidates: [LightWalletEndpoint], fetchThresholdSeconds: Double, nBlocksToFetch: UInt64, network: NetworkType) async -> LightWalletEndpoint? {
+        evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount += 1
+        evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReceivedArguments = (current: current, candidates: candidates, fetchThresholdSeconds: fetchThresholdSeconds, nBlocksToFetch: nBlocksToFetch, network: network)
+        if let closure = evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkClosure {
+            return await closure(current, candidates, fetchThresholdSeconds, nBlocksToFetch, network)
+        } else {
+            return evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReturnValue
+        }
+    }
+
     // MARK: - estimateBirthdayHeight
 
     var estimateBirthdayHeightForCallsCount = 0

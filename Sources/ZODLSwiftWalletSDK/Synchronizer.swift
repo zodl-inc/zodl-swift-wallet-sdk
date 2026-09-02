@@ -515,6 +515,36 @@ public protocol Synchronizer: AnyObject {
         network: NetworkType
     ) async -> [LightWalletEndpoint]
 
+    /// Benchmarks the candidate endpoints and decides whether switching away from `current`
+    /// is worth the synchronizer teardown. Hysteresis: the winner must beat the current
+    /// server's score by a meaningful margin (absolute AND relative) unless the current
+    /// server failed the benchmark twice in a row.
+    ///
+    /// The current server is always benchmarked, whether or not it appears in `candidates`,
+    /// and a missing score is confirmed by one re-probe before it is treated as unhealthy —
+    /// a single transient failure never forces a switch. Endpoint identity is host, port and
+    /// the TLS flag. A call whose surrounding task is cancelled returns nil (stay).
+    ///
+    /// How candidates are scored depends on the conformer: `SDKSynchronizer` runs the same
+    /// pipeline as `evaluateBestOf` (latency and health checks on every candidate, then the
+    /// block-fetch phase for the fastest few plus the current server, honoring
+    /// `fetchThresholdSeconds` and `nBlocksToFetch`), while `SlipstreamSynchronizer` ranks by
+    /// a single `getInfo` round trip and does not use the two fetch parameters.
+    /// - Parameters:
+    ///    - current: The endpoint the wallet uses right now (identified by host, port and TLS flag).
+    ///    - candidates: Endpoints to benchmark alongside `current`.
+    ///    - fetchThresholdSeconds: Per-endpoint cap for the block-fetch phase, where the conformer has one.
+    ///    - nBlocksToFetch: Number of blocks to stream in the fetch phase, where the conformer has one.
+    ///    - network: The network the candidate servers must serve — mainnet, testnet, or regtest.
+    /// - Returns: The endpoint to switch to, or nil when staying on `current` is the right call.
+    func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint?
+
     /// Takes a given date and finds out the closes checkpoint's height for it.
     /// Each checkpoint has a timestamp stored so it can be used for the calculations.
     func estimateBirthdayHeight(for date: Date) -> BlockHeight

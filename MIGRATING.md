@@ -107,6 +107,25 @@ What to re-check in a migration UI for a Keystone account:
   returns the empty schedule — the lock takes every spendable note. A host that already holds an
   estimate can read its `finalResidual` instead of paying for a second multi-run estimate.
 
+## `Synchronizer` gained a new requirement — `evaluateServerSwitch`
+
+`Synchronizer` protocol now requires `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:) async -> LightWalletEndpoint?`.
+Any custom `Synchronizer` conformer or test double must now implement it, returning the endpoint worth switching to or `nil` to stay on the current one.
+Delegating the decision logic is not required; a stub returning `nil` preserves prior behavior for doubles that never switch.
+
+```swift
+// A conformer that skips server switching (prior behavior):
+func evaluateServerSwitch(
+    current: LightWalletEndpoint,
+    candidates: [LightWalletEndpoint],
+    fetchThresholdSeconds: Double,
+    nBlocksToFetch: UInt64,
+    network: NetworkType
+) async -> LightWalletEndpoint? {
+    return nil
+}
+```
+
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
 `VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE
