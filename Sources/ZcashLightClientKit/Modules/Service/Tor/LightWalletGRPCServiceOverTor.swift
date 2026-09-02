@@ -8,9 +8,14 @@
 import Foundation
 
 actor ServiceConnections {
+    /// How many tagged connections are kept for reuse. Past this bound the least recently used
+    /// one is dropped, so a wallet that accumulates transactions and receivers over a long session
+    /// does not pin a live circuit for every one of them.
+    static let maxGroupConnections = 32
+
     var tor: TorClient
     var endpointString: String?
-    var groups: [String: TorLwdConn] = [:]
+    var groups = LRUKeyedCache<String, TorLwdConn>(capacity: ServiceConnections.maxGroupConnections)
     var defaultTorLwdConn: TorLwdConn?
 
     init(endpoint: LightWalletEndpoint, tor: TorClient) {
@@ -40,10 +45,10 @@ actor ServiceConnections {
             return connection
         } else if case let .torInGroup(groupName) = mode {
             // torInGroup
-            guard let torInGroup = groups[groupName] else {
+            guard let torInGroup = groups.value(forKey: groupName) else {
                 let torInGroupNamed = try await tor.connectToLightwalletd(endpoint: endpointString)
 
-                groups[groupName] = torInGroupNamed
+                groups.insert(torInGroupNamed, forKey: groupName)
 
                 return torInGroupNamed
             }

@@ -6,8 +6,33 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `ZcashError.serviceTorRequired` (`ZTSRV0006`), thrown by the transparent-address paths that must
+  go over Tor — the sync-cycle UTXO discovery, `refreshUTXOs(address:from:)` and transparent-history
+  enhancement — when the service in use has no Tor connection to offer. Previously such a call did
+  nothing and reported success.
+
 ## Changed
 
+- With Tor enabled, the transparent UTXO queries that still went over the direct gRPC connection
+  now go over Tor, one circuit per address: the UTXO discovery that runs on every sync cycle and
+  `Synchronizer.refreshUTXOs(address:from:)`. The server no longer sees the wallet's receivers in
+  a single request, nor the wallet's IP address on these calls. Two consequences are visible on
+  the Tor path: the UTXOs are stored as they arrive, so `SynchronizerEvent.storedUTXOs` and the
+  `RefreshedUTXOs` returned by `refreshUTXOs(address:from:)` carry empty `inserted` and `skipped`
+  lists; and `refreshUTXOs(address:from:)` queries from the address's exposure height (or the
+  account birthday when that is unknown) instead of `from`, and does nothing for an address no
+  account of the wallet exposed. A receiver whose Tor lookup fails is skipped, logged without
+  being named, and retried on the next sync cycle; the discovery fails only when every receiver
+  failed. With Tor disabled nothing changes.
+- With Tor enabled, the transaction-history lookups the wallet backend requests for its
+  transparent receivers during enhancement now go over Tor, one circuit per address, instead of
+  over the direct gRPC connection; the transactions found are decrypted and stored exactly as
+  before. With Tor disabled nothing changes.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) probes
+  the candidate servers over Tor when Tor is enabled, each on its own circuit, as
+  `SDKSynchronizer`'s already did.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see

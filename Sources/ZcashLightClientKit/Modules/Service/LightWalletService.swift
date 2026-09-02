@@ -157,6 +157,15 @@ enum ServiceMode: Equatable {
     static func txIdGroup(prefix: String, txId: Data) -> ServiceMode {
         torInGroup("\(prefix)-\(txId.hexEncodedString())")
     }
+
+    /// Helper method that generates a tagged group for a given transparent address with a prefix.
+    /// One circuit per address keeps the server from seeing a wallet's receivers together, while
+    /// repeated queries for the same address reuse the circuit instead of building a new one each
+    /// sync cycle — within the bound `ServiceConnections` keeps on retained tagged connections,
+    /// past which the least recently used ones are dropped and rebuilt on demand.
+    static func addressGroup(prefix: String, address: TransparentAddress) -> ServiceMode {
+        torInGroup("\(prefix)-\(address.stringEncoded)")
+    }
 }
 
 protocol LightWalletService: AnyObject {

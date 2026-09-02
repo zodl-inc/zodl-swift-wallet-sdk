@@ -241,6 +241,28 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         return validAccount
     }
 
+    // DB-READ (audited 2026-08-24): find_account_for_address + get_account — no SQL writes anywhere
+    // in their bodies.
+    func getAccount(forTransparentAddress address: TransparentAddress) async throws -> Account? {
+        let accountPtr: UnsafeMutablePointer<FfiAccount>? = zcashlc_get_account_for_transparent_address(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            address.stringEncoded
+        )
+
+        guard let accountPtr else {
+            throw ZcashError.rustGetAccountForTransparentAddress(
+                lastErrorMessage(fallback: "`getAccount(forTransparentAddress:)` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_account(accountPtr) }
+
+        // The not-found sentinel decodes to `nil`, which is the answer rather than a failure here.
+        return accountPtr.pointee.unsafeToAccount()
+    }
+
     // swiftlint:disable:next function_parameter_count
     @DBActor func importAccount(
         ufvk: String,

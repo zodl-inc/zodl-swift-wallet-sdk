@@ -933,47 +933,18 @@ extension CompactBlockProcessor {
 }
 
 extension CompactBlockProcessor {
-    func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight) async throws -> RefreshedUTXOs {
-        let dataDb = self.config.dataDb
-
-        // ServiceMode to resolve
-        let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: tAddress.stringEncoded,
-            startHeight: startHeight,
-            mode: .direct
+    func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight, mode: ServiceMode) async throws -> RefreshedUTXOs {
+        // Built per call so a server switch, which replaces the services held here, is honoured.
+        let refresher = UTXORefresher(
+            blockDownloaderService: blockDownloaderService,
+            service: service,
+            rustBackend: rustBackend,
+            dataDb: config.dataDb,
+            networkType: config.network.networkType,
+            logger: logger
         )
-        var utxos: [UnspentTransactionOutputEntity] = []
 
-        do {
-            for try await utxo in stream {
-                utxos.append(utxo)
-            }
-            return await storeUTXOs(utxos, in: dataDb)
-        } catch {
-            throw error
-        }
-    }
-
-    private func storeUTXOs(_ utxos: [UnspentTransactionOutputEntity], in dataDb: URL) async -> RefreshedUTXOs {
-        var refreshed: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-
-                refreshed.append(utxo)
-            } catch {
-                logger.info("failed to put utxo - error: \(error)")
-                skipped.append(utxo)
-            }
-        }
-        return (inserted: refreshed, skipped: skipped)
+        return try await refresher.refresh(address: tAddress, startHeight: startHeight, mode: mode)
     }
 }
 

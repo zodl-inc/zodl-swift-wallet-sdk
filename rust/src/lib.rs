@@ -516,6 +516,54 @@ pub unsafe extern "C" fn zcashlc_get_account(
     unwrap_exc_or_null(res)
 }
 
+/// Returns the account that exposed the given transparent address as one of its receivers, or
+/// the [`ffi::Account::NOT_FOUND`] sentinel value if no account of the wallet did.
+///
+/// Only a transparent address is accepted; any other address kind is an error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+/// - Call [`zcashlc_free_account`] to free the memory associated with the returned pointer
+///   when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_account_for_transparent_address(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    address: *const c_char,
+) -> *mut ffi::Account {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+
+        let addr = match Address::decode(&network, addr_str) {
+            Some(addr @ Address::Transparent(_)) => addr,
+            Some(_) => return Err(anyhow!("Expected a transparent address")),
+            None => return Err(anyhow!("Invalid address for this network")),
+        };
+
+        let account = match db_data.find_account_for_address(&network, &addr)? {
+            Some(account_uuid) => db_data.get_account(account_uuid)?,
+            None => None,
+        };
+
+        Ok(Box::into_raw(Box::new(
+            account.map_or(ffi::Account::NOT_FOUND, |account| {
+                ffi::Account::from_account(&account, &network)
+            }),
+        )))
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Adds the next available account-level spend authority, given the current set of [ZIP 316]
 /// account identifiers known, to the wallet database.
 ///
@@ -4793,6 +4841,99 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lookup resolves a receiver the wallet exposed to its account, answers the not-found
+    /// sentinel for a transparent address it never exposed, and refuses an address that is not
+    /// transparent at all.
+    #[test]
+    fn account_lookup_by_transparent_address() {
+        use rand::rngs::OsRng;
+        use secrecy::SecretVec;
+        use std::ffi::CString;
+        use zcash_client_backend::data_api::{
+            Account as _, AccountBirthday, WalletRead, WalletWrite,
+        };
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wallet.sqlite");
+        let path_bytes = path.to_str().expect("utf-8 path").as_bytes();
+        let init = unsafe {
+            zcashlc_init_data_database(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                std::ptr::null(),
+                0,
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(init >= 0, "wallet-db initialization must succeed");
+
+        let mut db = WalletDb::for_path(&path, MAIN_NETWORK, SystemClock, OsRng)
+            .expect("the wallet database must open");
+        let seed = SecretVec::new(vec![7u8; 32]);
+        let treestate = TreeState {
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        };
+        let birthday = AccountBirthday::from_treestate(treestate, None)
+            .expect("the fixture treestate must convert to a birthday");
+        let (account, _usk) = db
+            .create_account("fixture", &seed, &birthday, None)
+            .expect("account creation must succeed");
+        let receivers = db
+            .get_transparent_receivers(account, true, true)
+            .expect("the receivers must be listed");
+        let (receiver, _) = receivers
+            .iter()
+            .next()
+            .expect("a fresh account exposes a transparent receiver");
+        let exposed = CString::new(receiver.encode(&MAIN_NETWORK)).expect("c string");
+
+        let lookup = |address: &CString| unsafe {
+            zcashlc_get_account_for_transparent_address(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                NETWORK_ID_MAINNET,
+                address.as_ptr(),
+            )
+        };
+
+        let found = lookup(&exposed);
+        assert!(!found.is_null(), "an exposed receiver resolves");
+        assert_eq!(
+            unsafe { (*found).uuid_bytes() },
+            account.expose_uuid().into_bytes()
+        );
+        unsafe { ffi::zcashlc_free_account(found) };
+
+        let unknown = CString::new("t1dRJRY7GmyeykJnMH38mdQoaZtFhn1QmGz").expect("c string");
+        let not_found = lookup(&unknown);
+        assert!(!not_found.is_null(), "an unknown receiver is not an error");
+        assert_eq!(
+            unsafe { (*not_found).uuid_bytes() },
+            [0u8; 16],
+            "an unknown receiver answers the not-found sentinel"
+        );
+        unsafe { ffi::zcashlc_free_account(not_found) };
+
+        let shielded = CString::new(
+            "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9sly",
+        )
+        .expect("c string");
+        assert!(
+            lookup(&shielded).is_null(),
+            "a non-transparent address is refused"
+        );
+        let garbage = CString::new("not-an-address").expect("c string");
+        assert!(
+            lookup(&garbage).is_null(),
+            "an undecodable string is refused"
+        );
+    }
 
     /// Only the production network gets the ZIP 318 grid, whose anonymity set depends on every
     /// wallet sharing it. Testnet gets the shortened grid, so a migration passes through anchor

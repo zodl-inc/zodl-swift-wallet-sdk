@@ -1142,33 +1142,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // ── UTXO refresh ──────────────────────────────────────────────────────────
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
-        // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
-        let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: address.stringEncoded,
-            startHeight: height,
-            mode: .direct
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+
+        // The same implementation CompactBlockProcessor.refreshUTXOs delegates to, built per call
+        // so a server switch is honoured.
+        let refresher = UTXORefresher(
+            blockDownloaderService: initializer.blockDownloaderService,
+            service: initializer.lightWalletService,
+            rustBackend: initializer.rustBackend,
+            dataDb: initializer.dataDbURL,
+            networkType: initializer.network.networkType,
+            logger: initializer.logger
         )
-        var utxos: [UnspentTransactionOutputEntity] = []
-        for try await utxo in stream {
-            utxos.append(utxo)
-        }
-        var inserted: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await initializer.rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-                inserted.append(utxo)
-            } catch {
-                skipped.append(utxo)
-            }
-        }
-        return RefreshedUTXOs(inserted: inserted, skipped: skipped)
+
+        return try await refresher.refresh(address: address, startHeight: height, mode: await sdkFlags.ifTor(.uniqueTor))
     }
 
     // ── Exchange rate ─────────────────────────────────────────────────────────
@@ -1692,7 +1679,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             .map { $0.endpoint }
     }
 
-    /// Slipstream benchmarks by a single `getInfo` round trip per candidate —
+    /// Slipstream benchmarks by a single timed round trip per candidate —
     /// `fetchThresholdSeconds` and `nBlocksToFetch` are accepted for protocol conformance but
     /// unused, because this conformer has no block-fetch phase.
     public func evaluateServerSwitch(
@@ -1712,27 +1699,42 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
     }
 
-    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
-    /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
-    /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// Ranks `endpoints` by the round-trip time of a `latestBlockHeight` call, ascending (best
+    /// first), timed on the connection an untimed `getInfo` established. The `getInfo` answer goes
+    /// through the same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus
+    /// branch id, and the loose synced-height check — all skipped for custom networks, mirroring
+    /// `ValidateServerAction`. Delegates to ephemeral connections — same pattern as
+    /// `SDKSynchronizer`, including its Tor policy: with Tor enabled each candidate is probed on
+    /// its own circuit.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = LightWalletGRPCService(endpoint: endpoint)
+                    let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+                    let mode = await sdkFlags.ifTor(.defaultTor)
+
+                    // The first call carries the connection setup — over Tor a whole circuit —
+                    // which says nothing about the server, so it only fetches the info the health
+                    // checks below run on, untimed. The ranking times a second round trip on the
+                    // connection that call established.
+                    guard let info = try? await service.getInfo(mode: mode) else {
+                        await service.closeConnections()
+                        return nil
+                    }
+
                     let start = DispatchTime.now()
-                    let info = try? await service.getInfo(mode: .direct)
+                    let height = try? await service.latestBlockHeight(mode: mode)
                     let elapsed = DispatchTime.now().secondsSince(start)
                     await service.closeConnections()
-                    guard let info else { return nil }
-                    return (endpoint, elapsed, info)
+
+                    return height == nil ? nil : (endpoint, elapsed, info)
                 }
             }
 
