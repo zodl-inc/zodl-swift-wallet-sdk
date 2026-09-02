@@ -103,7 +103,12 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 xz2 = { version = "0.1", features = ["static"] }
 
 # Zcash voting
-zcash_voting = { version = "=3.0.0" }
+# 3.1.0 defaults to the `zakura` backend family. This SDK is built on the
+# upstream librustzcash crates (orchard, pasta_curves, zcash_client_sqlite),
+# so it selects `lrz` instead; taking the default would put two incompatible
+# families in one graph and every value handed across the boundary would be a
+# different type with the same name.
+zcash_voting = { version = "=3.1.0-rc.15", default-features = false, features = ["lrz"] }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
