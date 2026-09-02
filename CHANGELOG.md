@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `RustErrorKind.anchorNotFound`: a proposal that fails because the wallet has not scanned to an
+  anchorable height is classified on its own instead of as `proposalInvalid`, so a wallet can say
+  "scan further and retry" — the case it used to recognise by the upstream error text, which
+  redaction now removes.
+
 - `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
 
 ## Fixed
