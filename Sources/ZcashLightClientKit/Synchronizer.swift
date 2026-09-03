@@ -37,6 +37,9 @@ public struct SynchronizerState: Equatable {
     public var syncSessionID: UUID
     /// account balance known to this synchronizer given the data that has processed locally
     public var accountsBalances: [AccountUUID: AccountBalance]
+    /// Last account balances persisted in the wallet database, without network-freshness masking.
+    /// These values can be stale and are intended for display continuity while networking changes.
+    public var localAccountsBalances: [AccountUUID: AccountBalance]
     /// status of the whole sync process
     var internalSyncStatus: InternalSyncStatus
     public var syncStatus: SyncStatus
@@ -63,6 +66,7 @@ public struct SynchronizerState: Equatable {
         SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .unprepared,
             latestBlockHeight: .zero,
             fullyScannedHeight: .zero
@@ -72,6 +76,7 @@ public struct SynchronizerState: Equatable {
     init(
         syncSessionID: UUID,
         accountsBalances: [AccountUUID: AccountBalance],
+        localAccountsBalances: [AccountUUID: AccountBalance],
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
         fullyScannedHeight: BlockHeight = .zero,
@@ -79,6 +84,7 @@ public struct SynchronizerState: Equatable {
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
+        self.localAccountsBalances = localAccountsBalances
         self.internalSyncStatus = internalSyncStatus
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
@@ -415,6 +421,16 @@ public protocol Synchronizer: AnyObject {
     /// Accounts balances
     /// - Returns: `[AccountUUID: AccountBalance]`, struct that holds Sapling and unshielded balances per account
     func getAccountsBalances() async throws -> [AccountUUID: AccountBalance]
+
+    /// Returns the account balances currently persisted in the wallet database without applying
+    /// network-freshness masking.
+    ///
+    /// These values can be stale until synchronization refreshes the chain tip. They are intended
+    /// for preserving an already-known balance while networking is being initialized or replaced,
+    /// not as the sole authorization for constructing a transaction. Returns `nil` before the
+    /// synchronizer is prepared, after it is wiped, or when an alternate implementation does not
+    /// support durable snapshots.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]?
 
     /// Fetches the latest ZEC-USD exchange rate and updates `exchangeRateUSDSubject`.
     func refreshExchangeRateUSD()
@@ -1473,6 +1489,12 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
+    /// source-compatible and report that the capability is unavailable.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        nil
+    }
+
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that have
     /// a lightwalletd connection (such as `SDKSynchronizer`) override this;

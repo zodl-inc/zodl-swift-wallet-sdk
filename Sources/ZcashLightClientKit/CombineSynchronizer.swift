@@ -181,6 +181,8 @@ public protocol CombineSynchronizer {
 
     func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) -> SinglePublisher<RefreshedUTXOs, Error>
 
+    func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error>
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>
