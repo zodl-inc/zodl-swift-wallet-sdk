@@ -236,6 +236,11 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     // MARK: - Inert defaults
 
+    func testLocalAccountBalancesDefaultReturnsNil() async throws {
+        let balances = try await synchronizer.getLocalAccountBalances()
+        XCTAssertNil(balances)
+    }
+
     /// `nil` is the correct session-start answer for the inert default too: no host-level
     /// conformer means no crank has ever run.
     func testNextMigrationWakeDefaultReturnsNil() async {

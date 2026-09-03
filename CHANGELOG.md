@@ -18,6 +18,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The payment-URI result types expose public initialisers, so consumers can build canned values
   for tests and dependency doubles.
 
+### Balances
+
+- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
+  the last account balances stored in the wallet database without chain-tip freshness masking.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
+
 ## Removed
 
 - `ZcashEip681Backend` and the `zcashlc_eip681_*` FFI are gone. `PaymentURIParser` now handles

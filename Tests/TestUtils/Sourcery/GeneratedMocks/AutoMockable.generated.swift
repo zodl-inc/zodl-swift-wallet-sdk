@@ -2220,6 +2220,28 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getLocalAccountBalances
+
+    var getLocalAccountBalancesThrowableError: Error?
+    var getLocalAccountBalancesCallsCount = 0
+    var getLocalAccountBalancesCalled: Bool {
+        return getLocalAccountBalancesCallsCount > 0
+    }
+    var getLocalAccountBalancesReturnValue: [AccountUUID: AccountBalance]?
+    var getLocalAccountBalancesClosure: (() async throws -> [AccountUUID: AccountBalance]?)?
+
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        if let error = getLocalAccountBalancesThrowableError {
+            throw error
+        }
+        getLocalAccountBalancesCallsCount += 1
+        if let closure = getLocalAccountBalancesClosure {
+            return try await closure()
+        } else {
+            return getLocalAccountBalancesReturnValue
+        }
+    }
+
     // MARK: - refreshExchangeRateUSD
 
     var refreshExchangeRateUSDCallsCount = 0
