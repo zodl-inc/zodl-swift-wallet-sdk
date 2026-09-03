@@ -8,6 +8,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Changes are relative to `4.1.0`.
 
+## Added
+
+### Balances
+
+- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
+  the last account balances stored in the wallet database without chain-tip freshness masking.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
+
 ## Changed
 
 - The Swift package is renamed from `ZcashLightClientKit` to `zodl-swift-wallet-sdk`, and

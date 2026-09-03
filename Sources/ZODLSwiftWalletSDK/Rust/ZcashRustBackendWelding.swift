@@ -904,6 +904,18 @@ protocol ZcashRustBackendWelding {
     ) async throws -> [MigrationSignedTransferPczt]
 }
 
+/// An explicit capability for backends that can read durable, unmasked balances directly from the
+/// wallet database. Keeping this separate from `ZcashRustBackendWelding` prevents alternate
+/// backends and test doubles from silently manufacturing local balances from the masked summary.
+protocol LocalBalanceProviding {
+    func getWalletSummaryWithLocalBalances() async throws -> (
+        summary: WalletSummary?,
+        localBalances: [AccountUUID: AccountBalance]
+    )
+
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]
+}
+
 extension ZcashRustBackendWelding {
     func migrationAdvanceStep(
         for account: AccountUUID,
