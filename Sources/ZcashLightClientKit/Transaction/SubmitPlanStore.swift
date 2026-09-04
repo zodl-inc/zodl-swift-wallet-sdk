@@ -128,7 +128,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
             try connection.run(insert)
             try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(endpointsColumn <- json))
         } catch {
-            logger.warn("SubmitPlanStore failed to record submit plan: \(error)")
+            logger.warn("SubmitPlanStore failed to record submit plan: \(error.localizedDescription)")
         }
     }
 
