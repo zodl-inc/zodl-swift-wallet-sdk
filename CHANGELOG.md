@@ -59,6 +59,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on-chain shape as a migration `transfer`, but not a migration this account made. Such
   transactions were previously reported as `notClassified`. An exhaustive `switch` over
   `ZIP318Kind` stops compiling until the new case is handled.
+- `evaluateServerSwitch` on `SlipstreamSynchronizer` now bounds each candidate's `getInfo`
+  probe to 5 s instead of the endpoint's much longer gRPC single-call default, so a slow or
+  unreachable server can no longer make a call take an unbounded amount of time. On both
+  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server
+  is now skipped when the first benchmark round produced no results at all — nothing answered,
+  so a second call could not have fared any better; the outcome is unchanged.
 
 ## Fixed
 
