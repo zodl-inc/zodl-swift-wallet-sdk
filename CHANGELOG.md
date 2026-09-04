@@ -46,6 +46,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fastest candidates by latency plus the current server — never the whole list — so network cost
   does not grow with the number of candidates. A call whose surrounding task is cancelled returns
   `nil`.
+- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
+  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
+  `errorDescription` printed only the static sentence "Error from rust layer when calling
+  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
+  never rendered, so a user's error report named no cause and did not even say whether the failure
+  happened while BUILDING a proposal or while signing an already-confirmed one.
+
+  The rust layer now classifies these failures instead of flattening them into a string, and each
+  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
+  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
+  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
+  which now covers only the signing step. Two conditions a wallet should render itself rather than
+  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
+  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
+  amounts as `Zatoshi`.
+
+  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
+  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
+  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
+  and `errorDescription` appends it when present. See MIGRATING.md.
+
+  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
+  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
+  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
+  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
+  device at `debug!` level.
 
 ## Fixed
 
@@ -155,32 +181,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `finalResidual` rather than pay for a second one. A "Lock balance" offer built from it belongs
   only after `proposeMigrationTransfers` returns the empty schedule: `lockMigrationResidual` locks
   every spendable Orchard note, not just the residual. No call-site edit is needed.
-- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
-  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
-  `errorDescription` printed only the static sentence "Error from rust layer when calling
-  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
-  never rendered, so a user's error report named no cause and did not even say whether the failure
-  happened while BUILDING a proposal or while signing an already-confirmed one.
-
-  The rust layer now classifies these failures instead of flattening them into a string, and each
-  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
-  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
-  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
-  which now covers only the signing step. Two conditions a wallet should render itself rather than
-  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
-  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
-  amounts as `Zatoshi`.
-
-  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
-  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
-  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
-  and `errorDescription` appends it when present. See MIGRATING.md.
-
-  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
-  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
-  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
-  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
-  device at `debug!` level.
 
 # 4.0.0 - 2026-08-19
 
