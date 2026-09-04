@@ -9,7 +9,7 @@ import GRPC
 import NIO
 import NIOConcurrencyHelpers
 import SwiftProtobuf
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Darksidewalletd maintains two staging areas, blocks and transactions. The
 /// Stage*() gRPCs add items to the staging area; ApplyStaged() "applies" everything

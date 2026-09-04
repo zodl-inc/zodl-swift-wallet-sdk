@@ -1,17 +1,17 @@
 //
 //  FakeStorage.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 12/09/2019.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
 //
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class ZcashConsoleFakeStorage: CompactBlockRepository {
     func create() throws {}
 
-    func clear(upTo height: ZcashLightClientKit.BlockHeight) async throws { }
+    func clear(upTo height: ZODLSwiftWalletSDK.BlockHeight) async throws { }
 
     func clear() async throws {}
 
@@ -23,7 +23,7 @@ class ZcashConsoleFakeStorage: CompactBlockRepository {
         return self.latestBlockHeight
     }
 
-    func latestBlock() throws -> ZcashLightClientKit.ZcashCompactBlock {
+    func latestBlock() throws -> ZODLSwiftWalletSDK.ZcashCompactBlock {
         return ZcashCompactBlock(
             height: latestBlockHeight,
             data: Data(),

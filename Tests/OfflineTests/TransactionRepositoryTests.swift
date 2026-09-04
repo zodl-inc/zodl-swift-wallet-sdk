@@ -1,13 +1,13 @@
 //
 //  TransactionRepositoryTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 11/16/19.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class TransactionRepositoryTests: XCTestCase {
     func testZIP318KindDecodesEveryKnownClassification() {

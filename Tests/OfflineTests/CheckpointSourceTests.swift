@@ -6,7 +6,7 @@
 //
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class CheckpointSourceTests: XCTestCase {
     func test_BirthdayGetsMostRecentCheckpointPrecedingTheGivenHeight_Testnet() throws {

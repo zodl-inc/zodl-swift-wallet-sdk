@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 class TransactionsTableViewController: UITableViewController {
     var datasource: TransactionsDataSource? {

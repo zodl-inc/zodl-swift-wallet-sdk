@@ -6994,7 +6994,7 @@ mod engine_schema_names_tests {
             slipstream_core::reconcile::RECONCILE_VIEW_NAME,
             "ext_slipstream_v_tx_reconciled",
             "the engine renamed the reconciliation view; update the query in \
-             Sources/ZcashLightClientKit/DAO/TransactionDao.swift to match"
+             Sources/ZODLSwiftWalletSDK/DAO/TransactionDao.swift to match"
         );
     }
 

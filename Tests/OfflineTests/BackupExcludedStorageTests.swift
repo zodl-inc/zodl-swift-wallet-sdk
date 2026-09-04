@@ -1,11 +1,11 @@
 //
 //  BackupExcludedStorageTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Direct coverage of the shared provisioning helper (finding 15); `MigrationLogicTests`'
 /// `testGateInitExcludesItsStorageDirectoryFromBackup` covers the `MigrationSyncGate` consumer side.

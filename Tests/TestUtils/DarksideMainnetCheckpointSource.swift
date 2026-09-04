@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 struct DarksideMainnetCheckpointSource: CheckpointSource {
     // swiftlint:disable line_length
@@ -35,11 +35,11 @@ struct DarksideMainnetCheckpointSource: CheckpointSource {
         treeState
     }
 
-    func estimateBirthdayHeight(for date: Date) -> ZcashLightClientKit.BlockHeight {
+    func estimateBirthdayHeight(for date: Date) -> ZODLSwiftWalletSDK.BlockHeight {
         663150
     }
 
-    func estimateTimestamp(for height: ZcashLightClientKit.BlockHeight) -> TimeInterval? {
+    func estimateTimestamp(for height: ZODLSwiftWalletSDK.BlockHeight) -> TimeInterval? {
         1576821833
     }
 }

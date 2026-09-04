@@ -1,12 +1,12 @@
 //
 //  Zip325Tests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Created by Jack Grigg on 25/02/2025.
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class Zip325Tests: XCTestCase {
     let seedBytes: [UInt8] = [

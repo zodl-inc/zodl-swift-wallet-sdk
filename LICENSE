@@ -1,5 +1,5 @@
 Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
-ZODL ZcashLightClientKit is licensed under the GNU Affero General Public License, version 3 only (AGPL-3.0-only), the full text of which follows. See also LICENSE-EXCEPTIONS.md and COMMERCIAL-LICENSE.md in this repository.
+ZODL Swift Wallet SDK is licensed under the GNU Affero General Public License, version 3 only (AGPL-3.0-only), the full text of which follows. See also LICENSE-EXCEPTIONS.md and COMMERCIAL-LICENSE.md in this repository.
 Portions of this software are derived from ZcashLightClientKit, Copyright (c) 2020 Zcash, and were originally made available under the MIT License, which is reproduced in LICENSE-MIT. The MIT License permits sublicensing; those portions are conveyed as part of this combined work under the AGPL, and remain separately available from their original authors under the MIT License.
 
 GNU AFFERO GENERAL PUBLIC LICENSE

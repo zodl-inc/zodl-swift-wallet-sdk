@@ -43,7 +43,7 @@ NETWORKS = {
     "testnet": {"host": "testnet.zec.rocks:443", "interval": 10000, "network_value": "test"},
 }
 
-CHECKPOINTS_REL = "Sources/ZcashLightClientKit/Resources/checkpoints"
+CHECKPOINTS_REL = "Sources/ZODLSwiftWalletSDK/Resources/checkpoints"
 
 
 def repo_root() -> Path:

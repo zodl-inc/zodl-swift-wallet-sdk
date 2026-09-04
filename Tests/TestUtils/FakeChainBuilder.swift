@@ -1,12 +1,12 @@
 //
 //  FakeChainBuilder.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 5/21/20.
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 enum FakeChainBuilderError: Error {
     case fakeHexDataConversionFailed

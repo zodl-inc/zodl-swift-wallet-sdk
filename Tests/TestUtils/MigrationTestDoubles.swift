@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A mutable clock for injecting deterministic time into `MigrationSyncGate` under test. Shared by
 /// every migration test file that needs a controllable `now` (previously duplicated verbatim between

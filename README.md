@@ -1,6 +1,6 @@
 # Zcash iOS Framework
 
-[![Build Status](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zcash-swift-wallet-sdk/actions/workflows/swift.yml)
+[![Build Status](https://github.com/zodl-inc/zodl-swift-wallet-sdk/actions/workflows/swift.yml/badge.svg)](https://github.com/zodl-inc/zodl-swift-wallet-sdk/actions/workflows/swift.yml)
 
 
 A Zcash Lightweight Client SDK for iOS, maintained by the Zcash Open Development
@@ -23,14 +23,28 @@ advised of the following:
 
 ## Swift Package Manager
 
-Add a package with the source "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git" in
-either Xcode's GUI or in your `Package.swift` file. The library product is named
-`ZcashLightClientKit`:
+Add a package with the source "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git" in
+either Xcode's GUI or in your `Package.swift` file. The package is named
+`zodl-swift-wallet-sdk` and its library product and module are `ZODLSwiftWalletSDK`.
+SwiftPM derives the `package:` argument of `.product(name:package:)` from the last path
+component of the repository URL, which now matches the package name:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "3.0.0")
+    .package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "3.0.0")
+],
+targets: [
+    .target(
+        name: "MyWallet",
+        dependencies: [
+            .product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
+        ]
+    )
 ]
+```
+
+```swift
+import ZODLSwiftWalletSDK
 ```
 
 ### Pre-release version support for Xcode projects
@@ -85,7 +99,7 @@ The `LIGHTWALLETD_ADDRESS` environment variable can also be added to your shell 
 We advise setting this value as a secret variable on your CD/CI environment when possible.
 
 # Integrating with logging tools
-There are a lots of good logging tools for iOS. So we'll leave that choice to you. ZcashLightClientKit relies on a simple protocol to bubble up logs to client applications, which is called `Logger` (kudos for the naming originality...)
+There are a lots of good logging tools for iOS. So we'll leave that choice to you. ZODLSwiftWalletSDK relies on a simple protocol to bubble up logs to client applications, which is called `Logger` (kudos for the naming originality...)
 ```
 public protocol Logger {
     
@@ -146,10 +160,10 @@ Examples can be found in the [Demo App](/Example/ZcashLightClientSample).
 
 Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
 
-ZODL ZcashLightClientKit is free software, licensed under the GNU Affero General
+ZODL Swift Wallet SDK is free software, licensed under the GNU Affero General
 Public License, version 3 only (AGPL-3.0-only). See [LICENSE](LICENSE).
 
-In short: you may use, study, modify, and redistribute ZODL ZcashLightClientKit,
+In short: you may use, study, modify, and redistribute ZODL Swift Wallet SDK,
 but if you incorporate it into an application, the complete source of that
 application must be made available under the AGPL to its users, including users
 who interact with it over a network.
@@ -160,7 +174,7 @@ distributed through the Apple App Store are released by Znewco under separate
 terms; no App Store distribution permission is granted to AGPL licensees — see
 [LICENSE-EXCEPTIONS.md](LICENSE-EXCEPTIONS.md).
 
-ZODL ZcashLightClientKit is derived from ZcashLightClientKit, Copyright (c) 2020
+ZODL Swift Wallet SDK is derived from ZcashLightClientKit, Copyright (c) 2020
 Zcash, which was made available under the MIT License; that license is
 reproduced in [LICENSE-MIT](LICENSE-MIT). It also depends on the Zcash Rust
 crates (librustzcash and related) and other third-party libraries, which are

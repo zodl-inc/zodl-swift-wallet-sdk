@@ -1,5 +1,5 @@
 import Combine
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import Foundation
 
 {% macro methodName method%}{%if method|annotated:"mockedName" %}{{ method.annotations.mockedName }}{% else %}{% call swiftifyMethodName method.selectorName %}{% endif %}{% endmacro %}

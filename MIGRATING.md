@@ -1,5 +1,54 @@
 # Migrating from previous versions to _Unreleased_
 
+## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
+
+The package, its library product, and its module are renamed, and the repository has moved to
+`https://github.com/zodl-inc/zodl-swift-wallet-sdk`. There is no compatibility product under the
+old name, so every import site changes. SwiftPM derives the `package:` argument of
+`.product(name:package:)` from the last path component of the URL you declare, so update
+`.package(url:)` and `package:` together. GitHub redirects the old URL; a manifest that keeps it
+must keep `package: "zcash-swift-wallet-sdk"` to match.
+
+Before:
+
+```swift
+// Package.swift
+.package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "4.0.0")
+.product(name: "ZcashLightClientKit", package: "zcash-swift-wallet-sdk")
+```
+
+```swift
+import ZcashLightClientKit
+@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
+
+let height: ZcashLightClientKit.BlockHeight = 1
+```
+
+After:
+
+```swift
+// Package.swift
+.package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "4.0.0")
+.product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
+```
+
+```swift
+import ZODLSwiftWalletSDK
+@testable import ZODLSwiftWalletSDK
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
+
+let height: ZODLSwiftWalletSDK.BlockHeight = 1
+```
+
+If your dependency uses the explicit-name form, `.package(name: "ZcashLightClientKit", url: …)`,
+drop the `name:` argument or set it to `"zodl-swift-wallet-sdk"`.
+
+Two strings that were derived from the old module name change at runtime: a `ZcashError`
+bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM resource bundle
+is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
+rather than on either string.
+
 ## Migration runs are sized per account — stamp `Account.keystoneKeySource` on a Keystone import
 
 The SDK now reads the `keySource` an account was created or imported with. An account tagged

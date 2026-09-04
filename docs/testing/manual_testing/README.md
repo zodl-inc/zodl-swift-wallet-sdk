@@ -27,12 +27,12 @@ make
 
 5. Open Demo App workspace `ZcashLightClientSample.xcworkspace`
 6. Go to the manage schemes section
-7. Verify that the `ZcashLightClientKit-Unit-Tests` scheme is shown and shared
+7. Verify that the `ZODLSwiftWalletSDK` scheme is shown and shared
 8. Run the `AdvancedReOrgTests` test suite
 
 ## Running DerivationTool tests
 
 1. open Demo App workspace `ZcashLightClientSample.xcworkspace`
 2. go to the manage schemes section
-3. verify that the `ZcashLightClientKit-Unit-DerivationToolTests` scheme is shown and shared
-6. run the `ZcashLightClientKit-Unit-DerivationToolTests` test suite
+3. verify that the `ZODLSwiftWalletSDK` scheme is shown and shared
+6. run the `DerivationToolMainnetTests` and `DerivationToolTestnetTests` suites from the `ZODLSwiftWalletSDK` scheme

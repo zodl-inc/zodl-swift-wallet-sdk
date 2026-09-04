@@ -8,6 +8,6 @@
       location = "group:BuildSupport/FFIBuilder.xcodeproj">
    </FileRef>
    <FileRef
-      location = "group:ZcashLightClientKit.xctestplan">
+      location = "group:ZODLSwiftWalletSDK.xctestplan">
    </FileRef>
 </Workspace>

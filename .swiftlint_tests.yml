@@ -8,7 +8,6 @@ excluded:
   - Tests/TestUtils/proto/
   - xctemplates/
   - Sources/
-  - ZcashLightClientKitTests/Constants.generated.swift
   - build/
   - docs/
   - Tests/TestUtils/Sourcery/GeneratedMocks/AutoMockable.generated.swift

@@ -1,10 +1,10 @@
 //
 //  VotingRecoverWireJsonTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 private let recoverProposalId: UInt32 = 1
 private let recoverShareIndex: UInt32 = 0

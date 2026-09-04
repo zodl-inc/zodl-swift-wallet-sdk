@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class ZcashErrorLocalizedTests: XCTestCase {
     // MARK: - LocalizedError conformance
@@ -110,7 +110,7 @@ class ZcashErrorLocalizedTests: XCTestCase {
         let nsError = error as NSError
 
         // Before LocalizedError conformance, this would be:
-        // "The operation couldn't be completed. (ZcashLightClientKit.ZcashError error 29.)"
+        // "The operation couldn't be completed. (ZODLSwiftWalletSDK.ZcashError error 29.)"
         // After: "ZRUST0002: Error from rust layer when calling ZcashRustBackend.createToAddress"
         XCTAssertFalse(
             nsError.localizedDescription.contains("error 29"),
