@@ -269,6 +269,42 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
         )
     }
 
+    /// A restart whose generation is already stale abandons at its first guard, emitting nothing
+    /// and starting nothing.
+    ///
+    /// The guard is what keeps the recovery from resurrecting an engine another path has claimed:
+    /// a `stop()` the user asked for, or a `switchTo` / `wipe` / import / delete / rewind that is
+    /// bringing up a pass of its own. Its SILENCE is part of the contract. An abandoned restart
+    /// has not given up — the path that took the engine over is now responsible for the pass — so
+    /// a `.syncStalled(gaveUp: true)` here would tell a host the SDK had stopped trying when it
+    /// has not, and a `.syncStalled(gaveUp: false)` would promise a restart nobody is performing.
+    ///
+    /// `-1` stands in for "somebody bumped the counter while this restart was in flight": the
+    /// generation only ever climbs from 0, so no synchronizer can hold it and the test needs to
+    /// win no race to be sure the guard is the thing it exercises.
+    func testRestartWithAStaleGenerationAbandonsSilently() async throws {
+        let synchronizer = try makeSynchronizer()
+        var events: [SynchronizerEvent] = []
+        let subscription = synchronizer.eventStream.sink { events.append($0) }
+        defer { subscription.cancel() }
+
+        await synchronizer.restartHandleForRecovery(expectedStopGeneration: -1)
+
+        let stallEvents = events.filter { event in
+            if case .syncStalled = event {
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(stallEvents.isEmpty, "an abandoned restart owes the host no stall report, and must not forge one")
+        XCTAssertTrue(events.isEmpty, "nor anything else: it touched no transaction and found nothing")
+        XCTAssertEqual(
+            synchronizer.latestState.internalSyncStatus,
+            .unprepared,
+            "and it started nothing: the synchronizer is exactly as the guard found it"
+        )
+    }
+
     // MARK: - Helpers
 
     /// The policy as the poll loop asks it, with the shipped constants substituted for the

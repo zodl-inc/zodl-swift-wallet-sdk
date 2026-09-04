@@ -190,6 +190,34 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// engine down in the meantime, and resurrecting it would either undo a deliberate stop or
     /// interleave a second reopen/start with a switch.
     private var stopGeneration = 0
+    /// Bumped ONLY by `stopImpl`, the deliberate stop a host asks for. `stopGeneration` cannot
+    /// tell the two kinds apart: a switch, a wipe, an account import or delete and a rewind all
+    /// bump it too, and every one of them brings a pass of its own back up afterwards. So the
+    /// recovery asks THIS counter whether the pass it has just started must come down again — a
+    /// moved stop request means the app really does want a stopped synchronizer, while a mere
+    /// takeover means the taking-over path owns the pass and stopping it would leave the wallet
+    /// dead after, say, a server switch.
+    private var stopRequestGeneration = 0
+    /// `stopRequestGeneration` as it stood when the in-flight recovery was decided; meaningful
+    /// only while `stallRecoveryInFlight`. Captured at the decision rather than inside the
+    /// restart, so a stop landing between the two is visible to both of its readers.
+    private var stallRecoveryStopRequestGeneration = 0
+
+    /// Whether a sync pass is MEANT to be up, which is not the same question as `isRunning`.
+    ///
+    /// A stall recovery clears `isRunning` for the length of its teardown and reopen, and every
+    /// "stop, mutate the wallet, restart it if it was running" path samples that flag to decide
+    /// whether to restart. Sampling it during that window reads a mid-restart wallet as an idle
+    /// one, and the outcome is a wallet with no pass at all: the path mutates, reopens and skips
+    /// its restart, while the recovery — whose generation that same path has just retired —
+    /// abandons on the grounds that someone else is bringing a pass up. Reading the INTENT closes
+    /// that hole: a recovery in flight means a pass is wanted, whatever `isRunning` says today.
+    ///
+    /// Unless a deliberate stop has retired that recovery in the meantime. It is then on its way
+    /// to abandoning and the pass is meant to stay down, so restarting it would undo the stop.
+    private var passIntendedRunning: Bool {
+        isRunning || (stallRecoveryInFlight && stallRecoveryStopRequestGeneration == stopRequestGeneration)
+    }
 
     // ── [#1975] Background transaction resubmission ────────────────────────────
     // Parity with the old pipeline's `TxResubmissionAction`, which ran once per sync pass:
@@ -514,6 +542,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// The actor-isolated body of `stop()`.
     private func stopImpl() async {
         isRunning = false
+        // [MOB-1850] The one bump of the stop-REQUEST generation. `stopEngineOutsideRecovery()`
+        // below retires `stopGeneration` as every takeover does; this counter separately records
+        // that the stop was asked for, which is what an in-flight recovery needs in order to tell
+        // "the app stopped me" from "another path took the engine over".
+        stopRequestGeneration += 1
         stopPolling()
         // [#1975] Cancel, don't join: nothing is being deleted here, so a check that runs a
         //   moment longer is harmless, and `stop()` must stay prompt. Cancel ONLY — the fired
@@ -588,6 +621,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     private func startPolling() {
+        // REPLACES the loop, never adds one: a stall recovery's `start()` and a concurrent
+        // takeover's `start()` can both reach this, and two live loops would tick the same engine
+        // twice, decide two stall recoveries and emit every state and event in duplicate.
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -640,6 +676,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 // cancels the very `pollTask` this tick is running on, and the teardown that
                 // follows would then be running inside a cancelled task.
                 let generation = stopGeneration
+                // Captured in the same breath and for the same reason: the restart's last act
+                // asks whether a DELIBERATE stop landed while it was bringing the pass up, and
+                // the answer has to be relative to this instant rather than to whenever the task
+                // below gets its turn on the actor.
+                stallRecoveryStopRequestGeneration = stopRequestGeneration
                 Task { await self.restartHandleForRecovery(expectedStopGeneration: generation) }
             }
         case .giveUp:
@@ -797,10 +838,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// - Parameter expectedStopGeneration: `stopGeneration` as it stood when the poll loop decided
     ///   to restart. Every stop that is not this recovery's own goes through
     ///   `stopEngineOutsideRecovery()` and bumps that counter, and this method re-checks it after
-    ///   each of its suspension points — its own teardown, its reopen, and the `start()` it ends
-    ///   with. A changed value means another path took the engine down mid-restart, and carrying
-    ///   on would either resurrect a synchronizer the app deliberately stopped or race a second
-    ///   reopen against the one that path is already performing.
+    ///   its teardown and after its reopen — the two points at which nothing has been brought up
+    ///   yet. A changed value there means another path took the engine down mid-restart, and
+    ///   carrying on would either resurrect a synchronizer the app deliberately stopped or race a
+    ///   second reopen against the one that path is already performing, so the restart abandons.
+    ///   After the `start()` that ends the method the question is a different one, and asked of
+    ///   `stopRequestGeneration` instead: a pass is up by then, and only a stop the app asked for
+    ///   should take it down again.
     ///
     /// `internal` (not `private`) so `@testable` tests can drive the restart directly, the way
     /// `maybeRunTxResubmission` and `setInternalSyncStatusForTesting` are reachable: the only
@@ -876,10 +920,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
             // `stop()` registered after that await runs concurrently with the rest of `start()`
             // and can have its teardown overtaken by the fresh pass — a pre-existing shape of the
             // `pendingStop` ordering contract that the recovery inherits by calling `start()`.
-            // The generation makes that visible after the fact, and stopping again through the
-            // public `stop()` (which queues in `pendingStop` like any other stop) settles it for
-            // the recovery path: a user who backgrounded the wallet mid-restart stays stopped.
-            if stopGeneration != expectedStopGeneration {
+            // Stopping again through the public `stop()` (which queues in `pendingStop` like any
+            // other stop) settles it: a user who backgrounded the wallet mid-restart stays stopped.
+            //
+            // A DELIBERATE stop only, though. `stopGeneration` moves for a switch, a wipe, an
+            // account import or delete and a rewind as well, and each of those brings a pass of
+            // its own back up — tearing it down here would leave the wallet stopped after, say, a
+            // server switch that had already succeeded. A takeover wants nothing from this
+            // recovery; its own `start()` owns the pass. So the question asked is the narrow one.
+            if stopRequestGeneration != stallRecoveryStopRequestGeneration {
                 initializer.logger.info(
                     "[slipstream] stall recovery started a pass that a concurrent stop had already claimed — stopping it again",
                     file: #file,
@@ -1141,7 +1190,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // orphan commit lands BEFORE the import transaction (both serialize on the SQLite
         // write lock), so the force-re-queue is the last writer. The anchor fetch above
         // deliberately runs with the engine still live — it is network-only, no wallet write.
-        let wasRunning = isRunning
+        // [MOB-1850] The INTENT, not the instantaneous flag: a stall recovery clears `isRunning`
+        // across its own teardown, so sampling it there would read this wallet as idle, skip the
+        // restart below, and leave nothing running once the recovery abandons on the generation
+        // the stop below retires. See `passIntendedRunning`.
+        let wasRunning = passIntendedRunning
         await stopEngineOutsideRecovery()
 
         let uuid: AccountUUID
@@ -1193,8 +1246,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // stop the engine first, delete, then restart. The restarted pass re-seeds without
         // the deleted key, and `WalletSession::open` prunes the account's orphaned Historic
         // scan ranges — a deep-birthday import's restore does NOT grind on after its account
-        // is gone. `wasRunning` mirrors importAccount's restart contract.
-        let wasRunning = isRunning
+        // is gone. `wasRunning` mirrors importAccount's restart contract, intent included.
+        let wasRunning = passIntendedRunning
         await stopEngineOutsideRecovery()
         try await initializer.rustBackend.deleteAccount(accountUUID)
         // `delete_account` removes the account's transactions — bump `tx_set_version`
@@ -1589,7 +1642,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // truncate → restart. The restarted pass re-suggests from the truncated queue, and
         // the engine's scope-expansion re-baseline (E-5) makes the re-scan read as a genuine
         // climb. Restart on BOTH outcomes — a failed truncate must not leave the engine dead.
-        let wasRunning = isRunning
+        let wasRunning = passIntendedRunning
         await stopEngineOutsideRecovery()
 
         do {
@@ -1982,7 +2035,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             return
         }
 
-        let wasRunning = isRunning
+        let wasRunning = passIntendedRunning
 
         // F3: Warn when a switch fires while sync is active — the pass will restart.
         // This is not an error: the scan queue is durable and resumes after reopen.
