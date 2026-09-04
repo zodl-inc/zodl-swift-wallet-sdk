@@ -181,6 +181,34 @@ class SlipstreamOfflineTests: ZcashTestCase {
         }
     }
 
+    // MARK: - 1b. Submission status is read from the submit-plan store
+
+    /// `transactionSubmissionStatus(for:)` translates what the submit-plan store holds, so a host
+    /// can show a sent transaction as taken by a server instead of as still sending.
+    func testTransactionSubmissionStatusReflectsTheSubmitPlanStore() async throws {
+        let initializer = try makeInitializer()
+        let sync = SlipstreamSynchronizer(initializer: initializer)
+        let store = initializer.container.resolve(SubmitPlanStoring.self)
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let awaitingTxId = Data(repeating: 0x31, count: 32)
+        let submittedTxId = Data(repeating: 0x32, count: 32)
+        let acceptedTxId = Data(repeating: 0x33, count: 32)
+
+        await store.markAwaitingSubmission(txIds: [awaitingTxId])
+        await store.recordPlan(txId: submittedTxId, endpoints: [endpoint])
+        await store.recordPlan(txId: acceptedTxId, endpoints: [endpoint])
+        await store.markAccepted(txId: acceptedTxId, host: "a.example.com:443")
+
+        let awaiting = await sync.transactionSubmissionStatus(for: awaitingTxId)
+        XCTAssertEqual(awaiting, TransactionSubmissionStatus.awaiting)
+        let submitted = await sync.transactionSubmissionStatus(for: submittedTxId)
+        XCTAssertEqual(submitted, TransactionSubmissionStatus.submitted)
+        let accepted = await sync.transactionSubmissionStatus(for: acceptedTxId)
+        XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: "a.example.com:443"))
+        let unknown = await sync.transactionSubmissionStatus(for: Data(repeating: 0x34, count: 32))
+        XCTAssertNil(unknown, "A transaction the store never saw has no submission status")
+    }
+
     // MARK: - 2. Dealloc-without-stop: no crash on release without stop()
 
     /// Create a `SlipstreamSynchronizer` and immediately ARC-release it without calling `stop()`.

@@ -52,7 +52,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         await store.recordPlan(txId: txId, endpoints: [endpointA, endpointB])
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
     }
 
     func testRecordPlanWithoutPriorAwaitingRowCreatesReadyPlan() async {
@@ -62,7 +62,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         await store.recordPlan(txId: txId, endpoints: [endpointA])
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testMarkAwaitingDoesNotOverwriteRecordedPlan() async {
@@ -73,7 +73,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         await store.markAwaitingSubmission(txIds: [txId])
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testPlansPersistAcrossStoreInstances() async {
@@ -83,7 +83,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
 
         let secondStore = makeStore()
         let plan = await secondStore.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testAllPlannedTransactionIdsListsEveryRow() async {
@@ -110,7 +110,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let removed = await store.plan(for: removedTxId)
         XCTAssertNil(removed)
         let kept = await store.plan(for: keptTxId)
-        XCTAssertEqual(kept, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(kept, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testClearRemovesEverything() async {

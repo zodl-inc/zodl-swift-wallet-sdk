@@ -12,16 +12,41 @@ enum StoredSubmitPlan: Equatable {
     /// Resubmission must skip it.
     case awaiting
     /// Submitted to these endpoints; resubmission retries through them.
-    case ready([LightWalletEndpoint])
+    /// `acceptedBy` is `host:port` of the server that took the transaction into
+    /// its mempool, or `nil` while no server has acknowledged it. Acceptance
+    /// does not end retrying: an accepted transaction is still resubmitted
+    /// until it is mined, because a mempool is not a commitment.
+    case ready([LightWalletEndpoint], acceptedBy: String?)
     /// The store cannot be read, so whether a plan exists is unknown.
     /// Resubmission must skip the transaction: auto-submitting something the
     /// app may never have released is worse than delaying a retry.
     case storeUnavailable
 }
 
+extension StoredSubmitPlan {
+    /// The public status this stored plan reports to a host. `nil` where the SDK
+    /// cannot answer: a store it cannot read says nothing about the transaction,
+    /// and neither does a missing row.
+    var submissionStatus: TransactionSubmissionStatus? {
+        switch self {
+        case .awaiting:
+            return .awaiting
+        case .ready(_, let acceptedBy):
+            guard let acceptedBy else { return .submitted }
+            return .accepted(host: acceptedBy)
+        case .storeUnavailable:
+            return nil
+        }
+    }
+}
+
 protocol SubmitPlanStoring {
     func markAwaitingSubmission(txIds: [Data]) async
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async
+    /// Records that `host` (`host:port`) took the transaction into its mempool.
+    /// Creates the row when the transaction has no plan yet, so a transaction
+    /// accepted through a path that never recorded one is still reportable.
+    func markAccepted(txId: Data, host: String) async
     /// `nil` means the store was read successfully and has no row — a legacy
     /// transaction unknown to this store. Read failures return
     /// `.storeUnavailable`, never `nil`.
@@ -48,9 +73,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
     private var cachedConnection: Connection?
     private var connectionFailed = false
 
-    private let table = Table("tx_submit_plans")
+    private static let tableName = "tx_submit_plans"
+    private static let acceptedHostColumnName = "accepted_host"
+
+    private let table = Table(SubmitPlanStore.tableName)
     private let txIdColumn = SQLite.Expression<Blob>("tx_id")
     private let endpointsColumn = SQLite.Expression<String>("endpoints")
+    private let acceptedHostColumn = SQLite.Expression<String?>(SubmitPlanStore.acceptedHostColumnName)
 
     init(databaseURL: URL, logger: Logger) {
         self.databaseURL = databaseURL
@@ -87,14 +116,38 @@ actor SubmitPlanStore: SubmitPlanStoring {
             let storedEndpoints = endpoints.map { StoredEndpoint(endpoint: $0) }
             let encoded = try JSONEncoder().encode(storedEndpoints)
             let json = String(data: encoded, encoding: .utf8) ?? "[]"
-            let upsert = table.insert(
-                or: .replace,
+            // Insert-then-update rather than a replacing upsert, so a plan
+            // recorded again for an already-accepted transaction keeps its
+            // `accepted_host` instead of reverting to NULL: acceptance
+            // survives a re-recorded plan.
+            let insert = table.insert(
+                or: .ignore,
                 txIdColumn <- Blob(bytes: txId.bytes),
                 endpointsColumn <- json
             )
-            try connection.run(upsert)
+            try connection.run(insert)
+            try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(endpointsColumn <- json))
         } catch {
             logger.warn("SubmitPlanStore failed to record submit plan: \(error)")
+        }
+    }
+
+    func markAccepted(txId: Data, host: String) {
+        guard let connection = connection() else { return }
+        do {
+            // Insert-then-update rather than an upsert: a replacing insert would
+            // wipe the endpoint list `recordPlan` stored moments earlier, and
+            // that list is the only thing background resubmission can retry
+            // through.
+            let insert = table.insert(
+                or: .ignore,
+                txIdColumn <- Blob(bytes: txId.bytes),
+                endpointsColumn <- "[]"
+            )
+            try connection.run(insert)
+            try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(acceptedHostColumn <- host))
+        } catch {
+            logger.warn("SubmitPlanStore failed to record the accepting server for a submit plan: \(error.localizedDescription)")
         }
     }
 
@@ -104,18 +157,32 @@ actor SubmitPlanStore: SubmitPlanStoring {
             let query = table.filter(txIdColumn == Blob(bytes: txId.bytes))
             guard let row = try connection.pluck(query) else { return nil }
 
+            // The accepting host decides first: once a server has taken the
+            // transaction it is no longer awaiting submission, whatever the
+            // endpoint list says. A row written before this column existed, or
+            // by a path that only marked the transaction awaiting, has none and
+            // keeps the endpoint-driven mapping.
+            let acceptedHost = row[acceptedHostColumn]
+
             let json = row[endpointsColumn]
             guard
                 let data = json.data(using: .utf8),
                 let storedEndpoints = try? JSONDecoder().decode([StoredEndpoint].self, from: data)
             else {
                 // Never silently fall back to an endpoint the user didn't choose:
-                // an undecodable plan behaves as awaiting until pruning removes it.
-                logger.warn("SubmitPlanStore found undecodable endpoints for a plan; treating it as awaiting.")
-                return .awaiting
+                // an undecodable plan behaves as if it listed no endpoints until
+                // pruning removes it. Retrying an empty list is a no-op, so
+                // reporting the acceptance costs nothing.
+                logger.warn("SubmitPlanStore found undecodable endpoints for a plan; ignoring them.")
+                guard let acceptedHost else { return .awaiting }
+                return .ready([], acceptedBy: acceptedHost)
             }
 
-            return storedEndpoints.isEmpty ? .awaiting : .ready(storedEndpoints.map(\.endpoint))
+            let endpoints = storedEndpoints.map(\.endpoint)
+            if let acceptedHost {
+                return .ready(endpoints, acceptedBy: acceptedHost)
+            }
+            return endpoints.isEmpty ? .awaiting : .ready(endpoints, acceptedBy: nil)
         } catch {
             logger.warn("SubmitPlanStore failed to load submit plan: \(error)")
             return .storeUnavailable
@@ -200,7 +267,18 @@ actor SubmitPlanStore: SubmitPlanStoring {
             try connection.run(table.create(ifNotExists: true) { builder in
                 builder.column(txIdColumn, primaryKey: true)
                 builder.column(endpointsColumn, defaultValue: "[]")
+                builder.column(acceptedHostColumn)
             })
+            // `accepted_host` is added by presence check instead of by a schema
+            // version bump on purpose. A nullable added column is backward
+            // compatible: an older SDK build keeps reading and writing this
+            // store, simply ignoring the column. Bumping `user_version` would
+            // instead trip the newer-schema guard above in every older build on
+            // the same device — a TestFlight downgrade or a QA device that
+            // alternates builds would lose submit plans entirely.
+            if try !columnNames(of: connection).contains(Self.acceptedHostColumnName) {
+                try connection.run(table.addColumn(acceptedHostColumn))
+            }
             if schemaVersion < Self.schemaVersion {
                 try connection.run("PRAGMA user_version = \(Self.schemaVersion)")
             }
@@ -211,6 +289,15 @@ actor SubmitPlanStore: SubmitPlanStoring {
             connectionFailed = true
             logger.warn("SubmitPlanStore could not open its database; submit plans are disabled: \(error)")
             return nil
+        }
+    }
+
+    /// The columns the plans table currently has, so an additive column can be
+    /// added once and never a second time — `ADD COLUMN` on a column that is
+    /// already there throws, and that would disable the store for the session.
+    private func columnNames(of connection: Connection) throws -> [String] {
+        try connection.prepare("PRAGMA table_info(\(Self.tableName))").compactMap { row in
+            row[1] as? String
         }
     }
 }

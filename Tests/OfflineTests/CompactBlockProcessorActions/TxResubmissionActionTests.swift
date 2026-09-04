@@ -114,6 +114,35 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "Plan transactions must not use the default endpoint")
     }
 
+    func testAcceptedTransactionIsStillResubmittedThroughItsPlan() async throws {
+        let rawID = Data(repeating: 0x12, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        await submitPlanStore.markAccepted(txId: rawID, host: "x.example.com:1")
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        // A server holding the transaction in its mempool is not a guarantee it
+        // will be mined, so retrying continues exactly as for any ready plan.
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"])
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "Plan transactions must not use the default endpoint")
+    }
+
+    func testResubmissionRecordsTheServerThatAcceptedTheTransaction() async throws {
+        let rawID = Data(repeating: 0x13, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: "a.example.com:443"))
+    }
+
     func testLegacyTransactionUsesDefaultEncoderSubmit() async throws {
         let rawID = Data(repeating: 0x03, count: 32)
         let candidate = makeOverview(rawID: rawID)

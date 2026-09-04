@@ -87,10 +87,15 @@ private extension TxResubmitter {
                 "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()) until it is submitted by the app."
             )
 
-        case .ready(let endpoints):
+        case .ready(let endpoints, _):
+            // An already accepted transaction is resubmitted like any other:
+            // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
-            try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
+            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
+            if let acceptingEndpoint {
+                await submitPlanStore.markAccepted(txId: transaction.rawID, host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)")
+            }
 
         case .storeUnavailable:
             // Whether the app ever submitted this transaction is unknown.

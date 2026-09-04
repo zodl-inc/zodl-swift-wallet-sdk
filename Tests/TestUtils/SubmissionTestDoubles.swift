@@ -336,7 +336,16 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
 
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async {
         guard !endpoints.isEmpty else { return }
-        plans[txId] = StoredSubmitPlan.ready(endpoints)
+        plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: nil)
+    }
+
+    func markAccepted(txId: Data, host: String) async {
+        switch plans[txId] {
+        case .ready(let endpoints, _):
+            plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: host)
+        default:
+            plans[txId] = StoredSubmitPlan.ready([], acceptedBy: host)
+        }
     }
 
     func plan(for txId: Data) async -> StoredSubmitPlan? {

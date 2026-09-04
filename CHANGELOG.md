@@ -32,6 +32,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   react only from attempt 2, or when `gaveUp` is true. A `switch` over `SynchronizerEvent` that is
   exhaustive must handle the new case; matching with `if case` needs no change.
 
+### Submissions
+
+- `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
+  has got with the servers, so a sent transaction can be shown as handed over instead of as still
+  sending for the minutes it waits to be mined. It returns the new `TransactionSubmissionStatus`:
+  `.awaiting` (created, not sent yet), `.submitted` (sent, no server has acknowledged it), or
+  `.accepted(host:)`, whose `host` is the `host:port` of the server that took it into its mempool.
+  `nil` means the SDK has nothing to say — a transaction it never recorded, or a moment when its
+  record cannot be read. The method has a default implementation returning `nil`, so custom
+  `Synchronizer` conformers and test doubles keep compiling unchanged; the same method, and the
+  same default, is on `ClosureSynchronizer` and `CombineSynchronizer`. Acceptance describes
+  submission only, never mining: the SDK keeps resubmitting an accepted transaction until it is
+  mined or expires, exactly as before. The SDK's submit-plan database gained one nullable column
+  to record this; the change is additive and the file stays readable and writable by older SDK
+  builds on the same device.
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:

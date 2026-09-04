@@ -2763,6 +2763,26 @@ class SynchronizerMock: Synchronizer {
         try await deleteAccountClosure!(accountUUID)
     }
 
+    // MARK: - transactionSubmissionStatus
+
+    var transactionSubmissionStatusForCallsCount = 0
+    var transactionSubmissionStatusForCalled: Bool {
+        return transactionSubmissionStatusForCallsCount > 0
+    }
+    var transactionSubmissionStatusForReceivedRawID: Data?
+    var transactionSubmissionStatusForReturnValue: TransactionSubmissionStatus?
+    var transactionSubmissionStatusForClosure: ((Data) async -> TransactionSubmissionStatus?)?
+
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        transactionSubmissionStatusForCallsCount += 1
+        transactionSubmissionStatusForReceivedRawID = rawID
+        if let closure = transactionSubmissionStatusForClosure {
+            return await closure(rawID)
+        } else {
+            return transactionSubmissionStatusForReturnValue
+        }
+    }
+
     // MARK: - migrationAdvanceStep
 
     var migrationAdvanceStepAccountUUIDThrowableError: Error?
