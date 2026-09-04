@@ -70,6 +70,14 @@ final class SDKBroadcaster: Broadcaster {
 
         let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
+
+        // Remember which server took it, so the app can tell "handed to a
+        // server" apart from "still trying" while the transaction waits to be
+        // mined. Retrying continues either way — a mempool is not a commitment.
+        if case .accepted(by: let endpoint) = outcome {
+            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)")
+        }
+
         return outcome
     }
 

@@ -183,6 +183,9 @@ public protocol CombineSynchronizer {
 
     func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error>
 
+    /// Combine counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
+    func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never>
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>

@@ -684,6 +684,10 @@ public class SDKSynchronizer: Synchronizer {
         return try await provider.getLocalAccountBalances()
     }
 
+    public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        await submitPlanStore.plan(for: rawID)?.submissionStatus
+    }
+
     /// Fetches the latest ZEC-USD exchange rate.
     public func refreshExchangeRateUSD() {
         Task {

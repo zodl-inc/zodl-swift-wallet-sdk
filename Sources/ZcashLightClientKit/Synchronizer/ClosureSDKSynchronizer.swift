@@ -286,6 +286,12 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void) {
+        AsyncToClosureGateway.executeAction(completion) {
+            await self.synchronizer.transactionSubmissionStatus(for: rawID)
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }

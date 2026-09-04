@@ -1058,6 +1058,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return try await provider.getLocalAccountBalances()
     }
 
+    public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        await submitPlanStore.plan(for: rawID)?.submissionStatus
+    }
+
     public func listAccounts() async throws -> [Account] {
         try await initializer.rustBackend.listAccounts()
     }

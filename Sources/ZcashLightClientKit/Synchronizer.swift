@@ -112,6 +112,16 @@ public enum SynchronizerEvent {
     case syncStalled(attempt: Int, gaveUp: Bool)
 }
 
+/// Where a transaction this wallet submitted stands with the servers it was sent to.
+public enum TransactionSubmissionStatus: Equatable {
+    /// The transaction is stored but has not been sent to any server yet.
+    case awaiting
+    /// The transaction was sent to at least one server; none has acknowledged it yet.
+    case submitted
+    /// A server accepted the transaction into its mempool. `host` is `host:port`.
+    case accepted(host: String)
+}
+
 /// Primary interface for interacting with the SDK. Defines the contract that specific
 /// implementations like SdkSynchronizer fulfill.
 public protocol Synchronizer: AnyObject {
@@ -684,6 +694,21 @@ public protocol Synchronizer: AnyObject {
     /// Use this to implement custom broadcast strategies such as submitting
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
+
+    /// How far a submitted transaction has got with the servers, so a sent transaction can be
+    /// shown as handed over rather than as still sending while it waits to be mined.
+    ///
+    /// This describes submission only. It says nothing about whether the transaction will be
+    /// mined: acceptance means a server holds it in its mempool, and the SDK keeps resubmitting
+    /// an accepted transaction until it is mined or expires.
+    ///
+    /// - Parameter rawID: The transaction's raw id (`ZcashTransaction.Overview.rawID`,
+    ///   `CreatedTransaction.txId`).
+    /// - Returns: The status, or `nil` when the SDK has nothing to say — a transaction it never
+    ///   recorded (created before this bookkeeping existed, or by another wallet), or a moment
+    ///   when its record cannot be read. Conformers without submission bookkeeping always
+    ///   return `nil`.
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus?
 
     // MARK: - Migration (Orchard -> Ironwood)
     //
@@ -1503,6 +1528,14 @@ public extension Synchronizer {
         nil
     }
 
+    /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is
+    /// not a source-breaking change for downstream conformers. Conformers that keep submission
+    /// bookkeeping override this; mocks, stubs and alternate transports fall through here and
+    /// report that they know nothing about the transaction.
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        nil
+    }
+
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that have
     /// a lightwalletd connection (such as `SDKSynchronizer`) override this;
@@ -1719,6 +1752,14 @@ public extension ClosureSynchronizer {
     var broadcaster: Broadcaster {
         UnimplementedBroadcaster()
     }
+
+    /// Default implementation so adding `transactionSubmissionStatus(for:completion:)` to the
+    /// protocol is not a source-breaking change for downstream conformers. Conformers that keep
+    /// submission bookkeeping override this; the rest report that they know nothing about the
+    /// transaction.
+    func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void) {
+        completion(nil)
+    }
 }
 
 public extension CombineSynchronizer {
@@ -1728,6 +1769,13 @@ public extension CombineSynchronizer {
     /// through to this default and report the feature as unavailable.
     var broadcaster: Broadcaster {
         UnimplementedBroadcaster()
+    }
+
+    /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is
+    /// not a source-breaking change for downstream conformers. Conformers that keep submission
+    /// bookkeeping override this; the rest report that they know nothing about the transaction.
+    func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
+        Just(nil).eraseToAnyPublisher()
     }
 }
 
