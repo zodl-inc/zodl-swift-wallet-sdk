@@ -1585,8 +1585,7 @@ dependencies = [
 [[package]]
 name = "eip681"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3c9c0416f224ce25ea2b710bf8abd4e5e41e41fe8e75685ae1519d5d5d2276"
+source = "git+https://github.com/zcash/librustzcash.git?rev=330e4c0aa9e25199acdb93a56bf70126d0d3f2b9#330e4c0aa9e25199acdb93a56bf70126d0d3f2b9"
 dependencies = [
  "base64",
  "ens-normalize-rs",
@@ -2938,7 +2937,6 @@ dependencies = [
  "cbindgen",
  "cc",
  "cfg-if",
- "eip681",
  "ff",
  "ffi_helpers",
  "fs-mistrust",
@@ -2952,6 +2950,7 @@ dependencies = [
  "once_cell",
  "orchard",
  "pasta_curves",
+ "payment_uri",
  "pczt",
  "prost 0.14.4",
  "rand 0.8.7",
@@ -3658,6 +3657,18 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "payment_uri"
+version = "0.1.0"
+source = "git+https://github.com/zcash/librustzcash.git?rev=330e4c0aa9e25199acdb93a56bf70126d0d3f2b9#330e4c0aa9e25199acdb93a56bf70126d0d3f2b9"
+dependencies = [
+ "bech32",
+ "bs58",
+ "eip681",
+ "percent-encoding",
+ "serde_json",
+]
 
 [[package]]
 name = "pczt"

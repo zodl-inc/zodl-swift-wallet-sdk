@@ -8,6 +8,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
+  internal JSON envelope for SDK bindings.
 - `zcashlc_take_last_error_report`, `zcashlc_free_error_report`, and `FfiErrorReport` expose the
   most recent error as a classified, redacted report. `kind` is an `ErrorKind` discriminant
   (`u32`): `0` is unclassified, `1` scan required, `2` insufficient funds; the remaining values are

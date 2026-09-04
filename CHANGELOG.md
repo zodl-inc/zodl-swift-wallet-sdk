@@ -8,12 +8,30 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `PaymentURIParser` and the typed `PaymentURIRequest` results provide Rust-backed parsing and
+  validation for Bitcoin, Ethereum (EIP-681, native and ERC-20), Litecoin, and Solana payment
+  request URIs, including Solana Pay interactive transaction-request links.
+- `PaymentURIParserError` distinguishes a bad URI (`invalidURI`, `rejected(_:)`) from an
+  SDK/Rust-core mismatch (`unsupportedEnvelope(version:)`, `invalidEnvelope`) and from a parser
+  crash (`parserFailure(_:)`). `PaymentURIRejection` reports which check the Rust parser failed,
+  without carrying any fragment of the caller's input across the FFI.
+- The payment-URI result types expose public initialisers, so consumers can build canned values
+  for tests and dependency doubles.
+
 ### Balances
 
 - `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
   the last account balances stored in the wallet database without chain-tip freshness masking.
   Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
   do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
+
+## Removed
+
+- `ZcashEip681Backend` and the `zcashlc_eip681_*` FFI are gone. `PaymentURIParser` now handles
+  every `ethereum:` URI, so the two parse paths no longer disagree about a request's
+  `schemaPrefix`. This matches the Android SDK, which retired its EIP-681 path in the same way.
+  One behaviour is lost with it: non-`ethereum:` EIP-681 scheme prefixes such as `celo:` are no
+  longer accepted, and a URI's own scheme text is normalised to `"ethereum"`.
 
 ## Changed
 
