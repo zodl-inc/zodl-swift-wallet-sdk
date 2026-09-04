@@ -368,7 +368,7 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 1)
     }
 
-    func test_restoreRecoveredDelegation_refusesABundleCountMismatch() throws {
+    func test_restoreRecoveredDelegation_aFullerPackageExtendsARestoredPrefix() throws {
         let (backend, _) = try openedBackend()
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
@@ -376,10 +376,56 @@ final class VotingRustBackendTests: XCTestCase {
         let open = Opener(hotkey: hotkey, roundId: roundId)
         XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
 
-        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
-            open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
-        ]))
-        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 1)
+        XCTAssertEqual(
+            try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
+                open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
+            ]),
+            .restored
+        )
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 2)
+        XCTAssertEqual(try backend.getDelegationTxHash(roundId: roundId, bundleIndex: 1), recoveredHash(0xAC))
+    }
+
+    func test_restoreRecoveredDelegation_refusesAPackageThatDropsAnAcceptedBundle() throws {
+        let (backend, _) = try openedBackend()
+        defer { backend.close() }
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let roundId = hexRoundId(0x10)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(
+            try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
+                open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
+            ]),
+            .restored
+        )
+
+        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]))
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 2)
+    }
+
+    func test_restoreRecoveredDelegation_aPrefixReplacesRowsNoDelegationAccepted() throws {
+        let (backend, path) = try openedBackend()
+        defer { backend.close() }
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let roundId = hexRoundId(0x11)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(
+            try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
+                open.bundle(0, rand: 0x3A, hash: 0xBB), open.bundle(1, rand: 0x3B, hash: 0xBC), open.bundle(2, rand: 0x3C, hash: 0xBD)
+            ]),
+            .restored
+        )
+        // A rebuild the chain refused: rows without an accepted hash.
+        execute("UPDATE bundles SET delegation_tx_hash = NULL;", on: path)
+
+        XCTAssertEqual(
+            try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
+                open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
+            ]),
+            .restored
+        )
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 2)
+        XCTAssertEqual(try backend.getDelegationTxHash(roundId: roundId, bundleIndex: 0), recoveredHash(0xAB))
     }
 
     func test_restoreRecoveredDelegation_rejectsAWeightBelowOneBallotBeforeTouchingTheDatabase() throws {

@@ -129,6 +129,12 @@ enum Decision {
 
 /// The guards that decide what may be done to the round for this package.
 /// An error names the guard that refused.
+///
+/// Rows the wallet could still use stay: cast votes, delivered shares,
+/// Keystone signatures, and any bundle with an accepted hash that the package
+/// does not restore under the same index and hash. Rows without an accepted
+/// hash were never usable and may go, so the package may be a prefix of what
+/// a failed rebuild left behind, or extend a prefix restored earlier.
 fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Result<Decision> {
     if rows.votes > 0 {
         return Err(anyhow!(
@@ -151,33 +157,28 @@ fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Resu
     if rows.bundles.is_empty() {
         return Ok(Decision::ClearAndImport);
     }
-    if rows.bundles.len() != package.len() {
-        return Err(anyhow!(
-            "round holds {} bundle row(s) but the package describes {}; nothing may be cleared",
-            rows.bundles.len(),
-            package.len()
-        ));
-    }
-    let mut identical = true;
-    for ((index, stored_rand, stored_hash), (package_index, package_rand, package_hash)) in
-        rows.bundles.iter().zip(package)
-    {
-        if index != package_index {
-            return Err(anyhow!(
-                "bundle indices are not contiguous from zero; nothing may be cleared"
-            ));
-        }
-        match stored_hash {
-            Some(hash) if hash != package_hash => {
+    let mut identical = rows.bundles.len() == package.len();
+    for (index, stored_rand, stored_hash) in &rows.bundles {
+        let offered = package
+            .iter()
+            .find(|(offered_index, _, _)| offered_index == index);
+        match (stored_hash, offered) {
+            (Some(_), None) => {
                 return Err(anyhow!(
-                    "bundle {index} carries a different accepted delegation; nothing may be cleared"
+                    "bundle {index} carries an accepted delegation the package does not restore; nothing may be cleared"
                 ));
             }
-            Some(_) => {}
-            None => identical = false,
-        }
-        if stored_rand.as_deref() != Some(package_rand.as_slice()) {
-            identical = false;
+            (Some(hash), Some((_, offered_rand, offered_hash))) => {
+                if hash != offered_hash {
+                    return Err(anyhow!(
+                        "bundle {index} carries a different accepted delegation; nothing may be cleared"
+                    ));
+                }
+                if stored_rand.as_deref() != Some(offered_rand.as_slice()) {
+                    identical = false;
+                }
+            }
+            (None, _) => identical = false,
         }
     }
     Ok(if identical {
@@ -213,10 +214,12 @@ fn van_commitment(
 ///
 /// Validates the package and the round context, checks that each bundle's
 /// blinding and weight open the commitment it carries for the handle's
-/// hotkey, reads what the round holds, refuses unless every row is provably
-/// useless to the wallet (no votes, no shares, no Keystone signatures, no
-/// accepted hash other than the package's), and only then runs `clear_round`
-/// followed by `import_delegation_capability`.
+/// hotkey, reads what the round holds, refuses unless every row the package
+/// does not restore is provably useless to the wallet (no votes, no shares,
+/// no Keystone signatures, no bundle with an accepted hash), and only then
+/// runs `clear_round` followed by `import_delegation_capability`. The package
+/// must be contiguous from bundle zero; it may stop short of what a failed
+/// rebuild left behind, or extend a prefix restored earlier.
 ///
 /// `request_json` is one JSON object: `round_id`, `snapshot_height`, `ea_pk`,
 /// `nc_root`, `nullifier_imt_root` (byte arrays), `vote_chain_id`, `bundles`
@@ -627,5 +630,96 @@ mod tests {
             "{}",
             last_error()
         );
+    }
+
+    /// `(index, blinding tag, accepted hash tag)`; `None` is a NULL column.
+    fn stored(bundles: &[(u32, Option<u8>, Option<u8>)]) -> RoundRows {
+        RoundRows {
+            bundles: bundles
+                .iter()
+                .map(|(index, rand, hash)| {
+                    (
+                        *index,
+                        rand.map(|tag| vec![tag; 32]),
+                        hash.map(|tag| format!("{tag:02x}").repeat(32)),
+                    )
+                })
+                .collect(),
+            votes: 0,
+            shares: 0,
+            keystone_signatures: 0,
+        }
+    }
+
+    fn offered(bundles: &[(u32, u8, u8)]) -> Vec<(u32, [u8; 32], String)> {
+        bundles
+            .iter()
+            .map(|(index, rand, hash)| (*index, [*rand; 32], format!("{hash:02x}").repeat(32)))
+            .collect()
+    }
+
+    #[test]
+    fn the_same_package_is_already_restored() {
+        let rows = stored(&[(0, Some(0x2A), Some(0xAB)), (1, Some(0x2B), Some(0xAC))]);
+        let package = offered(&[(0, 0x2A, 0xAB), (1, 0x2B, 0xAC)]);
+        assert_eq!(decide(&rows, &package).unwrap(), Decision::AlreadyRestored);
+    }
+
+    #[test]
+    fn a_prefix_may_replace_rows_no_delegation_accepted() {
+        let rows = stored(&[
+            (0, Some(0x3A), None),
+            (1, Some(0x3B), None),
+            (2, Some(0x3C), None),
+        ]);
+        let package = offered(&[(0, 0x2A, 0xAB), (1, 0x2B, 0xAC)]);
+        assert_eq!(decide(&rows, &package).unwrap(), Decision::ClearAndImport);
+    }
+
+    #[test]
+    fn a_fuller_package_may_extend_a_restored_prefix() {
+        let rows = stored(&[(0, Some(0x2A), Some(0xAB))]);
+        let package = offered(&[(0, 0x2A, 0xAB), (1, 0x2B, 0xAC)]);
+        assert_eq!(decide(&rows, &package).unwrap(), Decision::ClearAndImport);
+    }
+
+    #[test]
+    fn a_package_that_drops_an_accepted_bundle_is_refused() {
+        let rows = stored(&[(0, Some(0x2A), Some(0xAB)), (1, Some(0x2B), Some(0xAC))]);
+        let package = offered(&[(0, 0x2A, 0xAB)]);
+        let message = decide(&rows, &package).unwrap_err().to_string();
+        assert!(
+            message
+                .contains("bundle 1 carries an accepted delegation the package does not restore"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_different_accepted_hash_is_refused() {
+        let rows = stored(&[(0, Some(0x2A), Some(0xAB))]);
+        let package = offered(&[(0, 0x2A, 0xAD)]);
+        let message = decide(&rows, &package).unwrap_err().to_string();
+        assert!(
+            message.contains("bundle 0 carries a different accepted delegation"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_blinding_under_the_accepted_hash_may_be_restored() {
+        let rows = stored(&[(0, None, Some(0xAB))]);
+        let package = offered(&[(0, 0x2A, 0xAB)]);
+        assert_eq!(decide(&rows, &package).unwrap(), Decision::ClearAndImport);
+    }
+
+    #[test]
+    fn a_cast_vote_is_refused_whatever_the_package() {
+        let mut rows = stored(&[(0, Some(0x3A), None)]);
+        rows.votes = 1;
+        let message = decide(&rows, &offered(&[(0, 0x2A, 0xAB)]))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("cast vote"), "{message}");
     }
 }
