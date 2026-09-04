@@ -670,13 +670,23 @@ public struct RecoveredDelegationBundle: Encodable, Equatable, Sendable, Undescr
     public let totalNoteValue: UInt64
     /// The 32-byte VAN blinding factor.
     public let vanCommRand: [UInt8]
+    /// The 32-byte VAN commitment the recovered row carried. The restore
+    /// refuses a bundle whose blinding and weight do not open it.
+    public let van: [UInt8]
     /// Lowercase hex SHA-256 of the signed delegation transaction.
     public let delegationTxHash: String
 
-    public init(bundleIndex: UInt32, totalNoteValue: UInt64, vanCommRand: [UInt8], delegationTxHash: String) {
+    public init(
+        bundleIndex: UInt32,
+        totalNoteValue: UInt64,
+        vanCommRand: [UInt8],
+        van: [UInt8],
+        delegationTxHash: String
+    ) {
         self.bundleIndex = bundleIndex
         self.totalNoteValue = totalNoteValue
         self.vanCommRand = vanCommRand
+        self.van = van
         self.delegationTxHash = delegationTxHash
     }
 
@@ -684,6 +694,7 @@ public struct RecoveredDelegationBundle: Encodable, Equatable, Sendable, Undescr
         case bundleIndex = "bundle_index"
         case totalNoteValue = "total_note_value"
         case vanCommRand = "van_comm_rand"
+        case van
         case delegationTxHash = "delegation_tx_hash"
     }
 }

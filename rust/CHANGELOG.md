@@ -14,8 +14,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shares, Keystone signatures, or accepted hash other than the package's, and only then clears the
   round and runs `zcash_voting::import_delegation_capability`. Replies `{"outcome":"restored"}` or
   `{"outcome":"already_restored"}` as a boxed slice; null with the error set otherwise.
-  The stored weight becomes the canonical whole-ballot total, as for every capability import;
-  the VAN is unaffected because `construct_van` commits to `num_ballots`.
+  Each bundle carries `van`, the commitment the recovered row held; the call recomputes the
+  VAN from the hotkey, weight and blinding and refuses, before clearing anything, when it
+  differs. The stored weight becomes the canonical whole-ballot total, as for every capability
+  import; the VAN is unaffected because `construct_van` commits to `num_ballots`.
+- `zcashlc_voting_van_commitment` returns the 32-byte VAN commitment a hotkey secret, network,
+  round id, weight and blinding open, as a boxed slice. It is the value the restore recomputes
+  per bundle, exposed so a caller can check a recovered row the same way.
 - `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
   describes, for a network id, so a caller that persisted only the secret can hand the SDK the
   full hotkey again. Free with `zcashlc_voting_free_hotkey`.

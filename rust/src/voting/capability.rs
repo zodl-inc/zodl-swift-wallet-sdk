@@ -15,7 +15,7 @@ use zcash_voting::storage::queries;
 use crate::unwrap_exc_or_null;
 
 use super::db::VotingDatabaseHandle;
-use super::helpers::{bytes_from_ptr, json_to_boxed_slice};
+use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr, voting_network};
 
 /// One bundle of a recovered delegation, as the caller supplies it.
 #[derive(Deserialize)]
@@ -25,6 +25,9 @@ struct RecoveredBundle {
     total_note_value: u64,
     /// The 32-byte VAN blinding factor.
     van_comm_rand: Vec<u8>,
+    /// The 32-byte VAN commitment the row carried. The restore refuses a
+    /// bundle whose blinding and weight do not open it for the handle's hotkey.
+    van: Vec<u8>,
     /// Lowercase hex SHA-256 of the signed delegation transaction.
     delegation_tx_hash: String,
 }
@@ -184,18 +187,41 @@ fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Resu
     })
 }
 
+/// The VAN commitment `hotkey`, `round_id`, `total_note_value` and
+/// `van_comm_rand` open: what the crate stores for a bundle built from them.
+fn van_commitment(
+    hotkey: &voting::VotingHotkey,
+    round_id: &str,
+    total_note_value: u64,
+    van_comm_rand: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let round_bytes = hex::decode(round_id).map_err(|_| anyhow!("round id is not hex"))?;
+    let (g_d_x, pk_d_x) =
+        voting::action::derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address())
+            .map_err(|e| anyhow!("hotkey address is not usable: {e}"))?;
+    voting::governance::construct_van(
+        &g_d_x,
+        &pk_d_x,
+        total_note_value,
+        &round_bytes,
+        van_comm_rand,
+    )
+    .map_err(|e| anyhow!("commitment could not be recomputed: {e}"))
+}
+
 /// Restore a delegation whose secrets were carved out of a wiped database.
 ///
-/// Validates the package and the round context, reads what the round holds,
-/// refuses unless every row is provably useless to the wallet (no votes, no
-/// shares, no Keystone signatures, no accepted hash other than the package's),
-/// and only then runs `clear_round` followed by `import_delegation_capability`,
-/// which recomputes every VAN from the handle's hotkey before writing.
+/// Validates the package and the round context, checks that each bundle's
+/// blinding and weight open the commitment it carries for the handle's
+/// hotkey, reads what the round holds, refuses unless every row is provably
+/// useless to the wallet (no votes, no shares, no Keystone signatures, no
+/// accepted hash other than the package's), and only then runs `clear_round`
+/// followed by `import_delegation_capability`.
 ///
 /// `request_json` is one JSON object: `round_id`, `snapshot_height`, `ea_pk`,
 /// `nc_root`, `nullifier_imt_root` (byte arrays), `vote_chain_id`, `bundles`
-/// (objects with `bundle_index`, `total_note_value`, `van_comm_rand` as a
-/// 32-byte array, `delegation_tx_hash` lowercase hex) and optional
+/// (objects with `bundle_index`, `total_note_value`, `van_comm_rand` and `van`
+/// as 32-byte arrays, `delegation_tx_hash` lowercase hex) and optional
 /// `session_json`. `hotkey_stored_secret` is the material returned as
 /// `FfiVotingHotkey::stored_secret`, passed as raw bytes.
 ///
@@ -258,6 +284,17 @@ pub unsafe extern "C" fn zcashlc_voting_restore_recovered_delegation(
                 bundle.van_comm_rand.as_slice().try_into().map_err(|_| {
                     anyhow!("bundle {} blinding is not 32 bytes", bundle.bundle_index)
                 })?;
+            let van: [u8; 32] = bundle.van.as_slice().try_into().map_err(|_| {
+                anyhow!("bundle {} commitment is not 32 bytes", bundle.bundle_index)
+            })?;
+            let opened = van_commitment(&hotkey, &request.round_id, bundle.total_note_value, &rand)
+                .map_err(|e| anyhow!("bundle {}: {e}", bundle.bundle_index))?;
+            if opened != van {
+                return Err(anyhow!(
+                    "bundle {} does not open its commitment; nothing may be cleared",
+                    bundle.bundle_index
+                ));
+            }
             comparable.push((bundle.bundle_index, rand, bundle.delegation_tx_hash.clone()));
             package_bundles.push(voting::DelegationCapabilityBundleV1 {
                 bundle_index: bundle.bundle_index,
@@ -342,6 +379,46 @@ pub unsafe extern "C" fn zcashlc_voting_restore_recovered_delegation(
     unwrap_exc_or_null(res)
 }
 
+/// The VAN commitment a hotkey, round, weight and blinding open.
+///
+/// `hotkey_stored_secret` is the material `FfiVotingHotkey::stored_secret`
+/// returns; `round_id` is the round's 64-character lowercase hex id;
+/// `van_comm_rand` is the 32-byte blinding. Returns the 32-byte commitment as
+/// a boxed slice, or null with the error set. It is the value
+/// `zcashlc_voting_restore_recovered_delegation` recomputes for each bundle
+/// before it clears anything, so a caller can check a recovered row the same
+/// way.
+///
+/// # Safety
+///
+/// - Every pointer must be valid for its stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_van_commitment(
+    hotkey_stored_secret: *const u8,
+    hotkey_stored_secret_len: usize,
+    network_id: u32,
+    round_id: *const u8,
+    round_id_len: usize,
+    total_note_value: u64,
+    van_comm_rand: *const u8,
+    van_comm_rand_len: usize,
+) -> *mut crate::ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let secret = unsafe { bytes_from_ptr(hotkey_stored_secret, hotkey_stored_secret_len) }?;
+        let round_id = unsafe { str_from_ptr(round_id, round_id_len) }?;
+        let rand = unsafe { bytes_from_ptr(van_comm_rand, van_comm_rand_len) }?;
+        let network = voting_network(network_id)?;
+        let hotkey = voting::VotingHotkey::from_stored_secret(secret, network)
+            .map_err(|e| anyhow!("invalid hotkey secret: {e}"))?;
+        if rand.len() != 32 {
+            return Err(anyhow!("blinding is not 32 bytes"));
+        }
+        let van = van_commitment(&hotkey, &round_id, total_note_value, rand)?;
+        Ok(crate::ffi::BoxedSlice::some(van))
+    });
+    unwrap_exc_or_null(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +432,12 @@ mod tests {
         format!("{tag:02x}{}", "00".repeat(31))
     }
 
-    fn restore_request(round_id: &str, total_note_value: u64, rand: &[u8; 32]) -> String {
+    fn restore_request(
+        round_id: &str,
+        total_note_value: u64,
+        rand: &[u8; 32],
+        van: &[u8],
+    ) -> String {
         serde_json::json!({
             "round_id": round_id,
             "snapshot_height": 123,
@@ -367,6 +449,7 @@ mod tests {
                 "bundle_index": 0,
                 "total_note_value": total_note_value,
                 "van_comm_rand": rand.to_vec(),
+                "van": van.to_vec(),
                 "delegation_tx_hash": "ab".repeat(32),
             }],
         })
@@ -387,7 +470,8 @@ mod tests {
         rand[0] = 0x2A;
         let exact_total: u64 = 13_000_000;
 
-        let request = restore_request(&round_id, exact_total, &rand);
+        let van = van_commitment(&hotkey, &round_id, exact_total, &rand).unwrap();
+        let request = restore_request(&round_id, exact_total, &rand, &van);
         let secret = hotkey.stored_secret().to_vec();
         let reply = unsafe {
             zcashlc_voting_restore_recovered_delegation(
@@ -429,5 +513,119 @@ mod tests {
         );
 
         unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    fn last_error() -> String {
+        ffi_helpers::error_handling::error_message().unwrap_or_default()
+    }
+
+    /// A bundle whose blinding does not open the commitment it carries is
+    /// refused before the round is read or written.
+    #[test]
+    fn a_bundle_that_does_not_open_its_commitment_is_refused() {
+        let db = open_memory_db();
+        let handle = unsafe { &*db };
+        let hotkey = voting::hotkey::generate_random_voting_hotkey(handle.network).unwrap();
+        let round_id = hex_round_id(0x0D);
+        let mut rand = [0u8; 32];
+        rand[0] = 0x2A;
+
+        let request = restore_request(&round_id, 13_000_000, &rand, &[9u8; 32]);
+        let secret = hotkey.stored_secret().to_vec();
+        let reply = unsafe {
+            zcashlc_voting_restore_recovered_delegation(
+                db,
+                request.as_ptr(),
+                request.len(),
+                secret.as_ptr(),
+                secret.len(),
+            )
+        };
+        assert!(reply.is_null());
+        let message = last_error();
+        assert!(
+            message.contains("bundle 0 does not open its commitment; nothing may be cleared"),
+            "{message}"
+        );
+
+        let rounds: i64 = handle
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM rounds WHERE round_id = ?1",
+                params![round_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rounds, 0);
+
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    fn van_commitment_ffi(
+        hotkey: &voting::VotingHotkey,
+        round_id: &str,
+        total_note_value: u64,
+        rand: &[u8],
+    ) -> Option<Vec<u8>> {
+        let secret = hotkey.stored_secret().to_vec();
+        let reply = unsafe {
+            zcashlc_voting_van_commitment(
+                secret.as_ptr(),
+                secret.len(),
+                crate::NETWORK_ID_TESTNET,
+                round_id.as_ptr(),
+                round_id.len(),
+                total_note_value,
+                rand.as_ptr(),
+                rand.len(),
+            )
+        };
+        if reply.is_null() {
+            return None;
+        }
+        let van = unsafe { (*reply).as_slice() }.to_vec();
+        unsafe { zcashlc_free_boxed_slice(reply) };
+        Some(van)
+    }
+
+    /// The exported commitment is the one `construct_van` yields for the
+    /// hotkey's address.
+    #[test]
+    fn van_commitment_ffi_matches_construct_van() {
+        let hotkey =
+            voting::hotkey::generate_random_voting_hotkey(voting::Network::Testnet).unwrap();
+        let round_id = hex_round_id(0x0E);
+        let mut rand = [0u8; 32];
+        rand[0] = 0x2B;
+
+        let van = van_commitment_ffi(&hotkey, &round_id, 25_000_000, &rand).expect("commitment");
+
+        let (g_d_x, pk_d_x) =
+            voting::action::derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address())
+                .unwrap();
+        let expected = voting::governance::construct_van(
+            &g_d_x,
+            &pk_d_x,
+            25_000_000,
+            &hex::decode(&round_id).unwrap(),
+            &rand,
+        )
+        .unwrap();
+        assert_eq!(van, expected);
+    }
+
+    #[test]
+    fn van_commitment_ffi_rejects_a_weight_below_one_ballot() {
+        let hotkey =
+            voting::hotkey::generate_random_voting_hotkey(voting::Network::Testnet).unwrap();
+        let round_id = hex_round_id(0x0F);
+
+        assert!(van_commitment_ffi(&hotkey, &round_id, 1, &[0x2C; 32]).is_none());
+        assert!(
+            last_error().contains("at least 1 ballot"),
+            "{}",
+            last_error()
+        );
     }
 }

@@ -1554,6 +1554,38 @@ extension VotingRustBackend {
         return votingHotkey(from: ptr)
     }
 
+    /// The VAN commitment `hotkey`, `roundId`, `totalNoteValue` and
+    /// `vanCommRand` open. It is the value `restoreRecoveredDelegation`
+    /// recomputes for each bundle before it clears anything, so a caller can
+    /// check a recovered row the same way.
+    public static func vanCommitment(
+        hotkey: VotingHotkey,
+        networkId: UInt32,
+        roundId: String,
+        totalNoteValue: UInt64,
+        vanCommRand: [UInt8]
+    ) throws -> [UInt8] {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        return try staticBoxedSliceFFI(fallback: "`van_commitment` failed") {
+            hotkey.storedSecret.withUnsafeBufferPointer { secret in
+                roundIdBytes.withUnsafeBufferPointer { round in
+                    vanCommRand.withUnsafeBufferPointer { rand in
+                        zcashlc_voting_van_commitment(
+                            secret.baseAddress,
+                            UInt(secret.count),
+                            networkId,
+                            round.baseAddress,
+                            UInt(round.count),
+                            totalNoteValue,
+                            rand.baseAddress,
+                            UInt(rand.count)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     /// Copies an `FfiVotingHotkey` into Swift-owned memory. The caller frees
     /// the Rust allocation.
     private static func votingHotkey(from ptr: UnsafeMutablePointer<FfiVotingHotkey>) -> VotingHotkey {

@@ -19,6 +19,40 @@ private func hexRoundId(_ tag: UInt8) -> String {
 }
 
 private let roundTripWalletId = "test-wallet"
+
+private func recoveredBlinding(_ tag: UInt8) -> [UInt8] {
+    var rand = [UInt8](repeating: 0, count: votingFieldElementByteCount)
+    rand[0] = tag
+    return rand
+}
+
+private func recoveredHash(_ tag: UInt8) -> String {
+    String(repeating: String(format: "%02x", tag), count: 32)
+}
+
+/// Builds bundles the way a carve finds them: each carries the commitment
+/// its blinding opens for `hotkey` in `roundId`.
+private struct Opener {
+    let hotkey: VotingHotkey
+    let roundId: String
+
+    func bundle(_ index: UInt32, rand: UInt8, hash: UInt8) throws -> RecoveredDelegationBundle {
+        let blinding = recoveredBlinding(rand)
+        return RecoveredDelegationBundle(
+            bundleIndex: index,
+            totalNoteValue: roundTripEligibleNoteValue,
+            vanCommRand: blinding,
+            van: try VotingRustBackend.vanCommitment(
+                hotkey: hotkey,
+                networkId: roundTripNetworkId,
+                roundId: roundId,
+                totalNoteValue: roundTripEligibleNoteValue,
+                vanCommRand: blinding
+            ),
+            delegationTxHash: recoveredHash(hash)
+        )
+    }
+}
 private let roundTripRoundId = hexRoundId(0x01)
 /// A well-formed round identifier that is never initialized, for tests that
 /// exercise lookups against a round the database does not know about.
@@ -208,25 +242,6 @@ final class VotingRustBackendTests: XCTestCase {
 
     // MARK: - restoreRecoveredDelegation
 
-    private func recoveredBlinding(_ tag: UInt8) -> [UInt8] {
-        var rand = [UInt8](repeating: 0, count: votingFieldElementByteCount)
-        rand[0] = tag
-        return rand
-    }
-
-    private func recoveredHash(_ tag: UInt8) -> String {
-        String(repeating: String(format: "%02x", tag), count: 32)
-    }
-
-    private func bundle(_ index: UInt32, rand: UInt8, hash: UInt8) -> RecoveredDelegationBundle {
-        RecoveredDelegationBundle(
-            bundleIndex: index,
-            totalNoteValue: roundTripEligibleNoteValue,
-            vanCommRand: recoveredBlinding(rand),
-            delegationTxHash: recoveredHash(hash)
-        )
-    }
-
     private func restore(
         _ backend: VotingRustBackend,
         roundId: String,
@@ -289,9 +304,10 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x05)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
 
         let result = try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
-            bundle(0, rand: 0x2A, hash: 0xAB), bundle(1, rand: 0x2B, hash: 0xAC)
+            open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
         ])
 
         XCTAssertEqual(result, .restored)
@@ -305,7 +321,8 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x06)
-        let bundles = [bundle(0, rand: 0x2A, hash: 0xAB)]
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        let bundles = try [open.bundle(0, rand: 0x2A, hash: 0xAB)]
 
         XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: bundles), .restored)
         XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: bundles), .alreadyRestored)
@@ -317,9 +334,10 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x07)
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
 
-        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2C, hash: 0xAD)]))
+        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2C, hash: 0xAD)]))
         XCTAssertEqual(try backend.getDelegationTxHash(roundId: roundId, bundleIndex: 0), recoveredHash(0xAB))
     }
 
@@ -328,11 +346,12 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x09)
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
         // A rebuild that re-set up the row over the accepted delegation.
         execute("UPDATE bundles SET van_comm_rand = X'2C" + String(repeating: "00", count: 31) + "' WHERE bundle_index = 0;", on: path)
 
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
     }
 
     func test_restoreRecoveredDelegation_refusesARoundWithAVote() throws {
@@ -340,11 +359,12 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x0A)
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
         execute("UPDATE bundles SET delegation_tx_hash = NULL WHERE bundle_index = 0;", on: path)
         execute("INSERT INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, created_at) VALUES ('\(roundId)', '\(roundTripWalletId)', 0, 1, 0, 1);", on: path)
 
-        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2D, hash: 0xAE)]))
+        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2D, hash: 0xAE)]))
         XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 1)
     }
 
@@ -353,10 +373,11 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x0B)
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
 
         XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
-            bundle(0, rand: 0x2A, hash: 0xAB), bundle(1, rand: 0x2B, hash: 0xAC)
+            open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
         ]))
         XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 1)
     }
@@ -366,12 +387,73 @@ final class VotingRustBackendTests: XCTestCase {
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
         let roundId = hexRoundId(0x0C)
-        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
 
         XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
-            RecoveredDelegationBundle(bundleIndex: 0, totalNoteValue: 1, vanCommRand: recoveredBlinding(0x2A), delegationTxHash: recoveredHash(0xAB))
+            RecoveredDelegationBundle(
+                bundleIndex: 0,
+                totalNoteValue: 1,
+                vanCommRand: recoveredBlinding(0x2A),
+                van: [UInt8](repeating: 0, count: votingFieldElementByteCount),
+                delegationTxHash: recoveredHash(0xAB)
+            )
         ]))
         XCTAssertEqual(try backend.getDelegationTxHash(roundId: roundId, bundleIndex: 0), recoveredHash(0xAB))
+    }
+
+    func test_restoreRecoveredDelegation_refusesABundleThatDoesNotOpenItsCommitment() throws {
+        let (backend, _) = try openedBackend()
+        defer { backend.close() }
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let roundId = hexRoundId(0x0D)
+        let open = Opener(hotkey: hotkey, roundId: roundId)
+        XCTAssertEqual(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [open.bundle(0, rand: 0x2A, hash: 0xAB)]), .restored)
+        let genuine = try open.bundle(0, rand: 0x2C, hash: 0xAB)
+        let forged = RecoveredDelegationBundle(
+            bundleIndex: genuine.bundleIndex,
+            totalNoteValue: genuine.totalNoteValue,
+            vanCommRand: genuine.vanCommRand,
+            van: [UInt8](repeating: 0x09, count: votingFieldElementByteCount),
+            delegationTxHash: genuine.delegationTxHash
+        )
+
+        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [forged])) { error in
+            XCTAssertTrue("\(error)".contains("does not open its commitment"), "\(error)")
+        }
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 1)
+    }
+
+    func test_vanCommitment_dependsOnTheBlinding() throws {
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+        let roundId = hexRoundId(0x0E)
+        let commit = { (rand: UInt8) throws -> [UInt8] in
+            try VotingRustBackend.vanCommitment(
+                hotkey: hotkey,
+                networkId: roundTripNetworkId,
+                roundId: roundId,
+                totalNoteValue: roundTripEligibleNoteValue,
+                vanCommRand: recoveredBlinding(rand)
+            )
+        }
+
+        XCTAssertEqual(try commit(0x2A).count, votingFieldElementByteCount)
+        XCTAssertEqual(try commit(0x2A), try commit(0x2A))
+        XCTAssertNotEqual(try commit(0x2A), try commit(0x2B))
+    }
+
+    func test_vanCommitment_rejectsAWeightBelowOneBallot() throws {
+        let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
+
+        XCTAssertThrowsError(
+            try VotingRustBackend.vanCommitment(
+                hotkey: hotkey,
+                networkId: roundTripNetworkId,
+                roundId: hexRoundId(0x0F),
+                totalNoteValue: 1,
+                vanCommRand: recoveredBlinding(0x2A)
+            )
+        )
     }
 
     // MARK: - requireHandle gating
