@@ -15,6 +15,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
   do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
+### Spendable balance masking
+
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in
+  `accountsBalances` is currently masked because the engine has not yet confirmed a fresh chain
+  tip — the only signal that separates "the wallet cannot spend this" from "the SDK is not
+  willing to say yet," which a zero balance alone cannot express (an empty wallet, funds still
+  confirming, and a masked balance all read as zero). It clears as soon as the tip refreshes, so a
+  client can safely drive a "working it out" affordance from it. The property is additive: the
+  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
+  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
+  without reporting it here.
+
 ### Sync stalls
 
 - `SynchronizerEvent.syncStalled(attempt:gaveUp:)` reports a sync pass that made no progress for the

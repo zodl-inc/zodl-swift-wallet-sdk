@@ -262,6 +262,27 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
     }
 
+    /// True while the [#1591] stale-tip mask is zeroing spendable — surfaced to clients as
+    /// `SynchronizerState.isSpendableMasked`, which is the only signal that separates "cannot
+    /// spend" from "not willing to say yet". Written wherever the unified summary is taken, read
+    /// when emitting state; mirrors `currentlyRecovering` above, including its transition logging.
+    private var currentlySpendableMasked = false {
+        didSet {
+            // Both edges are logged, so the mask window can be measured straight off the log —
+            // and a stall shows up as an APPLIED with no LIFTED after it. Transition-only: the
+            // mask is re-evaluated per poll tick, so logging every evaluation would bury it.
+            guard currentlySpendableMasked != oldValue else { return }
+            initializer.logger.info(
+                currentlySpendableMasked
+                    ? "[#1591] stale-tip mask APPLIED — spendable hidden until the tip refreshes"
+                    : "[#1591] stale-tip mask LIFTED — spendable is authoritative again",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+        }
+    }
+
     // [v2.1 E-5] `forceCounterProgressUntilDone` is GONE: the ENGINE re-baselines its
     // session progress floor when the scan scope expands (an import with an older birthday,
     // a rewind), so the blessed `progressPermille` reads the re-scan as a genuine climb by
@@ -383,7 +404,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
             accountsBalances: summary?.accountBalances ?? [:],
             localAccountsBalances: summaries.local ?? [:],
             fullyScannedHeight: summary?.fullyScannedHeight,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: currentlySpendableMasked
         ))
         return .success
     }
@@ -436,7 +458,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [v2.1 E-3] Warm start emission straight off the truthful snapshot: the engine
         // seeded the permille floor / recovery flag / persisted tip at open(), so a
         // cold-launch catch-up reads its real near-100% position (never 0%) with no
-        // summary math. Balances carry over from prepare()'s emission.
+        // summary math. Balances, and the mask flag describing them, carry over from
+        // prepare()'s emission — read from `latestState` rather than `currentlySpendableMasked`,
+        // which the reentrant actor may have already moved past this snapshot's balances (e.g. a
+        // concurrent `getAccountsBalances()` call between the `await` above and here).
         let snap = await engine.snapshot()
         currentlyRecovering = snap?.isRecovering == 1
         stateSubject.send(SynchronizerState(
@@ -449,7 +474,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
             ),
             latestBlockHeight: (snap?.chainTip).flatMap { $0 != 0 ? BlockHeight($0) : nil }
                 ?? latestState.latestBlockHeight,
-            isRecovering: currentlyRecovering
+            isRecovering: currentlyRecovering,
+            isSpendableMasked: latestState.isSpendableMasked
         ))
     }
 
@@ -506,7 +532,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 accountsBalances: latestState.accountsBalances,
                 localAccountsBalances: latestState.localAccountsBalances,
                 internalSyncStatus: .stopped,
-                latestBlockHeight: latestState.latestBlockHeight
+                latestBlockHeight: latestState.latestBlockHeight,
+                // Balances carry over verbatim here, so their masked-ness must carry with them
+                // rather than silently reading as authoritative.
+                isSpendableMasked: latestState.isSpendableMasked
             ))
         }
         // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
@@ -537,7 +566,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
             accountsBalances: latestState.accountsBalances,
             localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: status,
-            latestBlockHeight: latestState.latestBlockHeight
+            latestBlockHeight: latestState.latestBlockHeight,
+            // Status-only transition: the balances are the previous ones, so their masked-ness is too.
+            isSpendableMasked: latestState.isSpendableMasked
         ))
     }
 
@@ -669,7 +700,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 internalSyncStatus: .synced,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
-                isRecovering: recovering
+                isRecovering: recovering,
+                isSpendableMasked: currentlySpendableMasked
             ))
             // Fall through to foundTransactions emission below (still needed on Done).
         } else if snap.state == 1 {
@@ -687,7 +719,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 internalSyncStatus: .syncing(surfacedProgress, spendable),
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
-                isRecovering: recovering
+                isRecovering: recovering,
+                isSpendableMasked: currentlySpendableMasked
             ))
             // [v2.1 Phase 2] The F2 boundary refresh lives in the ENGINE now: the unified
             // summary refreshes itself (in a background thread) when ranges_completed moves,
@@ -712,7 +745,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 internalSyncStatus: newStatus,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: fullyScannedHeight,
-                isRecovering: recovering
+                isRecovering: recovering,
+                isSpendableMasked: currentlySpendableMasked
             ))
         }
 
@@ -907,7 +941,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 internalSyncStatus: .error(error),
                 latestBlockHeight: latestState.latestBlockHeight,
                 fullyScannedHeight: latestState.fullyScannedHeight,
-                isRecovering: currentlyRecovering
+                isRecovering: currentlyRecovering,
+                // Balances carry over verbatim here too, so their masked-ness must carry with them —
+                // same reasoning as `stopImpl`'s `.stopped` emission above.
+                isSpendableMasked: latestState.isSpendableMasked
             ))
         }
     }
@@ -1037,8 +1074,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         guard let summary else { return (nil, local) }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
+            currentlySpendableMasked = true
             return (summary.withSpendableMasked(), local)
         }
+        currentlySpendableMasked = false
         return (summary, local)
     }
 
