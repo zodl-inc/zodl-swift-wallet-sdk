@@ -15,6 +15,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
   do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
+### Sync stalls
+
+- `SynchronizerEvent.syncStalled(attempt:gaveUp:)` reports a sync pass that made no progress for the
+  stall window. The Slipstream synchronizer no longer merely logs such a pass — it restarts it, up to
+  3 times per engine handle, and reopens the endpoint already in use rather than moving the user to
+  another server. Three restarts have two waits between them: the SDK waits at least 60 seconds
+  before the second and at least 120 before the third. In practice the observed gap is about 120
+  seconds throughout, because a restarted pass cannot be seen to stall again until the 120-second
+  stall window of the new pass has elapsed. The event is emitted before each restart begins
+  (`gaveUp == false`, `attempt` 1-based), and once more when the SDK stops trying
+  (`gaveUp == true`) — because the cap is reached, or because a restart could not bring the pass
+  back up at all, which additionally moves the sync status to `.error`. The budget belongs to the
+  handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each hand the next handle a fresh one. An
+  app that surfaces connection trouble can treat `attempt: 1` as the SDK reconnecting by itself and
+  react only from attempt 2, or when `gaveUp` is true. A `switch` over `SynchronizerEvent` that is
+  exhaustive must handle the new case; matching with `if case` needs no change.
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:

@@ -110,9 +110,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // Detects the silent-freeze failure mode (field, 2026-06-12): state stuck at
     // Syncing while NO engine counter moves — the sync task hung (transport stall)
     // or died (panic — now also surfaced by the Rust-side B1 supervisor). The
-    // watchdog only LOGS (Logger.error, once per stall episode); it never restarts
-    // anything. The stall FACT is engine-owned (`snap.stalledSeconds`, Phase D) —
-    // Swift keeps only the once-per-episode log policy. Methods live in
+    // watchdog LOGS (Logger.error, once per stall episode) and reports the stall to
+    // the poll loop, which restarts the pass under the bounded policy below
+    // ([MOB-1850]). The stall FACT is engine-owned (`snap.stalledSeconds`, Phase D) —
+    // Swift keeps the once-per-episode log policy and the recovery policy. Methods live in
     // SlipstreamSynchronizer+StallWatchdog.swift; the pure predicate is
     // `isSyncStalled` (+PureHelpers.swift). State is `internal` (not private) so
     // the extension file can reach it.
@@ -133,6 +134,62 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// ~36 s (iPad A10 worst chunk), so 120 s is comfortably out of reach for a
     /// healthy sync. `internal` so tests can reference the constant.
     static let stallWatchdogThresholdSeconds: TimeInterval = 120
+
+    // ── [MOB-1850] Stall recovery: restart the pass, don't only log it ─────────
+    // The watchdog above proved the failure mode is real and self-inflicted damage is not: a
+    // stalled pass is a dead transport, and re-opening the engine handle against the same
+    // endpoint fixes it. So the SDK now restarts the pass itself rather than leaving every host
+    // to reimplement the same recovery. The restart is bounded on both axes — a cap per handle
+    // and a doubling wait between attempts (the pure policy is `stallRecoveryDecision`) — because
+    // the poll loop re-decides every 2 s and the stall fact stays true across ticks.
+    //
+    // A `.syncStalled` event accompanies every decision so the host can see what the SDK is
+    // doing: attempt 1 is the SDK reconnecting uncontested, later attempts say the reconnect is
+    // not sticking, and the give-up event says the SDK has stopped trying.
+
+    /// How many times a stalled pass may be restarted before the SDK gives up for this handle.
+    /// The budget is per HANDLE, so a `switchTo`, a `wipe` or an app-driven `start()` hands the
+    /// new handle a fresh one — a different server deserves its own three chances.
+    /// `internal` so tests can reference the constant, like `stallWatchdogThresholdSeconds`.
+    static let maxStallRestartsPerHandle = 3
+    /// The first backoff window after a recovery restart; it doubles per attempt. Three restarts
+    /// have exactly two waits between them, so with the shipped cap the SDK waits at least 60 and
+    /// then at least 120 seconds — the doubling never reaches a third window.
+    ///
+    /// "At least", because with the shipped constants the window is a floor rather than the
+    /// binding constraint: a restart re-stamps `watchdogHandleStartedAt`, so the new pass cannot
+    /// even be OBSERVED to stall until `stallWatchdogThresholdSeconds` (120 s) of its life have
+    /// elapsed — at least as long as either reachable window. The cadence a field log shows is
+    /// therefore ~120 s throughout, not 60 s and then 120 s. The floor is kept because it is the
+    /// only bound that does not depend on the watchdog's threshold: it is what keeps a stall the
+    /// SDK cannot fix from being met with one restart per 2 s poll tick, whatever that threshold
+    /// becomes.
+    static let stallRestartBackoffBase: TimeInterval = 60
+
+    /// Recovery restarts already performed for the current handle. Reset with the watchdog
+    /// whenever the handle changes (`switchTo`, `wipe`, an app-driven `start()`), NOT by the
+    /// `start()` the recovery itself performs — see `resetStallWatchdog(resetRecoveryBudget:)`.
+    private var stallRestartAttempts = 0
+    /// When the last recovery restart fired, or nil while this handle has never been restarted
+    /// (which is what makes the first restart immediate). Feeds the backoff window.
+    private var lastStallRestartAt: Date?
+    /// Whether the give-up event has been sent for this handle. Deliberately INDEPENDENT of
+    /// `watchdogStallLogged`, which re-arms the moment any counter moves: a pass that flickers
+    /// back to life for one tick and stalls again must not re-announce the give-up on every
+    /// subsequent tick, because the budget it exhausted is still exhausted.
+    private var stallGaveUpReported = false
+    /// Whether a recovery restart is in flight. Guards against a second restart being spawned by
+    /// the next poll tick, and tells `start()` that the budget it is about to reset is the budget
+    /// funding the very restart calling it.
+    private var stallRecoveryInFlight = false
+    /// Bumped by every path that stops the engine from OUTSIDE the recovery — an external
+    /// `stop()`, `switchTo`, `wipe`, an account import or delete, a rewind. They all stop through
+    /// `stopEngineOutsideRecovery()`, which is where the rule is enforced, so a new caller cannot
+    /// miss it. The recovery restart captures the value before its own `engine.stop()` and
+    /// re-checks it after each suspension point: a changed generation means someone else took the
+    /// engine down in the meantime, and resurrecting it would either undo a deliberate stop or
+    /// interleave a second reopen/start with a switch.
+    private var stopGeneration = 0
 
     // ── [#1975] Background transaction resubmission ────────────────────────────
     // Parity with the old pipeline's `TxResubmissionAction`, which ran once per sync pass:
@@ -364,8 +421,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // the FFI start() captures the refresh baseline and keeps freshness across a <120 s
         // stop→start hop — the SDKFlags.sdkStarted()/chainTipAtRunStart parity machinery
         // this block used to carry is deleted.
-        // B4: a new run starts with a fresh stall-watchdog window.
-        resetStallWatchdog()
+        // B4: a new run starts with a fresh stall-watchdog window. [MOB-1850] The recovery
+        // BUDGET only resets when the app is starting a run of its own: the stall recovery
+        // restarts the pass by calling this very method, and letting that call clear the
+        // attempt count would make the cap unreachable and the restart loop unbounded.
+        resetStallWatchdog(resetRecoveryBudget: !stallRecoveryInFlight)
         // TODO: [#1755] Consider passing ufvk=Some after T4.4 integration tests confirm
         //   idempotency. Current strategy: ufvk=nil (keyless) since prepare() already
         //   imported the account and stored its birthday treestate.
@@ -410,6 +470,21 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
     }
 
+    /// [MOB-1850] Stops the engine on behalf of a path that is NOT the stall recovery, retiring
+    /// the generation an in-flight recovery captured.
+    ///
+    /// Every such path must stop the engine through here. The recovery restart re-checks
+    /// `stopGeneration` around its own teardown, its reopen and its `start()`, and a stop that
+    /// does not bump the counter is invisible to those checks — the recovery would then reopen and
+    /// restart the engine underneath a deliberate stop, a server switch, a wipe, an account
+    /// import or delete, or a rewind, which is the exact interleaving the counter exists to
+    /// prevent. `restartHandleForRecovery` is the one caller that stops the engine directly,
+    /// because it owns the generation rather than competing with it.
+    private func stopEngineOutsideRecovery() async {
+        stopGeneration += 1
+        await engine.stop()
+    }
+
     /// The actor-isolated body of `stop()`.
     private func stopImpl() async {
         isRunning = false
@@ -436,7 +511,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
         // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
         // moment, and a start() more than 120 s later re-masks via snapshot.tipFresh (E-2).
-        await engine.stop()
+        // [MOB-1850] Through the helper: a deliberate stop retires the generation an in-flight
+        // stall recovery captured, so the restart abandons rather than resurrecting a
+        // synchronizer the app has just stopped (a backgrounded wallet, say).
+        await stopEngineOutsideRecovery()
     }
 
     /// Test-only seam: overrides `latestState`'s `internalSyncStatus` directly, without touching the
@@ -506,7 +584,44 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ = await engine.drainEvents()
 
         // B4: surface silent stalls (state==Syncing, zero counter movement) loudly.
-        checkStallWatchdog(snap)
+        // [MOB-1850] And act on them: the watchdog reports the fact, the pure policy decides
+        // whether this tick restarts the pass, waits out a backoff window, or has run out of
+        // budget, and the branches below carry that decision out.
+        let stalled = checkStallWatchdog(snap)
+        let decision = Self.stallRecoveryDecision(
+            isStalled: stalled,
+            attemptsSoFar: stallRestartAttempts,
+            maxAttempts: Self.maxStallRestartsPerHandle,
+            secondsSinceLastRestart: lastStallRestartAt.map { Date().timeIntervalSince($0) },
+            backoffBase: Self.stallRestartBackoffBase
+        )
+        switch decision {
+        case .restart(let attempt):
+            // One restart at a time: the poll loop re-decides every 2 s and `stopPolling()` inside
+            // the restart only takes effect once this tick yields, so without the gate a second
+            // tick could spawn a second teardown against the same handle.
+            if !stallRecoveryInFlight {
+                stallRecoveryInFlight = true
+                // Emitted BEFORE the restart begins, so `attempt: 1` reads as "the SDK is
+                // reconnecting now" rather than as a report of something already over.
+                eventSubject.send(.syncStalled(attempt: attempt, gaveUp: false))
+                // A FRESH task, never inline: the restart's first act is `stopPolling()`, which
+                // cancels the very `pollTask` this tick is running on, and the teardown that
+                // follows would then be running inside a cancelled task.
+                let generation = stopGeneration
+                Task { await self.restartHandleForRecovery(expectedStopGeneration: generation) }
+            }
+        case .giveUp:
+            // Once per handle. `watchdogStallLogged` cannot stand in for this: it re-arms the
+            // moment any counter moves, so a pass that twitches and stalls again would re-announce
+            // a give-up whose budget is still, and permanently, spent.
+            if !stallGaveUpReported {
+                stallGaveUpReported = true
+                eventSubject.send(.syncStalled(attempt: stallRestartAttempts, gaveUp: true))
+            }
+        case .none:
+            break
+        }
 
         // [v2.1 Phase 2] ONE summary source, refreshed every tick: the engine rations the
         // walk internally (E-1), so this is a cached serve on non-boundary ticks and carries
@@ -620,6 +735,180 @@ public actor SlipstreamSynchronizer: Synchronizer {
             lastRevealRecovering = recovering
             let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
             eventSubject.send(.foundTransactions(txs, nil))
+        }
+    }
+
+    /// [MOB-1850] Clears the per-handle stall-recovery budget. Called from
+    /// `resetStallWatchdog(resetRecoveryBudget:)` in the watchdog extension, which cannot reach
+    /// these `private` counters itself.
+    func resetStallRecoveryBudget() {
+        stallRestartAttempts = 0
+        lastStallRestartAt = nil
+        stallGaveUpReported = false
+    }
+
+    /// [MOB-1850] Restarts a stalled sync pass: tear the pass down, reopen the engine handle
+    /// against the SAME endpoint, and start again.
+    ///
+    /// The endpoint is deliberately unchanged. A stall is a dead transport — the connection the
+    /// engine holds stopped delivering while the engine still believes it is syncing — and a fresh
+    /// handle against the same server fixes it. Choosing a different server is a separate decision
+    /// with its own policy (`switchTo`, driven by the host's benchmark), and making it here would
+    /// silently move a user off their configured server on a transient network glitch.
+    ///
+    /// Runs in a task of its own, never inline in `tickPoll`: its first act is `stopPolling()`,
+    /// which cancels the very `pollTask` a tick runs on, so the teardown that follows would
+    /// otherwise be executing inside an already-cancelled task.
+    ///
+    /// - Parameter expectedStopGeneration: `stopGeneration` as it stood when the poll loop decided
+    ///   to restart. Every stop that is not this recovery's own goes through
+    ///   `stopEngineOutsideRecovery()` and bumps that counter, and this method re-checks it after
+    ///   each of its suspension points — its own teardown, its reopen, and the `start()` it ends
+    ///   with. A changed value means another path took the engine down mid-restart, and carrying
+    ///   on would either resurrect a synchronizer the app deliberately stopped or race a second
+    ///   reopen against the one that path is already performing.
+    ///
+    /// `internal` (not `private`) so `@testable` tests can drive the restart directly, the way
+    /// `maybeRunTxResubmission` and `setInternalSyncStatusForTesting` are reachable: the only
+    /// production caller is `tickPoll`, and a tick needs an engine snapshot, which needs a live
+    /// FFI handle and therefore a real sync pass. Without the seam the whole failure half of this
+    /// method — the half that decides whether a host is told anything at all — is untestable.
+    func restartHandleForRecovery(expectedStopGeneration: Int) async {
+        // Whatever happens below — abort, failed reopen, failed start — the gate must reopen, or
+        // no later stall of this handle could ever be recovered.
+        defer { stallRecoveryInFlight = false }
+
+        stopPolling()
+        isRunning = false
+        await engine.stop()
+
+        guard stopGeneration == expectedStopGeneration else {
+            initializer.logger.info(
+                "[slipstream] stall recovery abandoned: the engine was stopped by another path while the restart was in flight",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+            return
+        }
+
+        do {
+            try await engine.reopen(server: currentEndpoint, network: initializer.network)
+        } catch {
+            // A reopen that failed still spent an attempt. Not counting it would leave the backoff
+            // unarmed and the cap unreachable, so an endpoint that cannot be reopened at all would
+            // be retried on every poll tick for as long as the app stays in the foreground.
+            stallRestartAttempts += 1
+            lastStallRestartAt = Date()
+            initializer.logger.error(
+                "[slipstream] stall recovery could not reopen the engine handle: \(error.localizedDescription)",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+            // This is the end of the road, so it must be announced here — see
+            // `reportStallRecoveryStopped(error:)` for why silence would strand the host.
+            reportStallRecoveryStopped(error: error)
+            return
+        }
+
+        // The reopen was a suspension point, so re-check before touching any per-handle state: the
+        // counters below belong to the handle this recovery owns, and another path that stopped or
+        // switched in the meantime has already reset them for a handle of its own.
+        guard stopGeneration == expectedStopGeneration else {
+            initializer.logger.info(
+                "[slipstream] stall recovery abandoned after reopen: another path claimed the engine",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+            return
+        }
+
+        // The new handle's engine-side counters start at zero, so the emission mirrors must too —
+        // otherwise the first tick of the new pass reads the reset `txSetVersion` as "unchanged".
+        lastTxSetVersion = 0
+        lastRevealRecovering = false
+        // Re-arm the log and the handle-lifetime clamp for the new pass, but KEEP the recovery
+        // budget: it is what bounds this very restart, and `start()` below would otherwise clear
+        // it through the zero-argument re-arm.
+        resetStallWatchdog(resetRecoveryBudget: false)
+        stallRestartAttempts += 1
+        lastStallRestartAt = Date()
+
+        do {
+            try await start(retry: false)
+            // `start()` awaits the `pendingStop` chain and only then starts the engine, so a
+            // `stop()` registered after that await runs concurrently with the rest of `start()`
+            // and can have its teardown overtaken by the fresh pass — a pre-existing shape of the
+            // `pendingStop` ordering contract that the recovery inherits by calling `start()`.
+            // The generation makes that visible after the fact, and stopping again through the
+            // public `stop()` (which queues in `pendingStop` like any other stop) settles it for
+            // the recovery path: a user who backgrounded the wallet mid-restart stays stopped.
+            if stopGeneration != expectedStopGeneration {
+                initializer.logger.info(
+                    "[slipstream] stall recovery started a pass that a concurrent stop had already claimed — stopping it again",
+                    file: #file,
+                    function: #function,
+                    line: #line
+                )
+                stop()
+            }
+        } catch {
+            initializer.logger.error(
+                "[slipstream] stall recovery restarted the handle but could not start the pass: \(error.localizedDescription)",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+            // A failed start leaves no poll loop to re-decide, so this is the last chance to tell
+            // the host that the SDK has stopped trying — on the FIRST attempt as much as on the
+            // last. `start()` throws before it reaches `startPolling()` on every one of its exits
+            // (the `isPrepared` guard, the migration gate, and `engine.start()` itself, which is
+            // exactly what a dead transport fails), so what ends the recovery here is the absence
+            // of a loop, not the exhaustion of the budget. A migration-blocked start is reported
+            // the same way: the recovery is over either way, and the host's own migration-gate
+            // handling is what starts sync again once the gate reopens.
+            reportStallRecoveryStopped(error: error)
+        }
+    }
+
+    /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.
+    ///
+    /// Both failure exits of `restartHandleForRecovery` land here, and both are terminal in the
+    /// same way: `stopPolling()` has already run and no pass came up, so there is no tick left to
+    /// re-decide and the `.giveUp` branch — which lives in `tickPoll` — can never fire. A host
+    /// that has just received `.syncStalled(attempt: 1, gaveUp: false)` would otherwise wait
+    /// forever for a resolution that nothing in the SDK can produce. That is why the report is
+    /// NOT gated on the restart cap: what ends the recovery here is the missing loop, not a spent
+    /// budget, and a failure on attempt 1 silences the synchronizer exactly as thoroughly as one
+    /// on attempt 3.
+    ///
+    /// - Parameter error: the failure that ended the restart, carried on the state stream so a
+    ///   host watching only `stateStream` sees it too.
+    private func reportStallRecoveryStopped(error: Error) {
+        // The guard keeps the give-up once per handle, as everywhere else. `stallRestartAttempts`
+        // has already been incremented by the caller, so it names the attempt that just failed.
+        if !stallGaveUpReported {
+            stallGaveUpReported = true
+            eventSubject.send(.syncStalled(attempt: stallRestartAttempts, gaveUp: true))
+        }
+        // Mirror it on the state stream, the way `tickPoll` surfaces the engine's own error
+        // state: with no pass running, a host that watches only `stateStream` would otherwise
+        // keep displaying the last `.syncing`. Gated on `isPrepared` for the same reason
+        // `stopImpl` gates its `.stopped` emission — a `wipe` that landed while the restart was
+        // suspended has already published `.unprepared`, and `.error` would forge prepared-ness
+        // back onto a wiped wallet.
+        if latestState.internalSyncStatus.isPrepared {
+            stateSubject.send(SynchronizerState(
+                syncSessionID: latestState.syncSessionID,
+                accountsBalances: latestState.accountsBalances,
+                localAccountsBalances: latestState.localAccountsBalances,
+                internalSyncStatus: .error(error),
+                latestBlockHeight: latestState.latestBlockHeight,
+                fullyScannedHeight: latestState.fullyScannedHeight,
+                isRecovering: currentlyRecovering
+            ))
         }
     }
 
@@ -810,7 +1099,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // write lock), so the force-re-queue is the last writer. The anchor fetch above
         // deliberately runs with the engine still live — it is network-only, no wallet write.
         let wasRunning = isRunning
-        await engine.stop()
+        await stopEngineOutsideRecovery()
 
         let uuid: AccountUUID
         do {
@@ -863,7 +1152,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // scan ranges — a deep-birthday import's restore does NOT grind on after its account
         // is gone. `wasRunning` mirrors importAccount's restart contract.
         let wasRunning = isRunning
-        await engine.stop()
+        await stopEngineOutsideRecovery()
         try await initializer.rustBackend.deleteAccount(accountUUID)
         // `delete_account` removes the account's transactions — bump `tx_set_version`
         // (tag-5 poke) so hosts re-fetch and Activity drops the dead rows on the next tick.
@@ -1258,7 +1547,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // the engine's scope-expansion re-baseline (E-5) makes the re-scan read as a genuine
         // climb. Restart on BOTH outcomes — a failed truncate must not leave the engine dead.
         let wasRunning = isRunning
-        await engine.stop()
+        await stopEngineOutsideRecovery()
 
         do {
             let checkpointSource = initializer.container.resolve(CheckpointSource.self)
@@ -1336,7 +1625,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         await resubmissionTask?.value
 
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
-        await engine.stop()
+        // [MOB-1850] Through the generation-retiring helper: a stall recovery mid-flight must not
+        // reopen a handle onto database files this wipe is about to delete.
+        await stopEngineOutsideRecovery()
 
         // 3. Free the engine handle (exact-once — close() guards against double-free).
         await engine.close()
@@ -1662,9 +1953,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
 
         // Stop poll loop and cancel in-flight sync (also cancels in-flight summary task).
+        // [MOB-1850] Through the generation-retiring helper: this switch performs its own reopen
+        // + start, so an in-flight stall recovery must abandon its restart instead of interleaving
+        // a second reopen against the OLD endpoint with this one.
         stopPolling()
         isRunning = false
-        await engine.stop()
+        await stopEngineOutsideRecovery()
 
         // Re-open the engine handle against the new endpoint.
         try await engine.reopen(server: endpoint, network: initializer.network)

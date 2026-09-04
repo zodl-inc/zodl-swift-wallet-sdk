@@ -983,7 +983,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
     // "Syncing" — no logs, no error, no counter movement. The watchdog makes such
     // silent stalls VISIBLE: when state==Syncing and the progress-counter signature
     // has not changed for stallWatchdogThresholdSeconds, tickPoll logs ONE loud error
-    // per stall episode. It never restarts anything (policy stays with the app).
+    // per stall episode. What the poll loop then DOES about the stall is the separate
+    // recovery policy covered by SlipstreamStallRecoveryPolicyTests.
 
     /// Syncing + window exceeded → stalled.
     func testIsSyncStalledFiresWhenSyncingPastThreshold() {
