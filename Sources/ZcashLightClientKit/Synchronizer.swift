@@ -103,6 +103,13 @@ public enum SynchronizerEvent {
     case storedUTXOs(_ inserted: [UnspentTransactionOutputEntity], _ skipped: [UnspentTransactionOutputEntity])
     // Connection state to LightwalletEndpoint changed.
     case connectionStateChanged(ConnectionState)
+
+    /// The engine made no progress for the stall window and the SDK restarted the pass (`gaveUp == false`),
+    /// or will not restart again for this handle (`gaveUp == true`) — because it reached its restart
+    /// cap, or because a restart could not bring the pass back up, which also moves the sync status
+    /// to `.error`.
+    /// `attempt` is 1-based and counts restarts since the handle was opened or last switched.
+    case syncStalled(attempt: Int, gaveUp: Bool)
 }
 
 /// Primary interface for interacting with the SDK. Defines the contract that specific
