@@ -87,6 +87,29 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointB], acceptedBy: "a.example.com:443"))
     }
 
+    // MARK: - The test double must answer the same way
+
+    /// `SubmitPlanStoringMock` stands in for the store in every suite that exercises submission
+    /// and background resubmission, so a divergence here does not fail a test — it quietly makes
+    /// the tests that use it assert the wrong contract. Acceptance surviving a re-recorded plan is
+    /// the property the store had to be taught (an upsert would have cleared it), which is exactly
+    /// the kind a double is written before and then never revisited.
+    func testTheTestDoubleAlsoKeepsAcceptanceAcrossARecordedPlanUpdate() async {
+        let double = SubmitPlanStoringMock()
+        let txId = Data(repeating: 0x27, count: 32)
+        await double.recordPlan(txId: txId, endpoints: [endpointA])
+        await double.markAccepted(txId: txId, host: "a.example.com:443")
+
+        await double.recordPlan(txId: txId, endpoints: [endpointB])
+
+        let plan = await double.plan(for: txId)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.ready([endpointB], acceptedBy: "a.example.com:443"),
+            "the double must report what the store reports for the same two calls"
+        )
+    }
+
     // MARK: - Migration of a store written before `accepted_host` existed
 
     func testStoreWrittenWithoutTheAcceptedHostColumnGainsItOnOpen() async throws {

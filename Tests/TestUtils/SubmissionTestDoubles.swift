@@ -336,7 +336,14 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
 
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async {
         guard !endpoints.isEmpty else { return }
-        plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: nil)
+        // Acceptance survives a re-recorded plan, as it does in the real store: a host that
+        // submits the same transaction again replaces the endpoint list, not the fact that a
+        // server already took the transaction.
+        var acceptedBy: String?
+        if case .ready(_, let host) = plans[txId] {
+            acceptedBy = host
+        }
+        plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: acceptedBy)
     }
 
     func markAccepted(txId: Data, host: String) async {
