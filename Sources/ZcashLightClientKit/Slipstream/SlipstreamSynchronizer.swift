@@ -1702,6 +1702,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     // ── Server evaluation ─────────────────────────────────────────────────────
 
+    /// Bounds every server-benchmark probe (`probe(_:timeoutSeconds:using:)`) so a slow or
+    /// unreachable candidate cannot hold up `evaluateBestOf` / `evaluateServerSwitch` past this
+    /// many seconds — the endpoint's own gRPC single-call default is a much longer 30 s, which
+    /// is fine for a real request but far too slow for a benchmark that must return promptly.
+    /// Matches the app-side `evaluationTimeoutSeconds`. `internal` so tests can reference it.
+    static let serverProbeTimeoutSeconds: Double = 5
+
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
         fetchThresholdSeconds: Double = 60.0,
@@ -1735,6 +1742,26 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
     }
 
+    /// Measures one candidate's `getInfo` round trip, bounded to `timeoutSeconds` so a slow or
+    /// unreachable server cannot hold up the benchmark it is part of. Returns `nil` on timeout
+    /// or any error — the caller ranks only the survivors. Closes `service`'s connections on
+    /// every path: a bounded probe that leaked its ephemeral gRPC connection on timeout would
+    /// defeat the point of bounding it. `internal` so tests can exercise it directly.
+    static func probe(
+        _ endpoint: LightWalletEndpoint,
+        timeoutSeconds: Double,
+        using service: LightWalletService
+    ) async -> (roundTrip: TimeInterval, info: LightWalletdInfo)? {
+        let start = DispatchTime.now()
+        let info = try? await withTaskTimeout(UInt64(timeoutSeconds * 1_000_000_000)) {
+            try await service.getInfo(mode: .direct)
+        }
+        let elapsed = DispatchTime.now().secondsSince(start)
+        await service.closeConnections()
+        guard let info else { return nil }
+        return (roundTrip: elapsed, info: info)
+    }
+
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
     /// and the loose synced-height check — all skipped for custom networks, mirroring
@@ -1750,12 +1777,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
             for endpoint in endpoints {
                 group.addTask {
                     let service = LightWalletGRPCService(endpoint: endpoint)
-                    let start = DispatchTime.now()
-                    let info = try? await service.getInfo(mode: .direct)
-                    let elapsed = DispatchTime.now().secondsSince(start)
-                    await service.closeConnections()
-                    guard let info else { return nil }
-                    return (endpoint, elapsed, info)
+                    guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
+                        return nil
+                    }
+                    return (endpoint, probed.roundTrip, probed.info)
                 }
             }
 

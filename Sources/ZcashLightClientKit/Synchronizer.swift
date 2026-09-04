@@ -545,7 +545,8 @@ public protocol Synchronizer: AnyObject {
     /// pipeline as `evaluateBestOf` (latency and health checks on every candidate, then the
     /// block-fetch phase for the fastest few plus the current server, honoring
     /// `fetchThresholdSeconds` and `nBlocksToFetch`), while `SlipstreamSynchronizer` ranks by
-    /// a single `getInfo` round trip and does not use the two fetch parameters.
+    /// a single `getInfo` round trip — each probe bounded by the SDK's own per-probe timeout,
+    /// not by `fetchThresholdSeconds` — and does not use the two fetch parameters.
     /// - Parameters:
     ///    - current: The endpoint the wallet uses right now (identified by host, port and TLS flag).
     ///    - candidates: Endpoints to benchmark alongside `current`.
