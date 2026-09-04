@@ -8,6 +8,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
+  was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
+  `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no votes,
+  shares, Keystone signatures, or accepted hash other than the package's, and only then clears the
+  round and runs `zcash_voting::import_delegation_capability`. Replies `{"outcome":"restored"}` or
+  `{"outcome":"already_restored"}` as a boxed slice; null with the error set otherwise.
+  The stored weight becomes the canonical whole-ballot total, as for every capability import;
+  the VAN is unaffected because `construct_van` commits to `num_ballots`.
+- `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
+  describes, for a network id, so a caller that persisted only the secret can hand the SDK the
+  full hotkey again. Free with `zcashlc_voting_free_hotkey`.
 - `zcashlc_take_last_error_report`, `zcashlc_free_error_report`, and `FfiErrorReport` expose the
   most recent error as a classified, redacted report. `kind` is an `ErrorKind` discriminant
   (`u32`): `0` is unclassified, `1` scan required, `2` insufficient funds; the remaining values are

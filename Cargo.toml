@@ -122,6 +122,7 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # instance.
 slipstream-core = { version = "0.2", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+base64 = "0.22"
 
 [dev-dependencies]
 hex = "0.4"

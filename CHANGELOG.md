@@ -15,6 +15,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
   do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
+### Voting
+
+- `VotingRustBackend.restoreRecoveredDelegation(_:)`, `RecoveredDelegationRestoreRequest`,
+  `RecoveredDelegationBundle` and `RecoveredDelegationRestoreResult` restore a delegation from
+  recovered `(bundle_index, total_note_value, van_comm_rand, delegation_tx_hash)` tuples. The
+  call refuses to clear a round that holds votes, shares, Keystone signatures, or a different
+  accepted delegation, and reports `.alreadyRestored` without writing when the round already
+  holds the package. The request takes a `VotingHotkey`; its secret is unwrapped only at the FFI
+  boundary, and the recovered blinding factors are `Undescribable`.
+- `VotingRustBackend.hotkey(fromStoredSecret:networkId:)` returns the `VotingHotkey` a persisted
+  stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
+  that want the semantic type.
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:
