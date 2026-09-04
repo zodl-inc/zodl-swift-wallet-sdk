@@ -27,23 +27,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
   without reporting it here.
 
-### Sync stalls
-
-- `SynchronizerEvent.syncStalled(attempt:gaveUp:)` reports a sync pass that made no progress for the
-  stall window. The Slipstream synchronizer no longer merely logs such a pass — it restarts it, up to
-  3 times per engine handle, and reopens the endpoint already in use rather than moving the user to
-  another server. Three restarts have two waits between them: the SDK waits at least 60 seconds
-  before the second and at least 120 before the third. In practice the observed gap is about 120
-  seconds throughout, because a restarted pass cannot be seen to stall again until the 120-second
-  stall window of the new pass has elapsed. The event is emitted before each restart begins
-  (`gaveUp == false`, `attempt` 1-based), and once more when the SDK stops trying
-  (`gaveUp == true`) — because the cap is reached, or because a restart could not bring the pass
-  back up at all, which additionally moves the sync status to `.error`. The budget belongs to the
-  handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each hand the next handle a fresh one. An
-  app that surfaces connection trouble can treat `attempt: 1` as the SDK reconnecting by itself and
-  react only from attempt 2, or when `gaveUp` is true. A `switch` over `SynchronizerEvent` that is
-  exhaustive must handle the new case; matching with `if case` needs no change.
-
 ### Submissions
 
 - `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
@@ -104,12 +87,34 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on-chain shape as a migration `transfer`, but not a migration this account made. Such
   transactions were previously reported as `notClassified`. An exhaustive `switch` over
   `ZIP318Kind` stops compiling until the new case is handled.
-- `evaluateServerSwitch` on `SlipstreamSynchronizer` now bounds each candidate's `getInfo`
-  probe to 5 s instead of the endpoint's much longer gRPC single-call default, so a slow or
-  unreachable server can no longer make a call take an unbounded amount of time. On both
-  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server
-  is now skipped when the first benchmark round produced no results at all — nothing answered,
-  so a second call could not have fared any better; the outcome is unchanged.
+- `SlipstreamSynchronizer` now bounds each candidate's `getInfo` probe to 5 s instead of the
+  endpoint's much longer gRPC single-call default, so a slow or unreachable server can no longer
+  make a call take an unbounded amount of time. `evaluateServerSwitch` and `evaluateBestOf` share
+  that benchmark, and a server that does not answer within the bound is now dropped from it rather
+  than ranked late: `evaluateBestOf` can return FEWER endpoints than the `kServers` it was asked
+  for, and an empty array when nothing answers in time, where it previously ranked the slow server
+  and returned a full list. A caller that indexes into the result, or that assumes it is
+  non-empty, must handle the shorter list — an empty result means "no server qualified", not "stay
+  where you are". `evaluateServerSwitch` keeps its shape: a benchmark nothing survives leaves it
+  returning `nil`, as it already did whenever no candidate was worth a switch. On both
+  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server is now skipped when the first
+  benchmark round produced no results at all — nothing answered, so a second call could not have
+  fared any better; the outcome is unchanged.
+- `SynchronizerEvent` gained the case `syncStalled(attempt:gaveUp:)`. An exhaustive `switch` over
+  `SynchronizerEvent` stops compiling until the new case is handled; matching with `if case`, or a
+  `switch` with a `default`, needs no change — see `MIGRATING.md`. The event reports a sync pass
+  that made no progress for the stall window. The Slipstream synchronizer no longer merely logs
+  such a pass — it restarts it, up to 3 times per engine handle, and reopens the endpoint already
+  in use rather than moving the user to another server. Three restarts have two waits between
+  them: the SDK waits at least 60 seconds before the second and at least 120 before the third. In
+  practice the observed gap is about 120 seconds throughout, because a restarted pass cannot be
+  seen to stall again until the 120-second stall window of the new pass has elapsed. The event is
+  emitted before each restart begins (`gaveUp == false`, `attempt` 1-based), and once more when
+  the SDK stops trying (`gaveUp == true`) — because the cap is reached, or because a restart could
+  not bring the pass back up at all; only that second case additionally moves the sync status to
+  `.error`. The budget belongs to the handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each
+  hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
+  as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
 
 ## Fixed
 
