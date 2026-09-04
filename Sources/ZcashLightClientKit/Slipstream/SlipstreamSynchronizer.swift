@@ -923,11 +923,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
             // Stopping again through the public `stop()` (which queues in `pendingStop` like any
             // other stop) settles it: a user who backgrounded the wallet mid-restart stays stopped.
             //
-            // A DELIBERATE stop only, though. `stopGeneration` moves for a switch, a wipe, an
-            // account import or delete and a rewind as well, and each of those brings a pass of
-            // its own back up — tearing it down here would leave the wallet stopped after, say, a
-            // server switch that had already succeeded. A takeover wants nothing from this
-            // recovery; its own `start()` owns the pass. So the question asked is the narrow one.
+            // A DELIBERATE stop only, though. `stopGeneration` also moves for the four takeover
+            // paths — a switch, an account import or delete, and a rewind — and each of those
+            // restarts a pass of its own, so tearing this one down too would leave the wallet
+            // stopped after, say, a server switch that had already succeeded. `stop()` and
+            // `wipe()` are the opposite: neither owns a pass of its own, so both bump
+            // `stopRequestGeneration` instead — the counter this check reads. A takeover wants
+            // nothing from this recovery; its own `start()` owns the pass. So the question asked
+            // is the narrow one.
             if stopRequestGeneration != stallRecoveryStopRequestGeneration {
                 initializer.logger.info(
                     "[slipstream] stall recovery started a pass that a concurrent stop had already claimed — stopping it again",
@@ -1723,6 +1726,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
         // [MOB-1850] Through the generation-retiring helper: a stall recovery mid-flight must not
         // reopen a handle onto database files this wipe is about to delete.
+        // [MOB-1850] A wipe is a deliberate stop that brings no pass of its own back up, so an
+        // in-flight recovery must treat it like `stop()`.
+        stopRequestGeneration += 1
         await stopEngineOutsideRecovery()
 
         // 3. Free the engine handle (exact-once — close() guards against double-free).
