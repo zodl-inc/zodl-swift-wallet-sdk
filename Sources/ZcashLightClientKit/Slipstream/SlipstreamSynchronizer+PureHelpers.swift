@@ -25,12 +25,20 @@ extension SlipstreamSynchronizer {
     /// engine — a TRIVIAL mapping of the truthful-from-open snapshot (progress, recovery,
     /// spendability, persisted tip) plus the unified summary's balances. A zero snapshot
     /// (fresh wallet: no tip, no floor) emits cold `.disconnected`, as before.
+    /// - Parameter isSpendableMasked: whether the [#1591] mask was applied to `accountsBalances`.
+    ///   Passed in rather than re-derived from `snapshot` so the mask predicate keeps a single
+    ///   definition, in `walletBalanceSnapshots()`, which is what produced these balances. The
+    ///   default exists only to keep this function's parameter count under SwiftLint's
+    ///   `function_parameter_count` limit and fails SAFE: a call site that forgets the argument
+    ///   gets a masked, never an over-trusted, state — every existing call site passes it
+    ///   explicitly regardless.
     static func initialState(
         snapshot: SlipstreamSnapshot?,
         accountsBalances: [AccountUUID: AccountBalance],
         localAccountsBalances: [AccountUUID: AccountBalance],
         fullyScannedHeight: BlockHeight?,
-        syncSessionID: UUID
+        syncSessionID: UUID,
+        isSpendableMasked: Bool = true
     ) -> SynchronizerState {
         guard let snap = snapshot, snap.chainTip != 0 || snap.progressPermille != 0 else {
             return SynchronizerState(
@@ -39,6 +47,7 @@ extension SlipstreamSynchronizer {
                 localAccountsBalances: localAccountsBalances,
                 internalSyncStatus: .disconnected,
                 latestBlockHeight: .zero
+                // Balances are dropped entirely here, so nothing is being hidden: `false`.
             )
         }
         return SynchronizerState(
@@ -48,7 +57,8 @@ extension SlipstreamSynchronizer {
             internalSyncStatus: .syncing(Float(snap.progressPermille) / 1000, snap.spendableHint != 0),
             latestBlockHeight: BlockHeight(snap.chainTip),
             fullyScannedHeight: fullyScannedHeight ?? .zero,
-            isRecovering: snap.isRecovering == 1
+            isRecovering: snap.isRecovering == 1,
+            isSpendableMasked: isSpendableMasked
         )
     }
 
@@ -78,8 +88,8 @@ extension SlipstreamSynchronizer {
     ///
     /// Field failure 2 (2026-06-12): the UI froze at one chunk with the state stuck
     /// "Syncing" — no logs, no error, forever. This predicate makes such silent
-    /// stalls VISIBLE (a loud `Logger.error` in `tickPoll`); it deliberately does
-    /// NOT auto-restart anything — recovery policy stays with the app.
+    /// stalls VISIBLE (a loud `Logger.error` in `tickPoll`). It answers only WHETHER
+    /// the pass is stalled; what to do about it is `stallRecoveryDecision`'s call.
     ///
     /// - Parameters:
     ///   - state: `snap.state` (0=idle, 1=syncing, 2=error, 3=done). Only Syncing
@@ -96,6 +106,63 @@ extension SlipstreamSynchronizer {
         threshold: TimeInterval
     ) -> Bool {
         state == 1 && secondsSinceLastCounterChange >= threshold
+    }
+
+    /// What the poll loop should do about a stall it just observed.
+    ///
+    /// The watchdog used to only log — recovery was left entirely to the app, which meant a pass
+    /// whose transport had died sat at "Syncing" until the user noticed and restarted the wallet
+    /// themselves. The SDK now reconnects on its own, and this is the policy that keeps that
+    /// reconnect from becoming a worse failure than the stall.
+    enum StallRecoveryDecision: Equatable {
+        /// Nothing to do: the pass is healthy, or a restart already fired and its backoff
+        /// window has not elapsed yet.
+        case none
+        /// Restart the pass now. `attempt` is 1-based and counts restarts of the CURRENT handle.
+        case restart(attempt: Int)
+        /// The restart budget for this handle is spent. Stop trying and report it once.
+        case giveUp
+    }
+
+    /// The pure stall-recovery policy: given the stall fact and the restart history of the current
+    /// handle, decide whether to restart the pass, wait, or give up.
+    ///
+    /// Two properties matter and both live here rather than in the poll loop, so they are testable
+    /// without an engine handle:
+    ///
+    /// - A **cap** (`maxAttempts`). A stall the SDK cannot fix — a server that is down, a device
+    ///   that lost its network — would otherwise be met with an unbounded restart loop that costs
+    ///   battery and hides the problem from the user. Past the cap the SDK stops and says so, so
+    ///   the host can offer a server switch instead.
+    /// - An **exponential backoff** between attempts. The poll loop asks every 2 s and the stall
+    ///   fact stays true across ticks, so without a wait the whole budget would burn in a few
+    ///   seconds while the underlying cause had no chance to clear. The window after attempt *n*
+    ///   is `backoffBase * 2^(n-1)`. The function doubles for as long as the caller's cap allows;
+    ///   the shipped configuration (base 60 s, cap 3) reaches only the first two windows, 60 s and
+    ///   120 s, because three restarts have two waits between them and the cap is checked before
+    ///   any window is computed.
+    ///
+    /// - Parameters:
+    ///   - isStalled: what `checkStallWatchdog` just decided for this tick.
+    ///   - attemptsSoFar: restarts already performed for the current handle (0 on a fresh handle).
+    ///   - maxAttempts: the per-handle cap (`maxStallRestartsPerHandle`).
+    ///   - secondsSinceLastRestart: wall time since the last recovery restart, or nil when this
+    ///     handle has not been restarted yet — in which case the restart is due immediately.
+    ///   - backoffBase: the first window's length (`stallRestartBackoffBase`).
+    /// - Returns: the action the poll loop should take on this tick.
+    static func stallRecoveryDecision(
+        isStalled: Bool,
+        attemptsSoFar: Int,
+        maxAttempts: Int,
+        secondsSinceLastRestart: TimeInterval?,
+        backoffBase: TimeInterval
+    ) -> StallRecoveryDecision {
+        guard isStalled else { return .none }
+        guard attemptsSoFar < maxAttempts else { return .giveUp }
+        guard let secondsSinceLastRestart else { return .restart(attempt: attemptsSoFar + 1) }
+        let window = backoffBase * pow(2, Double(attemptsSoFar - 1))
+        guard secondsSinceLastRestart >= window else { return .none }
+        return .restart(attempt: attemptsSoFar + 1)
     }
 
     /// The handle-lifetime clamp on the engine-reported stall span, feeding `isSyncStalled`'s

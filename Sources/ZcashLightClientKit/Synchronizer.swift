@@ -61,6 +61,21 @@ public struct SynchronizerState: Equatable {
     /// backend's `recovery_progress`; `false` for light catch-ups and once fully synced.
     public var isRecovering: Bool
 
+    /// True while the [#1591] stale-tip mask is hiding spendable value: every pool's
+    /// `spendableValue` in `accountsBalances` has been forced to zero and shifted into
+    /// `valuePendingSpendability` because the engine has not yet confirmed a fresh chain tip.
+    ///
+    /// This is the only signal that separates "the wallet cannot spend this" from "the SDK is not
+    /// willing to say yet". A zero spendable balance cannot: an empty wallet, funds still
+    /// confirming, and this mask all produce one. A client that shows a determinate "working it
+    /// out" affordance — a spinner, a held error — must gate on this and must not infer it from a
+    /// zero balance, which would leave the affordance up indefinitely in the other two cases.
+    ///
+    /// Bounded: it clears as soon as the engine refreshes the tip, which is what makes it safe to
+    /// drive a spinner from. Always `false` on the legacy `SDKSynchronizer` path, which applies its
+    /// mask inside `ZcashRustBackend.getWalletSummary()` and does not report it here.
+    public var isSpendableMasked: Bool
+
     /// Represents a synchronizer that has made zero progress hasn't done a sync attempt
     public static var zero: SynchronizerState {
         SynchronizerState(
@@ -80,7 +95,8 @@ public struct SynchronizerState: Equatable {
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
         fullyScannedHeight: BlockHeight = .zero,
-        isRecovering: Bool = false
+        isRecovering: Bool = false,
+        isSpendableMasked: Bool = false
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
@@ -89,6 +105,7 @@ public struct SynchronizerState: Equatable {
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
         self.isRecovering = isRecovering
+        self.isSpendableMasked = isSpendableMasked
         self.syncStatus = internalSyncStatus.mapToSyncStatus()
     }
 }
@@ -103,6 +120,23 @@ public enum SynchronizerEvent {
     case storedUTXOs(_ inserted: [UnspentTransactionOutputEntity], _ skipped: [UnspentTransactionOutputEntity])
     // Connection state to LightwalletEndpoint changed.
     case connectionStateChanged(ConnectionState)
+
+    /// The engine made no progress for the stall window and the SDK restarted the pass (`gaveUp == false`),
+    /// or will not restart again for this handle (`gaveUp == true`) — because it reached its restart
+    /// cap, or because a restart could not bring the pass back up, which also moves the sync status
+    /// to `.error`.
+    /// `attempt` is 1-based and counts restarts since the handle was opened or last switched.
+    case syncStalled(attempt: Int, gaveUp: Bool)
+}
+
+/// Where a transaction this wallet submitted stands with the servers it was sent to.
+public enum TransactionSubmissionStatus: Equatable {
+    /// The transaction is stored but has not been sent to any server yet.
+    case awaiting
+    /// The transaction was sent to at least one server; none has acknowledged it yet.
+    case submitted
+    /// A server accepted the transaction into its mempool. `host` is `host:port`.
+    case accepted(host: String)
 }
 
 /// Primary interface for interacting with the SDK. Defines the contract that specific
@@ -545,7 +579,8 @@ public protocol Synchronizer: AnyObject {
     /// pipeline as `evaluateBestOf` (latency and health checks on every candidate, then the
     /// block-fetch phase for the fastest few plus the current server, honoring
     /// `fetchThresholdSeconds` and `nBlocksToFetch`), while `SlipstreamSynchronizer` ranks by
-    /// a single `getInfo` round trip and does not use the two fetch parameters.
+    /// a single `getInfo` round trip — each probe bounded by the SDK's own per-probe timeout,
+    /// not by `fetchThresholdSeconds` — and does not use the two fetch parameters.
     /// - Parameters:
     ///    - current: The endpoint the wallet uses right now (identified by host, port and TLS flag).
     ///    - candidates: Endpoints to benchmark alongside `current`.
@@ -676,6 +711,21 @@ public protocol Synchronizer: AnyObject {
     /// Use this to implement custom broadcast strategies such as submitting
     /// to multiple lightwalletd servers in parallel.
     var broadcaster: Broadcaster { get }
+
+    /// How far a submitted transaction has got with the servers, so a sent transaction can be
+    /// shown as handed over rather than as still sending while it waits to be mined.
+    ///
+    /// This describes submission only. It says nothing about whether the transaction will be
+    /// mined: acceptance means a server holds it in its mempool, and the SDK keeps resubmitting
+    /// an accepted transaction until it is mined or expires.
+    ///
+    /// - Parameter rawID: The transaction's raw id (`ZcashTransaction.Overview.rawID`,
+    ///   `CreatedTransaction.txId`).
+    /// - Returns: The status, or `nil` when the SDK has nothing to say — a transaction it never
+    ///   recorded (created before this bookkeeping existed, or by another wallet), or a moment
+    ///   when its record cannot be read. Conformers without submission bookkeeping always
+    ///   return `nil`.
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus?
 
     // MARK: - Migration (Orchard -> Ironwood)
     //
@@ -1495,6 +1545,14 @@ public extension Synchronizer {
         nil
     }
 
+    /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is
+    /// not a source-breaking change for downstream conformers. Conformers that keep submission
+    /// bookkeeping override this; mocks, stubs and alternate transports fall through here and
+    /// report that they know nothing about the transaction.
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        nil
+    }
+
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that have
     /// a lightwalletd connection (such as `SDKSynchronizer`) override this;
@@ -1711,6 +1769,14 @@ public extension ClosureSynchronizer {
     var broadcaster: Broadcaster {
         UnimplementedBroadcaster()
     }
+
+    /// Default implementation so adding `transactionSubmissionStatus(for:completion:)` to the
+    /// protocol is not a source-breaking change for downstream conformers. Conformers that keep
+    /// submission bookkeeping override this; the rest report that they know nothing about the
+    /// transaction.
+    func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void) {
+        completion(nil)
+    }
 }
 
 public extension CombineSynchronizer {
@@ -1720,6 +1786,13 @@ public extension CombineSynchronizer {
     /// through to this default and report the feature as unavailable.
     var broadcaster: Broadcaster {
         UnimplementedBroadcaster()
+    }
+
+    /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is
+    /// not a source-breaking change for downstream conformers. Conformers that keep submission
+    /// bookkeeping override this; the rest report that they know nothing about the transaction.
+    func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
+        Just(nil).eraseToAnyPublisher()
     }
 }
 

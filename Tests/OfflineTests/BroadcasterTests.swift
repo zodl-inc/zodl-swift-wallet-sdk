@@ -313,7 +313,56 @@ final class BroadcasterTests: ZcashTestCase {
 
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         let plan = await store.plan(for: transaction.txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([acceptingService.endpoint]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([acceptingService.endpoint], acceptedBy: "\(acceptingService.endpoint.host):\(acceptingService.endpoint.port)"))
+    }
+
+    // MARK: - Submission status reported to the host
+
+    func testSubmissionStatusIsAwaitingBeforeTheAppSubmits() async throws {
+        let rawID = Data(repeating: 0xAB, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        _ = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        let status = await synchronizer.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(status, TransactionSubmissionStatus.awaiting)
+    }
+
+    func testSubmissionStatusIsAcceptedWithTheServerThatTookTheTransaction() async throws {
+        let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? acceptingService.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [acceptingService.endpoint])
+
+        let endpoint = try XCTUnwrap(acceptingService.endpoint)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: "\(endpoint.host):\(endpoint.port)"))
+    }
+
+    func testSubmissionStatusIsSubmittedWhenNoServerAccepted() async throws {
+        let rejectingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
+        defer { try? rejectingService.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejectingService.endpoint])
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted)
+    }
+
+    func testSubmissionStatusIsNilForATransactionTheStoreNeverSaw() async throws {
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+
+        let status = await synchronizer.transactionSubmissionStatus(for: Data(repeating: 0xFE, count: 32))
+        XCTAssertNil(status)
     }
 
     func testSubmitToRejectingEndpointIsRejected() async throws {
@@ -347,7 +396,10 @@ final class BroadcasterTests: ZcashTestCase {
 
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         let plan = await store.plan(for: transaction.txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([rejectingService.endpoint, acceptingService.endpoint]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready(
+            [rejectingService.endpoint, acceptingService.endpoint],
+            acceptedBy: "\(acceptingService.endpoint.host):\(acceptingService.endpoint.port)"
+        ))
     }
 
     func testSubmitWithEmptyEndpointsIsUnreachableAndRecordsNoPlan() async throws {

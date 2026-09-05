@@ -34,6 +34,34 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
   that want the semantic type.
 
+### Spendable balance masking
+
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in
+  `accountsBalances` is currently masked because the engine has not yet confirmed a fresh chain
+  tip — the only signal that separates "the wallet cannot spend this" from "the SDK is not
+  willing to say yet," which a zero balance alone cannot express (an empty wallet, funds still
+  confirming, and a masked balance all read as zero). It clears as soon as the tip refreshes, so a
+  client can safely drive a "working it out" affordance from it. The property is additive: the
+  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
+  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
+  without reporting it here.
+
+### Submissions
+
+- `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
+  has got with the servers, so a sent transaction can be shown as handed over instead of as still
+  sending for the minutes it waits to be mined. It returns the new `TransactionSubmissionStatus`:
+  `.awaiting` (created, not sent yet), `.submitted` (sent, no server has acknowledged it), or
+  `.accepted(host:)`, whose `host` is the `host:port` of the server that took it into its mempool.
+  `nil` means the SDK has nothing to say — a transaction it never recorded, or a moment when its
+  record cannot be read. The method has a default implementation returning `nil`, so custom
+  `Synchronizer` conformers and test doubles keep compiling unchanged; the same method, and the
+  same default, is on `ClosureSynchronizer` and `CombineSynchronizer`. Acceptance describes
+  submission only, never mining: the SDK keeps resubmitting an accepted transaction until it is
+  mined or expires, exactly as before. The SDK's submit-plan database gained one nullable column
+  to record this; the change is additive and the file stays readable and writable by older SDK
+  builds on the same device.
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:
@@ -78,6 +106,34 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on-chain shape as a migration `transfer`, but not a migration this account made. Such
   transactions were previously reported as `notClassified`. An exhaustive `switch` over
   `ZIP318Kind` stops compiling until the new case is handled.
+- `SlipstreamSynchronizer` now bounds each candidate's `getInfo` probe to 5 s instead of the
+  endpoint's much longer gRPC single-call default, so a slow or unreachable server can no longer
+  make a call take an unbounded amount of time. `evaluateServerSwitch` and `evaluateBestOf` share
+  that benchmark, and a server that does not answer within the bound is now dropped from it rather
+  than ranked late: `evaluateBestOf` can return FEWER endpoints than the `kServers` it was asked
+  for, and an empty array when nothing answers in time, where it previously ranked the slow server
+  and returned a full list. A caller that indexes into the result, or that assumes it is
+  non-empty, must handle the shorter list — an empty result means "no server qualified", not "stay
+  where you are". `evaluateServerSwitch` keeps its shape: a benchmark nothing survives leaves it
+  returning `nil`, as it already did whenever no candidate was worth a switch. On both
+  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server is now skipped when the first
+  benchmark round produced no results at all — nothing answered, so a second call could not have
+  fared any better; the outcome is unchanged.
+- `SynchronizerEvent` gained the case `syncStalled(attempt:gaveUp:)`. An exhaustive `switch` over
+  `SynchronizerEvent` stops compiling until the new case is handled; matching with `if case`, or a
+  `switch` with a `default`, needs no change — see `MIGRATING.md`. The event reports a sync pass
+  that made no progress for the stall window. The Slipstream synchronizer no longer merely logs
+  such a pass — it restarts it, up to 3 times per engine handle, and reopens the endpoint already
+  in use rather than moving the user to another server. Three restarts have two waits between
+  them: the SDK waits at least 60 seconds before the second and at least 120 before the third. In
+  practice the observed gap is about 120 seconds throughout, because a restarted pass cannot be
+  seen to stall again until the 120-second stall window of the new pass has elapsed. The event is
+  emitted before each restart begins (`gaveUp == false`, `attempt` 1-based), and once more when
+  the SDK stops trying (`gaveUp == true`) — because the cap is reached, or because a restart could
+  not bring the pass back up at all; only that second case additionally moves the sync status to
+  `.error`. The budget belongs to the handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each
+  hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
+  as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
 
 ## Fixed
 
