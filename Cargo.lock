@@ -2932,6 +2932,7 @@ name = "libzcashlc"
 version = "4.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bindgen",
  "bitflags",
  "bytes",
