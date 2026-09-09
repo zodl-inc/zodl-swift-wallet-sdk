@@ -110,6 +110,9 @@ xz2 = { version = "0.1", features = ["static"] }
 # librustzcash Orchard/Halo 2 stack; the crate's default Zakura backend is never
 # enabled. Move to a crates.io `=3.1.x` pin once Valar publishes this line.
 zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "a8f32ad25b8eb651c9b8c4d3ba5c9936930b9d1d", default-features = false, features = ["lrz"] }
+# Direct dependency for typed circuit APIs used by the proof readback path; it
+# must resolve to the same crate instance zcash_voting uses.
+voting-circuits = { version = "=0.12.0-rc.2", default-features = false, features = ["lrz"] }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
