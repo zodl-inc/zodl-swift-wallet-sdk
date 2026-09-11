@@ -2595,6 +2595,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - httpRequestOverOHTTP
+
+    var httpRequestOverOHTTPForThrowableError: Error?
+    var httpRequestOverOHTTPForCallsCount = 0
+    var httpRequestOverOHTTPForCalled: Bool {
+        return httpRequestOverOHTTPForCallsCount > 0
+    }
+    var httpRequestOverOHTTPForReceivedRequest: URLRequest?
+    var httpRequestOverOHTTPForReturnValue: (data: Data, response: HTTPURLResponse)!
+    var httpRequestOverOHTTPForClosure: ((URLRequest) async throws -> (data: Data, response: HTTPURLResponse))?
+
+    func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+        if let error = httpRequestOverOHTTPForThrowableError {
+            throw error
+        }
+        httpRequestOverOHTTPForCallsCount += 1
+        httpRequestOverOHTTPForReceivedRequest = request
+        if let closure = httpRequestOverOHTTPForClosure {
+            return try await closure(request)
+        } else {
+            return httpRequestOverOHTTPForReturnValue
+        }
+    }
+
     // MARK: - httpRequestOverTor
 
     var httpRequestOverTorForRetryLimitThrowableError: Error?
