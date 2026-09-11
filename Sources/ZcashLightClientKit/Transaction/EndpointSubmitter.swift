@@ -47,8 +47,9 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
         )
 
         let service: LightWalletService
-        if OHTTPEndpoints.isGateway(endpoint.host) {
-            service = try! LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient)
+        if OHTTPEndpoints.isGateway(endpoint.host),
+           let ohttpService = try? LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient) {
+            service = ohttpService
         } else {
             service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: serviceTorClient)
         }
