@@ -464,6 +464,7 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func tor(enabled: Bool) async throws { Self.unused() }
     func exchangeRateOverTor(enabled: Bool) async throws { Self.unused() }
     func isTorSuccessfullyInitialized() async -> Bool? { Self.unused() }
+    func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
     func debugDatabase(sql: String) -> String { Self.unused() }
 
