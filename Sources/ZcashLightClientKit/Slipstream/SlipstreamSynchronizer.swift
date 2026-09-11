@@ -2680,6 +2680,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
+                    // Note: OHTTP dispatch happens at the DI level in Dependencies.swift
+                    // This evaluation path uses ephemeral direct connections only
                     let service = LightWalletGRPCService(endpoint: endpoint)
                     guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
                         return nil

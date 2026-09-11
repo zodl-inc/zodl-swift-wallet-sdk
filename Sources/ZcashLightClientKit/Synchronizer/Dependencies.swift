@@ -84,7 +84,11 @@ enum Dependencies {
         container.register(type: LightWalletService.self, isSingleton: true) { di in
             let torClient = di.resolve(TorClient.self)
 
-            return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            if OHTTPEndpoints.isGateway(endpoint.host) {
+                return try! LightWalletOHTTPService(endpoint: endpoint, tor: torClient)
+            } else {
+                return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            }
         }
 
         container.register(type: TransactionRepository.self, isSingleton: true) { _ in
