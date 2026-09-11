@@ -27,7 +27,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         static let environment = ProcessInfo.processInfo.environment
         static var seedHex: String? { environment["OHTTP_E2E_SEED_HEX"].flatMap { $0.isEmpty ? nil : $0 } }
         static var birthday: BlockHeight { environment["OHTTP_E2E_BIRTHDAY"].flatMap { Int($0) } ?? 4_123_503 }
-        static var minBalanceZatoshi: Int64 { environment["OHTTP_E2E_MIN_BALANCE_ZAT"].flatMap { Int64($0) } ?? 9_000_000_000 }
+        static var minBalanceZatoshi: Int64 { environment["OHTTP_E2E_MIN_BALANCE_ZAT"].flatMap { Int64($0) } ?? 100_000_000 } // 1 TAZ default; balance varies with E2E sends
         static var timeoutSeconds: TimeInterval { environment["OHTTP_E2E_TIMEOUT_SECONDS"].flatMap { TimeInterval($0) } ?? 3600 }
         static var gatewayHost: String { environment["OHTTP_E2E_GATEWAY_HOST"] ?? "ohttp-gateway-testnet.example" }
     }
@@ -107,9 +107,21 @@ final class OHTTPE2ETests: ZcashTestCase {
         let deadline = Date().addingTimeInterval(Env.timeoutSeconds)
         var lastReport = Date.distantPast
         var state = synchronizer.latestState
+        var restartBudget = 3
         while Date() < deadline {
             state = synchronizer.latestState
             if case .error(let error) = state.syncStatus {
+                let msg = "\(error)"
+                // gRPC OUT_OF_RANGE (code 11): lightwalletd returned "block N is newer than the
+                // latest known block" — a transient race between the chain-tip discovery and the
+                // backend index flush. The SDK stops on this error; restart and continue.
+                if restartBudget > 0 && (msg.contains("newer than the latest") || msg.contains("statusCode: 11")) {
+                    log("transient OUT_OF_RANGE (chain-tip race) — restarting sync (restarts left: \(restartBudget))")
+                    restartBudget -= 1
+                    try await synchronizer.start(retry: true)
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    continue
+                }
                 XCTFail("sync failed (\(mode)): \(error)")
                 return
             }
