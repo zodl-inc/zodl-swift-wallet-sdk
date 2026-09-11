@@ -84,12 +84,10 @@ enum Dependencies {
         container.register(type: LightWalletService.self, isSingleton: true) { di in
             let torClient = di.resolve(TorClient.self)
 
-            // OHTTP gateways get the RFC 9458 transport; `isGateway` only matches hosts with a
-            // configured relay, so the throwing init cannot fail here in practice. Should it, fall
-            // back to plain gRPC, which the gateway refuses (426) — a visible error, never a crash.
-            if OHTTPEndpoints.isGateway(endpoint.host),
-               let ohttpService = try? LightWalletOHTTPService(endpoint: endpoint, tor: torClient) {
-                return ohttpService
+            // OHTTP gateways get the RFC 9458 transport (`isGateway` only matches hosts with a
+            // configured relay); everything else keeps the grpc-swift / Tor service.
+            if OHTTPEndpoints.isGateway(endpoint.host) {
+                return LightWalletOHTTPService(endpoint: endpoint, tor: torClient)
             }
             return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
         }

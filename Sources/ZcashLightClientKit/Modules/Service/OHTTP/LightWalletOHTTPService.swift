@@ -16,15 +16,8 @@ import Foundation
 final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private let ohttpClient: OHTTPGRPCClient?
 
-    convenience init(endpoint: LightWalletEndpoint, tor: TorClient) throws {
-        try self.init(
-            endpoint: endpoint,
-            singleCallTimeout: endpoint.singleCallTimeoutInMillis,
-            streamingCallTimeout: endpoint.streamingCallTimeoutInMillis,
-            tor: tor
-        )
-    }
-
+    // `init(endpoint:tor:)` is inherited from the superclass: this class overrides its only
+    // designated initializer, so the superclass convenience initializers come along.
     override init(
         endpoint: LightWalletEndpoint,
         singleCallTimeout: Int64,
@@ -66,10 +59,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             return try await super.getInfo(mode: mode)
         }
 
-        return try await client.unary(
+        // The protocol returns the `LightWalletdInfo` existential; decode the concrete proto message.
+        let info: LightdInfo = try await client.unary(
             path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
             request: Empty()
         )
+        return info
     }
 
     override func latestBlock(mode: ServiceMode) async throws -> BlockID {
@@ -123,10 +118,11 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
 
         var transaction = RawTransaction()
         transaction.data = spendTransaction
-        return try await client.unary(
+        let response: SendResponse = try await client.unary(
             path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
             request: transaction
         )
+        return response
     }
 
     override func fetchTransaction(txId: Data, mode: ServiceMode) async throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {

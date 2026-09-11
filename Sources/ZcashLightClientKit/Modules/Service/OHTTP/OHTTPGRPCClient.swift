@@ -167,7 +167,9 @@ actor OHTTPGRPCClient {
         }
     }
 
-    private func parseGRPCFrames<T: SwiftProtobuf.Message>(_ body: Data) throws -> [T] {
+    private func parseGRPCFrames<T: SwiftProtobuf.Message>(_ slice: Data) throws -> [T] {
+        // Re-base: a `Data` slice keeps its parent's indices, and everything below indexes from 0.
+        let body = Data(slice)
         var messages: [T] = []
         var pos = 0
 
@@ -225,9 +227,10 @@ private extension String {
             let c = self[i]
             if c == "%" {
                 let nextIndex = self.index(after: i)
-                let nextNextIndex = self.index(after: nextIndex)
-                if nextNextIndex < self.endIndex {
-                    let hexString = String(self[nextIndex...self.index(before: nextNextIndex)])
+                if nextIndex < self.endIndex, self.index(after: nextIndex) < self.endIndex {
+                    let nextNextIndex = self.index(after: nextIndex)
+                    // Two hex digits follow the '%'.
+                    let hexString = String(self[nextIndex...nextNextIndex])
                     if let byte = UInt8(hexString, radix: 16) {
                         result.append(byte)
                         i = self.index(after: nextNextIndex)
