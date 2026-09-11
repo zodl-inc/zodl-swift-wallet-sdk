@@ -2769,6 +2769,34 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+        guard let host = request.url?.host, OHTTPEndpoints.isGateway(host) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let relayURL = try OHTTPEndpoints.relayURL(for: host)
+        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+        let scheme = request.url?.scheme ?? "https"
+        let path = (request.url?.path ?? "/") + (request.url?.query.map { "?\($0)" } ?? "")
+        let headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+        let bhttp = BinaryHTTP.Request(
+            method: request.httpMethod ?? "GET",
+            scheme: scheme,
+            authority: host,
+            path: path,
+            headers: headers,
+            body: request.httpBody ?? Data()
+        )
+        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+        guard let httpResp = HTTPURLResponse(
+            url: request.url!,
+            statusCode: response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
+        ) else { throw ZcashError.ohttpResponseError }
+        return (response.body, httpResp)
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled
