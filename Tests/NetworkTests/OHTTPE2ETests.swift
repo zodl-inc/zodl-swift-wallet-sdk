@@ -107,19 +107,21 @@ final class OHTTPE2ETests: ZcashTestCase {
         let deadline = Date().addingTimeInterval(Env.timeoutSeconds)
         var lastReport = Date.distantPast
         var state = synchronizer.latestState
-        var restartBudget = 3
+        var restartBudget = 10
         while Date() < deadline {
             state = synchronizer.latestState
             if case .error(let error) = state.syncStatus {
                 let msg = "\(error)"
                 // gRPC OUT_OF_RANGE (code 11): lightwalletd returned "block N is newer than the
                 // latest known block" — a transient race between the chain-tip discovery and the
-                // backend index flush. The SDK stops on this error; restart and continue.
+                // backend index flush. Wait 60s for the node to index the new block, then restart.
                 if restartBudget > 0 && (msg.contains("newer than the latest") || msg.contains("statusCode: 11")) {
-                    log("transient OUT_OF_RANGE (chain-tip race) — restarting sync (restarts left: \(restartBudget))")
+                    log("transient OUT_OF_RANGE (chain-tip race) — waiting 60s then restarting (restarts left: \(restartBudget))")
                     restartBudget -= 1
+                    // Give lightwalletd 60s to index the blocks that are just ahead of the tip.
+                    // New blocks arrive every ~75s on testnet, so one interval is enough.
+                    try await Task.sleep(nanoseconds: 60_000_000_000)
                     try await synchronizer.start(retry: true)
-                    try await Task.sleep(nanoseconds: 5_000_000_000)
                     continue
                 }
                 XCTFail("sync failed (\(mode)): \(error)")
