@@ -1,0 +1,643 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL Slipstream.
+//
+// ZODL Slipstream is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL Slipstream is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
+//! Lightwalletd connection factory honoring the old SDK's per-call Tor policy.
+//!
+//! Mirrors the old SDK's `ServiceMode`: the **bulk** block fetch is direct (the old
+//! SDK's `blockStream` uses `.direct` — public range data, too high-volume for Tor; per-user
+//! exposure (IP + birthday) is identical with or without Tor). Wallet-**identifying** metadata
+//! (treestate, latest-block, lightd info) goes over **isolated Tor circuits** when Tor is on.
+//!
+//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) are the exception to "bulk is
+//! direct": with Tor on, EVERY purpose — bulk included — is OHTTP-encapsulated AND its TCP leg to
+//! the relay is dialled through Tor. Anything less would either bypass OHTTP (the gateway refuses
+//! plain gRPC with 426 anyway) or hand the relay the device IP while the user asked for Tor.
+//!
+//! Tor is transport-only — the bytes written to the wallet DB are identical either way, so the
+//! golden + darkside oracles are unaffected.
+//!
+//! Runtime model (T-Tor.0, GO): the engine OWNS its arti [`TorConn`], bootstrapped on the
+//! engine's own tokio runtime (`TorClient::with_runtime(PreferredRuntime::current())`), so no
+//! `block_on` and no cross-runtime polling — see `tests/tor_runtime_spike.rs`.
+
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use arti_client::{DataStream, StreamPrefs, TorClient, config::{BoolOrAuto, TorClientConfigBuilder}};
+use hyper_util::rt::TokioIo;
+use tonic::transport::{ClientTlsConfig, Endpoint as TonicEndpoint, Uri};
+use tor_rtcompat::PreferredRuntime;
+use tower_service::Service;
+
+use crate::{
+    config::Endpoint,
+    error::SlipstreamError,
+    grpc::{self, LwdClient},
+    ohttp::{Dialer, OhttpConnector},
+};
+
+/// Why a lightwalletd connection is being opened — selects direct vs Tor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnPurpose {
+    /// Bulk compact-block download. ALWAYS direct, even with Tor on (mirrors `blockStream(.direct)`).
+    BulkFetch,
+    /// Wallet-identifying metadata (treestate, latest-block, tip). Isolated Tor (`.uniqueTor`).
+    MetadataUnique,
+    /// Server validation / lightd info. Default Tor circuit (`.defaultTor`).
+    MetadataDefault,
+}
+
+/// Which Tor circuit a purpose uses, or `None` for direct. This is the single source of the
+/// per-call policy (mirrors the old SDK's `ServiceMode` mapping); [`Connector::connect`] uses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TorMode {
+    Isolated,
+    Default,
+}
+
+fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
+    match purpose {
+        ConnPurpose::BulkFetch => None, // direct (for non-OHTTP hosts; see `route`)
+        ConnPurpose::MetadataUnique => Some(TorMode::Isolated),
+        ConnPurpose::MetadataDefault => Some(TorMode::Default),
+    }
+}
+
+/// The full routing decision for one connect: `tor_mode(purpose)`, plus the OHTTP override — when
+/// the endpoint is an OHTTP gateway and Tor is on, bulk rides Tor too (on the shared default
+/// circuit: it is public range data, so it needs no isolation from itself, and one circuit keeps
+/// the fetch workers' pooled h2 connections cheap).
+fn route(purpose: ConnPurpose, is_ohttp_gateway: bool) -> Option<TorMode> {
+    match (tor_mode(purpose), is_ohttp_gateway) {
+        (None, true) => Some(TorMode::Default),
+        (mode, _) => mode,
+    }
+}
+
+/// Per-attempt timeout for building a Tor circuit + connecting to lightwalletd. A healthy circuit
+/// builds in a few seconds; a STUCK one (dead relay / bad path) is cut here so we can retry on a
+/// FRESH isolated circuit instead of blocking on arti's much longer internal circuit-build
+/// timeout. Field evidence (2026-06-17, device, Tor ON): a single stuck circuit wedged a per-range
+/// enhancement connect for ~58s, turning a ~90s restore into ~161s. 15s leaves a slow-but-healthy
+/// circuit room while cutting a stuck one promptly.
+const TOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Fresh-circuit attempts before giving up a single connect. With `Isolated` mode each attempt
+/// draws a NEW isolated circuit, so a transient bad circuit recovers on the next try. The error
+/// returned after all attempts is still `Transport` (transient) — every higher resilience layer
+/// (scan treestate retry, the per-range enhancement's non-fatal defer, the initial-pass
+/// never-Error retry loop) still stacks on top. 3 attempts ⇒ ≤45s worst case vs the old single
+/// ~58s-then-fail, and ~0 overhead in the healthy case (attempt 1 connects fast).
+const TOR_CONNECT_ATTEMPTS: u32 = 3;
+
+/// Per-attempt timeout for an OHTTP-over-Tor connect. It has to build TWO circuits (gateway key
+/// fetch + relay) and complete two TLS handshakes over them before the first RPC can go out, so it
+/// gets more room than the single-stream direct-over-Tor case.
+const TOR_OHTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Timeouts zcash_client_backend's `tor::Timeouts::default()` applies to gRPC-over-Tor channels.
+const TOR_GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TOR_GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A bootstrapped arti Tor client, owned by the engine and driven on its own runtime.
+#[derive(Clone)]
+pub struct TorConn {
+    client: TorClient<PreferredRuntime>,
+}
+
+impl TorConn {
+    /// Bootstrap a Tor client on the CURRENT (engine's) runtime, from `tor_dir` — the same
+    /// `arti-data` / `arti-cache` layout (and permission policy) `zcash_client_backend::tor::Client`
+    /// uses, so the directory is shared with / warm from the SDK's own Tor client.
+    /// Performs the one-time Tor bootstrap; call once at sync start when Tor is enabled.
+    pub async fn bootstrap(
+        tor_dir: &Path,
+        dangerously_trust_everyone: bool,
+    ) -> Result<Self, SlipstreamError> {
+        let boot = |e: &dyn std::fmt::Display| SlipstreamError::Transport(format!("tor bootstrap: {e}"));
+        let runtime = PreferredRuntime::current().map_err(|e| boot(&e))?;
+        if !tokio::fs::try_exists(tor_dir).await.map_err(|e| boot(&e))? {
+            return Err(SlipstreamError::Config(format!(
+                "tor bootstrap: directory {} does not exist",
+                tor_dir.display()
+            )));
+        }
+        let mut config_builder = TorClientConfigBuilder::from_directories(
+            tor_dir.join("arti-data"),
+            tor_dir.join("arti-cache"),
+        );
+        if dangerously_trust_everyone {
+            config_builder
+                .storage()
+                .permissions()
+                .dangerously_trust_everyone();
+        }
+        let config = config_builder.build().map_err(|e| boot(&e))?;
+        tracing::debug!(dir = %tor_dir.display(), "bootstrapping arti Tor client (engine-owned)");
+        let client = TorClient::with_runtime(runtime)
+            .config(config)
+            .create_bootstrapped()
+            .await
+            .map_err(|e| boot(&e))?;
+        tracing::debug!("arti Tor client bootstrapped");
+        Ok(Self { client })
+    }
+
+    /// Wrap an already-bootstrapped arti client (e.g. one shared with another component).
+    pub fn from_client(client: TorClient<PreferredRuntime>) -> Self {
+        Self { client }
+    }
+
+    /// The underlying arti handle.
+    pub fn client(&self) -> &TorClient<PreferredRuntime> {
+        &self.client
+    }
+
+    /// Tor clients can become less bootstrapped over time (lost connectivity, expired directory);
+    /// re-bootstrap before opening streams, as `zcash_client_backend` does.
+    async fn ensure_bootstrapped(&self) -> Result<(), SlipstreamError> {
+        if !self.client.bootstrap_status().ready_for_traffic() {
+            tracing::debug!("re-bootstrapping Tor");
+            self.client
+                .bootstrap()
+                .await
+                .map_err(|e| SlipstreamError::Transport(format!("tor re-bootstrap: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Open an isolated (`.uniqueTor`-style) lightwalletd client to `endpoint` through Tor.
+    /// OHTTP gateways are OHTTP-encapsulated with the relay leg dialled through Tor; other hosts
+    /// are dialled directly over Tor. Public entry point for hosts outside the engine (the SDK's
+    /// FFI Tor client) that must share this routing policy.
+    pub async fn connect_isolated(&self, endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+        self.connect(TorMode::Isolated, endpoint).await
+    }
+
+    async fn connect(
+        &self,
+        mode: TorMode,
+        endpoint: &Endpoint,
+    ) -> Result<LwdClient, SlipstreamError> {
+        self.ensure_bootstrapped().await?;
+        let relay = crate::ohttp::relay_for(&endpoint.host);
+        let per_attempt = if relay.is_some() {
+            TOR_OHTTP_CONNECT_TIMEOUT
+        } else {
+            TOR_CONNECT_TIMEOUT
+        };
+
+        // Bounded circuit build + retry on a FRESH circuit (see TOR_CONNECT_* docs). A stuck
+        // circuit is cut at the per-attempt timeout and the next attempt draws a new isolated
+        // circuit, instead of blocking on arti's long internal timeout. The healthy case connects
+        // on attempt 1 with no added latency.
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=TOR_CONNECT_ATTEMPTS {
+            // `.uniqueTor` = a fresh isolated circuit EACH attempt (so a retry escapes a stuck
+            // circuit); `.defaultTor` = the default circuit (a retry still gets a fresh isolated
+            // one, since the default one just failed us).
+            let client = match (mode, attempt) {
+                (TorMode::Default, 1) => self.client.clone(),
+                _ => self.client.isolated_client(),
+            };
+            let attempt_fut = async {
+                match relay {
+                    Some(relay) => Self::connect_ohttp(client, endpoint, relay).await,
+                    None => Self::connect_direct_over_tor(client, endpoint).await,
+                }
+            };
+            match tokio::time::timeout(per_attempt, attempt_fut).await {
+                Ok(Ok(c)) => return Ok(c),
+                Ok(Err(e)) => {
+                    tracing::warn!(attempt, err = %e, "tor connect failed — retrying on a fresh circuit");
+                    last_err = Some(format!("tor connect: {e}"));
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        attempt,
+                        timeout_secs = per_attempt.as_secs(),
+                        "tor circuit build timed out — retrying on a fresh circuit"
+                    );
+                    last_err = Some(format!(
+                        "tor connect: circuit build exceeded {}s",
+                        per_attempt.as_secs()
+                    ));
+                }
+            }
+        }
+        // Still transient — callers retry/defer (the build never silently de-anonymises to direct).
+        Err(SlipstreamError::Transport(last_err.unwrap_or_else(|| {
+            "tor connect: failed to obtain a circuit".to_string()
+        })))
+    }
+
+    /// OHTTP gateway over Tor: tonic talks to the in-process OHTTP pipe exactly as in
+    /// [`grpc::connect`]; the connector's TCP legs (relay POSTs, gateway key fetch) go through
+    /// `client`. `warm_up` pulls the key config and opens the pooled relay connection NOW, inside
+    /// the caller's per-attempt timeout, so a stuck circuit is retried instead of eating the first
+    /// RPC's deadline.
+    async fn connect_ohttp(
+        client: TorClient<PreferredRuntime>,
+        endpoint: &Endpoint,
+        relay: &str,
+    ) -> Result<LwdClient, SlipstreamError> {
+        tracing::info!(
+            gateway = %endpoint.host,
+            relay,
+            "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
+        );
+        let connector = OhttpConnector::with_dialer(&endpoint.host, relay, Dialer::Tor(client))
+            .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
+        connector
+            .warm_up()
+            .await
+            .map_err(|e| SlipstreamError::Transport(format!("ohttp over tor warm-up: {e}")))?;
+        // Plain `http://`: the transport tonic sees is an in-memory pipe; TLS happens inside the
+        // connector, towards the relay (tonic refuses `https://` without a tls_config).
+        let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
+        let channel = TonicEndpoint::from_shared(pipe_uri)
+            .map_err(|e| SlipstreamError::Transport(format!("endpoint uri: {e}")))?
+            .connect_timeout(Duration::from_secs(10))
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| SlipstreamError::Transport(format!("ohttp connect {}: {e}", endpoint.host)))?;
+        Ok(LwdClient::new(channel))
+    }
+
+    /// Non-OHTTP host: gRPC(+TLS) directly over a Tor stream — a port of
+    /// `zcash_client_backend::tor::Client::connect_to_lightwalletd` (same tonic timeouts and
+    /// keep-alives, webpki roots, `.onion` allowed when the host is one).
+    async fn connect_direct_over_tor(
+        client: TorClient<PreferredRuntime>,
+        endpoint: &Endpoint,
+    ) -> Result<LwdClient, SlipstreamError> {
+        let uri: Uri = endpoint
+            .uri()
+            .parse()
+            .map_err(|e| SlipstreamError::Config(format!("bad endpoint uri for tor: {e}")))?;
+        let mut prefs = StreamPrefs::new();
+        if endpoint.host.ends_with(".onion") {
+            prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
+        }
+        let mut ep = TonicEndpoint::from(uri)
+            .connect_timeout(TOR_GRPC_CONNECT_TIMEOUT)
+            .timeout(TOR_GRPC_REQUEST_TIMEOUT)
+            .http2_keep_alive_interval(TOR_GRPC_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(TOR_GRPC_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(false);
+        if endpoint.tls {
+            ep = ep
+                .tls_config(ClientTlsConfig::new().with_webpki_roots())
+                .map_err(|e| SlipstreamError::Transport(format!("tls config: {e}")))?;
+        }
+        let channel = ep
+            .connect_with_connector(TorTcpConnector { client, prefs })
+            .await
+            .map_err(|e| {
+                let source = std::error::Error::source(&e)
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default();
+                SlipstreamError::Transport(format!("tor connect {}: {e}{source}", endpoint.host))
+            })?;
+        Ok(LwdClient::new(channel))
+    }
+}
+
+/// `tower::Service<Uri>` that opens the gRPC transport as an arti stream (the host is resolved at
+/// the Tor exit, never locally).
+struct TorTcpConnector {
+    client: TorClient<PreferredRuntime>,
+    prefs: StreamPrefs,
+}
+
+impl Service<Uri> for TorTcpConnector {
+    type Response = TokioIo<DataStream>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let client = self.client.clone();
+        let prefs = self.prefs.clone();
+        Box::pin(async move {
+            let host = dst.host().ok_or("endpoint uri without host")?.to_string();
+            let port = dst
+                .port_u16()
+                .unwrap_or(if dst.scheme_str() == Some("https") { 443 } else { 80 });
+            tracing::debug!(host, port, "connecting through Tor");
+            let stream = client.connect_with_prefs((host.as_str(), port), &prefs).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+/// Plan-chunk cap (blocks per `GetBlockRange`) when bulk goes OHTTP-over-Tor. An OHTTP response
+/// is one buffered message, so a chunk is downloaded whole before any block can be scanned; at
+/// Tor throughput (~0.4 MB/s observed) a 10k-block spam-era chunk (~34 MB) takes minutes and
+/// stalls the pipeline, while 2k blocks (~7 MB) keep every round trip well inside the OHTTP
+/// deadlines and let progress advance. Plain (non-Tor) OHTTP keeps the configured size.
+pub const TOR_OHTTP_MAX_CHUNK_BLOCKS: u32 = 2_000;
+
+/// Effective `chunk_blocks` for a bulk fetch of `endpoint` with the given Tor handle.
+pub fn bulk_chunk_blocks(configured: u32, endpoint: &Endpoint, tor: Option<&TorConn>) -> u32 {
+    if tor.is_some() && crate::ohttp::relay_for(&endpoint.host).is_some() {
+        configured.min(TOR_OHTTP_MAX_CHUNK_BLOCKS)
+    } else {
+        configured
+    }
+}
+
+/// Builds lightwalletd clients honoring the per-call Tor policy.
+#[derive(Clone)]
+pub struct Connector {
+    endpoint: Endpoint,
+    tor: Option<TorConn>,
+}
+
+impl Connector {
+    /// Tor-off: every purpose dials directly.
+    pub fn direct(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            tor: None,
+        }
+    }
+
+    /// Tor-on: metadata over Tor, bulk still direct (unless the endpoint is an OHTTP gateway, in
+    /// which case bulk is OHTTP-over-Tor as well).
+    pub fn with_tor(endpoint: Endpoint, tor: TorConn) -> Self {
+        Self {
+            endpoint,
+            tor: Some(tor),
+        }
+    }
+
+    /// Open a lightwalletd client for `purpose`.
+    pub async fn connect(&self, purpose: ConnPurpose) -> Result<LwdClient, SlipstreamError> {
+        connect_via(&self.endpoint, self.tor.as_ref(), purpose).await
+    }
+}
+
+/// Free-function form of [`Connector::connect`] for call sites that already thread `endpoint`
+/// (from `EngineConfig`) and an optional Tor handle separately — avoids restructuring the run
+/// path around the bundled [`Connector`]. Same per-call policy: bulk → direct; metadata → Tor
+/// when `tor` is `Some`. The bulk path stays on the plain direct client even with Tor on,
+/// mirroring the old SDK's `blockStream(.direct)` — EXCEPT for OHTTP gateways, where Tor-on means
+/// bulk is OHTTP-over-Tor too (see [`route`]). Without Tor, `connect_direct_with_retry` →
+/// `grpc::connect` already speaks OHTTP to gateways (direct relay leg).
+pub async fn connect_via(
+    endpoint: &Endpoint,
+    tor: Option<&TorConn>,
+    purpose: ConnPurpose,
+) -> Result<LwdClient, SlipstreamError> {
+    let is_ohttp_gateway = crate::ohttp::relay_for(&endpoint.host).is_some();
+    match (tor, route(purpose, is_ohttp_gateway)) {
+        (Some(t), Some(mode)) => t.connect(mode, endpoint).await,
+        _ => connect_direct_with_retry(endpoint).await,
+    }
+}
+
+/// Bounded transient-failure retries for the DIRECT (non-Tor) connect path. The Tor path refreshes
+/// a fresh circuit per attempt ([`TOR_CONNECT_ATTEMPTS`]); the direct path has no circuit to
+/// refresh, so it waits out a brief server outage with capped exponential backoff and resumes in
+/// place — instead of letting a transient `connect` failure bubble up and restart the WHOLE sync
+/// pass (which resets per-pass progress and re-establishes everything; field log syncLogsMac3,
+/// 2026-06-29). 6 attempts with the backoff below ⇒ ~31s survival window; a genuinely-down or
+/// misconfigured endpoint still surfaces after it, and the healthy case connects on attempt 1 with
+/// ~0 overhead. A longer outage falls back to a pass restart, which the SDK's monotonic progress
+/// floor keeps from visibly regressing.
+const DIRECT_CONNECT_ATTEMPTS: u32 = 6;
+
+/// Capped exponential backoff between direct-connect attempts: 1, 2, 4, 8, 16s (then held at 16s).
+fn direct_connect_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << attempt.saturating_sub(1).min(4))
+}
+
+/// Retry a transient connect/op with bounded backoff. Returns the first `Ok`, or the error from the
+/// final attempt. A NON-transient error (config / logic) returns immediately — only `is_transient()`
+/// failures are retried. Generic over the success type so the retry + backoff logic is unit-testable
+/// without a live client.
+async fn retry_transient<T, F, Fut>(
+    mut op: F,
+    attempts: u32,
+    backoff: impl Fn(u32) -> std::time::Duration,
+) -> Result<T, SlipstreamError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SlipstreamError>>,
+{
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !e.is_transient() || attempt >= attempts {
+                    return Err(e);
+                }
+                tracing::warn!(attempt, err = %e, "direct connect failed (transient) — retrying after backoff");
+                tokio::time::sleep(backoff(attempt)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Direct (non-Tor) lightwalletd connect with bounded transient-failure retry (see
+/// `DIRECT_CONNECT_ATTEMPTS`). Drop-in for `grpc::connect` at the sites that must survive a brief
+/// server outage without restarting the sync pass: the bulk-fetch workers and the direct branch of
+/// [`connect_via`].
+pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    retry_transient(
+        || grpc::connect(endpoint),
+        DIRECT_CONNECT_ATTEMPTS,
+        direct_connect_backoff,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_is_direct_for_plain_hosts() {
+        // Even when Tor is on, bulk fetch carries no Tor circuit (mirrors blockStream(.direct)).
+        assert_eq!(tor_mode(ConnPurpose::BulkFetch), None);
+        assert_eq!(route(ConnPurpose::BulkFetch, false), None);
+    }
+
+    #[test]
+    fn ohttp_gateway_routes_every_purpose_through_tor() {
+        // With Tor on and an OHTTP gateway endpoint, nothing may bypass Tor: bulk rides the
+        // default circuit, metadata keeps its usual isolation.
+        assert_eq!(route(ConnPurpose::BulkFetch, true), Some(TorMode::Default));
+        assert_eq!(route(ConnPurpose::MetadataUnique, true), Some(TorMode::Isolated));
+        assert_eq!(route(ConnPurpose::MetadataDefault, true), Some(TorMode::Default));
+        assert!(crate::ohttp::relay_for("ohttp-gateway-testnet.example").is_some());
+    }
+
+    #[test]
+    fn bulk_chunk_cap_applies_only_to_ohttp_over_tor() {
+        let gw = Endpoint {
+            host: "ohttp-gateway-testnet.example".into(),
+            port: 443,
+            tls: true,
+        };
+        let plain = Endpoint {
+            host: "zec.rocks".into(),
+            port: 443,
+            tls: true,
+        };
+        // No Tor handle: configured size everywhere (a live TorConn needs a bootstrap, so the
+        // Tor-on branch is covered by the constant + the ignored live test).
+        assert_eq!(bulk_chunk_blocks(10_000, &gw, None), 10_000);
+        assert_eq!(bulk_chunk_blocks(10_000, &plain, None), 10_000);
+        assert!(TOR_OHTTP_MAX_CHUNK_BLOCKS >= 100, "must satisfy EngineConfig's chunk_blocks >= 100");
+        assert!(TOR_OHTTP_MAX_CHUNK_BLOCKS < crate::config::EngineConfig::DEFAULT_CHUNK_BLOCKS);
+    }
+
+    #[test]
+    fn ohttp_over_tor_timeout_leaves_room_for_two_circuits() {
+        assert!(TOR_OHTTP_CONNECT_TIMEOUT >= TOR_CONNECT_TIMEOUT);
+        assert!(TOR_OHTTP_CONNECT_TIMEOUT.as_secs() <= 60);
+    }
+
+    #[test]
+    fn metadata_maps_to_isolated_and_default_circuits() {
+        assert_eq!(
+            tor_mode(ConnPurpose::MetadataUnique),
+            Some(TorMode::Isolated)
+        ); // .uniqueTor
+        assert_eq!(
+            tor_mode(ConnPurpose::MetadataDefault),
+            Some(TorMode::Default)
+        ); // .defaultTor
+    }
+
+    /// Locks the bounded-retry design intent: at least one fresh-circuit retry, and a per-attempt
+    /// timeout that gives a healthy circuit room (>=5s) while cutting a stuck one promptly (<=30s).
+    #[test]
+    fn tor_connect_retry_constants_are_sane() {
+        const {
+            assert!(
+                TOR_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry on a fresh circuit"
+            )
+        };
+        let secs = TOR_CONNECT_TIMEOUT.as_secs();
+        assert!(
+            (5..=30).contains(&secs),
+            "per-attempt timeout must be 5..=30s (room for a healthy circuit, cut a stuck one), got {secs}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_recovers_from_a_brief_outage() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let out: Result<u32, SlipstreamError> = retry_transient(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n < 3 {
+                        Err(SlipstreamError::Transport("server down".into()))
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+            DIRECT_CONNECT_ATTEMPTS,
+            |_| std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(out.expect("recovers in place — no pass restart"), 3);
+        assert_eq!(
+            calls.get(),
+            3,
+            "stops retrying the moment the connect succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transient_gives_up_after_budget() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let out: Result<u32, SlipstreamError> = retry_transient(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(SlipstreamError::Transport("still down".into())) }
+            },
+            4,
+            |_| std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(
+            out.is_err(),
+            "a genuinely-down endpoint still surfaces (pass then falls back to a restart)"
+        );
+        assert_eq!(calls.get(), 4, "exactly `attempts` tries");
+    }
+
+    #[tokio::test]
+    async fn retry_transient_does_not_retry_nontransient() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let out: Result<u32, SlipstreamError> = retry_transient(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(SlipstreamError::Config("bad uri".into())) }
+            },
+            DIRECT_CONNECT_ATTEMPTS,
+            |_| std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(
+            calls.get(),
+            1,
+            "a non-transient (config) error surfaces immediately, never retried"
+        );
+    }
+
+    #[test]
+    fn direct_connect_backoff_is_capped_exponential() {
+        assert_eq!(direct_connect_backoff(1).as_secs(), 1);
+        assert_eq!(direct_connect_backoff(2).as_secs(), 2);
+        assert_eq!(direct_connect_backoff(5).as_secs(), 16);
+        assert_eq!(
+            direct_connect_backoff(99).as_secs(),
+            16,
+            "held at the 16s cap, never overflows"
+        );
+        const {
+            assert!(
+                DIRECT_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry to absorb a blip"
+            )
+        };
+    }
+}
