@@ -86,6 +86,12 @@ public enum ZcashError: Equatable, Error {
     /// TorClient is called but SDKFlags are set as Tor disabled
     /// ZTSRV0005
     case torNotEnabled
+    /// httpRequestOverOHTTP was called with a URL whose host is not in OHTTPEndpoints.
+    /// ZTSRV0006
+    case ohttpUnsupportedHost
+    /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.
+    /// ZTSRV0007
+    case ohttpResponseError
     /// SimpleConnectionProvider init of Connection failed.
     /// ZSCPC0001
     case simpleConnectionProvider(_ error: Error)
@@ -1039,6 +1045,8 @@ public enum ZcashError: Equatable, Error {
         case .grpcServiceCalledWithTorMode: return "GRPC Service is called with a Tor mode instead of direct one"
         case .torClientUnavailable: return "TorClient is nil"
         case .torNotEnabled: return "TorClient is called but SDKFlags are set as Tor disabled"
+        case .ohttpUnsupportedHost: return "Request host is not registered in OHTTPEndpoints"
+        case .ohttpResponseError: return "OHTTP response could not be converted to HTTPURLResponse"
         case .simpleConnectionProvider: return "SimpleConnectionProvider init of Connection failed."
         case .saplingParamsInvalidSpendParams: return "Downloaded file with sapling spending parameters isn't valid."
         case .saplingParamsInvalidOutputParams: return "Downloaded file with sapling output parameters isn't valid."
@@ -1337,6 +1345,8 @@ public enum ZcashError: Equatable, Error {
         case .grpcServiceCalledWithTorMode: return .grpcServiceCalledWithTorMode
         case .torClientUnavailable: return .torClientUnavailable
         case .torNotEnabled: return .torNotEnabled
+        case .ohttpUnsupportedHost: return .ohttpUnsupportedHost
+        case .ohttpResponseError: return .ohttpResponseError
         case .simpleConnectionProvider: return .simpleConnectionProvider
         case .saplingParamsInvalidSpendParams: return .saplingParamsInvalidSpendParams
         case .saplingParamsInvalidOutputParams: return .saplingParamsInvalidOutputParams

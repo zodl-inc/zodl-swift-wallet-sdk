@@ -57,6 +57,10 @@ public enum ZcashErrorCode: String {
     case torClientUnavailable = "ZTSRV0004"
     /// TorClient is called but SDKFlags are set as Tor disabled
     case torNotEnabled = "ZTSRV0005"
+    /// httpRequestOverOHTTP host not in OHTTPEndpoints
+    case ohttpUnsupportedHost = "ZTSRV0006"
+    /// OHTTP response could not be converted to HTTPURLResponse
+    case ohttpResponseError = "ZTSRV0007"
     /// SimpleConnectionProvider init of Connection failed.
     case simpleConnectionProvider = "ZSCPC0001"
     /// Downloaded file with sapling spending parameters isn't valid.

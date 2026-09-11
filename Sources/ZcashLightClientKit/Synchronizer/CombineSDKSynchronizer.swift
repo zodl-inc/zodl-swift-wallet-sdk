@@ -309,6 +309,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func httpRequestOverOHTTP(for request: URLRequest) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.httpRequestOverOHTTP(for: request)
+        }
+    }
+
     public var broadcaster: Broadcaster { synchronizer.broadcaster }
 
     public func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { synchronizer.rewind(policy) }

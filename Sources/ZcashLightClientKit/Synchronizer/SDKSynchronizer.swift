@@ -1234,6 +1234,53 @@ public class SDKSynchronizer: Synchronizer {
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
     }
 
+    /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
+    /// destination service. The request URL must use a hostname registered in `OHTTPEndpoints`
+    /// (e.g. `cmc.zodl.com`, `near.zodl.com`). Use `OHTTPEndpoints.proxyURL(for:)` to convert a
+    /// real API URL to its OHTTP proxy counterpart before calling this method.
+    ///
+    /// Tor/OHTTP matrix:
+    ///   - Tor OFF: call this method → OHTTP → gateway → destination (IP hidden from destination)
+    ///   - Tor ON:  call `httpRequestOverTor` directly → Tor → destination (IP hidden everywhere)
+    ///
+    /// Authored on Linux — compile validation pending on macOS.
+    public func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+        guard let host = request.url?.host,
+              OHTTPEndpoints.isGateway(host) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let relayURL = try OHTTPEndpoints.relayURL(for: host)
+        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+
+        let scheme = request.url?.scheme ?? "https"
+        let rawPath = request.url?.path ?? "/"
+        let queryStr = request.url?.query.map { "?\($0)" } ?? ""
+        let headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+        let body = request.httpBody ?? Data()
+
+        let bhttpRequest = BinaryHTTP.Request(
+            method: request.httpMethod ?? "GET",
+            scheme: scheme,
+            authority: host,
+            path: rawPath + queryStr,
+            headers: headers,
+            body: body
+        )
+
+        let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
+
+        guard let httpResponse = HTTPURLResponse(
+            url: request.url!,
+            statusCode: bhttpResponse.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(bhttpResponse.headers.map { $0 }, uniquingKeysWith: { _, last in last })
+        ) else {
+            throw ZcashError.ohttpResponseError
+        }
+        return (bhttpResponse.body, httpResponse)
+    }
+
     public func debugDatabase(sql: String) -> String {
         transactionRepository.debugDatabase(sql: sql)
     }
