@@ -1,0 +1,172 @@
+name: OHTTP E2E (testnet, macOS)
+
+# Live end-to-end verification of the OHTTP transport on Apple platforms: build the Rust FFI
+# and the Swift package on a macOS runner, run the offline OHTTP unit tests, then restore a
+# testnet wallet through ohttp-gateway-testnet.example twice — OHTTP only, and Tor + OHTTP.
+# The gateway/relay logs are checked out-of-band (see docs/ohttp.md in zodl-inc/infra): the
+# gateway must only ever see the relay pod, the relay must see this runner's egress IP (ohttp
+# job) or a Tor exit (tor job). Both IPs are printed in the job log and step summary.
+
+on:
+  push:
+    branches:
+      - feature/ohttp-integration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ohttp-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE: /Applications/Xcode_16.0.app/Contents/Developer
+
+jobs:
+  ffi:
+    name: Build FFI (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "$XCODE"
+
+      - name: FFI source hash
+        id: ffi-hash
+        run: |
+          FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -not -path "*/target/*" -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
+          echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache XCFramework
+        id: cache-ffi
+        uses: actions/cache@v4
+        with:
+          path: BuildSupport/products/libzcashlc.xcframework
+          key: ohttp-e2e-xcframework-macos-arm64-${{ steps.ffi-hash.outputs.hash }}
+
+      - name: Setup Rust
+        if: steps.cache-ffi.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo
+        if: steps.cache-ffi.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git
+          key: ohttp-e2e-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ohttp-e2e-cargo-
+
+      # arm64 only: the runner is arm64 and nothing here links an x86_64 slice.
+      - name: Build FFI for macOS
+        if: steps.cache-ffi.outputs.cache-hit != 'true'
+        timeout-minutes: 75
+        run: make ffi-macos MACOS_ARCHS=aarch64-apple-darwin
+
+      - name: Verify XCFramework
+        run: make verify-ffi
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: libzcashlc-xcframework-macos
+          path: BuildSupport/products/libzcashlc.xcframework
+          retention-days: 3
+          if-no-files-found: error
+
+  e2e:
+    name: E2E (${{ matrix.mode }})
+    needs: ffi
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ohttp, tor]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: sudo xcode-select -s "$XCODE"
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: libzcashlc-xcframework-macos
+          path: BuildSupport/products/libzcashlc.xcframework
+
+      - name: Configure local FFI
+        run: make configure-local-ffi
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
+          restore-keys: |
+            ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-
+            ohttp-e2e-swiftpm-
+
+      - name: Build Swift package
+        timeout-minutes: 30
+        run: make build
+
+      - name: Offline OHTTP unit tests
+        if: matrix.mode == 'ohttp'
+        timeout-minutes: 20
+        run: swift test --filter 'OHTTPTests' 2>&1 | tee offline-ohttp-tests.log
+
+      - name: Runner egress IP
+        if: ${{ !cancelled() }}
+        run: |
+          IP=$(curl -fsS --max-time 15 https://api.ipify.org || echo unknown)
+          echo "runner egress ip: $IP"
+          echo "### OHTTP E2E — ${{ matrix.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- runner egress IP: \`$IP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore + sync over ${{ matrix.mode == 'tor' && 'Tor + OHTTP' || 'OHTTP' }}
+        if: ${{ !cancelled() }}
+        timeout-minutes: 75
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
+          OHTTP_E2E_MIN_BALANCE_ZAT: ${{ vars.OHTTP_E2E_MIN_BALANCE_ZAT || '9000000000' }}
+          OHTTP_E2E_TIMEOUT_SECONDS: '3600'
+          TEST: ${{ matrix.mode == 'tor' && 'testRestoreAndSyncOverTorAndOHTTP' || 'testRestoreAndSyncOverOHTTP' }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/${TEST}" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Evidence summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo '```'
+            grep -h 'OHTTP-E2E' offline-ohttp-tests.log e2e-*.log 2>/dev/null | grep -E 'mode=|ip=|RESULT|synced|error|failed' || echo "no OHTTP-E2E lines captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohttp-e2e-logs-${{ matrix.mode }}
+          path: |
+            offline-ohttp-tests.log
+            e2e-*.log
+          if-no-files-found: ignore
