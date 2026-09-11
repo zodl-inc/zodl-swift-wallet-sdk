@@ -171,6 +171,80 @@ final class OHTTPE2ETests: ZcashTestCase {
         XCTAssertGreaterThanOrEqual(total, Env.minBalanceZatoshi, "restored balance too low for \(mode)")
     }
 
+    // MARK: - External API proxy tests
+
+    /// Verifies that CMC and NEAR external API calls are routed through the OHTTP gateway.
+    /// No wallet seed required — just checks the proxy path end-to-end.
+    /// Set OHTTP_E2E_TEST_EXTERNAL_APIS=0 to skip.
+    func testExternalAPIsViaOHTTP() async throws {
+        guard ProcessInfo.processInfo.environment["OHTTP_E2E_TEST_EXTERNAL_APIS"] != "0" else {
+            throw XCTSkip("OHTTP_E2E_TEST_EXTERNAL_APIS=0")
+        }
+        let runnerIP = await publicIP(via: nil) ?? "unknown"
+        log("mode=external-apis host egress ip=\(runnerIP)")
+
+        // Test 1: NEAR token list — public endpoint, no auth required.
+        let nearURL = URL(string: "https://1click.chaindefuser.com/v0/tokens")!
+        if OHTTPEndpoints.proxyURL(for: nearURL) != nil {
+            log("NEAR tokens: routing via near.zodl.com OHTTP proxy")
+            let (data, response) = try await externalAPIRequest(url: nearURL)
+            XCTAssertEqual(response.statusCode, 200, "NEAR token list via OHTTP should return 200")
+            XCTAssertGreaterThan(data.count, 100, "NEAR token list should have content")
+            log("RESULT external=near status=\(response.statusCode) bytes=\(data.count)")
+        } else {
+            log("SKIP external=near no proxy configured (OHTTPEndpoints.proxyURL returned nil)")
+        }
+
+        // Test 2: CMC key/info endpoint — no API key returns 401, but the gateway
+        // must have proxied the request (we verify a real HTTP response arrived).
+        let cmcURL = URL(string: "https://pro-api.coinmarketcap.com/v1/key/info")!
+        if OHTTPEndpoints.proxyURL(for: cmcURL) != nil {
+            log("CMC: routing via cmc.zodl.com OHTTP proxy")
+            let (_, response) = try await externalAPIRequest(url: cmcURL)
+            XCTAssertTrue(
+                [200, 400, 401, 403].contains(response.statusCode),
+                "CMC via OHTTP must return a real HTTP status (got \(response.statusCode))"
+            )
+            log("RESULT external=cmc status=\(response.statusCode)")
+        } else {
+            log("SKIP external=cmc no proxy configured")
+        }
+    }
+
+    /// Routes `url` through its OHTTP proxy mapping (OHTTPEndpoints.proxyURL).
+    /// Falls back to a plain URLSession request if no mapping exists.
+    private func externalAPIRequest(url: URL) async throws -> (Data, HTTPURLResponse) {
+        guard let proxyURL = OHTTPEndpoints.proxyURL(for: url),
+              let host = proxyURL.host else {
+            let (data, resp) = try await URLSession.shared.data(for: URLRequest(url: url))
+            // swiftlint:disable:next force_cast
+            return (data, resp as! HTTPURLResponse)
+        }
+        let relayURL = try OHTTPEndpoints.relayURL(for: host)
+        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+
+        var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
+        let rawPath = comps.path.isEmpty ? "/" : comps.path
+        let path = rawPath + (comps.query.map { "?\($0)" } ?? "")
+        let bhttp = BinaryHTTP.Request(
+            method: "GET",
+            scheme: "https",
+            authority: host,
+            path: path,
+            headers: [("user-agent", "zodl-ohttp-e2e/1.0")],
+            body: Data()
+        )
+        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+        let httpResp = HTTPURLResponse(
+            url: proxyURL,
+            statusCode: response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(response.headers.map { ($0.0, $0.1) }, uniquingKeysWith: { $1 })
+        )!
+        return (response.body, httpResp)
+    }
+
     // MARK: - Helpers
 
     /// Public IP as seen by an external service: through Tor when a synchronizer with Tor enabled
