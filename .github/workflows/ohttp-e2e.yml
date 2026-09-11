@@ -150,7 +150,12 @@ jobs:
           TEST: ${{ matrix.mode == 'tor' && 'testRestoreAndSyncOverTorAndOHTTP' || 'testRestoreAndSyncOverOHTTP' }}
         run: |
           set -o pipefail
+          # Run LWD sync test
           swift test --filter "OHTTPE2ETests/${TEST}" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+          # Run external API proxy test (CMC price + NEAR tokens via OHTTP) — only on ohttp matrix
+          if [ "${{ matrix.mode }}" = "ohttp" ]; then
+            swift test --filter "OHTTPE2ETests/testExternalAPIsViaOHTTP" 2>&1 | tee -a "e2e-${{ matrix.mode }}.log"
+          fi
 
       - name: Evidence summary
         if: ${{ always() }}
