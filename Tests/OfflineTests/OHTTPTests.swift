@@ -234,4 +234,57 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(frame[3], 0)
         XCTAssertEqual(frame[4], UInt8(payload.count))
     }
+
+    // MARK: - Proxy Allowlist Tests
+
+    func testProxyAllowlistLeadingDotSuffix() {
+        // Leading-dot suffix (.valargroup.org) matches subdomains only
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "prod.vote-chain-primary.valargroup.org"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "x.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evilvalargroup.org"))
+    }
+
+    func testProxyAllowlistBareDomain() {
+        // Bare domain (chaindefuser.com) matches itself or any subdomain
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "chaindefuser.com"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "api.chaindefuser.com"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evilchaindefuser.com"))
+    }
+
+    func testProxyAllowlistCaseInsensitive() {
+        // Host matching is case-insensitive
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "PROD.VOTE-CHAIN-PRIMARY.VALARGROUP.ORG"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "ChainDefUser.Com"))
+    }
+
+    func testProxyAllowlistValarGroupDev() {
+        // .valargroup.dev suffix
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "voting.valargroup.dev"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "api.valargroup.dev"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.dev"))
+    }
+
+    func testProxyAllowlistGatewayDetection() {
+        // Allowlisted hosts should be recognized as gateways
+        XCTAssertTrue(OHTTPEndpoints.isGateway("prod.vote-chain-primary.valargroup.org"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("1click.chaindefuser.com"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("voting.valargroup.dev"))
+    }
+
+    func testProxyAllowlistProxyHostPassthrough() {
+        // Allowlisted hosts return unchanged host (no rewrite)
+        let url1 = URL(string: "https://prod.vote-chain-primary.valargroup.org/path")!
+        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: url1), "prod.vote-chain-primary.valargroup.org")
+
+        let url2 = URL(string: "https://1click.chaindefuser.com/api")!
+        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: url2), "1click.chaindefuser.com")
+    }
+
+    func testProxyAllowlistProxyURLPassthrough() {
+        // Allowlisted hosts return unchanged URL (no hostname rewrite)
+        let url = URL(string: "https://prod.vote-chain-primary.valargroup.org/shielded-vote/v1/rounds?limit=10")!
+        XCTAssertEqual(OHTTPEndpoints.proxyURL(for: url), url)
+    }
 }

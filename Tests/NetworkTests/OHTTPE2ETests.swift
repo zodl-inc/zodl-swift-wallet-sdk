@@ -209,20 +209,56 @@ final class OHTTPE2ETests: ZcashTestCase {
         } else {
             log("SKIP external=cmc no proxy configured")
         }
+
+        // Test 3: valargroup.org voting chain — allowlisted host (no hostname rewrite).
+        // Real authority is passed to gateway, which proxies by :authority header.
+        let votechainURL = URL(string: "https://prod.vote-chain-primary.valargroup.org/shielded-vote/v1/rounds")!
+        if OHTTPEndpoints.proxyURL(for: votechainURL) != nil {
+            log("votechain: routing via OHTTP (allowlisted host, real authority)")
+            let (_, response) = try await externalAPIRequest(url: votechainURL)
+            // Accept any HTTP status as "proxied" — 200/401/403/404 all prove gateway reached host
+            XCTAssertTrue(
+                (200...599).contains(response.statusCode),
+                "votechain via OHTTP must return real HTTP status (got \(response.statusCode))"
+            )
+            log("RESULT external=votechain status=\(response.statusCode)")
+        } else {
+            log("SKIP external=votechain no proxy configured")
+        }
+
+        // Test 4: voting.valargroup.dev dynamic config — allowlisted host.
+        let dynamicConfigURL = URL(string: "https://voting.valargroup.dev/prod/dynamic-voting-config.json")!
+        if OHTTPEndpoints.proxyURL(for: dynamicConfigURL) != nil {
+            log("voting-dynamic: routing via OHTTP (allowlisted host)")
+            let (_, response) = try await externalAPIRequest(url: dynamicConfigURL)
+            XCTAssertTrue(
+                (200...599).contains(response.statusCode),
+                "voting-dynamic via OHTTP must return real HTTP status (got \(response.statusCode))"
+            )
+            log("RESULT external=voting-dynamic status=\(response.statusCode)")
+        } else {
+            log("SKIP external=voting-dynamic no proxy configured")
+        }
     }
 
     /// Routes `url` through its OHTTP proxy mapping (OHTTPEndpoints.proxyURL).
+    /// For allowlisted hosts: uses the original host as BHTTP authority (no rewrite).
+    /// For static mappings: uses the rewritten proxy host as authority.
     /// Falls back to a plain URLSession request if no mapping exists.
     private func externalAPIRequest(url: URL) async throws -> (Data, HTTPURLResponse) {
         guard let proxyURL = OHTTPEndpoints.proxyURL(for: url),
-              let host = proxyURL.host else {
+              let proxyHost = proxyURL.host,
+              let originalHost = url.host else {
             let (data, resp) = try await URLSession.shared.data(for: URLRequest(url: url))
             // swiftlint:disable:next force_cast
             return (data, resp as! HTTPURLResponse)
         }
-        let relayURL = try OHTTPEndpoints.relayURL(for: host)
-        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
+        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
         let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+
+        // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
+        let authority = OHTTPEndpoints.isProxyAllowlisted(host: originalHost) ? originalHost : proxyHost
 
         var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
         let rawPath = comps.path.isEmpty ? "/" : comps.path
@@ -230,7 +266,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         let bhttp = BinaryHTTP.Request(
             method: "GET",
             scheme: "https",
-            authority: host,
+            authority: authority,
             path: path,
             headers: [("user-agent", "zodl-ohttp-e2e/1.0")],
             body: Data()

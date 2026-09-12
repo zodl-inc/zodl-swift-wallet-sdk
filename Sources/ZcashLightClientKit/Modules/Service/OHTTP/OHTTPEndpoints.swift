@@ -33,42 +33,92 @@ enum OHTTPEndpoints {
         "params.zodl.com": "https://simulator-relay.example.invalid/relay",  // Sapling params download
     ]
 
-    /// True only for hosts that have a configured relay. Case-insensitive.
+    /// Proxy allowlist suffixes. Gateway v1.4.5+ proxies inner requests whose `:authority` ends
+    /// with one of these suffixes to `https://<authority>` — no hostname rewrite needed.
+    static let proxyAllowedSuffixes = [".valargroup.org", ".valargroup.dev", "chaindefuser.com"]
+
+    /// Returns true if the host is allowlisted for passthrough OHTTP proxying.
+    /// Suffix rule: leading-dot suffix (`.valargroup.org`) matches `x.valargroup.org` but NOT `valargroup.org`.
+    /// Bare domain (`chaindefuser.com`) matches itself or `*.chaindefuser.com`.
+    static func isProxyAllowlisted(host: String) -> Bool {
+        let lower = host.lowercased()
+        for suffix in proxyAllowedSuffixes {
+            if suffix.hasPrefix(".") {
+                // Leading-dot suffix: only matches subdomains
+                if lower.hasSuffix(suffix) && lower != suffix.dropFirst() {
+                    return true
+                }
+            } else {
+                // Bare domain: matches itself or any subdomain
+                if lower == suffix || lower.hasSuffix(".\(suffix)") {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// True only for hosts that have a configured relay (static mappings or allowlisted). Case-insensitive.
     static func isGateway(_ host: String) -> Bool {
-        return relayByGatewayHost[host.lowercased()] != nil
+        return relayByGatewayHost[host.lowercased()] != nil || isProxyAllowlisted(host: host)
     }
 
     static func relayURL(for gatewayHost: String) throws -> String {
-        guard let relay = relayByGatewayHost[gatewayHost.lowercased()] else {
-            throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
+        if let relay = relayByGatewayHost[gatewayHost.lowercased()] {
+            return relay
         }
-        return relay
+        if isProxyAllowlisted(host: gatewayHost) {
+            return "https://simulator-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
+        }
+        throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
 
-    /// Key config URL. Proxy hosts share the mainnet gateway's HPKE key config — the gateway
-    /// decrypts on their behalf regardless of which backend it eventually calls.
+    /// Key config URL. Proxy hosts (static mappings and allowlisted) share the mainnet gateway's
+    /// HPKE key config — the gateway decrypts on their behalf regardless of which backend it eventually calls.
     static func keyConfigURL(for gatewayHost: String) -> String {
-        let canonical = gatewayHost.hasPrefix("ohttp-gateway") ? gatewayHost : "ohttp-gateway.example"
-        return "https://\(canonical)/ohttp-configs"
+        if gatewayHost.hasPrefix("ohttp-gateway") {
+            return "https://\(gatewayHost)/ohttp-configs"
+        }
+        // Static mappings and allowlisted hosts use mainnet gateway config
+        return "https://ohttp-gateway.example/ohttp-configs"
     }
 
     /// Maps a real external-service URL to its OHTTP proxy hostname.
+    /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
+    /// For static mappings, returns the rewritten proxy host.
     /// Returns nil if the host has no configured proxy (caller should fall through to clearnet or Tor).
     static func proxyHost(for url: URL) -> String? {
+        guard let host = url.host else { return nil }
+
+        // Allowlisted hosts pass through unchanged
+        if isProxyAllowlisted(host: host) {
+            return host
+        }
+
+        // Static hostname mappings
         let mapping: [String: String] = [
             "pro-api.coinmarketcap.com": "cmc.zodl.com",
             "1click.chaindefuser.com":   "near.zodl.com",
             "voting.valargroup.dev":     "vote.zodl.com",
             "download.z.cash":           "params.zodl.com",
         ]
-        guard let host = url.host else { return nil }
         return mapping[host.lowercased()]
     }
 
-    /// Rewrites `url` to go through the OHTTP proxy (substitutes the hostname).
+    /// Rewrites `url` to go through the OHTTP proxy.
+    /// For allowlisted hosts: returns the SAME URL (no hostname rewrite; gateway proxies by `:authority`).
+    /// For static mappings: substitutes the proxy hostname.
     /// Returns nil when the host has no proxy mapping (e.g. Tor is already active).
     static func proxyURL(for url: URL) -> URL? {
         guard let proxyHost = proxyHost(for: url) else { return nil }
+
+        // Allowlisted hosts: return unchanged URL (proxyHost == original host)
+        guard let originalHost = url.host else { return nil }
+        if isProxyAllowlisted(host: originalHost) {
+            return url
+        }
+
+        // Static mappings: rewrite hostname
         var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         comps.host = proxyHost
         return comps.url
