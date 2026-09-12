@@ -224,8 +224,8 @@ private extension String {
         var i = self.startIndex
 
         while i < self.endIndex {
-            let c = self[i]
-            if c == "%" {
+            let character = self[i]
+            if character == "%" {
                 let nextIndex = self.index(after: i)
                 if nextIndex < self.endIndex, self.index(after: nextIndex) < self.endIndex {
                     let nextNextIndex = self.index(after: nextIndex)
@@ -238,7 +238,7 @@ private extension String {
                     }
                 }
             }
-            if let asciiValue = c.asciiValue {
+            if let asciiValue = character.asciiValue {
                 result.append(asciiValue)
             }
             i = self.index(after: i)
