@@ -48,3 +48,14 @@ pub(super) const PIR_PATH_LEN: usize = PIR_PATH_ELEMENT_COUNT * PIR_ROOT_LEN;
 
 /// Byte length of PIR nullifier field elements.
 pub(super) const PIR_NULLIFIER_LEN: usize = 32;
+
+#[cfg(test)]
+mod tests {
+    /// The voting chain now runs the 50-proposal circuit family. The crates.io
+    /// `zcash_voting 3.1.0` release still caps rounds at 15 proposals, so this
+    /// pins the SDK to a core that can vote on the upgraded chain.
+    #[test]
+    fn voting_core_supports_fifty_proposals() {
+        assert_eq!(zcash_voting::types::MAX_PROPOSAL_ID, 50);
+    }
+}

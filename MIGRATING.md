@@ -5,7 +5,13 @@
 Source FFI builds require Rust 1.91 or newer. The voting database migrates from schema 13
 to 17 when opened. Back up before upgrading: older voting cores cannot reopen the migrated
 schema. Existing proof, PIR, PCZT, replacement authority note and helper recovery records
-remain durable. Ordinary wallet storage and signing keep their existing backend.
+remain durable. Ordinary wallet storage and signing keep their existing backend, and the voting core now
+shares it: `zcash_voting` is built with its `lrz` (librustzcash) feature rather than its
+default Zakura backend. The core is the upstream `release/v3.x` line with
+`voting-circuits 0.12.0-rc.2`, so rounds may carry proposal ids 1 through 50 and the
+delegation verification key changed with them. A wallet on this SDK can only delegate and
+vote on a voting chain upgraded to those circuits; coordinate the app release with that
+chain upgrade.
 
 Create a helper from the prepared voting backend and the selected synchronizer route:
 

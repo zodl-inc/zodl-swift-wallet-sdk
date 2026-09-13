@@ -78,6 +78,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+### Voting core
+
+- Coinholder polling rounds may carry up to 50 proposals; the previous core capped rounds at
+  15. The FFI now links `zcash_voting` 3.1 from upstream `release/v3.x` (commit `a8f32ad2`) with
+  `voting-circuits 0.12.0-rc.2` on the librustzcash backend, which is the circuit family the
+  upgraded voting chain verifies. A wallet on this SDK cannot vote on a chain that still runs
+  the previous circuits, and a wallet on the previous SDK cannot vote on the upgraded chain.
+
 - Rust source builds now require Rust 1.91 or newer after the upgrade to
   `zcash_voting` 3.1.0 and `voting-circuits` 0.11.2 with the default Zakura backend.
   Update older toolchains before rebuilding the FFI. Opening a voting database migrates

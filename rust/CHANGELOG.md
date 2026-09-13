@@ -294,6 +294,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The voting core is `zcash_voting` 3.1 from the upstream `release/v3.x` branch
+  (commit `a8f32ad2`), which carries `voting-circuits 0.12.0-rc.2`: proposal ids
+  1 through 50 per round and the delegation verification key the upgraded voting
+  chain requires. The crate is built with its `lrz` (librustzcash) feature, not
+  its default Zakura backend, so the FFI links one Orchard/Halo 2 stack shared
+  with ordinary wallet operations. A wallet on this core can only delegate and
+  vote on a chain upgraded to those circuits.
 - Building this FFI now requires Rust 1.91 or newer. Upgrade older toolchains for
   `zcash_voting` 3.1.0 / `voting-circuits` 0.11.2 with the default Zakura backend.
   Opening the voting database upgrades schema 13 to 17, which older voting cores
