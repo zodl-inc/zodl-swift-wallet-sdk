@@ -86,12 +86,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgraded voting chain verifies. A wallet on this SDK cannot vote on a chain that still runs
   the previous circuits, and a wallet on the previous SDK cannot vote on the upgraded chain.
 
-- Rust source builds now require Rust 1.91 or newer after the upgrade to
-  `zcash_voting` 3.1.0 and `voting-circuits` 0.11.2 with the default Zakura backend.
-  Update older toolchains before rebuilding the FFI. Opening a voting database migrates
-  schema 13 to 17; older voting cores cannot reopen it. Existing five-note bundles and
-  their full voting weight are preserved. New helper preparation requires durable
-  terminal ballot decisions for the complete proposal roster; missing choices are not skips.
+- Rust source builds now require Rust 1.91 or newer after the upgrade to the
+  `zcash_voting` 3.1 line described under Voting core above. Update older toolchains
+  before rebuilding the FFI. Opening a voting database migrates schema 13 to 17; older
+  voting cores cannot reopen it. Existing five-note bundles and their full voting weight
+  are preserved. New helper preparation requires durable terminal ballot decisions for the
+  complete proposal roster; missing choices are not skips.
 - `VotingRustBackend.clearRecoveryState`, `recordShareDelegation`, `markShareConfirmed`
   and `addSentServers` are removed; calls no longer compile. Replace custom journal
   mutation with `VotingHelperClient` preparation, submission, confirmation and tracking.

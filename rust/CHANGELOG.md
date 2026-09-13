@@ -301,11 +301,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its default Zakura backend, so the FFI links one Orchard/Halo 2 stack shared
   with ordinary wallet operations. A wallet on this core can only delegate and
   vote on a chain upgraded to those circuits.
-- Building this FFI now requires Rust 1.91 or newer. Upgrade older toolchains for
-  `zcash_voting` 3.1.0 / `voting-circuits` 0.11.2 with the default Zakura backend.
-  Opening the voting database upgrades schema 13 to 17, which older voting cores
-  cannot reopen. Existing bundles and full voting weight are preserved; new helper
-  preparation requires durable terminal decisions for the complete proposal roster.
+- Building this FFI now requires Rust 1.91 or newer. Upgrade older toolchains for the
+  `zcash_voting` 3.1 line described in the previous entry. Opening the voting database
+  upgrades schema 13 to 17, which older voting cores cannot reopen. Existing bundles and
+  full voting weight are preserved; new helper preparation requires durable terminal
+  decisions for the complete proposal roster.
 - `zcashlc_voting_clear_recovery_state`, `zcashlc_voting_record_share_delegation`,
   `zcashlc_voting_mark_share_confirmed` and `zcashlc_voting_add_sent_servers` are removed;
   consumers calling them will no longer compile/link. Replace their custom journal
