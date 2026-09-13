@@ -475,4 +475,16 @@ mod tests {
             .unwrap();
         assert!(fixture.read(fixture.request()).is_err());
     }
+
+    /// The direct `voting-circuits` pin must be the same crate family the voting
+    /// core links, or `Instance::from_parts` would validate against a different
+    /// proposal-authority layout than the proofs were made with.
+    #[test]
+    fn direct_circuits_pin_matches_the_voting_core() {
+        let bits = zcash_voting::types::MAX_PROPOSAL_ID + 1;
+        assert_eq!(
+            voting_circuits::MAX_PROPOSAL_AUTHORITY,
+            (1u64 << bits) - 1
+        );
+    }
 }
