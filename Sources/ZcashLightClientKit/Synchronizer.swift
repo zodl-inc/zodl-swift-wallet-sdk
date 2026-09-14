@@ -1589,6 +1589,23 @@ public extension Synchronizer {
         nil
     }
 
+    /// Default implementation so adding `getTransactionOutputs(for transactions:)` to the
+    /// protocol is not a source-breaking change for downstream conformers. It answers correctly
+    /// but slowly — one single-transaction read per transaction — so a conformer that can read
+    /// outputs in bulk overrides it, as both shipped synchronizers do. A transaction without
+    /// outputs has no entry; a transaction listed twice is read once.
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
+        var seen: Set<Data> = []
+        for transaction in transactions where seen.insert(transaction.rawID).inserted {
+            let outputs = await getTransactionOutputs(for: transaction)
+            if !outputs.isEmpty {
+                outputsByRawID[transaction.rawID] = outputs
+            }
+        }
+        return outputsByRawID
+    }
+
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that have
     /// a lightwalletd connection (such as `SDKSynchronizer`) override this;
