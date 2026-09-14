@@ -856,6 +856,28 @@ public class SDKSynchronizer: Synchronizer {
         try await initializer.rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
     }
 
+    /// The service for any endpoint: OHTTP gateways get the RFC 9458 transport, everything else the
+    /// grpc-swift / Tor service — the same choice `Dependencies.setupForNewInstance` makes for the main
+    /// service. `evaluateBestOf`/`evaluateServerSwitch` and `switchTo` used to build a plain
+    /// `LightWalletGRPCServiceOverTor` here, which speaks plain gRPC to a gateway that refuses it
+    /// (426), so a healthy gateway failed validation and could never be a switch target.
+    static func makeService(
+        endpoint: LightWalletEndpoint,
+        tor: TorClient,
+        singleCallTimeout: Int64? = nil
+    ) -> LightWalletGRPCServiceOverTor {
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            if let singleCallTimeout {
+                return LightWalletOHTTPService(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+            }
+            return LightWalletOHTTPService(endpoint: endpoint, tor: tor)
+        }
+        if let singleCallTimeout {
+            return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+        }
+        return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+    }
+
     /// Takes the list of endpoints and runs it through a series of checks to evaluate its performance.
     /// - Parameters:
     ///    - endpoints: Array of endpoints to evaluate.
@@ -944,7 +966,7 @@ public class SDKSynchronizer: Synchronizer {
         let services = endpoints.map {
             Service(
                 originalEndpoint: $0,
-                service: LightWalletGRPCServiceOverTor(endpoint: $0, tor: torClient),
+                service: Self.makeService(endpoint: $0, tor: torClient),
                 // The scheme-qualified form so endpoints differing only in the TLS flag —
                 // distinct servers under `isSameServer` — cannot collide on one key.
                 url: $0.urlString
@@ -1595,7 +1617,7 @@ public class SDKSynchronizer: Synchronizer {
         // Validation of the server is first because any custom endpoint can be passed here
         // Extra instance of the service is created with lower timeout for a single call
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000)
+            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000)
         }
 
         let validateSever = ValidateServerAction(
@@ -1616,7 +1638,7 @@ public class SDKSynchronizer: Synchronizer {
 
         // LightWalletService dependency update
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            Self.makeService(endpoint: endpoint, tor: torClient)
         }
 
         // DEPENDENCIES
