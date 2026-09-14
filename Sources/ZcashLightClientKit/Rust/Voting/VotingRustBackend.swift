@@ -599,22 +599,36 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Proving intent
+
+/// Selects the proving priority for `buildAndProveDelegation`.
+public enum VotingProvingIntent: Sendable, Equatable {
+    /// prepared ahead of the user's Confirm; runs at utility priority without the pool-wide boost so
+    /// it never competes with work the user is waiting on. Swift escalates an awaited task to its
+    /// awaiter's priority, so a caller that wants the utility QoS must itself await from a
+    /// utility-or-lower task; a higher-priority caller still gets the missing boost, only not the
+    /// lower QoS.
+    case speculative
+    /// the user is waiting on this proof; the proving pool is boosted for its duration
+    case interactive
+}
+
 // MARK: - Interactive proving QoS boost
 
 extension VotingRustBackend {
     /// Raises every proving-pool worker from its resting utility QoS to
     /// user-initiated for the duration of an interactive proving session.
     /// Refcounted in the FFI; every begin must be paired with an end.
-    static func beginInteractiveProvingBoost() {
+    public static func beginInteractiveProvingBoost() {
         zcashlc_proving_interactive_begin()
     }
 
-    static func endInteractiveProvingBoost() {
+    public static func endInteractiveProvingBoost() {
         zcashlc_proving_interactive_end()
     }
 
     /// Outstanding interactive proving sessions (diagnostics and tests).
-    static func interactiveProvingBoostCount() -> Int32 {
+    public static func interactiveProvingBoostCount() -> Int32 {
         zcashlc_proving_interactive_active()
     }
 
@@ -622,8 +636,9 @@ extension VotingRustBackend {
     /// on every exit path. The FFI end is refcounted and saturating, but a
     /// missing end pins the pool at user-initiated for the process lifetime —
     /// route every boost through this helper instead of pairing the raw
-    /// begin/end statics by hand.
-    static func withInteractiveProvingBoost<T>(
+    /// begin/end statics by hand. Public so a host can hold the boost while it
+    /// waits on a proof it started speculatively.
+    public static func withInteractiveProvingBoost<T>(
         _ body: () async throws -> T
     ) async rethrows -> T {
         beginInteractiveProvingBoost()
@@ -2005,12 +2020,21 @@ extension VotingRustBackend {
     /// synchronous and non-cooperative, and runs to completion regardless of
     /// later cancellation. That limitation is inherent to the FFI boundary, not
     /// something this method closes.
+    ///
+    /// `intent` selects the proving priority. `.interactive` (default) boosts the proving pool for
+    /// the duration of the call, as before. `.speculative` runs without the boost at utility
+    /// priority, for a proof prepared before the user asked for it; a host that later needs that
+    /// proof can raise the pool with `withInteractiveProvingBoost` while it waits. Swift escalates
+    /// an awaited task to its awaiter's priority, so a caller that wants the utility QoS must
+    /// itself await from a utility-or-lower task; a higher-priority caller still gets the missing
+    /// boost, only not the lower QoS.
     public func buildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],
         expectedSnapshotHeight: UInt64,
         pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
+        intent: VotingProvingIntent = .interactive,
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> VotingDelegationProofResult {
         try await buildAndProveDelegation(
@@ -2019,6 +2043,7 @@ extension VotingRustBackend {
             expectedSnapshotHeight: expectedSnapshotHeight,
             pirLayout: pirLayout,
             pirResolver: pirResolver,
+            intent: intent,
             progress: progress,
             // A closure literal, not the bare `syncBuildAndProveDelegation` method reference: a
             // bound instance-method value is not inferred `@Sendable` even though `self` is
@@ -2050,6 +2075,7 @@ extension VotingRustBackend {
         expectedSnapshotHeight: UInt64,
         pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
+        intent: VotingProvingIntent = .interactive,
         progress: (@Sendable (Double) -> Void)? = nil,
         proveEntry: @escaping @Sendable (
             VotingDelegationProofParams,
@@ -2088,8 +2114,18 @@ extension VotingRustBackend {
         // closure consults before calling `proveEntry`. Once `proveEntry` has been entered, nothing
         // here can interrupt it — see this method's doc comment for why.
         return try await withTaskCancellationHandler {
-            try await Self.withInteractiveProvingBoost {
-                try await Task.detached(priority: .userInitiated) {
+            switch intent {
+            case .interactive:
+                return try await Self.withInteractiveProvingBoost {
+                    try await Task.detached(priority: .userInitiated) {
+                        if cancellationFlag.isCancelled {
+                            throw CancellationError()
+                        }
+                        return try proveEntry(params, pirServerUrl, pirLayout, progress)
+                    }.value
+                }
+            case .speculative:
+                return try await Task.detached(priority: .utility) {
                     if cancellationFlag.isCancelled {
                         throw CancellationError()
                     }
