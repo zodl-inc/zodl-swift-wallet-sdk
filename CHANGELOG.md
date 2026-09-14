@@ -111,6 +111,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
   as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
 
+### Coinholder voting
+
+- Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
+  voting-circuits 0.12 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
+  and a wallet built on it votes only on chains upgraded to that circuit. Nothing in the SDK's
+  voting API changed shape; the crate now also accepts `vote_protocol` v1 configs alongside v0 and
+  writes its sidecar under immediate SQLite transactions. Building the Rust core from source now
+  requires Rust 1.91.
+- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
+  (default) behaves as before; `.speculative` runs the proof at utility priority without the
+  pool-wide boost, for a proof a host prepares before the user asks for it. The interactive boost
+  helpers (`beginInteractiveProvingBoost`, `endInteractiveProvingBoost`,
+  `withInteractiveProvingBoost`, `interactiveProvingBoostCount`) are public so a host can raise the
+  pool while it waits on a speculative proof.
+
 ## Fixed
 
 - Slipstream lifecycle operations (start, stop, server switch, account import and delete, rewind,

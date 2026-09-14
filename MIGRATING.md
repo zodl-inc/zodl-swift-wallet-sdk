@@ -154,6 +154,27 @@ Helper-server payloads returned by `recoverWireJson(...)` now include `vote_roun
 (lowercase hex). Remove any app-side injection of that field; the payload remains verbatim wire
 JSON — do not decode, re-shape or re-encode it.
 
+## Voting rides `zcash_voting` 4.0.0-rc.1 — 50 proposals, upgraded chains only
+
+Rounds may now carry proposal ids 1 to 50 (previously 1 to 15), and a round's proposal count
+follows the same range. Host-side validation that mirrored the old 1 to 15 limit must accept the
+wider range, or it will reject proposals a 4.0 wallet would otherwise accept.
+
+A wallet built on `zcash_voting` 4.0 votes only on chains that have upgraded to the
+voting-circuits 0.12 delegation circuit, and a 3.x build stops working on a round once its chain
+makes that upgrade. Ship this SDK version together with the chain upgrade, not ahead of it, or
+users still on the old build lose the ability to vote until they update.
+
+`buildAndProveDelegation(intent:)` is additive: the default `.interactive` behaves exactly as
+before, so existing call sites keep compiling and behaving unchanged. A host that prepares a proof
+before the user reaches Confirm should pass `.speculative`, which runs the proof at utility
+priority without the pool-wide boost, and call `withInteractiveProvingBoost` around its later wait
+once the user does ask, to raise the pool back up for that wait. Swift escalates an awaited task
+to its awaiter's priority, so a host that wants the speculative proof to actually run at utility
+QoS must await it only from a task that is itself utility priority or lower — the interactive
+boost is exactly what the `.speculative` intent removes, and awaiting it from a higher-priority
+task silently restores it.
+
 ## Voting wire payloads are produced by `zcash_voting`, not by the SDK
 
 `VotingSharePayload` is removed and `VotingVoteCommit.sharePayloads` is gone with it. Helper-server
