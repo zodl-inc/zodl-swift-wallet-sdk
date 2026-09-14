@@ -2612,6 +2612,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// is fine for a real request but far too slow for a benchmark that must return promptly.
     /// Matches the app-side `evaluationTimeoutSeconds`. `internal` so tests can reference it.
     static let serverProbeTimeoutSeconds: Double = 5
+    /// Probe bound with Tor enabled: a fresh circuit plus a TLS handshake through it routinely
+    /// takes longer than the direct bound, and a benchmark that times out every clearnet fallback
+    /// leaves the wallet with nowhere to go when the gateway is down.
+    static let serverProbeTimeoutSecondsOverTor: Double = 20
 
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
@@ -2682,6 +2686,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
         let torClient = initializer.container.resolve(TorClient.self)
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let probeTimeout = await sdkFlags.torEnabled ? Self.serverProbeTimeoutSecondsOverTor : Self.serverProbeTimeoutSeconds
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
@@ -2690,7 +2695,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
                     let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
                     guard let probed = await Self.probe(
                         endpoint,
-                        timeoutSeconds: Self.serverProbeTimeoutSeconds,
+                        timeoutSeconds: probeTimeout,
                         using: service,
                         mode: mode
                     ) else {
