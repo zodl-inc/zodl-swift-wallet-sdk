@@ -417,6 +417,7 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func getMemos(for transaction: ZcashTransaction.Overview) async throws -> [Memo] { Self.unused() }
     func getRecipients(for transaction: ZcashTransaction.Overview) async -> [TransactionRecipient] { Self.unused() }
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output] { Self.unused() }
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] { Self.unused() }
     func allTransactions() async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func allTransactions(from transaction: ZcashTransaction.Overview, limit: Int) async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func latestHeight() async throws -> BlockHeight { Self.unused() }

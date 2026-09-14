@@ -1885,6 +1885,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         (try? await transactionRepository.getTransactionOutputs(for: transaction.rawID)) ?? []
     }
 
+    public func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        (try? await transactionRepository.getTransactionOutputs(for: transactions.map(\.rawID))) ?? [:]
+    }
+
     public func fetchTxidsWithMemoContaining(searchTerm: String) async throws -> [Data] {
         try await transactionRepository.fetchTxidsWithMemoContaining(searchTerm: searchTerm)
     }

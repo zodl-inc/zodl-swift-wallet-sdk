@@ -274,6 +274,31 @@ class TransactionSQLDAO: TransactionRepository {
         return try await execute(query) { try ZcashTransaction.Output(row: $0) }
     }
 
+    /// [MOB-1953] Ids per `IN (...)` statement. `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on every
+    /// SQLite the SDK runs against; 500 keeps each statement cheap to plan and bind, and the number
+    /// of statements is what bounds the cost, not their size.
+    static let outputsQueryChunkSize = 500
+
+    // DB-READ (audited 2026-09-14): SELECT over v_tx_outputs filtered with `txid IN (...)`, chunked.
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
+        var seen: Set<Data> = []
+        let uniqueRawIDs = rawIDs.filter { seen.insert($0).inserted }
+
+        var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
+        var start = 0
+        while start < uniqueRawIDs.count {
+            let end = min(start + Self.outputsQueryChunkSize, uniqueRawIDs.count)
+            let chunk = uniqueRawIDs[start..<end].map { Blob(bytes: $0.bytes) }
+            let query = txOutputsView.filter(chunk.contains(ZcashTransaction.Output.Column.rawID))
+            let outputs: [ZcashTransaction.Output] = try await execute(query) { try ZcashTransaction.Output(row: $0) }
+            for output in outputs {
+                outputsByRawID[output.rawID, default: []].append(output)
+            }
+            start = end
+        }
+        return outputsByRawID
+    }
+
     func getRecipients(for rawID: Data) async throws -> [TransactionRecipient] {
         try await getTransactionOutputs(for: rawID).map { $0.recipient }
     }

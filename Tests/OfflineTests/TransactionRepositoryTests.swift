@@ -275,6 +275,78 @@ class TransactionRepositoryTests: XCTestCase {
             XCTAssertLessThan(precedingBlockTime, transactionBlockTime)
         }
     }
+
+    // MARK: - MOB-1953: batched outputs
+
+    /// MOB-1953: the batched read must answer exactly what the per-row read answers for every
+    /// transaction in the fixture, so a client can replace its per-row loop with no behaviour
+    /// change. Output order within a transaction is the view's for both reads and is not asserted.
+    func testBatchedOutputsMatchPerRowOutputsForEveryTransaction() async throws {
+        let transactions = try await transactionRepository.find(offset: 0, limit: Int.max, kind: .all)
+        XCTAssertEqual(transactions.count, 21)
+
+        let batched = try await transactionRepository.getTransactionOutputs(for: transactions.map(\.rawID))
+
+        var transactionsWithOutputs = 0
+        for transaction in transactions {
+            let perRow = try await transactionRepository.getTransactionOutputs(for: transaction.rawID)
+            XCTAssertEqual(
+                Self.canonical(batched[transaction.rawID] ?? []),
+                Self.canonical(perRow),
+                "outputs of \(transaction.rawID.toHexStringTxId()) differ between the batched and the per-row read"
+            )
+            if !perRow.isEmpty {
+                transactionsWithOutputs += 1
+            }
+        }
+        XCTAssertGreaterThan(transactionsWithOutputs, 0, "the fixture must exercise at least one transaction with outputs")
+        XCTAssertTrue(
+            Set(batched.keys).subtracting(transactions.map(\.rawID)).isEmpty,
+            "the batch must not answer for ids it was not asked about"
+        )
+    }
+
+    /// MOB-1953: more ids than one statement's chunk, most of them unknown, some duplicated. The
+    /// read must chunk (never trip SQLite's bound-variable limit), answer the known ids exactly
+    /// as the per-row read does, produce no entry for an id the wallet has never seen, and not
+    /// duplicate the rows of a duplicated id.
+    func testBatchedOutputsChunkAndIgnoreUnknownIds() async throws {
+        let transactions = try await transactionRepository.find(offset: 0, limit: Int.max, kind: .all)
+        let unknownIDs: [Data] = (0..<(TransactionSQLDAO.outputsQueryChunkSize + 37)).map { _ in
+            Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        }
+        let knownIDs = transactions.map(\.rawID)
+
+        let batched = try await transactionRepository.getTransactionOutputs(for: unknownIDs + knownIDs + knownIDs)
+
+        for id in unknownIDs {
+            XCTAssertNil(batched[id], "an id the wallet has never seen must have no entry")
+        }
+        for transaction in transactions {
+            let perRow = try await transactionRepository.getTransactionOutputs(for: transaction.rawID)
+            XCTAssertEqual(
+                Self.canonical(batched[transaction.rawID] ?? []),
+                Self.canonical(perRow),
+                "a duplicated id must answer once, with the per-row rows"
+            )
+        }
+    }
+
+    /// MOB-1953: asking for nothing answers nothing and issues no query.
+    func testBatchedOutputsForNoIdsIsEmpty() async throws {
+        let batched = try await transactionRepository.getTransactionOutputs(for: [])
+        XCTAssertTrue(batched.isEmpty)
+    }
+
+    /// Order-insensitive fingerprint of an output list: the two reads share no ORDER BY, so only
+    /// the multiset is compared.
+    private static func canonical(_ outputs: [ZcashTransaction.Output]) -> [String] {
+        outputs
+            .map { output in
+                "\(String(describing: output.pool))|\(output.index)|\(output.value.amount)|\(output.isChange)|\(String(describing: output.recipient))"
+            }
+            .sorted()
+    }
 }
 
 extension Data {

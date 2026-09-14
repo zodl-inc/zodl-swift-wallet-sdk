@@ -21,6 +21,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
   without reporting it here.
 
+### Transaction outputs in one read
+
+- `Synchronizer.getTransactionOutputs(for transactions:)` returns the outputs of many transactions
+  at once, keyed by `rawID`, in one `v_tx_outputs` query per 500 transactions. The
+  single-transaction `getTransactionOutputs(for:)` runs one query per call, and every such query
+  first materialises the wallet's whole notes union, so a client that mapped a long history one
+  row at a time paid transactions × notes for it — 1,256 queries and 25 seconds for a
+  1,255-transaction wallet on an iPhone 15, before any contention. The same rows come back in
+  milliseconds through this call. Output order within a transaction is the view's, as with the
+  single-transaction call; a transaction without outputs has no entry.
+
 ### Submissions
 
 - `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
