@@ -392,7 +392,9 @@ extension OHTTPE2ETests {
             isTorEnabled: tor,
             isExchangeRateEnabled: false
         )
-        let synchronizer = SDKSynchronizer(initializer: initializer)
+        // The apps run the engine-backed synchronizer (`useSlipstreamSynchronizer` defaults to
+        // true), so the fallback primitives are exercised on the same class the apps use.
+        let synchronizer = SlipstreamSynchronizer(initializer: initializer)
         defer { synchronizer.stop() }
 
         let prepared = try await synchronizer.prepare(with: [UInt8](seed), walletBirthday: Env.birthday, name: "ohttp-e2e", keySource: nil)

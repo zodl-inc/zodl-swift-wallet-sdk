@@ -2654,11 +2654,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
     static func probe(
         _ endpoint: LightWalletEndpoint,
         timeoutSeconds: Double,
-        using service: LightWalletService
+        using service: LightWalletService,
+        mode: ServiceMode = .direct
     ) async -> (roundTrip: TimeInterval, info: LightWalletdInfo)? {
         let start = DispatchTime.now()
         let info = try? await withTaskTimeout(UInt64(timeoutSeconds * 1_000_000_000)) {
-            try await service.getInfo(mode: .direct)
+            try await service.getInfo(mode: mode)
         }
         let elapsed = DispatchTime.now().secondsSince(start)
         await service.closeConnections()
@@ -2669,21 +2670,30 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
     /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// `ValidateServerAction`. Delegates to ephemeral connections built by
+    /// `SDKSynchronizer.makeService`: OHTTP gateways get `LightWalletOHTTPService` (a plain gRPC
+    /// probe to a gateway is refused with 426, so a healthy gateway would never rank), and with
+    /// Tor enabled every probe rides a Tor circuit — a benchmark of clearnet fallbacks must not
+    /// leak the device IP to servers the user has not chosen.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    // Note: OHTTP dispatch happens at the DI level in Dependencies.swift
-                    // This evaluation path uses ephemeral direct connections only
-                    let service = LightWalletGRPCService(endpoint: endpoint)
-                    guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient)
+                    let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
+                    guard let probed = await Self.probe(
+                        endpoint,
+                        timeoutSeconds: Self.serverProbeTimeoutSeconds,
+                        using: service,
+                        mode: mode
+                    ) else {
                         return nil
                     }
                     return (endpoint, probed.roundTrip, probed.info)
