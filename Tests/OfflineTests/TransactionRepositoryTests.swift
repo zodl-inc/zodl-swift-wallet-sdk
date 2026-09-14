@@ -5,11 +5,16 @@
 //  Created by Francisco Gindre on 11/16/19.
 //
 
+import SQLite
 import XCTest
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
 class TransactionRepositoryTests: XCTestCase {
+    enum TestError: Error {
+        case fixtureHasNoSentNotes
+    }
+
     func testZIP318KindDecodesEveryKnownClassification() {
         XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 0), .notClassified)
         XCTAssertEqual(ZcashTransaction.Overview.ZIP318Kind(rawValue: 1), .nonconforming)
@@ -280,7 +285,8 @@ class TransactionRepositoryTests: XCTestCase {
 
     /// MOB-1953: the batched read must answer exactly what the per-row read answers for every
     /// transaction in the fixture, so a client can replace its per-row loop with no behaviour
-    /// change. Output order within a transaction is the view's for both reads and is not asserted.
+    /// change. Order is part of that: both queries order by pool and then output index, and the
+    /// app reads the first address of a transaction, so the arrays are compared as arrays.
     func testBatchedOutputsMatchPerRowOutputsForEveryTransaction() async throws {
         let transactions = try await transactionRepository.find(offset: 0, limit: Int.max, kind: .all)
         XCTAssertEqual(transactions.count, 21)
@@ -291,8 +297,8 @@ class TransactionRepositoryTests: XCTestCase {
         for transaction in transactions {
             let perRow = try await transactionRepository.getTransactionOutputs(for: transaction.rawID)
             XCTAssertEqual(
-                Self.canonical(batched[transaction.rawID] ?? []),
-                Self.canonical(perRow),
+                batched[transaction.rawID] ?? [],
+                perRow,
                 "outputs of \(transaction.rawID.toHexStringTxId()) differ between the batched and the per-row read"
             )
             if !perRow.isEmpty {
@@ -325,8 +331,8 @@ class TransactionRepositoryTests: XCTestCase {
         for transaction in transactions {
             let perRow = try await transactionRepository.getTransactionOutputs(for: transaction.rawID)
             XCTAssertEqual(
-                Self.canonical(batched[transaction.rawID] ?? []),
-                Self.canonical(perRow),
+                batched[transaction.rawID] ?? [],
+                perRow,
                 "a duplicated id must answer once, with the per-row rows"
             )
         }
@@ -338,14 +344,140 @@ class TransactionRepositoryTests: XCTestCase {
         XCTAssertTrue(batched.isEmpty)
     }
 
-    /// Order-insensitive fingerprint of an output list: the two reads share no ORDER BY, so only
-    /// the multiset is compared.
-    private static func canonical(_ outputs: [ZcashTransaction.Output]) -> [String] {
-        outputs
-            .map { output in
-                "\(String(describing: output.pool))|\(output.index)|\(output.value.amount)|\(output.isChange)|\(String(describing: output.recipient))"
-            }
-            .sorted()
+    /// MOB-1953: an output row that cannot be decoded must cost that row and nothing else.
+    /// `ZcashTransaction.Output.init(row:)` throws on a row naming neither an address the SDK can
+    /// parse nor a receiving account, and the batched read decodes up to 500 transactions' rows in
+    /// one statement. Decoding that statement strictly meant one such row threw for the whole
+    /// chunk, and both synchronizers answer a throw with an empty dictionary for every transaction
+    /// the caller asked about — so a single bad row emptied the outputs of the entire list. Those
+    /// same callers wrap the per-transaction read in `try?`, which has always confined the failure
+    /// to one transaction; this pins the batched read to no worse than that.
+    func testBatchedOutputsSkipOnlyTheRowThatFailsToDecode() async throws {
+        let transactions = try await transactionRepository.find(offset: 0, limit: Int.max, kind: .all)
+        var expectedOutputs: [Data: [ZcashTransaction.Output]] = [:]
+        for transaction in transactions {
+            expectedOutputs[transaction.rawID] = try await transactionRepository.getTransactionOutputs(for: transaction.rawID)
+        }
+
+        // `setUp` migrates the bundled fixture in place, so a copy taken here already carries the
+        // current schema. The copy is what gets poisoned: the fixture itself stays usable by every
+        // other test in the suite.
+        let poisonedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("poisoned_outputs_\(UUID().uuidString).db")
+        try FileManager.default.copyItem(at: TestDbBuilder.prePopulatedMainnetDataDbURL()!, to: poisonedURL)
+        defer { try? FileManager.default.removeItem(at: poisonedURL) }
+
+        let poisonedTxID = try Self.insertUndecodableOutputRow(intoDbAt: poisonedURL)
+        guard let poisonedTransaction = transactions.first(where: { $0.rawID == poisonedTxID }) else {
+            return XCTFail("the poisoned row must belong to a transaction the wallet reports")
+        }
+        XCTAssertFalse(
+            expectedOutputs[poisonedTxID, default: []].isEmpty,
+            "the poisoned transaction must already own decodable rows, or the test proves nothing"
+        )
+
+        let trace = TraceRecorder()
+        let poisonedRepository = TransactionSQLDAO(
+            dbProvider: SimpleConnectionProvider(path: poisonedURL.path, readonly: true),
+            traceClosure: { trace.record($0) }
+        )
+
+        // The inserted row really is undecodable: the strict per-transaction read cannot get past it.
+        do {
+            _ = try await poisonedRepository.getTransactionOutputs(for: poisonedTxID)
+            XCTFail("the inserted row must fail to decode, otherwise nothing is being tested")
+        } catch {
+            // Expected — the per-transaction read is strict, which is why its callers use `try?`.
+        }
+
+        let batched = try await poisonedRepository.getTransactionOutputs(for: transactions.map(\.rawID))
+
+        for transaction in transactions where transaction.rawID != poisonedTxID {
+            XCTAssertEqual(
+                batched[transaction.rawID] ?? [],
+                expectedOutputs[transaction.rawID] ?? [],
+                "one bad row elsewhere must not touch \(transaction.rawID.toHexStringTxId())"
+            )
+        }
+        XCTAssertEqual(
+            batched[poisonedTxID] ?? [],
+            expectedOutputs[poisonedTxID] ?? [],
+            "the poisoned transaction must keep every row of its own that still decodes"
+        )
+        XCTAssertTrue(
+            trace.messages.contains { $0.contains("skipped an output row that failed to decode") },
+            "a skipped row must be reported, not swallowed silently"
+        )
+        XCTAssertEqual(
+            poisonedTransaction.rawID,
+            poisonedTxID,
+            "sanity: the poisoned transaction is the one whose outputs were asserted above"
+        )
+    }
+
+    /// Adds one row to `sent_notes` that `ZcashTransaction.Output.init(row:)` cannot decode, and
+    /// answers the raw id of the transaction it belongs to. Every column is copied from a row that
+    /// is already there, so the table's NOT NULL columns and its uniqueness constraint are
+    /// satisfied without the test having to know the migrated schema by heart; exactly one thing is
+    /// broken, the recipient — an address no parser accepts, and no receiving account to fall back
+    /// on.
+    private static func insertUndecodableOutputRow(intoDbAt url: URL) throws -> Data {
+        let connection = try SimpleConnectionProvider(path: url.path, readonly: false).connection()
+
+        guard let transactionID = try connection.scalar(
+            "SELECT transaction_id FROM sent_notes ORDER BY transaction_id LIMIT 1"
+        ) as? Int64 else {
+            throw TestError.fixtureHasNoSentNotes
+        }
+
+        // Free across the whole view, not just `sent_notes`: `v_tx_outputs` merges a sent row and a
+        // received row that share (transaction, pool, index), and a merged row borrows the received
+        // row's account — which would make the poisoned row decode after all.
+        let freeOutputIndex = (try connection.scalar(
+            "SELECT IFNULL(MAX(output_index), -1) + 1 FROM v_tx_outputs WHERE transaction_id = ?",
+            transactionID
+        ) as? Int64) ?? 0
+
+        try connection.run(
+            """
+            INSERT INTO sent_notes
+                (transaction_id, output_pool, output_index, from_account_id, to_address, to_account_id, value, memo)
+            SELECT transaction_id, output_pool, ?, from_account_id, ?, NULL, value, NULL
+            FROM sent_notes WHERE transaction_id = ? LIMIT 1
+            """,
+            freeOutputIndex,
+            "not-an-address-any-parser-accepts",
+            transactionID
+        )
+
+        guard let txid = try connection.scalar(
+            "SELECT txid FROM transactions WHERE id_tx = ?",
+            transactionID
+        ) as? Blob else {
+            throw TestError.fixtureHasNoSentNotes
+        }
+
+        return Data(blob: txid)
+    }
+}
+
+/// Collects what the DAO reports through its trace hook. SQLite invokes the hook synchronously on
+/// whichever thread runs the statement, so the collection is locked. `NSLock` rather than
+/// `OSAllocatedUnfairLock` because the package's platform floor predates the latter.
+private final class TraceRecorder {
+    private let lock = NSLock()
+    private var collected: [String] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return collected
+    }
+
+    func record(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        collected.append(message)
     }
 }
 

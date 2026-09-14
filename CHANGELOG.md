@@ -29,11 +29,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first materialises the wallet's whole notes union, so a client that mapped a long history one
   row at a time paid transactions × notes for it — 1,256 queries and 25 seconds for a
   1,255-transaction wallet on an iPhone 15, before any contention. The same rows come back in
-  milliseconds through this call. Output order within a transaction is the view's, as with the
-  single-transaction call; a transaction without outputs has no entry. The protocol requirement
-  ships with a default implementation that falls back to one single-transaction read per
-  transaction, so custom `Synchronizer` conformers and test doubles keep compiling unchanged; both
-  shipped synchronizers override it with the batched read.
+  milliseconds through this call. Output order within a transaction is by pool and then output
+  index, for this call and for the single-transaction one alike; a transaction without outputs has
+  no entry. The protocol requirement ships with a default implementation that falls back to one
+  single-transaction read per transaction, so custom `Synchronizer` conformers and test doubles
+  keep compiling unchanged; both shipped synchronizers override it with the batched read.
 
 ### Submissions
 

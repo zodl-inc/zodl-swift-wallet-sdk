@@ -439,9 +439,9 @@ public protocol Synchronizer: AnyObject {
     /// query per 500 transactions instead of one per transaction (MOB-1953). Every `v_tx_outputs`
     /// query first materialises the wallet's whole notes union, so mapping a long history one row
     /// at a time costs transactions × notes; this call costs a handful of queries. Output order
-    /// within a transaction is the view's, as with `getTransactionOutputs(for:)`. A transaction
-    /// without outputs has no entry. Answers `[:]` if the read fails, as the single-transaction
-    /// call answers `[]`.
+    /// within a transaction is by pool and then output index, as with `getTransactionOutputs(for:)`.
+    /// A transaction without outputs has no entry. Answers `[:]` if the read fails, as the
+    /// single-transaction call answers `[]`.
     // sourcery: mockedName="getTransactionOutputsForTransactions"
     func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]]
 
