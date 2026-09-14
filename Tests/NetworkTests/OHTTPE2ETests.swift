@@ -337,6 +337,125 @@ private extension Data {
 // MARK: - OHTTP -> clearnet fallback primitives
 
 extension OHTTPE2ETests {
+    /// Mainnet clearnet fallback tier benchmark: measure the wall time of evaluating the mainnet
+    /// gateway (tier 0) and the 7 mainnet clearnet hosts (tier 1) with `evaluateBestOf`.
+    /// Controlled by `OHTTP_E2E_TOR=1` for Tor mode (same `matrix.mode` as the other tests).
+    func testMainnetFallbackTierBenchmark() async throws {
+        guard let seedHex = Env.seedHex, let seed = Data(hexString: seedHex), seed.count == 64 else {
+            throw XCTSkip("OHTTP_E2E_SEED_HEX not set (or not a 64-byte hex seed); mainnet benchmark skipped")
+        }
+        let environment = ProcessInfo.processInfo.environment
+        let tor = environment["OHTTP_E2E_TOR"] == "1"
+        let mode = tor ? "tor" : "ohttp"
+        log("mode=\(mode) network=mainnet gateway=ohttp-gateway.example")
+
+        let gateway = LightWalletEndpoint(
+            address: "ohttp-gateway.example",
+            port: 443,
+            secure: true,
+            singleCallTimeoutInMillis: 30_000,
+            streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+        )
+
+        // Tier 1: 7 mainnet clearnet hosts
+        let clearnetHosts = [
+            "zec.rocks",
+            "na.zec.rocks",
+            "sa.zec.rocks",
+            "eu.zec.rocks",
+            "ap.zec.rocks",
+            "us.zec.stardust.rest",
+            "eu.zec.stardust.rest"
+        ]
+        let tier1Endpoints = clearnetHosts.map { host in
+            LightWalletEndpoint(
+                address: host,
+                port: 443,
+                secure: true,
+                singleCallTimeoutInMillis: 30_000,
+                streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+            )
+        }
+
+        let databases = TemporaryDbBuilder.build()
+        let initializer = Initializer(
+            cacheDbURL: nil,
+            fsBlockDbRoot: databases.fsCacheDbRoot,
+            generalStorageURL: databases.generalStorageURL,
+            dataDbURL: databases.dataDB,
+            torDirURL: databases.torDir,
+            endpoint: gateway,
+            network: ZcashNetworkBuilder.network(for: .mainnet),
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            alias: .custom("ohttp-e2e-bench-mainnet-\(mode)"),
+            loggingPolicy: .default(.debug),
+            isTorEnabled: tor,
+            isExchangeRateEnabled: false
+        )
+        let synchronizer = SlipstreamSynchronizer(initializer: initializer)
+        defer { synchronizer.stop() }
+
+        // Mainnet sapling activation is 419200, but use a more recent checkpoint for faster prepare
+        let mainnetBirthday: BlockHeight = 2_500_000
+        let prepared = try await synchronizer.prepare(
+            with: [UInt8](seed),
+            walletBirthday: mainnetBirthday,
+            name: "bench-mainnet",
+            keySource: nil
+        )
+        guard case .success = prepared else {
+            return XCTFail("prepare() returned \(prepared), expected .success")
+        }
+        log("prepared wallet (mainnet, birthday=\(mainnetBirthday))")
+
+        if tor {
+            try await synchronizer.tor(enabled: true)
+            log("tor enabled, initialized=\(String(describing: await synchronizer.isTorSuccessfullyInitialized()))")
+        }
+
+        // Tier 0: measure gateway
+        let tier0Start = DispatchTime.now()
+        let tier0Ranked = await synchronizer.evaluateBestOf(
+            endpoints: [gateway],
+            fetchThresholdSeconds: 20,
+            nBlocksToFetch: 1,
+            kServers: 1,
+            network: .mainnet
+        )
+        let tier0End = DispatchTime.now()
+        let tier0Seconds = Double(tier0End.uptimeNanoseconds - tier0Start.uptimeNanoseconds) / 1_000_000_000.0
+        let tier0Hosts = tier0Ranked.map { $0.host }
+        log("RESULT bench mode=\(mode) tier0_seconds=\(String(format: "%.2f", tier0Seconds)) tier0_ranked=\(tier0Hosts)")
+
+        // Tier 1: measure clearnet hosts, repeat 3 times
+        var anyRunRanked = false
+        for run in 1...3 {
+            let tier1Start = DispatchTime.now()
+            let tier1Ranked = await synchronizer.evaluateBestOf(
+                endpoints: tier1Endpoints,
+                fetchThresholdSeconds: 20,
+                nBlocksToFetch: 1,
+                kServers: 3,
+                network: .mainnet
+            )
+            let tier1End = DispatchTime.now()
+            let tier1Seconds = Double(tier1End.uptimeNanoseconds - tier1Start.uptimeNanoseconds) / 1_000_000_000.0
+            let tier1Hosts = tier1Ranked.map { $0.host }
+            log(
+                "RESULT bench mode=\(mode) tier1_run=\(run) tier1_seconds=\(String(format: "%.2f", tier1Seconds)) tier1_ranked=\(tier1Hosts)"
+            )
+
+            if !tier1Ranked.isEmpty {
+                anyRunRanked = true
+            }
+            XCTAssertLessThan(tier1Seconds, 60.0, "tier 1 measurement must complete within 60s (run \(run))")
+        }
+
+        XCTAssertTrue(anyRunRanked, "tier 1 must rank at least one host in at least one run")
+    }
+
     /// SDK-level half of the fallback design (the decision itself lives in the apps'
     /// `OHTTPFirstServerPolicy`): prove the primitives the apps rely on, against the live testnet
     /// gateway and the clearnet `testnet.zec.rocks`.

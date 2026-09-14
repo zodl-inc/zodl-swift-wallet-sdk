@@ -17,13 +17,15 @@ on:
         description: >-
           e2e = restore+sync over OHTTP / Tor+OHTTP (default);
           fallback-up = gateway reachable, policy stays on OHTTP;
-          fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks
+          fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks;
+          bench-mainnet = mainnet clearnet fallback tier benchmark
         type: choice
         default: e2e
         options:
           - e2e
           - fallback-up
           - fallback-down
+          - bench-mainnet
 
 permissions:
   contents: read
@@ -180,6 +182,16 @@ jobs:
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testFallbackPrimitives" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Mainnet clearnet fallback tier benchmark
+        if: ${{ !cancelled() && inputs.scenario == 'bench-mainnet' }}
+        timeout-minutes: 30
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testMainnetFallbackTierBenchmark" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
       - name: Evidence summary
         if: ${{ always() }}
