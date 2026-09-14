@@ -285,7 +285,7 @@ final class OHTTPE2ETests: ZcashTestCase {
 
     /// Public IP as seen by an external service: through Tor when a synchronizer with Tor enabled
     /// is given, otherwise directly. Evidence only — never fails the test.
-    private func publicIP(via synchronizer: SDKSynchronizer?) async -> String? {
+    private func publicIP(via synchronizer: Synchronizer?) async -> String? {
         guard let url = URL(string: "https://api.ipify.org") else { return nil }
         do {
             let data: Data
