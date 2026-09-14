@@ -603,13 +603,13 @@ extension VotingRustBackend {
 
 /// Selects the proving priority for `buildAndProveDelegation`.
 public enum VotingProvingIntent: Sendable, Equatable {
-    /// prepared ahead of the user's Confirm; runs at utility priority without the pool-wide boost so
-    /// it never competes with work the user is waiting on. Swift escalates an awaited task to its
-    /// awaiter's priority, so a caller that wants the utility QoS must itself await from a
-    /// utility-or-lower task; a higher-priority caller still gets the missing boost, only not the
-    /// lower QoS.
+    /// A proof prepared ahead of the user's Confirm. Runs at utility priority without the pool-wide
+    /// boost, so it never competes with work the user is waiting on. Swift escalates an awaited task
+    /// to its awaiter's priority, so a caller that wants the utility QoS must itself await from a
+    /// utility-or-lower task; awaited from a higher-priority task the proof runs at that priority,
+    /// and what `.speculative` still withholds is the pool-wide boost.
     case speculative
-    /// the user is waiting on this proof; the proving pool is boosted for its duration
+    /// The user is waiting on this proof. The proving pool is boosted for its duration.
     case interactive
 }
 
@@ -2026,8 +2026,8 @@ extension VotingRustBackend {
     /// priority, for a proof prepared before the user asked for it; a host that later needs that
     /// proof can raise the pool with `withInteractiveProvingBoost` while it waits. Swift escalates
     /// an awaited task to its awaiter's priority, so a caller that wants the utility QoS must
-    /// itself await from a utility-or-lower task; a higher-priority caller still gets the missing
-    /// boost, only not the lower QoS.
+    /// itself await from a utility-or-lower task; awaited from a higher-priority task the proof
+    /// runs at that priority, and what `.speculative` still withholds is the pool-wide boost.
     public func buildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],

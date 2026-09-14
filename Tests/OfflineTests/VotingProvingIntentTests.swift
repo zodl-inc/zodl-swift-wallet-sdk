@@ -81,7 +81,12 @@ final class VotingProvingIntentTests: XCTestCase {
         observation: Observation
     ) async throws {
         let baseline = VotingRustBackend.interactiveProvingBoostCount()
-        let entry: @Sendable (VotingDelegationProofParams, String, VotingPirLayout, (@Sendable (Double) -> Void)?) throws -> VotingDelegationProofResult = { [observation, baseline] _, _, _, _ in
+        let entry: @Sendable (
+            VotingDelegationProofParams,
+            String,
+            VotingPirLayout,
+            (@Sendable (Double) -> Void)?
+        ) throws -> VotingDelegationProofResult = { [observation, baseline] _, _, _, _ in
             observation.record(
                 boostDelta: VotingRustBackend.interactiveProvingBoostCount() - baseline,
                 priority: Task.currentPriority
