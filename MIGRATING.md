@@ -171,9 +171,9 @@ before the user reaches Confirm should pass `.speculative`, which runs the proof
 priority without the pool-wide boost, and call `withInteractiveProvingBoost` around its later wait
 once the user does ask, to raise the pool back up for that wait. Swift escalates an awaited task
 to its awaiter's priority, so a host that wants the speculative proof to actually run at utility
-QoS must await it only from a task that is itself utility priority or lower — the interactive
-boost is exactly what the `.speculative` intent removes, and awaiting it from a higher-priority
-task silently restores it.
+QoS must await it only from a task that is itself utility priority or lower. The pool-wide boost
+is a separate matter: `.speculative` never takes it, whatever the awaiter's priority, so a
+higher-priority awaiter only raises that one task's QoS and nothing else.
 
 ## Voting wire payloads are produced by `zcash_voting`, not by the SDK
 
