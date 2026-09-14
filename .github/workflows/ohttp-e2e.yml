@@ -12,6 +12,18 @@ on:
     branches:
       - feature/ohttp-integration
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: >-
+          e2e = restore+sync over OHTTP / Tor+OHTTP (default);
+          fallback-up = gateway reachable, policy stays on OHTTP;
+          fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks
+        type: choice
+        default: e2e
+        options:
+          - e2e
+          - fallback-up
+          - fallback-down
 
 permissions:
   contents: read
@@ -140,7 +152,7 @@ jobs:
           echo "- started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore + sync over ${{ matrix.mode == 'tor' && 'Tor + OHTTP' || 'OHTTP' }}
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && (inputs.scenario == '' || inputs.scenario == 'e2e') }}
         timeout-minutes: 75
         env:
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
@@ -156,6 +168,18 @@ jobs:
           if [ "${{ matrix.mode }}" = "ohttp" ]; then
             swift test --filter "OHTTPE2ETests/testExternalAPIsViaOHTTP" 2>&1 | tee -a "e2e-${{ matrix.mode }}.log"
           fi
+
+      - name: OHTTP -> clearnet fallback primitives (${{ inputs.scenario }})
+        if: ${{ !cancelled() && startsWith(inputs.scenario, 'fallback-') }}
+        timeout-minutes: 30
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
+          OHTTP_E2E_GATEWAY_STATE: ${{ inputs.scenario == 'fallback-down' && 'down' || 'up' }}
+          OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testFallbackPrimitives" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
       - name: Evidence summary
         if: ${{ always() }}

@@ -57,7 +57,10 @@ use crate::{
 /// Why a lightwalletd connection is being opened — selects direct vs Tor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnPurpose {
-    /// Bulk compact-block download. ALWAYS direct, even with Tor on (mirrors `blockStream(.direct)`).
+    /// Bulk compact-block download. Direct with Tor off; with Tor ON it rides the shared default
+    /// circuit for EVERY host (OHTTP gateway or clearnet lightwalletd). Upstream Zashi kept bulk
+    /// direct even with Tor on (`blockStream(.direct)`); Zodl changed that on 2026-09-14 so that a
+    /// clearnet lightwalletd used as the OHTTP fallback never sees the device IP while Tor is on.
     BulkFetch,
     /// Wallet-identifying metadata (treestate, latest-block, tip). Isolated Tor (`.uniqueTor`).
     MetadataUnique,
@@ -75,21 +78,22 @@ enum TorMode {
 
 fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
     match purpose {
-        ConnPurpose::BulkFetch => None, // direct (for non-OHTTP hosts; see `route`)
+        // Public range data: needs no isolation from itself, and one shared circuit keeps the
+        // fetch workers' pooled h2 connections cheap.
+        ConnPurpose::BulkFetch => Some(TorMode::Default),
         ConnPurpose::MetadataUnique => Some(TorMode::Isolated),
         ConnPurpose::MetadataDefault => Some(TorMode::Default),
     }
 }
 
-/// The full routing decision for one connect: `tor_mode(purpose)`, plus the OHTTP override — when
-/// the endpoint is an OHTTP gateway and Tor is on, bulk rides Tor too (on the shared default
-/// circuit: it is public range data, so it needs no isolation from itself, and one circuit keeps
-/// the fetch workers' pooled h2 connections cheap).
+/// The full routing decision for one connect. With a Tor handle present (Tor ON) NOTHING bypasses
+/// Tor, whatever the host: OHTTP gateways and clearnet lightwalletd alike carry bulk on the default
+/// circuit and metadata on its usual circuit. `is_ohttp_gateway` is kept for call-site clarity and
+/// logging; it no longer changes the decision. Without Tor, [`connect_via`] goes direct (and
+/// `grpc::connect` speaks OHTTP to gateways over the direct relay leg).
 fn route(purpose: ConnPurpose, is_ohttp_gateway: bool) -> Option<TorMode> {
-    match (tor_mode(purpose), is_ohttp_gateway) {
-        (None, true) => Some(TorMode::Default),
-        (mode, _) => mode,
-    }
+    let _ = is_ohttp_gateway;
+    tor_mode(purpose)
 }
 
 /// Per-attempt timeout for building a Tor circuit + connecting to lightwalletd. A healthy circuit
@@ -403,11 +407,10 @@ impl Connector {
 
 /// Free-function form of [`Connector::connect`] for call sites that already thread `endpoint`
 /// (from `EngineConfig`) and an optional Tor handle separately — avoids restructuring the run
-/// path around the bundled [`Connector`]. Same per-call policy: bulk → direct; metadata → Tor
-/// when `tor` is `Some`. The bulk path stays on the plain direct client even with Tor on,
-/// mirroring the old SDK's `blockStream(.direct)` — EXCEPT for OHTTP gateways, where Tor-on means
-/// bulk is OHTTP-over-Tor too (see [`route`]). Without Tor, `connect_direct_with_retry` →
-/// `grpc::connect` already speaks OHTTP to gateways (direct relay leg).
+/// path around the bundled [`Connector`]. Per-call policy: with `tor` `Some` every purpose rides
+/// Tor (bulk on the default circuit, metadata on its own — see [`route`]); with `tor` `None`,
+/// `connect_direct_with_retry` → `grpc::connect`, which already speaks OHTTP to gateways over the
+/// direct relay leg.
 pub async fn connect_via(
     endpoint: &Endpoint,
     tor: Option<&TorConn>,
@@ -483,10 +486,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bulk_is_direct_for_plain_hosts() {
-        // Even when Tor is on, bulk fetch carries no Tor circuit (mirrors blockStream(.direct)).
-        assert_eq!(tor_mode(ConnPurpose::BulkFetch), None);
-        assert_eq!(route(ConnPurpose::BulkFetch, false), None);
+    fn plain_hosts_route_every_purpose_through_tor_too() {
+        // Tor ON + clearnet lightwalletd (the OHTTP fallback / a manual pick): bulk must NOT
+        // bypass Tor — the device IP would otherwise reach the server during the block download.
+        assert_eq!(tor_mode(ConnPurpose::BulkFetch), Some(TorMode::Default));
+        assert_eq!(route(ConnPurpose::BulkFetch, false), Some(TorMode::Default));
+        assert_eq!(route(ConnPurpose::MetadataUnique, false), Some(TorMode::Isolated));
+        assert_eq!(route(ConnPurpose::MetadataDefault, false), Some(TorMode::Default));
     }
 
     #[test]

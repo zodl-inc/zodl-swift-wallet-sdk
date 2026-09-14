@@ -333,3 +333,132 @@ private extension Data {
         self.init(bytes)
     }
 }
+
+// MARK: - OHTTP -> clearnet fallback primitives
+
+extension OHTTPE2ETests {
+    /// SDK-level half of the fallback design (the decision itself lives in the apps'
+    /// `OHTTPFirstServerPolicy`): prove the primitives the apps rely on, against the live testnet
+    /// gateway and the clearnet `testnet.zec.rocks`.
+    ///
+    /// - `OHTTP_E2E_GATEWAY_STATE=up` (default): `evaluateBestOf([gateway])` validates the gateway,
+    ///   so the policy stays on OHTTP (scenarios 1/2/9; 10 with Tor).
+    /// - `OHTTP_E2E_GATEWAY_STATE=down` (the operator scaled the testnet gateway to 0):
+    ///   `evaluateBestOf([gateway])` is empty, `evaluateBestOf([clearnet])` still validates, and
+    ///   `switchTo(clearnet)` + `start()` make progress (scenarios 3/5; 11/13 with Tor).
+    /// - `OHTTP_E2E_TOR=1`: everything above runs with Tor enabled, i.e. the probes and the clearnet
+    ///   traffic ride arti circuits (bulk included, see `connector::route`).
+    func testFallbackPrimitives() async throws {
+        guard let seedHex = Env.seedHex, let seed = Data(hexString: seedHex), seed.count == 64 else {
+            throw XCTSkip("OHTTP_E2E_SEED_HEX not set (or not a 64-byte hex seed); live OHTTP E2E skipped")
+        }
+        let environment = ProcessInfo.processInfo.environment
+        let expectGatewayDown = (environment["OHTTP_E2E_GATEWAY_STATE"] ?? "up").lowercased() == "down"
+        let tor = environment["OHTTP_E2E_TOR"] == "1"
+        let mode = "fallback-\(expectGatewayDown ? "down" : "up")\(tor ? "+tor" : "")"
+
+        let gateway = LightWalletEndpoint(
+            address: Env.gatewayHost,
+            port: 443,
+            secure: true,
+            singleCallTimeoutInMillis: 30_000,
+            streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+        )
+        let clearnet = LightWalletEndpoint(
+            address: environment["OHTTP_E2E_CLEARNET_HOST"] ?? "testnet.zec.rocks",
+            port: 443,
+            secure: true,
+            singleCallTimeoutInMillis: 30_000,
+            streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+        )
+        XCTAssertTrue(OHTTPEndpoints.isGateway(gateway.host))
+        XCTAssertFalse(OHTTPEndpoints.isGateway(clearnet.host))
+        log("mode=\(mode) gateway=\(gateway.host) clearnet=\(clearnet.host)")
+
+        let databases = TemporaryDbBuilder.build()
+        let initializer = Initializer(
+            cacheDbURL: nil,
+            fsBlockDbRoot: databases.fsCacheDbRoot,
+            generalStorageURL: databases.generalStorageURL,
+            dataDbURL: databases.dataDB,
+            torDirURL: databases.torDir,
+            endpoint: gateway,
+            network: ZcashNetworkBuilder.network(for: .testnet),
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            alias: .custom("ohttp-e2e-\(mode)"),
+            loggingPolicy: .default(.debug),
+            isTorEnabled: tor,
+            isExchangeRateEnabled: false
+        )
+        let synchronizer = SDKSynchronizer(initializer: initializer)
+        defer { synchronizer.stop() }
+
+        let prepared = try await synchronizer.prepare(with: [UInt8](seed), walletBirthday: Env.birthday, name: "ohttp-e2e", keySource: nil)
+        guard case .success = prepared else {
+            return XCTFail("prepare() returned \(prepared), expected .success")
+        }
+        if tor {
+            try await synchronizer.tor(enabled: true)
+            log("tor enabled, initialized=\(String(describing: await synchronizer.isTorSuccessfullyInitialized()))")
+            log("tor exit ip=\(await publicIP(via: synchronizer) ?? "unknown")")
+        }
+
+        // Tier 0: is the OHTTP gateway reachable? Same call the apps make.
+        let healthyGateways = await synchronizer.evaluateBestOf(
+            endpoints: [gateway],
+            fetchThresholdSeconds: 20,
+            nBlocksToFetch: 1,
+            kServers: 1,
+            network: .testnet
+        )
+        // Tier 1: is the clearnet fallback reachable? (always expected to be)
+        let rankedClearnet = await synchronizer.evaluateBestOf(
+            endpoints: [clearnet],
+            fetchThresholdSeconds: 20,
+            nBlocksToFetch: 1,
+            kServers: 1,
+            network: .testnet
+        )
+        log("RESULT mode=\(mode) gateway_reachable=\(!healthyGateways.isEmpty) clearnet_reachable=\(!rankedClearnet.isEmpty)")
+        XCTAssertEqual(healthyGateways.isEmpty, expectGatewayDown, "gateway reachability must match OHTTP_E2E_GATEWAY_STATE=\(expectGatewayDown ? "down" : "up")")
+        XCTAssertFalse(rankedClearnet.isEmpty, "the clearnet fallback tier must validate")
+
+        guard expectGatewayDown else {
+            // OHTTP-first: with the gateway reachable the policy never leaves it.
+            XCTAssertEqual(healthyGateways.first?.host, gateway.host)
+            log("RESULT mode=\(mode) decision=stay-on-ohttp")
+            return
+        }
+
+        // OHTTP down: the apps switch to the best validated clearnet server and keep syncing.
+        try await synchronizer.switchTo(endpoint: clearnet)
+        log("RESULT mode=\(mode) decision=fallback switched_to=\(clearnet.host)")
+        try await synchronizer.start(retry: false)
+        let deadline = Date().addingTimeInterval(240)
+        var progressed = false
+        while Date() < deadline {
+            let status = synchronizer.latestState.syncStatus
+            switch status {
+            case .syncing(let progress, _) where progress > 0:
+                progressed = true
+            case .upToDate:
+                progressed = true
+            case .error(let error):
+                let msg = "\(error)"
+                if msg.contains("newer than the latest") || msg.contains("statusCode: 11") {
+                    progressed = true // chain-tip race on testnet: the fallback server served blocks
+                } else {
+                    return XCTFail("sync on clearnet fallback errored: \(msg)")
+                }
+            default:
+                break
+            }
+            if progressed { break }
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+        log("RESULT mode=\(mode) clearnet_sync_progressed=\(progressed)")
+        XCTAssertTrue(progressed, "sync must progress on \(clearnet.host) after falling back")
+    }
+}
