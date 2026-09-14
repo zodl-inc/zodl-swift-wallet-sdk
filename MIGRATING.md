@@ -161,7 +161,7 @@ follows the same range. Host-side validation that mirrored the old 1 to 15 limit
 wider range, or it will reject proposals a 4.0 wallet would otherwise accept.
 
 A wallet built on `zcash_voting` 4.0 votes only on chains that have upgraded to the
-voting-circuits 0.12 delegation circuit, and a 3.x build stops working on a round once its chain
+voting-circuits 0.12.0 delegation circuit, and a 3.x build stops working on a round once its chain
 makes that upgrade. Ship this SDK version together with the chain upgrade, not ahead of it, or
 users still on the old build lose the ability to vote until they update.
 

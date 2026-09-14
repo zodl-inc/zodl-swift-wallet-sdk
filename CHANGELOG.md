@@ -60,6 +60,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method has a default implementation that does nothing, so custom `Broadcaster` conformers
   without submit-plan bookkeeping keep compiling unchanged.
 
+### Coinholder voting
+
+- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
+  (default) behaves as before; `.speculative` runs the proof at utility priority without the
+  pool-wide boost, for a proof a host prepares before the user asks for it.
+  `withInteractiveProvingBoost` and `interactiveProvingBoostCount` are public so a host can raise
+  the pool while it waits on a speculative proof.
+
 ## Changed
 
 - `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
@@ -114,17 +122,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Coinholder voting
 
 - Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
-  voting-circuits 0.12 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
-  and a wallet built on it votes only on chains upgraded to that circuit. Nothing in the SDK's
-  voting API changed shape; the crate now also accepts `vote_protocol` v1 configs alongside v0 and
-  writes its sidecar under immediate SQLite transactions. Building the Rust core from source now
-  requires Rust 1.91.
-- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
-  (default) behaves as before; `.speculative` runs the proof at utility priority without the
-  pool-wide boost, for a proof a host prepares before the user asks for it. The interactive boost
-  helpers (`beginInteractiveProvingBoost`, `endInteractiveProvingBoost`,
-  `withInteractiveProvingBoost`, `interactiveProvingBoostCount`) are public so a host can raise the
-  pool while it waits on a speculative proof.
+  voting-circuits 0.12.0 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
+  and a wallet built on it votes only on chains upgraded to that circuit. No existing voting
+  signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
+  v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
+  Rust core from source now requires Rust 1.91.
 
 ## Fixed
 

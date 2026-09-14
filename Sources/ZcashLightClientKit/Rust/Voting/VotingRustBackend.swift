@@ -619,11 +619,11 @@ extension VotingRustBackend {
     /// Raises every proving-pool worker from its resting utility QoS to
     /// user-initiated for the duration of an interactive proving session.
     /// Refcounted in the FFI; every begin must be paired with an end.
-    public static func beginInteractiveProvingBoost() {
+    static func beginInteractiveProvingBoost() {
         zcashlc_proving_interactive_begin()
     }
 
-    public static func endInteractiveProvingBoost() {
+    static func endInteractiveProvingBoost() {
         zcashlc_proving_interactive_end()
     }
 
