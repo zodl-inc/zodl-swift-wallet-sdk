@@ -76,7 +76,7 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use orchard::keys::SpendingKey;
 use rand::rngs::OsRng;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use zcash_client_backend::data_api::wallet::{
     TargetHeight,
     input_selection::{LockFilter, LockedInputPolicy},
@@ -245,9 +245,19 @@ struct CallCtx {
 /// the slipstream engine's writer (write-behind commits, `deleteAccount`/`importAccount` mid-pass)
 /// can hold the file lock for seconds, and a migration call racing it must wait as long as the
 /// wallet handle would rather than failing fast on rusqlite's 5 s default.
+///
+/// Never creates the database file: these are rusqlite's own default flags minus
+/// `SQLITE_OPEN_CREATE`. `open()` below relies on that: it opens this connection FIRST, so a
+/// missing (or unreadable) database file fails right here, before `open()` ever reaches
+/// `crate::wallet_db`'s CREATE-capable open.
 fn open_store_conn(db_path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
     conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
         .map_err(|e| anyhow!("Error setting migration store busy_timeout: {e}"))?;
     Ok(conn)
@@ -295,10 +305,18 @@ unsafe fn wallet_db_read_only(
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
-/// drops it at the end (no persistent handle). All tables are created by the wallet schema
-/// migrations during `init_data_db`: the engine's store tables by `zcash_client_sqlite`'s own
-/// migration graph (`zcash_client_sqlite::pool_migration` registers them), and the SDK's extension
-/// tables by the external migrations in [`crate::ext_schema`].
+/// drops it at the end (no persistent handle). `open()` itself never creates the wallet database
+/// file, and creates none of the wallet schema: ALL of that comes ONLY from `init_data_db`'s
+/// migrations, run beforehand by the caller -- the engine's store tables by
+/// `zcash_client_sqlite`'s own migration graph (`zcash_client_sqlite::pool_migration` registers
+/// them), and the SDK's extension tables by the external migrations in [`crate::ext_schema`]. The
+/// one thing this function DOES create is its own `sdk_immediate_runs` side table, lazily, and
+/// only once the wallet schema (an `accounts` table) is confirmed present. The guard against both
+/// is ordering, not a separate pre-check: the no-`SQLITE_OPEN_CREATE` [`open_store_conn`] is
+/// opened, and the wallet schema probed, BEFORE the CREATE-capable `crate::wallet_db` handle is
+/// opened at all -- a path that does not exist, or an existing file with no wallet schema, errors
+/// out of one of those two steps instead of ever reaching the call that could manufacture a file or
+/// a lone `sdk_immediate_runs` table later mistaken for an initialized wallet (MOB-1975).
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -313,8 +331,26 @@ unsafe fn open(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
+    let mut store_conn = open_store_conn(&db_path).map_err(|e| {
+        anyhow!(
+            "wallet database not found or unreadable at {}: {e}",
+            db_path.display()
+        )
+    })?;
+    let has_wallet_schema: bool = store_conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| anyhow!("Error checking the wallet schema: {e}"))?;
+    if !has_wallet_schema {
+        return Err(anyhow!(
+            "wallet database at {} has no wallet schema (no accounts table): init_data_db must run before the migration surface",
+            db_path.display()
+        ));
+    }
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
-    let mut store_conn = open_store_conn(&db_path)?;
     init_immediate_runs(&store_conn)
         .map_err(|e| anyhow!("Error initializing immediate-run table: {e}"))?;
     // One-time: fold any legacy invalid-marks rows into the engine state and drop their table
@@ -6750,6 +6786,11 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+        // `open_store_conn` never creates the file (MOB-1975) -- create it first so this test
+        // stays about the busy_timeout pragma, not about file-creation semantics.
+        {
+            Connection::open(&path).expect("the fixture file creates");
+        }
         let conn = open_store_conn(&path).expect("the store connection must open");
         let busy_timeout: u32 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
@@ -7767,6 +7808,138 @@ mod tests {
             !path.exists(),
             "a read-only open must not create the database file"
         );
+    }
+
+    // ----- rw `open()` must not manufacture a wallet database (MOB-1975) -----
+
+    /// `open()` on a wallet-database path that does not exist must error, and must NOT create the
+    /// file: this is the missing-file guard added ahead of `crate::wallet_db`'s `Connection::open`,
+    /// which otherwise would.
+    #[test]
+    fn rw_open_on_a_missing_file_errors_without_creating_it() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_open_missing_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account_bytes = [9u8; 16];
+        let err = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .err()
+        .expect("open() must fail on a missing wallet database file");
+        assert!(
+            err.to_string().contains("wallet database not found"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "open() must not create the wallet database file"
+        );
+    }
+
+    /// An existing file with no wallet schema at all (not even `init_data_db` has ever touched
+    /// it) must make `open()` error, and must NOT let it create the SDK-owned
+    /// `sdk_immediate_runs` side table -- exactly that combination (a stray table, no `accounts`)
+    /// is what made the app treat an empty file as an initialized wallet.
+    #[test]
+    fn rw_open_on_a_schemaless_database_creates_no_immediate_runs_table() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_open_schemaless_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("the plain connection opens");
+            conn.execute("CREATE TABLE sdk_stray (x INTEGER)", [])
+                .expect("the stray table creates");
+        }
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account_bytes = [9u8; 16];
+        let err = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .err()
+        .expect("open() must fail on a database with no wallet schema");
+        assert!(
+            err.to_string().contains("no wallet schema"),
+            "unexpected error message: {err}"
+        );
+
+        let conn = Connection::open(&path).expect("the fixture database reopens");
+        let has_immediate_runs: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sdk_immediate_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the existence probe succeeds");
+        assert!(
+            !has_immediate_runs,
+            "open() must not create sdk_immediate_runs on a database with no wallet schema"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `open()` on an already-initialized wallet database (a real `accounts` table, from
+    /// `WalletDb::for_path` + `init_wallet_db`, the same fixture pattern `retained_marks.rs` uses)
+    /// still succeeds, and still creates `sdk_immediate_runs` lazily -- the one case that must
+    /// keep working exactly as before.
+    #[test]
+    fn rw_open_on_an_initialized_wallet_still_works() {
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::wallet::init::init_wallet_db;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_open_initialized_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = WalletDb::for_path(&path, MAIN_NETWORK, SystemClock, OsRng)
+                .expect("the wallet database must open");
+            init_wallet_db(&mut db, None).expect("initializes the wallet schema");
+        }
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account_bytes = [9u8; 16];
+        let ctx = unsafe {
+            open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("open() on an already-initialized wallet must succeed");
+        drop(ctx);
+
+        let conn = Connection::open(&path).expect("the fixture database reopens");
+        let has_immediate_runs: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sdk_immediate_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the existence probe succeeds");
+        assert!(
+            has_immediate_runs,
+            "open() on an initialized wallet must still create sdk_immediate_runs"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The pure `zcashlc_migration_progress` path may run before any rw migration call ever
