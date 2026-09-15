@@ -207,6 +207,14 @@ public protocol ClosureSynchronizer {
 
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
 
+    /// Closure adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    )
+
     var broadcaster: Broadcaster { get }
 
     /*

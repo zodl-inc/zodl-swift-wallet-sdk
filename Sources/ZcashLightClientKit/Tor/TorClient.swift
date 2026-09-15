@@ -11,22 +11,37 @@ import libzcashlc
 public actor TorClient {
     private var underlyingRuntime: OpaquePointer?
     private var torDir: URL
+    private let httpGetNative: TorHTTPGetNative
+    private let httpExecutor: TorHTTPRequestExecutor
 
     public var cachedFiatCurrencyResult: FiatCurrencyResult?
 
-    init(torDir: URL) {
+    init(
+        torDir: URL,
+        httpGetNative: TorHTTPGetNative = TorHTTPGetNative(),
+        httpExecutor: TorHTTPRequestExecutor = .shared
+    ) {
         self.torDir = torDir
+        self.httpGetNative = httpGetNative
+        self.httpExecutor = httpExecutor
     }
 
-    private init(runtimePtr: OpaquePointer, torDir: URL) {
+    init(
+        runtimePtr: OpaquePointer,
+        torDir: URL,
+        httpGetNative: TorHTTPGetNative = TorHTTPGetNative(),
+        httpExecutor: TorHTTPRequestExecutor = .shared
+    ) {
         underlyingRuntime = runtimePtr
         self.torDir = torDir
+        self.httpGetNative = httpGetNative
+        self.httpExecutor = httpExecutor
     }
 
     deinit {
         guard let runtime = underlyingRuntime else { return }
 
-        zcashlc_free_tor_runtime(runtime)
+        httpGetNative.freeRuntime(runtime)
     }
 
     func prepare() throws {
@@ -36,7 +51,7 @@ public actor TorClient {
     func close() throws {
         guard let runtime = underlyingRuntime else { return }
 
-        zcashlc_free_tor_runtime(runtime)
+        httpGetNative.freeRuntime(runtime)
 
         underlyingRuntime = nil
     }
@@ -61,7 +76,7 @@ public actor TorClient {
         }
 
         let rawDir = torDir.osPathStr()
-        let runtimePtr = zcashlc_create_tor_runtime(rawDir.0, rawDir.1)
+        let runtimePtr = httpGetNative.createRuntime(rawDir.0, rawDir.1)
 
         guard let runtimePtr else {
             throw ZcashError.rustTorClientInit(lastErrorMessage(fallback: "`TorClient` init failed with unknown error"))
@@ -75,7 +90,7 @@ public actor TorClient {
     public func isolatedClient() throws -> TorClient {
         let runtime = try resolveRuntime()
 
-        let isolatedPtr = zcashlc_tor_isolated_client(runtime)
+        let isolatedPtr = httpGetNative.isolateRuntime(runtime)
 
         guard let isolatedPtr else {
             throw ZcashError.rustTorIsolatedClient(
@@ -83,7 +98,7 @@ public actor TorClient {
             )
         }
 
-        return TorClient(runtimePtr: isolatedPtr, torDir: torDir)
+        return TorClient(runtimePtr: isolatedPtr, torDir: torDir, httpGetNative: httpGetNative, httpExecutor: httpExecutor)
     }
 
     /// Changes the client's current dormant mode, putting background tasks to sleep or waking
@@ -185,6 +200,47 @@ public actor TorClient {
         }
 
         return response
+    }
+
+    /// Makes an isolated GET with one deadline covering admission, retries and response body.
+    /// Queued cancellation starts no request. Active cancellation waits for native cleanup.
+    /// Requires a prepared runtime from successful Tor enablement; otherwise throws torClientUnavailable.
+    public nonisolated func httpGet(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        return try await httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+    }
+
+    func httpGet(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        deadlineUptime: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try Task.checkCancellation()
+        let url = try TorHTTPGetRequest.validate(request)
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
+        guard let isolated = httpGetNative.isolateRuntime(runtime) else {
+            throw ZcashError.rustTorIsolatedClient(lastErrorMessage(fallback: "TorClient.httpGet could not isolate runtime"))
+        }
+        let ownedRequest = TorHTTPGetRequest(
+            runtime: isolated,
+            request: request,
+            url: url,
+            retryLimit: retryLimit,
+            deadline: deadlineUptime,
+            native: httpGetNative
+        )
+        return try await httpExecutor.execute(
+            deadlineUptime: deadlineUptime,
+            operation: { try ownedRequest.run(timeoutMilliseconds: $0) },
+            dispose: { ownedRequest.dispose() }
+        )
     }
 
     public func getExchangeRateUSD() throws -> FiatCurrencyResult {

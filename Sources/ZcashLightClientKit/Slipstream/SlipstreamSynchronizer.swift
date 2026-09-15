@@ -44,6 +44,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // [MOB-1850] The protocol, not the concrete actor: tests substitute a gated fake so the
     // lifecycle interleavings this file guards against can be reproduced without an FFI handle.
     private let engine: any SlipstreamEngineControlling
+    private nonisolated let torHTTPUptime: @Sendable () -> UInt64
 
     // ── Shared infrastructure ──────────────────────────────────────────────────
     // `private` reaches the same-file private extension (Swift 4+ file-scope rule).
@@ -383,8 +384,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     /// [MOB-1850] The injecting initializer, for tests only.
     ///
-    /// Identical to the public one in every respect but the engine: the public initializer builds a
-    /// real `SlipstreamEngine` and calls straight through to here, so there is one construction path
+    /// The public initializer supplies a real `SlipstreamEngine` and the monotonic uptime clock,
+    /// then calls straight through to here, so there is one construction path
     /// and a test's synchronizer is wired exactly like a shipped one. `alternateEndpoints` still
     /// arrives so the parameter list stays honest about what the engine was given, even though the
     /// engine itself is now the caller's.
@@ -394,9 +395,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
     init(
         initializer: Initializer,
         alternateEndpoints: [LightWalletEndpoint],
-        engine: any SlipstreamEngineControlling
+        engine: any SlipstreamEngineControlling,
+        torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         self.engine = engine
+        self.torHTTPUptime = torHTTPUptime
         self.initializer = initializer
         self.currentEndpoint = initializer.endpoint
         self.transactionRepository = initializer.transactionRepository
@@ -2752,7 +2755,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         if enabled {
             try await torClient.prepare()
         } else {
-            try await torClient.close()
+            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+            if !exchangeRateEnabled {
+                try await torClient.close()
+            }
         }
         await sdkFlags.torFlagUpdate(enabled)
     }
@@ -2786,6 +2792,33 @@ public actor SlipstreamSynchronizer: Synchronizer {
         }
         let torClient = initializer.container.resolve(TorClient.self)
         return try await torClient.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+    }
+
+    public nonisolated func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: torHTTPUptime()
+        )
+        return try await httpGetOverTor(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+    }
+
+    private func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        deadlineUptime: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let torEnabled = await sdkFlags.torEnabled
+        let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+        guard torEnabled || exchangeRateEnabled else {
+            throw ZcashError.torNotEnabled
+        }
+        let torClient = initializer.container.resolve(TorClient.self)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadlineUptime)
     }
 
     // ── Transparent / UTXO helpers ────────────────────────────────────────────

@@ -195,6 +195,13 @@ public protocol CombineSynchronizer {
 
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 
+    /// Combine adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
+
     var broadcaster: Broadcaster { get }
 
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error>

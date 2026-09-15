@@ -466,6 +466,8 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func exchangeRateOverTor(enabled: Bool) async throws { Self.unused() }
     func isTorSuccessfullyInitialized() async -> Bool? { Self.unused() }
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
     func debugDatabase(sql: String) -> String { Self.unused() }
 
     func getSingleUseTransparentAddress(accountUUID: AccountUUID) async throws -> SingleUseTransparentAddress { Self.unused() }
@@ -605,6 +607,13 @@ private final class ClosureSynchronizerWithoutRestartSync: ClosureSynchronizer {
         completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
     ) { Self.unused() }
 
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    ) { Self.unused() }
+
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }
     func wipe() -> CompletablePublisher<Error> { Self.unused() }
     func rescanFrom(height: BlockHeight, completion: @escaping (Error?) -> Void) { Self.unused() }
@@ -722,6 +731,12 @@ private final class CombineSynchronizerWithoutRestartSync: CombineSynchronizer {
     func httpRequestOverTor(
         for request: URLRequest,
         retryLimit: UInt8
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> { Self.unused() }
+
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
     ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> { Self.unused() }
 
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }
