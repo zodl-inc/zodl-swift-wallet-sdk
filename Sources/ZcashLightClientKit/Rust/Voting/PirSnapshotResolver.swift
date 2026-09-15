@@ -11,11 +11,13 @@
 // would answer nullifier-non-membership queries against the wrong tree and
 // produce a proof the chain rejects.
 //
-// To avoid that, the resolver probes every configured endpoint and randomly
-// selects one whose served height is exactly equal to `expectedSnapshotHeight`.
-// Endpoints that are missing snapshot metadata, unreachable, or report any
-// other height are excluded. If no endpoint matches, `resolve(...)` throws —
-// the SDK refuses to proceed instead of falling back to a mismatched server.
+// To avoid that, the resolver first probes a configured preferred endpoint when
+// supplied. A matching preference is returned immediately; otherwise the
+// resolver probes the remaining endpoints and randomly selects one whose served
+// height is exactly equal to `expectedSnapshotHeight`. Endpoints that are
+// missing snapshot metadata, unreachable, or report any other height are
+// excluded. If no endpoint matches, `resolve(...)` throws — the SDK refuses to
+// proceed instead of falling back to a mismatched server.
 
 import Foundation
 
@@ -105,8 +107,9 @@ public struct PirSnapshotResolver: Sendable {
         self.matchingEndpointSelector = matchingEndpointSelector
     }
 
-    /// Probe all `endpoints` in parallel and return a randomly selected URL
-    /// whose served snapshot height equals `expectedSnapshotHeight` exactly.
+    /// Probe `preferredEndpoint` first when it is configured, returning it immediately when its
+    /// served snapshot height matches. Otherwise, probe the remaining `endpoints` in parallel and
+    /// return a randomly selected matching URL.
     ///
     /// Strict equality — not `>=` — because the delegation proof is bound to the
     /// round's specific snapshot. A PIR server serving a different snapshot
@@ -118,14 +121,38 @@ public struct PirSnapshotResolver: Sendable {
     /// is missing metadata, or is unreachable.
     public func resolve(
         endpoints: [String],
-        expectedSnapshotHeight: BlockHeight
+        expectedSnapshotHeight: BlockHeight,
+        preferredEndpoint: String? = nil
     ) async throws -> String {
         guard !endpoints.isEmpty else {
             throw PirSnapshotResolverError.noEndpointsConfigured
         }
 
-        let outcomes = await withTaskGroup(of: (Int, PirSnapshotProbeOutcome).self) { group in
-            for (index, url) in endpoints.enumerated() {
+        var indexedOutcomes: [(Int, PirSnapshotProbeOutcome)] = []
+        var endpointsToProbe = Array(endpoints.enumerated())
+
+        if let preferredEndpoint,
+           endpoints.contains(preferredEndpoint) {
+            let preferredOutcome = await probe.probe(
+                url: preferredEndpoint,
+                expectedSnapshotHeight: expectedSnapshotHeight
+            )
+            try Task.checkCancellation()
+            if case .matching = preferredOutcome.status {
+                return preferredEndpoint
+            }
+            let preferredEntries = endpoints.enumerated().filter { $0.element == preferredEndpoint }
+            indexedOutcomes.append(contentsOf: preferredEntries.map { entry in
+                (
+                    entry.offset,
+                    PirSnapshotProbeOutcome(url: entry.element, status: preferredOutcome.status)
+                )
+            })
+            endpointsToProbe.removeAll { $0.element == preferredEndpoint }
+        }
+
+        let remainingOutcomes = await withTaskGroup(of: (Int, PirSnapshotProbeOutcome).self) { group in
+            for (index, url) in endpointsToProbe {
                 group.addTask {
                     let outcome = await probe.probe(
                         url: url,
@@ -134,14 +161,16 @@ public struct PirSnapshotResolver: Sendable {
                     return (index, outcome)
                 }
             }
-            // Preserve input order for stable diagnostics when no endpoint matches.
             var collected: [(Int, PirSnapshotProbeOutcome)] = []
             for await item in group {
                 collected.append(item)
             }
-            collected.sort { $0.0 < $1.0 }
-            return collected.map(\.1)
+            return collected
         }
+        indexedOutcomes.append(contentsOf: remainingOutcomes)
+        // Preserve input order for stable diagnostics when no endpoint matches.
+        indexedOutcomes.sort { $0.0 < $1.0 }
+        let outcomes = indexedOutcomes.map(\.1)
 
         // [MOB-1860] A caller that cancelled while endpoints were still being probed must
         // never receive a match: check here, before filtering, so cancellation always wins over an
