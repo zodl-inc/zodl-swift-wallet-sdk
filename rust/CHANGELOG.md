@@ -468,6 +468,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependency `zcash_voting` moves from 3.0.0 to 4.0.0-rc.1 (voting-circuits 0.12.0), which raises
   the crate's `rust-version` to 1.91. The 4.0 line keeps the 3.0 API: proposal ids widen to 1 to
   50, and the crate now writes its sidecar under immediate SQLite transactions. No FFI change.
+- `zcashlc_voting_precompute_delegation_pir` and `zcashlc_voting_build_and_prove_delegation` reuse
+  one PIR client per `VotingDatabaseHandle`, keyed by endpoint URL and layout.
 
 ### Removed
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that

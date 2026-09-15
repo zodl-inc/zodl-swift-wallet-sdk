@@ -1,5 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
@@ -17,6 +18,70 @@ pub struct VotingDatabaseHandle {
     pub(super) tree_sync: VoteTreeSync,
     pub(super) network: voting::types::Network,
     pub(super) network_id: u32,
+    /// The connected PIR client, reused across bundles and phases of a round.
+    pir_client: Mutex<CachedSlot<Arc<voting::PirClientBlocking>>>,
+}
+
+/// One value negotiated for an endpoint and a PIR layout, reused while both stay the same, so a
+/// server or geometry change reconnects instead of silently reusing the wrong dataset.
+struct CachedSlot<T> {
+    entry: Option<(String, voting::config::PirLayout, T)>,
+}
+
+impl<T: Clone> CachedSlot<T> {
+    fn new() -> Self {
+        Self { entry: None }
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        url: &str,
+        layout: voting::config::PirLayout,
+        connect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if let Some((cached_url, cached_layout, value)) = &self.entry
+            && cached_url == url
+            && *cached_layout == layout
+        {
+            return Ok(value.clone());
+        }
+        let value = connect()?;
+        self.entry = Some((url.to_string(), layout, value.clone()));
+        Ok(value)
+    }
+}
+
+impl VotingDatabaseHandle {
+    /// Returns a PIR client connected to `url` for `layout`, connecting only the first time.
+    ///
+    /// The handshake is expensive: `connect_pir_blocking` stands up a tokio runtime and a TLS
+    /// client, then the client fetches both tiers' parameters and downloads the whole Tier-0
+    /// dataset to recompute its root. The delegation PIR precompute and the delegation proof
+    /// each need a client for every bundle of a round, so the connection is made once per handle
+    /// and shared by both. The Swift side serializes every call on this handle, so no two
+    /// connects race; the client is dropped with the handle.
+    pub(super) fn pir_client_for(
+        &self,
+        url: &str,
+        layout: voting::config::PirLayout,
+    ) -> anyhow::Result<Arc<voting::PirClientBlocking>> {
+        let mut slot = self
+            .pir_client
+            .lock()
+            .map_err(|_| anyhow!("voting DB PIR client mutex poisoned"))?;
+        slot.get_or_insert_with(url, layout, || Ok(Arc::new(connect_pir_client(url, layout)?)))
+    }
+}
+
+// The layout comes from the round's resolved dynamic config and is passed through unchanged:
+// `connect_pir_blocking` performs the config/server layout handshake and fails closed before any
+// private query when the server disagrees.
+fn connect_pir_client(
+    pir_url: &str,
+    pir_layout: voting::config::PirLayout,
+) -> anyhow::Result<voting::PirClientBlocking> {
+    voting::connect_pir_blocking(pir_layout, pir_url, Arc::new(voting::HyperTransport::new()))
+        .map_err(|e| anyhow!("connect to PIR server failed: {}", e))
 }
 
 /// Open a voting database at the given path.
@@ -64,6 +129,7 @@ pub unsafe extern "C" fn zcashlc_voting_db_open(
             tree_sync: VoteTreeSync::new(),
             network,
             network_id,
+            pir_client: Mutex::new(CachedSlot::new()),
         })))
     });
     unwrap_exc_or_null(res)
@@ -196,5 +262,63 @@ mod tests {
         );
         unsafe { zcashlc_voting_db_free(db) };
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn layout(depth: u32) -> voting::config::PirLayout {
+        voting::config::PirLayout {
+            pir_depth: depth,
+            tier0_layers: 2,
+            tier1_layers: 3,
+            poly_len: 4096,
+        }
+    }
+
+    #[test]
+    fn cached_slot_connects_once_for_the_same_endpoint_and_layout() {
+        let mut slot: CachedSlot<u32> = CachedSlot::new();
+        let mut connects = 0;
+
+        let first = slot
+            .get_or_insert_with("https://pir.example", layout(20), || {
+                connects += 1;
+                Ok(connects)
+            })
+            .unwrap();
+        let second = slot
+            .get_or_insert_with("https://pir.example", layout(20), || {
+                connects += 1;
+                Ok(connects)
+            })
+            .unwrap();
+
+        assert_eq!((first, second), (1, 1));
+        assert_eq!(connects, 1);
+    }
+
+    #[test]
+    fn cached_slot_reconnects_when_the_endpoint_or_the_layout_changes() {
+        let mut slot: CachedSlot<u32> = CachedSlot::new();
+        let mut connects = 0;
+        let mut connect = || {
+            connects += 1;
+            Ok(connects)
+        };
+
+        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), &mut connect).unwrap(), 1);
+        assert_eq!(slot.get_or_insert_with("https://other.example", layout(20), &mut connect).unwrap(), 2);
+        assert_eq!(slot.get_or_insert_with("https://other.example", layout(21), &mut connect).unwrap(), 3);
+        assert_eq!(slot.get_or_insert_with("https://other.example", layout(21), &mut connect).unwrap(), 3);
+        assert_eq!(connects, 3);
+    }
+
+    #[test]
+    fn cached_slot_keeps_the_old_client_when_a_reconnect_fails() {
+        let mut slot: CachedSlot<u32> = CachedSlot::new();
+        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), || Ok(7)).unwrap(), 7);
+
+        let failed = slot.get_or_insert_with("https://other.example", layout(20), || Err(anyhow!("down")));
+        assert!(failed.is_err());
+
+        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), || Ok(8)).unwrap(), 7);
     }
 }

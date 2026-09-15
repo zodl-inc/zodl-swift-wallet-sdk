@@ -42,6 +42,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
   v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
   Rust core from source now requires Rust 1.91.
+- The PIR client is connected once per voting database handle and reused across the bundles and
+  phases of a round (delegation PIR precompute and delegation proof), instead of once per call. The
+  connection is keyed by endpoint and layout, so a server or geometry change still reconnects.
 
 ## Checkpoints
 
