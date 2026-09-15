@@ -208,6 +208,8 @@ public protocol ClosureSynchronizer {
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
 
     /// Closure adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    /// It preserves that method's original timeout budget, late-admission prevention, and owned cleanup.
+    /// This adapter exposes no cancellation handle; the completion reports the underlying async result.
     func httpGetOverTor(
         for request: URLRequest,
         retryLimit: UInt8,

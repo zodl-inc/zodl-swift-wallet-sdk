@@ -658,9 +658,13 @@ public protocol Synchronizer: AnyObject {
     ///    - retryLimit: How many times the request will be retried in case of failure
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
 
-    /// Makes an isolated GET with a positive timeout covering queue wait, retries and body collection.
-    /// At most two bounded GETs run across the process. Cancellation while queued starts no request;
-    /// active cancellation returns CancellationError only after the bounded native call and cleanup finish.
+    /// Makes an isolated GET under one positive timeout budget that starts before synchronizer actor
+    /// admission and includes later Tor actor admission, executor waiting, native retries, and response-body
+    /// collection. Cancellation or expiry before runtime ownership can complete while an actor remains busy;
+    /// later admission starts no native work. Once runtime ownership begins, cancellation waits for the
+    /// bounded operation and cleanup. At most two bounded GETs own executor slots across the process, with
+    /// each slot held through disposal. Cleanup, including final-owner runtime shutdown, can extend caller
+    /// completion beyond the HTTP timer.
     /// Requires successful Tor enablement (a prepared runtime); throws torClientUnavailable otherwise.
     /// Existing HTTP request APIs are unchanged. Custom conformers must implement this requirement.
     func httpGetOverTor(

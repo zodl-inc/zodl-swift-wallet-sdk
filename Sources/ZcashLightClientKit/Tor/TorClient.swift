@@ -202,8 +202,12 @@ public actor TorClient {
         return response
     }
 
-    /// Makes an isolated GET with one deadline covering admission, retries and response body.
-    /// Queued cancellation starts no request. Active cancellation waits for native cleanup.
+    /// Makes an isolated GET under one timeout budget that starts before actor admission and includes
+    /// executor waiting, native retries, and response-body collection. Cancellation or expiry before
+    /// runtime ownership can complete while this actor remains busy; later admission starts no native work.
+    /// Once the request owns runtime resources, cancellation waits for its bounded operation and cleanup.
+    /// At most two bounded GETs own executor slots across the process, with each slot held through disposal.
+    /// Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer.
     /// Requires a prepared runtime from successful Tor enablement; otherwise throws torClientUnavailable.
     public nonisolated func httpGet(
         for request: URLRequest,

@@ -196,6 +196,9 @@ public protocol CombineSynchronizer {
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 
     /// Combine adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    /// It preserves the async method's timeout budget and owned-cleanup behavior after work begins.
+    /// The inherited Combine gateway does not propagate subscriber cancellation to the underlying async
+    /// task, so cancelling the subscription is not guaranteed to cancel or stop the request.
     func httpGetOverTor(
         for request: URLRequest,
         retryLimit: UInt8,

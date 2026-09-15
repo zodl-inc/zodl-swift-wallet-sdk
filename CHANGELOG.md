@@ -19,12 +19,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precompute and proof work for the same wallet, round, snapshot, layout, and endpoint list. It
   revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
   call sites remain compatible, and wallet or database lifecycle changes discard the selection.
+- A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
+  Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
+  Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
+  final-owner runtime shutdown can extend completion beyond the HTTP timer. This hardening adds no further
+  public signature changes, and the existing GET/POST routes remain unchanged.
 - `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
 - `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
 
 ## Changed
 
-- Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. At most two bounded requests run at once across the process. Queued cancellation starts no request; active cancellation waits for native cleanup before returning `CancellationError`. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
+- Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
 
 # 4.5.0 - 2026-09-15
 
