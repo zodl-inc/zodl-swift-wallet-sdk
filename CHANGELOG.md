@@ -43,6 +43,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
   Rust core from source now requires Rust 1.91.
 
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3480000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3482500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4340000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4350000.json
+````
+
 # 4.4.0 - 2026-09-10
 
 ## Added
