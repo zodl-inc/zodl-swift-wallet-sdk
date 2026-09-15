@@ -61,6 +61,8 @@ public enum ZcashErrorCode: String {
     case ohttpUnsupportedHost = "ZTSRV0006"
     /// OHTTP response could not be converted to HTTPURLResponse
     case ohttpResponseError = "ZTSRV0007"
+    /// OHTTP transport error (self reference lost in httpSender closure)
+    case ohttpTransportError = "ZTSRV0008"
     /// SimpleConnectionProvider init of Connection failed.
     case simpleConnectionProvider = "ZSCPC0001"
     /// Downloaded file with sapling spending parameters isn't valid.

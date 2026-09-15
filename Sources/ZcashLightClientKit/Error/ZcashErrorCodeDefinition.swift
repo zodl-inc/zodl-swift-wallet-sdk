@@ -111,6 +111,9 @@ enum ZcashErrorDefinition {
     // sourcery: code="ZTSRV0007"
     /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.
     case ohttpResponseError
+    // sourcery: code="ZTSRV0008"
+    /// OHTTP transport error (e.g., self reference lost in httpSender closure).
+    case ohttpTransportError
     /// TorClient is called but SDKFlags are set as Tor disabled
     // sourcery: code="ZTSRV0005"
     case torNotEnabled
