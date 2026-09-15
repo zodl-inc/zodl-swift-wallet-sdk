@@ -3856,6 +3856,10 @@ unsafe fn tor_http_get_impl(
         };
         let collect_response_body = |body| collect_http_response_body(body);
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            #[cfg(test)]
+            crate::tor::http::network_tests::observe_retry(
+                res.as_ref().map(|status| status.as_u16()).map_err(|_| ()),
+            );
             res.is_err()
                 .then_some(zcash_client_backend::tor::http::Retry::Same)
         };
@@ -3893,6 +3897,8 @@ where
     B: BodyExt,
     HttpError: From<B::Error>,
 {
+    #[cfg(test)]
+    crate::tor::http::network_tests::observe_body();
     Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
 }
 

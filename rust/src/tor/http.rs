@@ -1,6 +1,10 @@
 use std::future::Future;
 
 #[cfg(test)]
+#[path = "http_network_tests.rs"]
+pub(crate) mod network_tests;
+
+#[cfg(test)]
 #[path = "http_transport_tests.rs"]
 mod transport_tests;
 
