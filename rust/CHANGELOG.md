@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_tor_http_get_with_timeout` adds an HTTP GET entry point whose trailing positive
+  `timeout_ms` bounds the complete Tor operation, including connection setup, retries, and response
+  body collection. It otherwise accepts the same arguments and returns the same response as
+  `zcashlc_tor_http_get`; expiry or an invalid zero timeout returns null with the thread-local error
+  set. Existing GET and POST call sites require no changes.
 - `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
   was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
   `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no

@@ -130,6 +130,7 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 bindgen = "0.72"
@@ -179,4 +180,3 @@ lto = true
 #zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-
