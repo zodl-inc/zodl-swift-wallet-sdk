@@ -2639,6 +2639,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - httpGetOverTor
+
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError: Error?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount = 0
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCalled: Bool {
+        return httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount > 0
+    }
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments: (request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64)?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue: (data: Data, response: HTTPURLResponse)!
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsClosure: ((URLRequest, UInt8, UInt64) async throws -> (data: Data, response: HTTPURLResponse))?
+
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+        if let error = httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError {
+            throw error
+        }
+        httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount += 1
+        httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments = (request: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        if let closure = httpGetOverTorForRetryLimitTimeoutMillisecondsClosure {
+            return try await closure(request, retryLimit, timeoutMilliseconds)
+        } else {
+            return httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue
+        }
+    }
+
     // MARK: - debugDatabase
 
     var debugDatabaseSqlCallsCount = 0

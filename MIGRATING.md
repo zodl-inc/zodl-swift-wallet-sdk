@@ -1,5 +1,36 @@
 # Migrating from previous versions to _Unreleased_
 
+## Bounded Tor GET requests
+
+After successful Tor enablement, use
+`httpGetOverTor(for:retryLimit:timeoutMilliseconds:)` for GET requests that need one
+positive timeout across queue wait, retries, and body collection. Set `retryLimit: 0`
+to disable retries. A missing prepared runtime throws `torClientUnavailable`; this
+method does not bootstrap Tor. A request cancelled while queued never starts native
+work. A request cancelled while active returns `CancellationError` after its bounded
+native operation and cleanup finish. All clients share a limit of two active bounded
+GETs. `httpRequestOverTor(for:retryLimit:)` and its existing GET/POST behavior remain
+available unchanged.
+
+Custom `Synchronizer` conformers and test doubles must add:
+
+```swift
+func httpGetOverTor(
+    for request: URLRequest,
+    retryLimit: UInt8,
+    timeoutMilliseconds: UInt64
+) async throws -> (data: Data, response: HTTPURLResponse)
+```
+
+Custom `ClosureSynchronizer` conformers add the same three arguments followed by
+`completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void`.
+Custom `CombineSynchronizer` conformers return
+`SinglePublisher<(data: Data, response: HTTPURLResponse), Error>` instead of using
+`async throws`. The SDK's `ClosureSDKSynchronizer` and `CombineSDKSynchronizer` already
+forward these requests to their underlying async synchronizer. There is no unbounded
+fallback implementation. Direct `TorClient` users can call
+`httpGet(for:retryLimit:timeoutMilliseconds:)` on a prepared client.
+
 ## `ZIP318Kind` gained a case — `canonicalCrossingPayment`
 
 `ZcashTransaction.Overview.ZIP318Kind`, the type of `zip318Kind`, has a fifth case,

@@ -1238,6 +1238,26 @@ public class SDKSynchronizer: Synchronizer {
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
     }
 
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        let torEnabled = await sdkFlags.torEnabled
+        let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+        guard torEnabled || exchangeRateEnabled else {
+            throw ZcashError.torNotEnabled
+        }
+
+        let torClient = initializer.container.resolve(TorClient.self)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+    }
+
     public func debugDatabase(sql: String) -> String {
         transactionRepository.debugDatabase(sql: sql)
     }
