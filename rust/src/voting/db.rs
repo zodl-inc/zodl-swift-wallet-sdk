@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::anyhow;
+use ff::PrimeField;
 use ffi_helpers::panic::catch_panic;
+use pasta_curves::pallas;
 use zcash_voting as voting;
 use zcash_voting::storage::VotingDb;
 use zcash_voting::tree_sync::VoteTreeSync;
@@ -22,10 +24,9 @@ pub struct VotingDatabaseHandle {
     pir_client: Mutex<CachedSlot<Arc<voting::PirClientBlocking>>>,
 }
 
-/// One value negotiated for an endpoint and a PIR layout, reused while both stay the same, so a
-/// server or geometry change reconnects instead of silently reusing the wrong dataset.
+/// One value negotiated for an endpoint, PIR layout, and round snapshot.
 struct CachedSlot<T> {
-    entry: Option<(String, voting::config::PirLayout, T)>,
+    entry: Option<(String, voting::config::PirLayout, [u8; 32], T)>,
 }
 
 impl<T: Clone> CachedSlot<T> {
@@ -37,22 +38,58 @@ impl<T: Clone> CachedSlot<T> {
         &mut self,
         url: &str,
         layout: voting::config::PirLayout,
+        expected_root: [u8; 32],
+        root_of: impl Fn(&T) -> [u8; 32],
         connect: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        if let Some((cached_url, cached_layout, value)) = &self.entry
+        if let Some((cached_url, cached_layout, cached_root, value)) = &self.entry
             && cached_url == url
             && *cached_layout == layout
+            && *cached_root == expected_root
+            && root_of(value) == expected_root
         {
             return Ok(value.clone());
         }
         let value = connect()?;
-        self.entry = Some((url.to_string(), layout, value.clone()));
+        if root_of(&value) != expected_root {
+            return Err(anyhow!(
+                "connected PIR circuit root does not match the stored round nullifier_imt_root"
+            ));
+        }
+        self.entry = Some((url.to_string(), layout, expected_root, value.clone()));
         Ok(value)
     }
 }
 
 impl VotingDatabaseHandle {
-    /// Returns a PIR client connected to `url` for `layout`, connecting only the first time.
+    fn pir_root_for_round(&self, round_id: &str) -> anyhow::Result<[u8; 32]> {
+        let wallet_id = self.db.wallet_id();
+        let (params, network) = {
+            let conn = self.db.conn();
+            voting::storage::queries::load_round_params_with_network(&conn, round_id, &wallet_id)
+                .map_err(|e| anyhow!("load stored voting round for PIR failed: {e}"))?
+        };
+        if network != self.network {
+            return Err(anyhow!(
+                "stored voting round network does not match the voting database handle"
+            ));
+        }
+        let root_bytes: [u8; 32] =
+            params
+                .nullifier_imt_root
+                .try_into()
+                .map_err(|root: Vec<u8>| {
+                    anyhow!(
+                        "stored round nullifier_imt_root must be exactly 32 bytes, got {}",
+                        root.len()
+                    )
+                })?;
+        let root = Option::<pallas::Base>::from(pallas::Base::from_repr(root_bytes))
+            .ok_or_else(|| anyhow!("stored round nullifier_imt_root is not canonical"))?;
+        Ok(root.to_repr())
+    }
+
+    /// Returns a PIR client connected to `url` for `layout` and the round's persisted snapshot.
     ///
     /// The handshake is expensive: `connect_pir_blocking` stands up a tokio runtime and a TLS
     /// client, then the client fetches both tiers' parameters and downloads the whole Tier-0
@@ -62,14 +99,22 @@ impl VotingDatabaseHandle {
     /// connects race; the client is dropped with the handle.
     pub(super) fn pir_client_for(
         &self,
+        round_id: &str,
         url: &str,
         layout: voting::config::PirLayout,
     ) -> anyhow::Result<Arc<voting::PirClientBlocking>> {
+        let expected_root = self.pir_root_for_round(round_id)?;
         let mut slot = self
             .pir_client
             .lock()
             .map_err(|_| anyhow!("voting DB PIR client mutex poisoned"))?;
-        slot.get_or_insert_with(url, layout, || Ok(Arc::new(connect_pir_client(url, layout)?)))
+        slot.get_or_insert_with(
+            url,
+            layout,
+            expected_root,
+            |client| client.circuit_root().to_repr(),
+            || Ok(Arc::new(connect_pir_client(url, layout)?)),
+        )
     }
 }
 
@@ -182,6 +227,8 @@ pub unsafe extern "C" fn zcashlc_voting_set_wallet_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff::PrimeField;
+    use pasta_curves::pallas;
 
     #[test]
     fn db_open_rejects_invalid_utf8_path() {
@@ -273,52 +320,347 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct TestPirClient {
+        root: [u8; 32],
+        generation: u32,
+    }
+
+    fn test_client(root: [u8; 32], generation: u32) -> Arc<TestPirClient> {
+        Arc::new(TestPirClient { root, generation })
+    }
+
     #[test]
     fn cached_slot_connects_once_for_the_same_endpoint_and_layout() {
-        let mut slot: CachedSlot<u32> = CachedSlot::new();
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
         let mut connects = 0;
+        let root = [1u8; 32];
 
         let first = slot
-            .get_or_insert_with("https://pir.example", layout(20), || {
-                connects += 1;
-                Ok(connects)
-            })
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root,
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root, connects))
+                },
+            )
             .unwrap();
         let second = slot
-            .get_or_insert_with("https://pir.example", layout(20), || {
-                connects += 1;
-                Ok(connects)
-            })
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root,
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root, connects))
+                },
+            )
             .unwrap();
 
-        assert_eq!((first, second), (1, 1));
+        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(connects, 1);
     }
 
     #[test]
-    fn cached_slot_reconnects_when_the_endpoint_or_the_layout_changes() {
-        let mut slot: CachedSlot<u32> = CachedSlot::new();
+    fn cached_slot_reconnects_for_a_new_snapshot() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
         let mut connects = 0;
+        let root_a = [1u8; 32];
+        let root_b = [2u8; 32];
+
+        let first = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_a,
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root_a, connects))
+                },
+            )
+            .unwrap();
+        let second = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_b,
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root_b, connects))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 2);
+        assert_eq!(connects, 2);
+    }
+
+    #[test]
+    fn cached_slot_revalidates_the_cached_clients_actual_root() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
+        let expected = [1u8; 32];
+        let first = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                expected,
+                |client| client.root,
+                || Ok(test_client(expected, 1)),
+            )
+            .unwrap();
+        drop(first);
+        let cached = &mut slot.entry.as_mut().expect("cached client").3;
+        Arc::get_mut(cached)
+            .expect("cache owns the only client")
+            .root = [2u8; 32];
+
+        let corrected = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                expected,
+                |client| client.root,
+                || Ok(test_client(expected, 2)),
+            )
+            .unwrap();
+
+        assert_eq!(corrected.generation, 2);
+        assert_eq!(corrected.root, expected);
+    }
+
+    #[test]
+    fn cached_slot_reconnects_when_the_endpoint_or_the_layout_changes() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
+        let mut connects = 0;
+        let root = [1u8; 32];
         let mut connect = || {
             connects += 1;
-            Ok(connects)
+            Ok(test_client(root, connects))
         };
 
-        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), &mut connect).unwrap(), 1);
-        assert_eq!(slot.get_or_insert_with("https://other.example", layout(20), &mut connect).unwrap(), 2);
-        assert_eq!(slot.get_or_insert_with("https://other.example", layout(21), &mut connect).unwrap(), 3);
-        assert_eq!(slot.get_or_insert_with("https://other.example", layout(21), &mut connect).unwrap(), 3);
+        assert_eq!(
+            slot.get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root,
+                |client| client.root,
+                &mut connect
+            )
+            .unwrap()
+            .generation,
+            1
+        );
+        assert_eq!(
+            slot.get_or_insert_with(
+                "https://other.example",
+                layout(20),
+                root,
+                |client| client.root,
+                &mut connect
+            )
+            .unwrap()
+            .generation,
+            2
+        );
+        assert_eq!(
+            slot.get_or_insert_with(
+                "https://other.example",
+                layout(21),
+                root,
+                |client| client.root,
+                &mut connect
+            )
+            .unwrap()
+            .generation,
+            3
+        );
+        assert_eq!(
+            slot.get_or_insert_with(
+                "https://other.example",
+                layout(21),
+                root,
+                |client| client.root,
+                &mut connect
+            )
+            .unwrap()
+            .generation,
+            3
+        );
         assert_eq!(connects, 3);
     }
 
     #[test]
-    fn cached_slot_keeps_the_old_client_when_a_reconnect_fails() {
-        let mut slot: CachedSlot<u32> = CachedSlot::new();
-        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), || Ok(7)).unwrap(), 7);
+    fn a_mismatched_candidate_is_not_cached() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
+        let expected = [2u8; 32];
 
-        let failed = slot.get_or_insert_with("https://other.example", layout(20), || Err(anyhow!("down")));
+        let error = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                expected,
+                |client| client.root,
+                || Ok(test_client([1u8; 32], 1)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("circuit root"));
+
+        let corrected = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                expected,
+                |client| client.root,
+                || Ok(test_client(expected, 2)),
+            )
+            .unwrap();
+        assert_eq!(corrected.generation, 2);
+    }
+
+    #[test]
+    fn cached_slot_keeps_the_old_client_when_a_reconnect_fails() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
+        let root_a = [1u8; 32];
+        let root_b = [2u8; 32];
+        let original = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_a,
+                |client| client.root,
+                || Ok(test_client(root_a, 7)),
+            )
+            .unwrap();
+
+        let failed = slot.get_or_insert_with(
+            "https://pir.example",
+            layout(20),
+            root_b,
+            |client| client.root,
+            || Err(anyhow!("down")),
+        );
         assert!(failed.is_err());
 
-        assert_eq!(slot.get_or_insert_with("https://pir.example", layout(20), || Ok(8)).unwrap(), 7);
+        let reused = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_a,
+                |client| client.root,
+                || panic!("the valid prior client should remain cached"),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &reused));
+    }
+
+    fn stored_round(round_id: String, root: [u8; 32]) -> voting::VotingRoundParams {
+        voting::VotingRoundParams {
+            vote_round_id: round_id,
+            snapshot_height: 100,
+            ea_pk: vec![0; 32],
+            nc_root: pallas::Base::from(9).to_repr().to_vec(),
+            nullifier_imt_root: root.to_vec(),
+        }
+    }
+
+    fn memory_handle() -> VotingDatabaseHandle {
+        let db = Arc::new(VotingDb::open(":memory:").expect("open voting database"));
+        db.set_wallet_id("cache-test-wallet");
+        VotingDatabaseHandle {
+            db,
+            tree_sync: VoteTreeSync::new(),
+            network: voting::Network::Mainnet,
+            network_id: crate::NETWORK_ID_MAINNET,
+            pir_client: Mutex::new(CachedSlot::new()),
+        }
+    }
+
+    #[test]
+    fn persisted_round_roots_select_the_cache_snapshot() {
+        let handle = memory_handle();
+        let root_a = pallas::Base::from(1).to_repr();
+        let root_b = pallas::Base::from(2).to_repr();
+        let round_a = hex::encode(pallas::Base::from(3).to_repr());
+        let round_b = hex::encode(pallas::Base::from(4).to_repr());
+        handle
+            .db
+            .init_round(
+                voting::Network::Mainnet,
+                &stored_round(round_a.clone(), root_a),
+                None,
+            )
+            .expect("insert first round");
+        handle
+            .db
+            .init_round(
+                voting::Network::Mainnet,
+                &stored_round(round_b.clone(), root_b),
+                None,
+            )
+            .expect("insert second round");
+
+        assert_eq!(handle.pir_root_for_round(&round_a).unwrap(), root_a);
+        assert_eq!(handle.pir_root_for_round(&round_b).unwrap(), root_b);
+    }
+
+    #[test]
+    fn persisted_round_root_rejects_missing_and_malformed_rows() {
+        let handle = memory_handle();
+        let round_id = hex::encode(pallas::Base::from(5).to_repr());
+        assert!(handle.pir_root_for_round(&round_id).is_err());
+
+        let root = pallas::Base::from(6).to_repr();
+        handle
+            .db
+            .init_round(
+                voting::Network::Mainnet,
+                &stored_round(round_id.clone(), root),
+                None,
+            )
+            .expect("insert round");
+        let wallet_id = handle.db.wallet_id();
+        let conn = handle.db.conn();
+        conn.execute(
+            "UPDATE rounds SET nullifier_imt_root = X'FF' WHERE round_id = ?1 AND wallet_id = ?2",
+            rusqlite::params![round_id, wallet_id],
+        )
+        .expect("malform persisted root");
+        drop(conn);
+
+        assert!(handle.pir_root_for_round(&round_id).is_err());
+
+        let conn = handle.db.conn();
+        conn.execute(
+            "UPDATE rounds SET nullifier_imt_root = ?3 WHERE round_id = ?1 AND wallet_id = ?2",
+            rusqlite::params![round_id, wallet_id, vec![0xffu8; 32]],
+        )
+        .expect("persist noncanonical root");
+        drop(conn);
+
+        assert!(handle.pir_root_for_round(&round_id).is_err());
+    }
+
+    #[test]
+    fn persisted_round_root_rejects_a_different_network() {
+        let handle = memory_handle();
+        let root = pallas::Base::from(7).to_repr();
+        let round_id = hex::encode(pallas::Base::from(8).to_repr());
+        handle
+            .db
+            .init_round(
+                voting::Network::Testnet,
+                &stored_round(round_id.clone(), root),
+                None,
+            )
+            .expect("insert round");
+
+        assert!(handle.pir_root_for_round(&round_id).is_err());
     }
 }

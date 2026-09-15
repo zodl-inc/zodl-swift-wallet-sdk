@@ -44,7 +44,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rust core from source now requires Rust 1.91.
 - The PIR client is connected once per voting database handle and reused across the bundles and
   phases of a round (delegation PIR precompute and delegation proof), instead of once per call. The
-  connection is keyed by endpoint and layout, so a server or geometry change still reconnects.
+  connection is keyed by endpoint, layout, and the round's persisted snapshot root, so a server,
+  geometry, or snapshot change reconnects. A connected client's actual circuit root must match the
+  stored round before the SDK caches or reuses it.
 
 ## Checkpoints
 

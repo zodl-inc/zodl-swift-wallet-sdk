@@ -405,7 +405,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
             tier1_layers,
             poly_len,
         };
-        let pir_client = handle.pir_client_for(&pir_url, pir_layout)?;
+        let pir_client = handle.pir_client_for(&round_id_str, &pir_url, pir_layout)?;
 
         let result = handle
             .db
@@ -501,7 +501,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
             tier1_layers,
             poly_len,
         };
-        let pir_client = handle.pir_client_for(&pir_url, pir_layout)?;
+        let pir_client = handle.pir_client_for(&round_id_str, &pir_url, pir_layout)?;
 
         let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_secret, handle.network)
             .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;

@@ -469,7 +469,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the crate's `rust-version` to 1.91. The 4.0 line keeps the 3.0 API: proposal ids widen to 1 to
   50, and the crate now writes its sidecar under immediate SQLite transactions. No FFI change.
 - `zcashlc_voting_precompute_delegation_pir` and `zcashlc_voting_build_and_prove_delegation` reuse
-  one PIR client per `VotingDatabaseHandle`, keyed by endpoint URL and layout.
+  one PIR client per `VotingDatabaseHandle`, keyed by endpoint URL, layout, and the persisted round
+  snapshot root. A client's actual circuit root must match the stored round before it is cached or
+  reused; a different round snapshot reconnects.
 
 ### Removed
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
