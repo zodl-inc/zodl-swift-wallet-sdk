@@ -65,7 +65,7 @@ final class OHTTPE2ETests: ZcashTestCase {
 
         let networkString = Env.environment["OHTTP_E2E_NETWORK"] ?? "testnet"
         let isMainnet = networkString.lowercased() == "mainnet"
-        let network: ZcashNetworkType = isMainnet ? .mainnet : .testnet
+        let network: NetworkType = isMainnet ? .mainnet : .testnet
         let gatewayHost = isMainnet ? "ohttp-gateway.example" : Env.gatewayHost
         let birthday: BlockHeight = Env.environment["OHTTP_E2E_SEND_BIRTHDAY"].flatMap { Int($0) } ?? 4_123_865
         let sendAmount = Zatoshi(Env.environment["OHTTP_E2E_SEND_ZATOSHI"].flatMap { Int64($0) } ?? 1_000_000)
@@ -79,7 +79,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         try await sendLeg(seed: seed2, birthday: birthday, recipientUA: recipientUA, amount: sendAmount, network: network, gatewayHost: gatewayHost, tor: true)
     }
 
-    private func sendLeg(seed: Data, birthday: BlockHeight, recipientUA: String, amount: Zatoshi, network: ZcashNetworkType, gatewayHost: String, tor: Bool) async throws {
+    private func sendLeg(seed: Data, birthday: BlockHeight, recipientUA: String, amount: Zatoshi, network: NetworkType, gatewayHost: String, tor: Bool) async throws {
         let mode = tor ? "tor" : "ohttp"
         log("SEND LEG mode=\(mode) network=\(network) gateway=\(gatewayHost) birthday=\(birthday)")
 
