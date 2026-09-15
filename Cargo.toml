@@ -129,8 +129,10 @@ base64 = "0.22"
 hex = "0.4"
 
 [dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 
 [build-dependencies]
 bindgen = "0.72"

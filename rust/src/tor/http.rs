@@ -1,5 +1,9 @@
 use std::future::Future;
 
+#[cfg(test)]
+#[path = "http_transport_tests.rs"]
+mod transport_tests;
+
 pub(crate) async fn with_http_timeout<T>(
     timeout_ms: u64,
     operation: impl Future<Output = anyhow::Result<T>>,
