@@ -89,6 +89,22 @@ impl VotingDatabaseHandle {
         Ok(root.to_repr())
     }
 
+    fn pir_client_for_with<T: Clone>(
+        &self,
+        cache: &Mutex<CachedSlot<T>>,
+        round_id: &str,
+        url: &str,
+        layout: voting::config::PirLayout,
+        root_of: impl Fn(&T) -> [u8; 32],
+        connect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let expected_root = self.pir_root_for_round(round_id)?;
+        let mut slot = cache
+            .lock()
+            .map_err(|_| anyhow!("voting DB PIR client mutex poisoned"))?;
+        slot.get_or_insert_with(url, layout, expected_root, root_of, connect)
+    }
+
     /// Returns a PIR client connected to `url` for `layout` and the round's persisted snapshot.
     ///
     /// The handshake is expensive: `connect_pir_blocking` stands up a tokio runtime and a TLS
@@ -103,15 +119,11 @@ impl VotingDatabaseHandle {
         url: &str,
         layout: voting::config::PirLayout,
     ) -> anyhow::Result<Arc<voting::PirClientBlocking>> {
-        let expected_root = self.pir_root_for_round(round_id)?;
-        let mut slot = self
-            .pir_client
-            .lock()
-            .map_err(|_| anyhow!("voting DB PIR client mutex poisoned"))?;
-        slot.get_or_insert_with(
+        self.pir_client_for_with(
+            &self.pir_client,
+            round_id,
             url,
             layout,
-            expected_root,
             |client| client.circuit_root().to_repr(),
             || Ok(Arc::new(connect_pir_client(url, layout)?)),
         )
@@ -560,6 +572,42 @@ mod tests {
         assert!(Arc::ptr_eq(&original, &reused));
     }
 
+    #[test]
+    fn cached_slot_keeps_the_old_client_when_a_candidate_root_mismatches() {
+        let mut slot: CachedSlot<Arc<TestPirClient>> = CachedSlot::new();
+        let root_a = [1u8; 32];
+        let root_b = [2u8; 32];
+        let original = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_a,
+                |client| client.root,
+                || Ok(test_client(root_a, 1)),
+            )
+            .unwrap();
+
+        let failed = slot.get_or_insert_with(
+            "https://pir.example",
+            layout(20),
+            root_b,
+            |client| client.root,
+            || Ok(test_client([3u8; 32], 2)),
+        );
+        assert!(failed.is_err());
+
+        let reused = slot
+            .get_or_insert_with(
+                "https://pir.example",
+                layout(20),
+                root_a,
+                |client| client.root,
+                || panic!("a root-mismatched candidate must not evict the valid prior client"),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &reused));
+    }
+
     fn stored_round(round_id: String, root: [u8; 32]) -> voting::VotingRoundParams {
         voting::VotingRoundParams {
             vote_round_id: round_id,
@@ -583,8 +631,10 @@ mod tests {
     }
 
     #[test]
-    fn persisted_round_roots_select_the_cache_snapshot() {
+    fn persisted_round_roots_drive_cache_selection() {
         let handle = memory_handle();
+        let cache: Mutex<CachedSlot<Arc<TestPirClient>>> = Mutex::new(CachedSlot::new());
+        let mut connects = 0;
         let root_a = pallas::Base::from(1).to_repr();
         let root_b = pallas::Base::from(2).to_repr();
         let round_a = hex::encode(pallas::Base::from(3).to_repr());
@@ -606,8 +656,47 @@ mod tests {
             )
             .expect("insert second round");
 
-        assert_eq!(handle.pir_root_for_round(&round_a).unwrap(), root_a);
-        assert_eq!(handle.pir_root_for_round(&round_b).unwrap(), root_b);
+        let first = handle
+            .pir_client_for_with(
+                &cache,
+                &round_a,
+                "https://pir.example",
+                layout(20),
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root_a, connects))
+                },
+            )
+            .unwrap();
+        let repeated = handle
+            .pir_client_for_with(
+                &cache,
+                &round_a,
+                "https://pir.example",
+                layout(20),
+                |client| client.root,
+                || panic!("the same persisted round should reuse its client"),
+            )
+            .unwrap();
+        let second = handle
+            .pir_client_for_with(
+                &cache,
+                &round_b,
+                "https://pir.example",
+                layout(20),
+                |client| client.root,
+                || {
+                    connects += 1;
+                    Ok(test_client(root_b, connects))
+                },
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 2);
+        assert_eq!(connects, 2);
     }
 
     #[test]
