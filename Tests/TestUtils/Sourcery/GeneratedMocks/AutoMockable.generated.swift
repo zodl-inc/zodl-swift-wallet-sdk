@@ -2602,18 +2602,18 @@ class SynchronizerMock: Synchronizer {
     var httpRequestOverOHTTPForCalled: Bool {
         return httpRequestOverOHTTPForCallsCount > 0
     }
-    var httpRequestOverOHTTPForReceivedRequest: URLRequest?
+    var httpRequestOverOHTTPForReceivedArguments: (request: URLRequest, viaTor: Bool)?
     var httpRequestOverOHTTPForReturnValue: (data: Data, response: HTTPURLResponse)!
-    var httpRequestOverOHTTPForClosure: ((URLRequest) async throws -> (data: Data, response: HTTPURLResponse))?
+    var httpRequestOverOHTTPForClosure: ((URLRequest, Bool) async throws -> (data: Data, response: HTTPURLResponse))?
 
-    func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+    func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
         if let error = httpRequestOverOHTTPForThrowableError {
             throw error
         }
         httpRequestOverOHTTPForCallsCount += 1
-        httpRequestOverOHTTPForReceivedRequest = request
+        httpRequestOverOHTTPForReceivedArguments = (request: request, viaTor: viaTor)
         if let closure = httpRequestOverOHTTPForClosure {
-            return try await closure(request)
+            return try await closure(request, viaTor)
         } else {
             return httpRequestOverOHTTPForReturnValue
         }
