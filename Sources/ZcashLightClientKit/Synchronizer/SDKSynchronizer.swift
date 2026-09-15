@@ -665,6 +665,10 @@ public class SDKSynchronizer: Synchronizer {
         return (try? await transactionRepository.getTransactionOutputs(for: transaction.rawID)) ?? []
     }
 
+    public func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        return (try? await transactionRepository.getTransactionOutputs(for: transactions.map(\.rawID))) ?? [:]
+    }
+
     public func latestHeight() async throws -> BlockHeight {
         try await blockProcessor.latestHeight(mode: await sdkFlags.ifTor(.torInGroup("SDKSynchronizer.latestHeight")))
     }
