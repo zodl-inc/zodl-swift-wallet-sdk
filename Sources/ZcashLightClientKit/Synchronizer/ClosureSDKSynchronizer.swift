@@ -315,7 +315,7 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
 
     public func httpRequestOverOHTTP(for request: URLRequest, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
-            try await self.synchronizer.httpRequestOverOHTTP(for: request)
+            try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
         }
     }
 

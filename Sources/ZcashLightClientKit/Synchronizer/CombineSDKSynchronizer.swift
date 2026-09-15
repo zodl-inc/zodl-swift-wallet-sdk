@@ -311,7 +311,7 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
 
     public func httpRequestOverOHTTP(for request: URLRequest) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
-            try await self.synchronizer.httpRequestOverOHTTP(for: request)
+            try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
         }
     }
 
