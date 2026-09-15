@@ -2790,16 +2790,45 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
-    public func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool = false) async throws -> (data: Data, response: HTTPURLResponse) {
         guard let host = request.url?.host, OHTTPEndpoints.isGateway(host) else {
             throw ZcashError.ohttpUnsupportedHost
         }
         let relayURL = try OHTTPEndpoints.relayURL(for: host)
         let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
-        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            httpSender = { [weak self] request in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpRequestOverTor(for: request, retryLimit: 3)
+            }
+        } else {
+            httpSender = { request in
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, httpSender: httpSender)
         let scheme = request.url?.scheme ?? "https"
         let path = (request.url?.path ?? "/") + (request.url?.query.map { "?\($0)" } ?? "")
-        let headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+
+        // Strip gateway-injected secrets for mapped hosts (CMC, NEAR).
+        var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+        if OHTTPEndpoints.proxyHost(for: request.url!) != nil {
+            let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
+            let originalCount = headers.count
+            headers = headers.filter { !strippedHeaders.contains($0.0) }
+            if headers.count < originalCount {
+                initializer.logger.info("httpRequestOverOHTTP: stripped \(originalCount - headers.count) gateway-injected secret header(s) for \(host)")
+            }
+        }
+
         let bhttp = BinaryHTTP.Request(
             method: request.httpMethod ?? "GET",
             scheme: scheme,

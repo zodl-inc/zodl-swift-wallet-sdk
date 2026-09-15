@@ -650,8 +650,13 @@ public protocol Synchronizer: AnyObject {
 
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
     /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`).
-    /// Use when Tor is OFF; when Tor is ON call `httpRequestOverTor` directly instead.
-    func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse)
+    ///
+    /// - Parameters:
+    ///    - for: URLRequest with the OHTTP proxy hostname (use `OHTTPEndpoints.proxyURL(for:)` to convert)
+    ///    - viaTor: When true, the relay POST rides a Tor circuit (Tor → relay → gateway). The gateway
+    ///              injects secrets for external APIs (CMC, NEAR) on behalf of the client. When false,
+    ///              uses clearnet to reach the relay (device → relay → gateway). Default false.
+    func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
 
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!

@@ -9,11 +9,16 @@
 import Foundation
 
 actor OHTTPTransport {
+    /// Pluggable HTTP sender for the relay POST (and the key-config GET).
+    /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
+    typealias HTTPSender = (URLRequest) async throws -> (Data, HTTPURLResponse)
+
     private let relayURL: String
     private let keyConfigURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
     private var cachedKeyConfig: OHTTPKeyConfig?
+    private let httpSender: HTTPSender
 
     private static let requestMediaType = "message/ohttp-req"
     private static let responseMediaType = "message/ohttp-res"
@@ -21,11 +26,24 @@ actor OHTTPTransport {
     private static let requestLabel = "message/bhttp request".data(using: .ascii)!
     private static let responseLabel = "message/bhttp response".data(using: .ascii)!
 
-    init(relayURL: String, keyConfigURL: String, connectTimeoutMS: Int = 15000, keyFetchTimeoutMS: Int = 15000) {
+    init(
+        relayURL: String,
+        keyConfigURL: String,
+        connectTimeoutMS: Int = 15000,
+        keyFetchTimeoutMS: Int = 15000,
+        httpSender: @escaping HTTPSender = { request in
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw OHTTPError.transportError("Invalid response type")
+            }
+            return (data, httpResponse)
+        }
+    ) {
         self.relayURL = relayURL
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
+        self.httpSender = httpSender
     }
 
     /// Fetches (or returns the cached) gateway key configuration.
@@ -113,11 +131,7 @@ actor OHTTPTransport {
         request.httpMethod = "GET"
         request.setValue(Self.keysMediaType, forHTTPHeaderField: "Accept")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OHTTPError.transportError("Invalid response type")
-        }
+        let (data, httpResponse) = try await httpSender(request)
 
         guard httpResponse.statusCode == 200 else {
             throw OHTTPError.transportError("Key config fetch failed: HTTP \(httpResponse.statusCode)")
@@ -138,11 +152,7 @@ actor OHTTPTransport {
         request.setValue(Self.responseMediaType, forHTTPHeaderField: "Accept")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OHTTPError.transportError("Invalid response type")
-        }
+        let (data, httpResponse) = try await httpSender(request)
 
         guard httpResponse.statusCode == 200 else {
             let detail = String(data: data.prefix(200), encoding: .utf8) ?? ""

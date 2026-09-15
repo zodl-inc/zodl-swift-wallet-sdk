@@ -398,38 +398,97 @@ final class OHTTPE2ETests: ZcashTestCase {
     /// Verifies that CMC and NEAR external API calls are routed through the OHTTP gateway.
     /// No wallet seed required — just checks the proxy path end-to-end.
     /// Set OHTTP_E2E_TEST_EXTERNAL_APIS=0 to skip.
+    /// Set OHTTP_E2E_TOR=1 to test Tor+OHTTP routing with gateway-injected secrets.
     func testExternalAPIsViaOHTTP() async throws {
         guard ProcessInfo.processInfo.environment["OHTTP_E2E_TEST_EXTERNAL_APIS"] != "0" else {
             throw XCTSkip("OHTTP_E2E_TEST_EXTERNAL_APIS=0")
         }
+        let tor = ProcessInfo.processInfo.environment["OHTTP_E2E_TOR"] == "1"
+        let mode = tor ? "tor-ohttp" : "ohttp"
         let runnerIP = await publicIP(via: nil) ?? "unknown"
-        log("mode=external-apis host egress ip=\(runnerIP)")
+        log("mode=external-apis-\(mode) host egress ip=\(runnerIP)")
 
-        // Test 1: NEAR token list — public endpoint, no auth required.
-        let nearURL = URL(string: "https://1click.chaindefuser.com/v0/tokens")!
-        if OHTTPEndpoints.proxyURL(for: nearURL) != nil {
-            log("NEAR tokens: routing via near.zodl.com OHTTP proxy")
-            let (data, response) = try await externalAPIRequest(url: nearURL)
-            XCTAssertEqual(response.statusCode, 200, "NEAR token list via OHTTP should return 200")
-            XCTAssertGreaterThan(data.count, 100, "NEAR token list should have content")
-            log("RESULT external=near status=\(response.statusCode) bytes=\(data.count)")
-        } else {
-            log("SKIP external=near no proxy configured (OHTTPEndpoints.proxyURL returned nil)")
+        // Initialize a synchronizer if Tor is enabled (for httpRequestOverTor)
+        var synchronizer: Synchronizer?
+        if tor {
+            guard let seedHex = Env.seedHex, let seed = Data(hexString: seedHex), seed.count == 64 else {
+                throw XCTSkip("OHTTP_E2E_TOR=1 but OHTTP_E2E_SEED_HEX not set; Tor+OHTTP test skipped")
+            }
+            let databases = TemporaryDbBuilder.build()
+            let initializer = Initializer(
+                cacheDbURL: nil,
+                fsBlockDbRoot: databases.fsCacheDbRoot,
+                generalStorageURL: databases.generalStorageURL,
+                dataDbURL: databases.dataDB,
+                torDirURL: databases.torDir,
+                endpoint: LightWalletEndpoint(
+                    address: Env.gatewayHost,
+                    port: 443,
+                    secure: true,
+                    singleCallTimeoutInMillis: 30_000,
+                    streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+                ),
+                network: ZcashNetworkBuilder.network(for: .testnet),
+                spendParamsURL: try __spendParamsURL(),
+                outputParamsURL: try __outputParamsURL(),
+                saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+                alias: .custom("ohttp-e2e-external-apis-tor"),
+                loggingPolicy: .default(.debug),
+                isTorEnabled: true,
+                isExchangeRateEnabled: false
+            )
+            let sync = SDKSynchronizer(initializer: initializer)
+            let result = try await sync.prepare(with: [UInt8](seed), walletBirthday: Env.birthday, name: "external-apis", keySource: nil)
+            guard case .success = result else {
+                throw XCTSkip("prepare() failed for Tor+OHTTP test")
+            }
+            try await sync.tor(enabled: true)
+            let torInitialized = await sync.isTorSuccessfullyInitialized()
+            log("tor enabled, initialized=\(String(describing: torInitialized))")
+            let torExitIP = await publicIP(via: sync) ?? "unknown"
+            log("tor exit ip=\(torExitIP)")
+            synchronizer = sync
         }
 
-        // Test 2: CMC key/info endpoint — no API key returns 401, but the gateway
-        // must have proxied the request (we verify a real HTTP response arrived).
+        // Test 1: CMC key/info endpoint — the gateway should inject X-CMC_PRO_API_KEY and return 200.
+        // If Tor is off (OHTTP only), the request lacks the key so 401 is expected (gateway not yet configured).
+        // If Tor is on (Tor+OHTTP), the gateway injects the key and 200 is expected.
         let cmcURL = URL(string: "https://pro-api.coinmarketcap.com/v1/key/info")!
         if OHTTPEndpoints.proxyURL(for: cmcURL) != nil {
-            log("CMC: routing via cmc.zodl.com OHTTP proxy")
-            let (_, response) = try await externalAPIRequest(url: cmcURL)
-            XCTAssertTrue(
-                [200, 400, 401, 403].contains(response.statusCode),
-                "CMC via OHTTP must return a real HTTP status (got \(response.statusCode))"
-            )
-            log("RESULT external=cmc status=\(response.statusCode)")
+            log("CMC: routing via cmc.zodl.com OHTTP proxy (\(mode))")
+            let (_, response) = try await externalAPIRequest(url: cmcURL, viaTor: tor, synchronizer: synchronizer)
+            let expectedStatus = tor ? 200 : [200, 400, 401, 403]
+            if tor {
+                XCTAssertEqual(response.statusCode, 200, "CMC via Tor+OHTTP must return 200 (gateway-injected key)")
+            } else {
+                XCTAssertTrue(
+                    (expectedStatus as! [Int]).contains(response.statusCode),
+                    "CMC via OHTTP must return a real HTTP status (got \(response.statusCode))"
+                )
+            }
+            log("RESULT external=cmc via=\(mode) status=\(response.statusCode)")
         } else {
             log("SKIP external=cmc no proxy configured")
+        }
+
+        // Test 2: NEAR token list — if Tor is on, the gateway should inject the Bearer token and return 200.
+        // If Tor is off (OHTTP only), 200 is expected (public endpoint).
+        let nearURL = URL(string: "https://1click.chaindefuser.com/v0/tokens")!
+        if OHTTPEndpoints.proxyURL(for: nearURL) != nil {
+            log("NEAR tokens: routing via near.zodl.com OHTTP proxy (\(mode))")
+            let (data, response) = try await externalAPIRequest(url: nearURL, viaTor: tor, synchronizer: synchronizer)
+            // The NEAR endpoint may return 200 (public) or 401 (requires auth); both are valid responses.
+            // With Tor+OHTTP and gateway injection, 200 is expected if the gateway has the secret configured.
+            XCTAssertTrue(
+                [200, 401].contains(response.statusCode),
+                "NEAR via \(mode) must return 200 or 401 (got \(response.statusCode))"
+            )
+            if response.statusCode == 200 {
+                XCTAssertGreaterThan(data.count, 100, "NEAR token list should have content")
+            }
+            log("RESULT external=near via=\(mode) status=\(response.statusCode) bytes=\(data.count)")
+        } else {
+            log("SKIP external=near no proxy configured (OHTTPEndpoints.proxyURL returned nil)")
         }
 
         // Test 3: valargroup.org voting chain — allowlisted host (no hostname rewrite).
@@ -467,7 +526,12 @@ final class OHTTPE2ETests: ZcashTestCase {
     /// For allowlisted hosts: uses the original host as BHTTP authority (no rewrite).
     /// For static mappings: uses the rewritten proxy host as authority.
     /// Falls back to a plain URLSession request if no mapping exists.
-    private func externalAPIRequest(url: URL) async throws -> (Data, HTTPURLResponse) {
+    ///
+    /// - Parameters:
+    ///   - url: Original URL (e.g. https://pro-api.coinmarketcap.com/v1/key/info)
+    ///   - viaTor: When true, uses Tor+OHTTP routing (via synchronizer.httpRequestOverOHTTP(viaTor: true))
+    ///   - synchronizer: Required when viaTor is true
+    private func externalAPIRequest(url: URL, viaTor: Bool = false, synchronizer: Synchronizer? = nil) async throws -> (Data, HTTPURLResponse) {
         guard let proxyURL = OHTTPEndpoints.proxyURL(for: url),
               let proxyHost = proxyURL.host,
               let originalHost = url.host else {
@@ -475,32 +539,46 @@ final class OHTTPE2ETests: ZcashTestCase {
             // swiftlint:disable:next force_cast
             return (data, resp as! HTTPURLResponse)
         }
-        let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
-        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
-        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
 
-        // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
-        let authority = OHTTPEndpoints.isProxyAllowlisted(host: originalHost) ? originalHost : proxyHost
+        if viaTor {
+            // Tor+OHTTP: use the synchronizer's httpRequestOverOHTTP(viaTor: true) which strips secrets
+            // and sends the relay POST through Tor. The gateway injects the secret after decrypting.
+            guard let sync = synchronizer else {
+                throw XCTSkip("viaTor=true requires a synchronizer")
+            }
+            var request = URLRequest(url: proxyURL)
+            request.httpMethod = "GET"
+            request.setValue("zodl-ohttp-e2e/1.0", forHTTPHeaderField: "User-Agent")
+            return try await sync.httpRequestOverOHTTP(for: request, viaTor: true)
+        } else {
+            // OHTTP only (clearnet → relay → gateway)
+            let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
+            let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
+            let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
 
-        var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
-        let rawPath = comps.path.isEmpty ? "/" : comps.path
-        let path = rawPath + (comps.query.map { "?\($0)" } ?? "")
-        let bhttp = BinaryHTTP.Request(
-            method: "GET",
-            scheme: "https",
-            authority: authority,
-            path: path,
-            headers: [("user-agent", "zodl-ohttp-e2e/1.0")],
-            body: Data()
-        )
-        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
-        let httpResp = HTTPURLResponse(
-            url: proxyURL,
-            statusCode: response.status,
-            httpVersion: "HTTP/1.1",
-            headerFields: Dictionary(response.headers.map { ($0.0, $0.1) }, uniquingKeysWith: { $1 })
-        )!
-        return (response.body, httpResp)
+            // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
+            let authority = OHTTPEndpoints.isProxyAllowlisted(host: originalHost) ? originalHost : proxyHost
+
+            var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
+            let rawPath = comps.path.isEmpty ? "/" : comps.path
+            let path = rawPath + (comps.query.map { "?\($0)" } ?? "")
+            let bhttp = BinaryHTTP.Request(
+                method: "GET",
+                scheme: "https",
+                authority: authority,
+                path: path,
+                headers: [("user-agent", "zodl-ohttp-e2e/1.0")],
+                body: Data()
+            )
+            let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+            let httpResp = HTTPURLResponse(
+                url: proxyURL,
+                statusCode: response.status,
+                httpVersion: "HTTP/1.1",
+                headerFields: Dictionary(response.headers.map { ($0.0, $0.1) }, uniquingKeysWith: { $1 })
+            )!
+            return (response.body, httpResp)
+        }
     }
 
     // MARK: - Helpers

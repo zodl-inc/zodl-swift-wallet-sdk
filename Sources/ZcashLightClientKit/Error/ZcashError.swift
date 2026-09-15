@@ -92,6 +92,9 @@ public enum ZcashError: Equatable, Error {
     /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.
     /// ZTSRV0007
     case ohttpResponseError
+    /// OHTTP transport error (e.g., self reference lost in httpSender closure).
+    /// ZTSRV0008
+    case ohttpTransportError
     /// SimpleConnectionProvider init of Connection failed.
     /// ZSCPC0001
     case simpleConnectionProvider(_ error: Error)
@@ -1047,6 +1050,7 @@ public enum ZcashError: Equatable, Error {
         case .torNotEnabled: return "TorClient is called but SDKFlags are set as Tor disabled"
         case .ohttpUnsupportedHost: return "Request host is not registered in OHTTPEndpoints"
         case .ohttpResponseError: return "OHTTP response could not be converted to HTTPURLResponse"
+        case .ohttpTransportError: return "OHTTP transport error (self reference lost in httpSender closure)"
         case .simpleConnectionProvider: return "SimpleConnectionProvider init of Connection failed."
         case .saplingParamsInvalidSpendParams: return "Downloaded file with sapling spending parameters isn't valid."
         case .saplingParamsInvalidOutputParams: return "Downloaded file with sapling output parameters isn't valid."
@@ -1347,6 +1351,7 @@ public enum ZcashError: Equatable, Error {
         case .torNotEnabled: return .torNotEnabled
         case .ohttpUnsupportedHost: return .ohttpUnsupportedHost
         case .ohttpResponseError: return .ohttpResponseError
+        case .ohttpTransportError: return .ohttpTransportError
         case .simpleConnectionProvider: return .simpleConnectionProvider
         case .saplingParamsInvalidSpendParams: return .saplingParamsInvalidSpendParams
         case .saplingParamsInvalidOutputParams: return .saplingParamsInvalidOutputParams

@@ -1263,22 +1263,56 @@ public class SDKSynchronizer: Synchronizer {
     ///
     /// Tor/OHTTP matrix:
     ///   - Tor OFF: call this method → OHTTP → gateway → destination (IP hidden from destination)
-    ///   - Tor ON:  call `httpRequestOverTor` directly → Tor → destination (IP hidden everywhere)
+    ///   - Tor ON:  call this method with `viaTor: true` → Tor → relay → gateway → destination
+    ///              (the relay POST rides a Tor circuit; the gateway injects secrets for mapped hosts)
+    ///
+    /// Gateway-injected secrets: external APIs that need a secret (CMC, NEAR) must NOT receive the
+    /// app's secret when Tor is ON. With `viaTor: true`, the gateway injects the secret on behalf
+    /// of the client after decrypting the OHTTP-encapsulated request.
     ///
     /// Authored on Linux — compile validation pending on macOS.
-    public func httpRequestOverOHTTP(for request: URLRequest) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool = false) async throws -> (data: Data, response: HTTPURLResponse) {
         guard let host = request.url?.host,
               OHTTPEndpoints.isGateway(host) else {
             throw ZcashError.ohttpUnsupportedHost
         }
         let relayURL = try OHTTPEndpoints.relayURL(for: host)
         let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
-        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            httpSender = { [weak self] request in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpRequestOverTor(for: request, retryLimit: 3)
+            }
+        } else {
+            httpSender = { request in
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, httpSender: httpSender)
 
         let scheme = request.url?.scheme ?? "https"
         let rawPath = request.url?.path ?? "/"
         let queryStr = request.url?.query.map { "?\($0)" } ?? ""
-        let headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+
+        // Strip gateway-injected secrets for mapped hosts (CMC, NEAR).
+        var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+        if OHTTPEndpoints.proxyHost(for: request.url!) != nil {
+            let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
+            let originalCount = headers.count
+            headers = headers.filter { !strippedHeaders.contains($0.0) }
+            if headers.count < originalCount {
+                logger.info("httpRequestOverOHTTP: stripped \(originalCount - headers.count) gateway-injected secret header(s) for \(host)")
+            }
+        }
+
         let body = request.httpBody ?? Data()
 
         let bhttpRequest = BinaryHTTP.Request(
