@@ -85,9 +85,14 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
         } catch PirSnapshotResolverError.noMatchingEndpoint(let expected, let details) {
             XCTAssertEqual(expected, snapshotHeight)
             XCTAssertEqual(details.map(\.url), [endpointB, endpointA, endpointA])
-            XCTAssertEqual(details[0].status, .unreachable(reason: "offline"))
-            XCTAssertEqual(details[1].status, .mismatched(height: snapshotHeight - 1))
-            XCTAssertEqual(details[2].status, .mismatched(height: snapshotHeight - 1))
+            XCTAssertEqual(
+                details.map(\.status),
+                [
+                    .unreachable(reason: "offline"),
+                    .mismatched(height: snapshotHeight - 1),
+                    .mismatched(height: snapshotHeight - 1)
+                ]
+            )
             let probedURLs = await recorder.probedURLs()
             XCTAssertEqual(probedURLs, [endpointA, endpointB])
         } catch {
@@ -279,7 +284,7 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
         XCTAssertEqual(enteredURLs.values[0], enteredURLs.values[1])
     }
 
-    func testCancellingOneCoalescedCallerDoesNotPoisonTheOtherCaller() async throws {
+    func testCancellingJoiningCoalescedCallerDoesNotPoisonOriginatingCaller() async throws {
         let backend = try makeOpenBackend()
         defer { backend.close() }
         let probeGate = Gate()
@@ -289,24 +294,33 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
         )
         let resolver = PirSnapshotResolver(probe: recorder)
         let enteredURLs = LockedURLs()
+        let acquisitions = ResolutionAcquisitionRecorder()
 
         let survivingTask = Task {
             try await self.prove(
                 backend: backend,
                 endpoints: [self.endpointA],
                 resolver: resolver,
-                enteredURLs: enteredURLs
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
             )
         }
+        await acquisitions.waitUntilCount(1)
         await recorder.waitUntilProbeCount(1)
         let cancelledTask = Task {
             try await self.prove(
                 backend: backend,
                 endpoints: [self.endpointA],
                 resolver: resolver,
-                enteredURLs: enteredURLs
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
             )
         }
+        await acquisitions.waitUntilCount(2)
         cancelledTask.cancel()
         probeGate.open()
 
@@ -315,7 +329,385 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
         XCTAssertThrowsError(try cancelledResult.get()) { error in
             XCTAssertTrue(error is CancellationError)
         }
+        let joinedExistingResolutions = await acquisitions.values
+        let probeCount = await recorder.probeCount()
+        XCTAssertEqual(joinedExistingResolutions, [false, true])
+        XCTAssertEqual(probeCount, 1)
         XCTAssertEqual(enteredURLs.values, [endpointA])
+    }
+
+    func testCancellingOriginatingCoalescedCallerDoesNotPoisonJoiningCaller() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let probeGate = Gate()
+        let recorder = GatedRecordingPirSnapshotProbe(
+            status: .matching(height: snapshotHeight),
+            gate: probeGate
+        )
+        let resolver = PirSnapshotResolver(probe: recorder)
+        let enteredURLs = LockedURLs()
+        let acquisitions = ResolutionAcquisitionRecorder()
+
+        let cancelledTask = Task {
+            try await self.prove(
+                backend: backend,
+                endpoints: [self.endpointA],
+                resolver: resolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(1)
+        await recorder.waitUntilProbeCount(1)
+        let survivingTask = Task {
+            try await self.prove(
+                backend: backend,
+                endpoints: [self.endpointA],
+                resolver: resolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(2)
+        cancelledTask.cancel()
+        probeGate.open()
+
+        _ = try await survivingTask.value
+        let cancelledResult = await cancelledTask.result
+        XCTAssertThrowsError(try cancelledResult.get()) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        let joinedExistingResolutions = await acquisitions.values
+        let probeCount = await recorder.probeCount()
+        XCTAssertEqual(joinedExistingResolutions, [false, true])
+        XCTAssertEqual(probeCount, 1)
+        XCTAssertEqual(enteredURLs.values, [endpointA])
+    }
+
+    func testThirdCallerJoinsCompletedResolutionWhileSurvivingWaiterIsPending() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let probeGate = Gate()
+        let recorder = GatedRecordingPirSnapshotProbe(
+            status: .matching(height: snapshotHeight),
+            gate: probeGate
+        )
+        let firstResolver = PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.first })
+        let lastResolver = PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last })
+        let enteredURLs = LockedURLs()
+        let acquisitions = ResolutionAcquisitionRecorder()
+        let survivorDispositionReached = AsyncMarker()
+        let survivorDispositionGate = Gate()
+
+        let originatingTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: firstResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(1)
+        await recorder.waitUntilProbeCount(2)
+
+        let survivingTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: lastResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                },
+                beforeResolutionDisposition: {
+                    await survivorDispositionReached.mark()
+                    await survivorDispositionGate.wait()
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(2)
+        originatingTask.cancel()
+        probeGate.open()
+
+        let originatingResult = await originatingTask.result
+        XCTAssertThrowsError(try originatingResult.get()) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        await survivorDispositionReached.waitUntilMarked()
+
+        let thirdTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: lastResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(3)
+        _ = try await thirdTask.value
+
+        var probeCount = await recorder.probeCount()
+        let joinedExistingResolutions = await acquisitions.values
+        XCTAssertEqual(joinedExistingResolutions, [false, true, true])
+        XCTAssertEqual(probeCount, 2)
+        XCTAssertEqual(enteredURLs.values, [endpointA])
+
+        survivorDispositionGate.open()
+        _ = try await survivingTask.value
+        probeCount = await recorder.probeCount()
+        XCTAssertEqual(probeCount, 2)
+        XCTAssertEqual(enteredURLs.values, [endpointA, endpointA])
+    }
+
+    func testCancelledSoleCallerWithCompletedSuccessRequiresFreshHealthCheck() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let probeGate = Gate()
+        let recorder = GatedRecordingPirSnapshotProbe(
+            status: .matching(height: snapshotHeight),
+            gate: probeGate
+        )
+        let enteredURLs = LockedURLs()
+
+        let cancelledTask = Task {
+            try await self.prove(
+                backend: backend,
+                endpoints: [self.endpointA],
+                resolver: PirSnapshotResolver(probe: recorder),
+                enteredURLs: enteredURLs
+            )
+        }
+        await recorder.waitUntilProbeCount(1)
+        cancelledTask.cancel()
+        probeGate.open()
+        let cancelledResult = await cancelledTask.result
+        XCTAssertThrowsError(try cancelledResult.get()) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        await recorder.setStatus(.unreachable(reason: "offline"))
+        await recorder.clearRecordedURLs()
+        let unavailableResult = await Task {
+            try await self.prove(
+                backend: backend,
+                endpoints: [self.endpointA],
+                resolver: PirSnapshotResolver(probe: recorder),
+                enteredURLs: enteredURLs
+            )
+        }.result
+        XCTAssertThrowsError(try unavailableResult.get()) { error in
+            guard case PirSnapshotResolverError.noMatchingEndpoint = error else {
+                return XCTFail("unexpected error: \(error.localizedDescription)")
+            }
+        }
+        var probedURLs = await recorder.probedURLs()
+        XCTAssertEqual(probedURLs, [endpointA])
+        XCTAssertTrue(enteredURLs.values.isEmpty)
+
+        await recorder.setStatus(.matching(height: snapshotHeight))
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            endpoints: [endpointA],
+            resolver: PirSnapshotResolver(probe: recorder),
+            enteredURLs: enteredURLs
+        )
+        probedURLs = await recorder.probedURLs()
+        XCTAssertEqual(probedURLs, [endpointA])
+        XCTAssertEqual(enteredURLs.values, [endpointA])
+    }
+
+    func testCancelledSoleCallerWithCompletedFailureDoesNotBlockRecovery() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let probeGate = Gate()
+        let recorder = GatedRecordingPirSnapshotProbe(
+            status: .unreachable(reason: "offline"),
+            gate: probeGate
+        )
+        let enteredURLs = LockedURLs()
+
+        let cancelledTask = Task {
+            try await self.prove(
+                backend: backend,
+                endpoints: [self.endpointA],
+                resolver: PirSnapshotResolver(probe: recorder),
+                enteredURLs: enteredURLs
+            )
+        }
+        await recorder.waitUntilProbeCount(1)
+        cancelledTask.cancel()
+        probeGate.open()
+        let cancelledResult = await cancelledTask.result
+        XCTAssertThrowsError(try cancelledResult.get()) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        await recorder.setStatus(.matching(height: snapshotHeight))
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            endpoints: [endpointA],
+            resolver: PirSnapshotResolver(probe: recorder),
+            enteredURLs: enteredURLs
+        )
+        let probedURLs = await recorder.probedURLs()
+        XCTAssertEqual(probedURLs, [endpointA])
+        XCTAssertEqual(enteredURLs.values, [endpointA])
+    }
+
+    func testDelayedOldSuccessCannotOverwriteNewerPreference() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let recorder = RecordingPirSnapshotProbe(matching: [endpointA, endpointB])
+        let oldResolver = PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.first })
+        let enteredURLs = LockedURLs()
+        let acquisitions = ResolutionAcquisitionRecorder()
+        let dispositionReached = AsyncMarker()
+        let dispositionGate = Gate()
+
+        let delayedOldTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: oldResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                },
+                beforeResolutionDisposition: {
+                    await dispositionReached.mark()
+                    await dispositionGate.wait()
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(1)
+        await dispositionReached.waitUntilMarked()
+
+        let completingOldTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: oldResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(2)
+        _ = try await completingOldTask.value
+
+        await recorder.setStatus(.unreachable(reason: "offline"), for: endpointA)
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            resolver: PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last }),
+            enteredURLs: enteredURLs
+        )
+        var probedURLs = await recorder.probedURLs()
+        XCTAssertEqual(probedURLs, [endpointA, endpointB])
+
+        dispositionGate.open()
+        _ = try await delayedOldTask.value
+
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            resolver: PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last }),
+            enteredURLs: enteredURLs
+        )
+        probedURLs = await recorder.probedURLs()
+        let joinedExistingResolutions = await acquisitions.values
+        XCTAssertEqual(joinedExistingResolutions, [false, true])
+        XCTAssertEqual(probedURLs, [endpointB])
+    }
+
+    func testDelayedOldFailureCannotClearNewerPreference() async throws {
+        let backend = try makeOpenBackend()
+        defer { backend.close() }
+        let recorder = RecordingPirSnapshotProbe(matching: [endpointA, endpointB])
+        let enteredURLs = LockedURLs()
+
+        _ = try await prove(
+            backend: backend,
+            resolver: PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last }),
+            enteredURLs: enteredURLs
+        )
+        await recorder.setStatus(.unreachable(reason: "offline"), for: endpointA)
+        await recorder.setStatus(.unreachable(reason: "offline"), for: endpointB)
+        await recorder.clearRecordedURLs()
+
+        let acquisitions = ResolutionAcquisitionRecorder()
+        let dispositionReached = AsyncMarker()
+        let dispositionGate = Gate()
+        let failingResolver = PirSnapshotResolver(probe: recorder)
+        let delayedOldTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: failingResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                },
+                beforeResolutionDisposition: {
+                    await dispositionReached.mark()
+                    await dispositionGate.wait()
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(1)
+        await dispositionReached.waitUntilMarked()
+
+        let completingOldTask = Task {
+            try await self.prove(
+                backend: backend,
+                resolver: failingResolver,
+                enteredURLs: enteredURLs,
+                resolutionAcquired: { joinedExistingResolution in
+                    await acquisitions.record(joinedExistingResolution)
+                }
+            )
+        }
+        await acquisitions.waitUntilCount(2)
+        let completingOldResult = await completingOldTask.result
+        XCTAssertThrowsError(try completingOldResult.get()) { error in
+            guard case PirSnapshotResolverError.noMatchingEndpoint = error else {
+                return XCTFail("unexpected error: \(error.localizedDescription)")
+            }
+        }
+
+        await recorder.setStatus(.matching(height: snapshotHeight), for: endpointB)
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            resolver: PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last }),
+            enteredURLs: enteredURLs
+        )
+
+        dispositionGate.open()
+        let delayedOldResult = await delayedOldTask.result
+        XCTAssertThrowsError(try delayedOldResult.get()) { error in
+            guard case PirSnapshotResolverError.noMatchingEndpoint = error else {
+                return XCTFail("unexpected error: \(error.localizedDescription)")
+            }
+        }
+
+        await recorder.clearRecordedURLs()
+        _ = try await prove(
+            backend: backend,
+            resolver: PirSnapshotResolver(probe: recorder, matchingEndpointSelector: { $0.last }),
+            enteredURLs: enteredURLs
+        )
+        let probedURLs = await recorder.probedURLs()
+        let joinedExistingResolutions = await acquisitions.values
+        XCTAssertEqual(joinedExistingResolutions, [false, true])
+        XCTAssertEqual(probedURLs, [endpointB])
     }
 
     func testCancellationDuringResolutionNeverEntersNativeWork() async throws {
@@ -447,7 +839,9 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
         layout: VotingPirLayout? = nil,
         endpoints: [String]? = nil,
         resolver: PirSnapshotResolver,
-        enteredURLs: LockedURLs
+        enteredURLs: LockedURLs,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeResolutionDisposition: @escaping @Sendable () async -> Void = {}
     ) async throws -> VotingDelegationProofResult {
         try await backend.buildAndProveDelegation(
             makeProofParams(roundId: roundId ?? self.roundId(0x11)),
@@ -455,6 +849,8 @@ final class VotingPirEndpointSelectionTests: XCTestCase {
             expectedSnapshotHeight: height ?? UInt64(snapshotHeight),
             pirLayout: layout ?? self.layout,
             pirResolver: resolver,
+            resolutionAcquired: resolutionAcquired,
+            beforeResolutionDisposition: beforeResolutionDisposition,
             proveEntry: { _, url, _, _ in
                 enteredURLs.append(url)
                 return self.makeProofResult()
@@ -552,7 +948,7 @@ private actor RecordingPirSnapshotProbe: PirSnapshotProbing {
 }
 
 private actor GatedRecordingPirSnapshotProbe: PirSnapshotProbing {
-    private let status: PirSnapshotProbeOutcome.Status
+    private var status: PirSnapshotProbeOutcome.Status
     private let gate: Gate
     private var urls: [String] = []
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -578,6 +974,47 @@ private actor GatedRecordingPirSnapshotProbe: PirSnapshotProbing {
         await withCheckedContinuation { continuation in
             waiters.append((count, continuation))
         }
+    }
+
+    func probedURLs() -> [String] {
+        urls
+    }
+
+    func probeCount() -> Int {
+        urls.count
+    }
+
+    func clearRecordedURLs() {
+        urls = []
+    }
+
+    func setStatus(_ status: PirSnapshotProbeOutcome.Status) {
+        self.status = status
+    }
+}
+
+private actor ResolutionAcquisitionRecorder {
+    private var acquisitions: [Bool] = []
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func record(_ joinedExistingResolution: Bool) {
+        acquisitions.append(joinedExistingResolution)
+        let ready = waiters.filter { acquisitions.count >= $0.0 }
+        waiters.removeAll { acquisitions.count >= $0.0 }
+        ready.forEach { $0.1.resume() }
+    }
+
+    func waitUntilCount(_ count: Int) async {
+        if acquisitions.count >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append((count, continuation))
+        }
+    }
+
+    var values: [Bool] {
+        acquisitions
     }
 }
 

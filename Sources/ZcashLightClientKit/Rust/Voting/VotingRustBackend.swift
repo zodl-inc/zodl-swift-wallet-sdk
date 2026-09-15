@@ -46,10 +46,29 @@ private struct PirEndpointPreference: Sendable {
     let url: String
 }
 
-private struct PirEndpointResolution: Sendable {
+private final class PirEndpointResolution: @unchecked Sendable {
     let id: UInt64
     let context: PirEndpointContext
     let task: Task<String, Error>
+    // Guarded by the owning backend's `lock`.
+    var activeWaiterCount: Int
+
+    init(
+        id: UInt64,
+        context: PirEndpointContext,
+        task: Task<String, Error>,
+        activeWaiterCount: Int
+    ) {
+        self.id = id
+        self.context = context
+        self.task = task
+        self.activeWaiterCount = activeWaiterCount
+    }
+}
+
+private struct PirEndpointResolutionWaiter: Sendable {
+    let resolution: PirEndpointResolution
+    let joinedExistingResolution: Bool
 }
 
 private struct PirEndpointLease: Sendable {
@@ -2169,6 +2188,8 @@ extension VotingRustBackend {
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         intent: VotingProvingIntent = .interactive,
         progress: (@Sendable (Double) -> Void)? = nil,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeResolutionDisposition: @escaping @Sendable () async -> Void = {},
         beforeNativeEntry: @escaping @Sendable () async -> Void = {},
         proveEntry: @escaping @Sendable (
             VotingDelegationProofParams,
@@ -2185,6 +2206,8 @@ extension VotingRustBackend {
             pirResolver: pirResolver,
             intent: intent,
             progress: progress,
+            resolutionAcquired: resolutionAcquired,
+            beforeResolutionDisposition: beforeResolutionDisposition,
             beforeNativeEntry: beforeNativeEntry,
             nativeProveEntry: { _, entryParams, url, layout, entryProgress in
                 try proveEntry(entryParams, url, layout, entryProgress)
@@ -2201,6 +2224,8 @@ extension VotingRustBackend {
         pirResolver: PirSnapshotResolver,
         intent: VotingProvingIntent,
         progress: (@Sendable (Double) -> Void)?,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeResolutionDisposition: @escaping @Sendable () async -> Void = {},
         beforeNativeEntry: @escaping @Sendable () async -> Void = {},
         nativeProveEntry: @escaping @Sendable (
             OpaquePointer,
@@ -2223,7 +2248,9 @@ extension VotingRustBackend {
             endpoints: pirEndpoints,
             expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight),
             pirLayout: pirLayout,
-            resolver: pirResolver
+            resolver: pirResolver,
+            resolutionAcquired: resolutionAcquired,
+            beforeDisposition: beforeResolutionDisposition
         )
 
         // `resolve` above already refuses to return a match once cancelled, but a cancellation
@@ -2343,29 +2370,36 @@ private extension VotingRustBackend {
         endpoints: [String],
         expectedSnapshotHeight: BlockHeight,
         pirLayout: VotingPirLayout,
-        resolver: PirSnapshotResolver
+        resolver: PirSnapshotResolver,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeDisposition: @escaping @Sendable () async -> Void = {}
     ) async throws -> PirEndpointLease {
-        let resolution = try beginPirResolution(
+        let waiter = try beginPirResolution(
             roundId: roundId,
             endpoints: endpoints,
             expectedSnapshotHeight: expectedSnapshotHeight,
             pirLayout: pirLayout,
             resolver: resolver
         )
+        let resolution = waiter.resolution
+        await resolutionAcquired(waiter.joinedExistingResolution)
 
         let selectedURL: String
         do {
             selectedURL = try await resolution.task.value
         } catch let resolutionError {
-            // Resolution is shared. A cancelled waiter must report its own cancellation without
-            // cancelling or clearing the result another waiter may still need.
-            try Task.checkCancellation()
+            await beforeDisposition()
             finishPirResolution(resolution, clearPreference: true)
+            // Retire the completed shared work before reporting this waiter's cancellation. Any
+            // callers that already joined retain the task value through their local resolution.
+            try Task.checkCancellation()
             throw resolutionError
         }
 
+        await beforeDisposition()
+        let lease = try commitPirResolution(resolution, selectedURL: selectedURL)
         try Task.checkCancellation()
-        return try commitPirResolution(resolution, selectedURL: selectedURL)
+        return lease
     }
 
     func beginPirResolution(
@@ -2374,7 +2408,7 @@ private extension VotingRustBackend {
         expectedSnapshotHeight: BlockHeight,
         pirLayout: VotingPirLayout,
         resolver: PirSnapshotResolver
-    ) throws -> PirEndpointResolution {
+    ) throws -> PirEndpointResolutionWaiter {
         lock.lock()
         defer { lock.unlock() }
         guard handle != nil else {
@@ -2388,7 +2422,11 @@ private extension VotingRustBackend {
             endpoints: endpoints
         )
         if let current = pirResolution, current.context == context {
-            return current
+            current.activeWaiterCount += 1
+            return PirEndpointResolutionWaiter(
+                resolution: current,
+                joinedExistingResolution: true
+            )
         }
         let preferredEndpoint = preferredPirEndpoint.flatMap { preference in
             preference.context == context ? preference.url : nil
@@ -2402,9 +2440,17 @@ private extension VotingRustBackend {
                 preferredEndpoint: preferredEndpoint
             )
         }
-        let resolution = PirEndpointResolution(id: id, context: context, task: task)
+        let resolution = PirEndpointResolution(
+            id: id,
+            context: context,
+            task: task,
+            activeWaiterCount: 1
+        )
         pirResolution = resolution
-        return resolution
+        return PirEndpointResolutionWaiter(
+            resolution: resolution,
+            joinedExistingResolution: false
+        )
     }
 
     func commitPirResolution(
@@ -2413,25 +2459,44 @@ private extension VotingRustBackend {
     ) throws -> PirEndpointLease {
         lock.lock()
         defer { lock.unlock() }
-        if pirResolution?.id == resolution.id {
-            pirResolution = nil
-        }
+        let callerCancelled = Task.isCancelled
+        releasePirResolutionWaiterLocked(
+            resolution,
+            keepForRemainingWaiters: callerCancelled
+        )
         guard handle != nil,
               identityGeneration == resolution.context.identityGeneration else {
             throw CancellationError()
         }
-        preferredPirEndpoint = PirEndpointPreference(context: resolution.context, url: selectedURL)
+        if !callerCancelled, resolution.id == nextPirResolutionId {
+            preferredPirEndpoint = PirEndpointPreference(context: resolution.context, url: selectedURL)
+        }
         return PirEndpointLease(context: resolution.context, url: selectedURL)
     }
 
     func finishPirResolution(_ resolution: PirEndpointResolution, clearPreference: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        if pirResolution?.id == resolution.id {
-            pirResolution = nil
-        }
-        if clearPreference, preferredPirEndpoint?.context == resolution.context {
+        releasePirResolutionWaiterLocked(resolution, keepForRemainingWaiters: false)
+        if clearPreference,
+           resolution.id == nextPirResolutionId,
+           preferredPirEndpoint?.context == resolution.context {
             preferredPirEndpoint = nil
+        }
+    }
+
+    func releasePirResolutionWaiterLocked(
+        _ resolution: PirEndpointResolution,
+        keepForRemainingWaiters: Bool
+    ) {
+        precondition(resolution.activeWaiterCount > 0)
+        resolution.activeWaiterCount -= 1
+        // A cancelled successful waiter has not established a preference, so retain the completed
+        // task while joined callers remain. A noncancelled success commits its preference under
+        // this lock, and a failure has no winner to preserve, so those outcomes can retire now.
+        if pirResolution?.id == resolution.id,
+           !keepForRemainingWaiters || resolution.activeWaiterCount == 0 {
+            pirResolution = nil
         }
     }
 
