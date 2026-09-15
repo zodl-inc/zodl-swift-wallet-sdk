@@ -457,12 +457,12 @@ final class OHTTPE2ETests: ZcashTestCase {
         if OHTTPEndpoints.proxyURL(for: cmcURL) != nil {
             log("CMC: routing via cmc.zodl.com OHTTP proxy (\(mode))")
             let (_, response) = try await externalAPIRequest(url: cmcURL, viaTor: tor, synchronizer: synchronizer)
-            let expectedStatus = tor ? 200 : [200, 400, 401, 403]
+            let acceptedStatuses: [Int] = tor ? [200] : [200, 400, 401, 403]
             if tor {
                 XCTAssertEqual(response.statusCode, 200, "CMC via Tor+OHTTP must return 200 (gateway-injected key)")
             } else {
                 XCTAssertTrue(
-                    (expectedStatus as! [Int]).contains(response.statusCode),
+                    acceptedStatuses.contains(response.statusCode),
                     "CMC via OHTTP must return a real HTTP status (got \(response.statusCode))"
                 )
             }
