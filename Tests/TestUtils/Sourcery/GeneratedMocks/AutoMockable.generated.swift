@@ -2121,6 +2121,26 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForTransactionsCallsCount = 0
+    var getTransactionOutputsForTransactionsCalled: Bool {
+        return getTransactionOutputsForTransactionsCallsCount > 0
+    }
+    var getTransactionOutputsForTransactionsReceivedTransactions: [ZcashTransaction.Overview]?
+    var getTransactionOutputsForTransactionsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForTransactionsClosure: (([ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        getTransactionOutputsForTransactionsCallsCount += 1
+        getTransactionOutputsForTransactionsReceivedTransactions = transactions
+        if let closure = getTransactionOutputsForTransactionsClosure {
+            return await closure(transactions)
+        } else {
+            return getTransactionOutputsForTransactionsReturnValue
+        }
+    }
+
     // MARK: - allTransactions
 
     var allTransactionsThrowableError: Error?
@@ -4032,6 +4052,30 @@ class TransactionRepositoryMock: TransactionRepository {
             return try await closure(rawID)
         } else {
             return getTransactionOutputsForReturnValue
+        }
+    }
+
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForRawIDsThrowableError: Error?
+    var getTransactionOutputsForRawIDsCallsCount = 0
+    var getTransactionOutputsForRawIDsCalled: Bool {
+        return getTransactionOutputsForRawIDsCallsCount > 0
+    }
+    var getTransactionOutputsForRawIDsReceivedRawIDs: [Data]?
+    var getTransactionOutputsForRawIDsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForRawIDsClosure: (([Data]) async throws -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
+        if let error = getTransactionOutputsForRawIDsThrowableError {
+            throw error
+        }
+        getTransactionOutputsForRawIDsCallsCount += 1
+        getTransactionOutputsForRawIDsReceivedRawIDs = rawIDs
+        if let closure = getTransactionOutputsForRawIDsClosure {
+            return try await closure(rawIDs)
+        } else {
+            return getTransactionOutputsForRawIDsReturnValue
         }
     }
 

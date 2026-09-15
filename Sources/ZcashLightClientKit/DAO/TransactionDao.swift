@@ -270,8 +270,62 @@ class TransactionSQLDAO: TransactionRepository {
     func getTransactionOutputs(for rawID: Data) async throws -> [ZcashTransaction.Output] {
         let query = self.txOutputsView
             .filter(ZcashTransaction.Output.Column.rawID == Blob(bytes: rawID.bytes))
+            .order(ZcashTransaction.Output.Column.pool, ZcashTransaction.Output.Column.index)
 
         return try await execute(query) { try ZcashTransaction.Output(row: $0) }
+    }
+
+    /// [MOB-1953] Ids per `IN (...)` statement. `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on every
+    /// SQLite the SDK runs against; 500 keeps each statement cheap to plan and bind, and the number
+    /// of statements is what bounds the cost, not their size.
+    static let outputsQueryChunkSize = 500
+
+    /// Rows come back ordered by pool and then output index, which is what the caller-visible
+    /// promise of "the same order the per-transaction read returns" needs: neither `txid = ?` nor
+    /// `txid IN (...)` orders anything on its own, so without the `ORDER BY` the two reads could
+    /// legitimately disagree on the order of one transaction's rows.
+    ///
+    /// A row that fails to decode is skipped, and reported through the trace hook, rather than
+    /// failing the chunk it sits in. Decoding a whole chunk strictly would let a single malformed
+    /// row blank the outputs of every other transaction read alongside it, because the callers of
+    /// this method answer a thrown error with an empty result for the entire batch. The
+    /// per-transaction read's `try?` at those same call sites has always confined such a failure to
+    /// the one transaction, so skipping the row keeps the blast radius where callers already expect
+    /// it.
+    // DB-READ (audited 2026-09-14): SELECT over v_tx_outputs filtered with `txid IN (...)`, chunked.
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
+        var seen: Set<Data> = []
+        let uniqueRawIDs = rawIDs.filter { seen.insert($0).inserted }
+
+        var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
+        var start = 0
+        while start < uniqueRawIDs.count {
+            let end = min(start + Self.outputsQueryChunkSize, uniqueRawIDs.count)
+            let chunk = uniqueRawIDs[start..<end].map { Blob(bytes: $0.bytes) }
+            let query = txOutputsView
+                .filter(chunk.contains(ZcashTransaction.Output.Column.rawID))
+                .order(ZcashTransaction.Output.Column.pool, ZcashTransaction.Output.Column.index)
+
+            do {
+                for row in try connection().prepare(query) {
+                    guard let output = try? ZcashTransaction.Output(row: row) else {
+                        // Deliberately says nothing about the row itself: an output carries a
+                        // recipient address and a memo, neither of which belongs in a trace.
+                        traceClosure?("getTransactionOutputs(for rawIDs:): skipped an output row that failed to decode.")
+                        continue
+                    }
+                    outputsByRawID[output.rawID, default: []].append(output)
+                }
+            } catch {
+                if let error = error as? ZcashError {
+                    throw error
+                } else {
+                    throw ZcashError.transactionRepositoryQueryExecute(error)
+                }
+            }
+            start = end
+        }
+        return outputsByRawID
     }
 
     func getRecipients(for rawID: Data) async throws -> [TransactionRecipient] {

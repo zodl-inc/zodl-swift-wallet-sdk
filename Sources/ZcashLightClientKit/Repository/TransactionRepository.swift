@@ -27,6 +27,20 @@ protocol TransactionRepository {
     func findMemos(for transaction: ZcashTransaction.Overview) async throws -> [Memo]
     func getRecipients(for rawID: Data) async throws -> [TransactionRecipient]
     func getTransactionOutputs(for rawID: Data) async throws -> [ZcashTransaction.Output]
+
+    /// [MOB-1953] Every output of every transaction in `rawIDs`, keyed by the transaction's raw id
+    /// — one `v_tx_outputs` query per `TransactionSQLDAO.outputsQueryChunkSize` ids instead of one
+    /// per transaction. The view materialises the wallet's whole notes union on every query, so a
+    /// per-row loop over a long history costs transactions × notes (1,256 queries and 25 s for a
+    /// 1,255-transaction wallet on an iPhone 15); the batched read costs a handful of queries.
+    /// Row order within a transaction is by pool and then output index, the same order
+    /// `getTransactionOutputs(for rawID:)` returns — both queries order explicitly, because a
+    /// `WHERE` clause alone leaves SQLite free to return one transaction's rows in either order.
+    /// A row that does not decode is skipped rather than failing the whole batch, so one malformed
+    /// output cannot blank every other transaction's outputs. A transaction without outputs has no
+    /// entry; a duplicated id answers once.
+    // sourcery: mockedName="getTransactionOutputsForRawIDs"
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]]
     func debugDatabase(sql: String) -> String
 
     /// [#1755] Txids whose `account_balance_delta` is not yet final during a deep recovery — read from
