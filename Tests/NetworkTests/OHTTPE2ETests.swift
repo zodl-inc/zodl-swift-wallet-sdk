@@ -154,8 +154,11 @@ final class OHTTPE2ETests: ZcashTestCase {
         guard let account = accounts.first else {
             return XCTFail("no accounts found")
         }
+        guard let accountIndex = account.hdAccountIndex else {
+            return XCTFail("account has no HD account index")
+        }
         let derivationTool = DerivationTool(networkType: .testnet)
-        let spendingKey = try derivationTool.deriveUnifiedSpendingKey(seed: [UInt8](seed), accountIndex: account.account)
+        let spendingKey = try derivationTool.deriveUnifiedSpendingKey(seed: [UInt8](seed), accountIndex: accountIndex)
 
         // Create recipient
         let recipient = try Recipient(recipientUA, network: .testnet)
@@ -164,7 +167,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         // Propose transfer
         log("proposing transfer (\(mode))...")
         let proposal = try await synchronizer.proposeTransfer(
-            accountUUID: account.uuid,
+            accountUUID: account.id,
             recipient: recipient,
             amount: amount,
             memo: memo
