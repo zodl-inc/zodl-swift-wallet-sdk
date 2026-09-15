@@ -2755,7 +2755,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         if enabled {
             try await torClient.prepare()
         } else {
-            try await torClient.close()
+            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+            if !exchangeRateEnabled {
+                try await torClient.close()
+            }
         }
         await sdkFlags.torFlagUpdate(enabled)
     }

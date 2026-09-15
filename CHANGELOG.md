@@ -17,6 +17,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
   call sites remain compatible, and wallet or database lifecycle changes discard the selection.
 - `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
+- `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
 
 ## Changed
 
