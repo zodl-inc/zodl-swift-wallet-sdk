@@ -76,7 +76,7 @@ public actor TorClient {
         }
 
         let rawDir = torDir.osPathStr()
-        let runtimePtr = zcashlc_create_tor_runtime(rawDir.0, rawDir.1)
+        let runtimePtr = httpGetNative.createRuntime(rawDir.0, rawDir.1)
 
         guard let runtimePtr else {
             throw ZcashError.rustTorClientInit(lastErrorMessage(fallback: "`TorClient` init failed with unknown error"))

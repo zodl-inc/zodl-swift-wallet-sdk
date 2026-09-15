@@ -1163,7 +1163,7 @@ public class SDKSynchronizer: Synchronizer {
         let isExchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
         // turn Tor on
-        if enabled && !isExchangeRateEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1179,7 +1179,7 @@ public class SDKSynchronizer: Synchronizer {
         let isTorEnabled = await sdkFlags.torEnabled
 
         // turn Tor on
-        if enabled && !isTorEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
