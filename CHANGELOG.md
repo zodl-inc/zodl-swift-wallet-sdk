@@ -6,6 +6,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Fixed
+
+- [MOB-1963] `VotingRustBackend` reuses a healthy snapshot-matching PIR endpoint across delegation
+  precompute and proof work for the same wallet, round, snapshot, layout, and endpoint list. It
+  revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
+  call sites remain compatible, and wallet or database lifecycle changes discard the selection.
 # 4.5.0 - 2026-09-15
 
 ## Added
