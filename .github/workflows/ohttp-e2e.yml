@@ -19,7 +19,8 @@ on:
           fallback-up = gateway reachable, policy stays on OHTTP;
           fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks;
           bench-mainnet = mainnet clearnet fallback tier benchmark;
-          send = testnet SEND E2E (Wallet 2 sends to Wallet 1, both legs sequentially)
+          send = testnet SEND E2E (Wallet 2 sends to Wallet 1, both legs sequentially);
+          send-mainnet = mainnet SEND E2E (0.0005 ZEC)
         type: choice
         default: e2e
         options:
@@ -28,10 +29,15 @@ on:
           - fallback-down
           - bench-mainnet
           - send
+          - send-mainnet
       recipient:
         description: 'Recipient unified address for send scenario (default: Wallet 1 UA)'
         type: string
         default: 'utest1wkj0qj7q0nlnvtl0gywf0zvgh86ssmdypqp4y560phrx5edu52hnn4cjhkcszjnx4mkumtd32z2sqmhvrwk5cl2y9my46kuu3ceta4ef45vps67jur8l2qsn4mqn0kj8gz5sl90t63l4wwcvdw284dla46s985jf7vgaplfhaqjzjm8s'
+      mainnet_recipient:
+        description: 'Recipient unified address for send-mainnet scenario'
+        type: string
+        default: 'u1gnkh8m8xfg4gn9gzlsuf3kpu0ylgr2szzj9prmh9cqxckt6uv9pps7rt5lwccytkrheups52l7z4jpfwurk2ux9x3rhwjczt8qezzj2whgp7wcfur58ew4vkd4sv8ppc7tmqf2ar9sqzmznwsw5em0lx48484nhdc4d27syypyzcn07gypkcvkl3yuj7a3crna0vsq8gx6ly7wwkluz'
 
 permissions:
   contents: read
@@ -205,6 +211,19 @@ jobs:
         env:
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Mainnet SEND E2E (0.0005 ZEC, Wallet 2 → Wallet 1, both legs)
+        if: ${{ !cancelled() && inputs.scenario == 'send-mainnet' && matrix.mode == 'tor' }}
+        timeout-minutes: 90
+        env:
+          OHTTP_E2E_NETWORK: mainnet
+          OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_MAINNET_SEED2_HEX }}
+          OHTTP_E2E_SEND_BIRTHDAY: 3427084
+          OHTTP_E2E_SEND_ZATOSHI: 50000
+          OHTTP_E2E_RECIPIENT_UA: ${{ inputs.mainnet_recipient }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
