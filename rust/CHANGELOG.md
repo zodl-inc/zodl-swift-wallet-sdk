@@ -465,6 +465,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
+- Dependency `zcash_voting` moves from 3.0.0 to 4.0.0-rc.1 (voting-circuits 0.12.0), which raises
+  the crate's `rust-version` to 1.91. The 4.0 line keeps the 3.0 API: proposal ids widen to 1 to
+  50, and the crate now writes its sidecar under immediate SQLite transactions. No FFI change.
 
 ### Removed
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
