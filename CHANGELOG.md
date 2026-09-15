@@ -6,6 +6,61 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 4.5.0 - 2026-09-15
+
+## Added
+
+### Transaction outputs in one read
+
+- `Synchronizer.getTransactionOutputs(for transactions:)` returns the outputs of many transactions
+  at once, keyed by `rawID`, in one `v_tx_outputs` query per 500 transactions. The
+  single-transaction `getTransactionOutputs(for:)` runs one query per call, and every such query
+  first materialises the wallet's whole notes union, so a client that mapped a long history one
+  row at a time paid transactions × notes for it — 1,256 queries and 25 seconds for a
+  1,255-transaction wallet on an iPhone 15, before any contention. The same rows come back in
+  milliseconds through this call. Output order within a transaction is by pool and then output
+  index, for this call and for the single-transaction one alike; a transaction without outputs has
+  no entry. The protocol requirement ships with a default implementation that falls back to one
+  single-transaction read per transaction, so custom `Synchronizer` conformers and test doubles
+  keep compiling unchanged; both shipped synchronizers override it with the batched read.
+
+### Coinholder polling
+
+- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
+  (default) behaves as before; `.speculative` runs the proof at utility priority without the
+  pool-wide boost, for a proof a host prepares before the user asks for it.
+  `withInteractiveProvingBoost` and `interactiveProvingBoostCount` are public so a host can raise
+  the pool while it waits on a speculative proof.
+
+## Changed
+
+### Coinholder polling
+
+- Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
+  voting-circuits 0.12.0 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
+  and a wallet built on it votes only on chains upgraded to that circuit. No existing voting
+  signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
+  v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
+  Rust core from source now requires Rust 1.91.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3480000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3482500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4340000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4350000.json
+````
+
 # 4.4.0 - 2026-09-10
 
 ## Added
@@ -62,6 +117,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method has a default implementation that does nothing, so custom `Broadcaster` conformers
   without submit-plan bookkeeping keep compiling unchanged.
 
+
 ## Changed
 
 - `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
@@ -112,6 +168,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.error`. The budget belongs to the handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each
   hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
   as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
+
 
 ## Fixed
 
