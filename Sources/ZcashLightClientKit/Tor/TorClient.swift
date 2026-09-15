@@ -214,17 +214,21 @@ public actor TorClient {
             timeoutMilliseconds: timeoutMilliseconds,
             now: DispatchTime.now().uptimeNanoseconds
         )
-        return try await httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.httpGet(for: request, retryLimit: retryLimit, context: context)
+        }
     }
 
     func httpGet(
         for request: URLRequest,
         retryLimit: UInt8,
-        deadlineUptime: UInt64
+        context: TorHTTPRequestContext
     ) async throws -> (data: Data, response: HTTPURLResponse) {
-        try Task.checkCancellation()
+        try context.checkCancellation()
         let url = try TorHTTPGetRequest.validate(request)
         guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
+        try context.claimOwnership()
         guard let isolated = httpGetNative.isolateRuntime(runtime) else {
             throw ZcashError.rustTorIsolatedClient(lastErrorMessage(fallback: "TorClient.httpGet could not isolate runtime"))
         }
@@ -233,12 +237,15 @@ public actor TorClient {
             request: request,
             url: url,
             retryLimit: retryLimit,
-            deadline: deadlineUptime,
+            deadline: context.deadlineUptime,
             native: httpGetNative
         )
         return try await httpExecutor.execute(
-            deadlineUptime: deadlineUptime,
-            operation: { try ownedRequest.run(timeoutMilliseconds: $0) },
+            deadlineUptime: context.deadlineUptime,
+            operation: {
+                try context.checkCancellation()
+                return try ownedRequest.run(timeoutMilliseconds: $0)
+            },
             dispose: { ownedRequest.dispose() }
         )
     }

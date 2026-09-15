@@ -2803,14 +2803,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
             timeoutMilliseconds: timeoutMilliseconds,
             now: torHTTPUptime()
         )
-        return try await httpGetOverTor(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+        let context = TorHTTPRequestContext(deadlineUptime: deadline, now: torHTTPUptime)
+        return try await context.run { context in
+            try await self.httpGetOverTor(for: request, retryLimit: retryLimit, context: context)
+        }
     }
 
     private func httpGetOverTor(
         for request: URLRequest,
         retryLimit: UInt8,
-        deadlineUptime: UInt64
+        context: TorHTTPRequestContext
     ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try context.checkCancellation()
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
@@ -2818,7 +2822,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             throw ZcashError.torNotEnabled
         }
         let torClient = initializer.container.resolve(TorClient.self)
-        return try await torClient.httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadlineUptime)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
     }
 
     // ── Transparent / UTXO helpers ────────────────────────────────────────────

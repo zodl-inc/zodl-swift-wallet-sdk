@@ -190,10 +190,12 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
         }
         await fulfillment(of: [disposalEntered], timeout: 3)
         task.cancel()
+        task.cancel()
         XCTAssertEqual(returned.value, 0)
         XCTAssertEqual(count.value, 0)
         release.signal()
         await assertCancelled(task)
+        task.cancel()
         XCTAssertEqual(returned.value, 1)
         XCTAssertEqual(count.value, 1)
     }

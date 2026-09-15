@@ -1247,6 +1247,18 @@ public class SDKSynchronizer: Synchronizer {
             timeoutMilliseconds: timeoutMilliseconds,
             now: DispatchTime.now().uptimeNanoseconds
         )
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.httpGetOverTor(for: request, retryLimit: retryLimit, context: context)
+        }
+    }
+
+    private func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        context: TorHTTPRequestContext
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try context.checkCancellation()
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1255,7 +1267,7 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
-        return try await torClient.httpGet(for: request, retryLimit: retryLimit, deadlineUptime: deadline)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
     }
 
     public func debugDatabase(sql: String) -> String {

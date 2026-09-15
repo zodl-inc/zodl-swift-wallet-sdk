@@ -107,6 +107,7 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
         let start: UInt64 = UInt64.max - 10_000_000_000
         clock.advance(to: start)
         let captured = expectation(description: "deadline sampled outside actor")
+        let capture = TorDeadlineCapture()
         let actorEntered = expectation(description: "Slipstream actor occupied")
         let releaseActor = DispatchSemaphore(value: 0)
         let runtimes = TorTestRuntimes()
@@ -138,7 +139,7 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
             engine: SlipstreamEngine(dbURL: initializer.dataDbURL, server: initializer.endpoint, alternates: []),
             torHTTPUptime: {
                 let now = clock.now
-                captured.fulfill()
+                capture.once { captured.fulfill() }
                 return now
             }
         )
@@ -250,5 +251,19 @@ private extension SlipstreamSynchronizer {
     func holdActorForTorDeadlineTest(entered: XCTestExpectation, release: DispatchSemaphore) {
         entered.fulfill()
         XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+    }
+}
+
+private final class TorDeadlineCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured = false
+
+    func once(_ action: () -> Void) {
+        let first = lock.withLock {
+            if captured { return false }
+            captured = true
+            return true
+        }
+        if first { action() }
     }
 }
