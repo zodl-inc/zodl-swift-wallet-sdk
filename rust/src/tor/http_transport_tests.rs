@@ -403,16 +403,16 @@ async fn wait_for_eof(stream: &mut TcpStream) -> anyhow::Result<bool> {
     .map_err(|_| anyhow::anyhow!("timed out waiting for client EOF"))?
 }
 
-async fn connect_client(addr: SocketAddr) -> (SendRequest<Empty<Bytes>>, JoinHandle<()>) {
+type ClientDriver = JoinHandle<Result<(), hyper::Error>>;
+
+async fn connect_client(addr: SocketAddr) -> (SendRequest<Empty<Bytes>>, ClientDriver) {
     let stream = TcpStream::connect(addr)
         .await
         .expect("connect to loopback test server");
     let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .expect("complete local HTTP/1 handshake");
-    let driver = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let driver = tokio::spawn(connection);
     (sender, driver)
 }
 
@@ -440,15 +440,42 @@ async fn expect_stage_absent(stage: oneshot::Receiver<()>, name: &str) {
     }
 }
 
-async fn join_client_driver(mut driver: JoinHandle<()>) {
-    if timeout(TEST_GUARD, &mut driver).await.is_err() {
-        driver.abort();
-        let _ = driver.await;
-        panic!("local HTTP client driver exceeded the teardown guard");
+async fn join_clean_client_driver(mut driver: ClientDriver) {
+    let joined = match timeout(TEST_GUARD, &mut driver).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            driver.abort();
+            match driver.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("local HTTP client driver abort failed: {error}"),
+                Ok(result) => {
+                    panic!("local HTTP client driver completed after its guard: {result:?}")
+                }
+            }
+            panic!("local HTTP client driver exceeded the teardown guard");
+        }
+    };
+
+    let connection_result = match joined {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => {
+            panic!("local HTTP client driver panicked: {error}")
+        }
+        Err(error) if error.is_cancelled() => {
+            panic!("local HTTP client driver was unexpectedly cancelled: {error}")
+        }
+        Err(error) => panic!("local HTTP client driver failed to join: {error}"),
+    };
+
+    match connection_result {
+        Ok(()) => {}
+        Err(error) => {
+            panic!("local HTTP client connection failed unexpectedly: {error}")
+        }
     }
 }
 
-type DriverRegistry = Arc<Mutex<Vec<JoinHandle<()>>>>;
+type DriverRegistry = Arc<Mutex<Vec<ClientDriver>>>;
 
 async fn connect_tracked_client(
     addr: SocketAddr,
@@ -469,7 +496,7 @@ async fn join_tracked_client_drivers(drivers: &DriverRegistry) {
             .expect("client-driver registry lock for teardown"),
     );
     for driver in drivers {
-        join_client_driver(driver).await;
+        join_clean_client_driver(driver).await;
     }
 }
 
@@ -497,7 +524,7 @@ async fn stalled_body_uses_outer_deadline() {
     server.expect_request_headers().await;
     server.expect_response_headers_written().await;
     server.expect_response_body_written().await;
-    join_client_driver(driver).await;
+    join_clean_client_driver(driver).await;
     let outcome = server.join().await;
 
     assert!(outcome.client_eof, "the client must close its local socket");
@@ -532,7 +559,7 @@ async fn complete_body_copies_exact_bytes() {
     server.expect_request_headers().await;
     server.expect_response_headers_written().await;
     server.expect_response_body_written().await;
-    join_client_driver(driver).await;
+    join_clean_client_driver(driver).await;
     let outcome = server.join().await;
 
     assert!(outcome.client_eof, "the client must close its local socket");
@@ -564,7 +591,7 @@ async fn truncated_body_is_an_error() {
     server.expect_request_headers().await;
     server.expect_response_headers_written().await;
     server.expect_response_body_written().await;
-    join_client_driver(driver).await;
+    join_clean_client_driver(driver).await;
     let outcome = server.join().await;
 
     assert!(outcome.client_eof, "the client must close its local socket");
@@ -594,7 +621,7 @@ async fn delayed_headers_use_outer_deadline() {
     .await;
 
     server.expect_request_headers().await;
-    join_client_driver(driver).await;
+    join_clean_client_driver(driver).await;
     expect_stage_absent(parsed_headers, "client response headers").await;
     server.expect_no_response_headers().await;
     server.expect_no_response_body().await;
