@@ -17,7 +17,7 @@
 
 import Foundation
 
-enum OHTTPEndpoints {
+public enum OHTTPEndpoints {
     /// Gateway host → relay URL.
     /// LWD gateways (mainnet/testnet) have dedicated relays with matching HPKE keys.
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
@@ -35,12 +35,12 @@ enum OHTTPEndpoints {
 
     /// Proxy allowlist suffixes. Gateway v1.4.5+ proxies inner requests whose `:authority` ends
     /// with one of these suffixes to `https://<authority>` — no hostname rewrite needed.
-    static let proxyAllowedSuffixes = [".valargroup.org", ".valargroup.dev", "chaindefuser.com"]
+    public static let proxyAllowedSuffixes = [".valargroup.org", ".valargroup.dev", "chaindefuser.com"]
 
     /// Returns true if the host is allowlisted for passthrough OHTTP proxying.
     /// Suffix rule: leading-dot suffix (`.valargroup.org`) matches `x.valargroup.org` but NOT `valargroup.org`.
     /// Bare domain (`chaindefuser.com`) matches itself or `*.chaindefuser.com`.
-    static func isProxyAllowlisted(host: String) -> Bool {
+    public static func isProxyAllowlisted(host: String) -> Bool {
         let lower = host.lowercased()
         for suffix in proxyAllowedSuffixes {
             if suffix.hasPrefix(".") {
@@ -59,11 +59,11 @@ enum OHTTPEndpoints {
     }
 
     /// True only for hosts that have a configured relay (static mappings or allowlisted). Case-insensitive.
-    static func isGateway(_ host: String) -> Bool {
+    public static func isGateway(_ host: String) -> Bool {
         return relayByGatewayHost[host.lowercased()] != nil || isProxyAllowlisted(host: host)
     }
 
-    static func relayURL(for gatewayHost: String) throws -> String {
+    public static func relayURL(for gatewayHost: String) throws -> String {
         if let relay = relayByGatewayHost[gatewayHost.lowercased()] {
             return relay
         }
@@ -75,7 +75,7 @@ enum OHTTPEndpoints {
 
     /// Key config URL. Proxy hosts (static mappings and allowlisted) share the mainnet gateway's
     /// HPKE key config — the gateway decrypts on their behalf regardless of which backend it eventually calls.
-    static func keyConfigURL(for gatewayHost: String) -> String {
+    public static func keyConfigURL(for gatewayHost: String) -> String {
         if gatewayHost.hasPrefix("ohttp-gateway") {
             return "https://\(gatewayHost)/ohttp-configs"
         }
@@ -87,7 +87,7 @@ enum OHTTPEndpoints {
     /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
     /// For static mappings, returns the rewritten proxy host.
     /// Returns nil if the host has no configured proxy (caller should fall through to clearnet or Tor).
-    static func proxyHost(for url: URL) -> String? {
+    public static func proxyHost(for url: URL) -> String? {
         guard let host = url.host else { return nil }
 
         // Allowlisted hosts pass through unchanged
@@ -109,7 +109,7 @@ enum OHTTPEndpoints {
     /// For allowlisted hosts: returns the SAME URL (no hostname rewrite; gateway proxies by `:authority`).
     /// For static mappings: substitutes the proxy hostname.
     /// Returns nil when the host has no proxy mapping (e.g. Tor is already active).
-    static func proxyURL(for url: URL) -> URL? {
+    public static func proxyURL(for url: URL) -> URL? {
         guard let proxyHost = proxyHost(for: url) else { return nil }
 
         // Allowlisted hosts: return unchanged URL (proxyHost == original host)
