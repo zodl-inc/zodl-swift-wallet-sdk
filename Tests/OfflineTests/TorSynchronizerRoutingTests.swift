@@ -12,6 +12,59 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
         try await assertRouting(slipstream: true)
     }
 
+    func testSlipstreamDisablingAlreadyDisabledTorPreservesExchangeRateRoot() async throws {
+        try await assertSlipstreamDisableOrder(first: .tor, enableFirstConsumer: false)
+    }
+
+    func testSlipstreamDisablingTorPreservesExchangeRateRoot() async throws {
+        try await assertSlipstreamDisableOrder(first: .tor)
+    }
+
+    func testSlipstreamDisablingExchangeRatePreservesTorRoot() async throws {
+        try await assertSlipstreamDisableOrder(first: .exchangeRate)
+    }
+
+    private func assertSlipstreamDisableOrder(first: SlipstreamTorConsumer, enableFirstConsumer: Bool = true) async throws {
+        let fixture = SlipstreamTorLifecycleFixture()
+        let client = TorClient(torDir: testTempDirectory.appendingPathComponent("tor-lifecycle"), httpGetNative: fixture.native)
+        let initializer = try makeInitializer(client: client, torEnabled: false, exchangeRateEnabled: false)
+        let synchronizer = SlipstreamSynchronizer(initializer: initializer)
+        let remaining: SlipstreamTorConsumer = first == .tor ? .exchangeRate : .tor
+        try await remaining.update(synchronizer, enabled: true)
+        if enableFirstConsumer {
+            try await first.update(synchronizer, enabled: true)
+        }
+        XCTAssertEqual(fixture.creationCount, 1)
+
+        for _ in 0..<2 {
+            // Repeating false must preserve the runtime owned by the remaining consumer.
+            try await first.update(synchronizer, enabled: false)
+            XCTAssertEqual(fixture.rootFreeCount, 0)
+            XCTAssertTrue(fixture.runtimes.isAlive(fixture.runtimes.parent))
+            do {
+                let result = try await synchronizer.httpGetOverTor(
+                    for: URLRequest(url: URL(string: "https://example.com")!),
+                    retryLimit: 0,
+                    timeoutMilliseconds: 500
+                )
+                XCTAssertEqual(result.data, Data([3, 1, 4]))
+                XCTAssertEqual(result.response.statusCode, 201)
+            } catch {
+                XCTFail("Disabling one consumer broke the remaining consumer's bounded GET: \(error.localizedDescription)")
+            }
+        }
+        XCTAssertEqual(fixture.creationCount, 1, "Bounded GET must reuse the prepared root")
+        XCTAssertEqual(fixture.requestCount, 2)
+
+        try await remaining.update(synchronizer, enabled: false)
+        XCTAssertEqual(fixture.rootFreeCount, 1)
+        XCTAssertFalse(fixture.runtimes.isAlive(fixture.runtimes.parent))
+        try await remaining.update(synchronizer, enabled: false)
+        try await first.update(synchronizer, enabled: false)
+        try await client.close()
+        XCTAssertEqual(fixture.rootFreeCount, 1, "Repeated disable and close must not free the root again")
+    }
+
     private func assertRouting(slipstream: Bool) async throws {
         let runtimes = TorTestRuntimes()
         let fixture = TorResponseFixture()
@@ -116,7 +169,7 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
         try await client.close()
     }
 
-    private func makeInitializer(client: TorClient) throws -> Initializer {
+    private func makeInitializer(client: TorClient, torEnabled: Bool = true, exchangeRateEnabled: Bool = false) throws -> Initializer {
         mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in ZcashRustBackendWeldingMock() }
         mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
@@ -133,9 +186,63 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
             spendParamsURL: try __spendParamsURL(),
             outputParamsURL: try __outputParamsURL(),
             saplingParamsSourceURL: SaplingParamsSourceURL.tests,
-            isTorEnabled: true,
-            isExchangeRateEnabled: false
+            isTorEnabled: torEnabled,
+            isExchangeRateEnabled: exchangeRateEnabled
         )
+    }
+}
+
+private enum SlipstreamTorConsumer {
+    case tor
+    case exchangeRate
+
+    func update(_ synchronizer: SlipstreamSynchronizer, enabled: Bool) async throws {
+        switch self {
+        case .tor: try await synchronizer.tor(enabled: enabled)
+        case .exchangeRate: try await synchronizer.exchangeRateOverTor(enabled: enabled)
+        }
+    }
+}
+
+private final class SlipstreamTorLifecycleFixture: @unchecked Sendable {
+    let runtimes = TorTestRuntimes()
+    private let response = TorResponseFixture()
+    private let lock = NSLock()
+    private var creations = 0
+    private var rootFrees = 0
+    private var requests = 0
+
+    var creationCount: Int { lock.withLock { creations } }
+    var rootFreeCount: Int { lock.withLock { rootFrees } }
+    var requestCount: Int { lock.withLock { requests } }
+
+    var native: TorHTTPGetNative {
+        TorHTTPGetNative(
+            get: { [self] pointer, _, _, _, _, _ in
+                XCTAssertNotEqual(pointer, runtimes.parent)
+                XCTAssertTrue(runtimes.isAlive(pointer))
+                lock.withLock { requests += 1 }
+                return response.pointer
+            },
+            // The fixture retains one immutable response across these sequential requests.
+            freeResponse: { _ in },
+            isolateRuntime: { [self] in runtimes.clone($0) },
+            freeRuntime: { [self] pointer in
+                if pointer == runtimes.parent {
+                    lock.withLock { rootFrees += 1 }
+                }
+                runtimes.free(pointer)
+            },
+            createRuntime: { [self] _, _ in
+                lock.withLock { creations += 1 }
+                return runtimes.parent
+            }
+        )
+    }
+
+    deinit {
+        response.free()
+        if runtimes.isAlive(runtimes.parent) { runtimes.free(runtimes.parent) }
     }
 }
 
