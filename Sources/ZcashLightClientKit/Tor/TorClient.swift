@@ -220,26 +220,12 @@ public actor TorClient {
         }
     }
 
-    func httpGet(
+    nonisolated func httpGet(
         for request: URLRequest,
         retryLimit: UInt8,
         context: TorHTTPRequestContext
     ) async throws -> (data: Data, response: HTTPURLResponse) {
-        try context.checkCancellation()
-        let url = try TorHTTPGetRequest.validate(request)
-        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
-        try context.claimOwnership()
-        guard let isolated = httpGetNative.isolateRuntime(runtime) else {
-            throw ZcashError.rustTorIsolatedClient(lastErrorMessage(fallback: "TorClient.httpGet could not isolate runtime"))
-        }
-        let ownedRequest = TorHTTPGetRequest(
-            runtime: isolated,
-            request: request,
-            url: url,
-            retryLimit: retryLimit,
-            deadline: context.deadlineUptime,
-            native: httpGetNative
-        )
+        let ownedRequest = try await prepareHTTPGet(for: request, retryLimit: retryLimit, context: context)
         return try await httpExecutor.execute(
             deadlineUptime: context.deadlineUptime,
             operation: {
@@ -247,6 +233,30 @@ public actor TorClient {
                 return try ownedRequest.run(timeoutMilliseconds: $0)
             },
             dispose: { ownedRequest.dispose() }
+        )
+    }
+
+    /// Ownership is acquired on the root actor; native execution and its completion
+    /// must not need this actor again after it hands the owner to the caller.
+    private func prepareHTTPGet(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        context: TorHTTPRequestContext
+    ) throws -> TorHTTPGetRequest {
+        try context.checkCancellation()
+        let url = try TorHTTPGetRequest.validate(request)
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
+        try context.claimOwnership()
+        guard let isolated = httpGetNative.isolateRuntime(runtime) else {
+            throw ZcashError.rustTorIsolatedClient(lastErrorMessage(fallback: "TorClient.httpGet could not isolate runtime"))
+        }
+        return TorHTTPGetRequest(
+            runtime: isolated,
+            request: request,
+            url: url,
+            retryLimit: retryLimit,
+            deadline: context.deadlineUptime,
+            native: httpGetNative
         )
     }
 

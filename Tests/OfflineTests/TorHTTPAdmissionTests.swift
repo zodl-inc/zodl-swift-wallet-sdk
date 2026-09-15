@@ -162,6 +162,114 @@ final class TorHTTPAdmissionTests: ZcashTestCase {
         try await client.close()
     }
 
+    func testSuccessAfterCleanupCompletesWhileRootActorIsHeld() async throws {
+        try await assertCompletionAfterCleanup(slipstream: false, cancel: false)
+    }
+
+    func testCancellationAfterCleanupCompletesWhileRootActorIsHeld() async throws {
+        try await assertCompletionAfterCleanup(slipstream: false, cancel: true)
+    }
+
+    func testSuccessAfterCleanupCompletesWhileSlipstreamActorIsHeld() async throws {
+        try await assertCompletionAfterCleanup(slipstream: true, cancel: false)
+    }
+
+    func testCancellationAfterCleanupCompletesWhileSlipstreamActorIsHeld() async throws {
+        try await assertCompletionAfterCleanup(slipstream: true, cancel: true)
+    }
+
+    private func assertCompletionAfterCleanup(slipstream: Bool, cancel: Bool) async throws {
+        let fixture = TorAdmissionFixture()
+        let nativeEntered = expectation(description: "native GET entered")
+        let responseFreed = expectation(description: "native response disposed")
+        let cloneFreed = expectation(description: "native clone disposed")
+        let actorHeld = expectation(description: "actor held after GET entry")
+        let completed = expectation(description: "caller completed after cleanup while actor held")
+        let prematureCompletion = expectation(description: "active native work retains caller")
+        prematureCompletion.isInverted = true
+        let releaseNative = DispatchSemaphore(value: 0)
+        let releaseActor = DispatchSemaphore(value: 0)
+        let completion = TorAdmissionCompletionObservation()
+        var native = fixture.native
+        native.get = { _, _, _, _, _, _ in
+            nativeEntered.fulfill()
+            XCTAssertEqual(releaseNative.wait(timeout: .now() + 5), .success)
+            return fixture.response.pointer
+        }
+        native.freeResponse = { _ in responseFreed.fulfill() }
+        native.freeRuntime = { pointer in
+            fixture.runtimes.free(pointer)
+            if pointer != fixture.runtimes.parent { cloneFreed.fulfill() }
+        }
+        let client = TorClient(runtimePtr: fixture.runtimes.parent, torDir: testTempDirectory, httpGetNative: native)
+        let operation: () async throws -> TorHTTPRequestExecutor.Response
+        let holdActor: () async -> Void
+        if slipstream {
+            let synchronizer = SlipstreamSynchronizer(initializer: try makeInitializer(client: client))
+            operation = { try await synchronizer.httpGetOverTor(for: self.request, retryLimit: 0, timeoutMilliseconds: 10_000) }
+            holdActor = { await synchronizer.holdAdmission(entered: actorHeld, release: releaseActor) }
+        } else {
+            operation = { try await client.httpGet(for: self.request, retryLimit: 0, timeoutMilliseconds: 10_000) }
+            holdActor = { await client.holdAdmission(entered: actorHeld, release: releaseActor) }
+        }
+        let task = Task {
+            defer {
+                completion.markCompleted()
+                prematureCompletion.fulfill()
+                completed.fulfill()
+            }
+            do { return Result<TorHTTPRequestExecutor.Response, Error>.success(try await operation()) }
+            catch { return Result<TorHTTPRequestExecutor.Response, Error>.failure(error) }
+        }
+        await fulfillment(of: [nativeEntered], timeout: 3)
+        let blocker = Task { await holdActor() }
+        await fulfillment(of: [actorHeld], timeout: 3)
+        if cancel { task.cancel() }
+        await fulfillment(of: [prematureCompletion], timeout: 0.05)
+        XCTAssertFalse(completion.completed, "Active native work must retain its caller")
+        releaseNative.signal()
+        await fulfillment(of: [responseFreed, cloneFreed], timeout: 3)
+        await fulfillment(of: [completed], timeout: 1)
+        releaseActor.signal()
+        await blocker.value
+        switch await task.value {
+        case .success(let response):
+            XCTAssertFalse(cancel, "Cancelled active GET succeeded")
+            XCTAssertEqual(response.data, Data([3, 1, 4]))
+            XCTAssertEqual(response.response.statusCode, 201)
+        case .failure(let error):
+            XCTAssertTrue(cancel && error is CancellationError, "Unexpected failure: \(error)")
+        }
+        try await client.close()
+    }
+
+    func testTaskLocalLifetimeObservesInheritedTaskExitAfterCallerReturns() async {
+        let childEntered = expectation(description: "inherited task entered")
+        let lifetimeExited = expectation(description: "inherited task released lifetime")
+        let release = TorAdmissionStartGate()
+        let observation = TorAdmissionCompletionObservation()
+        let caller = Task {
+            TorAdmissionTaskState.$lifetime.withValue(TorAdmissionLifetime {
+                observation.markCompleted()
+                lifetimeExited.fulfill()
+            }) {
+                Task {
+                    XCTAssertNotNil(TorAdmissionTaskState.lifetime)
+                    childEntered.fulfill()
+                    await release.wait()
+                    XCTAssertNotNil(TorAdmissionTaskState.lifetime)
+                }
+            }
+        }
+        let child = await caller.value
+        await fulfillment(of: [childEntered], timeout: 3)
+        XCTAssertFalse(observation.completed, "Caller exit must not hide an inherited task still running")
+        await release.release()
+        await child.value
+        await fulfillment(of: [lifetimeExited], timeout: 3)
+        XCTAssertTrue(observation.completed)
+    }
+
     private enum Entry { case root, classic, slipstream }
 
     private func assertBlockedAdmission(entry: Entry, cancel: Bool, alreadyCancelled: Bool = false) async throws {
@@ -172,6 +280,7 @@ final class TorHTTPAdmissionTests: ZcashTestCase {
         let completed = expectation(description: "caller completed while actor held")
         let started = expectation(description: "request started")
         let start = TorAdmissionStartGate()
+        let admissionExited = expectation(description: "inherited admission and timer state released")
         let operation: () async throws -> TorHTTPRequestExecutor.Response
         let blocker: Task<Void, Never>
         switch entry {
@@ -190,9 +299,12 @@ final class TorHTTPAdmissionTests: ZcashTestCase {
         await fulfillment(of: [entered], timeout: 3)
         let task = Task {
             await start.wait()
-            started.fulfill()
-            defer { completed.fulfill() }
-            do { return Result<TorHTTPRequestExecutor.Response, Error>.success(try await operation()) } catch { return Result<TorHTTPRequestExecutor.Response, Error>.failure(error) }
+            return await TorAdmissionTaskState.$lifetime.withValue(TorAdmissionLifetime { admissionExited.fulfill() }) {
+                started.fulfill()
+                defer { completed.fulfill() }
+                do { return Result<TorHTTPRequestExecutor.Response, Error>.success(try await operation()) }
+                catch { return Result<TorHTTPRequestExecutor.Response, Error>.failure(error) }
+            }
         }
         if alreadyCancelled { task.cancel() }
         await start.release()
@@ -208,10 +320,13 @@ final class TorHTTPAdmissionTests: ZcashTestCase {
         case .failure(let error):
             if cancel { XCTAssertTrue(error is CancellationError) } else { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
         }
-        // Flush the late actor hop before inspecting native side effects.
-        try await client.close()
+        // The task-local value is inherited by admission/timer tasks. Its release
+        // observes their exit before parent close could hide an illicit late clone.
+        await fulfillment(of: [admissionExited], timeout: 3)
+        XCTAssertTrue(fixture.runtimes.isAlive(fixture.runtimes.parent))
         XCTAssertEqual(fixture.gets, 0)
         XCTAssertEqual(fixture.clones, 0)
+        try await client.close()
     }
 
     private var request: URLRequest { URLRequest(url: URL(string: "https://example.com")!) }
@@ -234,21 +349,21 @@ final class TorHTTPAdmissionTests: ZcashTestCase {
 private extension TorClient {
     func holdAdmission(entered: XCTestExpectation, release: DispatchSemaphore) {
         entered.fulfill()
-        _ = release.wait(timeout: .now() + 5)
+        XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
     }
 }
 
 private extension SDKFlags {
     func holdAdmission(entered: XCTestExpectation, release: DispatchSemaphore) {
         entered.fulfill()
-        _ = release.wait(timeout: .now() + 5)
+        XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
     }
 }
 
 private extension SlipstreamSynchronizer {
     func holdAdmission(entered: XCTestExpectation, release: DispatchSemaphore) {
         entered.fulfill()
-        _ = release.wait(timeout: .now() + 5)
+        XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
     }
 }
 
@@ -304,8 +419,25 @@ private final class TorAdmissionWorkerRead: @unchecked Sendable {
         }
         if worker {
             entered.fulfill()
-            _ = release.wait(timeout: .now() + 5)
+            XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
         }
         return DispatchTime.now().uptimeNanoseconds
     }
+}
+
+private final class TorAdmissionCompletionObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didComplete = false
+    var completed: Bool { lock.withLock { didComplete } }
+    func markCompleted() { lock.withLock { didComplete = true } }
+}
+
+private enum TorAdmissionTaskState {
+    @TaskLocal static var lifetime: TorAdmissionLifetime?
+}
+
+private final class TorAdmissionLifetime: @unchecked Sendable {
+    private let onExit: @Sendable () -> Void
+    init(onExit: @escaping @Sendable () -> Void) { self.onExit = onExit }
+    deinit { onExit() }
 }
