@@ -18,7 +18,8 @@ on:
           e2e = restore+sync over OHTTP / Tor+OHTTP (default);
           fallback-up = gateway reachable, policy stays on OHTTP;
           fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks;
-          bench-mainnet = mainnet clearnet fallback tier benchmark
+          bench-mainnet = mainnet clearnet fallback tier benchmark;
+          send = testnet SEND E2E (Wallet 2 sends to Wallet 1, both legs sequentially)
         type: choice
         default: e2e
         options:
@@ -26,6 +27,11 @@ on:
           - fallback-up
           - fallback-down
           - bench-mainnet
+          - send
+      recipient:
+        description: 'Recipient unified address for send scenario (default: Wallet 1 UA)'
+        type: string
+        default: 'utest1wkj0qj7q0nlnvtl0gywf0zvgh86ssmdypqp4y560phrx5edu52hnn4cjhkcszjnx4mkumtd32z2sqmhvrwk5cl2y9my46kuu3ceta4ef45vps67jur8l2qsn4mqn0kj8gz5sl90t63l4wwcvdw284dla46s985jf7vgaplfhaqjzjm8s'
 
 permissions:
   contents: read
@@ -192,6 +198,16 @@ jobs:
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testMainnetFallbackTierBenchmark" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Testnet SEND E2E (Wallet 2 → Wallet 1, both legs)
+        if: ${{ !cancelled() && inputs.scenario == 'send' && matrix.mode == 'tor' }}
+        timeout-minutes: 45
+        env:
+          OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
+          OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
       - name: Evidence summary
         if: ${{ always() }}

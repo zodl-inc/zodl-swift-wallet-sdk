@@ -46,6 +46,193 @@ final class OHTTPE2ETests: ZcashTestCase {
         try await restoreAndSync(tor: true)
     }
 
+    /// Testnet SEND E2E: restore Wallet 2, send to Wallet 1 twice (OHTTP, then Tor+OHTTP), wait
+    /// for both transactions to be mined. Runs both legs sequentially to avoid racing for notes.
+    /// Only runs in the `tor` matrix leg (the `ohttp` leg skips this test).
+    func testSendOverOHTTP() async throws {
+        guard let seed2Hex = Env.environment["OHTTP_E2E_SEED2_HEX"].flatMap({ $0.isEmpty ? nil : $0 }), let seed2 = Data(hexString: seed2Hex), seed2.count == 64 else {
+            throw XCTSkip("OHTTP_E2E_SEED2_HEX not set (or not a 64-byte hex seed); send E2E skipped")
+        }
+        guard let recipientUA = Env.environment["OHTTP_E2E_RECIPIENT_UA"].flatMap({ $0.isEmpty ? nil : $0 }) else {
+            throw XCTSkip("OHTTP_E2E_RECIPIENT_UA not set; send E2E skipped")
+        }
+
+        let host = Env.gatewayHost
+        let birthday2: BlockHeight = 4_123_865
+        let sendAmount = Zatoshi(1_000_000) // 0.01 TAZ
+        log("scenario=send gateway=\(host) birthday=\(birthday2) amount=\(sendAmount.amount) recipient=\(recipientUA.prefix(20))...")
+
+        // Leg A: OHTTP only (Tor off)
+        try await sendLeg(seed: seed2, birthday: birthday2, recipientUA: recipientUA, amount: sendAmount, tor: false)
+
+        // Leg B: Tor + OHTTP (Tor on)
+        try await sendLeg(seed: seed2, birthday: birthday2, recipientUA: recipientUA, amount: sendAmount, tor: true)
+    }
+
+    private func sendLeg(seed: Data, birthday: BlockHeight, recipientUA: String, amount: Zatoshi, tor: Bool) async throws {
+        let mode = tor ? "tor" : "ohttp"
+        let host = Env.gatewayHost
+        log("SEND LEG mode=\(mode) gateway=\(host) birthday=\(birthday)")
+
+        let endpoint = LightWalletEndpoint(
+            address: host,
+            port: 443,
+            secure: true,
+            singleCallTimeoutInMillis: 30_000,
+            streamingCallTimeoutInMillis: 10 * 60 * 60 * 1000
+        )
+        let databases = TemporaryDbBuilder.build()
+        let initializer = Initializer(
+            cacheDbURL: nil,
+            fsBlockDbRoot: databases.fsCacheDbRoot,
+            generalStorageURL: databases.generalStorageURL,
+            dataDbURL: databases.dataDB,
+            torDirURL: databases.torDir,
+            endpoint: endpoint,
+            network: ZcashNetworkBuilder.network(for: .testnet),
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            alias: .custom("ohttp-e2e-send-\(mode)"),
+            loggingPolicy: .default(.debug),
+            isTorEnabled: tor,
+            isExchangeRateEnabled: false
+        )
+        let synchronizer = SlipstreamSynchronizer(initializer: initializer)
+        defer { synchronizer.stop() }
+
+        let result = try await synchronizer.prepare(with: [UInt8](seed), walletBirthday: birthday, name: "send-e2e", keySource: nil)
+        guard case .success = result else {
+            return XCTFail("prepare() returned \(result), expected .success")
+        }
+        log("prepared wallet (\(mode))")
+
+        if tor {
+            try await synchronizer.tor(enabled: true)
+            let initialized = await synchronizer.isTorSuccessfullyInitialized()
+            log("tor enabled, initialized=\(String(describing: initialized))")
+            log("tor exit ip=\(await publicIP(via: synchronizer) ?? "unknown")")
+        }
+
+        try await synchronizer.start(retry: false)
+        log("sync started")
+
+        // Wait for sync to complete
+        let syncDeadline = Date().addingTimeInterval(600) // 10 minutes for sync
+        var synced = false
+        while Date() < syncDeadline {
+            let state = synchronizer.latestState
+            if case .error(let error) = state.syncStatus {
+                let msg = "\(error)"
+                if msg.contains("newer than the latest") || msg.contains("statusCode: 11") {
+                    log("OUT_OF_RANGE (chain-tip race) — considering synced")
+                    synced = true
+                    break
+                }
+                XCTFail("sync failed (\(mode)): \(error)")
+                return
+            }
+            if case .upToDate = state.syncStatus, !state.isRecovering {
+                synced = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        XCTAssertTrue(synced, "sync must complete within 10 minutes (\(mode))")
+        log("sync complete (\(mode))")
+
+        // Get balance before send
+        let balancesBefore = try await synchronizer.getAccountsBalances()
+        var totalBefore: Int64 = 0
+        for (_, balance) in balancesBefore {
+            totalBefore += balance.shieldedTotal().amount + balance.unshielded.amount
+        }
+        log("balance_before=\(totalBefore) zatoshi (\(mode))")
+
+        // Get account and spending key
+        let accounts = try await synchronizer.listAccounts()
+        guard let account = accounts.first else {
+            return XCTFail("no accounts found")
+        }
+        let derivationTool = DerivationTool(networkType: .testnet)
+        let spendingKey = try derivationTool.deriveUnifiedSpendingKey(seed: [UInt8](seed), accountIndex: account.account)
+
+        // Create recipient
+        let recipient = try Recipient(recipientUA, network: .testnet)
+        let memo = try Memo(string: "ohttp-e2e \(mode)")
+
+        // Propose transfer
+        log("proposing transfer (\(mode))...")
+        let proposal = try await synchronizer.proposeTransfer(
+            accountUUID: account.uuid,
+            recipient: recipient,
+            amount: amount,
+            memo: memo
+        )
+        log("proposal created: fee=\(proposal.totalFeeRequired().amount) zatoshi (\(mode))")
+
+        // Create and submit transaction
+        log("creating and submitting transaction (\(mode))...")
+        let submittedAt = ISO8601DateFormatter().string(from: Date())
+        let stream = try await synchronizer.createProposedTransactions(proposal: proposal, spendingKey: spendingKey)
+        var submittedTxId: Data?
+        var submitSuccess = false
+        for try await submitResult in stream {
+            switch submitResult {
+            case .success(let txId):
+                submittedTxId = txId
+                submitSuccess = true
+                log("transaction submitted: txid=\(txId.hexEncodedString()) submitted_at=\(submittedAt) (\(mode))")
+            case .grpcFailure(let txId, let error):
+                log("FAILED grpc failure: txid=\(txId.hexEncodedString()) error=\(error) (\(mode))")
+                XCTFail("transaction submission failed (gRPC): \(error)")
+                return
+            case .submitFailure(let txId, let code, let description):
+                log("FAILED submit failure: txid=\(txId.hexEncodedString()) code=\(code) description=\(description) (\(mode))")
+                XCTFail("transaction submission failed (code \(code)): \(description)")
+                return
+            case .notAttempted(let txId):
+                log("WARNING not attempted: txid=\(txId.hexEncodedString()) (\(mode))")
+            }
+        }
+
+        guard submitSuccess, let txId = submittedTxId else {
+            XCTFail("transaction not submitted (\(mode))")
+            return
+        }
+
+        // Wait for transaction to be mined (poll every 10s, up to 12 minutes)
+        log("waiting for transaction to be mined (txid=\(txId.hexEncodedString()), mode=\(mode))...")
+        let mineDeadline = Date().addingTimeInterval(720) // 12 minutes
+        var minedHeight: BlockHeight?
+        while Date() < mineDeadline {
+            let txs = try await synchronizer.allTransactions()
+            if let tx = txs.first(where: { $0.rawID == txId }) {
+                if let height = tx.minedHeight {
+                    minedHeight = height
+                    log("transaction mined: txid=\(txId.hexEncodedString()) mined_height=\(height) (\(mode))")
+                    break
+                }
+            }
+            try await Task.sleep(nanoseconds: 10_000_000_000) // 10 seconds
+        }
+
+        guard let finalMinedHeight = minedHeight else {
+            log("RESULT send mode=\(mode) txid=\(txId.hexEncodedString()) submitted_at=\(submittedAt) mined_height=none balance_before=\(totalBefore)")
+            XCTFail("transaction not mined within 12 minutes (\(mode)): txid=\(txId.hexEncodedString())")
+            return
+        }
+
+        // Get balance after send
+        let balancesAfter = try await synchronizer.getAccountsBalances()
+        var totalAfter: Int64 = 0
+        for (_, balance) in balancesAfter {
+            totalAfter += balance.shieldedTotal().amount + balance.unshielded.amount
+        }
+
+        log("RESULT send mode=\(mode) txid=\(txId.hexEncodedString()) submitted_at=\(submittedAt) mined_height=\(finalMinedHeight) balance_before=\(totalBefore) balance_after=\(totalAfter)")
+    }
+
     // MARK: - Scenario
 
     private func restoreAndSync(tor: Bool) async throws {
