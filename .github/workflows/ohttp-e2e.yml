@@ -178,10 +178,10 @@ jobs:
           set -o pipefail
           # Run LWD sync test
           swift test --filter "OHTTPE2ETests/${TEST}" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
-          # Run external API proxy test (CMC price + NEAR tokens via OHTTP) — only on ohttp matrix
-          if [ "${{ matrix.mode }}" = "ohttp" ]; then
+          # External API proxy test (CMC key/info + NEAR tokens + voting): OHTTP on the ohttp leg,
+          # Tor -> OHTTP with gateway-injected secrets on the tor leg (OHTTP_E2E_TOR=1).
+          OHTTP_E2E_TOR="${{ matrix.mode == 'tor' && '1' || '0' }}" \
             swift test --filter "OHTTPE2ETests/testExternalAPIsViaOHTTP" 2>&1 | tee -a "e2e-${{ matrix.mode }}.log"
-          fi
 
       - name: OHTTP -> clearnet fallback primitives (${{ inputs.scenario }})
         if: ${{ !cancelled() && startsWith(inputs.scenario, 'fallback-') }}
