@@ -322,12 +322,44 @@ final class OHTTPTests: XCTestCase {
 
     // MARK: - Client Trace ID Tests
 
+    /// Creates a valid OHTTP key config for testing (X25519 / HKDF-SHA256 / AES-128-GCM).
+    private func makeValidKeyConfig() -> Data {
+        var config = Data()
+        var configBody = Data()
+        
+        configBody.append(0x01)  // key_id
+        configBody.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
+        configBody.append(Data(count: 32))  // dummy 32-byte public key
+        configBody.append(contentsOf: [0x00, 0x04])  // suites_length = 4
+        configBody.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
+        configBody.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
+        
+        let length = UInt16(configBody.count)
+        config.append(UInt8(length >> 8))
+        config.append(UInt8(length & 0xFF))
+        config.append(configBody)
+        
+        return config
+    }
+
     func testClientTraceIdAbsentWhenNotSet() async throws {
         var capturedRequest: URLRequest?
+        let validKeyConfig = makeValidKeyConfig()
+        
         let mockSender: OHTTPTransport.HTTPSender = { request in
-            capturedRequest = request
-            // Return a minimal valid response to prevent the test from failing on decryption
-            throw OHTTPError.transportError("test abort")
+            // Return valid key config for GET, capture POST where trace ID should be
+            if request.httpMethod == "GET" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                capturedRequest = request
+                throw OHTTPError.transportError("test abort")
+            }
         }
 
         let transport = OHTTPTransport(
@@ -337,7 +369,6 @@ final class OHTTPTests: XCTestCase {
             httpSender: mockSender
         )
 
-        // This will fail at the mock sender, but that's fine - we just want to capture the request
         do {
             _ = try await transport.roundTrip(
                 request: BinaryHTTP.Request(
@@ -351,7 +382,7 @@ final class OHTTPTests: XCTestCase {
                 timeoutMS: 5000
             )
         } catch {
-            // Expected - mock sender throws
+            // Expected - mock sender throws on POST
         }
 
         XCTAssertNotNil(capturedRequest, "Request should have been captured")
@@ -361,9 +392,21 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdPresentWhenSet() async throws {
         var capturedRequest: URLRequest?
+        let validKeyConfig = makeValidKeyConfig()
+        
         let mockSender: OHTTPTransport.HTTPSender = { request in
-            capturedRequest = request
-            throw OHTTPError.transportError("test abort")
+            if request.httpMethod == "GET" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                capturedRequest = request
+                throw OHTTPError.transportError("test abort")
+            }
         }
 
         let transport = OHTTPTransport(
@@ -399,11 +442,69 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
     }
 
+    func testClientTraceIdNeverSetsXRequestId() async throws {
+        var capturedRequest: URLRequest?
+        let validKeyConfig = makeValidKeyConfig()
+        
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            if request.httpMethod == "GET" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                capturedRequest = request
+                throw OHTTPError.transportError("test abort")
+            }
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            clientTraceIdPrefix: "test",
+            httpSender: mockSender
+        )
+
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+        } catch {
+            // Expected
+        }
+
+        XCTAssertNotNil(capturedRequest, "Request should have been captured")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "SDK must never set X-Request-Id")
+    }
+
     func testClientTraceIdSanitization() async throws {
         var capturedRequest: URLRequest?
+        let validKeyConfig = makeValidKeyConfig()
+        
         let mockSender: OHTTPTransport.HTTPSender = { request in
-            capturedRequest = request
-            throw OHTTPError.transportError("test abort")
+            if request.httpMethod == "GET" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                capturedRequest = request
+                throw OHTTPError.transportError("test abort")
+            }
         }
 
         let transport = OHTTPTransport(
@@ -439,9 +540,21 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdTruncation() async throws {
         var capturedRequest: URLRequest?
+        let validKeyConfig = makeValidKeyConfig()
+        
         let mockSender: OHTTPTransport.HTTPSender = { request in
-            capturedRequest = request
-            throw OHTTPError.transportError("test abort")
+            if request.httpMethod == "GET" {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                capturedRequest = request
+                throw OHTTPError.transportError("test abort")
+            }
         }
 
         let longPrefix = String(repeating: "a", count: 60)
