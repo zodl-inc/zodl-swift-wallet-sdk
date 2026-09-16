@@ -256,7 +256,8 @@ enum Dependencies {
             return SaplingParametersHandlerImpl(
                 config: saplingParametersHandlerConfig,
                 rustBackend: rustBackend,
-                logger: logger
+                logger: logger,
+                container: container
             )
         }
     }

@@ -9,7 +9,7 @@
 //
 //    app ──HPKE-encrypted──▶ relay (sees IP, not content) ──▶ gateway (sees content, not IP) ──▶ lightwalletd
 //
-//  Non-LWD proxy hosts (CMC, NEAR, voting, Sapling params) also route through the same relay→gateway
+//  Non-LWD proxy hosts (CMC, NEAR, voting) also route through the same relay→gateway
 //  pair. The gateway proxies these to their real backends; the destination never sees the client IP.
 //  When Tor is OFF: OHTTP hides the client IP from all external services.
 //  When Tor is ON:  LWD uses Tor→OHTTP; other calls use Tor directly (no double-wrapping needed).
@@ -30,7 +30,6 @@ public enum OHTTPEndpoints {
         "cmc.zodl.com":    "https://simulator-relay.example.invalid/relay",  // CoinMarketCap price feed
         "near.zodl.com":   "https://simulator-relay.example.invalid/relay",  // NEAR 1click intents API
         "vote.zodl.com":   "https://simulator-relay.example.invalid/relay",  // Voting config / vote servers
-        "params.zodl.com": "https://simulator-relay.example.invalid/relay",  // Sapling params download
     ]
 
     /// Proxy allowlist suffixes. Gateway v1.4.5+ proxies inner requests whose `:authority` ends
@@ -100,7 +99,6 @@ public enum OHTTPEndpoints {
             "pro-api.coinmarketcap.com": "cmc.zodl.com",
             "1click.chaindefuser.com":   "near.zodl.com",
             "voting.valargroup.dev":     "vote.zodl.com",
-            "download.z.cash":           "params.zodl.com",
         ]
         return mapping[host.lowercased()]
     }

@@ -209,7 +209,7 @@ public enum ZcashSDK {
     /// The Url that is used by default in zcashd.
     /// We'll want to make this externally configurable, rather than baking it into the SDK but
     /// this will do for now, since we're using a cloudfront URL that already redirects.
-    public static let cloudParameterURL = "https://download.z.cash/downloads/"
+    public static let cloudParameterURL = "https://raw.githubusercontent.com/zodl-inc/zcash-sapling-params/main/"
 
     /// File name for the sapling spend params
     public static let spendParamFilename = "sapling-spend.params"

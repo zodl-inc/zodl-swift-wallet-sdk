@@ -21,6 +21,7 @@ struct SaplingParametersHandlerImpl {
     let config: SaplingParametersHandlerConfig
     let rustBackend: ZcashRustBackendWelding
     let logger: Logger
+    let container: DIContainer
 }
 
 extension SaplingParametersHandlerImpl: SaplingParametersHandler {
@@ -60,13 +61,17 @@ extension SaplingParametersHandlerImpl: SaplingParametersHandler {
             return
         }
 
+        let sdkFlags = container.resolve(SDKFlags.self)
+        let isTorEnabled = await sdkFlags.torEnabled
+        let torClient: TorClient? = isTorEnabled ? container.resolve(TorClient.self) : nil
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             retryEnabled: true,
             spendURL: config.spendParamsURL,
             spendSourceURL: config.saplingParamsSourceURL.spendParamFileURL,
             outputURL: config.outputParamsURL,
             outputSourceURL: config.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
+            logger: logger,
+            torClient: torClient
         )
     }
 }
