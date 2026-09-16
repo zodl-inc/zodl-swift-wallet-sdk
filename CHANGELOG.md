@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- [MOB-1963] Concurrent voting work now waits for a competing database writer when storing a
+  vote, avoiding an immediate database-locked failure during ballot submission. No call-site
+  changes are required.
 - [MOB-1963] `VotingRustBackend` reuses a healthy snapshot-matching PIR endpoint across delegation
   precompute and proof work for the same wallet, round, snapshot, layout, and endpoint list. It
   revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
