@@ -30,6 +30,21 @@ final class OHTTPE2ETests: ZcashTestCase {
         static var minBalanceZatoshi: Int64 { environment["OHTTP_E2E_MIN_BALANCE_ZAT"].flatMap { Int64($0) } ?? 100_000_000 } // 1 TAZ default; balance varies with E2E sends
         static var timeoutSeconds: TimeInterval { environment["OHTTP_E2E_TIMEOUT_SECONDS"].flatMap { TimeInterval($0) } ?? 3600 }
         static var gatewayHost: String { environment["OHTTP_E2E_GATEWAY_HOST"] ?? "ohttp-gateway-testnet.example" }
+        static var clientTracePrefix: String? { environment["OHTTP_E2E_CLIENT_TRACE_PREFIX"].flatMap { $0.isEmpty ? nil : $0 } }
+    }
+
+    // MARK: - Setup
+
+    override func setUp() {
+        super.setUp()
+        if let prefix = Env.clientTracePrefix {
+            OHTTPEndpoints.clientTraceIdPrefix = prefix
+        }
+    }
+
+    override func tearDown() {
+        OHTTPEndpoints.clientTraceIdPrefix = nil
+        super.tearDown()
     }
 
     // MARK: - Tests

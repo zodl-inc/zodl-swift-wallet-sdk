@@ -38,6 +38,10 @@ on:
         description: 'Recipient unified address for send-mainnet scenario'
         type: string
         default: 'u1gnkh8m8xfg4gn9gzlsuf3kpu0ylgr2szzj9prmh9cqxckt6uv9pps7rt5lwccytkrheups52l7z4jpfwurk2ux9x3rhwjczt8qezzj2whgp7wcfur58ew4vkd4sv8ppc7tmqf2ar9sqzmznwsw5em0lx48484nhdc4d27syypyzcn07gypkcvkl3yuj7a3crna0vsq8gx6ly7wwkluz'
+      client_trace_prefix:
+        description: 'Client trace ID prefix for debugging (empty = disabled)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -173,6 +177,7 @@ jobs:
           OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
           OHTTP_E2E_MIN_BALANCE_ZAT: ${{ vars.OHTTP_E2E_MIN_BALANCE_ZAT || '9000000000' }}
           OHTTP_E2E_TIMEOUT_SECONDS: '3600'
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
           TEST: ${{ matrix.mode == 'tor' && 'testRestoreAndSyncOverTorAndOHTTP' || 'testRestoreAndSyncOverOHTTP' }}
         run: |
           set -o pipefail
@@ -191,6 +196,7 @@ jobs:
           OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
           OHTTP_E2E_GATEWAY_STATE: ${{ inputs.scenario == 'fallback-down' && 'down' || 'up' }}
           OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testFallbackPrimitives" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
@@ -201,6 +207,7 @@ jobs:
         env:
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
           OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testMainnetFallbackTierBenchmark" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
@@ -211,6 +218,7 @@ jobs:
         env:
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
@@ -224,6 +232,7 @@ jobs:
           OHTTP_E2E_SEND_BIRTHDAY: 3427084
           OHTTP_E2E_SEND_ZATOSHI: 50000
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.mainnet_recipient }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
