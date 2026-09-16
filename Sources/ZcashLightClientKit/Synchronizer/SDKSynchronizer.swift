@@ -578,15 +578,17 @@ public class SDKSynchronizer: Synchronizer {
         // TODO [#1724]: zcash_client_backend: Make Sapling parameters optional for extract_and_store_transaction
         // TODO [#1724]: https://github.com/zcash/librustzcash/issues/1724
 //        if await initializer.rustBackend.PCZTRequiresSaplingProofs(pczt: pczt) {
-        let isTorEnabled = await sdkFlags.torEnabled
-        let torClient: TorClient? = isTorEnabled ? initializer.container.resolve(TorClient.self) : nil
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
             logger: logger,
-            torClient: torClient
+            torClientProvider: {
+                let isTorEnabled = await self.sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
 //        }
 

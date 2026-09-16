@@ -209,15 +209,17 @@ final class SDKBroadcaster: Broadcaster {
 
     private func downloadSaplingParamsIfNeeded() async throws {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let isTorEnabled = await sdkFlags.torEnabled
-        let torClient: TorClient? = isTorEnabled ? initializer.container.resolve(TorClient.self) : nil
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
             logger: logger,
-            torClient: torClient
+            torClientProvider: {
+                let isTorEnabled = await sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
     }
 

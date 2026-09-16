@@ -54,7 +54,7 @@ public enum SaplingParameterDownloader {
     /// - Parameters:
     ///     - spendURL: URL to check whether the parameter is already downloaded
     ///     - outputURL: URL to check whether the parameter is already downloaded
-    ///     - torClient: Optional TorClient for downloading over Tor. If nil, uses direct HTTPS.
+    ///     - torClientProvider: Closure that provides TorClient only when download is needed. If nil, uses direct HTTPS.
     /// - Throws:
     ///     - `saplingParamsDownload` if file downloading fails.
     ///     - `saplingParamsCantMoveDownloadedFile` if file is downloaded but moving to final destination fails.
@@ -68,15 +68,15 @@ public enum SaplingParameterDownloader {
         outputURL: URL,
         outputSourceURL: URL,
         logger: Logger,
-        torClient: TorClient? = nil
+        torClientProvider: (@Sendable () async -> TorClient?)? = nil
     ) async throws -> (spend: URL, output: URL) {
         if retryEnabled {
             var retryAttempts = 3
 
             while retryAttempts > 0 {
                 do {
-                    async let spendResultURL = ensureSpendParameter(at: spendURL, sourceURL: spendSourceURL, logger: logger, torClient: torClient)
-                    async let outputResultURL = ensureOutputParameter(at: outputURL, sourceURL: outputSourceURL, logger: logger, torClient: torClient)
+                    async let spendResultURL = ensureSpendParameter(at: spendURL, sourceURL: spendSourceURL, logger: logger, torClientProvider: torClientProvider)
+                    async let outputResultURL = ensureOutputParameter(at: outputURL, sourceURL: outputSourceURL, logger: logger, torClientProvider: torClientProvider)
 
                     let results = try await [spendResultURL, outputResultURL]
                     return (spend: results[0], output: results[1])
@@ -87,27 +87,29 @@ public enum SaplingParameterDownloader {
             }
         }
 
-        async let spendResultURL = ensureSpendParameter(at: spendURL, sourceURL: spendSourceURL, logger: logger, torClient: torClient)
-        async let outputResultURL = ensureOutputParameter(at: outputURL, sourceURL: outputSourceURL, logger: logger, torClient: torClient)
+        async let spendResultURL = ensureSpendParameter(at: spendURL, sourceURL: spendSourceURL, logger: logger, torClientProvider: torClientProvider)
+        async let outputResultURL = ensureOutputParameter(at: outputURL, sourceURL: outputSourceURL, logger: logger, torClientProvider: torClientProvider)
 
         let results = try await [spendResultURL, outputResultURL]
         return (spend: results[0], output: results[1])
     }
 
-    static func ensureSpendParameter(at url: URL, sourceURL: URL, logger: Logger, torClient: TorClient? = nil) async throws -> URL {
+    static func ensureSpendParameter(at url: URL, sourceURL: URL, logger: Logger, torClientProvider: (@Sendable () async -> TorClient?)? = nil) async throws -> URL {
         if isFilePresent(url: url) {
             try isSpendParamsSHA1Valid(url: url)
             return url
         } else {
+            let torClient = await torClientProvider?()
             return try await downloadSpendParameter(url, sourceURL: sourceURL, logger: logger, torClient: torClient)
         }
     }
 
-    static func ensureOutputParameter(at url: URL, sourceURL: URL, logger: Logger, torClient: TorClient? = nil) async throws -> URL {
+    static func ensureOutputParameter(at url: URL, sourceURL: URL, logger: Logger, torClientProvider: (@Sendable () async -> TorClient?)? = nil) async throws -> URL {
         if isFilePresent(url: url) {
             try isOutputParamsSHA1Valid(url: url)
             return url
         } else {
+            let torClient = await torClientProvider?()
             return try await downloadOutputParameter(url, sourceURL: sourceURL, logger: logger, torClient: torClient)
         }
     }

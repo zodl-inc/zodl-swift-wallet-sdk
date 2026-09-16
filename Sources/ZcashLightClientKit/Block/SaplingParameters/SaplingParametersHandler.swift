@@ -62,8 +62,7 @@ extension SaplingParametersHandlerImpl: SaplingParametersHandler {
         }
 
         let sdkFlags = container.resolve(SDKFlags.self)
-        let isTorEnabled = await sdkFlags.torEnabled
-        let torClient: TorClient? = isTorEnabled ? container.resolve(TorClient.self) : nil
+        let containerRef = container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             retryEnabled: true,
             spendURL: config.spendParamsURL,
@@ -71,7 +70,10 @@ extension SaplingParametersHandlerImpl: SaplingParametersHandler {
             outputURL: config.outputParamsURL,
             outputSourceURL: config.saplingParamsSourceURL.outputParamFileURL,
             logger: logger,
-            torClient: torClient
+            torClientProvider: {
+                let isTorEnabled = await sdkFlags.torEnabled
+                return isTorEnabled ? containerRef.resolve(TorClient.self) : nil
+            }
         )
     }
 }

@@ -1778,15 +1778,17 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     public func addProofsToPCZT(pczt: Pczt) async throws -> Pczt {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let isTorEnabled = await sdkFlags.torEnabled
-        let torClient: TorClient? = isTorEnabled ? initializer.container.resolve(TorClient.self) : nil
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
             logger: initializer.logger,
-            torClient: torClient
+            torClientProvider: {
+                let isTorEnabled = await sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
         return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
     }
