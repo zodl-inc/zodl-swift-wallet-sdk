@@ -329,7 +329,13 @@ final class OHTTPTests: XCTestCase {
         
         configBody.append(0x01)  // key_id
         configBody.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
-        configBody.append(Data(count: 32))  // dummy 32-byte public key
+        // Use a non-zero public key (arbitrary but non-zero to avoid potential edge cases)
+        configBody.append(Data([
+            0x50, 0x4a, 0x36, 0x99, 0x9f, 0x48, 0x9c, 0xd2,
+            0xfd, 0xbc, 0x08, 0xba, 0xff, 0x3d, 0x88, 0xfa,
+            0x00, 0x56, 0x9d, 0x21, 0x74, 0x05, 0x10, 0x9e,
+            0x79, 0xda, 0x66, 0x05, 0x3c, 0x5f, 0x04, 0xef
+        ]))
         configBody.append(contentsOf: [0x00, 0x04])  // suites_length = 4
         configBody.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
         configBody.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
@@ -344,9 +350,11 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdAbsentWhenNotSet() async throws {
         var capturedRequest: URLRequest?
+        var callCount = 0
         let validKeyConfig = makeValidKeyConfig()
         
         let mockSender: OHTTPTransport.HTTPSender = { request in
+            callCount += 1
             // Return valid key config for GET, capture POST where trace ID should be
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
@@ -357,6 +365,7 @@ final class OHTTPTests: XCTestCase {
                 )!
                 return (validKeyConfig, response)
             } else {
+                // POST to relay - capture and throw to abort the test early
                 capturedRequest = request
                 throw OHTTPError.transportError("test abort")
             }
@@ -381,11 +390,12 @@ final class OHTTPTests: XCTestCase {
                 ),
                 timeoutMS: 5000
             )
+            XCTFail("Should have thrown")
         } catch {
             // Expected - mock sender throws on POST
         }
 
-        XCTAssertNotNil(capturedRequest, "Request should have been captured")
+        XCTAssertNotNil(capturedRequest, "Request should have been captured (callCount=\(callCount))")
         XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id"), "X-Client-Trace-Id should be absent")
         XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
     }
@@ -428,6 +438,7 @@ final class OHTTPTests: XCTestCase {
                 ),
                 timeoutMS: 5000
             )
+            XCTFail("Should have thrown")
         } catch {
             // Expected
         }
@@ -480,6 +491,7 @@ final class OHTTPTests: XCTestCase {
                 ),
                 timeoutMS: 5000
             )
+            XCTFail("Should have thrown")
         } catch {
             // Expected
         }
@@ -526,6 +538,7 @@ final class OHTTPTests: XCTestCase {
                 ),
                 timeoutMS: 5000
             )
+            XCTFail("Should have thrown")
         } catch {
             // Expected
         }
@@ -577,6 +590,7 @@ final class OHTTPTests: XCTestCase {
                 ),
                 timeoutMS: 5000
             )
+            XCTFail("Should have thrown")
         } catch {
             // Expected
         }
