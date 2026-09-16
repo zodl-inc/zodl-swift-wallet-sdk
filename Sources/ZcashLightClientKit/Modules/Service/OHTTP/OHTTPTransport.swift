@@ -19,6 +19,14 @@ actor OHTTPTransport {
     private let keyFetchTimeoutMS: Int
     private var cachedKeyConfig: OHTTPKeyConfig?
     private let httpSender: HTTPSender
+    /// Optional client trace ID prefix. When set, every outer OHTTP POST to the relay carries
+    /// `X-Client-Trace-Id: <prefix>-<uuid>` so a tester can tag and follow requests end-to-end in
+    /// Grafana (relay → gateway → downstream). The prefix is sanitised to `[A-Za-z0-9._:-]` and
+    /// truncated so the full header value ≤ 64 chars.
+    ///
+    /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
+    /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
+    private let clientTraceIdPrefix: String?
 
     private static let requestMediaType = "message/ohttp-req"
     private static let responseMediaType = "message/ohttp-res"
@@ -31,6 +39,7 @@ actor OHTTPTransport {
         keyConfigURL: String,
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
+        clientTraceIdPrefix: String? = nil,
         httpSender: @escaping HTTPSender = { request in
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -43,6 +52,7 @@ actor OHTTPTransport {
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
+        self.clientTraceIdPrefix = clientTraceIdPrefix
         self.httpSender = httpSender
     }
 
@@ -152,6 +162,11 @@ actor OHTTPTransport {
         request.setValue(Self.responseMediaType, forHTTPHeaderField: "Accept")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
+        if let prefix = clientTraceIdPrefix {
+            let traceId = generateClientTraceId(prefix: prefix)
+            request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
+        }
+
         let (data, httpResponse) = try await httpSender(request)
 
         guard httpResponse.statusCode == 200 else {
@@ -160,5 +175,15 @@ actor OHTTPTransport {
         }
 
         return data
+    }
+
+    /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to
+    /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement).
+    private func generateClientTraceId(prefix: String) -> String {
+        let allowedCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
+        let sanitized = prefix.unicodeScalars.filter { allowedCharacters.contains($0) }.map { String($0) }.joined()
+        let uuid = UUID().uuidString
+        let full = "\(sanitized)-\(uuid)"
+        return full.count <= 64 ? full : String(full.prefix(64))
     }
 }

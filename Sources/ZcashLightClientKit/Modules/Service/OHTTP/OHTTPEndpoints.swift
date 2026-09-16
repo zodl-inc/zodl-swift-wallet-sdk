@@ -18,6 +18,13 @@
 import Foundation
 
 public enum OHTTPEndpoints {
+    /// Optional client trace ID prefix for debug end-to-end tracking. When set, every outer OHTTP POST
+    /// to the relay carries `X-Client-Trace-Id: <prefix>-<uuid>`.
+    ///
+    /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
+    /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
+    public static var clientTraceIdPrefix: String?
+
     /// Gateway host → relay URL.
     /// LWD gateways (mainnet/testnet) have dedicated relays with matching HPKE keys.
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet

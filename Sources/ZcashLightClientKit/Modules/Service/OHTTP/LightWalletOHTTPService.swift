@@ -29,7 +29,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             do {
                 let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
                 let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
-                let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+                let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix)
                 self.ohttpClient = OHTTPGRPCClient(
                     authority: endpoint.host,
                     transport: transport,

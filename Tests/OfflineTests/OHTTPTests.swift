@@ -320,3 +320,157 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(OHTTPEndpoints.proxyHost(for: clearnetURL), "example.com should NOT be mapped")
     }
 }
+
+    // MARK: - Client Trace ID Tests
+
+    func testClientTraceIdAbsentWhenNotSet() async throws {
+        var capturedRequest: URLRequest?
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            capturedRequest = request
+            // Return a minimal valid response to prevent the test from failing on decryption
+            throw OHTTPError.transportError("test abort")
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            clientTraceIdPrefix: nil,
+            httpSender: mockSender
+        )
+
+        // This will fail at the mock sender, but that's fine - we just want to capture the request
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+        } catch {
+            // Expected - mock sender throws
+        }
+
+        XCTAssertNotNil(capturedRequest, "Request should have been captured")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id"), "X-Client-Trace-Id should be absent")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
+    }
+
+    func testClientTraceIdPresentWhenSet() async throws {
+        var capturedRequest: URLRequest?
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            capturedRequest = request
+            throw OHTTPError.transportError("test abort")
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            clientTraceIdPrefix: "test-wallet",
+            httpSender: mockSender
+        )
+
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+        } catch {
+            // Expected
+        }
+
+        XCTAssertNotNil(capturedRequest, "Request should have been captured")
+        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        XCTAssertNotNil(traceId, "X-Client-Trace-Id should be present")
+        XCTAssertTrue(traceId?.hasPrefix("test-wallet-") ?? false, "Trace ID should start with prefix")
+        XCTAssertLessThanOrEqual(traceId?.count ?? 0, 64, "Trace ID should be ≤ 64 chars")
+        XCTAssertTrue(traceId?.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$", options: .regularExpression) != nil,
+                      "Trace ID should match allowed charset")
+        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
+    }
+
+    func testClientTraceIdSanitization() async throws {
+        var capturedRequest: URLRequest?
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            capturedRequest = request
+            throw OHTTPError.transportError("test abort")
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            clientTraceIdPrefix: "test@wallet#123",
+            httpSender: mockSender
+        )
+
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+        } catch {
+            // Expected
+        }
+
+        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        XCTAssertNotNil(traceId, "Trace ID should be present")
+        XCTAssertFalse(traceId?.contains("@") ?? true, "Trace ID should not contain @")
+        XCTAssertFalse(traceId?.contains("#") ?? true, "Trace ID should not contain #")
+        XCTAssertTrue(traceId?.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$", options: .regularExpression) != nil,
+                      "Trace ID should match allowed charset")
+    }
+
+    func testClientTraceIdTruncation() async throws {
+        var capturedRequest: URLRequest?
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            capturedRequest = request
+            throw OHTTPError.transportError("test abort")
+        }
+
+        let longPrefix = String(repeating: "a", count: 60)
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            clientTraceIdPrefix: longPrefix,
+            httpSender: mockSender
+        )
+
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+        } catch {
+            // Expected
+        }
+
+        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        XCTAssertNotNil(traceId, "Trace ID should be present")
+        XCTAssertEqual(traceId?.count, 64, "Trace ID should be truncated to exactly 64 chars")
+    }
+}
