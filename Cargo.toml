@@ -129,7 +129,10 @@ base64 = "0.22"
 hex = "0.4"
 
 [dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
+tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 
 [build-dependencies]
 bindgen = "0.72"
@@ -179,4 +182,3 @@ lto = true
 #zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-

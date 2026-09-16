@@ -2958,6 +2958,8 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "incrementalmerkletree",
  "libc",
  "log-panics",
