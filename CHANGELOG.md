@@ -6,6 +6,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Fixed
+
+- [MOB-1963] Concurrent voting work now waits for a competing database writer when storing a
+  vote, avoiding an immediate database-locked failure during ballot submission. No call-site
+  changes are required.
+- [MOB-1963] `VotingRustBackend` reuses a healthy snapshot-matching PIR endpoint across delegation
+  precompute and proof work for the same wallet, round, snapshot, layout, and endpoint list. It
+  revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
+  call sites remain compatible, and wallet or database lifecycle changes discard the selection.
 # 4.5.0 - 2026-09-15
 
 ## Added
@@ -42,6 +51,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
   v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
   Rust core from source now requires Rust 1.91.
+- The PIR client is connected once per voting database handle and reused across the bundles and
+  phases of a round (delegation PIR precompute and delegation proof), instead of once per call. The
+  connection is keyed by endpoint, layout, and the round's persisted snapshot root, so a server,
+  geometry, or snapshot change reconnects. A connected client's actual circuit root must match the
+  stored round before the SDK caches or reuses it.
 
 ## Checkpoints
 

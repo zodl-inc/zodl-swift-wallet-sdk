@@ -106,7 +106,7 @@ xz2 = { version = "0.1", features = ["static"] }
 # Coinholder voting core. 4.0.x keeps the 3.0 API and adds the 50-proposal circuit
 # (voting-circuits 0.12.0) that the upgraded vote chains verify; 3.x proofs are
 # rejected there. Move to `=4.0.0` when the final 4.0.0 release is published.
-zcash_voting = { version = "=4.0.0-rc.1" }
+zcash_voting = { version = "=4.0.0-rc.2" }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
