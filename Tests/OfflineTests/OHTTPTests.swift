@@ -319,7 +319,6 @@ final class OHTTPTests: XCTestCase {
         let clearnetURL = URL(string: "https://example.com/api")!
         XCTAssertNil(OHTTPEndpoints.proxyHost(for: clearnetURL), "example.com should NOT be mapped")
     }
-}
 
     // MARK: - Client Trace ID Tests
 
