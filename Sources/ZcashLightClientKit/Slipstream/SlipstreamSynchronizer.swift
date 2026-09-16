@@ -2824,7 +2824,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             }
         }
 
-        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, httpSender: httpSender, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix)
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
         let scheme = request.url?.scheme ?? "https"
         let path = (request.url?.path ?? "/") + (request.url?.query.map { "?\($0)" } ?? "")
 

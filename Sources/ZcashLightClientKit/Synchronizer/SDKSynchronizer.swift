@@ -1305,7 +1305,7 @@ public class SDKSynchronizer: Synchronizer {
             }
         }
 
-        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, httpSender: httpSender, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix)
+        let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
 
         let scheme = request.url?.scheme ?? "https"
         let rawPath = request.url?.path ?? "/"
