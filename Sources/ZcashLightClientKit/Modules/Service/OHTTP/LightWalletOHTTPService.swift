@@ -14,7 +14,16 @@ import Foundation
 /// The base class's grpc-swift connection is never created when using OHTTP (all `.direct` calls are
 /// intercepted before `compactTxStreamer` is accessed).
 final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
-    private let ohttpClient: OHTTPGRPCClient?
+    private var ohttpClientClearnet: OHTTPGRPCClient?
+    private var ohttpClientTor: OHTTPGRPCClient?
+    private let torClient: TorClient
+    private var httpTor: TorClient?
+    private let gatewayHost: String?
+    private let gatewayRelayURL: String?
+    private let gatewayKeyConfigURL: String?
+    private let singleCallTimeoutMS: Int64
+    private let streamingCallTimeoutMS: Int64
+    private let sdkFlags: SDKFlags?
 
     // `init(endpoint:tor:)` is inherited from the superclass: this class overrides its only
     // designated initializer, so the superclass convenience initializers come along.
@@ -24,24 +33,25 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         streamingCallTimeout: Int64,
         tor: TorClient
     ) {
-        // Initialize OHTTP client if this is an OHTTP gateway
+        self.torClient = tor
+        self.singleCallTimeoutMS = singleCallTimeout
+        self.streamingCallTimeoutMS = streamingCallTimeout
+        self.sdkFlags = nil
+
+        // Store gateway configuration but defer OHTTPTransport creation until first use
         if OHTTPEndpoints.isGateway(endpoint.host) {
+            self.gatewayHost = endpoint.host
             do {
-                let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
-                let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
-                let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix)
-                self.ohttpClient = OHTTPGRPCClient(
-                    authority: endpoint.host,
-                    transport: transport,
-                    singleCallTimeoutMS: Int(singleCallTimeout),
-                    streamingCallTimeoutMS: Int(streamingCallTimeout)
-                )
+                self.gatewayRelayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+                self.gatewayKeyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
             } catch {
-                // Log error but continue - will fall back to parent if OHTTP fails to init
-                self.ohttpClient = nil
+                self.gatewayRelayURL = nil
+                self.gatewayKeyConfigURL = nil
             }
         } else {
-            self.ohttpClient = nil
+            self.gatewayHost = nil
+            self.gatewayRelayURL = nil
+            self.gatewayKeyConfigURL = nil
         }
 
         super.init(
@@ -52,10 +62,126 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         )
     }
 
+    /// Internal init that accepts SDKFlags for Tor detection
+    init(
+        endpoint: LightWalletEndpoint,
+        singleCallTimeout: Int64,
+        streamingCallTimeout: Int64,
+        tor: TorClient,
+        sdkFlags: SDKFlags
+    ) {
+        self.torClient = tor
+        self.singleCallTimeoutMS = singleCallTimeout
+        self.streamingCallTimeoutMS = streamingCallTimeout
+        self.sdkFlags = sdkFlags
+
+        // Store gateway configuration but defer OHTTPTransport creation until first use
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            self.gatewayHost = endpoint.host
+            do {
+                self.gatewayRelayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+                self.gatewayKeyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
+            } catch {
+                self.gatewayRelayURL = nil
+                self.gatewayKeyConfigURL = nil
+            }
+        } else {
+            self.gatewayHost = nil
+            self.gatewayRelayURL = nil
+            self.gatewayKeyConfigURL = nil
+        }
+
+        super.init(
+            endpoint: endpoint,
+            singleCallTimeout: singleCallTimeout,
+            streamingCallTimeout: streamingCallTimeout,
+            tor: tor
+        )
+    }
+
+    /// Ensures the OHTTP client is initialized with the appropriate HTTP sender.
+    /// When Tor is globally enabled (via SDKFlags), we use a Tor-backed HTTP sender
+    /// for the OHTTP transport so that both the key-config GET and all relay POSTs
+    /// go through Tor, preventing device IP leakage.
+    ///
+    /// When mode != .direct, returns nil to fall back to parent's TorLwdConn implementation.
+    private func ensureOHTTPClient(mode: ServiceMode) async throws -> OHTTPGRPCClient? {
+        // Only use OHTTP for .direct mode; other modes use TorLwdConn
+        guard mode == .direct else {
+            return nil
+        }
+
+        guard let host = gatewayHost,
+              let relayURL = gatewayRelayURL,
+              let keyConfigURL = gatewayKeyConfigURL else {
+            return nil
+        }
+
+        // Check if Tor is globally enabled
+        let isTorEnabled = sdkFlags != nil ? await sdkFlags!.torEnabled : false
+
+        // Return cached client if we have one for the current Tor state
+        if isTorEnabled, let existing = ohttpClientTor {
+            return existing
+        }
+        if !isTorEnabled, let existing = ohttpClientClearnet {
+            return existing
+        }
+
+        let httpSender: OHTTPTransport.HTTPSender
+        if isTorEnabled {
+            // Tor-backed sender: isolate a Tor client for OHTTP HTTP requests
+            if httpTor == nil {
+                httpTor = try await torClient.isolatedClient()
+            }
+            guard let torClient = httpTor else {
+                throw ZcashError.torClientUnavailable
+            }
+
+            httpSender = { request in
+                // Use the Tor client's httpRequest method, which returns synchronously
+                // but needs to be called on the actor (hence the await).
+                return try await torClient.httpRequest(for: request, retryLimit: 3)
+            }
+        } else {
+            // Clearnet sender
+            httpSender = { request in
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: relayURL,
+            keyConfigURL: keyConfigURL,
+            clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix,
+            httpSender: httpSender
+        )
+
+        let client = OHTTPGRPCClient(
+            authority: host,
+            transport: transport,
+            singleCallTimeoutMS: Int(singleCallTimeoutMS),
+            streamingCallTimeoutMS: Int(streamingCallTimeoutMS)
+        )
+
+        // Cache the client for the current Tor state
+        if isTorEnabled {
+            ohttpClientTor = client
+        } else {
+            ohttpClientClearnet = client
+        }
+
+        return client
+    }
+
     // MARK: - LightWalletService Protocol
 
     override func getInfo(mode: ServiceMode) async throws -> LightWalletdInfo {
-        guard mode == .direct, let client = ohttpClient else {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
             return try await super.getInfo(mode: mode)
         }
 
@@ -68,7 +194,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func latestBlock(mode: ServiceMode) async throws -> BlockID {
-        guard mode == .direct, let client = ohttpClient else {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
             return try await super.latestBlock(mode: mode)
         }
 
@@ -87,13 +213,18 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func blockRange(_ range: CompactBlockRange, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
-        guard mode == .direct, let client = ohttpClient else {
-            return try super.blockRange(range, mode: mode)
-        }
-
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: mode) else {
+                        // Fall back to parent implementation
+                        for try await block in try super.blockRange(range, mode: mode) {
+                            continuation.yield(block)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     let blocks: [CompactBlock] = try await client.serverStreaming(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
                         request: range.blockRange()
@@ -112,7 +243,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func submit(spendTransaction: Data, mode: ServiceMode) async throws -> LightWalletServiceResponse {
-        guard mode == .direct, let client = ohttpClient else {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
             return try await super.submit(spendTransaction: spendTransaction, mode: mode)
         }
 
@@ -126,7 +257,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func fetchTransaction(txId: Data, mode: ServiceMode) async throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {
-        guard mode == .direct, let client = ohttpClient else {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
             return try await super.fetchTransaction(txId: txId, mode: mode)
         }
 
@@ -175,10 +306,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         height: BlockHeight,
         mode: ServiceMode
     ) throws -> AsyncThrowingStream<UnspentTransactionOutputEntity, Error> {
-        guard mode == .direct, let client = ohttpClient else {
-            return try super.fetchUTXOs(for: tAddresses, height: height, mode: mode)
-        }
-
         guard !tAddresses.isEmpty else {
             return AsyncThrowingStream { continuation in continuation.finish() }
         }
@@ -186,6 +313,15 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: mode) else {
+                        // Fall back to parent implementation
+                        for try await utxo in try super.fetchUTXOs(for: tAddresses, height: height, mode: mode) {
+                            continuation.yield(utxo)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     var args = GetAddressUtxosArg()
                     args.addresses = tAddresses
                     args.startHeight = UInt64(height)
@@ -220,13 +356,18 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         endHeight: BlockHeight,
         mode: ServiceMode
     ) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
-        guard mode == .direct, let client = ohttpClient else {
-            return try super.blockStream(startHeight: startHeight, endHeight: endHeight, mode: mode)
-        }
-
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: mode) else {
+                        // Fall back to parent implementation
+                        for try await block in try super.blockStream(startHeight: startHeight, endHeight: endHeight, mode: mode) {
+                            continuation.yield(block)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     let blocks: [CompactBlock] = try await client.serverStreaming(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
                         request: BlockRange(startHeight: startHeight, endHeight: endHeight)
@@ -246,14 +387,19 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
 
     override func getMempoolStream() throws -> AsyncThrowingStream<RawTransaction, Error> {
         // Note: getMempoolStream doesn't take a mode parameter in the protocol
-        // For consistency, we use OHTTP if available
-        guard let client = ohttpClient else {
-            return try super.getMempoolStream()
-        }
-
+        // We default to .direct mode for backward compatibility
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: .direct) else {
+                        // Fall back to parent implementation
+                        for try await tx in try super.getMempoolStream() {
+                            continuation.yield(tx)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     let transactions: [RawTransaction] = try await client.serverStreaming(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
                         request: Empty()
@@ -272,13 +418,18 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {
-        guard mode == .direct, let client = ohttpClient else {
-            return try super.getSubtreeRoots(request, mode: mode)
-        }
-
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: mode) else {
+                        // Fall back to parent implementation
+                        for try await root in try super.getSubtreeRoots(request, mode: mode) {
+                            continuation.yield(root)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     let roots: [SubtreeRoot] = try await client.serverStreaming(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots",
                         request: request
@@ -297,7 +448,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func getTreeState(_ id: BlockID, mode: ServiceMode) async throws -> TreeState {
-        guard mode == .direct, let client = ohttpClient else {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
             return try await super.getTreeState(id, mode: mode)
         }
 
@@ -308,13 +459,18 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func getTaddressTransactions(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
-        guard mode == .direct, let client = ohttpClient else {
-            return try super.getTaddressTransactions(request, mode: mode)
-        }
-
         return AsyncThrowingStream { continuation in
             Task {
                 do {
+                    guard let client = try await self.ensureOHTTPClient(mode: mode) else {
+                        // Fall back to parent implementation
+                        for try await tx in try super.getTaddressTransactions(request, mode: mode) {
+                            continuation.yield(tx)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
                     let transactions: [RawTransaction] = try await client.serverStreaming(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
                         request: request

@@ -599,4 +599,67 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNotNil(traceId, "Trace ID should be present")
         XCTAssertEqual(traceId?.count, 64, "Trace ID should be truncated to exactly 64 chars")
     }
+
+    // MARK: - Tor Mode Tests
+
+    func testTorModeUsesCustomSenderForKeyConfigAndRelay() async throws {
+        var keyConfigRequestCaptured = false
+        var relayRequestCaptured = false
+        let validKeyConfig = makeValidKeyConfig()
+
+        let torSender: OHTTPTransport.HTTPSender = { request in
+            if request.httpMethod == "GET" {
+                keyConfigRequestCaptured = true
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                )!
+                return (validKeyConfig, response)
+            } else {
+                relayRequestCaptured = true
+                throw OHTTPError.transportError("test abort after relay POST")
+            }
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            httpSender: torSender
+        )
+
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+            XCTFail("Should have thrown")
+        } catch {
+            // Expected
+        }
+
+        XCTAssertTrue(keyConfigRequestCaptured, "Custom sender should be used for key config GET")
+        XCTAssertTrue(relayRequestCaptured, "Custom sender should be used for relay POST")
+    }
+
+    func testClearnetModeUsesDefaultSenderWhenNotProvided() async throws {
+        // This test verifies that when httpSender is not provided (uses default URLSession),
+        // it works as expected for clearnet. We can't easily test the actual URLSession call
+        // without mocking URLSession, so this is more of a smoke test that the default path compiles.
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs"
+        )
+
+        // The transport should be created successfully with default httpSender
+        XCTAssertNotNil(transport, "Transport should initialize with default httpSender")
+    }
 }
