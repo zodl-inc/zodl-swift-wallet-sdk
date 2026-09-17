@@ -417,6 +417,7 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func getMemos(for transaction: ZcashTransaction.Overview) async throws -> [Memo] { Self.unused() }
     func getRecipients(for transaction: ZcashTransaction.Overview) async -> [TransactionRecipient] { Self.unused() }
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output] { Self.unused() }
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] { Self.unused() }
     func allTransactions() async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func allTransactions(from transaction: ZcashTransaction.Overview, limit: Int) async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func latestHeight() async throws -> BlockHeight { Self.unused() }
@@ -465,6 +466,8 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func exchangeRateOverTor(enabled: Bool) async throws { Self.unused() }
     func isTorSuccessfullyInitialized() async -> Bool? { Self.unused() }
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
     func debugDatabase(sql: String) -> String { Self.unused() }
 
     func getSingleUseTransparentAddress(accountUUID: AccountUUID) async throws -> SingleUseTransparentAddress { Self.unused() }
@@ -604,6 +607,13 @@ private final class ClosureSynchronizerWithoutRestartSync: ClosureSynchronizer {
         completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
     ) { Self.unused() }
 
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    ) { Self.unused() }
+
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }
     func wipe() -> CompletablePublisher<Error> { Self.unused() }
     func rescanFrom(height: BlockHeight, completion: @escaping (Error?) -> Void) { Self.unused() }
@@ -721,6 +731,12 @@ private final class CombineSynchronizerWithoutRestartSync: CombineSynchronizer {
     func httpRequestOverTor(
         for request: URLRequest,
         retryLimit: UInt8
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> { Self.unused() }
+
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
     ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> { Self.unused() }
 
     func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }

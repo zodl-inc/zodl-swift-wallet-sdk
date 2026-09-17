@@ -665,6 +665,10 @@ public class SDKSynchronizer: Synchronizer {
         return (try? await transactionRepository.getTransactionOutputs(for: transaction.rawID)) ?? []
     }
 
+    public func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        return (try? await transactionRepository.getTransactionOutputs(for: transactions.map(\.rawID))) ?? [:]
+    }
+
     public func latestHeight() async throws -> BlockHeight {
         try await blockProcessor.latestHeight(mode: await sdkFlags.ifTor(.torInGroup("SDKSynchronizer.latestHeight")))
     }
@@ -1159,7 +1163,7 @@ public class SDKSynchronizer: Synchronizer {
         let isExchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
         // turn Tor on
-        if enabled && !isExchangeRateEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1175,7 +1179,7 @@ public class SDKSynchronizer: Synchronizer {
         let isTorEnabled = await sdkFlags.torEnabled
 
         // turn Tor on
-        if enabled && !isTorEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1232,6 +1236,38 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+    }
+
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.httpGetOverTor(for: request, retryLimit: retryLimit, context: context)
+        }
+    }
+
+    private func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        context: TorHTTPRequestContext
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try context.checkCancellation()
+        let torEnabled = await sdkFlags.torEnabled
+        let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+        guard torEnabled || exchangeRateEnabled else {
+            throw ZcashError.torNotEnabled
+        }
+
+        let torClient = initializer.container.resolve(TorClient.self)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
     }
 
     public func debugDatabase(sql: String) -> String {

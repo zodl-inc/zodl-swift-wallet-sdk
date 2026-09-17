@@ -435,6 +435,16 @@ public protocol Synchronizer: AnyObject {
     // sourcery: mockedName="getTransactionOutputsForTransaction"
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output]
 
+    /// The outputs of every transaction in `transactions`, keyed by `rawID`, read in one database
+    /// query per 500 transactions instead of one per transaction (MOB-1953). Every `v_tx_outputs`
+    /// query first materialises the wallet's whole notes union, so mapping a long history one row
+    /// at a time costs transactions × notes; this call costs a handful of queries. Output order
+    /// within a transaction is by pool and then output index, as with `getTransactionOutputs(for:)`.
+    /// A transaction without outputs has no entry. Answers `[:]` if the read fails, as the
+    /// single-transaction call answers `[]`.
+    // sourcery: mockedName="getTransactionOutputsForTransactions"
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]]
+
     /// Returns all transactions, most recent first.
     func allTransactions() async throws -> [ZcashTransaction.Overview]
 
@@ -647,6 +657,21 @@ public protocol Synchronizer: AnyObject {
     ///    - for: URLRequest
     ///    - retryLimit: How many times the request will be retried in case of failure
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
+
+    /// Makes an isolated GET under one positive timeout budget that starts before synchronizer actor
+    /// admission and includes later Tor actor admission, executor waiting, native retries, and response-body
+    /// collection. Cancellation or expiry before runtime ownership can complete while an actor remains busy;
+    /// later admission starts no native work. Once runtime ownership begins, cancellation waits for the
+    /// bounded operation and cleanup. At most two bounded GETs own executor slots across the process, with
+    /// each slot held through disposal. Cleanup, including final-owner runtime shutdown, can extend caller
+    /// completion beyond the HTTP timer.
+    /// Requires successful Tor enablement (a prepared runtime); throws torClientUnavailable otherwise.
+    /// Existing HTTP request APIs are unchanged. Custom conformers must implement this requirement.
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse)
 
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!
@@ -1577,6 +1602,23 @@ public extension Synchronizer {
     /// report that they know nothing about the transaction.
     func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
         nil
+    }
+
+    /// Default implementation so adding `getTransactionOutputs(for transactions:)` to the
+    /// protocol is not a source-breaking change for downstream conformers. It answers correctly
+    /// but slowly — one single-transaction read per transaction — so a conformer that can read
+    /// outputs in bulk overrides it, as both shipped synchronizers do. A transaction without
+    /// outputs has no entry; a transaction listed twice is read once.
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
+        var seen: Set<Data> = []
+        for transaction in transactions where seen.insert(transaction.rawID).inserted {
+            let outputs = await getTransactionOutputs(for: transaction)
+            if !outputs.isEmpty {
+                outputsByRawID[transaction.rawID] = outputs
+            }
+        }
+        return outputsByRawID
     }
 
     /// Default implementation so adding `getTreeState(height:)` to the protocol is

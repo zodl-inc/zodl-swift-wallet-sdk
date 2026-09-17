@@ -1,5 +1,4 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
 use anyhow::anyhow;
 use ff::PrimeField;
@@ -354,21 +353,6 @@ pub unsafe extern "C" fn zcashlc_voting_generate_note_witnesses(
     unwrap_exc_or_null(res)
 }
 
-// Keep PIR client construction at the SDK boundary so zcash_voting can accept
-// an injected transport. Today we use direct Hyper/Rustls. In the future this will be the
-// single place to add a Tor-backed transport based on SDK configuration.
-//
-// The layout comes from the round's resolved dynamic config and is passed through
-// unchanged: `connect_pir_blocking` performs the config/server layout handshake and
-// fails closed before any private query when the server disagrees.
-fn connect_pir_client(
-    pir_url: &str,
-    pir_layout: voting::config::PirLayout,
-) -> anyhow::Result<voting::PirClientBlocking> {
-    voting::connect_pir_blocking(pir_layout, pir_url, Arc::new(voting::HyperTransport::new()))
-        .map_err(|e| anyhow!("connect to PIR server failed: {}", e))
-}
-
 /// Precompute and cache delegation PIR IMT proofs for the delegation ZKP.
 ///
 /// `pir_depth`, `tier0_layers`, `tier1_layers`, and `poly_len` describe the round's
@@ -421,7 +405,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
             tier1_layers,
             poly_len,
         };
-        let pir_client = connect_pir_client(&pir_url, pir_layout)?;
+        let pir_client = handle.pir_client_for(&round_id_str, &pir_url, pir_layout)?;
 
         let result = handle
             .db
@@ -429,7 +413,7 @@ pub unsafe extern "C" fn zcashlc_voting_precompute_delegation_pir(
                 &round_id_str,
                 bundle_index,
                 &core_notes,
-                &pir_client,
+                pir_client.as_ref(),
                 handle.network,
             )
             .map_err(|e| anyhow!("precompute_delegation_pir failed: {}", e))?;
@@ -517,7 +501,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
             tier1_layers,
             poly_len,
         };
-        let pir_client = connect_pir_client(&pir_url, pir_layout)?;
+        let pir_client = handle.pir_client_for(&round_id_str, &pir_url, pir_layout)?;
 
         let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_secret, handle.network)
             .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
@@ -550,7 +534,7 @@ pub unsafe extern "C" fn zcashlc_voting_build_and_prove_delegation(
                 bundle_index,
                 &core_notes,
                 &keys,
-                &pir_client,
+                pir_client.as_ref(),
                 stages.as_ref(),
             )
             .map_err(|e| anyhow!("build_and_prove_delegation failed: {}", e))?;

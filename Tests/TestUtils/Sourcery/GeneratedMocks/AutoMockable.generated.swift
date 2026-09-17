@@ -2121,6 +2121,26 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForTransactionsCallsCount = 0
+    var getTransactionOutputsForTransactionsCalled: Bool {
+        return getTransactionOutputsForTransactionsCallsCount > 0
+    }
+    var getTransactionOutputsForTransactionsReceivedTransactions: [ZcashTransaction.Overview]?
+    var getTransactionOutputsForTransactionsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForTransactionsClosure: (([ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        getTransactionOutputsForTransactionsCallsCount += 1
+        getTransactionOutputsForTransactionsReceivedTransactions = transactions
+        if let closure = getTransactionOutputsForTransactionsClosure {
+            return await closure(transactions)
+        } else {
+            return getTransactionOutputsForTransactionsReturnValue
+        }
+    }
+
     // MARK: - allTransactions
 
     var allTransactionsThrowableError: Error?
@@ -2616,6 +2636,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(request, retryLimit)
         } else {
             return httpRequestOverTorForRetryLimitReturnValue
+        }
+    }
+
+    // MARK: - httpGetOverTor
+
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError: Error?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount = 0
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCalled: Bool {
+        return httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount > 0
+    }
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments: (request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64)?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue: (data: Data, response: HTTPURLResponse)!
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsClosure: ((URLRequest, UInt8, UInt64) async throws -> (data: Data, response: HTTPURLResponse))?
+
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+        if let error = httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError {
+            throw error
+        }
+        httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount += 1
+        httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments = (request: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        if let closure = httpGetOverTorForRetryLimitTimeoutMillisecondsClosure {
+            return try await closure(request, retryLimit, timeoutMilliseconds)
+        } else {
+            return httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue
         }
     }
 
@@ -4032,6 +4076,30 @@ class TransactionRepositoryMock: TransactionRepository {
             return try await closure(rawID)
         } else {
             return getTransactionOutputsForReturnValue
+        }
+    }
+
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForRawIDsThrowableError: Error?
+    var getTransactionOutputsForRawIDsCallsCount = 0
+    var getTransactionOutputsForRawIDsCalled: Bool {
+        return getTransactionOutputsForRawIDsCallsCount > 0
+    }
+    var getTransactionOutputsForRawIDsReceivedRawIDs: [Data]?
+    var getTransactionOutputsForRawIDsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForRawIDsClosure: (([Data]) async throws -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
+        if let error = getTransactionOutputsForRawIDsThrowableError {
+            throw error
+        }
+        getTransactionOutputsForRawIDsCallsCount += 1
+        getTransactionOutputsForRawIDsReceivedRawIDs = rawIDs
+        if let closure = getTransactionOutputsForRawIDsClosure {
+            return try await closure(rawIDs)
+        } else {
+            return getTransactionOutputsForRawIDsReturnValue
         }
     }
 

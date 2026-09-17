@@ -1,5 +1,48 @@
 # Migrating from previous versions to _Unreleased_
 
+## Bounded Tor GET requests
+
+After successful Tor enablement, use
+`httpGetOverTor(for:retryLimit:timeoutMilliseconds:)` for GET requests that need one
+positive timeout. The original budget starts before synchronizer and Tor actor
+admission and includes executor waiting, native retries, and response-body collection.
+Set `retryLimit: 0` to disable retries. A missing prepared runtime throws
+`torClientUnavailable`; this method does not bootstrap Tor.
+
+Cancellation or expiry before the request acquires runtime ownership can complete
+while a synchronizer or Tor actor remains busy. If admission occurs later, it observes
+the same original cancellation or deadline and performs no HTTP work. Once runtime
+ownership begins, cancellation waits for the bounded native operation and safe cleanup.
+All clients share a limit of two active bounded GETs, and a slot remains occupied until
+disposal finishes. Cleanup, including shutdown when the request is the runtime's final
+owner, can extend caller completion beyond the HTTP timer.
+
+`httpRequestOverTor(for:retryLimit:)` and its existing GET/POST behavior remain
+available unchanged. The admission and cleanup hardening adds no further public
+signature changes.
+
+Custom `Synchronizer` conformers and test doubles must add:
+
+```swift
+func httpGetOverTor(
+    for request: URLRequest,
+    retryLimit: UInt8,
+    timeoutMilliseconds: UInt64
+) async throws -> (data: Data, response: HTTPURLResponse)
+```
+
+Custom `ClosureSynchronizer` conformers add the same three arguments followed by
+`completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void`.
+Custom `CombineSynchronizer` conformers return
+`SinglePublisher<(data: Data, response: HTTPURLResponse), Error>` instead of using
+`async throws`. The SDK's `ClosureSDKSynchronizer` and `CombineSDKSynchronizer` already
+forward these requests to their underlying async synchronizer. The closure adapter
+exposes no cancellation handle. The inherited Combine gateway does not propagate
+subscriber cancellation to its underlying async task, so cancelling a subscription is
+not guaranteed to cancel or stop the request. There is no unbounded fallback
+implementation. Direct `TorClient` users can call
+`httpGet(for:retryLimit:timeoutMilliseconds:)` on a prepared client.
+
 ## `ZIP318Kind` gained a case — `canonicalCrossingPayment`
 
 `ZcashTransaction.Overview.ZIP318Kind`, the type of `zip318Kind`, has a fifth case,
@@ -153,6 +196,27 @@ is bound to the value, and 3.0 clients verify the advertised degree at connect.
 Helper-server payloads returned by `recoverWireJson(...)` now include `vote_round_id`
 (lowercase hex). Remove any app-side injection of that field; the payload remains verbatim wire
 JSON — do not decode, re-shape or re-encode it.
+
+## Voting rides `zcash_voting` 4.0.0-rc.1 — 50 proposals, upgraded chains only
+
+Rounds may now carry proposal ids 1 to 50 (previously 1 to 15), and a round's proposal count
+follows the same range. Host-side validation that mirrored the old 1 to 15 limit must accept the
+wider range, or it will reject proposals a 4.0 wallet would otherwise accept.
+
+A wallet built on `zcash_voting` 4.0 votes only on chains that have upgraded to the
+voting-circuits 0.12.0 delegation circuit, and a 3.x build stops working on a round once its chain
+makes that upgrade. Ship this SDK version together with the chain upgrade, not ahead of it, or
+users still on the old build lose the ability to vote until they update.
+
+`buildAndProveDelegation(intent:)` is additive: the default `.interactive` behaves exactly as
+before, so existing call sites keep compiling and behaving unchanged. A host that prepares a proof
+before the user reaches Confirm should pass `.speculative`, which runs the proof at utility
+priority without the pool-wide boost, and call `withInteractiveProvingBoost` around its later wait
+once the user does ask, to raise the pool back up for that wait. Swift escalates an awaited task
+to its awaiter's priority, so a host that wants the speculative proof to actually run at utility
+QoS must await it only from a task that is itself utility priority or lower. The pool-wide boost
+is a separate matter: `.speculative` never takes it, whatever the awaiter's priority, so a
+higher-priority awaiter only raises that one task's QoS and nothing else.
 
 ## Voting wire payloads are produced by `zcash_voting`, not by the SDK
 
