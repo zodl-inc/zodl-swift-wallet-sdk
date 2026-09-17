@@ -313,6 +313,17 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.httpGetOverTor(for: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        }
+    }
+
     public var broadcaster: Broadcaster { synchronizer.broadcaster }
 
     /*

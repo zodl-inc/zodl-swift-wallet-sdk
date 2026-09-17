@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "4.4.0"
+version = "4.5.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -106,7 +106,7 @@ xz2 = { version = "0.1", features = ["static"] }
 # Coinholder voting core. 4.0.x keeps the 3.0 API and adds the 50-proposal circuit
 # (voting-circuits 0.12.0) that the upgraded vote chains verify; 3.x proofs are
 # rejected there. Move to `=4.0.0` when the final 4.0.0 release is published.
-zcash_voting = { version = "=4.0.0-rc.1" }
+zcash_voting = { version = "=4.0.0-rc.2" }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
@@ -129,7 +129,10 @@ base64 = "0.22"
 hex = "0.4"
 
 [dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
+tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 
 [build-dependencies]
 bindgen = "0.72"
@@ -179,4 +182,3 @@ lto = true
 #zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-

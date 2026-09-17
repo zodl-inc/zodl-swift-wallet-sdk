@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_tor_http_get_with_timeout` adds an HTTP GET entry point whose trailing positive
+  `timeout_ms` bounds the complete Tor operation, including connection setup, retries, and response
+  body collection. It otherwise accepts the same arguments and returns the same response as
+  `zcashlc_tor_http_get`; expiry or an invalid zero timeout returns null with the thread-local error
+  set. Existing GET and POST call sites require no changes.
 - `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
   was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
   `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no
@@ -468,6 +473,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependency `zcash_voting` moves from 3.0.0 to 4.0.0-rc.1 (voting-circuits 0.12.0), which raises
   the crate's `rust-version` to 1.91. The 4.0 line keeps the 3.0 API: proposal ids widen to 1 to
   50, and the crate now writes its sidecar under immediate SQLite transactions. No FFI change.
+- `zcashlc_voting_precompute_delegation_pir` and `zcashlc_voting_build_and_prove_delegation` reuse
+  one PIR client per `VotingDatabaseHandle`, keyed by endpoint URL, layout, and the persisted round
+  snapshot root. A client's actual circuit root must match the stored round before it is cached or
+  reused; a different round snapshot reconnects.
 
 ### Removed
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
@@ -496,6 +505,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+- `zcashlc_voting_commit_vote` uses `zcash_voting` 4.0.0-rc.2 to wait for a competing
+  database writer before storing a vote. Existing FFI signatures are unchanged.
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously
   omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood

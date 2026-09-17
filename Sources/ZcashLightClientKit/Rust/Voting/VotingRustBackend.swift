@@ -33,6 +33,49 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
     }
 }
 
+private struct PirEndpointContext: Equatable, Sendable {
+    let identityGeneration: UInt64
+    let roundId: String
+    let expectedSnapshotHeight: BlockHeight
+    let pirLayout: VotingPirLayout
+    let endpoints: [String]
+}
+
+private struct PirEndpointPreference: Sendable {
+    let context: PirEndpointContext
+    let url: String
+}
+
+private final class PirEndpointResolution: @unchecked Sendable {
+    let id: UInt64
+    let context: PirEndpointContext
+    let task: Task<String, Error>
+    // Guarded by the owning backend's `lock`.
+    var activeWaiterCount: Int
+
+    init(
+        id: UInt64,
+        context: PirEndpointContext,
+        task: Task<String, Error>,
+        activeWaiterCount: Int
+    ) {
+        self.id = id
+        self.context = context
+        self.task = task
+        self.activeWaiterCount = activeWaiterCount
+    }
+}
+
+private struct PirEndpointResolutionWaiter: Sendable {
+    let resolution: PirEndpointResolution
+    let joinedExistingResolution: Bool
+}
+
+private struct PirEndpointLease: Sendable {
+    let context: PirEndpointContext
+    let url: String
+}
+
 // MARK: - VotingRustBackend
 
 /// Wraps the voting `libzcashlc` C FFI surface.
@@ -47,6 +90,11 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
+    private var walletId: String?
+    private var identityGeneration: UInt64 = 0
+    private var preferredPirEndpoint: PirEndpointPreference?
+    private var pirResolution: PirEndpointResolution?
+    private var nextPirResolutionId: UInt64 = 0
 
     public init() {}
 
@@ -86,6 +134,8 @@ public final class VotingRustBackend: @unchecked Sendable {
             )
         }
         handle = ptr
+        walletId = nil
+        invalidatePirIdentityLocked()
     }
 
     /// Close the voting database, freeing the underlying handle.
@@ -98,6 +148,8 @@ public final class VotingRustBackend: @unchecked Sendable {
         if let dbh = handle {
             zcashlc_voting_db_free(dbh)
             handle = nil
+            walletId = nil
+            invalidatePirIdentityLocked()
         }
     }
 }
@@ -118,6 +170,10 @@ extension VotingRustBackend {
 
             guard result == 0 else {
                 throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`set_wallet_id` failed"))
+            }
+            if self.walletId != walletId {
+                self.walletId = walletId
+                invalidatePirIdentityLocked()
             }
         }
     }
@@ -148,49 +204,103 @@ extension VotingRustBackend {
         pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver()
     ) async throws -> VotingDelegationPirPrecomputeResult {
-        try requireOpenDatabase()
-
-        // PirSnapshotResolver expects `BlockHeight` (Int); voting snapshot
-        // heights are `UInt64` everywhere else in the voting types, so convert
-        // at the boundary. Snapshot heights well within Int.max in practice.
-        let pirServerUrl = try await pirResolver.resolve(
-            endpoints: pirEndpoints,
-            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
+        try await precomputeDelegationPir(
+            roundId: roundId,
+            bundleIndex: bundleIndex,
+            notes: notes,
+            pirEndpoints: pirEndpoints,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            pirResolver: pirResolver,
+            precomputeEntry: { [self] dbh, entryRoundId, entryBundleIndex, entryNotes, url, layout in
+                try syncPrecomputeDelegationPir(
+                    handle: dbh,
+                    roundId: entryRoundId,
+                    bundleIndex: entryBundleIndex,
+                    notes: entryNotes,
+                    pirServerUrl: url,
+                    pirLayout: layout
+                )
+            }
         )
+    }
 
+    /// Test seam for the method above. `precomputeEntry` replaces only the synchronous native
+    /// entry point, while endpoint selection and lifecycle fencing remain production code.
+    // swiftlint:disable:next function_parameter_count
+    func precomputeDelegationPir(
+        roundId: String,
+        bundleIndex: UInt32,
+        notes: [VotingNoteInfo],
+        pirEndpoints: [String],
+        expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout = .unknown,
+        pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
+        precomputeEntry: @escaping @Sendable (
+            OpaquePointer,
+            String,
+            UInt32,
+            [VotingNoteInfo],
+            String,
+            VotingPirLayout
+        ) throws -> VotingDelegationPirPrecomputeResult
+    ) async throws -> VotingDelegationPirPrecomputeResult {
+        let snapshotHeight = BlockHeight(expectedSnapshotHeight)
+        let lease = try await resolvePirEndpoint(
+            roundId: roundId,
+            endpoints: pirEndpoints,
+            expectedSnapshotHeight: snapshotHeight,
+            pirLayout: pirLayout,
+            resolver: pirResolver
+        )
+        try Task.checkCancellation()
+
+        return try withHandle(expectedIdentityGeneration: lease.context.identityGeneration) { dbh in
+            try precomputeEntry(dbh, roundId, bundleIndex, notes, lease.url, pirLayout)
+        }
+    }
+}
+
+private extension VotingRustBackend {
+    // swiftlint:disable:next function_parameter_count
+    func syncPrecomputeDelegationPir(
+        handle: OpaquePointer,
+        roundId: String,
+        bundleIndex: UInt32,
+        notes: [VotingNoteInfo],
+        pirServerUrl: String,
+        pirLayout: VotingPirLayout
+    ) throws -> VotingDelegationPirPrecomputeResult {
         let roundIdBytes = [UInt8](roundId.utf8)
         let notesJson = try JSONEncoder().encode(notes)
         let notesBytes = [UInt8](notesJson)
         let urlBytes = [UInt8](pirServerUrl.utf8)
 
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    urlBytes.withUnsafeBufferPointer { urlBuf in
-                        zcashlc_voting_precompute_delegation_pir(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            bundleIndex,
-                            notesBuf.baseAddress,
-                            UInt(notesBuf.count),
-                            urlBuf.baseAddress,
-                            UInt(urlBuf.count),
-                            pirLayout.pirDepth,
-                            pirLayout.tier0Layers,
-                            pirLayout.tier1Layers,
-                            pirLayout.polyLen
-                        )
-                    }
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
+            notesBytes.withUnsafeBufferPointer { notesBuf in
+                urlBytes.withUnsafeBufferPointer { urlBuf in
+                    zcashlc_voting_precompute_delegation_pir(
+                        handle,
+                        ridBuf.baseAddress,
+                        UInt(ridBuf.count),
+                        bundleIndex,
+                        notesBuf.baseAddress,
+                        UInt(notesBuf.count),
+                        urlBuf.baseAddress,
+                        UInt(urlBuf.count),
+                        pirLayout.pirDepth,
+                        pirLayout.tier0Layers,
+                        pirLayout.tier1Layers,
+                        pirLayout.polyLen
+                    )
                 }
             }
+        }
 
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`precompute_delegation_pir` failed")
-                )
-            }
-            return ptr
+        guard let ptr else {
+            throw VotingRustBackendError.rustError(
+                lastErrorMessage(fallback: "`precompute_delegation_pir` failed")
+            )
         }
         defer { zcashlc_free_boxed_slice(ptr) }
         return try decodeJSON(from: ptr)
@@ -2048,8 +2158,9 @@ extension VotingRustBackend {
             // A closure literal, not the bare `syncBuildAndProveDelegation` method reference: a
             // bound instance-method value is not inferred `@Sendable` even though `self` is
             // `@unchecked Sendable`, which would otherwise warn on every call.
-            proveEntry: { [self] proveParams, url, layout, proveProgress in
+            nativeProveEntry: { [self] dbh, proveParams, url, layout, proveProgress in
                 try syncBuildAndProveDelegation(
+                    handle: dbh,
                     proveParams,
                     pirServerUrl: url,
                     pirLayout: layout,
@@ -2077,7 +2188,47 @@ extension VotingRustBackend {
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         intent: VotingProvingIntent = .interactive,
         progress: (@Sendable (Double) -> Void)? = nil,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeResolutionDisposition: @escaping @Sendable () async -> Void = {},
+        beforeNativeEntry: @escaping @Sendable () async -> Void = {},
         proveEntry: @escaping @Sendable (
+            VotingDelegationProofParams,
+            String,
+            VotingPirLayout,
+            (@Sendable (Double) -> Void)?
+        ) throws -> VotingDelegationProofResult
+    ) async throws -> VotingDelegationProofResult {
+        try await buildAndProveDelegation(
+            params,
+            pirEndpoints: pirEndpoints,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            pirResolver: pirResolver,
+            intent: intent,
+            progress: progress,
+            resolutionAcquired: resolutionAcquired,
+            beforeResolutionDisposition: beforeResolutionDisposition,
+            beforeNativeEntry: beforeNativeEntry,
+            nativeProveEntry: { _, entryParams, url, layout, entryProgress in
+                try proveEntry(entryParams, url, layout, entryProgress)
+            }
+        )
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    func buildAndProveDelegation(
+        _ params: VotingDelegationProofParams,
+        pirEndpoints: [String],
+        expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout,
+        pirResolver: PirSnapshotResolver,
+        intent: VotingProvingIntent,
+        progress: (@Sendable (Double) -> Void)?,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeResolutionDisposition: @escaping @Sendable () async -> Void = {},
+        beforeNativeEntry: @escaping @Sendable () async -> Void = {},
+        nativeProveEntry: @escaping @Sendable (
+            OpaquePointer,
             VotingDelegationProofParams,
             String,
             VotingPirLayout,
@@ -2092,14 +2243,21 @@ extension VotingRustBackend {
             )
         }
 
-        let pirServerUrl = try await pirResolver.resolve(
+        let lease = try await resolvePirEndpoint(
+            roundId: params.roundId,
             endpoints: pirEndpoints,
-            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
+            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight),
+            pirLayout: pirLayout,
+            resolver: pirResolver,
+            resolutionAcquired: resolutionAcquired,
+            beforeDisposition: beforeResolutionDisposition
         )
 
         // `resolve` above already refuses to return a match once cancelled, but a cancellation
         // that lands in the instant between `resolve` returning and this check still needs to be
         // caught here, before the detached proving call below can be scheduled at all.
+        try Task.checkCancellation()
+        await beforeNativeEntry()
         try Task.checkCancellation()
 
         let cancellationFlag = CancellationFlag()
@@ -2118,18 +2276,22 @@ extension VotingRustBackend {
             case .interactive:
                 return try await Self.withInteractiveProvingBoost {
                     try await Task.detached(priority: .userInitiated) {
-                        if cancellationFlag.isCancelled {
-                            throw CancellationError()
+                        try self.withHandle(
+                            expectedIdentityGeneration: lease.context.identityGeneration,
+                            cancellationFlag: cancellationFlag
+                        ) { dbh in
+                            try nativeProveEntry(dbh, params, lease.url, pirLayout, progress)
                         }
-                        return try proveEntry(params, pirServerUrl, pirLayout, progress)
                     }.value
                 }
             case .speculative:
                 return try await Task.detached(priority: .utility) {
-                    if cancellationFlag.isCancelled {
-                        throw CancellationError()
+                    try self.withHandle(
+                        expectedIdentityGeneration: lease.context.identityGeneration,
+                        cancellationFlag: cancellationFlag
+                    ) { dbh in
+                        try nativeProveEntry(dbh, params, lease.url, pirLayout, progress)
                     }
-                    return try proveEntry(params, pirServerUrl, pirLayout, progress)
                 }.value
             }
         } onCancel: {
@@ -2203,6 +2365,147 @@ extension VotingRustBackend {
 // MARK: - Private helpers
 
 private extension VotingRustBackend {
+    func resolvePirEndpoint(
+        roundId: String,
+        endpoints: [String],
+        expectedSnapshotHeight: BlockHeight,
+        pirLayout: VotingPirLayout,
+        resolver: PirSnapshotResolver,
+        resolutionAcquired: @escaping @Sendable (Bool) async -> Void = { _ in },
+        beforeDisposition: @escaping @Sendable () async -> Void = {}
+    ) async throws -> PirEndpointLease {
+        let waiter = try beginPirResolution(
+            roundId: roundId,
+            endpoints: endpoints,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            resolver: resolver
+        )
+        let resolution = waiter.resolution
+        await resolutionAcquired(waiter.joinedExistingResolution)
+
+        let selectedURL: String
+        do {
+            selectedURL = try await resolution.task.value
+        } catch let resolutionError {
+            await beforeDisposition()
+            finishPirResolution(resolution, clearPreference: true)
+            // Retire the completed shared work before reporting this waiter's cancellation. Any
+            // callers that already joined retain the task value through their local resolution.
+            try Task.checkCancellation()
+            throw resolutionError
+        }
+
+        await beforeDisposition()
+        let lease = try commitPirResolution(resolution, selectedURL: selectedURL)
+        try Task.checkCancellation()
+        return lease
+    }
+
+    func beginPirResolution(
+        roundId: String,
+        endpoints: [String],
+        expectedSnapshotHeight: BlockHeight,
+        pirLayout: VotingPirLayout,
+        resolver: PirSnapshotResolver
+    ) throws -> PirEndpointResolutionWaiter {
+        lock.lock()
+        defer { lock.unlock() }
+        guard handle != nil else {
+            throw VotingRustBackendError.databaseNotOpen
+        }
+        let context = PirEndpointContext(
+            identityGeneration: identityGeneration,
+            roundId: roundId,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            endpoints: endpoints
+        )
+        if let current = pirResolution, current.context == context {
+            current.activeWaiterCount += 1
+            return PirEndpointResolutionWaiter(
+                resolution: current,
+                joinedExistingResolution: true
+            )
+        }
+        let preferredEndpoint = preferredPirEndpoint.flatMap { preference in
+            preference.context == context ? preference.url : nil
+        }
+        nextPirResolutionId &+= 1
+        let id = nextPirResolutionId
+        let task = Task {
+            try await resolver.resolve(
+                endpoints: endpoints,
+                expectedSnapshotHeight: expectedSnapshotHeight,
+                preferredEndpoint: preferredEndpoint
+            )
+        }
+        let resolution = PirEndpointResolution(
+            id: id,
+            context: context,
+            task: task,
+            activeWaiterCount: 1
+        )
+        pirResolution = resolution
+        return PirEndpointResolutionWaiter(
+            resolution: resolution,
+            joinedExistingResolution: false
+        )
+    }
+
+    func commitPirResolution(
+        _ resolution: PirEndpointResolution,
+        selectedURL: String
+    ) throws -> PirEndpointLease {
+        lock.lock()
+        defer { lock.unlock() }
+        let callerCancelled = Task.isCancelled
+        releasePirResolutionWaiterLocked(
+            resolution,
+            keepForRemainingWaiters: callerCancelled
+        )
+        guard handle != nil,
+              identityGeneration == resolution.context.identityGeneration else {
+            throw CancellationError()
+        }
+        if !callerCancelled, resolution.id == nextPirResolutionId {
+            preferredPirEndpoint = PirEndpointPreference(context: resolution.context, url: selectedURL)
+        }
+        return PirEndpointLease(context: resolution.context, url: selectedURL)
+    }
+
+    func finishPirResolution(_ resolution: PirEndpointResolution, clearPreference: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        releasePirResolutionWaiterLocked(resolution, keepForRemainingWaiters: false)
+        if clearPreference,
+           resolution.id == nextPirResolutionId,
+           preferredPirEndpoint?.context == resolution.context {
+            preferredPirEndpoint = nil
+        }
+    }
+
+    func releasePirResolutionWaiterLocked(
+        _ resolution: PirEndpointResolution,
+        keepForRemainingWaiters: Bool
+    ) {
+        precondition(resolution.activeWaiterCount > 0)
+        resolution.activeWaiterCount -= 1
+        // A cancelled successful waiter has not established a preference, so retain the completed
+        // task while joined callers remain. A noncancelled success commits its preference under
+        // this lock, and a failure has no winner to preserve, so those outcomes can retire now.
+        if pirResolution?.id == resolution.id,
+           !keepForRemainingWaiters || resolution.activeWaiterCount == 0 {
+            pirResolution = nil
+        }
+    }
+
+    func invalidatePirIdentityLocked() {
+        identityGeneration &+= 1
+        preferredPirEndpoint = nil
+        pirResolution = nil
+    }
+
     /// Runs a database-bound operation while holding the handle lock. Keeping
     /// the lock through the FFI call prevents `close()` from freeing the handle
     /// before Rust is done using it.
@@ -2211,6 +2514,25 @@ private extension VotingRustBackend {
         defer { lock.unlock() }
         guard let dbh = handle else {
             throw VotingRustBackendError.databaseNotOpen
+        }
+        return try operation(dbh)
+    }
+
+    /// Enters native work only while the handle identity still matches the one captured before
+    /// endpoint resolution. The lifecycle and cancellation checks share the handle lock with the
+    /// FFI call, so `close()` and `setWalletId(_:)` cannot replace its identity in between.
+    func withHandle<T>(
+        expectedIdentityGeneration: UInt64,
+        cancellationFlag: CancellationFlag? = nil,
+        _ operation: (OpaquePointer) throws -> T
+    ) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let dbh = handle, identityGeneration == expectedIdentityGeneration else {
+            throw CancellationError()
+        }
+        guard !Task.isCancelled, cancellationFlag?.isCancelled != true else {
+            throw CancellationError()
         }
         return try operation(dbh)
     }
@@ -2372,6 +2694,7 @@ private extension VotingRustBackend {
     /// inside `Task.detached` so the calling actor is not blocked for the
     /// duration of proving (potentially minutes).
     func syncBuildAndProveDelegation(
+        handle: OpaquePointer,
         _ params: VotingDelegationProofParams,
         pirServerUrl: String,
         pirLayout: VotingPirLayout,
@@ -2393,52 +2716,49 @@ private extension VotingRustBackend {
         }
         let trampoline: VotingProgressCallback? = progressBox == nil ? nil : votingProgressCallbackTrampoline
 
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    keys.fvk.withUnsafeBufferPointer { fvkBuf in
-                        keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                            keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                                roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                    urlBytes.withUnsafeBufferPointer { urlBuf in
-                                        zcashlc_voting_build_and_prove_delegation(
-                                            dbh,
-                                            ridBuf.baseAddress,
-                                            UInt(ridBuf.count),
-                                            params.bundleIndex,
-                                            notesBuf.baseAddress,
-                                            UInt(notesBuf.count),
-                                            fvkBuf.baseAddress,
-                                            UInt(fvkBuf.count),
-                                            secretBuf.baseAddress,
-                                            UInt(secretBuf.count),
-                                            fpBuf.baseAddress,
-                                            UInt(fpBuf.count),
-                                            keys.accountIndex,
-                                            nameBuf.baseAddress,
-                                            UInt(nameBuf.count),
-                                            urlBuf.baseAddress,
-                                            UInt(urlBuf.count),
-                                            pirLayout.pirDepth,
-                                            pirLayout.tier0Layers,
-                                            pirLayout.tier1Layers,
-                                            pirLayout.polyLen,
-                                            trampoline,
-                                            progressContext
-                                        )
-                                    }
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
+            notesBytes.withUnsafeBufferPointer { notesBuf in
+                keys.fvk.withUnsafeBufferPointer { fvkBuf in
+                    keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
+                        keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
+                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
+                                urlBytes.withUnsafeBufferPointer { urlBuf in
+                                    zcashlc_voting_build_and_prove_delegation(
+                                        handle,
+                                        ridBuf.baseAddress,
+                                        UInt(ridBuf.count),
+                                        params.bundleIndex,
+                                        notesBuf.baseAddress,
+                                        UInt(notesBuf.count),
+                                        fvkBuf.baseAddress,
+                                        UInt(fvkBuf.count),
+                                        secretBuf.baseAddress,
+                                        UInt(secretBuf.count),
+                                        fpBuf.baseAddress,
+                                        UInt(fpBuf.count),
+                                        keys.accountIndex,
+                                        nameBuf.baseAddress,
+                                        UInt(nameBuf.count),
+                                        urlBuf.baseAddress,
+                                        UInt(urlBuf.count),
+                                        pirLayout.pirDepth,
+                                        pirLayout.tier0Layers,
+                                        pirLayout.tier1Layers,
+                                        pirLayout.polyLen,
+                                        trampoline,
+                                        progressContext
+                                    )
                                 }
                             }
                         }
                     }
                 }
             }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`build_and_prove_delegation` failed")
-                )
-            }
-            return ptr
+        }
+        guard let ptr else {
+            throw VotingRustBackendError.rustError(
+                lastErrorMessage(fallback: "`build_and_prove_delegation` failed")
+            )
         }
         defer { zcashlc_free_boxed_slice(ptr) }
         return try decodeJSON(from: ptr)

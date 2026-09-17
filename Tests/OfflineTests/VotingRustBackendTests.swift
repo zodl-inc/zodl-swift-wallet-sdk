@@ -1625,16 +1625,24 @@ final class VotingRustBackendTests: XCTestCase {
     /// Pins that the `.unknown` sentinel layout (`polyLen` 0) fails closed
     /// inside `zcash_voting` at the FFI boundary: the crate rejects the layout
     /// locally, before issuing any network request. The probe stub satisfies
-    /// snapshot resolution offline, so the failure can only be the layout
-    /// rejection, not a resolver or transport error.
+    /// snapshot resolution offline, while the persisted round satisfies the
+    /// snapshot-safe cache precondition, so the failure can only be the layout
+    /// rejection, not a resolver, storage, or transport error.
     func test_precomputeDelegationPir_unknownLayout_failsClosedThroughFFI() async throws {
-        let backend = VotingRustBackend()
-        try backend.open(path: makeTempDbPath(), networkId: roundTripNetworkId)
+        let roundId = hexRoundId(0x11)
+        let backend = try makeReadyBackend()
         defer { backend.close() }
+        try backend.initRound(
+            roundId: roundId,
+            snapshotHeight: 0,
+            eaPublicKey: roundTripRoundParameter,
+            ncRoot: roundTripRoundParameter,
+            nullifierImtRoot: roundTripRoundParameter
+        )
 
         do {
             _ = try await backend.precomputeDelegationPir(
-                roundId: hexRoundId(0x11),
+                roundId: roundId,
                 bundleIndex: 0,
                 notes: [],
                 pirEndpoints: ["https://stub"],
