@@ -320,7 +320,7 @@ final class OHTTPE2ETests: ZcashTestCase {
             isTorEnabled: tor,
             isExchangeRateEnabled: false
         )
-        let synchronizer = SDKSynchronizer(initializer: initializer)
+        let synchronizer = SlipstreamSynchronizer(initializer: initializer)
         defer { synchronizer.stop() }
 
         let result = try await synchronizer.prepare(with: [UInt8](seed), walletBirthday: Env.birthday, name: "ohttp-e2e", keySource: nil)
@@ -452,7 +452,7 @@ final class OHTTPE2ETests: ZcashTestCase {
                 isTorEnabled: true,
                 isExchangeRateEnabled: false
             )
-            let sync = SDKSynchronizer(initializer: initializer)
+            let sync = SlipstreamSynchronizer(initializer: initializer)
             let result = try await sync.prepare(with: [UInt8](seed), walletBirthday: Env.birthday, name: "external-apis", keySource: nil)
             guard case .success = result else {
                 throw XCTSkip("prepare() failed for Tor+OHTTP test")
