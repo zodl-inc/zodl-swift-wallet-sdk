@@ -1821,6 +1821,5 @@ pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(prefix: *
         c_str.to_str().ok().map(|s| s.to_string())
     };
 
-    #[cfg(feature = "slipstream")]
     zodl_slipstream::ohttp::set_default_client_trace_prefix(prefix_opt);
 }
