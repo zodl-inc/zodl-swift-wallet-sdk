@@ -270,7 +270,7 @@ impl TorConn {
             relay,
             "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
-        let connector = OhttpConnector::with_dialer(&endpoint.host, relay, Dialer::Tor(client))
+        let connector = OhttpConnector::with_dialer(&endpoint.host, relay, Dialer::Tor(client), None)
             .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
         connector
             .warm_up()

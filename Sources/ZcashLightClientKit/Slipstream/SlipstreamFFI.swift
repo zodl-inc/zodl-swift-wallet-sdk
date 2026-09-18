@@ -109,6 +109,19 @@ public struct SlipstreamSnapshot {
     }
 }
 
+/// Sets the default OHTTP client trace prefix for all Rust engine connections (process-wide).
+/// This MUST be called before the engine starts the first time. If the prefix is nil,
+/// trace headers are disabled. Debug only — never set in release builds (see OHTTPEndpoints docs).
+public func setDefaultOhttpClientTracePrefix(_ prefix: String?) {
+    if let prefix = prefix {
+        prefix.withCString { ptr in
+            zcashlc_set_default_ohttp_client_trace_prefix(ptr)
+        }
+    } else {
+        zcashlc_set_default_ohttp_client_trace_prefix(nil)
+    }
+}
+
 /// Swift-friendly wrapper around `FfiSlipstreamEvent`.
 /// Event tags: 1 = SyncStarted, 2 = SyncProgress, 3 = SyncDone, 4 = SyncError, 5 = FoundTransactions.
 public struct SlipstreamEngineEvent {

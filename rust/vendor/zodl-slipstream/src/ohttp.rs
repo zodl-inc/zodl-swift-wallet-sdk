@@ -34,6 +34,7 @@ use std::{
     io::Cursor,
     pin::Pin,
     sync::Arc,
+    sync::OnceLock,
     task::{Context, Poll},
     time::Duration,
 };
@@ -86,6 +87,22 @@ const USER_AGENT: &str = "zodl-slipstream-ohttp/0.1";
 
 /// Hostname prefix that marks an endpoint as an OHTTP gateway (mirrors the Kotlin SDK).
 pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
+
+/// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
+static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
+
+/// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
+/// Called from JNI when TorRuntime is created.
+pub fn set_default_client_trace_prefix(prefix: Option<String>) {
+    let _ = DEFAULT_CLIENT_TRACE_PREFIX.set(prefix);
+}
+
+/// Get the default client trace prefix.
+fn get_default_client_trace_prefix() -> Option<String> {
+    DEFAULT_CLIENT_TRACE_PREFIX
+        .get()
+        .and_then(|opt| opt.clone())
+}
 
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
@@ -175,13 +192,28 @@ pub struct OhttpConnector {
 impl OhttpConnector {
     /// Direct dialer: the relay sees the device IP.
     pub fn new(gateway_host: &str, relay_url: &str) -> Result<Self, String> {
-        Self::with_dialer(gateway_host, relay_url, Dialer::Direct)
+        Self::with_dialer(
+            gateway_host,
+            relay_url,
+            Dialer::Direct,
+            get_default_client_trace_prefix(),
+        )
     }
 
     /// Connector whose TCP legs (relay POSTs and the gateway key fetch) go through `dialer`.
-    pub fn with_dialer(gateway_host: &str, relay_url: &str, dialer: Dialer) -> Result<Self, String> {
+    pub fn with_dialer(
+        gateway_host: &str,
+        relay_url: &str,
+        dialer: Dialer,
+        client_trace_prefix: Option<String>,
+    ) -> Result<Self, String> {
         Ok(Self {
-            client: Arc::new(OhttpClient::new(gateway_host, relay_url, dialer)?),
+            client: Arc::new(OhttpClient::new(
+                gateway_host,
+                relay_url,
+                dialer,
+                client_trace_prefix.or_else(get_default_client_trace_prefix),
+            )?),
         })
     }
 
@@ -387,6 +419,8 @@ struct OhttpClient {
     /// stack, a reliable way to crash qemu under connection churn. Over Tor this matters even
     /// more: every new connection would be a new circuit build.
     h2_pool: Mutex<HashMap<String, http2::SendRequest<Full<Bytes>>>>,
+    /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
+    client_trace: Option<client_trace::ClientTrace>,
 }
 
 fn forward_header(name: &HeaderName) -> bool {
@@ -395,7 +429,12 @@ fn forward_header(name: &HeaderName) -> bool {
 }
 
 impl OhttpClient {
-    fn new(gateway_host: &str, relay_url: &str, dialer: Dialer) -> Result<Self, String> {
+    fn new(
+        gateway_host: &str,
+        relay_url: &str,
+        dialer: Dialer,
+        client_trace_prefix: Option<String>,
+    ) -> Result<Self, String> {
         let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -413,6 +452,7 @@ impl OhttpClient {
             tls: Arc::new(tls),
             dialer,
             h2_pool: Mutex::new(HashMap::new()),
+            client_trace: client_trace_prefix.map(|p| client_trace::ClientTrace::new(&p)),
         })
     }
 
@@ -484,6 +524,12 @@ impl OhttpClient {
             .header(header::ACCEPT_ENCODING, "identity");
         if let Some(ct) = content_type {
             req = req.header(header::CONTENT_TYPE, ct);
+        }
+        // Add client trace ID to relay POSTs only (not key config fetches)
+        if content_type == Some("message/ohttp-req")
+            && let Some(ref trace) = self.client_trace
+        {
+            req = req.header("X-Client-Trace-Id", trace.next());
         }
         req.body(Full::new(Bytes::from(body)))
             .map_err(|e| format!("build request: {e}"))
@@ -885,5 +931,102 @@ mod tests {
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .try_init()
+    }
+}
+
+/// Client trace ID generator for debug request tracking (Rust side, bulk sync path).
+/// Format: `<prefix>-<sessionUuid>-<seq>` where seq is zero-padded 6 digits, total ≤ 64 chars.
+/// The session UUID is generated once when the generator is created.
+mod client_trace {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use uuid::Uuid;
+
+    pub struct ClientTrace {
+        prefix: String,
+        session_uuid: Uuid,
+        counter: AtomicU64,
+    }
+
+    impl ClientTrace {
+        pub fn new(prefix: &str) -> Self {
+            let sanitized = sanitize_prefix(prefix);
+            Self {
+                prefix: sanitized,
+                session_uuid: Uuid::new_v4(),
+                counter: AtomicU64::new(0),
+            }
+        }
+
+        pub fn next(&self) -> String {
+            let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+            let full = format!("{}-{}-{:06}", self.prefix, self.session_uuid, seq);
+            if full.len() <= 64 {
+                full
+            } else {
+                full[..64].to_string()
+            }
+        }
+    }
+
+    fn sanitize_prefix(prefix: &str) -> String {
+        // Keep only [A-Za-z0-9._:-], ensure first char is alphanumeric
+        let cleaned: String = prefix
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+            .collect();
+        if cleaned.is_empty() {
+            return "trace".to_string();
+        }
+        if cleaned.chars().next().unwrap().is_ascii_alphanumeric() {
+            cleaned
+        } else {
+            // Drop leading non-alphanumeric
+            let result: String = cleaned
+                .chars()
+                .skip_while(|c| !c.is_ascii_alphanumeric())
+                .collect();
+            if result.is_empty() {
+                "trace".to_string()
+            } else {
+                result
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_sanitize_prefix() {
+            assert_eq!(sanitize_prefix("test-wallet"), "test-wallet");
+            assert_eq!(sanitize_prefix("test@wallet#123"), "testwallet123");
+            assert_eq!(sanitize_prefix("___abc"), "abc");
+            assert_eq!(sanitize_prefix(""), "trace");
+            assert_eq!(sanitize_prefix("___"), "trace");
+        }
+
+        #[test]
+        fn test_trace_format() {
+            let trace = ClientTrace::new("yassi");
+            let id1 = trace.next();
+            let id2 = trace.next();
+            // Format: yassi-<uuid>-000000
+            assert!(id1.starts_with("yassi-"));
+            assert!(id1.len() <= 64);
+            // Sequence must increment
+            let parts1: Vec<&str> = id1.rsplitn(2, '-').collect();
+            let parts2: Vec<&str> = id2.rsplitn(2, '-').collect();
+            assert_eq!(parts1[0], "000000");
+            assert_eq!(parts2[0], "000001");
+        }
+
+        #[test]
+        fn test_truncation() {
+            let long_prefix = "a".repeat(60);
+            let trace = ClientTrace::new(&long_prefix);
+            let id = trace.next();
+            assert_eq!(id.len(), 64);
+        }
     }
 }
