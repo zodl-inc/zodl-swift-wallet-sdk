@@ -341,9 +341,20 @@ impl DrivePolicyDto {
     }
 }
 
-/// Swift-tunable per-round overrides applied on top of the stored round
-/// config. Each field is independently absent (no override), explicitly
-/// cleared, or set: see [`Self::ceremony_start_seconds`].
+/// Swift-tunable service configuration applied on top of the round a session
+/// was opened with — the helper fleet, the vote-tree nodes and the round's
+/// timing.
+///
+/// One of these is not a value on its own but an update to the session's
+/// single live slot, which every writer merges into field by field: a field
+/// this names replaces the slot's value, and a field it leaves absent keeps
+/// whatever is there. So it is always a *partial* configuration, and a host
+/// that refreshes only its helper fleet sends only that field.
+///
+/// The doubled `Option` of the two timing fields cannot express a clear. JSON
+/// has no way to say "clear this" here — an explicit `null` deserializes as
+/// absent, not as `Some(None)` — so a round whose timing must be gone is
+/// opened without it rather than cleared through one of these.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub(super) struct HostOverridesDto {
     #[serde(default)]

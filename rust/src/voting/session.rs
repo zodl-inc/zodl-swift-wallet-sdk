@@ -238,8 +238,24 @@ pub struct VotingSession {
     /// The inputs this session was opened with, kept because a step needs the
     /// ones the crate does not capture at construction: the helper fleet, the
     /// vote-tree nodes and the round's timing. A run reads them through
-    /// [`HostInputs`], which applies that call's overrides on top.
+    /// [`HostInputs`], which applies [`Self::live_host`] on top.
     inputs: SessionInputsDto,
+    /// The host's live service configuration over [`Self::inputs`]: the
+    /// helper fleet, the vote-tree nodes and the round's timing, as the host
+    /// last stated them.
+    ///
+    /// One slot per session, not one per run. Every writer merges into it —
+    /// [`Self::run`] and [`Self::track_shares`] as they start,
+    /// [`Self::merge_host_overrides`] at any time — and both drivers read it
+    /// through [`HostInputs`] on every dispatch, so a round that takes minutes
+    /// can be moved onto a fleet the host learned about after it started. A
+    /// run and a tracking pass running at once share it, deliberately: they
+    /// are two views of one round, and a helper fleet one of them must stop
+    /// using is one the other must stop using too.
+    ///
+    /// Its own small lock, taken only to clone the slot out or to merge into
+    /// it, and never while a driver lock is held: see [`HostInputs`].
+    live_host: std::sync::Mutex<HostOverridesDto>,
     /// The voting identity of the store this session was opened from.
     network: zcash_voting::Network,
     /// The SDK's numeric network id, kept so wallet-database and key
@@ -409,7 +425,39 @@ impl VotingSession {
             network: store.network,
             network_id: store.network_id,
             inputs,
+            live_host: std::sync::Mutex::new(HostOverridesDto::default()),
         })
+    }
+
+    /// Merge `update` into the session's host configuration: a field it names
+    /// replaces the current value, a field it leaves absent keeps it.
+    ///
+    /// Both drivers read the merged value on every dispatch, so a write made
+    /// while a run is in flight takes effect at its next dispatch. The lock is
+    /// this slot's alone: no driver lock is ever held while it is taken.
+    ///
+    /// A poisoned lock is recovered from rather than propagated. The slot is
+    /// four independent fields assigned one at a time, so a panic between two
+    /// of them leaves each field either its old value or its new one — never a
+    /// half-written one — and refusing to serve a configuration would stop a
+    /// round over a panic that happened somewhere else entirely.
+    pub(super) fn merge_host_overrides(&self, update: HostOverridesDto) {
+        let mut live = self
+            .live_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if update.helper_urls.is_some() {
+            live.helper_urls = update.helper_urls;
+        }
+        if update.vote_tree_node_urls.is_some() {
+            live.vote_tree_node_urls = update.vote_tree_node_urls;
+        }
+        if update.ceremony_start_seconds.is_some() {
+            live.ceremony_start_seconds = update.ceremony_start_seconds;
+        }
+        if update.vote_end_time_seconds.is_some() {
+            live.vote_end_time_seconds = update.vote_end_time_seconds;
+        }
     }
 
     /// The round's resume plan, against the roster this session is bound to.
@@ -638,6 +686,15 @@ impl VotingSession {
     /// worker, and the driver hands its planning reads off the worker with
     /// `block_in_place`, which only a multi-thread runtime allows.
     ///
+    /// `overrides` is merged into the session's live host configuration before
+    /// the driver starts, by [`Self::merge_host_overrides`] and with its
+    /// semantics: a field it names replaces the session's current value, a
+    /// field it leaves absent keeps whatever is there. The driver reads that
+    /// slot on every dispatch, so a configuration pushed while this run is in
+    /// flight reaches its next dispatch — and what this call merged outlives
+    /// the run, standing for later runs of the same session until something
+    /// replaces it.
+    ///
     /// `signer` decides what the run may do with delegation. Without one, the
     /// driver reports the bundles that owe a signature instead of dispatching
     /// them; with a software seed, the seed goes into [`SeedSpendAuthSigner`]
@@ -657,6 +714,7 @@ impl VotingSession {
         policy: DrivePolicyDto,
         sink: EventSink,
     ) -> anyhow::Result<zcash_voting::wire::RoundRunReportView> {
+        self.merge_host_overrides(overrides);
         let session = Arc::clone(self);
         let (drive_policy, max_proof_concurrency) = policy.into_policy();
         // `.clone()` rather than `Arc::clone`: the unsizing coercion to the
@@ -690,7 +748,6 @@ impl VotingSession {
                 let host = SessionHost {
                     inputs: HostInputs {
                         session: Arc::clone(&session),
-                        overrides,
                     },
                     delegation,
                     max_proof_concurrency,
@@ -712,6 +769,10 @@ impl VotingSession {
     /// driver never fails: a run that owed nothing, ran out of passes or found
     /// the vote already closed says so through the report's quiescence.
     ///
+    /// `overrides` is merged into the session's live host configuration as in
+    /// [`Self::run`] — the same slot, the same per-field merge — and this
+    /// driver reads it on every pass.
+    ///
     /// A round admits one tracking run at a time. A second started while a
     /// live one holds the round returns at once with `already_driving`; one
     /// started while a cancelled run is on its way out waits for it to release
@@ -722,6 +783,7 @@ impl VotingSession {
         policy: ShareTrackingPolicyDto,
         sink: EventSink,
     ) -> anyhow::Result<zcash_voting::wire::ShareTrackingRunReportView> {
+        self.merge_host_overrides(overrides);
         let session = Arc::clone(self);
         let policy = policy.into_policy();
 
@@ -730,7 +792,6 @@ impl VotingSession {
                 let host = ShareTrackingHost {
                     inputs: HostInputs {
                         session: Arc::clone(&session),
-                        overrides,
                     },
                 };
                 let reporter = ShareTrackingCallbackReporter { sink };
@@ -786,46 +847,63 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// The host inputs one run reads: the session's own, with that call's
-/// overrides applied.
+/// The host inputs a driver reads: the session's own, with whatever is in the
+/// session's live host slot ([`VotingSession::merge_host_overrides`]) on top.
 ///
-/// Overrides replace, never merge, and only where present: a field the host
-/// set stands in for the session's value for this run, and one it left absent
+/// The slot is read afresh on every accessor call rather than captured when a
+/// run starts, because the drivers ask for a host context between dispatches
+/// precisely so the host can refresh what a long round depends on — the helper
+/// fleet, the vote-tree nodes and the round's timing. A configuration the host
+/// pushes mid-run therefore reaches the next dispatch.
+///
+/// A slot field that is set stands in for the session's value; one left absent
 /// keeps the session's. JSON cannot say "clear this" — an explicit `null`
 /// deserializes as absent — so a round whose timing must be gone is opened
-/// without it rather than overridden here.
+/// without it rather than cleared here.
 ///
 /// Every accessor clones and returns; none of them touches the sidecar or any
 /// lock the drivers hold, because the drivers call this between dispatches and
-/// a context that waited on a step's own lock would deadlock the run.
+/// a context that waited on a step's own lock would deadlock the run. The slot
+/// lock is held for the clone alone, and by nothing that can block.
 struct HostInputs {
     session: Arc<VotingSession>,
-    overrides: HostOverridesDto,
 }
 
 impl HostInputs {
-    fn configured_helper_urls(&self) -> Vec<String> {
-        self.overrides
-            .helper_urls
+    /// The session's live host slot as it stands right now.
+    ///
+    /// Cloned out under the lock and read outside it, so nothing this context
+    /// answers with is computed while the slot is held. A poisoned lock is
+    /// recovered from for the reason
+    /// [`VotingSession::merge_host_overrides`] gives.
+    fn live(&self) -> HostOverridesDto {
+        self.session
+            .live_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn configured_helper_urls(&self) -> Vec<String> {
+        self.live()
+            .helper_urls
             .unwrap_or_else(|| self.session.inputs.helper_urls.clone())
     }
 
     fn vote_tree_node_urls(&self) -> Vec<String> {
-        self.overrides
+        self.live()
             .vote_tree_node_urls
-            .clone()
             .unwrap_or_else(|| self.session.inputs.vote_tree_node_urls.clone())
     }
 
     fn ceremony_start_seconds(&self) -> Option<u64> {
-        self.overrides
+        self.live()
             .ceremony_start_seconds
             .unwrap_or(self.session.inputs.ceremony_start_seconds)
     }
 
     fn vote_end_time_seconds(&self) -> Option<u64> {
-        self.overrides
+        self.live()
             .vote_end_time_seconds
             .unwrap_or(self.session.inputs.vote_end_time_seconds)
     }
@@ -1413,6 +1491,140 @@ mod tests {
                 "a share_tracking event carries the driver event: {json}"
             );
         }
+    }
+
+    /// The round driver reads the session's host configuration on every
+    /// dispatch, so a configuration pushed mid-run reaches the next one.
+    ///
+    /// Asserted against one host object throughout: a host that had captured
+    /// its configuration at construction would keep answering with what the
+    /// session was opened with, which is what the first `assert_ne!` rules
+    /// out. The second write names no helpers, which must leave the pushed
+    /// ones standing rather than restore the session's own.
+    #[test]
+    fn host_context_reads_the_latest_pushed_configuration_on_every_dispatch() {
+        use zcash_voting::RoundHostSource;
+
+        let (_store, _dir, session) = open_session(0x72);
+        let session = Arc::new(session);
+        let host = SessionHost {
+            inputs: HostInputs {
+                session: Arc::clone(&session),
+            },
+            delegation: None,
+            max_proof_concurrency: 1,
+        };
+        let opened_with = host.host_context().configured_helper_urls;
+
+        session.merge_host_overrides(HostOverridesDto {
+            helper_urls: Some(vec!["https://helper.example/".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            host.host_context().configured_helper_urls,
+            vec!["https://helper.example/".to_string()]
+        );
+        assert_ne!(host.host_context().configured_helper_urls, opened_with);
+
+        // A later write that names no helpers keeps the pushed ones.
+        session.merge_host_overrides(HostOverridesDto {
+            vote_tree_node_urls: Some(vec!["https://tree.example/".to_string()]),
+            ..Default::default()
+        });
+        let context = host.host_context();
+        assert_eq!(
+            context.configured_helper_urls,
+            vec!["https://helper.example/".to_string()]
+        );
+        assert_eq!(
+            context.vote_tree_node_urls,
+            vec!["https://tree.example/".to_string()]
+        );
+    }
+
+    /// The same slot, read by the other driver: share tracking sees a pushed
+    /// helper fleet and a pushed vote end on its next pass.
+    #[test]
+    fn share_tracking_host_context_reads_the_latest_pushed_configuration() {
+        use zcash_voting::ShareTrackingHostSource;
+
+        let (_store, _dir, session) = open_session(0x73);
+        let session = Arc::new(session);
+        let host = ShareTrackingHost {
+            inputs: HostInputs {
+                session: Arc::clone(&session),
+            },
+        };
+        let opened_with = host.host_context().configured_helper_urls;
+
+        session.merge_host_overrides(HostOverridesDto {
+            helper_urls: Some(vec!["https://tracking-helper.example/".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(
+            host.host_context().configured_helper_urls,
+            vec!["https://tracking-helper.example/".to_string()]
+        );
+        assert_ne!(host.host_context().configured_helper_urls, opened_with);
+
+        // A later write that names no helpers keeps the pushed ones.
+        session.merge_host_overrides(HostOverridesDto {
+            vote_end_time_seconds: Some(Some(4_000_000_000)),
+            ..Default::default()
+        });
+        let context = host.host_context();
+        assert_eq!(
+            context.configured_helper_urls,
+            vec!["https://tracking-helper.example/".to_string()]
+        );
+        assert_eq!(context.vote_end_time_seconds, Some(4_000_000_000));
+    }
+
+    /// A run merges its own overrides into the session's slot rather than
+    /// carrying them alone, so what one run was driven with still holds for
+    /// the next one — and a later run that names nothing keeps it.
+    ///
+    /// Driven on a cancelled session, which reaches no endpoint and reads no
+    /// plan: what is under test is the merge the call performs before it
+    /// spawns anything.
+    #[test]
+    fn a_runs_overrides_merge_into_the_session_slot_and_outlive_the_run() {
+        use zcash_voting::RoundHostSource;
+
+        let (_store, _dir, session) = open_session(0x74);
+        let session = Arc::new(session);
+        session.cancel();
+        session
+            .run(
+                HostOverridesDto {
+                    helper_urls: Some(vec!["https://run-helper.example/".to_string()]),
+                    ..Default::default()
+                },
+                Signer::None,
+                DrivePolicyDto::default(),
+                EventSink::none(),
+            )
+            .expect("a cancelled run still reports");
+        session
+            .track_shares(
+                HostOverridesDto::default(),
+                ShareTrackingPolicyDto::default(),
+                EventSink::none(),
+            )
+            .expect("a cancelled tracking run still reports");
+
+        let host = SessionHost {
+            inputs: HostInputs {
+                session: Arc::clone(&session),
+            },
+            delegation: None,
+            max_proof_concurrency: 1,
+        };
+        assert_eq!(
+            host.host_context().configured_helper_urls,
+            vec!["https://run-helper.example/".to_string()],
+            "a later driver must still see what an earlier run was driven with"
+        );
     }
 
     /// One Keystone-signed bundle, with PCZT bytes no signature can come out

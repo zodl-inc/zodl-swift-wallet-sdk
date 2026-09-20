@@ -190,6 +190,62 @@ final class VotingRoundSessionTests: XCTestCase {
         await session.close()
     }
 
+    // MARK: - Host configuration
+
+    /// Pushing a service configuration is a short call over the open handle,
+    /// and a closed session refuses it like every other call.
+    func testUpdateHostConfigurationIsAcceptedOnAnOpenSessionAndRefusedOnceClosed() async throws {
+        let fixture = try await makeFixture(tag: 0x4A)
+
+        try fixture.session.updateHostConfiguration(VotingHostOverrides(helperUrls: ["https://helper.example/"]))
+        // A merge that names nothing is a no-op rather than a refusal: a host
+        // refreshing one field sends one field.
+        try fixture.session.updateHostConfiguration(VotingHostOverrides())
+
+        await fixture.session.close()
+
+        XCTAssertThrowsError(try fixture.session.updateHostConfiguration(VotingHostOverrides())) { error in
+            XCTAssertEqual(error as? VotingRustBackendError, .sessionClosed)
+        }
+    }
+
+    /// A configuration pushed while a run is in flight is accepted rather than
+    /// held behind it. The call takes the session's own configuration lock and
+    /// never one a driver holds, which is the whole point of being able to
+    /// replace a helper fleet mid-round.
+    ///
+    /// Held open by the run's own event stream, as in
+    /// `testASecondRunWhileOneIsInFlightIsRefusedAsBusy`: the first event parks
+    /// on the session's delivery queue and a run does not return until that
+    /// queue has drained, so the run is provably still in flight when the push
+    /// is made. No sleeps.
+    func testHostConfigurationIsReplaceableWhileARunIsInFlight() async throws {
+        let fixture = try await makeFixture(tag: 0x4B)
+        let session = fixture.session
+        let gate = FirstEventGate()
+        let reported = expectation(description: "the run reported its first event")
+
+        async let first: VotingRoundRunReport = session.run(signer: VotingDelegationSigner.none) { _ in
+            guard gate.claimFirst() else { return }
+            reported.fulfill()
+            gate.waitForRelease()
+        }
+
+        await fulfillment(of: [reported], timeout: 60)
+
+        // The discard port again: the round quiesces on its undecided ballot
+        // without dispatching, and a fleet that was somehow reached would be
+        // refused at once rather than reaching a real host.
+        try session.updateHostConfiguration(VotingHostOverrides(helperUrls: [votingFixtureUnroutableEndpoint]))
+
+        gate.release()
+
+        let report = try await first
+        XCTAssertEqual(report.quiescence.kind, .needsBallot)
+
+        await session.close()
+    }
+
     // MARK: - Lifecycle
 
     func testCloseIsIdempotentAndEveryLaterCallIsRefused() async throws {

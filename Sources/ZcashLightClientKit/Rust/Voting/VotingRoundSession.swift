@@ -358,6 +358,15 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// A software seed lives in Rust's signer for this call only and is
     /// zeroized there; it never reaches Swift again, and neither do the
     /// sighashes or PCZTs the run signs.
+    ///
+    /// `overrides` is merged into the session's service configuration as this
+    /// run starts, with the semantics of
+    /// ``updateHostConfiguration(_:)``: a field it names replaces the
+    /// session's current value, a field it leaves absent keeps whatever is
+    /// there — including a configuration pushed earlier. The driver reads that
+    /// configuration on every dispatch, so it can be replaced while this run
+    /// is in flight, and what this call merged outlives the run: a later run
+    /// that names nothing is still driven against it.
     public func run(
         signer: VotingDelegationSigner,
         policy: VotingRoundDrivePolicy = .default,
@@ -409,6 +418,11 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// quiescence, and tracking a round another pass already holds returns
     /// ``VotingShareTrackingQuiescenceKind/alreadyDriving`` at once. No signer:
     /// tracking delivers and confirms shares that already exist.
+    ///
+    /// `overrides` is merged into the session's service configuration exactly
+    /// as ``run(signer:policy:overrides:events:)`` merges its own — the same
+    /// configuration, the same per-field merge — and this driver reads it on
+    /// every pass.
     public func trackShares(
         policy: VotingShareTrackingPolicy = VotingShareTrackingPolicy(),
         overrides: VotingHostOverrides = VotingHostOverrides(),
@@ -441,6 +455,38 @@ public final class VotingRoundSession: @unchecked Sendable {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: - Host configuration
+
+    /// Replace the service configuration this session's drivers read.
+    ///
+    /// A field the overrides name replaces the session's current value; one
+    /// they leave absent keeps it. Both drivers read the merged value on every
+    /// dispatch, so a call made while ``run(signer:policy:overrides:events:)``
+    /// or ``trackShares(policy:overrides:events:)`` is in flight takes effect
+    /// at the next dispatch, and it still holds for later runs. Push the
+    /// helper fleet and vote-tree nodes here whenever the host refreshes its
+    /// service configuration.
+    ///
+    /// Returns as soon as the merge is recorded, whatever else the session is
+    /// doing: it takes the configuration's own lock and nothing a driver
+    /// holds. Throws ``VotingRustBackendError/sessionClosed`` on a closed
+    /// session — unlike ``cancel()`` and ``setOperationEpoch(_:)``, which are
+    /// no-ops there, because a configuration nothing will ever read is worth
+    /// saying out loud.
+    public func updateHostConfiguration(_ overrides: VotingHostOverrides) throws {
+        let hostJSON = try VotingRustBackend.encodeJSON(overrides, describing: "host overrides")
+
+        try withHandle { session in
+            let status = hostJSON.withUnsafeBufferPointer { hostBytes in
+                zcashlc_voting_session_update_host_configuration(session, hostBytes.baseAddress, UInt(hostBytes.count))
+            }
+
+            guard status == 0 else {
+                throw VotingRustBackend.votingError(fallback: "`voting_session_update_host_configuration` failed")
             }
         }
     }

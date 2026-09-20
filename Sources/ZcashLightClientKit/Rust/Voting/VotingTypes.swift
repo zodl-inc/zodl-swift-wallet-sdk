@@ -425,21 +425,31 @@ public struct VotingProvingPolicy: Equatable, Sendable, Encodable {
     }
 }
 
-/// Per-run overrides applied on top of the round's stored configuration.
+/// An update to the service configuration a session's drivers read: the helper
+/// fleet, the vote-tree nodes and the round's timing.
 ///
-/// An outer `nil` leaves the stored value alone: the key is left out of the
-/// JSON entirely. The inner `nil` of the two optional-of-optional fields cannot
-/// be expressed to Rust — the FFI reads a JSON `null` as "no override" rather
-/// than as "clear this value" — so `.some(nil)` is encoded as absent too, and
-/// clearing a stored ceremony start or vote end is not something a host can ask
-/// for through this type.
+/// A session holds one such configuration, over the inputs it was opened with,
+/// and every writer merges into it field by field —
+/// ``VotingRoundSession/updateHostConfiguration(_:)`` at any time, and
+/// ``VotingRoundSession/run(signer:policy:overrides:events:)`` and
+/// ``VotingRoundSession/trackShares(policy:overrides:events:)`` as they start.
+/// So this is always a partial update, never a whole configuration: a host
+/// refreshing only its helper fleet names only `helperUrls`, and what it does
+/// not name keeps whatever is in place, including a value pushed earlier.
+///
+/// An outer `nil` names nothing: the key is left out of the JSON entirely. The
+/// inner `nil` of the two optional-of-optional fields cannot be expressed to
+/// Rust — the FFI reads a JSON `null` as "names nothing" rather than as "clear
+/// this value" — so `.some(nil)` is encoded as absent too, and clearing a
+/// ceremony start or vote end is not something a host can ask for through this
+/// type.
 public struct VotingHostOverrides: Equatable, Sendable, Encodable {
     public let helperUrls: [String]?
     public let voteTreeNodeUrls: [String]?
     public let ceremonyStartSeconds: UInt64??
     public let voteEndTimeSeconds: UInt64??
 
-    /// Override nothing.
+    /// Name nothing, leaving the session's configuration as it stands.
     public static let none = VotingHostOverrides()
 
     public init(

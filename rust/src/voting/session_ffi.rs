@@ -500,8 +500,12 @@ pub unsafe extern "C" fn zcashlc_voting_session_store_keystone_signatures(
 /// `RoundRunReportView` JSON.
 ///
 /// `host_json` is a `HostOverridesDto` and `policy_json` a `DrivePolicyDto`;
-/// an empty argument (`len == 0`) means the session's own inputs and the
-/// default policy respectively. `signer_json` is a `SignerDto` and is never
+/// an empty argument (`len == 0`) names nothing, which leaves the session's
+/// live host configuration as it stands and runs under the default policy.
+/// `host_json` is merged into that configuration field by field, exactly as
+/// [`zcashlc_voting_session_update_host_configuration`] merges — so it
+/// replaces only what it names, and what it wrote still holds for later runs
+/// of this session. `signer_json` is a `SignerDto` and is never
 /// empty: a run without delegation is `{"kind":"none"}`, stated by the host
 /// rather than inferred from a missing argument. A software seed lives in the
 /// SDK's signer for this call only, and never reaches Swift; it is moved into
@@ -569,9 +573,11 @@ pub unsafe extern "C" fn zcashlc_voting_session_run(
 /// tracking report as `ShareTrackingRunReportView` JSON.
 ///
 /// `host_json` is a `HostOverridesDto` and `policy_json` a
-/// `ShareTrackingPolicyDto`; an empty argument (`len == 0`) means the
-/// session's own inputs and the default policy. No signer: tracking delivers
-/// and confirms shares that already exist.
+/// `ShareTrackingPolicyDto`; an empty argument (`len == 0`) names nothing,
+/// leaving the session's live host configuration as it stands and tracking
+/// under the default policy. `host_json` is merged into that configuration as
+/// in [`zcashlc_voting_session_run`]. No signer: tracking delivers and
+/// confirms shares that already exist.
 ///
 /// Like a run, the driver does not fail — a round that owed nothing, ran out
 /// of passes or found the vote closed says so through the report's quiescence,
@@ -664,6 +670,47 @@ pub unsafe extern "C" fn zcashlc_voting_session_set_epoch(
         Ok(())
     });
     unwrap_exc_or(res, ())
+}
+
+/// Merge `host_json` into the service configuration this session's drivers
+/// read: the helper fleet, the vote-tree nodes and the round's timing.
+///
+/// `host_json` is a `HostOverridesDto`. A field it names replaces the
+/// session's current value; a field it leaves absent keeps it, so a host that
+/// refreshes only its helper fleet names only that. The same slot is what
+/// [`zcashlc_voting_session_run`] and [`zcashlc_voting_session_track_shares`]
+/// merge their own `host_json` into when they start, and both drivers read it
+/// on every dispatch — so a call made while a run is in flight takes effect at
+/// that run's next dispatch, and what it wrote still holds for later runs of
+/// the same session.
+///
+/// Returns 0, or -1 with `VotingErrorView` JSON in the last-error slot for a
+/// null handle or a payload this boundary cannot parse. Takes only the slot's
+/// own small lock, so it returns at once even while a run is blocked in
+/// `_run`; unlike an empty `host_json` argument elsewhere on this surface, a
+/// zero-length payload here is not a JSON document and is refused — the merge
+/// that names nothing is `{}`.
+///
+/// # Safety
+///
+/// - If non-null, `session` must be a valid `VotingSessionHandle` pointer that
+///   has not been freed.
+/// - The `(ptr, len)` byte argument follows the [`bytes_from_ptr`] contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_session_update_host_configuration(
+    session: *mut VotingSessionHandle,
+    host_json: *const u8,
+    host_json_len: usize,
+) -> i32 {
+    let session = AssertUnwindSafe(session);
+    let res = catch_panic(|| {
+        let session = unsafe { session_from_ptr(*session) }?;
+        let update: HostOverridesDto =
+            unsafe { json_from_ptr(host_json, host_json_len, "host overrides") }?;
+        session.merge_host_overrides(update);
+        Ok(0)
+    });
+    unwrap_exc_or(res, -1)
 }
 
 #[cfg(test)]
@@ -955,7 +1002,7 @@ mod tests {
 
     /// A null session is a host mistake every entry point reports the same
     /// way: the same typed JSON behind null for the ones that answer with a
-    /// pointer and behind `-1` for the one that answers with an integer, and
+    /// pointer and behind `-1` for the ones that answer with an integer, and
     /// nothing at all for the two that answer with nothing.
     #[test]
     fn entry_points_reject_a_null_session() {
@@ -1018,10 +1065,59 @@ mod tests {
                 std::ptr::null_mut(),
             )
         });
+        let empty_object = b"{}";
+        refused_integer("update_host_configuration", unsafe {
+            i64::from(zcashlc_voting_session_update_host_configuration(
+                null,
+                empty_object.as_ptr(),
+                empty_object.len(),
+            ))
+        });
         // Neither of these can report anything, so what must hold is that a
         // null handle is ignored rather than dereferenced.
         unsafe { zcashlc_voting_session_cancel(null) };
         unsafe { zcashlc_voting_session_set_epoch(null, 9) };
+    }
+
+    /// The host's service configuration crosses as JSON like every other
+    /// argument here, so a payload this boundary cannot parse is refused
+    /// before the session's slot is touched — and an empty object, which
+    /// names no field, is accepted as the no-op merge it is.
+    #[test]
+    fn update_host_configuration_refuses_malformed_json_and_accepts_an_empty_merge() {
+        let (db, _dir, session) = open_session(0x5a);
+        let malformed = b"not json";
+        refused_integer("update_host_configuration", unsafe {
+            i64::from(zcashlc_voting_session_update_host_configuration(
+                session,
+                malformed.as_ptr(),
+                malformed.len(),
+            ))
+        });
+
+        let helpers = br#"{"helper_urls":["https://helper.example/"]}"#;
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_session_update_host_configuration(
+                    session,
+                    helpers.as_ptr(),
+                    helpers.len(),
+                )
+            },
+            0
+        );
+        let empty_object = b"{}";
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_session_update_host_configuration(
+                    session,
+                    empty_object.as_ptr(),
+                    empty_object.len(),
+                )
+            },
+            0
+        );
+        unsafe { free_session(db, session) };
     }
 
     /// The plan crosses as the `RoundPlanView` JSON Swift decodes, for the

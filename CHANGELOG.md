@@ -21,6 +21,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the replacement for each removed call. `VotingRustBackend` keeps only the sidecar: opening it,
   binding it to a wallet, the reads a round list is rendered from, and the maintenance calls made
   outside a round.
+- A session holds one service configuration — the helper fleet, the vote-tree nodes and the round's
+  timing — over the inputs it was opened with, and both drivers read it on every dispatch rather
+  than capturing it when a run starts. `VotingRoundSession.updateHostConfiguration(_:)` replaces it
+  at any time, including while `run(signer:policy:overrides:events:)` or
+  `trackShares(policy:overrides:events:)` is in flight: a run can take minutes, and this is how a
+  host whose service configuration has moved on gets it to a round already under way. It returns as
+  soon as the merge is recorded, whatever else the session is doing, and throws
+  `VotingRustBackendError.sessionClosed` on a closed session.
+  Every writer merges into that configuration field by field: a `VotingHostOverrides` field that is
+  named replaces the current value, one left absent keeps whatever is in place. The `overrides` a
+  run or a tracking call passes are merged in the same way as that call starts, so they hold for the
+  session rather than for the one call — a host that wants a later call driven against the values
+  the session was opened with names those values on that call.
 - New on the surviving `VotingRustBackend` surface, alongside the session:
   `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
   share-tracking schedule are built from), `resetVoteTree(roundId:)`,

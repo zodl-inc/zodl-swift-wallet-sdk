@@ -39,7 +39,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     so a bad round configuration is reported immediately rather than through a timeout. The
     session then drives the round: `zcashlc_voting_session_{plan, set_ballot_intents,
     setup_bundles, eligibility, sync_vote_tree, precompute_pir, precompute_delegation_proof,
-    keystone_signing_requests, store_keystone_signatures, run, track_shares, cancel, set_epoch}`.
+    keystone_signing_requests, store_keystone_signatures, run, track_shares, cancel, set_epoch,
+    update_host_configuration}`.
     `_run` and `_track_shares` block for the whole drive — minutes on a round with proofs to
     generate — and stream progress to an optional host callback that is invoked on runtime
     worker threads, possibly concurrently, and must not block; the event stream is lossy by
@@ -47,6 +48,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `_sync_vote_tree` takes the session handle and a node URL — no database handle and no round
     id, because the session is already bound to a round — blocks for the sync, and returns the
     height synced to, or -1 on error.
+  - A session holds one service configuration — the helper fleet, the vote-tree nodes and the
+    round's timing — over the inputs it was opened with, and both drivers read it on every
+    dispatch rather than capturing it when a run starts.
+    `zcashlc_voting_session_update_host_configuration(session, host_json, host_json_len)` merges
+    a `HostOverridesDto` into it and returns 0, or -1 with `VotingErrorView` JSON in the
+    last-error slot for a null handle or a payload it cannot parse. It takes that configuration's
+    own lock alone, so it returns at once even while `_run` or `_track_shares` is blocked, and a
+    fleet pushed mid-run reaches that run's next dispatch. Every writer merges field by field: a
+    field the JSON names replaces the current value, one it leaves absent keeps whatever is in
+    place — `{}` changes nothing, and a zero-length payload is not a JSON document and is
+    refused. The `host_json` of `_run` and `_track_shares` is merged in the same way as the call
+    starts, so it holds for the session rather than for that one call; a caller that wants a
+    later call driven against the values the session was opened with names those values on it.
   - The route a session is opened on governs every service it touches for the session's whole
     life — chain and helper traffic, PIR queries and vote-tree sync: a null `TorRuntime` is the
     direct HTTP route, and a Tor runtime is used through an isolated client, never falling back
