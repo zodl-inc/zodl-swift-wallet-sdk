@@ -43,12 +43,12 @@ use zeroize::Zeroizing;
 use super::errors::{VotingResultExt, envelope_or_invalid_input, internal, invalid_input};
 use super::route::SdkRoute;
 use super::signer::SeedSpendAuthSigner;
-use super::store::VotingDatabaseHandle;
+use super::store::{VotingDatabaseHandle, legacy_in_flight};
 use super::wallet_access::SdkWalletDbOpener;
 use super::wire::{
     BallotIntentDto, BundleLayoutDto, DelegationProgressDto, DrivePolicyDto, EligibilityDto,
     HostOverridesDto, KeystoneSignatureBatchResultDto, KeystoneSignedBundleDto,
-    KeystoneSigningRequestDto, PirPrecomputeDto, ProofStatusDto, SessionBindingDto,
+    KeystoneSigningRequestDto, PirPrecomputeDto, ProofStatusDto, RoundPlanDto, SessionBindingDto,
     SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, Signer, plan_view,
 };
 
@@ -469,9 +469,9 @@ impl VotingSession {
     /// routing both through it is what keeps the two answers the same one. The
     /// executor also refuses a round the sidecar stores under another network,
     /// which the bare `resume_plan` does not check.
-    pub(super) fn plan(&self) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
+    pub(super) fn plan(&self) -> anyhow::Result<RoundPlanDto> {
         let plan = self.executor.plan().ffi()?;
-        plan_view(plan)
+        self.plan_dto(plan)
     }
 
     /// Records ballot decisions and returns the refreshed plan.
@@ -482,13 +482,27 @@ impl VotingSession {
     pub(super) fn set_ballot_intents(
         &self,
         intents: Vec<BallotIntentDto>,
-    ) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
+    ) -> anyhow::Result<RoundPlanDto> {
         let intents = intents
             .into_iter()
             .map(BallotIntentDto::into_intent)
             .collect::<Vec<_>>();
         let plan = self.executor.set_ballot_intents(&intents).ffi()?;
-        plan_view(plan)
+        self.plan_dto(plan)
+    }
+
+    /// The wire form of `plan`, with the legacy in-flight flag this session's
+    /// sidecar rows answer.
+    ///
+    /// Both entry points that return a plan go through here, so a host reads
+    /// the same answer whether it planned the round or recorded a ballot.
+    fn plan_dto(&self, plan: zcash_voting::session::RoundPlan) -> anyhow::Result<RoundPlanDto> {
+        let has_legacy_in_flight_submission =
+            legacy_in_flight(&self.database, &self.round_id, &plan)?;
+        Ok(RoundPlanDto {
+            plan: plan_view(plan)?,
+            has_legacy_in_flight_submission,
+        })
     }
 
     /// Creates the round row, then its delegation bundle rows.
@@ -1200,7 +1214,10 @@ mod tests {
             vec![hex_round_id(0x22).as_str()],
         );
 
-        let plan = session.plan().expect("a round with no bundles still plans");
+        let plan = session
+            .plan()
+            .expect("a round with no bundles still plans")
+            .plan;
         assert_eq!(plan.round_id, hex_round_id(0x22));
         assert!(plan.needs_draft_setup);
         assert!(!plan.needs_bundle_setup);
@@ -1214,10 +1231,43 @@ mod tests {
     #[test]
     fn plan_before_any_round_row_is_an_idle_plan() {
         let (_store, _dir, session) = open_session(0x29);
-        let plan = session.plan().expect("plan");
+        let plan = session.plan().expect("plan").plan;
         assert_eq!(plan.round_id, hex_round_id(0x29));
         assert!(plan.next_steps.is_empty());
         assert!(plan.needs_draft_setup);
+    }
+
+    /// Both plan-returning session calls answer the legacy in-flight question,
+    /// and a round this SDK created answers `false`.
+    ///
+    /// A session cannot reach a round an older SDK left mid-submission without
+    /// that round's sidecar, which `store::tests` builds and drives through
+    /// `round_plan`; what belongs here is that neither entry point drops the
+    /// field on the way out, since a host that reads it from one and not the
+    /// other would gate on nothing.
+    #[test]
+    fn both_plan_entry_points_report_the_legacy_in_flight_flag() {
+        let (_store, _dir, session) = open_session(0x2a);
+        assert!(
+            !session
+                .plan()
+                .expect("plan")
+                .has_legacy_in_flight_submission
+        );
+
+        session.setup_bundles().unwrap_err(); // empty wallet; the round row survives
+        let plan = session
+            .set_ballot_intents(vec![BallotIntentDto {
+                proposal_id: 1,
+                decision: DecisionDto::Choice { option: 0 },
+            }])
+            .expect("plan");
+        assert!(!plan.has_legacy_in_flight_submission);
+        assert_eq!(
+            serde_json::to_value(&plan).expect("json")["has_legacy_in_flight_submission"],
+            false,
+            "the flag has to cross to Swift beside the crate's own keys"
+        );
     }
 
     #[test]
@@ -1259,7 +1309,8 @@ mod tests {
                 proposal_id: 1,
                 decision: DecisionDto::Choice { option: 0 },
             }])
-            .expect("plan");
+            .expect("plan")
+            .plan;
         assert_eq!(plan.round_id, hex_round_id(0x27));
         // Proposal 2 is rostered and undecided, so the round still owes a draft;
         // proposal 1 now holds a choice with no bundle rows behind it.

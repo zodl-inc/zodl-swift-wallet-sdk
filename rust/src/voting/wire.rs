@@ -81,6 +81,32 @@ pub(super) fn plan_view(
     zcash_voting::wire::RoundPlanView::try_from(plan).ffi()
 }
 
+/// A round plan, plus the one thing about it only the sidecar's typed phases
+/// can say.
+///
+/// Flattened, so the JSON Swift decodes is the crate's plan object with one
+/// more key beside its own rather than the plan nested under one. The plans
+/// embedded in run reports and events are the crate's view as it stands and
+/// carry no such key.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub(super) struct RoundPlanDto {
+    #[serde(flatten)]
+    pub plan: zcash_voting::wire::RoundPlanView,
+    /// True when the round holds a delegation or a vote *this wallet built*
+    /// that an older SDK dispatched and never saw confirmed. The 5.x chain
+    /// lifecycle never adopted it — it owns only submissions it reserved
+    /// itself — so running the round would plan an advance step and
+    /// re-dispatch the same transaction bytes, with nothing promised about how
+    /// that ends. Upstream does not support resuming such a round; a host
+    /// should show it and not drive it.
+    ///
+    /// A delegation imported from a capability package is not covered, even
+    /// though it reaches the same phase: the lifecycle adopts its hash and
+    /// never dispatches the transaction again, so there is nothing to
+    /// re-dispatch and such a round is driven normally.
+    pub has_legacy_in_flight_submission: bool,
+}
+
 /// Parameters for a voting round, sourced from the vote chain.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct RoundParamsDto {

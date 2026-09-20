@@ -138,7 +138,11 @@ pub unsafe extern "C" fn zcashlc_voting_list_rounds(
 }
 
 /// The plan for one round against an authenticated proposal roster, as
-/// `RoundPlanView` JSON.
+/// `RoundPlanView` JSON, with `has_legacy_in_flight_submission` beside
+/// its keys: true when the round holds a delegation or a vote this wallet
+/// built that an older SDK dispatched and never saw confirmed, which this
+/// SDK's chain lifecycle did not adopt and cannot resume. A delegation
+/// imported from a capability package is excluded: nothing re-dispatches it.
 ///
 /// `proposal_ids_json` is a JSON array of proposal ids — the roster the host
 /// authenticated. Returns null on error.
@@ -523,10 +527,15 @@ mod tests {
             )
         };
         assert!(!ptr.is_null());
+        let json = unsafe { take_json(ptr) };
+        // The crate's own view still decodes the payload: the SDK's extra key
+        // rides beside its keys rather than nesting them under one.
         let plan: zcash_voting::wire::RoundPlanView =
-            serde_json::from_str(&unsafe { take_json(ptr) }).expect("plan json");
+            serde_json::from_str(&json).expect("plan json");
         assert_eq!(plan.round_id, round_id);
         assert_eq!(plan.open_proposals, vec![1, 2]);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("plan json");
+        assert_eq!(value["has_legacy_in_flight_submission"], false);
 
         let malformed = b"[1,";
         assert!(

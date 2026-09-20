@@ -238,7 +238,11 @@ pub unsafe extern "C" fn zcashlc_voting_session_free(ptr: *mut VotingSessionHand
     }
 }
 
-/// This round's resume plan, as `RoundPlanView` JSON.
+/// This round's resume plan, as `RoundPlanView` JSON, with `has_legacy_in_flight_submission` beside
+/// its keys: true when the round holds a delegation or a vote this wallet
+/// built that an older SDK dispatched and never saw confirmed, which this
+/// SDK's chain lifecycle did not adopt and cannot resume. A delegation
+/// imported from a capability package is excluded: nothing re-dispatches it.
 ///
 /// Planned against the roster the session is bound to. Returns null on error.
 ///
@@ -259,8 +263,11 @@ pub unsafe extern "C" fn zcashlc_voting_session_plan(
     unwrap_exc_or_null(res)
 }
 
-/// Record ballot decisions and return the refreshed plan, as `RoundPlanView`
-/// JSON.
+/// Record ballot decisions and return the refreshed plan, as `RoundPlanView` JSON, with `has_legacy_in_flight_submission` beside
+/// its keys: true when the round holds a delegation or a vote this wallet
+/// built that an older SDK dispatched and never saw confirmed, which this
+/// SDK's chain lifecycle did not adopt and cannot resume. A delegation
+/// imported from a capability package is excluded: nothing re-dispatches it.
 ///
 /// `intents_json` is a JSON array of `BallotIntentDto`. The whole batch is
 /// resolved against the bound roster before anything is written, so a decision
@@ -1129,6 +1136,8 @@ mod tests {
         assert_eq!(plan["round_id"], hex_round_id(0x53));
         // The fixture roster is undecided, so the round owes a draft.
         assert_eq!(plan["needs_draft_setup"], true);
+        // The SDK's own key rides beside the crate's, at the top level.
+        assert_eq!(plan["has_legacy_in_flight_submission"], false);
         unsafe { free_session(db, session) };
     }
 

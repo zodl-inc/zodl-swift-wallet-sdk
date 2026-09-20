@@ -88,6 +88,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingChainSubmissionStateEvidence`, `VotingChainSubmissionFailureState`, `VotingVoteCommitStage`
   and `VotingResubmittedShare`. Every new field decodes leniently, defaulting to empty or absent when
   an older payload omits it, so no existing call site needs a change.
+- `VotingRoundPlan.hasLegacyInFlightSubmission` reports a round holding a delegation or a vote this
+  wallet built that an older SDK dispatched and never saw confirmed. Upgrading keeps every row of
+  the voting database, but the chain lifecycle this SDK drives owns only the submissions it reserved
+  itself, so such a transaction is not adopted and resuming it is unsupported: running the round
+  plans an advance step and re-dispatches the same transaction bytes, with no guarantee about the
+  outcome. Check it before bundle setup, precompute or `run(signer:policy:overrides:events:)`, and
+  treat such a round as display-only. `VotingRoundSession.plan()`,
+  `VotingRoundSession.setBallotIntents(_:)` and `VotingRustBackend.roundPlan(roundId:proposalIds:)`
+  answer it; the plans embedded in run reports and events do not carry it and read as `false`. Share
+  tracking is unaffected, and rounds the older build only set up or saw through to confirmation
+  report `false`. A delegation imported from a capability package also reports `false` and is driven
+  normally: its transaction was broadcast elsewhere and the lifecycle adopts the hash rather than
+  dispatching anything again. See `MIGRATING.md`.
 
 ## Fixed
 

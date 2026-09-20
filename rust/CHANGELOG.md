@@ -77,6 +77,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
     describes, for a network id, so a caller that persisted only the secret can hand the SDK the
     full hotkey again. Free with `zcashlc_voting_free_hotkey`.
+  - The plan JSON of `zcashlc_voting_round_plan`, `zcashlc_voting_session_plan` and
+    `zcashlc_voting_session_set_ballot_intents` carries one key beside the crate's own, at the
+    same level: `has_legacy_in_flight_submission` (bool). It is true when the round holds a
+    delegation or a vote this wallet built that an older SDK dispatched and never saw confirmed.
+    Opening a sidecar written by that SDK migrates it in place and keeps every row, but the 5.x
+    chain lifecycle owns only the submissions it reserved itself, so such a transaction gets no
+    lifecycle row and resuming it is unsupported: the driver plans an advance step and re-dispatches
+    the same transaction bytes, with nothing promised about the outcome. Read it before bundle
+    setup, precompute or `_run`, and drive no such round. A delegation imported from a capability
+    package is excluded and reports false: its transaction was broadcast elsewhere, the lifecycle
+    adopts the hash rather than sending anything again, and the round is driven normally. The plans
+    nested in a run report and in the event stream are the crate's view unchanged and carry no such
+    key, so a caller that must gate on it reads one of the three calls above.
 
 - `zcashlc_take_last_error_report`, `zcashlc_free_error_report`, and `FfiErrorReport` expose the
   most recent error as a classified, redacted report. `kind` is an `ErrorKind` discriminant

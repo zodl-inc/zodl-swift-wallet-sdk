@@ -253,6 +253,7 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(plan.unrosteredIntents, [9])
         XCTAssertFalse(plan.immediateShareConfirmed)
         XCTAssertFalse(plan.allDecided)
+        XCTAssertTrue(plan.hasLegacyInFlightSubmission)
 
         XCTAssertEqual(plan.delegationStatuses.count, 2)
         XCTAssertEqual(plan.delegationStatuses.first?.bundleIndex, 0)
@@ -937,6 +938,10 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertTrue(plan.unrosteredIntents.isEmpty)
         XCTAssertEqual(plan.primaryAction, .idle)
         XCTAssertTrue(plan.allDecided)
+        // Not every plan carries the key: the ones embedded in run reports and
+        // events are the crate's own view, and a host must read them as "no
+        // legacy submission known" rather than lose the plan.
+        XCTAssertFalse(plan.hasLegacyInFlightSubmission)
     }
 
     func testDecodesDelegationStatusWithTerminalAbsent() throws {
@@ -1066,7 +1071,8 @@ final class VotingTypesTests: XCTestCase {
       "unrostered_intents": [9],
       "immediate_share_key": null,
       "immediate_share_confirmed": false,
-      "all_decided": false
+      "all_decided": false,
+      "has_legacy_in_flight_submission": true
     }
     """
 }

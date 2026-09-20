@@ -33,7 +33,7 @@ use zcash_voting::storage::VotingDb;
 
 use super::errors::{VotingResultExt, internal, invalid_input};
 use super::helpers::voting_network;
-use super::wire::{KeystoneSignatureRecordDto, RoundSummaryDto, plan_view};
+use super::wire::{KeystoneSignatureRecordDto, RoundPlanDto, RoundSummaryDto, plan_view};
 
 /// Opaque handle over one open voting sidecar database.
 ///
@@ -277,10 +277,71 @@ pub(super) fn round_plan(
     h: &VotingDatabaseHandle,
     round_id: &str,
     proposal_ids: &[u32],
-) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
+) -> anyhow::Result<RoundPlanDto> {
     let db = h.scoped()?;
     let plan = zcash_voting::session::resume_plan(&db, round_id, proposal_ids).ffi()?;
-    plan_view(plan)
+    let has_legacy_in_flight_submission = legacy_in_flight(&db, round_id, &plan)?;
+    Ok(RoundPlanDto {
+        plan: plan_view(plan)?,
+        has_legacy_in_flight_submission,
+    })
+}
+
+/// Whether `round_id` holds a submission *this wallet built* and an older SDK
+/// dispatched without ever seeing it confirmed.
+///
+/// A sidecar first gains the lifecycle table at schema 18, and the migration
+/// that adds it imports none of the evidence beside it: a delegation or a vote
+/// that carried only a transaction hash keeps carrying only that. The crate's
+/// typed phases project such a row as `Submitted`, which the 5.x lifecycle
+/// never produces for work it reserved itself — anything it owns projects as
+/// `SubmissionManaged`, `SubmittedWithoutHash`, `SubmissionRejected` or
+/// `Confirmed` — so `Submitted` is the evidence an older build left behind.
+///
+/// It is not, on its own, evidence of a *resumable* dispatch. A delegation
+/// imported from a capability package reaches the same phase from a hash
+/// somebody else broadcast, and carries none of the material a dispatch is
+/// made of: no note selection, no PCZT, no proof. The lifecycle adopts that
+/// hash on its first pass and never asks the voter for a signer or sends the
+/// transaction again, so there is nothing to re-dispatch and the round is
+/// driven normally. Those bundles are excluded, using the distinction the
+/// planner already made: it is the crate's own classifier that decides whether
+/// a bundle's delegation work is `AdvanceImportedDelegation`, and this reads
+/// that decision off the typed plan rather than re-deriving it from columns.
+///
+/// The vote half has no such exception: a vote reaching `Submitted` was built
+/// and cast by this wallet either way.
+///
+/// This is computed here rather than read off the plan because the plan's JSON
+/// view carries no per-vote phase at all, so a host could not tell a legacy
+/// vote from a lifecycle-owned one.
+pub(super) fn legacy_in_flight(
+    db: &VotingDb,
+    round_id: &str,
+    plan: &zcash_voting::session::RoundPlan,
+) -> anyhow::Result<bool> {
+    use zcash_voting::phases::{DelegationPhase, VotePhase};
+    use zcash_voting::session::NextStep;
+
+    // `NextStep` is `#[non_exhaustive]`, so this matches the one variant it
+    // needs and ignores the rest by design: a step kind added upstream is not
+    // an imported delegation until something says it is.
+    let imported: std::collections::BTreeSet<u32> = plan
+        .next_steps
+        .iter()
+        .filter_map(|step| match step {
+            NextStep::AdvanceImportedDelegation { bundle_index } => Some(*bundle_index),
+            _ => None,
+        })
+        .collect();
+
+    let delegations = db.delegation_phases(round_id).ffi()?;
+    let votes = db.vote_phases(round_id).ffi()?;
+    Ok(delegations.iter().any(|(bundle_index, phase)| {
+        matches!(phase, DelegationPhase::Submitted) && !imported.contains(bundle_index)
+    }) || votes
+        .iter()
+        .any(|(_, _, phase)| matches!(phase, VotePhase::Submitted)))
 }
 
 /// Rounds of this wallet with helper-share work still outstanding.
@@ -411,6 +472,9 @@ pub(super) fn keystone_signatures(
 mod tests {
     use super::*;
     use crate::voting::test_support::{hex_round_id, open_memory_store, synthetic_round_params};
+    // The two crate enums the characterization assertions below name, aliased
+    // because they read as the plan's own vocabulary at the assertion site.
+    use zcash_voting::wire::{NextStepKind as Step, WorkflowPhaseView as Phase};
 
     #[test]
     fn open_rejects_unknown_network_and_requires_wallet_id() {
@@ -453,7 +517,9 @@ mod tests {
         db.ensure_round(zcash_voting::Network::Mainnet, &params, None)
             .unwrap();
 
-        let plan = round_plan(&handle, &hex_round_id(0x12), &[1, 2]).unwrap();
+        let plan = round_plan(&handle, &hex_round_id(0x12), &[1, 2])
+            .unwrap()
+            .plan;
         assert_eq!(plan.round_id, hex_round_id(0x12));
         assert!(!plan.needs_bundle_setup);
         assert!(plan.needs_draft_setup);
@@ -466,7 +532,9 @@ mod tests {
         )
         .unwrap();
 
-        let plan = round_plan(&handle, &hex_round_id(0x12), &[1, 2]).unwrap();
+        let plan = round_plan(&handle, &hex_round_id(0x12), &[1, 2])
+            .unwrap()
+            .plan;
         assert_eq!(plan.round_id, hex_round_id(0x12));
         assert!(plan.needs_bundle_setup);
     }
@@ -480,7 +548,7 @@ mod tests {
     fn round_plan_for_unknown_round_is_an_idle_plan_and_a_bad_roster_is_a_json_error() {
         let handle = open_memory_store(crate::NETWORK_ID_MAINNET, "w");
 
-        let plan = round_plan(&handle, &hex_round_id(0xfe), &[1]).unwrap();
+        let plan = round_plan(&handle, &hex_round_id(0xfe), &[1]).unwrap().plan;
         assert_eq!(plan.round_id, hex_round_id(0xfe));
         assert!(plan.next_steps.is_empty());
         assert!(plan.needs_draft_setup);
@@ -650,6 +718,466 @@ mod tests {
                 .unwrap()
         };
         (count("rounds"), count("bundles"))
+    }
+
+    // MARK: the boundary at the upgrade
+
+    /// The state an older SDK left one round in, as a schema-13 sidecar holds
+    /// it.
+    ///
+    /// Every variant is written with a raw connection against the schema-13
+    /// DDL, because that is the point: these rows predate the lifecycle table,
+    /// which the sidecar first gains at schema 18, and the migration adds that
+    /// table empty rather than importing the evidence beside it. A transaction
+    /// hash on a bundle or a vote is therefore all that is left of a dispatch
+    /// the older build made.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LegacyFixture {
+        /// The ballot was decided and the bundle laid out; nothing was built,
+        /// signed or dispatched.
+        SetUpOnly,
+        /// The delegation was dispatched and never seen confirmed: a
+        /// transaction hash on the bundle and no VAN position.
+        DelegationSubmitted,
+        /// A delegation imported from a capability package and not yet seen
+        /// confirmed: a transaction hash somebody else broadcast, with none of
+        /// the local material a wallet's own delegation carries.
+        ///
+        /// The same columns `zcash_voting`'s `import_delegation_capability`
+        /// writes, which the previously released SDK exposed as
+        /// `zcashlc_voting_restore_recovered_delegation`, so a schema-13
+        /// sidecar can hold exactly this.
+        CapabilityImported,
+        /// The delegation confirmed, and the vote was dispatched and never
+        /// seen confirmed: a transaction hash on the vote, no tree position,
+        /// and the recovery material the older build persisted before it
+        /// dispatched.
+        VoteSubmitted,
+        /// [`Self::VoteSubmitted`] with the recovery material missing. The
+        /// older build's call order wrote that column before it recorded a
+        /// hash, so this is not a shape it produced, and 5.1.0 refuses to plan
+        /// it at all.
+        VoteSubmittedWithoutRecovery,
+        /// Everything the older build dispatched was confirmed, shares
+        /// included.
+        AllConfirmed,
+    }
+
+    const LEGACY_WALLET: &str = "legacy-wallet";
+    /// The one proposal the fixture's voter chose; 1 and 3 are skipped, so the
+    /// roster is fully decided before anything is dispatched.
+    const LEGACY_PROPOSAL: u32 = 2;
+    const LEGACY_CHOICE: u32 = 1;
+    const LEGACY_ROSTER: &[u32] = &[1, 2, 3];
+
+    /// A schema-13 sidecar in `fixture`'s state, migrated by opening it.
+    ///
+    /// The returned directory must outlive the handle: the sidecar is a real
+    /// file, both because the migration is what this exercises and because
+    /// every handle on one path shares a root, so each fixture needs a path of
+    /// its own.
+    fn migrated_schema13_sidecar(
+        fixture: LegacyFixture,
+    ) -> (VotingDatabaseHandle, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let round_id = hex_round_id(0x61);
+        let imported_capability = matches!(fixture, LegacyFixture::CapabilityImported);
+        let dispatched_delegation =
+            !matches!(fixture, LegacyFixture::SetUpOnly) && !imported_capability;
+        let confirmed_delegation = matches!(
+            fixture,
+            LegacyFixture::VoteSubmitted
+                | LegacyFixture::VoteSubmittedWithoutRecovery
+                | LegacyFixture::AllConfirmed
+        );
+        let dispatched_vote = confirmed_delegation;
+        let confirmed_vote = matches!(fixture, LegacyFixture::AllConfirmed);
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open fixture");
+            conn.execute_batch(include_str!("fixtures/schema13.sql"))
+                .expect("schema 13 ddl");
+            conn.execute(
+                "INSERT INTO rounds(round_id, wallet_id, network, snapshot_height, \
+                 ea_pk, nc_root, nullifier_imt_root, created_at) \
+                 VALUES (?1, ?2, 'mainnet', 4200000, ?3, ?3, ?3, 1)",
+                (&round_id, LEGACY_WALLET, vec![0x61u8; 32]),
+            )
+            .expect("round row");
+
+            // The ballot the voter completed before anything reached the
+            // chain: one choice and two deliberate skips, so the roster the
+            // plan is read against is fully decided.
+            for (proposal_id, skipped, choice) in [
+                (1u32, 1i64, None),
+                (LEGACY_PROPOSAL, 0, Some(i64::from(LEGACY_CHOICE))),
+                (3, 1, None),
+            ] {
+                conn.execute(
+                    "INSERT INTO ballot_intent(round_id, wallet_id, proposal_id, skipped, \
+                     choice, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1)",
+                    (&round_id, LEGACY_WALLET, proposal_id, skipped, choice),
+                )
+                .expect("ballot intent row");
+            }
+
+            if imported_capability {
+                // Exactly the columns the crate's `import_delegation_capability`
+                // writes: the package's commitments, its weight, and the
+                // transaction hash of a delegation somebody else broadcast.
+                // Every field a locally built bundle carries stays NULL,
+                // `note_positions_blob` included, which is how the planner
+                // recognizes the import.
+                conn.execute(
+                    "INSERT INTO bundles(round_id, wallet_id, bundle_index, van_comm_rand, \
+                     gov_comm, total_note_value, address_index, delegation_tx_hash) \
+                     VALUES (?1, ?2, 0, ?3, ?4, 12500000, 0, 'dtx')",
+                    (&round_id, LEGACY_WALLET, vec![0x63u8; 32], vec![0x64u8; 32]),
+                )
+                .expect("imported bundle row");
+            } else {
+                // The note selection a locally laid-out bundle always persists
+                // — two note positions as little-endian `u64`s, with an opaque
+                // 32-byte identity digest each. It has to be here: the planner
+                // reads a bundle whose `note_positions_blob` is NULL as an
+                // imported delegation capability, which is somebody else's
+                // delegation already on the chain, not a dispatch of this
+                // wallet's own.
+                //
+                // Deliberately out of scope: `van_comm_rand`, `gov_comm` and
+                // the rest of the proving and signing material a bundle that
+                // really built a governance transaction carries. Nothing any
+                // projection under test reads touches them, so the row is the
+                // phase evidence rather than a complete picture of a
+                // dispatched bundle.
+                let note_positions = [17u64, 23]
+                    .iter()
+                    .flat_map(|position| position.to_le_bytes())
+                    .collect::<Vec<u8>>();
+                let note_identity_hashes = [0x81u8, 0x82]
+                    .iter()
+                    .flat_map(|tag| [*tag; 32])
+                    .collect::<Vec<u8>>();
+                conn.execute(
+                    "INSERT INTO bundles(round_id, wallet_id, bundle_index, note_positions_blob, \
+                     note_identity_hashes_blob, total_note_value, address_index, pczt_sighash, \
+                     delegation_tx_hash, van_leaf_position) \
+                     VALUES (?1, ?2, 0, ?3, ?4, 12500000, 0, ?5, ?6, ?7)",
+                    (
+                        &round_id,
+                        LEGACY_WALLET,
+                        note_positions,
+                        note_identity_hashes,
+                        dispatched_delegation.then(|| vec![0x62u8; 32]),
+                        dispatched_delegation.then_some("dtx"),
+                        confirmed_delegation.then_some(7i64),
+                    ),
+                )
+                .expect("bundle row");
+            }
+
+            // A dispatched delegation was proved first, and the proof row is
+            // what says so.
+            if dispatched_delegation {
+                conn.execute(
+                    "INSERT INTO proofs(round_id, wallet_id, bundle_index, success, created_at) \
+                     VALUES (?1, ?2, 0, 1, 1)",
+                    (&round_id, LEGACY_WALLET),
+                )
+                .expect("proof row");
+            }
+
+            if dispatched_vote {
+                let recovery = (fixture != LegacyFixture::VoteSubmittedWithoutRecovery)
+                    .then(|| legacy_vote_recovery_json(&round_id, confirmed_vote));
+                conn.execute(
+                    "INSERT INTO votes(round_id, wallet_id, bundle_index, proposal_id, choice, \
+                     commitment, created_at, tx_hash, vc_tree_position, commitment_bundle_json) \
+                     VALUES (?1, ?2, 0, ?3, ?4, ?5, 1, 'vtx', ?6, ?7)",
+                    (
+                        &round_id,
+                        LEGACY_WALLET,
+                        LEGACY_PROPOSAL,
+                        LEGACY_CHOICE,
+                        vec![0xCCu8; 16],
+                        confirmed_vote.then_some(LEGACY_VC_TREE_POSITION as i64),
+                        recovery,
+                    ),
+                )
+                .expect("vote row");
+            }
+
+            // A confirmed vote owes its helper shares, so "everything
+            // confirmed" has to include them or the round is not finished.
+            if confirmed_vote {
+                for share_index in 0..2u32 {
+                    conn.execute(
+                        "INSERT INTO share_delegations(round_id, wallet_id, bundle_index, \
+                         proposal_id, share_index, sent_to_urls, nullifier, confirmed, \
+                         submit_at, created_at) \
+                         VALUES (?1, ?2, 0, ?3, ?4, '[\"https://helper.example/\"]', ?5, 1, 0, 1)",
+                        (
+                            &round_id,
+                            LEGACY_WALLET,
+                            LEGACY_PROPOSAL,
+                            share_index,
+                            vec![0x70u8 + share_index as u8; 32],
+                        ),
+                    )
+                    .expect("share row");
+                }
+            }
+
+            conn.pragma_update(None, "user_version", 13)
+                .expect("stamp version 13");
+        }
+
+        let handle =
+            VotingDatabaseHandle::open(path.to_str().expect("utf-8"), crate::NETWORK_ID_MAINNET)
+                .expect("a schema-13 sidecar opens and migrates");
+        handle.set_wallet_id(LEGACY_WALLET).expect("wallet id");
+        (handle, round_id, dir)
+    }
+
+    /// The tree position a confirmed fixture vote carries.
+    const LEGACY_VC_TREE_POSITION: u64 = 42;
+
+    /// The recovery material the older build persisted when it committed a
+    /// vote, in the crate's own `zcash_voting_vote_recovery_v1` JSON.
+    ///
+    /// Written through the crate's serializer rather than by hand, so the
+    /// bytes in the fixture are the bytes the format actually produces and the
+    /// planner can parse them back.
+    fn legacy_vote_recovery_json(round_id: &str, confirmed: bool) -> String {
+        let share =
+            |tag: u8, share_index: u32, plaintext_value: u64| zcash_voting::types::EncryptedShare {
+                c1: vec![tag; 32],
+                c2: vec![tag + 1; 32],
+                share_index,
+                plaintext_value,
+                randomness: vec![tag + 2; 32],
+            };
+        zcash_voting::vote::serialize_recovery(&zcash_voting::vote::VoteRecoveryBundle {
+            vote_round_id: round_id.to_string(),
+            bundle_index: 0,
+            proposal_id: LEGACY_PROPOSAL,
+            vote_decision: LEGACY_CHOICE,
+            anchor_height: 123,
+            vc_tree_position: if confirmed {
+                LEGACY_VC_TREE_POSITION
+            } else {
+                0
+            },
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![share(0x21, 0, 5), share(0x31, 1, 6)],
+            share_blinds: vec![[0x41; 32], [0x42; 32]],
+            share_comms: vec![[0x51; 32], [0x52; 32]],
+            batch: None,
+        })
+        .expect("recovery json")
+    }
+
+    /// The `kind` of every step a plan owes, in order.
+    fn step_kinds(plan: &RoundPlanDto) -> Vec<zcash_voting::wire::NextStepKind> {
+        plan.plan.next_steps.iter().map(|step| step.kind).collect()
+    }
+
+    /// The phase of every bundle's delegation, in bundle order.
+    fn delegation_phases(plan: &RoundPlanDto) -> Vec<zcash_voting::wire::WorkflowPhaseView> {
+        plan.plan
+            .delegation_statuses
+            .iter()
+            .map(|status| status.phase)
+            .collect()
+    }
+
+    /// A delegation the older build dispatched and never saw confirmed: the
+    /// bundle carries a transaction hash and no VAN position.
+    ///
+    /// Everything asserted past the flag is characterization — upstream
+    /// specifies no outcome for resuming this, so what is pinned is what
+    /// 5.1.0 in fact says. It says the round is ordinary work: an
+    /// `advance_delegation` step that would re-dispatch the same transaction
+    /// bytes, with the cast queued behind it.
+    #[test]
+    fn a_migrated_round_with_an_unconfirmed_legacy_delegation_reports_legacy_in_flight() {
+        let (handle, round_id, _dir) =
+            migrated_schema13_sidecar(LegacyFixture::DelegationSubmitted);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+
+        assert!(plan.has_legacy_in_flight_submission);
+        assert_eq!(delegation_phases(&plan), [Phase::SubmittedDelegation]);
+        assert_eq!(step_kinds(&plan), [Step::AdvanceDelegation, Step::CastVote]);
+        let json = serde_json::to_value(&plan).expect("json");
+        assert_eq!(json["primary_action"], "delegate");
+        assert_eq!(
+            json["delegation_statuses"][0]["phase"],
+            "submitted_delegation"
+        );
+        assert!(plan.plan.has_in_flight_delegation);
+        assert!(plan.plan.pending_recovery);
+        assert!(plan.plan.blocking_recovery);
+    }
+
+    /// A vote the older build dispatched and never saw confirmed, behind a
+    /// delegation that did confirm.
+    ///
+    /// The plan carries no vote phase at all, which is why the flag cannot be
+    /// derived from it: the only thing distinguishing this from a vote the
+    /// 5.x lifecycle is tracking is the `advance_vote` step, and a lifecycle
+    /// vote under recovery plans the same step.
+    #[test]
+    fn a_migrated_round_with_an_unconfirmed_legacy_vote_reports_legacy_in_flight() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::VoteSubmitted);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+
+        assert!(plan.has_legacy_in_flight_submission);
+        assert_eq!(delegation_phases(&plan), [Phase::Confirmed]);
+        assert_eq!(step_kinds(&plan), [Step::AdvanceVote]);
+        let json = serde_json::to_value(&plan).expect("json");
+        assert_eq!(json["primary_action"], "vote");
+        assert_eq!(json["recovered_vote_work"][0]["tx_hash"], "vtx");
+        assert!(plan.plan.needs_vote_polling);
+        assert!(plan.plan.pending_recovery);
+        assert!(plan.plan.blocking_recovery);
+    }
+
+    #[test]
+    fn a_migrated_round_whose_legacy_submissions_all_confirmed_does_not() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::AllConfirmed);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+
+        assert!(!plan.has_legacy_in_flight_submission);
+        assert_eq!(delegation_phases(&plan), [Phase::Confirmed]);
+        assert!(step_kinds(&plan).is_empty());
+        assert_eq!(
+            serde_json::to_value(&plan).expect("json")["primary_action"],
+            "done"
+        );
+        assert!(plan.plan.completed_for_display);
+        assert!(!plan.plan.pending_recovery);
+        assert!(!plan.plan.blocking_recovery);
+    }
+
+    /// A delegation imported from a capability is NOT a legacy in-flight
+    /// submission, although its phase is the same `Submitted`.
+    ///
+    /// The row carries a transaction hash somebody else broadcast and none of
+    /// the material a dispatch is made of — no note selection, no PCZT, no
+    /// proof — so there is nothing here to re-dispatch. The lifecycle adopts
+    /// the package hash on its first pass and never asks the voter for a
+    /// signer, which is what `advance_imported_delegation` is for, so the harm
+    /// the flag exists to prevent cannot happen. Firing it would do harm
+    /// instead: the host would make the round display-only and the voter could
+    /// never cast, over work that finishes normally.
+    #[test]
+    fn a_migrated_round_whose_delegation_was_imported_from_a_capability_does_not() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::CapabilityImported);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+
+        assert!(!plan.has_legacy_in_flight_submission);
+        // The phase is the same one a legacy dispatch reaches, which is why
+        // the phase alone cannot decide this.
+        assert_eq!(delegation_phases(&plan), [Phase::SubmittedDelegation]);
+        assert_eq!(step_kinds(&plan), [Step::AdvanceImportedDelegation]);
+        let json = serde_json::to_value(&plan).expect("json");
+        assert_eq!(json["primary_action"], "delegate");
+        assert_eq!(
+            json["recovered_delegation_work"][0]["kind"],
+            "advance_imported_delegation"
+        );
+        // The voter is never asked for signing material, because the
+        // transaction is already broadcast and this wallet holds no key that
+        // could re-sign it — the reason there is nothing here to re-dispatch.
+        assert!(!plan.plan.needs_delegation_signing);
+        assert!(plan.plan.delegation_bundles_needing_signing.is_empty());
+        assert!(plan.plan.has_in_flight_delegation);
+        // The cast waits for the imported delegation to confirm, so this round
+        // is real work the host must be able to drive to the end.
+        assert!(plan.plan.pending_recovery);
+        assert_eq!(plan.plan.delegation_bundles_needing_work, vec![0]);
+    }
+
+    /// A round the older build only set up reports `false` and is ordinary
+    /// work: nothing of it ever reached the chain, so there is nothing for the
+    /// 5.x lifecycle to have failed to adopt.
+    #[test]
+    fn a_migrated_round_the_older_build_only_set_up_does_not() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::SetUpOnly);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+
+        assert!(!plan.has_legacy_in_flight_submission);
+        assert_eq!(delegation_phases(&plan), [Phase::Prepared]);
+        assert_eq!(step_kinds(&plan), [Step::Delegate, Step::CastVote]);
+        assert_eq!(
+            serde_json::to_value(&plan).expect("json")["primary_action"],
+            "delegate"
+        );
+        assert!(!plan.plan.has_in_flight_delegation);
+    }
+
+    /// A vote row with a transaction hash and no recovery material cannot be
+    /// planned at all, so the flag is never reached for one.
+    ///
+    /// `commitment_bundle_json` is nullable in the schema-13 DDL, and the
+    /// older build's own submission call did not guard the ordering, so the
+    /// combination was prevented by that build's call order — committing the
+    /// vote, which wrote the column, before recording a hash — rather than by
+    /// anything enforced in storage. What is pinned here is 5.1.0's answer to
+    /// it either way: the round is refused rather than planned, so no host can
+    /// read a flag off it.
+    #[test]
+    fn a_migrated_vote_with_a_hash_and_no_recovery_material_cannot_be_planned() {
+        let (handle, round_id, _dir) =
+            migrated_schema13_sidecar(LegacyFixture::VoteSubmittedWithoutRecovery);
+        let err = round_plan(&handle, &round_id, LEGACY_ROSTER).unwrap_err();
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(
+            serde_json::to_value(view.kind).unwrap(),
+            "invalid_input",
+            "{}",
+            view.message
+        );
+        assert!(
+            view.message
+                .contains("submitted vote without recovery material"),
+            "{}",
+            view.message
+        );
+    }
+
+    #[test]
+    fn a_round_this_sdk_created_itself_reports_no_legacy_in_flight_submission() {
+        let handle = open_memory_store(crate::NETWORK_ID_MAINNET, "w");
+        let params = synthetic_round_params(0x62, 123);
+        handle
+            .scoped()
+            .unwrap()
+            .ensure_round(zcash_voting::Network::Mainnet, &params, None)
+            .unwrap();
+        let plan = round_plan(&handle, &hex_round_id(0x62), LEGACY_ROSTER).expect("plan");
+        assert!(!plan.has_legacy_in_flight_submission);
+    }
+
+    #[test]
+    fn the_flag_rides_on_the_crate_plan_keys_rather_than_nesting_them() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::VoteSubmitted);
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER).expect("plan");
+        let json = serde_json::to_value(&plan).expect("json");
+        assert_eq!(json["round_id"], round_id);
+        assert!(json["primary_action"].is_string());
+        assert_eq!(json["has_legacy_in_flight_submission"], true);
     }
 
     #[test]

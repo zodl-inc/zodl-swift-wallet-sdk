@@ -314,6 +314,29 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     public let unrosteredIntents: [UInt32]
     public let immediateShareConfirmed: Bool
     public let allDecided: Bool
+    /// True when the round holds a delegation or a vote this wallet built that
+    /// an older SDK dispatched and never saw confirmed.
+    ///
+    /// Upgrading a wallet migrates its voting database in place and keeps
+    /// every row, but it does not hand such a transaction to the chain
+    /// lifecycle this SDK drives, which owns only the submissions it reserved
+    /// itself. Running the round anyway plans an advance step and re-dispatches
+    /// the same transaction bytes, and nothing is promised about how that ends,
+    /// so treat the round as display-only: show what it recorded and do not
+    /// drive it. Share tracking is unaffected.
+    ///
+    /// A delegation imported from a capability package is deliberately not
+    /// covered. Its transaction was broadcast elsewhere and this wallet holds
+    /// no key that could re-sign it, so the lifecycle adopts the hash and
+    /// never dispatches anything again: such a round reports `false` and is
+    /// driven normally.
+    ///
+    /// Reported by ``VotingRoundSession/plan()``,
+    /// ``VotingRoundSession/setBallotIntents(_:)`` and
+    /// ``VotingRustBackend/roundPlan(roundId:proposalIds:)``. The plans
+    /// embedded in run reports and in the event stream do not carry it and
+    /// decode as `false`, so gate on a plan read from one of those three.
+    public let hasLegacyInFlightSubmission: Bool
 
     private enum CodingKeys: String, CodingKey {
         case roundId = "round_id"
@@ -339,12 +362,18 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         case unrosteredIntents = "unrostered_intents"
         case immediateShareConfirmed = "immediate_share_confirmed"
         case allDecided = "all_decided"
+        case hasLegacyInFlightSubmission = "has_legacy_in_flight_submission"
     }
 
     // The three per-bundle lists and `unrosteredIntents` are
     // `#[serde(default)]` upstream: a payload that omits one must still yield a
     // plan, because losing the whole plan over a missing list is the worse
     // failure. Everything else the planner always writes.
+    //
+    // `hasLegacyInFlightSubmission` is absent for the same reason and defaults
+    // the same way: only the three calls its documentation names add it to the
+    // plan, and a plan that arrives without it says nothing about a legacy
+    // submission rather than failing to decode.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         roundId = try container.decode(String.self, forKey: .roundId)
@@ -370,6 +399,7 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         unrosteredIntents = try container.decodeIfPresent([UInt32].self, forKey: .unrosteredIntents) ?? []
         immediateShareConfirmed = try container.decode(Bool.self, forKey: .immediateShareConfirmed)
         allDecided = try container.decode(Bool.self, forKey: .allDecided)
+        hasLegacyInFlightSubmission = try container.decodeIfPresent(Bool.self, forKey: .hasLegacyInFlightSubmission) ?? false
     }
 }
 

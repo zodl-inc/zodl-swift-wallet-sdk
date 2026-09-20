@@ -461,6 +461,35 @@ flight. The same rule applies to the event stream: it is a best-effort narration
 events under load, and the `VotingRoundRunReport` a call returns is the authoritative account of what
 that call did.
 
+### Rounds caught mid-submission by the upgrade
+
+Opening an existing sidecar migrates it in place to schema 24 and keeps every row. What the
+migration does not do is adopt a transaction an older SDK already dispatched: the 5.x chain
+lifecycle owns only submissions it reserved itself. A delegation or vote **this wallet built** that
+had a transaction hash but no confirmation when the app was updated therefore has no lifecycle row,
+and upstream does not support resuming it. If the round is run anyway, the driver plans an advance
+step for it and re-dispatches the same transaction bytes; the nullifier makes a double count
+impossible, but nothing is promised about how that ends.
+
+`VotingRoundPlan.hasLegacyInFlightSubmission` is `true` for exactly those rounds. Check it on the
+plan you read when the round is opened, before bundle setup, precompute or `run`, and treat such a
+round as display-only: show what it recorded, and do not drive it. Share tracking is unaffected and
+can still confirm shares the older build delivered. Rounds the older build only set up, and rounds
+whose older submissions were all confirmed, report `false` and are driven normally.
+
+A delegation **imported from a capability package** is not covered by the flag, although its
+recorded phase is the same. Its transaction was broadcast by whoever exported the capability, and
+this wallet holds no delegation key that could re-sign it: the lifecycle adopts the hash on its
+first pass and never dispatches anything again. There is nothing to re-dispatch, so such a round
+reports `false` and must be driven normally — the plan's step for it is
+`advanceImportedDelegation`, and the ballot cannot be cast until it confirms. A host that treated it
+as display-only would strand the voter.
+
+The three calls that answer it are `VotingRoundSession.plan()`,
+`VotingRoundSession.setBallotIntents(_:)` and `VotingRustBackend.roundPlan(roundId:proposalIds:)`.
+The plans embedded in a `VotingRoundRunReport` and in the event stream do not carry it and read as
+`false`, so read one of those three rather than a plan that arrived with a report.
+
 ### Rollout: upgraded chains only
 
 The 4.0 delegation circuit differs from the 3.x one, and there is no fallback and no negotiation: a
