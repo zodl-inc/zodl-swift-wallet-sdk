@@ -98,7 +98,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundle is not proof its transaction was submitted or confirmed), `VotingChainSubmissionState`,
   `VotingChainSubmissionStateEvidence`, `VotingChainSubmissionFailureState`, `VotingVoteCommitStage`
   and `VotingResubmittedShare`. Every one of these fields decodes leniently, defaulting to empty or
-  absent when a payload omits it, so a report an older core produced still decodes.
+  absent when a payload omits it, so a report an older core produced still decodes — including a
+  diagnostic that carries a message without a classification, which reads as a `nil`
+  `diagnosticKind` beside an intact `diagnosticMessage` rather than failing the whole outcome.
 - `VotingRoundPlan.hasLegacyInFlightSubmission` reports a round holding a delegation or a vote this
   wallet built that an older SDK dispatched and never saw confirmed. Upgrading keeps every row of
   the voting database, but the chain lifecycle this SDK drives owns only the submissions it reserved

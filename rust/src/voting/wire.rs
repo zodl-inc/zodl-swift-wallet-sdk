@@ -1077,11 +1077,15 @@ mod tests {
             skipped_suffix_value_zatoshi: 70,
         };
         let json = serde_json::to_value(BundleLayoutDto::from(layout)).expect("json");
+        assert_eq!(json["bundle_count"], 2);
+        assert_eq!(json["eligible_weight"], 900);
+        assert_eq!(json["dropped_count"], 1);
+        assert_eq!(json["privacy_trim_dropped_bundles"], 3);
+        assert_eq!(json["privacy_trim_dropped_notes"], 11);
         assert_eq!(json["privacy_trim_dropped_value_zatoshi"], 4_200);
         assert_eq!(json["skipped_suffix_bundles"], 1);
         assert_eq!(json["skipped_suffix_notes"], 5);
         assert_eq!(json["skipped_suffix_value_zatoshi"], 70);
-        assert_eq!(json["bundle_count"], 2);
     }
 
     /// Pins the top-level keys of the crate's own `RoundRunReportView` JSON,

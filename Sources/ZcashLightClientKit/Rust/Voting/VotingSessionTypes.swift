@@ -405,11 +405,12 @@ public struct VotingBundleLayout: Equatable, Sendable, Decodable {
     /// Raw value of the notes the privacy trim excludes from delegation, not
     /// their bundle-quantized voting weight. Surface that distinction.
     public let privacyTrimDroppedValueZatoshi: UInt64
-    /// Trailing bundles a host removed from this round with
-    /// `deleteSkippedBundles(roundId:keepCount:)`: how many bundles, how many
-    /// notes they held, and their raw value.
+    /// How many trailing bundles a host removed from this round with
+    /// `deleteSkippedBundles(roundId:keepCount:)`.
     public let skippedSuffixBundles: UInt32
+    /// How many notes those removed trailing bundles held.
     public let skippedSuffixNotes: UInt32
+    /// The raw value of those notes, not their bundle-quantized voting weight.
     public let skippedSuffixValueZatoshi: UInt64
 
     private enum CodingKeys: String, CodingKey {
@@ -451,11 +452,12 @@ public struct VotingEligibilityReport: Equatable, Sendable, Decodable {
     /// Raw value of the notes the privacy trim excludes from delegation, not
     /// their bundle-quantized voting weight. Surface that distinction.
     public let privacyTrimDroppedValueZatoshi: UInt64
-    /// Trailing bundles a host removed from this round with
-    /// `deleteSkippedBundles(roundId:keepCount:)`: how many bundles, how many
-    /// notes they held, and their raw value.
+    /// How many trailing bundles a host removed from this round with
+    /// `deleteSkippedBundles(roundId:keepCount:)`.
     public let skippedSuffixBundles: UInt32
+    /// How many notes those removed trailing bundles held.
     public let skippedSuffixNotes: UInt32
+    /// The raw value of those notes, not their bundle-quantized voting weight.
     public let skippedSuffixValueZatoshi: UInt64
 
     private enum CodingKeys: String, CodingKey {

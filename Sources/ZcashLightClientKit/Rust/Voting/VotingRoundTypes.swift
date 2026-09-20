@@ -167,7 +167,9 @@ public enum VotingChainDiagnosticKind: String, Equatable, Sendable, Decodable {
 /// (``VotingChainOutcomeKind/submittedWithoutHash`` and
 /// ``VotingChainOutcomeKind/rejected``), which schedule no further work.
 /// `diagnosticKind` is present alongside it for the same outcomes: branch on
-/// the kind, never on the message text.
+/// the kind, never on the message text. It is `nil` both when there is no
+/// diagnostic at all and when one carries a message without a classification,
+/// so a host that must tell those apart reads `diagnosticMessage` as well.
 public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
     public let kind: VotingChainOutcomeKind
     /// How a confirmation was established: `hash` or `tree`.
@@ -190,8 +192,15 @@ public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
     }
 
     /// The nested diagnostic: both its kind and its message cross into Swift.
+    ///
+    /// `kind` is optional so that a diagnostic which carries only a message
+    /// still decodes, leaving `diagnosticKind` `nil` and `diagnosticMessage`
+    /// intact. Requiring it would fail the whole chain outcome — the
+    /// transaction hash, the tree positions, everything — over one absent
+    /// classification, which is the opposite of what every other new field on
+    /// this surface does.
     private struct Diagnostic: Decodable {
-        let kind: VotingChainDiagnosticKind
+        let kind: VotingChainDiagnosticKind?
         let message: String
     }
 

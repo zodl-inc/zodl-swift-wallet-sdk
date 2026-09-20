@@ -181,6 +181,22 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertNil(none.diagnosticKind)
     }
 
+    /// A diagnostic without a `kind` still decodes, and still carries its
+    /// message. Every other new field on this surface defaults rather than
+    /// failing the whole decode, and the kind was the one that did not: a
+    /// payload from a core that records the message alone would have cost the
+    /// host the entire chain outcome, message included.
+    func testDecodesChainOutcomeDiagnosticWithoutAKind() throws {
+        let outcome = try decode(VotingChainSubmissionOutcome.self, from: """
+        {"kind": "rejected", "vote_commitment_positions": [],
+         "diagnostic": {"message": "the chain refused it"}}
+        """)
+
+        XCTAssertNil(outcome.diagnosticKind)
+        XCTAssertEqual(outcome.diagnosticMessage, "the chain refused it")
+        XCTAssertEqual(outcome.kind, .rejected)
+    }
+
     func testDecodesStepFailureChainContext() throws {
         let failure = try decode(VotingRoundStepFailure.self, from: """
         {"kind": "transport", "step": null, "message": "m",
@@ -986,6 +1002,8 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertTrue(report.failures.isEmpty)
         XCTAssertTrue(report.skippedBundles.isEmpty)
         XCTAssertTrue(report.chainOutcomes.isEmpty)
+        XCTAssertTrue(report.shareDeliveries.isEmpty)
+        XCTAssertTrue(report.delegations.isEmpty)
     }
 
     func testDecodesShareTrackingRunReportWithDefaultedListsAbsent() throws {
@@ -1001,6 +1019,8 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertTrue(report.confirmed.isEmpty)
         XCTAssertTrue(report.unrecoverable.isEmpty)
         XCTAssertTrue(report.failures.isEmpty)
+        XCTAssertTrue(report.resubmitted.isEmpty)
+        XCTAssertTrue(report.ambiguous.isEmpty)
     }
 
     // MARK: - Helpers
