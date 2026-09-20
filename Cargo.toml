@@ -104,12 +104,12 @@ xz2 = { version = "0.1", features = ["static"] }
 
 # Zcash voting
 #
-# Coinholder voting core. Pinned to a COMMIT HASH on upstream main until the
-# 4.0.0 release is published (crates.io tops out at 3.1.0): a hash cannot drift,
-# a branch can. The `lrz` feature selects the librustzcash backend so the crate
-# shares this package's zcash_client_sqlite / orchard family instead of pulling
-# the zakura forks. Move to `version = "=4.0.0"` when the tag exists.
-zcash_voting = { git = "https://github.com/valargroup/zcash_voting.git", rev = "0eccfe692068e394991c143a0bac5ecbff753bf1", default-features = false, features = ["lrz"] }
+# Coinholder voting core: the zcash_voting 5.x round driver. The `lrz` feature
+# selects the librustzcash backend so the crate shares this package's
+# zcash_client_sqlite / orchard family instead of pulling the zakura forks.
+# Pinned exactly, like every voting release this package has taken: the sidecar
+# schema and the wire views move with the crate, so an upgrade is a reviewed change.
+zcash_voting = { version = "=5.1.0", default-features = false, features = ["lrz"] }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.

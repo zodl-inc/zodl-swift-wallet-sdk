@@ -4,7 +4,7 @@
 //! derivations, so neither entry point touches the sidecar database or the
 //! wallet: one draws fresh random material, the other rebuilds the same hotkey
 //! from a secret the caller stored. Both survived the move to the
-//! `zcash_voting` 4.0 round driver unchanged, because the crate's hotkey API
+//! `zcash_voting` 5.x round driver unchanged, because the crate's hotkey API
 //! did.
 
 use anyhow::anyhow;

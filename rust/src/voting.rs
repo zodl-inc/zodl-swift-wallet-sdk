@@ -1,6 +1,6 @@
 //! C FFI for coinholder voting.
 //!
-//! The SDK hosts the `zcash_voting` 4.0 native round driver: it owns the
+//! The SDK hosts the `zcash_voting` 5.x native round driver: it owns the
 //! sidecar handle, a per-round session (executor, driver, delegation pipeline,
 //! chain and helper clients, PIR fleet, cancellation control), the transport
 //! route, the wallet-database opener and the software signer. Orchestration,

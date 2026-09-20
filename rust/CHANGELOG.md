@@ -324,9 +324,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the run completes the remaining dust is now reported where `-1` was returned before, and a
   balance whose canonical split the notes cannot fund now reports the whole spendable balance where
   the call used to fail. It costs one planning pass per remaining run, like the estimate.
-- Coinholder voting hosts the `zcash_voting` 4.0 native round driver with the `lrz` (librustzcash)
-  backend, pinned to upstream commit `0eccfe69` until 4.0.0 is published. Building requires Rust
-  1.91. Opening a voting database migrates schema 13 to 24 in place; older cores cannot reopen it.
+- Coinholder voting hosts the `zcash_voting` 5.x native round driver with the `lrz` (librustzcash)
+  backend, pinned to the published `=5.1.0` release. Building requires Rust 1.91. Opening a voting
+  database migrates schema 13 to 24 in place; older cores cannot reopen it.
   The step-by-step entry points a host used to drive are gone (see Removed) and the session surface
   that replaces them is new (see Added); what changed for the entry points that survive is:
   - `zcashlc_voting_db_open` takes a network id, fixing the voting network for the lifetime of
