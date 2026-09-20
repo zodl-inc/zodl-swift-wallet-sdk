@@ -191,6 +191,24 @@ pub struct VotingSession {
     /// it is the session's own read handle, and the one share tracking drives
     /// the round's shares over.
     database: Arc<zcash_voting::storage::VotingDb>,
+    /// The handle's own shared root, kept alive for as long as this session
+    /// lives.
+    ///
+    /// [`Self::database`] above is [`VotingDatabaseHandle::scoped`] over the
+    /// handle this session was opened from — a distinct `VotingDb` value
+    /// (and so a distinct `Arc` allocation) that shares the same underlying
+    /// connection but is not the registry's root itself. Closing that handle
+    /// (`zcashlc_voting_db_free`) drops its root; nothing forbids doing so
+    /// while a session opened from it is still alive. Without a strong
+    /// reference to the root here, the registry's `Weak` entry for this path
+    /// would then die with the handle, and a later
+    /// `VotingDatabaseHandle::open` on the same path would open a genuine
+    /// second connection instead of finding this session's — exactly the
+    /// contention the registry exists to prevent. Never read again after
+    /// construction: its only job is staying alive for as long as the
+    /// session does.
+    #[allow(dead_code)]
+    root: Arc<zcash_voting::storage::VotingDb>,
     /// Runs the round's steps. Owns the round binding — id, network, roster
     /// and hotkey secret — which is why planning goes through it rather than
     /// through a roster this struct would otherwise have to keep in step.
@@ -250,6 +268,10 @@ impl VotingSession {
         epoch: u64,
     ) -> anyhow::Result<Self> {
         let database = store.scoped()?;
+        // See the `root` field's own doc comment: this keeps the handle's
+        // registry entry alive for as long as this session runs, even if the
+        // handle itself closes first.
+        let root = store.shared_root_handle();
 
         let round_params = inputs.round_params.clone().into_params();
         // Checked here as well as inside the pipeline constructor, so a bad
@@ -369,6 +391,7 @@ impl VotingSession {
 
         Ok(VotingSession {
             database,
+            root,
             executor,
             pipeline,
             pir,
@@ -1569,5 +1592,71 @@ mod tests {
             0,
             "PIR or vote-tree traffic bypassed the session's route"
         );
+    }
+
+    /// A live session keeps its handle's root alive, so a handle that closes
+    /// while the session still runs does not orphan the session's connection:
+    /// a fresh handle opened afterward on the same path must still find it
+    /// rather than opening a second one.
+    ///
+    /// The registry only tracks a `Weak` for each path (see `shared_root` in
+    /// `store.rs`), so nothing but a live strong reference keeps an entry
+    /// resolvable. `database` below is a *scoped* clone — a distinct
+    /// `VotingDb` value, and so a distinct `Arc` allocation, over the same
+    /// underlying connection — not a clone of the handle's root itself, so it
+    /// cannot be what keeps the registry's entry alive; this test asserts the
+    /// session provides that some other way.
+    ///
+    /// A `Weak` (rather than the store's own strong `root` field, which this
+    /// module cannot reach — it is private to `store.rs`) is downgraded from
+    /// [`VotingDatabaseHandle::shared_root_handle`] before the handle closes:
+    /// this test must not itself hold a strong reference across the `drop`,
+    /// or it would keep the entry alive regardless of what the session does,
+    /// masking the very bug this test exists to catch.
+    #[test]
+    fn a_live_session_keeps_its_handles_root_alive_so_a_reopened_handle_shares_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path");
+
+        let store =
+            VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET).expect("open store");
+        store
+            .set_wallet_id("session-keepalive-wallet")
+            .expect("wallet id");
+        let weak_root = Arc::downgrade(&store.shared_root_handle());
+
+        let (_wallet_dir, wallet_path, account_uuid) =
+            temp_wallet_db_with_account(crate::NETWORK_ID_TESTNET);
+        let inputs = synthetic_session_inputs(0x91, &wallet_path, &account_uuid);
+        let hotkey =
+            zcash_voting::hotkey::generate_random_voting_hotkey(zcash_voting::Network::Testnet)
+                .expect("hotkey")
+                .stored_secret()
+                .to_vec();
+        let session = VotingSession::open(
+            &store,
+            inputs,
+            synthetic_binding(2, Some(hotkey)),
+            SdkRoute::direct(),
+            1,
+        )
+        .expect("open session");
+
+        drop(store);
+
+        let kept_alive = weak_root
+            .upgrade()
+            .expect("a live session must keep its handle's root alive after the handle closes");
+
+        let second = VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET)
+            .expect("a fresh handle on the same path must still open while the session lives");
+        assert!(
+            Arc::ptr_eq(&second.shared_root_handle(), &kept_alive),
+            "a handle reopened while a session lives must share the session's root"
+        );
+        // Keeps the session alive to the end of the test on purpose, so it is
+        // still what is holding `kept_alive` up to the assertion above.
+        drop(session);
     }
 }

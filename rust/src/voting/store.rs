@@ -9,12 +9,25 @@
 //! clones the root's connection handle rather than opening one — so there is
 //! nothing to cache and no lifetime to manage beyond this one.
 //!
+//! That is the contract a host is expected to keep, but this module does not
+//! rely on it holding perfectly: every handle opened on one canonical sidecar
+//! path shares one root — a handful of SQLite database names excepted, which
+//! are never shared (see [`is_private_database_name`]) — so two callers that
+//! each open their own handle on the same file serialize on that root
+//! instead of contending for the file lock. A round session opened from a
+//! handle keeps that handle's root alive for as long as the session runs,
+//! even past the handle itself closing, so the same guarantee holds for a
+//! handle re-opened while an older session on its path is still live. See
+//! [`shared_root`].
+//!
 //! Everything here is synchronous and short: these are the reads and the
 //! destructive edits a screen performs directly. Nothing here reaches the
 //! network. Anything that does — proving, submission, helper delivery,
 //! vote-tree sync — belongs to the session, which has a route to take it on.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use zcash_voting::storage::VotingDb;
 
@@ -32,8 +45,9 @@ pub struct VotingDatabaseHandle {
     /// The unscoped connection to the sidecar. Every scoped handle derived
     /// from it shares this one connection, so writers reached through this
     /// handle serialize on it instead of contending for the file. A second
-    /// `zcashlc_voting_db_open` on the same path gets its own connection;
-    /// the SDK opens one handle per sidecar and keeps it.
+    /// `zcashlc_voting_db_open` on the same canonical path shares this same
+    /// root through the process-wide registry (see [`shared_root`]) instead
+    /// of opening a second connection.
     root: Arc<VotingDb>,
     /// The wallet whose rows this handle reads and writes. `None` until Swift
     /// calls `zcashlc_voting_set_wallet_id`; a `Mutex` because the handle is
@@ -48,21 +62,157 @@ pub struct VotingDatabaseHandle {
     pub(super) network_id: u32,
 }
 
+/// Open sidecar roots, keyed by canonical path.
+///
+/// `VotingDb::open` gives every call its own SQLite connection, so two
+/// backends opened on one sidecar would contend for the file lock instead of
+/// serializing on one connection. The crate's `open_wallet_sidecar` prevents
+/// that, but it derives the sidecar's path from the wallet database's, and
+/// this SDK's sidecar lives where the host put it. The sharing is done here
+/// instead: every handle opened on one path holds the same root, and each
+/// scopes it to its own wallet through `VotingDb::scoped`.
+///
+/// The registry lock is held across the open, migrations included, so opens
+/// serialize process-wide. A host opens one sidecar, so that costs nothing in
+/// practice and keeps two racing opens of one path from both migrating it.
+static ROOTS: OnceLock<Mutex<HashMap<PathBuf, Weak<VotingDb>>>> = OnceLock::new();
+
+/// Whether `path` names a SQLite database that must never be shared through
+/// the registry: the empty string, `:memory:`, or a `file:` URI.
+///
+/// An empty path is reachable through the FFI (`str_from_ptr` accepts a
+/// zero-length string, see `helpers::str_from_ptr_zero_len_accepts_null`) and
+/// names SQLite's own private on-disk temporary database — a fresh, unshared
+/// file-backed database on every open, by SQLite's own documented contract
+/// for it, exactly like `:memory:`. A `file:` URI is excepted wholesale
+/// rather than parsed: it can itself name an in-memory or a temporary
+/// database, or opt into SQLite's own `cache=shared` connection pooling, and
+/// none of that is this registry's to interpret or to interfere with by
+/// keying it into the map alongside ordinary paths.
+fn is_private_database_name(path: &str) -> bool {
+    path.is_empty() || path == ":memory:" || path.starts_with("file:")
+}
+
+/// A root `VotingDb` shared with every other handle already open on `path`.
+///
+/// [`is_private_database_name`] paths are excepted and never shared: each
+/// names a database SQLite itself never reuses across opens (or, for a
+/// `file:` URI, whose sharing is the URI's own business). For every other
+/// path, the registry lock is held for the whole call, including
+/// `VotingDb::open`'s migration on a first open, so this must never be
+/// called while that lock is already held on this thread. `VotingDb::open`
+/// runs no code that calls back into this module — it only opens a
+/// `rusqlite::Connection` and runs the crate's own migrations — so it cannot
+/// re-enter `shared_root` and deadlock on the lock it is called under.
+fn shared_root(path: &str) -> anyhow::Result<Arc<VotingDb>> {
+    if is_private_database_name(path) {
+        return Ok(Arc::new(VotingDb::open(path).ffi()?));
+    }
+    let key = registry_key(path);
+    // A poisoned lock is recovered rather than treated as fatal. This map is
+    // mutated only by the `retain`/`insert` pair below, which runs after
+    // `VotingDb::open` has already returned successfully — a panic while this
+    // lock was held can only have come from a *previous* holder's own open,
+    // or from a `VotingDb::open` this call itself is about to retry, never
+    // from a half-finished mutation of the map. The crate's own two
+    // process-wide registries recover from poison the same way and for the
+    // same reason (`OPEN_SIDECARS` in `zcash_voting::storage`,
+    // `sidecar_registry()` in `zcash_voting::round`). Treating it as fatal
+    // instead would mean one panic anywhere inside a `VotingDb::open` call —
+    // caught at the FFI boundary, but only after poisoning this mutex on the
+    // way out — permanently disables `zcashlc_voting_db_open` for every path
+    // for the rest of the process.
+    let mut roots = ROOTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(root) = roots.get(&key).and_then(Weak::upgrade) {
+        return Ok(root);
+    }
+    let root = Arc::new(VotingDb::open(path).ffi()?);
+    roots.retain(|_, weak| weak.strong_count() > 0);
+    roots.insert(key, Arc::downgrade(&root));
+    Ok(root)
+}
+
+/// Test-only: take the registry lock and panic while still holding it.
+///
+/// Lets a test poison [`ROOTS`]'s lock deliberately, from another thread, so
+/// it can then confirm the registry recovers a later open rather than
+/// bricking it. Touches nothing in the map — the point is to prove that
+/// merely holding the lock across a panic is harmless on its own, without
+/// also having to reason about a mutation the panic interrupted partway.
+#[cfg(test)]
+fn poison_roots_lock_for_test() {
+    let _guard = ROOTS.get_or_init(Default::default).lock().expect("lock");
+    panic!("deliberately poisoning the sidecar registry lock (test)");
+}
+
+/// The registry key for `path`. Mirrors the crate's own
+/// `zcash_voting::storage::sidecar_registry_key`.
+///
+/// Canonicalizing `path` whole succeeds once the sidecar exists, and that is
+/// tried first: it also resolves a sidecar path that is itself a symlink to
+/// its real target, so the symlink and the file it points at share one key.
+/// Before the file exists, canonicalizing the PARENT directory and rejoining
+/// the file name is the fallback — `.` stands in for an empty parent
+/// component, so `voting.sqlite3` and `./voting.sqlite3` share a key too —
+/// and a parent that cannot be canonicalized either (not created yet) keeps
+/// the path exactly as given.
+fn registry_key(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if let Ok(existing) = path.canonicalize() {
+        return existing;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            parent
+                .canonicalize()
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 impl VotingDatabaseHandle {
     /// Open (or create) the sidecar at `path` for `network_id`.
     ///
     /// The network is resolved once, here, so no later call has to re-check
-    /// it: a handle cannot exist for a network that does not. `VotingDb::open`
-    /// migrates an existing schema-13 sidecar in place.
+    /// it: a handle cannot exist for a network that does not. The root
+    /// connection is shared with every other handle already open on the same
+    /// canonical path — see [`shared_root`] — so only the first open on a
+    /// path runs `VotingDb::open`'s migration of an existing schema-13
+    /// sidecar; a later open reuses that migrated connection.
+    /// [`is_private_database_name`] paths (an empty path, `:memory:`, a
+    /// `file:` URI) are excepted and never shared.
     pub(super) fn open(path: &str, network_id: u32) -> anyhow::Result<Self> {
         let network = voting_network(network_id)?;
-        let root = VotingDb::open(path).ffi()?;
+        let root = shared_root(path)?;
         Ok(VotingDatabaseHandle {
-            root: Arc::new(root),
+            root,
             wallet_id: Mutex::new(None),
             network,
             network_id,
         })
+    }
+
+    /// A clone of this handle's shared root.
+    ///
+    /// The clone is a second strong reference to the very same `Arc<VotingDb>`
+    /// allocation as [`Self::root`] — unlike [`Self::scoped`], which wraps a
+    /// distinct `VotingDb` value (and so a distinct allocation) over the same
+    /// underlying connection. Anything that must keep this handle's root
+    /// findable through the registry after this handle itself is dropped
+    /// holds this clone instead: a round session outliving the handle it was
+    /// opened from is why this exists.
+    pub(super) fn shared_root_handle(&self) -> Arc<VotingDb> {
+        Arc::clone(&self.root)
     }
 
     /// Bind every subsequent operation to `wallet_id`.
@@ -518,5 +668,144 @@ mod tests {
         );
         clear_ballot_intents(&handle, &hex_round_id(0x14), &[1]).unwrap();
         reset_session_state(&handle, &hex_round_id(0x14)).unwrap();
+    }
+
+    #[test]
+    fn two_handles_on_one_path_share_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path");
+        let first =
+            VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET).expect("first open");
+        let second =
+            VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET).expect("second open");
+        assert!(Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    #[test]
+    fn two_spellings_of_one_path_share_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("voting.sqlite3");
+        let dotted = dir.path().join(".").join("voting.sqlite3");
+        let first =
+            VotingDatabaseHandle::open(plain.to_str().expect("utf-8"), crate::NETWORK_ID_TESTNET)
+                .expect("open");
+        let second =
+            VotingDatabaseHandle::open(dotted.to_str().expect("utf-8"), crate::NETWORK_ID_TESTNET)
+                .expect("open");
+        assert!(Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    #[test]
+    fn handles_on_different_paths_do_not_share() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = VotingDatabaseHandle::open(
+            dir.path().join("a.sqlite3").to_str().expect("utf-8"),
+            crate::NETWORK_ID_TESTNET,
+        )
+        .expect("open");
+        let second = VotingDatabaseHandle::open(
+            dir.path().join("b.sqlite3").to_str().expect("utf-8"),
+            crate::NETWORK_ID_TESTNET,
+        )
+        .expect("open");
+        assert!(!Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    #[test]
+    fn the_root_is_released_with_its_last_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path");
+        let first = VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET).expect("open");
+        let weak = Arc::downgrade(&first.root);
+        drop(first);
+        assert!(
+            weak.upgrade().is_none(),
+            "the registry must not keep a closed sidecar alive"
+        );
+        let reopened = VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET).expect("reopen");
+        reopened
+            .set_wallet_id("registry-wallet")
+            .expect("wallet id");
+        assert!(list_rounds(&reopened).expect("list rounds").is_empty());
+    }
+
+    #[test]
+    fn in_memory_stores_never_share() {
+        let first =
+            VotingDatabaseHandle::open(":memory:", crate::NETWORK_ID_TESTNET).expect("open");
+        let second =
+            VotingDatabaseHandle::open(":memory:", crate::NETWORK_ID_TESTNET).expect("open");
+        assert!(!Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    /// An empty path is reachable through the FFI (`str_from_ptr` accepts a
+    /// zero-length string) and names SQLite's own private on-disk temporary
+    /// database: a fresh, unshared database on every open, by SQLite's own
+    /// documented contract for it, same as `:memory:`.
+    #[test]
+    fn two_opens_of_the_empty_path_do_not_share_a_root() {
+        let first = VotingDatabaseHandle::open("", crate::NETWORK_ID_TESTNET).expect("open");
+        let second = VotingDatabaseHandle::open("", crate::NETWORK_ID_TESTNET).expect("open");
+        assert!(!Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    #[test]
+    fn is_private_database_name_matches_sqlite_special_names_only() {
+        assert!(is_private_database_name(""));
+        assert!(is_private_database_name(":memory:"));
+        assert!(is_private_database_name("file::memory:?cache=shared"));
+        assert!(!is_private_database_name("voting.sqlite3"));
+    }
+
+    /// A panic anywhere inside a `VotingDb::open` call — while the registry
+    /// lock is held across it, by design (see [`shared_root`]) — must not
+    /// permanently disable every later sidecar open in the process.
+    ///
+    /// The registry is process-wide, so poisoning it here is safe to run only
+    /// in isolation: run this one test alone
+    /// (`cargo test --lib voting::store::tests::a_poisoned_registry_lock_still_lets_a_later_path_open`),
+    /// never as part of the full suite, since a run before the fix leaves the
+    /// lock poisoned for every other test still to come in the same process.
+    #[test]
+    fn a_poisoned_registry_lock_still_lets_a_later_path_open() {
+        let poisoner = std::thread::spawn(poison_roots_lock_for_test);
+        assert!(
+            poisoner.join().is_err(),
+            "the poisoning thread must itself have panicked"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path");
+        VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET)
+            .expect("a poisoned registry lock must not brick a later open");
+    }
+
+    /// A sidecar path that is itself a symlink shares its target's root: the
+    /// registry key is the canonical path, and canonicalizing resolves
+    /// symlinks along the way, exactly like the crate's own
+    /// `sidecar_registry_key`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_sidecar_shares_its_targets_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("voting.sqlite3");
+        let first = VotingDatabaseHandle::open(
+            real.to_str().expect("utf-8 path"),
+            crate::NETWORK_ID_TESTNET,
+        )
+        .expect("open the real path");
+
+        let link = dir.path().join("voting-link.sqlite3");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let second = VotingDatabaseHandle::open(
+            link.to_str().expect("utf-8 path"),
+            crate::NETWORK_ID_TESTNET,
+        )
+        .expect("open through the symlink");
+
+        assert!(Arc::ptr_eq(&first.root, &second.root));
     }
 }
