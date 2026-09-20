@@ -681,10 +681,12 @@ public protocol Synchronizer: AnyObject {
     /// round over plain HTTP. The Tor runtime stays owned by the synchronizer,
     /// and is lent to the crate for the duration of this call.
     ///
-    /// Opening the session reaches no network. The `.tor` route may still take
-    /// as long as reaching the Tor network takes: the first round session on a
-    /// synchronizer whose Tor client has not been started yet bootstraps that
-    /// client before the session is opened.
+    /// Opening the session reaches no network. Both shipped synchronizers
+    /// bootstrap their Tor client while `tor(enabled:)` runs, so by the time a
+    /// round session is opened that client is already up. A conformer that
+    /// instead defers the bootstrap until the runtime is first needed pays for
+    /// it here, and the `.tor` route then takes as long as reaching the Tor
+    /// network takes.
     ///
     /// - Parameters:
     ///    - backend: The voting backend whose sidecar the round persists to.

@@ -10,16 +10,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
 
-## Fixed
-
-- A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
-  Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
-  Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
-  final-owner runtime shutdown can extend completion beyond the HTTP timer. This hardening adds no further
-  public signature changes, and the existing GET/POST routes remain unchanged.
-- `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
-- `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
-
 ### Coinholder voting on zcash_voting 4.0
 
 - The voting API is now a round session. `VotingRoundSession` — opened through
@@ -57,6 +47,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account of what a run did. Events are delivered one at a time on a serial queue per session, and
   every event of a call arrives before that call returns. The closure must not block that queue, and
   must not wait on the call that is emitting into it.
+
+## Fixed
+
+- A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
+  Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
+  Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
+  final-owner runtime shutdown can extend completion beyond the HTTP timer. This hardening adds no further
+  public signature changes, and the existing GET/POST routes remain unchanged.
+- `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
+- `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
 
 ## Changed
 

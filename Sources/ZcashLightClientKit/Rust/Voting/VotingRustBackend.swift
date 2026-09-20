@@ -419,7 +419,7 @@ extension VotingRustBackend {
     }
 
     /// Outstanding interactive proving sessions (diagnostics and tests).
-    static func interactiveProvingBoostCount() -> Int32 {
+    public static func interactiveProvingBoostCount() -> Int32 {
         zcashlc_proving_interactive_active()
     }
 
@@ -428,7 +428,7 @@ extension VotingRustBackend {
     /// missing end pins the pool at user-initiated for the process lifetime —
     /// route every boost through this helper instead of pairing the raw
     /// begin/end statics by hand.
-    static func withInteractiveProvingBoost<T>(
+    public static func withInteractiveProvingBoost<T>(
         _ body: () async throws -> T
     ) async rethrows -> T {
         beginInteractiveProvingBoost()
