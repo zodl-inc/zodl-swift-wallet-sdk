@@ -375,6 +375,14 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// configuration on every dispatch, so it can be replaced while this run
     /// is in flight, and what this call merged outlives the run: a later run
     /// that names nothing is still driven against it.
+    ///
+    /// The merge happens once this call has been admitted — a
+    /// ``VotingRustBackendError/sessionBusy`` or
+    /// ``VotingRustBackendError/sessionClosed`` refusal merges nothing — and
+    /// before the signer is built, so a call that then throws on a seed Rust
+    /// cannot derive from has still moved the session's configuration. Nothing
+    /// rolls it back: a host that wants a later call driven against the values
+    /// the session was opened with names those values on that call.
     public func run(
         signer: VotingDelegationSigner,
         policy: VotingRoundDrivePolicy = .default,

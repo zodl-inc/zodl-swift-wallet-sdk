@@ -40,9 +40,12 @@
 //!   the report the call returns carries the same plan, failures and outcomes
 //!   and is the authoritative account of what happened.
 //!
-//! A session admits one run or tracking run at a time — the SDK's Swift
-//! wrapper serializes them — and the events of concurrent runs over one
-//! callback would be indistinguishable.
+//! A session admits one run or tracking run at a time: the SDK's Swift wrapper
+//! refuses a second driver on a session that already has one
+//! (`VotingRustBackendError.sessionBusy`), because two drivers over one round
+//! would contend for its rows and their events would be indistinguishable over
+//! one callback. Nothing below this module enforces it — a caller reaching
+//! these entry points directly is trusted to keep the same rule.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -1123,6 +1126,39 @@ mod tests {
                 )
             },
             0
+        );
+        unsafe { free_session(db, session) };
+    }
+
+    /// The merge actually happens, rather than the payload being decoded and
+    /// dropped.
+    ///
+    /// Nothing else here can tell the two apart: the entry point answers `0`
+    /// for every payload it can decode, and no call on the C surface reads the
+    /// configuration back, so an entry point that stopped merging would still
+    /// satisfy every other assertion in this module. The slot is asserted
+    /// directly for that reason.
+    #[test]
+    fn update_host_configuration_reaches_the_sessions_configuration_slot() {
+        let (db, _dir, session) = open_session(0x5b);
+        let helpers = br#"{"helper_urls":["https://helper.example/"]}"#;
+        assert_eq!(
+            unsafe {
+                zcashlc_voting_session_update_host_configuration(
+                    session,
+                    helpers.as_ptr(),
+                    helpers.len(),
+                )
+            },
+            0
+        );
+
+        // SAFETY: `open_session` returned this handle and nothing has freed it.
+        let live = unsafe { &*session }.session.live_host_snapshot();
+        assert_eq!(
+            live.helper_urls,
+            Some(vec!["https://helper.example/".to_string()]),
+            "the payload the C call decoded never reached the session's slot"
         );
         unsafe { free_session(db, session) };
     }

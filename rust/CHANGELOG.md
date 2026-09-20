@@ -58,9 +58,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fleet pushed mid-run reaches that run's next dispatch. Every writer merges field by field: a
     field the JSON names replaces the current value, one it leaves absent keeps whatever is in
     place — `{}` changes nothing, and a zero-length payload is not a JSON document and is
-    refused. The `host_json` of `_run` and `_track_shares` is merged in the same way as the call
-    starts, so it holds for the session rather than for that one call; a caller that wants a
-    later call driven against the values the session was opened with names those values on it.
+    refused. The `host_json` of `_run` and `_track_shares` is merged in the same way once the
+    call's own arguments have decoded and before its signer is built, so it holds for the session
+    rather than for that one call — including when the call then fails, as `_run` does on a seed
+    it cannot build a signer from. Nothing rolls that merge back; a caller that wants a later call
+    driven against the values the session was opened with names those values on it.
   - The route a session is opened on governs every service it touches for the session's whole
     life — chain and helper traffic, PIR queries and vote-tree sync: a null `TorRuntime` is the
     direct HTTP route, and a Tor runtime is used through an isolated client, never falling back

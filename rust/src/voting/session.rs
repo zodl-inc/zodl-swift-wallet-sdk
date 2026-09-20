@@ -247,14 +247,26 @@ pub struct VotingSession {
     /// [`Self::run`] and [`Self::track_shares`] as they start,
     /// [`Self::merge_host_overrides`] at any time — and both drivers read it
     /// through [`HostInputs`] on every dispatch, so a round that takes minutes
-    /// can be moved onto a fleet the host learned about after it started. A
-    /// run and a tracking pass running at once share it, deliberately: they
-    /// are two views of one round, and a helper fleet one of them must stop
-    /// using is one the other must stop using too.
+    /// can be moved onto a fleet the host learned about after it started.
+    ///
+    /// The SDK's Swift wrapper admits one driver per session at a time, so a
+    /// run and a tracking pass do not in fact overlap here. Nothing in this
+    /// module relies on that: one shared slot is the right answer either way,
+    /// because the two are views of one round, and a helper fleet one of them
+    /// must stop using is one the other must stop using too.
     ///
     /// Its own small lock, taken only to clone the slot out or to merge into
     /// it, and never while a driver lock is held: see [`HostInputs`].
     live_host: std::sync::Mutex<HostOverridesDto>,
+    /// How many times [`Self::live_host`] has been read, so a test can prove
+    /// one host context is built from ONE snapshot of it.
+    ///
+    /// That is not observable from the values a context carries: a context
+    /// assembled field by field and one assembled from a single snapshot agree
+    /// on every value except when a merge lands between two of the reads, so
+    /// only the read count separates them without racing a writer.
+    #[cfg(test)]
+    live_host_reads: std::sync::atomic::AtomicUsize,
     /// The voting identity of the store this session was opened from.
     network: zcash_voting::Network,
     /// The SDK's numeric network id, kept so wallet-database and key
@@ -425,6 +437,8 @@ impl VotingSession {
             network_id: store.network_id,
             inputs,
             live_host: std::sync::Mutex::new(HostOverridesDto::default()),
+            #[cfg(test)]
+            live_host_reads: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -714,6 +728,13 @@ impl VotingSession {
     /// the run, standing for later runs of the same session until something
     /// replaces it.
     ///
+    /// That merge happens before the signer is built, so a call that then
+    /// fails on an unusable seed has already moved the session's
+    /// configuration. This is not a rollback boundary and is not meant to be
+    /// one: the host stated a fleet, and the fleet it stated is the one the
+    /// next call is driven against, whether or not this call got as far as
+    /// signing anything.
+    ///
     /// `signer` decides what the run may do with delegation. Without one, the
     /// driver reports the bundles that owe a signature instead of dispatching
     /// them; with a software seed, the seed goes into [`SeedSpendAuthSigner`]
@@ -850,6 +871,23 @@ impl VotingSession {
     pub(super) fn round_id(&self) -> &str {
         &self.round_id
     }
+
+    /// The session's live host configuration as it stands.
+    ///
+    /// Test-only, and deliberately not part of the C surface: a host states
+    /// this configuration, it does not read it back, and the drivers reach it
+    /// through [`HostInputs`]. It exists so a test on the far side of the FFI
+    /// can assert that a configuration pushed through
+    /// `zcashlc_voting_session_update_host_configuration` landed in this slot.
+    /// Nothing else can: that entry point answers `0` for any payload it can
+    /// decode, whether or not it went on to merge it.
+    #[cfg(test)]
+    pub(super) fn live_host_snapshot(&self) -> HostOverridesDto {
+        self.live_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Unix seconds now, or 0 on a host whose clock predates the epoch.
@@ -880,12 +918,32 @@ fn now_seconds() -> u64 {
 /// deserializes as absent — so a round whose timing must be gone is opened
 /// without it rather than cleared here.
 ///
-/// Every accessor clones and returns; none of them touches the sidecar or any
-/// lock the drivers hold, because the drivers call this between dispatches and
-/// a context that waited on a step's own lock would deadlock the run. The slot
-/// lock is held for the clone alone, and by nothing that can block.
+/// [`Self::resolved`] takes the slot once and answers all four values from
+/// that one snapshot. Taking it per value would let a merge land between two
+/// of them and produce a configuration no host ever stated — a helper fleet
+/// from before it and a vote end from after, or worse, a `ceremony_start` and
+/// a `vote_end` that never bounded one window. The crate reads that pair for
+/// `RoundHostContext::is_last_moment()`, whose answer becomes the durable
+/// `single_share` property of a cast, so the mixed pair would outlive the
+/// dispatch that saw it.
+///
+/// The resolution touches neither the sidecar nor any lock the drivers hold,
+/// because the drivers ask for a context between dispatches and one that
+/// waited on a step's own lock would deadlock the run. The slot lock is held
+/// for the clone alone, and by nothing that can block.
 struct HostInputs {
     session: Arc<VotingSession>,
+}
+
+/// Everything one host context is built from, resolved together.
+///
+/// A value stands for one reading of the session's configuration: the live
+/// slot where it names a field, the session's own inputs where it does not.
+struct ResolvedHostConfiguration {
+    configured_helper_urls: Vec<String>,
+    vote_tree_node_urls: Vec<String>,
+    ceremony_start_seconds: Option<u64>,
+    vote_end_time_seconds: Option<u64>,
 }
 
 impl HostInputs {
@@ -896,6 +954,10 @@ impl HostInputs {
     /// recovered from for the reason
     /// [`VotingSession::merge_host_overrides`] gives.
     fn live(&self) -> HostOverridesDto {
+        #[cfg(test)]
+        self.session
+            .live_host_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.session
             .live_host
             .lock()
@@ -903,28 +965,27 @@ impl HostInputs {
             .clone()
     }
 
-    fn configured_helper_urls(&self) -> Vec<String> {
-        self.live()
-            .helper_urls
-            .unwrap_or_else(|| self.session.inputs.helper_urls.clone())
-    }
-
-    fn vote_tree_node_urls(&self) -> Vec<String> {
-        self.live()
-            .vote_tree_node_urls
-            .unwrap_or_else(|| self.session.inputs.vote_tree_node_urls.clone())
-    }
-
-    fn ceremony_start_seconds(&self) -> Option<u64> {
-        self.live()
-            .ceremony_start_seconds
-            .unwrap_or(self.session.inputs.ceremony_start_seconds)
-    }
-
-    fn vote_end_time_seconds(&self) -> Option<u64> {
-        self.live()
-            .vote_end_time_seconds
-            .unwrap_or(self.session.inputs.vote_end_time_seconds)
+    /// One snapshot of the slot, resolved against the session's own inputs.
+    ///
+    /// Called exactly once per host context. The snapshot's fields are moved
+    /// out rather than cloned, so the session's inputs are cloned only for the
+    /// fields the host has not replaced.
+    fn resolved(&self) -> ResolvedHostConfiguration {
+        let live = self.live();
+        ResolvedHostConfiguration {
+            configured_helper_urls: live
+                .helper_urls
+                .unwrap_or_else(|| self.session.inputs.helper_urls.clone()),
+            vote_tree_node_urls: live
+                .vote_tree_node_urls
+                .unwrap_or_else(|| self.session.inputs.vote_tree_node_urls.clone()),
+            ceremony_start_seconds: live
+                .ceremony_start_seconds
+                .unwrap_or(self.session.inputs.ceremony_start_seconds),
+            vote_end_time_seconds: live
+                .vote_end_time_seconds
+                .unwrap_or(self.session.inputs.vote_end_time_seconds),
+        }
     }
 }
 
@@ -940,12 +1001,13 @@ struct SessionHost {
 
 impl zcash_voting::RoundHostSource for SessionHost {
     fn host_context(&self) -> zcash_voting::RoundHostContext {
+        let resolved = self.inputs.resolved();
         zcash_voting::RoundHostContext {
-            configured_helper_urls: self.inputs.configured_helper_urls(),
+            configured_helper_urls: resolved.configured_helper_urls,
             now_seconds: now_seconds(),
-            ceremony_start_seconds: self.inputs.ceremony_start_seconds(),
-            vote_end_time_seconds: self.inputs.vote_end_time_seconds(),
-            vote_tree_node_urls: self.inputs.vote_tree_node_urls(),
+            ceremony_start_seconds: resolved.ceremony_start_seconds,
+            vote_end_time_seconds: resolved.vote_end_time_seconds,
+            vote_tree_node_urls: resolved.vote_tree_node_urls,
             delegation: self.delegation.clone(),
             // Fresh submissions only: the driver upgrades work the sidecar
             // already holds to exact-tree recovery itself, so naming a policy
@@ -964,10 +1026,14 @@ struct ShareTrackingHost {
 
 impl zcash_voting::ShareTrackingHostSource for ShareTrackingHost {
     fn host_context(&self) -> zcash_voting::ShareTrackingHostContext {
+        // One snapshot here too, for the reason [`HostInputs`] gives: a pass
+        // driven against a helper fleet from before a merge and a vote end
+        // from after it is a pass no host asked for.
+        let resolved = self.inputs.resolved();
         zcash_voting::ShareTrackingHostContext {
-            configured_helper_urls: self.inputs.configured_helper_urls(),
+            configured_helper_urls: resolved.configured_helper_urls,
             now_seconds: now_seconds(),
-            vote_end_time_seconds: self.inputs.vote_end_time_seconds(),
+            vote_end_time_seconds: resolved.vote_end_time_seconds,
         }
     }
 }
@@ -1596,6 +1662,79 @@ mod tests {
             context.vote_tree_node_urls,
             vec!["https://tree.example/".to_string()]
         );
+    }
+
+    /// One host context is built from ONE read of the session's configuration
+    /// slot, on both hosts.
+    ///
+    /// A context assembled from a read per field can mix two configurations
+    /// that never co-existed: a merge landing between the ceremony-start read
+    /// and the vote-end read produces a window whose start is the old one and
+    /// whose end is the new one. The crate decides `is_last_moment()` from that
+    /// pair, and that decision becomes the durable `single_share` property of a
+    /// cast, so the mixed window is not a transient display value.
+    ///
+    /// Counting the reads is what makes the invariant testable at all: the four
+    /// values of a correct context and of a mixed one are the same whenever no
+    /// merge happens to land in between, so an assertion on values alone would
+    /// pass on either. All four fields are merged first so that every one of
+    /// them would show a stale read.
+    #[test]
+    fn a_host_context_is_built_from_one_snapshot_of_the_configuration_slot() {
+        use std::sync::atomic::Ordering;
+        use zcash_voting::{RoundHostSource, ShareTrackingHostSource};
+
+        let (_store, _dir, session) = open_session(0x75);
+        let session = Arc::new(session);
+        session.merge_host_overrides(HostOverridesDto {
+            helper_urls: Some(vec!["https://snapshot-helper.example/".to_string()]),
+            vote_tree_node_urls: Some(vec!["https://snapshot-tree.example/".to_string()]),
+            ceremony_start_seconds: Some(Some(3_000_000_000)),
+            vote_end_time_seconds: Some(Some(4_000_000_000)),
+        });
+
+        let host = SessionHost {
+            inputs: HostInputs {
+                session: Arc::clone(&session),
+            },
+            delegation: None,
+            max_proof_concurrency: 1,
+        };
+        session.live_host_reads.store(0, Ordering::SeqCst);
+        let context = host.host_context();
+        assert_eq!(
+            session.live_host_reads.load(Ordering::SeqCst),
+            1,
+            "the round host read the configuration slot more than once for one context"
+        );
+        assert_eq!(
+            context.configured_helper_urls,
+            vec!["https://snapshot-helper.example/".to_string()]
+        );
+        assert_eq!(
+            context.vote_tree_node_urls,
+            vec!["https://snapshot-tree.example/".to_string()]
+        );
+        assert_eq!(context.ceremony_start_seconds, Some(3_000_000_000));
+        assert_eq!(context.vote_end_time_seconds, Some(4_000_000_000));
+
+        let tracking = ShareTrackingHost {
+            inputs: HostInputs {
+                session: Arc::clone(&session),
+            },
+        };
+        session.live_host_reads.store(0, Ordering::SeqCst);
+        let context = tracking.host_context();
+        assert_eq!(
+            session.live_host_reads.load(Ordering::SeqCst),
+            1,
+            "the share-tracking host read the configuration slot more than once for one context"
+        );
+        assert_eq!(
+            context.configured_helper_urls,
+            vec!["https://snapshot-helper.example/".to_string()]
+        );
+        assert_eq!(context.vote_end_time_seconds, Some(4_000_000_000));
     }
 
     /// The same slot, read by the other driver: share tracking sees a pushed

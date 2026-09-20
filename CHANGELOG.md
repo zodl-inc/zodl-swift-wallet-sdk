@@ -31,11 +31,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingRustBackendError.sessionClosed` on a closed session.
   Every writer merges into that configuration field by field: a `VotingHostOverrides` field that is
   named replaces the current value, one left absent keeps whatever is in place. The `overrides` a
-  run or a tracking call passes are merged in the same way as that call starts, before the call does
-  anything else, so they hold for the session rather than for the one call even when the call goes on
-  to fail — a signer `run(signer:policy:overrides:events:)` cannot build, for instance — and a host
-  that wants a later call driven against the values the session was opened with names those values on
-  that call.
+  run or a tracking call passes are merged once that call has been admitted — a `sessionBusy` or
+  `sessionClosed` refusal merges nothing — and before its signer is built, so they hold for the
+  session rather than for the one call even when the call goes on to fail, as
+  `run(signer:policy:overrides:events:)` does on a seed it cannot build a signer from. Nothing rolls
+  that merge back, so a host that wants a later call driven against the values the session was
+  opened with names those values on that call.
 - New on the surviving `VotingRustBackend` surface, alongside the session:
   `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
   share-tracking schedule are built from), `resetVoteTree(roundId:)`,
