@@ -17,8 +17,9 @@
 //! instead of contending for the file lock. A round session opened from a
 //! handle keeps that handle's root alive for as long as the session runs,
 //! even past the handle itself closing, so the same guarantee holds for a
-//! handle re-opened while an older session on its path is still live. See
-//! [`shared_root`].
+//! handle re-opened while an older session on its path is still live — unless
+//! the file itself is gone, in which case the re-opened handle gets a fresh
+//! database rather than the old connection. See [`shared_root`].
 //!
 //! Everything here is synchronous and short: these are the reads and the
 //! destructive edits a screen performs directly. Nothing here reaches the
@@ -75,7 +76,72 @@ pub struct VotingDatabaseHandle {
 /// The registry lock is held across the open, migrations included, so opens
 /// serialize process-wide. A host opens one sidecar, so that costs nothing in
 /// practice and keeps two racing opens of one path from both migrating it.
-static ROOTS: OnceLock<Mutex<HashMap<PathBuf, Weak<VotingDb>>>> = OnceLock::new();
+static ROOTS: OnceLock<Mutex<HashMap<PathBuf, RegisteredRoot>>> = OnceLock::new();
+
+/// One registry entry: a root, and the file it was connected to.
+struct RegisteredRoot {
+    /// Weak, so a path nothing holds open any more releases its connection.
+    root: Weak<VotingDb>,
+    /// The file `root` was opened on, read once the open had returned.
+    ///
+    /// `None` where the platform exposes no identity for a file; see
+    /// [`FileIdentity`].
+    identity: Option<FileIdentity>,
+}
+
+impl RegisteredRoot {
+    /// Whether this entry's root is still a connection to whatever `path`
+    /// names now.
+    ///
+    /// A missing file answers no whatever the platform can tell: the root is
+    /// then connected to an inode nothing can reach by name, and handing it to
+    /// a caller that just asked for `path` would put that caller's rows in a
+    /// database which disappears when the last handle on it closes.
+    fn still_describes(&self, path: &str) -> bool {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        match self.identity {
+            Some(registered) => file_identity(&metadata) == Some(registered),
+            // Nothing was recorded, so existence is the whole of what this
+            // platform can check. It cannot tell a replacement apart from the
+            // original; see [`FileIdentity`].
+            None => true,
+        }
+    }
+}
+
+/// Which file on which device — what survives a rename and changes on a
+/// delete-and-recreate, so it is what says whether a path still names the file
+/// a root was opened on.
+///
+/// Unix only. This crate is built for Apple platforms and for the host running
+/// its own unit tests, all of which are unix; elsewhere the identity is simply
+/// unknown ([`file_identity`] answers `None`) and a reopened path that still
+/// exists is reused as before. Losing the distinction there costs the
+/// delete-and-recreate case, not the delete case, which
+/// [`RegisteredRoot::still_describes`] answers without an identity at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// The identity `metadata` describes, or `None` on a platform that exposes
+/// none. See [`FileIdentity`].
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    None
+}
 
 /// Whether `path` names a SQLite database that must never be shared through
 /// the registry: the empty string, `:memory:`, or a `file:` URI.
@@ -93,7 +159,8 @@ fn is_private_database_name(path: &str) -> bool {
     path.is_empty() || path == ":memory:" || path.starts_with("file:")
 }
 
-/// A root `VotingDb` shared with every other handle already open on `path`.
+/// A root `VotingDb` shared with every other handle already open on `path`,
+/// unless the file it was opened on is no longer the file `path` names.
 ///
 /// [`is_private_database_name`] paths are excepted and never shared: each
 /// names a database SQLite itself never reuses across opens (or, for a
@@ -104,6 +171,17 @@ fn is_private_database_name(path: &str) -> bool {
 /// runs no code that calls back into this module — it only opens a
 /// `rusqlite::Connection` and runs the crate's own migrations — so it cannot
 /// re-enter `shared_root` and deadlock on the lock it is called under.
+///
+/// Sharing is conditional on the file still being there, and still being the
+/// same one ([`RegisteredRoot::still_describes`]). The registry outlives a
+/// handle — a live round session keeps its entry upgradable — while
+/// [`registry_key`] yields the same key for a path whose file has been
+/// deleted, so without that check a host that deleted the sidecar between two
+/// opens would be handed a connection to the unlinked inode and write the new
+/// wallet's rounds into a file that vanishes with the process. A root that
+/// fails the check is left alone rather than dropped: whoever still holds it
+/// asked for the old file and has it, and only the registry's answer for this
+/// path changes.
 fn shared_root(path: &str) -> anyhow::Result<Arc<VotingDb>> {
     if is_private_database_name(path) {
         return Ok(Arc::new(VotingDb::open(path).ffi()?));
@@ -126,12 +204,30 @@ fn shared_root(path: &str) -> anyhow::Result<Arc<VotingDb>> {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(root) = roots.get(&key).and_then(Weak::upgrade) {
+    if let Some(entry) = roots.get(&key)
+        && let Some(root) = entry.root.upgrade()
+        && entry.still_describes(path)
+    {
         return Ok(root);
     }
     let root = Arc::new(VotingDb::open(path).ffi()?);
-    roots.retain(|_, weak| weak.strong_count() > 0);
-    roots.insert(key, Arc::downgrade(&root));
+    // Read after the open, so the file is there to be identified even on a
+    // first open that created it.
+    let identity = std::fs::metadata(path)
+        .ok()
+        .as_ref()
+        .and_then(file_identity);
+    roots.retain(|_, entry| entry.root.strong_count() > 0);
+    // Replaces a stale entry rather than merging with it: this root is the
+    // answer for this path from now on, whatever the old one is still
+    // connected to.
+    roots.insert(
+        key,
+        RegisteredRoot {
+            root: Arc::downgrade(&root),
+            identity,
+        },
+    );
     Ok(root)
 }
 
@@ -191,6 +287,14 @@ impl VotingDatabaseHandle {
     /// sidecar; a later open reuses that migrated connection.
     /// [`is_private_database_name`] paths (an empty path, `:memory:`, a
     /// `file:` URI) are excepted and never shared.
+    ///
+    /// A path whose file was deleted or replaced since it was opened is not
+    /// shared either: this call then opens a fresh database there. A session
+    /// or handle still holding the old root keeps it — its connection is to
+    /// the old file, which is what it asked for — so a host that deletes the
+    /// sidecar while a round session is live leaves that session writing into
+    /// a database nothing can reach by name any more. Close the sessions and
+    /// the handles before deleting the file.
     pub(super) fn open(path: &str, network_id: u32) -> anyhow::Result<Self> {
         let network = voting_network(network_id)?;
         let root = shared_root(path)?;
@@ -1291,11 +1395,13 @@ mod tests {
     /// lock is held across it, by design (see [`shared_root`]) — must not
     /// permanently disable every later sidecar open in the process.
     ///
-    /// The registry is process-wide, so poisoning it here is safe to run only
-    /// in isolation: run this one test alone
-    /// (`cargo test --lib voting::store::tests::a_poisoned_registry_lock_still_lets_a_later_path_open`),
-    /// never as part of the full suite, since a run before the fix leaves the
-    /// lock poisoned for every other test still to come in the same process.
+    /// The registry is process-wide, so this test poisons the lock for every
+    /// test that runs after it in the same process. That is harmless, and is
+    /// the point: recovery is what [`shared_root`] does, so a poisoned lock
+    /// costs a later open nothing. Were the recovery removed, this test would
+    /// not be the only casualty — every other test that opens a sidecar on a
+    /// real path would start failing too, which is a louder signal than one
+    /// isolated failure, not a reason to keep this one out of the suite.
     #[test]
     fn a_poisoned_registry_lock_still_lets_a_later_path_open() {
         let poisoner = std::thread::spawn(poison_roots_lock_for_test);
@@ -1309,6 +1415,119 @@ mod tests {
         let path = path.to_str().expect("utf-8 path");
         VotingDatabaseHandle::open(path, crate::NETWORK_ID_TESTNET)
             .expect("a poisoned registry lock must not brick a later open");
+    }
+
+    /// Removes the sidecar at `path` along with the `-wal` and `-shm`
+    /// siblings SQLite may have left beside it, the way a host wiping a
+    /// wallet's voting data does.
+    fn remove_sidecar_files(path: &str) {
+        std::fs::remove_file(path).expect("remove the sidecar");
+        for suffix in ["-wal", "-shm"] {
+            let sibling = format!("{path}{suffix}");
+            if std::fs::metadata(&sibling).is_ok() {
+                std::fs::remove_file(&sibling).expect("remove a sidecar sibling");
+            }
+        }
+    }
+
+    /// Stores one round through `handle`, so a later open of the same path can
+    /// say whether it is reading the same file.
+    fn store_a_round(handle: &VotingDatabaseHandle, tag: u8) {
+        handle
+            .scoped()
+            .expect("scoped")
+            .ensure_round(
+                zcash_voting::Network::Testnet,
+                &crate::voting::test_support::synthetic_round_params(tag, 123),
+                None,
+            )
+            .expect("store a round");
+    }
+
+    /// A host that deletes the sidecar file while a session still holds its
+    /// root must not have the next open of that path handed the old,
+    /// now-unlinked database.
+    ///
+    /// The registry key is the same either way — [`registry_key`] falls back
+    /// to the canonical parent plus the file name once the file is gone — so
+    /// nothing but the recorded file identity distinguishes the two cases. A
+    /// live session keeps the entry upgradable (see
+    /// `a_live_session_keeps_its_handles_root_alive_so_a_reopened_handle_shares_it`
+    /// in `session.rs`), which is what makes this reachable: the strong clone
+    /// held here stands in for that session.
+    ///
+    /// The reopened handle's writes must reach the file at the path, which the
+    /// third open below reads back — a root still connected to the unlinked
+    /// inode would answer with rows that vanish when the process exits.
+    #[test]
+    fn a_reopened_path_whose_file_was_deleted_opens_a_fresh_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path").to_string();
+
+        let first = VotingDatabaseHandle::open(&path, crate::NETWORK_ID_TESTNET).expect("open");
+        let session_root = first.shared_root_handle();
+        drop(first);
+        remove_sidecar_files(&path);
+
+        let second = VotingDatabaseHandle::open(&path, crate::NETWORK_ID_TESTNET).expect("reopen");
+        assert!(
+            !Arc::ptr_eq(&second.shared_root_handle(), &session_root),
+            "a path whose file was deleted must not be served from the old root"
+        );
+
+        second.set_wallet_id("reopened-wallet").expect("wallet id");
+        store_a_round(&second, 0x51);
+        drop(second);
+
+        let third =
+            VotingDatabaseHandle::open(&path, crate::NETWORK_ID_TESTNET).expect("third open");
+        third.set_wallet_id("reopened-wallet").expect("wallet id");
+        assert_eq!(
+            list_rounds(&third)
+                .expect("rounds")
+                .iter()
+                .map(|round| round.round_id.clone())
+                .collect::<Vec<_>>(),
+            vec![hex_round_id(0x51)],
+            "the reopened handle's rows must be in the file at the path"
+        );
+        // Held to here on purpose: the old root must still be alive while the
+        // reopen above happens, or the registry would drop its entry for
+        // reasons that have nothing to do with the deleted file.
+        drop(session_root);
+    }
+
+    /// The same path standing for a *different* file: deleted and recreated
+    /// while the old root is still held. The path exists again by the time of
+    /// the reopen, so an existence check alone would hand back the old root;
+    /// only the file's identity tells the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_replaced_by_another_file_is_not_served_from_the_old_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("voting.sqlite3");
+        let path = path.to_str().expect("utf-8 path").to_string();
+
+        let first = VotingDatabaseHandle::open(&path, crate::NETWORK_ID_TESTNET).expect("open");
+        let session_root = first.shared_root_handle();
+        drop(first);
+        remove_sidecar_files(&path);
+        // A second sidecar now stands where the first one did. The first one's
+        // inode cannot be recycled for it, because `session_root` still holds
+        // that file open.
+        drop(VotingDb::open(&path).expect("recreate the sidecar at the same path"));
+        assert!(
+            std::fs::metadata(&path).is_ok(),
+            "the replacement file must exist for this test to mean anything"
+        );
+
+        let second = VotingDatabaseHandle::open(&path, crate::NETWORK_ID_TESTNET).expect("reopen");
+        assert!(
+            !Arc::ptr_eq(&second.shared_root_handle(), &session_root),
+            "a replaced file at a known path must not be served from the old root"
+        );
+        drop(session_root);
     }
 
     /// A sidecar path that is itself a symlink shares its target's root: the

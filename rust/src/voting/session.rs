@@ -207,8 +207,7 @@ pub struct VotingSession {
     /// contention the registry exists to prevent. Never read again after
     /// construction: its only job is staying alive for as long as the
     /// session does.
-    #[allow(dead_code)]
-    root: Arc<zcash_voting::storage::VotingDb>,
+    _root: Arc<zcash_voting::storage::VotingDb>,
     /// Runs the round's steps. Owns the round binding — id, network, roster
     /// and hotkey secret — which is why planning goes through it rather than
     /// through a roster this struct would otherwise have to keep in step.
@@ -296,7 +295,7 @@ impl VotingSession {
         epoch: u64,
     ) -> anyhow::Result<Self> {
         let database = store.scoped()?;
-        // See the `root` field's own doc comment: this keeps the handle's
+        // See the `_root` field's own doc comment: this keeps the handle's
         // registry entry alive for as long as this session runs, even if the
         // handle itself closes first.
         let root = store.shared_root_handle();
@@ -414,7 +413,7 @@ impl VotingSession {
 
         Ok(VotingSession {
             database,
-            root,
+            _root: root,
             executor,
             pipeline,
             pir,

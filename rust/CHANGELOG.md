@@ -364,8 +364,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that replaces them is new (see Added); what changed for the entry points that survive is:
   - `zcashlc_voting_db_open` takes a network id, fixing the voting network for the lifetime of
     the returned handle; an unknown one is rejected once at open rather than by each call.
-  - Voting database handles opened on the same sidecar path now share one connection instead of
-    each opening its own.
+  - Voting database handles opened on the same sidecar path share one connection instead of each
+    opening its own, so writers serialize on it rather than contending for the file lock and only
+    the first open migrates the file. A path whose file has been deleted or replaced since it was
+    opened is excepted: `zcashlc_voting_db_open` then opens a fresh database there. Whatever still
+    holds the old connection — another handle, or a session that outlived the handle it was opened
+    from — keeps it, writing into a database no path names any more. Free the sessions, then the
+    handles, before deleting a sidecar file.
   - `zcashlc_voting_generate_hotkey` drops its database and seed parameters and takes a network
     id, because voting hotkeys are app-owned random values rather than wallet-seed derivations;
     the caller must persist the returned stored secret. `FfiVotingHotkey` carries

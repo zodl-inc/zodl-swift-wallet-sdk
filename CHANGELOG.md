@@ -141,6 +141,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first time `VotingRustBackend.open(path:networkId:)` opens it. Nothing changes at the call site,
   and rounds already stored survive; an SDK build older than this one can no longer open the
   migrated file, so a downgrade leaves the voting sidecar unusable.
+- Voting backends opened on one sidecar path share one connection to it. A second
+  `VotingRustBackend.open(path:networkId:)` on a path already open — through another backend or
+  through a `VotingRoundSession` still holding it — reuses that connection instead of opening a
+  second one, so writers serialize on it rather than contending for the file lock, and only the
+  first open migrates the file. A path whose file has been deleted or replaced since it was opened
+  is not reused: the open creates a fresh database there, while whatever still holds the old
+  connection keeps writing into a database no path names any more. Close every session, then the
+  backend, before deleting a sidecar; see `MIGRATING.md`.
 - Every failing voting call now throws the crate's own `VotingError`, which carries `kind`
   (`VotingErrorKind`: `invalidInput`, `keystoneSignatureConflict`, `proofFailed`, `busy`, `storage`,
   `internal`, `insufficientEligibility`, `noSpendableNotes`, `setupAlreadyPersisted`,

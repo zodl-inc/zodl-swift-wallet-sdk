@@ -460,6 +460,14 @@ sessions before closing the backend, and close both before deleting the sidecar 
 `VotingRustBackend.close()` never blocks, so a host that means to delete the file rather than stop
 using it should let everything it started finish first.
 
+That order is not advice about tidiness. Backends opened on one sidecar path share one connection,
+and a live session keeps its own reference to it, so deleting the file while a session is open
+leaves that session writing into a database the deletion made unreachable by name. The next
+`VotingRustBackend.open(path:networkId:)` on the same path does **not** join it — it creates a fresh
+database there — so the wallet and the surviving session diverge silently, and everything the
+session recorded is gone when it closes. Nothing throws; the two just stop being the same file.
+Close every session, then the backend, then delete.
+
 ### What replaced each removed call
 
 | Removed from `VotingRustBackend` | Now |

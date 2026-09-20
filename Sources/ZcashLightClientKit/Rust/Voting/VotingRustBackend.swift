@@ -102,6 +102,16 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// its voting identity from the registered base network, and opening fails
     /// if that network has not been configured yet.
     ///
+    /// Backends opened on one sidecar path share one connection to it, so a
+    /// second open of a path already open — through another backend, or
+    /// through a ``VotingRoundSession`` still holding it — reuses that
+    /// connection rather than opening a second one, and only the first open
+    /// migrates the file. A path whose file has been deleted or replaced since
+    /// it was opened is not reused: this call opens a fresh database there,
+    /// while whatever still holds the old connection keeps it, writing into a
+    /// database no path names any more. That is why the order in ``close()``
+    /// matters before deleting a sidecar.
+    ///
     /// Throws ``VotingRustBackendError/databaseAlreadyOpen`` if the backend
     /// already holds an open handle.
     public func open(path: String, networkId: UInt32) throws {
@@ -136,6 +146,12 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// stop using it, should let anything it started finish first — and close
     /// the sessions before the backend, since a session holds its own reference
     /// to the same sidecar.
+    ///
+    /// Deleting the file out from under a session that is still open does not
+    /// fail: that session keeps writing into the database it opened, which the
+    /// deletion has left unreachable by name, and a backend reopened on the
+    /// same path gets a fresh one instead of joining it. The two then diverge
+    /// silently, and what the old session recorded is gone when it closes.
     public func close() {
         lock.lock()
         defer { lock.unlock() }
