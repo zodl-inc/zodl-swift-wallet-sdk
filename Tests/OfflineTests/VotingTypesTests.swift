@@ -453,6 +453,43 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(layout.privacyTrimDroppedNotes, 3)
     }
 
+    func testDecodesBundleLayoutWithTrimAndSkippedSuffixTotals() throws {
+        let json = """
+        {"bundle_count": 2, "eligible_weight": 900, "dropped_count": 1,
+         "privacy_trim_dropped_bundles": 3, "privacy_trim_dropped_notes": 11,
+         "privacy_trim_dropped_value_zatoshi": 4200,
+         "skipped_suffix_bundles": 1, "skipped_suffix_notes": 5, "skipped_suffix_value_zatoshi": 70}
+        """
+        let layout = try decode(VotingBundleLayout.self, from: json)
+        XCTAssertEqual(layout.privacyTrimDroppedValueZatoshi, 4200)
+        XCTAssertEqual(layout.skippedSuffixBundles, 1)
+        XCTAssertEqual(layout.skippedSuffixNotes, 5)
+        XCTAssertEqual(layout.skippedSuffixValueZatoshi, 70)
+    }
+
+    func testDecodesBundleLayoutWithoutTheNewerTotals() throws {
+        let json = """
+        {"bundle_count": 1, "eligible_weight": 5, "dropped_count": 0,
+         "privacy_trim_dropped_bundles": 0, "privacy_trim_dropped_notes": 0}
+        """
+        let layout = try decode(VotingBundleLayout.self, from: json)
+        XCTAssertEqual(layout.privacyTrimDroppedValueZatoshi, 0)
+        XCTAssertEqual(layout.skippedSuffixValueZatoshi, 0)
+    }
+
+    func testDecodesEligibilityReportWithSkippedSuffixTotals() throws {
+        let json = """
+        {"distinct_note_count": 4, "eligible_weight": 9000, "is_eligible": true,
+         "privacy_trim_dropped_value_zatoshi": 250,
+         "skipped_suffix_bundles": 1, "skipped_suffix_notes": 5, "skipped_suffix_value_zatoshi": 70}
+        """
+        let eligibility = try decode(VotingEligibilityReport.self, from: json)
+        XCTAssertEqual(eligibility.privacyTrimDroppedValueZatoshi, 250)
+        XCTAssertEqual(eligibility.skippedSuffixBundles, 1)
+        XCTAssertEqual(eligibility.skippedSuffixNotes, 5)
+        XCTAssertEqual(eligibility.skippedSuffixValueZatoshi, 70)
+    }
+
     func testDecodesEligibilityPrecomputeSummaryAndPendingRound() throws {
         let eligibility = try decode(
             VotingEligibilityReport.self,

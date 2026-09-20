@@ -249,6 +249,18 @@ pub struct VotingSession {
     round_id: String,
 }
 
+/// The bundle policy a new round is seeded with: the crate's default, privacy
+/// trim included. The trim drops low-value trailing bundles, never below two,
+/// within the smaller of 1% of the selected value and 1,000 ZEC; a wallet with
+/// a long dust tail otherwise pays a delegation proof and a vote proof per
+/// question for bundles that carry almost no weight. What was dropped is
+/// reported in the layout so the host can show it. A round that already
+/// persisted a policy keeps it: the crate treats the stored one as
+/// authoritative.
+fn new_round_bundle_policy() -> zcash_voting::BundlePolicy {
+    zcash_voting::BundlePolicy::default()
+}
+
 impl VotingSession {
     /// Opens a session for one round over `store`'s sidecar.
     ///
@@ -310,12 +322,7 @@ impl VotingSession {
             .transpose()
             .ffi()?;
 
-        // The five-note bundle layout this SDK has always used, with privacy
-        // trimming off: trimming drops eligible notes to blur the voter's
-        // weight, which costs voting power the voter did not agree to give up.
-        // A round that already persisted a plan keeps its stored policy — the
-        // crate treats that one as authoritative — so this seeds new rounds only.
-        let bundle_policy = zcash_voting::BundlePolicy::default().with_max_privacy_bundles(None);
+        let bundle_policy = new_round_bundle_policy();
 
         let pipeline = Arc::new(
             zcash_voting::DelegationPipeline::new(
@@ -446,26 +453,13 @@ impl VotingSession {
     pub(super) fn setup_bundles(&self) -> anyhow::Result<BundleLayoutDto> {
         self.pipeline.ensure_round().ffi()?;
         let layout = self.pipeline.setup_bundles().ffi()?;
-        Ok(BundleLayoutDto {
-            bundle_count: layout.bundle_count,
-            eligible_weight: layout.eligible_weight,
-            dropped_count: layout.dropped_count,
-            privacy_trim_dropped_bundles: layout.privacy_trim_dropped_bundles,
-            privacy_trim_dropped_notes: layout.privacy_trim_dropped_notes,
-        })
+        Ok(BundleLayoutDto::from(layout))
     }
 
     /// Whether the account can vote in this round, without persisting anything.
     pub(super) fn eligibility(&self) -> anyhow::Result<EligibilityDto> {
         let report = self.pipeline.eligibility().ffi()?;
-        Ok(EligibilityDto {
-            // `usize` on every target this SDK builds for is at most 64 bits,
-            // so widening is lossless.
-            distinct_note_count: report.eligibility.distinct_note_count as u64,
-            eligible_weight: report.eligibility.eligible_weight,
-            is_eligible: report.eligibility.is_eligible(),
-            privacy_trim_dropped_value_zatoshi: report.privacy_trim_dropped_value_zatoshi,
-        })
+        Ok(EligibilityDto::from(report))
     }
 
     /// Persists one bundle's witnesses and padded secrets and warms its PIR
@@ -1096,6 +1090,13 @@ mod tests {
     fn open_binds_the_round_id_from_the_round_params() {
         let (_store, _dir, session) = open_session(0x20);
         assert_eq!(session.round_id(), hex_round_id(0x20));
+    }
+
+    #[test]
+    fn new_rounds_are_seeded_with_the_crates_default_privacy_trim() {
+        let policy = new_round_bundle_policy();
+        assert_eq!(policy.max_privacy_bundles(), Some(2));
+        assert_eq!(policy.privacy_drop_bps(), 100);
     }
 
     /// A round whose bundle setup failed keeps its row and still plans.

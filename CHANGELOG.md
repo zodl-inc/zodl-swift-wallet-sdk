@@ -57,6 +57,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account of what a run did. Events are delivered one at a time on a serial queue per session, and
   every event of a call arrives before that call returns. The closure must not block that queue, and
   must not wait on the call that is emitting into it.
+- `VotingBundleLayout` gains `privacyTrimDroppedValueZatoshi`, `skippedSuffixBundles`,
+  `skippedSuffixNotes` and `skippedSuffixValueZatoshi`; `VotingEligibilityReport` gains
+  `skippedSuffixBundles`, `skippedSuffixNotes` and `skippedSuffixValueZatoshi` — the raw note value a
+  privacy trim withheld and the trailing bundles a host removed with
+  `deleteSkippedBundles(roundId:keepCount:)`, so a screen can show what a round no longer counts.
 
 ## Fixed
 
@@ -119,6 +124,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their voting identity through the registered custom network's base network — a modified-mainnet
   chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
   the call rather than silently treated as regtest.
+- New rounds use the crate's default bundle policy, privacy trim included (at most two bundles
+  dropped within 1% of the selected value, capped at 1,000 ZEC); `VotingBundleLayout` reports what
+  was dropped.
 
 ## Removed
 

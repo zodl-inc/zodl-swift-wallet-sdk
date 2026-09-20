@@ -321,6 +321,15 @@ public struct VotingBundleLayout: Equatable, Sendable, Decodable {
     public let droppedCount: UInt32
     public let privacyTrimDroppedBundles: UInt32
     public let privacyTrimDroppedNotes: UInt32
+    /// Raw value of the notes the privacy trim excludes from delegation, not
+    /// their bundle-quantized voting weight. Surface that distinction.
+    public let privacyTrimDroppedValueZatoshi: UInt64
+    /// Trailing bundles a host removed from this round with
+    /// `deleteSkippedBundles(roundId:keepCount:)`: how many bundles, how many
+    /// notes they held, and their raw value.
+    public let skippedSuffixBundles: UInt32
+    public let skippedSuffixNotes: UInt32
+    public let skippedSuffixValueZatoshi: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case bundleCount = "bundle_count"
@@ -328,6 +337,28 @@ public struct VotingBundleLayout: Equatable, Sendable, Decodable {
         case droppedCount = "dropped_count"
         case privacyTrimDroppedBundles = "privacy_trim_dropped_bundles"
         case privacyTrimDroppedNotes = "privacy_trim_dropped_notes"
+        case privacyTrimDroppedValueZatoshi = "privacy_trim_dropped_value_zatoshi"
+        case skippedSuffixBundles = "skipped_suffix_bundles"
+        case skippedSuffixNotes = "skipped_suffix_notes"
+        case skippedSuffixValueZatoshi = "skipped_suffix_value_zatoshi"
+    }
+
+    // The trim-dropped value and the skipped-suffix totals are newer than the
+    // other fields here: an older FFI's JSON leaves them out, and each falls
+    // back to zero rather than failing the whole decode.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bundleCount = try container.decode(UInt32.self, forKey: .bundleCount)
+        eligibleWeight = try container.decode(UInt64.self, forKey: .eligibleWeight)
+        droppedCount = try container.decode(UInt32.self, forKey: .droppedCount)
+        privacyTrimDroppedBundles = try container.decode(UInt32.self, forKey: .privacyTrimDroppedBundles)
+        privacyTrimDroppedNotes = try container.decode(UInt32.self, forKey: .privacyTrimDroppedNotes)
+        privacyTrimDroppedValueZatoshi =
+            try container.decodeIfPresent(UInt64.self, forKey: .privacyTrimDroppedValueZatoshi) ?? 0
+        skippedSuffixBundles = try container.decodeIfPresent(UInt32.self, forKey: .skippedSuffixBundles) ?? 0
+        skippedSuffixNotes = try container.decodeIfPresent(UInt32.self, forKey: .skippedSuffixNotes) ?? 0
+        skippedSuffixValueZatoshi =
+            try container.decodeIfPresent(UInt64.self, forKey: .skippedSuffixValueZatoshi) ?? 0
     }
 }
 
@@ -339,12 +370,36 @@ public struct VotingEligibilityReport: Equatable, Sendable, Decodable {
     /// Raw value of the notes the privacy trim excludes from delegation, not
     /// their bundle-quantized voting weight. Surface that distinction.
     public let privacyTrimDroppedValueZatoshi: UInt64
+    /// Trailing bundles a host removed from this round with
+    /// `deleteSkippedBundles(roundId:keepCount:)`: how many bundles, how many
+    /// notes they held, and their raw value.
+    public let skippedSuffixBundles: UInt32
+    public let skippedSuffixNotes: UInt32
+    public let skippedSuffixValueZatoshi: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case distinctNoteCount = "distinct_note_count"
         case eligibleWeight = "eligible_weight"
         case isEligible = "is_eligible"
         case privacyTrimDroppedValueZatoshi = "privacy_trim_dropped_value_zatoshi"
+        case skippedSuffixBundles = "skipped_suffix_bundles"
+        case skippedSuffixNotes = "skipped_suffix_notes"
+        case skippedSuffixValueZatoshi = "skipped_suffix_value_zatoshi"
+    }
+
+    // The skipped-suffix totals are newer than the other fields here: an
+    // older FFI's JSON leaves them out, and each falls back to zero rather
+    // than failing the whole decode.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        distinctNoteCount = try container.decode(UInt64.self, forKey: .distinctNoteCount)
+        eligibleWeight = try container.decode(UInt64.self, forKey: .eligibleWeight)
+        isEligible = try container.decode(Bool.self, forKey: .isEligible)
+        privacyTrimDroppedValueZatoshi = try container.decode(UInt64.self, forKey: .privacyTrimDroppedValueZatoshi)
+        skippedSuffixBundles = try container.decodeIfPresent(UInt32.self, forKey: .skippedSuffixBundles) ?? 0
+        skippedSuffixNotes = try container.decodeIfPresent(UInt32.self, forKey: .skippedSuffixNotes) ?? 0
+        skippedSuffixValueZatoshi =
+            try container.decodeIfPresent(UInt64.self, forKey: .skippedSuffixValueZatoshi) ?? 0
     }
 }
 

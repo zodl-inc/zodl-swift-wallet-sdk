@@ -441,6 +441,13 @@ impl From<zcash_voting::storage::RoundSummary> for RoundSummaryDto {
 }
 
 /// Delegation bundle layout after quantizing eligible notes.
+///
+/// `privacy_trim_dropped_value_zatoshi` is the raw value of the notes the
+/// privacy trim withheld, not their bundle-quantized voting weight — the two
+/// mean different things to a voter, and this is the former.
+/// `skipped_suffix_*` are the trailing bundles a host removed from this round
+/// with `deleteSkippedBundles`, kept separate because they were never part of
+/// the trim's own decision.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct BundleLayoutDto {
     pub bundle_count: u32,
@@ -448,15 +455,58 @@ pub(super) struct BundleLayoutDto {
     pub dropped_count: u32,
     pub privacy_trim_dropped_bundles: u32,
     pub privacy_trim_dropped_notes: u32,
+    pub privacy_trim_dropped_value_zatoshi: u64,
+    pub skipped_suffix_bundles: u32,
+    pub skipped_suffix_notes: u32,
+    pub skipped_suffix_value_zatoshi: u64,
+}
+
+impl From<zcash_voting::round::BundleLayout> for BundleLayoutDto {
+    fn from(layout: zcash_voting::round::BundleLayout) -> Self {
+        BundleLayoutDto {
+            bundle_count: layout.bundle_count,
+            eligible_weight: layout.eligible_weight,
+            dropped_count: layout.dropped_count,
+            privacy_trim_dropped_bundles: layout.privacy_trim_dropped_bundles,
+            privacy_trim_dropped_notes: layout.privacy_trim_dropped_notes,
+            privacy_trim_dropped_value_zatoshi: layout.privacy_trim_dropped_value_zatoshi,
+            skipped_suffix_bundles: layout.skipped_suffix_bundles,
+            skipped_suffix_notes: layout.skipped_suffix_notes,
+            skipped_suffix_value_zatoshi: layout.skipped_suffix_value_zatoshi,
+        }
+    }
 }
 
 /// Voting eligibility computed for the wallet's snapshot notes.
+///
+/// See [`BundleLayoutDto`]'s doc comment for what `privacy_trim_dropped_value_zatoshi`
+/// and `skipped_suffix_*` mean; both DTOs report them for the same reason, one
+/// from a persisted layout and this one from a preview that persists nothing.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct EligibilityDto {
     pub distinct_note_count: u64,
     pub eligible_weight: u64,
     pub is_eligible: bool,
     pub privacy_trim_dropped_value_zatoshi: u64,
+    pub skipped_suffix_bundles: u32,
+    pub skipped_suffix_notes: u32,
+    pub skipped_suffix_value_zatoshi: u64,
+}
+
+impl From<zcash_voting::VotingEligibilityReport> for EligibilityDto {
+    fn from(report: zcash_voting::VotingEligibilityReport) -> Self {
+        EligibilityDto {
+            // `usize` on every target this SDK builds for is at most 64 bits,
+            // so widening is lossless.
+            distinct_note_count: report.eligibility.distinct_note_count as u64,
+            eligible_weight: report.eligibility.eligible_weight,
+            is_eligible: report.eligibility.is_eligible(),
+            privacy_trim_dropped_value_zatoshi: report.privacy_trim_dropped_value_zatoshi,
+            skipped_suffix_bundles: report.skipped_suffix_bundles,
+            skipped_suffix_notes: report.skipped_suffix_notes,
+            skipped_suffix_value_zatoshi: report.skipped_suffix_value_zatoshi,
+        }
+    }
 }
 
 /// Progress of PIR precompute for one delegation bundle.
@@ -973,5 +1023,26 @@ mod tests {
         let json = serde_json::to_string(&dto).expect("serialize");
         let round_tripped: SessionInputsDto = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, dto);
+    }
+
+    #[test]
+    fn bundle_layout_dto_carries_every_layout_field() {
+        let layout = zcash_voting::round::BundleLayout {
+            bundle_count: 2,
+            eligible_weight: 900,
+            dropped_count: 1,
+            privacy_trim_dropped_bundles: 3,
+            privacy_trim_dropped_notes: 11,
+            privacy_trim_dropped_value_zatoshi: 4_200,
+            skipped_suffix_bundles: 1,
+            skipped_suffix_notes: 5,
+            skipped_suffix_value_zatoshi: 70,
+        };
+        let json = serde_json::to_value(BundleLayoutDto::from(layout)).expect("json");
+        assert_eq!(json["privacy_trim_dropped_value_zatoshi"], 4_200);
+        assert_eq!(json["skipped_suffix_bundles"], 1);
+        assert_eq!(json["skipped_suffix_notes"], 5);
+        assert_eq!(json["skipped_suffix_value_zatoshi"], 70);
+        assert_eq!(json["bundle_count"], 2);
     }
 }

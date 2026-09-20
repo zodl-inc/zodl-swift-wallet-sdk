@@ -371,6 +371,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connection to the sidecar. Reset when the voter leaves the round, not on every session free —
     a round-scoped reset drops that round's state on every tree client of the wallet, including
     one a concurrent session is syncing on.
+  - `zcashlc_voting_session_setup_bundles`'s JSON gains `privacy_trim_dropped_value_zatoshi`,
+    `skipped_suffix_bundles`, `skipped_suffix_notes` and `skipped_suffix_value_zatoshi`;
+    `zcashlc_voting_session_eligibility`'s gains `skipped_suffix_bundles`, `skipped_suffix_notes`
+    and `skipped_suffix_value_zatoshi`. A new round is now seeded with the crate's default bundle
+    policy — privacy trim included, at most two bundles dropped within 1% of the selected value and
+    capped at 1,000 ZEC — instead of it disabled; a round that already has a persisted policy keeps
+    it.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
