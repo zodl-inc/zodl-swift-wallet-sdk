@@ -389,8 +389,8 @@ case .unknown:
 finished, not paused, and further work on that round needs a new session. It does **not** interrupt
 a proof already running inside `precomputeDelegationProof(bundleIndex:progress:)`: the crate takes no
 cancellation signal for a native proof at this revision, so that call runs to completion (the proof
-is persisted and reused, so nothing is wasted). `syncVoteTree(roundId:nodeUrl:)` is `async` now but
-likewise not cancellable.
+is persisted and reused, so nothing is wasted). `syncVoteTree(nodeUrl:)` — a session call now, not a
+backend one — is `async` but likewise not cancellable.
 
 `setOperationEpoch(_:)` invalidates passes that captured an older epoch: bump it when the voter
 switches wallets or leaves the flow, and every bounded pass started under the older epoch stops at
@@ -410,9 +410,9 @@ throws `VotingRustBackendError.sessionClosed`. It does not drain the event queue
 into the events closure can arrive after `close()` has returned — what it carries is an already
 decoded Swift value, nothing the freed handle owned, but a host that tears down the state its closure
 writes to should expect that last callback. Close the sessions before closing the backend, and
-close both before deleting the sidecar file — `VotingRustBackend.close()` does not wait for a
-`syncVoteTree` still in flight, so a host that means to delete the file rather than stop using it
-should let that sync finish first.
+close both before deleting the sidecar file — `VotingRustBackend.close()` never blocks, so a host
+that means to delete the file rather than stop using it should let everything it started finish
+first.
 
 ### What replaced each removed call
 

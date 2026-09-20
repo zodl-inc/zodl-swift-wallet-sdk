@@ -692,7 +692,7 @@ public protocol Synchronizer: AnyObject {
     ///    - backend: The voting backend whose sidecar the round persists to.
     ///    - inputs: The round's parameters and endpoints.
     ///    - binding: The proposal roster the session is bound to.
-    ///    - route: Which route the session's chain and helper traffic takes.
+    ///    - route: Which route every service the session touches takes.
     ///    - epoch: The submission epoch the session starts at.
     func makeVotingRoundSession(
         backend: VotingRustBackend,

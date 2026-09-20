@@ -38,16 +38,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `VotingSessionHandle` freed with `zcashlc_voting_session_free`. It performs no network I/O,
     so a bad round configuration is reported immediately rather than through a timeout. The
     session then drives the round: `zcashlc_voting_session_{plan, set_ballot_intents,
-    setup_bundles, eligibility, precompute_pir, precompute_delegation_proof,
+    setup_bundles, eligibility, sync_vote_tree, precompute_pir, precompute_delegation_proof,
     keystone_signing_requests, store_keystone_signatures, run, track_shares, cancel, set_epoch}`.
     `_run` and `_track_shares` block for the whole drive — minutes on a round with proofs to
     generate — and stream progress to an optional host callback that is invoked on runtime
     worker threads, possibly concurrently, and must not block; the event stream is lossy by
     design and the returned report is authoritative. One run at a time per session.
-  - The route a session is opened on governs its chain and helper traffic for the session's whole
-    life: a null `TorRuntime` is the direct HTTP route, and a Tor runtime is used through an
-    isolated client, never falling back to a direct connection when Tor cannot connect. PIR and
-    vote-tree traffic take a shared direct transport either way.
+    `_sync_vote_tree` takes the session handle and a node URL — no database handle and no round
+    id, because the session is already bound to a round — blocks for the sync, and returns the
+    height synced to, or -1 on error.
+  - The route a session is opened on governs every service it touches for the session's whole
+    life — chain and helper traffic, PIR queries and vote-tree sync: a null `TorRuntime` is the
+    direct HTTP route, and a Tor runtime is used through an isolated client, never falling back
+    to a direct connection when Tor cannot connect. A PIR query hides which rows are fetched, not
+    who fetches them, so a Tor session fails closed for all four rather than letting any of them
+    show the PIR server or the tree node the device's address.
   - Delegation signing is stated per run. A software wallet passes its seed, which reaches the
     SDK's signer for that call only and never returns to the caller as a sighash, randomizer or
     PCZT; a Keystone wallet exchanges per-bundle signing requests through
@@ -346,6 +351,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Hotkey generation and the software signer accept a regtest or custom network id, which
     resolves its voting identity through the registered base network: a modified-mainnet chain
     votes with mainnet hotkeys and HRPs, and an unconfigured custom network is rejected.
+  - Every voting service a session touches rides the route the session was opened on: chain and
+    helper traffic, PIR queries and vote-tree sync alike. A PIR query hides which rows are
+    fetched, not who fetches them, so PIR and vote-tree traffic previously showed the PIR server
+    and the tree node the device's address, the round and one fetch burst per bundle whatever
+    route the session chose. A Tor session now fails closed for all four, and vote-tree sync is
+    a session call (`zcashlc_voting_session_sync_vote_tree`) rather than a store call, because
+    only a session carries a route to take it on.
+    The vote-tree client follows the route rather than the round, which costs bandwidth and
+    memory the caller should budget for. The crate keeps one tree client per wallet and
+    transport, and each session has its own transport, so a session's first
+    `zcashlc_voting_session_sync_vote_tree` for a round syncs the tree FROM SCRATCH instead of
+    continuing the previous session's — paid whenever a round is reopened, and always on a route
+    change, which requires a new session. The previous session's tree is also retained after the
+    session is freed, for as long as its client holds any round's state:
+    `zcashlc_voting_reset_vote_tree` for those rounds releases it, as does closing the last
+    connection to the sidecar. Reset when the voter leaves the round, not on every session free —
+    a round-scoped reset drops that round's state on every tree client of the wallet, including
+    one a concurrent session is syncing on.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
@@ -500,8 +523,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_voting_round_plan`, `zcashlc_voting_reset_session_state` and
     `zcashlc_voting_delete_round`.
   - Vote-tree state — `zcashlc_voting_store_tree_state` and `zcashlc_voting_reset_tree_client` —
-    are replaced by `zcashlc_voting_sync_vote_tree` and `zcashlc_voting_reset_vote_tree`; the
-    round's anchor tree state is now an input to `zcashlc_voting_session_open`.
+    are replaced by `zcashlc_voting_session_sync_vote_tree` and `zcashlc_voting_reset_vote_tree`;
+    the round's anchor tree state is now an input to `zcashlc_voting_session_open`.
   - `zcashlc_voting_store_keystone_signature` is replaced by
     `zcashlc_voting_session_store_keystone_signatures`, which stores a whole round's signatures
     in one batch and reports how many were already present.
@@ -518,6 +541,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_voting_free_round_state`, `zcashlc_voting_free_vote_records` and
     `zcashlc_voting_free_bundle_setup_result`, are gone: every voting result is JSON in an
     `FfiBoxedSlice`, freed with `zcashlc_free_boxed_slice`.
+- `zcashlc_voting_sync_vote_tree` is removed, and `zcashlc_voting_session_sync_vote_tree`
+  replaces it. The store-level call had no route to take, so vote-tree traffic reached the node
+  directly even for a round whose session had been opened on Tor. The replacement takes the
+  `VotingSessionHandle` and the node URL in place of the database handle and the round id, and
+  syncs over the session's route; a host that synced outside a round opens the round's session
+  first.
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
   wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
   committed schedule so its transfers become due in quick succession for manual broadcast testing.

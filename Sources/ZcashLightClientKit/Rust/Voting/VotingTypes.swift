@@ -108,14 +108,15 @@ public struct VotingRoundParameters: Equatable, Sendable, Encodable {
     }
 }
 
-/// The route a round session's chain and helper traffic takes.
+/// The route a round session's traffic takes.
 ///
 /// Chosen once, when the session is opened, and kept for the session's whole
 /// life. ``tor`` fails closed: a session that cannot have the Tor route is
 /// refused rather than opened on a direct connection, so a voter who asked for
-/// Tor never ends up announcing themselves over plain HTTP. PIR and vote-tree
-/// traffic take the crate's direct transport either way, because a PIR query
-/// names no voter and its volume does not belong on Tor.
+/// Tor never ends up announcing themselves over plain HTTP. Every service a
+/// session touches takes this route: chain and helper traffic, PIR queries and
+/// vote-tree sync. A PIR query hides which rows are fetched, not who fetches
+/// them, so none of it may leave a Tor session any other way.
 ///
 /// The runtime the ``tor`` route needs belongs to the synchronizer rather than
 /// to the caller, which is why a route is named here instead of a client being
@@ -127,9 +128,8 @@ public enum VotingTransportRoute: Sendable, Equatable {
 
 /// Everything needed to open a round session.
 ///
-/// The endpoints are the ones the session uses for its whole life: chain and
-/// helper traffic follow the route chosen when the session is opened, while PIR
-/// and vote-tree traffic always use the crate's direct transport.
+/// The endpoints are the ones the session uses for its whole life, and every
+/// one of them is reached over the route chosen when the session is opened.
 public struct VotingSessionInputs: Equatable, Sendable, Encodable {
     public let accountUUID: String
     public let walletDbPath: String

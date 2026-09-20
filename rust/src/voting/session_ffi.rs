@@ -4,8 +4,9 @@
 //! arguments arrive as `(ptr, len)` byte pairs, JSON results come back as a
 //! `*mut crate::ffi::BoxedSlice` the caller frees with
 //! [`zcashlc_free_boxed_slice`](crate::ffi::zcashlc_free_boxed_slice), and
-//! failure is null with `VotingErrorView` JSON in the last-error slot. Swift
-//! branches on the typed `kind` in that JSON, never on message text.
+//! failure is null (pointer returns) or `-1` (integer returns) with
+//! `VotingErrorView` JSON in the last-error slot. Swift branches on the typed
+//! `kind` in that JSON, never on message text.
 //!
 //! [`zcashlc_voting_session_open`] opens one session per round and
 //! [`zcashlc_voting_session_free`] releases it; every other entry point takes
@@ -53,7 +54,7 @@ use serde::de::DeserializeOwned;
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::errors::invalid_input;
-use super::helpers::{bytes_from_ptr, json_to_boxed_slice};
+use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
 use super::route::SdkRoute;
 use super::session::{EventCallback, EventSink, VotingSession};
 use super::store::VotingDatabaseHandle;
@@ -154,14 +155,14 @@ struct ProofStatusResponse {
 /// one is refused as `invalid_input` here rather than at the first step that
 /// would have read a row.
 ///
-/// `tor` selects the route this session's chain and helper traffic takes, for
-/// the session's whole life: null is the direct HTTP route, and a Tor runtime
-/// is used through an isolated client taken during this call, so the round's
-/// circuits are not linkable to the rest of the wallet's Tor use. A session
-/// opened on Tor never falls back to a direct connection: a Tor route that
-/// cannot connect fails the request, because putting the voter's traffic on
-/// the clear network after they asked for Tor is worse than failing. PIR and
-/// vote-tree traffic take the shared direct transport either way.
+/// `tor` selects the route every service this session touches takes, for the
+/// session's whole life — chain and helper traffic, PIR queries and vote-tree
+/// sync alike: null is the direct HTTP route, and a Tor runtime is used
+/// through an isolated client taken during this call, so the round's circuits
+/// are not linkable to the rest of the wallet's Tor use. A session opened on
+/// Tor never falls back to a direct connection: a Tor route that cannot
+/// connect fails the request, because putting the voter's traffic on the clear
+/// network after they asked for Tor is worse than failing.
 ///
 /// `epoch` is the host's operation epoch at open; move it with
 /// [`zcashlc_voting_session_set_epoch`]. Nothing here reaches the network:
@@ -334,12 +335,38 @@ pub unsafe extern "C" fn zcashlc_voting_session_eligibility(
     unwrap_exc_or_null(res)
 }
 
+/// Sync this round's vote-commitment tree from `node_url` over the session's
+/// route.
+///
+/// Blocks for the duration of the sync. Returns the height synced to, or -1 on
+/// error.
+///
+/// # Safety
+///
+/// - `session` must be a valid, non-null `VotingSessionHandle` pointer.
+/// - The `(node_url, node_url_len)` byte argument follows the
+///   [`bytes_from_ptr`] contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_session_sync_vote_tree(
+    session: *mut VotingSessionHandle,
+    node_url: *const u8,
+    node_url_len: usize,
+) -> i64 {
+    let session = AssertUnwindSafe(session);
+    let res = catch_panic(|| {
+        let session = unsafe { session_from_ptr(*session) }?;
+        let node_url = unsafe { str_from_ptr(node_url, node_url_len) }?;
+        Ok(i64::from(session.sync_vote_tree(&node_url)?))
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// Persist one bundle's witnesses and padded secrets and warm its PIR rows,
 /// returning what the precompute did as JSON.
 ///
-/// Reaches the PIR fleet over the shared direct transport whatever route the
-/// session opened on — a PIR query names no voter — so it blocks for as long
-/// as those queries take. Returns null on error.
+/// Reaches the PIR fleet over the session's route like everything else it
+/// touches, so it blocks for as long as those queries take. Returns null on
+/// error.
 ///
 /// # Safety
 ///
@@ -743,6 +770,13 @@ mod tests {
         assert_eq!(last_error_kind(), "invalid_input", "{name}");
     }
 
+    /// [`refused`] for an entry point that answers with an integer: the same
+    /// typed error, behind `-1` rather than a null pointer.
+    fn refused_integer(name: &str, status: i64) {
+        assert_eq!(status, -1, "{name} accepted a call it must refuse");
+        assert_eq!(last_error_kind(), "invalid_input", "{name}");
+    }
+
     /// Collects every event the session streamed, as the host's context.
     ///
     /// # Safety
@@ -920,8 +954,9 @@ mod tests {
     }
 
     /// A null session is a host mistake every entry point reports the same
-    /// way: null with typed JSON for the ones that return a result, and
-    /// nothing at all for the two that return none.
+    /// way: the same typed JSON behind null for the ones that answer with a
+    /// pointer and behind `-1` for the one that answers with an integer, and
+    /// nothing at all for the two that answer with nothing.
     #[test]
     fn entry_points_reject_a_null_session() {
         let null = std::ptr::null_mut();
@@ -935,6 +970,9 @@ mod tests {
         });
         refused("eligibility", unsafe {
             zcashlc_voting_session_eligibility(null)
+        });
+        refused_integer("sync_vote_tree", unsafe {
+            zcashlc_voting_session_sync_vote_tree(null, b"u".as_ptr(), 1)
         });
         refused("precompute_pir", unsafe {
             zcashlc_voting_session_precompute_pir(null, 0)

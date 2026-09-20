@@ -190,35 +190,6 @@ pub unsafe extern "C" fn zcashlc_voting_pending_share_rounds(
     unwrap_exc_or_null(res)
 }
 
-/// Sync a round's vote-commitment tree from `node_url`.
-///
-/// Blocks for the duration of the sync. Returns the height synced to, or -1 on
-/// error.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-/// - Each `(ptr, len)` byte argument follows the [`bytes_from_ptr`] contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_sync_vote_tree(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-    node_url: *const u8,
-    node_url_len: usize,
-) -> i64 {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle = unsafe { handle_from_ptr(*db) }?;
-        let round_id = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let node_url = unsafe { str_from_ptr(node_url, node_url_len) }?;
-        Ok(i64::from(store::sync_vote_tree(
-            handle, &round_id, &node_url,
-        )?))
-    });
-    unwrap_exc_or(res, -1)
-}
-
 /// Drop the cached vote-tree state for one round.
 ///
 /// A zero-length `round_id` means the crate's wallet-wide reset, which forgets
@@ -627,10 +598,6 @@ mod tests {
         );
         assert_eq!(
             unsafe { zcashlc_voting_retry_blocked_combined_cast(null, id, len, 0) },
-            -1
-        );
-        assert_eq!(
-            unsafe { zcashlc_voting_sync_vote_tree(null, id, len, b"u".as_ptr(), 1) },
             -1
         );
         assert_eq!(

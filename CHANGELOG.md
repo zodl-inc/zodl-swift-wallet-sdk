@@ -36,12 +36,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screen can say "you cannot vote in this round" before a round row exists.
 - `Synchronizer` gained `makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, with the
   matching `ClosureSynchronizer` and `CombineSynchronizer` counterparts. `VotingTransportRoute`
-  names the route the session's chain and helper traffic takes for its whole life: `.tor` fails
+  names the route the session's traffic takes for its whole life: `.tor` fails
   closed, throwing `ZcashError.torNotEnabled` when Tor is off and `ZcashError.torClientUnavailable`
   when the conformer has no Tor client at all, and never falls back to a direct connection. All
   three protocols carry a default implementation that opens `.direct` sessions and refuses `.tor`,
-  so existing conformers and test doubles keep compiling unchanged. PIR and vote-tree traffic take
-  the direct transport on either route, because a PIR query names no voter.
+  so existing conformers and test doubles keep compiling unchanged. Every service the session
+  touches takes that route — chain and helper traffic, PIR queries and vote-tree sync — because a
+  PIR query hides which rows are fetched, not who fetches them.
+  That route owns the vote-tree client, which costs bandwidth and memory a host should budget for:
+  a session's first `VotingRoundSession.syncVoteTree(nodeUrl:)` for a round syncs the tree from
+  scratch rather than continuing the previous session's, so reopening an already-synced round pays
+  for the whole tree again, and a route change — always a new session — resyncs over the new route.
+  The previous session's tree also stays in memory after `close()`, for as long as its client holds
+  any round's state; `VotingRustBackend.resetVoteTree(roundId:)` releases it, as does closing the
+  sidecar once nothing holds it open. Reset when the voter leaves the round rather than on every
+  `close()`: the reset forgets that round on every tree client of the wallet, a concurrent
+  session's included.
 - A run's live events are a best-effort narration and may be dropped under load: the
   `VotingRoundRunReport` a call returns, not the `VotingRoundDriveEvent` stream, is the authoritative
   account of what a run did. Events are delivered one at a time on a serial queue per session, and
@@ -89,8 +99,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Members that kept their name and changed: `listRounds()` answers the new `VotingRoundSummary`,
   whose `phase` is a `String` rather than the removed `VotingRoundPhase` enum and which gained
   `walletId` and `network` — a `switch` over the old enum is replaced by a comparison against the
-  crate's phase strings, or better by `VotingRoundPlan.primaryAction`. `syncVoteTree(roundId:nodeUrl:)`
-  is now `async` and no longer blocks the caller's thread or the backend's other calls.
+  crate's phase strings, or better by `VotingRoundPlan.primaryAction`.
+  `syncVoteTree(roundId:nodeUrl:)` is `VotingRoundSession.syncVoteTree(nodeUrl:)`, `async` and
+  taking no round id — the session is already bound to one — so the sync takes the session's
+  route instead of reaching the node directly.
   `deleteSkippedBundles(roundId:keepCount:)` returns `UInt64` instead of `UInt32`.
   `setupBundles(roundId:notes:)` is `VotingRoundSession.setupBundles()`, `async` and returning
   `VotingBundleLayout` instead of `VotingBundleSetupResult`. `resetSessionState(roundId:)` and the

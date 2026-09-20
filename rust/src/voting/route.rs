@@ -39,6 +39,10 @@ pub(super) enum SdkRoute {
     /// order of magnitude larger than a `DirectRoute`, and every session pays
     /// for the larger arm otherwise.
     Tor(Box<TorRoute>),
+    /// Refuses every request before dispatch and counts the attempts, so a
+    /// test can prove which traffic reached the session's route.
+    #[cfg(test)]
+    Refusing(Arc<std::sync::atomic::AtomicUsize>),
 }
 
 impl SdkRoute {
@@ -66,6 +70,15 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.execute(request, on_dispatch),
             Self::Tor(tor) => tor.execute(request, on_dispatch),
+            #[cfg(test)]
+            Self::Refusing(attempts) => {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(RouteError::before_dispatch(
+                        "refused by the test route".to_string(),
+                    ))
+                })
+            }
         }
     }
 
@@ -73,6 +86,8 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.hook_precedes_connection_setup(),
             Self::Tor(tor) => tor.hook_precedes_connection_setup(),
+            #[cfg(test)]
+            Self::Refusing(_) => false,
         }
     }
 
@@ -80,6 +95,8 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.enforces_connect_timeout(),
             Self::Tor(tor) => tor.enforces_connect_timeout(),
+            #[cfg(test)]
+            Self::Refusing(_) => false,
         }
     }
 }
@@ -325,11 +342,8 @@ impl RouteHttp for TorRoute {
     // connect budget either.
 }
 
-/// The crate transport for the chain and helper traffic of one session.
-///
-/// PIR and vote-tree traffic keeps the shared direct transport instead
-/// ([`super::runtime::direct_transport`]): it identifies no voter and is
-/// throughput-sensitive, so it is not what this route governs.
+/// The crate transport for every service of one session: chain, helper, PIR
+/// and vote-tree traffic.
 pub(super) fn routed_transport(route: SdkRoute) -> Arc<HyperTransport<SdkRoute>> {
     Arc::new(HyperTransport::with_route(route))
 }

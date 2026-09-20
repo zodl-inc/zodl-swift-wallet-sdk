@@ -125,35 +125,19 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertFalse(try VotingRustBackend.configureProving(conflicting))
     }
 
-    /// The vote-tree sync is the one store call that reaches the network. It
-    /// runs off the backend lock, so a node that refuses the connection comes
-    /// back as the crate's typed failure and leaves the backend answering.
-    func testSyncVoteTreeReportsATypedFailureAndLeavesTheBackendUsable() async throws {
-        let backend = try openBackend()
-
-        do {
-            // Port 9 is the discard port: nothing listens, and loopback refuses
-            // at once rather than hanging.
-            _ = try await backend.syncVoteTree(roundId: hexRoundId(0x03), nodeUrl: "http://127.0.0.1:9/")
-            XCTFail("nothing is listening on the discard port")
-        } catch {
-            XCTAssertTrue(error is VotingError, "expected VotingError, got \(error)")
-        }
-
-        XCTAssertEqual(try backend.listRounds(), [])
-    }
-
     /// A close that cannot free its handle parks it, and a second close while
     /// the first handle is still parked parks its own rather than replacing it.
     ///
-    /// The sequence is close → open → sync → close with the first sync still in
-    /// flight: a single parking slot would hold only the second handle, and the
-    /// first sidecar connection would be leaked with nothing left able to reach
-    /// it. Both handles are real, so the frees this asserts are real frees.
+    /// The sequence is close → open → blocking call → close with the first call
+    /// still in flight: a single parking slot would hold only the second
+    /// handle, and the first sidecar connection would be leaked with nothing
+    /// left able to reach it. Both handles are real, so the frees this asserts
+    /// are real frees.
     ///
     /// The in-flight calls take the backend's own blocking path with a test body
-    /// in place of the FFI call: what the body does is irrelevant to the
-    /// bookkeeping, and a real `syncVoteTree` returns too fast to hold open.
+    /// in place of an FFI call: what the body does is irrelevant to the
+    /// bookkeeping, and holding a real one open long enough would mean waiting
+    /// on the network.
     func testASecondCloseParksItsOwnHandleRatherThanReplacingTheFirst() async throws {
         let backend = VotingRustBackend()
         let firstPath = "\(NSTemporaryDirectory())voting-\(UUID().uuidString).sqlite3"

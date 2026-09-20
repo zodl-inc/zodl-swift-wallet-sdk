@@ -107,6 +107,27 @@ final class VotingRoundSessionTests: XCTestCase {
         await fixture.session.close()
     }
 
+    /// The vote-tree sync is the session call that names a node URL, and it
+    /// reaches that node over the session's route like the rest of its
+    /// traffic. A node that refuses the connection comes back as the crate's
+    /// typed failure and leaves the session answering.
+    func testSyncVoteTreeReportsATypedFailureAndLeavesTheSessionUsable() async throws {
+        let fixture = try await makeFixture(tag: 0x49)
+
+        do {
+            // Port 9 is the discard port: nothing listens, and loopback refuses
+            // at once rather than hanging.
+            _ = try await fixture.session.syncVoteTree(nodeUrl: "http://127.0.0.1:9/")
+            XCTFail("nothing is listening on the discard port")
+        } catch {
+            XCTAssertTrue(error is VotingError, "expected VotingError, got \(error)")
+        }
+
+        XCTAssertEqual(try fixture.session.plan().roundId, fixture.roundId)
+
+        await fixture.session.close()
+    }
+
     // MARK: - Runs
 
     /// A cancelled session drives nothing: it reads no plan, dials no endpoint,

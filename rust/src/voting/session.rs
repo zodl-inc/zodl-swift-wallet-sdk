@@ -14,11 +14,13 @@
 //! is what lets Swift open a session on the main thread and discover a bad
 //! round configuration immediately rather than through a timeout.
 //!
-//! Traffic splits by kind: chain and helper requests go through the route
-//! chosen at open — Tor or direct, never falling back — because they are what
-//! links this device to a vote. PIR and vote-tree requests use the
-//! process-wide direct transport: they identify no voter and move enough
-//! bytes that routing them over Tor would cost far more than it bought.
+//! Every service a session touches rides the route chosen at open — Tor or
+//! direct, never falling back: chain and helper traffic, PIR queries and
+//! vote-tree sync alike. A PIR query hides which rows are fetched, not who
+//! fetches them, so a fleet reached any other way would show the PIR server
+//! the device address, the round and one fetch burst per bundle, and the tree
+//! node as much again — an address tied to participation and to approximate
+//! weight, which is exactly what the route exists to withhold.
 //!
 //! A run — [`VotingSession::run`] or [`VotingSession::track_shares`] — is
 //! driven on the shared runtime instead of on the calling thread, and streams
@@ -198,10 +200,16 @@ pub struct VotingSession {
     /// `Arc` because the round driver hands it to the crate as a
     /// `DelegationDriver` while this session keeps using it.
     pipeline: Arc<zcash_voting::DelegationPipeline<SdkWalletDbOpener>>,
-    /// The PIR fleet delegation precompute queries, over the shared direct
-    /// transport rather than this session's route: a PIR query names no
-    /// voter, and the volume it moves does not belong on Tor.
+    /// The PIR fleet delegation precompute queries, over [`Self::transport`]
+    /// like every other service: a PIR query hides which rows are fetched, not
+    /// who fetches them.
     pir: Arc<zcash_voting::PirFleet>,
+    /// The crate transport every one of this session's services was built on,
+    /// kept because vote-tree sync takes it per call rather than at
+    /// construction — the crate keeps one tree client per wallet and
+    /// transport, so handing it the same one each time keeps the incremental
+    /// state.
+    transport: Arc<zcash_voting::HyperTransport<SdkRoute>>,
     /// The helper client, kept beside the executor's clone: the two share one
     /// health tracker, so share tracking observes what the round's deliveries
     /// learned about each helper.
@@ -300,18 +308,22 @@ impl VotingSession {
             .ffi()?,
         );
 
+        let transport = super::route::routed_transport(route);
+
         // Constructing the fleet validates the layout and normalizes the
-        // endpoint list; it connects to nothing.
+        // endpoint list; it connects to nothing. It rides the session's route
+        // like every other service: a PIR query hides which rows are fetched,
+        // not who fetches them, so on a Tor session it must not leave the
+        // device any other way.
         let pir = Arc::new(
             zcash_voting::PirFleet::new(
                 &inputs.pir_endpoints,
                 inputs.pir_layout.clone().into_layout(),
-                super::runtime::direct_transport(),
+                transport.clone(),
             )
             .ffi()?,
         );
 
-        let transport = super::route::routed_transport(route);
         let helper_transport: Arc<dyn zcash_voting::HelperTransport> = transport.clone();
         let helper_client = zcash_voting::HelperClient::new(
             helper_transport,
@@ -348,10 +360,10 @@ impl VotingSession {
             hotkey_secret: binding.hotkey_secret.map(Zeroizing::new),
         })
         .ffi()?
-        // Vote-tree sync is not chain or helper traffic — it names no voter —
-        // so it keeps the shared direct transport whatever route this session
-        // chose.
-        .with_tree_transport(super::runtime::direct_transport());
+        // Vote-tree sync takes the session's route as well: the tree node sees
+        // the device address and the round, which is what the route exists to
+        // keep from it.
+        .with_tree_transport(transport.clone());
 
         let control = zcash_voting::ChainSubmissionControl::new(epoch);
 
@@ -360,6 +372,7 @@ impl VotingSession {
             executor,
             pipeline,
             pir,
+            transport,
             helper_client,
             control,
             round_id: round_params.vote_round_id,
@@ -437,9 +450,10 @@ impl VotingSession {
     ///
     /// The one delegation step worth running ahead of a drive: a bundle whose
     /// rows are already warm proves without waiting on the PIR fleet, and the
-    /// report says how much of the warmth was already there. PIR traffic takes
-    /// the shared direct transport whatever route this session opened on: a
-    /// PIR query names no voter, and its volume does not belong on Tor.
+    /// report says how much of the warmth was already there. The fleet is
+    /// reached over the session's route like everything else it touches, so on
+    /// a Tor session these queries fail closed rather than leaving the device
+    /// directly.
     pub(super) fn precompute_pir(&self, bundle_index: u32) -> anyhow::Result<PirPrecomputeDto> {
         let report = self
             .pipeline
@@ -453,6 +467,39 @@ impl VotingSession {
             // enough for a host to say "bundle 2 of 5".
             bundle_count: report.layout.bundle_count,
         })
+    }
+
+    /// Sync this round's vote-commitment tree from `node_url` over the
+    /// session's route, returning the height synced to.
+    ///
+    /// The crate keeps one tree client per wallet and transport, so passing
+    /// the session's own transport on every call keeps the incremental state
+    /// *within* one session.
+    ///
+    /// Across sessions it does not, and that is this routing's standing cost.
+    /// Every session builds its own transport and the crate keys its clients
+    /// on that transport's identity, so each session's first sync of a round
+    /// syncs the tree from scratch rather than continuing the last session's.
+    /// It is paid wherever a round is reopened, and worst where a route change
+    /// forces a new session: toggling Tor mid-round buys a full resync over
+    /// Tor.
+    ///
+    /// The old client is not dropped with the session either. A routed client
+    /// outlives every clone of the transport it was built over for as long as
+    /// it holds any round's tree state, so that state stays in memory until
+    /// [`super::store::reset_vote_tree`] forgets its rounds or the last
+    /// connection to the sidecar closes. Nothing here resets on close, on
+    /// purpose: the crate's round-scoped reset drops that round's state on
+    /// *every* client the wallet has, so a session tidying up after itself
+    /// would throw away a concurrent session's sync.
+    pub(super) fn sync_vote_tree(&self, node_url: &str) -> anyhow::Result<u32> {
+        zcash_voting::precompute::sync_vote_tree_with(
+            &self.database,
+            &self.round_id,
+            node_url,
+            self.transport.clone(),
+        )
+        .ffi()
     }
 
     /// Generates this bundle's proof, or reports the persisted one it reused,
@@ -1449,5 +1496,78 @@ mod tests {
                 "a delegation_progress event names its stage: {json}"
             );
         }
+    }
+
+    /// A local listener that counts the connections it is offered. A session
+    /// whose PIR or vote-tree traffic left the route would show up here.
+    fn counting_listener() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok(_) => {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        });
+        (url, accepted)
+    }
+
+    /// Every service a session touches rides the route it opened on.
+    ///
+    /// A route that refuses before dispatch stands in for a Tor route that
+    /// cannot connect: PIR and vote-tree traffic must fail through it rather
+    /// than reach the endpoint some other way, which the listener proves by
+    /// counting the connections nothing was supposed to make.
+    #[test]
+    fn pir_and_vote_tree_traffic_take_the_session_route() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (url, direct_connections) = counting_listener();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let store = open_memory_store(crate::NETWORK_ID_TESTNET, "routing-wallet");
+        let (_dir, wallet_db_path, account_uuid) =
+            temp_wallet_db_with_account(crate::NETWORK_ID_TESTNET);
+        let mut inputs = synthetic_session_inputs(0x71, &wallet_db_path, &account_uuid);
+        inputs.pir_endpoints = vec![url.clone()];
+        inputs.vote_tree_node_urls = vec![url.clone()];
+        let session = VotingSession::open(
+            &store,
+            inputs,
+            synthetic_binding(2, None),
+            SdkRoute::Refusing(Arc::clone(&attempts)),
+            1,
+        )
+        .expect("open");
+
+        assert!(
+            session.pir.connect().is_err(),
+            "the refusing route must fail PIR"
+        );
+        let after_pir = attempts.load(Ordering::SeqCst);
+        assert!(after_pir >= 1, "PIR never reached the session's route");
+
+        assert!(
+            session.sync_vote_tree(&url).is_err(),
+            "the refusing route must fail the tree sync"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) > after_pir,
+            "vote-tree sync never reached the session's route"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            direct_connections.load(Ordering::SeqCst),
+            0,
+            "PIR or vote-tree traffic bypassed the session's route"
+        );
     }
 }

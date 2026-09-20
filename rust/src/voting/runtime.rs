@@ -1,5 +1,5 @@
-//! Shared Tokio runtime, process-wide proving-policy configuration, and the
-//! process-wide direct HTTP transport for the voting host.
+//! Shared Tokio runtime and process-wide proving-policy configuration for the
+//! voting host.
 //!
 //! `zcash_voting`'s proving pool is fixed once per process behind its own
 //! `OnceLock`: the first caller (an explicit [`configure_proving`], or an
@@ -8,13 +8,10 @@
 //! reports [`ProvingConfigureOutcome::AlreadyConfigured`] without changing
 //! the running pool.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use ffi_helpers::panic::catch_panic;
-use zcash_voting::{
-    DirectRoute, HyperTransport, ProvingConfigurationError, ProvingPolicy,
-    configure_proving_runtime,
-};
+use zcash_voting::{ProvingConfigurationError, ProvingPolicy, configure_proving_runtime};
 
 use crate::unwrap_exc_or;
 
@@ -22,7 +19,6 @@ use super::errors::{internal, invalid_input};
 use super::helpers::bytes_from_ptr;
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-static DIRECT: OnceLock<Arc<HyperTransport<DirectRoute>>> = OnceLock::new();
 
 /// The shared multi-thread Tokio runtime that drives voting session work.
 ///
@@ -37,19 +33,6 @@ pub(super) fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("voting runtime")
     })
-}
-
-/// The process-wide direct HTTP transport for PIR and vote-tree traffic.
-///
-/// Chain and helper traffic route through the transport selected at session
-/// open (Tor or direct); PIR and vote-tree traffic always use this shared
-/// direct transport instead, because neither carries anything that identifies
-/// the voter to an observer and both are throughput-sensitive enough that
-/// routing them over Tor would cost far more than it bought.
-pub(super) fn direct_transport() -> Arc<HyperTransport<DirectRoute>> {
-    DIRECT
-        .get_or_init(|| Arc::new(HyperTransport::new()))
-        .clone()
 }
 
 /// Outcome of a [`configure_proving`] call.

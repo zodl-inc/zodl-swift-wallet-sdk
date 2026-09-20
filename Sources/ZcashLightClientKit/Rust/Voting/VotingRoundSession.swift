@@ -217,11 +217,59 @@ public final class VotingRoundSession: @unchecked Sendable {
         }
     }
 
+    /// Sync this round's vote-commitment tree from `nodeUrl`, returning the
+    /// height synced to.
+    ///
+    /// The sync rides the session's route like the rest of its traffic, so on
+    /// a ``VotingTransportRoute/tor`` session it fails closed instead of
+    /// reaching the node directly.
+    ///
+    /// The tree client belongs to the session's route rather than to the
+    /// round, which costs a host two things worth planning for. A session's
+    /// first sync of a round starts the tree from scratch instead of
+    /// continuing the last session's, so reopening a round that was already
+    /// synced pays for the whole tree again — and because a route change is
+    /// always a new session, toggling Tor mid-round means resyncing over Tor.
+    /// The session that synced also leaves its tree in memory after
+    /// ``close()``: that client outlives the session for as long as it holds
+    /// any round's state. ``VotingRustBackend/resetVoteTree(roundId:)``
+    /// releases it, and so does closing the sidecar once no session and no
+    /// ``VotingRustBackend`` still hold it open.
+    ///
+    /// Reset when the voter leaves the round, not on every ``close()``: the
+    /// reset forgets that round on every tree client the wallet has, including
+    /// one a concurrent session is still syncing on.
+    public func syncVoteTree(nodeUrl: String) async throws -> UInt32 {
+        let url = [UInt8](nodeUrl.utf8)
+
+        let height = try await runBlocking { session -> Int64 in
+            let synced = url.withUnsafeBufferPointer { urlBytes in
+                zcashlc_voting_session_sync_vote_tree(session, urlBytes.baseAddress, UInt(urlBytes.count))
+            }
+
+            // Read here rather than after the await: the FFI's last-error slot
+            // is per-thread, and this is the thread that made the call.
+            guard synced >= 0 else {
+                throw VotingRustBackend.votingError(fallback: "`voting_session_sync_vote_tree` failed")
+            }
+            return synced
+        }
+
+        guard let synced = UInt32(exactly: height) else {
+            throw VotingError(
+                kind: .internal,
+                message: "vote tree synced to height \(height), which is not a block height"
+            )
+        }
+        return synced
+    }
+
     /// Persist one bundle's witnesses and padded secrets and warm its PIR rows.
     ///
-    /// Reaches the PIR fleet over the shared direct transport whatever route
-    /// this session opened on — a PIR query names no voter — so it blocks for
-    /// as long as those queries take.
+    /// Reaches the PIR fleet over the session's route like the rest of its
+    /// traffic, so it blocks for as long as those queries take — and on a
+    /// ``VotingTransportRoute/tor`` session it fails closed rather than
+    /// querying the fleet directly.
     public func precomputePir(bundleIndex: UInt32) async throws -> VotingPirPrecomputeReport {
         try await blocking(fallback: "`voting_session_precompute_pir` failed") { session in
             zcashlc_voting_session_precompute_pir(session, bundleIndex)

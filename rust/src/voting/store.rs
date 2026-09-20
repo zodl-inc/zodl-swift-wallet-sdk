@@ -10,11 +10,9 @@
 //! nothing to cache and no lifetime to manage beyond this one.
 //!
 //! Everything here is synchronous and short: these are the reads and the
-//! destructive edits a screen performs directly. Driving a round (proving,
-//! submission, helper delivery) belongs to the session, not to this module;
-//! the one exception is [`sync_vote_tree`], which the crate implements as a
-//! blocking call over its own direct transport — vote-tree traffic names no
-//! voter, so it is not routed through a session's Tor choice.
+//! destructive edits a screen performs directly. Nothing here reaches the
+//! network. Anything that does — proving, submission, helper delivery,
+//! vote-tree sync — belongs to the session, which has a route to take it on.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -157,23 +155,6 @@ pub(super) fn pending_share_rounds(
             .map(zcash_voting::wire::PendingShareRoundView::from)
             .collect(),
     )
-}
-
-/// Sync the round's vote-commitment tree from `node_url`, returning the height
-/// synced to.
-///
-/// The crate resolves the transport itself: it reuses the wallet's tree
-/// client that already holds this round, whatever transport that client was
-/// built on, and otherwise opens one over its own direct transport. There is
-/// no route argument here by design — vote-tree traffic names no voter, so it
-/// is not the chain and helper traffic the session's route governs.
-pub(super) fn sync_vote_tree(
-    h: &VotingDatabaseHandle,
-    round_id: &str,
-    node_url: &str,
-) -> anyhow::Result<u32> {
-    let db = h.scoped()?;
-    zcash_voting::precompute::sync_vote_tree(&db, round_id, node_url).ffi()
 }
 
 /// Drop the cached vote-tree state for one round.

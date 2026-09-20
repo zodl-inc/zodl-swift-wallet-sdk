@@ -57,23 +57,21 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 /// refusals — no handle, a handle already open — throw
 /// ``VotingRustBackendError``.
 ///
-/// Thread safety: handle access is serialized by an `NSLock`. The sidecar reads
-/// and writes hold it for their whole duration — they are queries, and holding
-/// it is what keeps ``close()`` from freeing the handle underneath one. The one
-/// store call that reaches the network, ``syncVoteTree(roundId:nodeUrl:)``,
-/// does not: it runs its FFI call on the voting surface's own threads with the
-/// lock released, so a round listing or a close is never stuck behind a tree
-/// sync. Everything else that blocks for longer than a query belongs to a
-/// session.
+/// Thread safety: handle access is serialized by an `NSLock`. Every sidecar
+/// read and write holds it for its whole duration — they are queries, and
+/// holding it is what keeps ``close()`` from freeing the handle underneath one.
+/// Nothing here reaches the network, so none of them holds it for longer than a
+/// query; anything that blocks for longer than that belongs to a session, which
+/// has a route to take it on.
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
-    /// The handles a ``close()`` could not free because a sync was still using
-    /// one. The last sync to finish frees them all: a backend closed and
-    /// reopened while a sync runs parks a second handle, and neither of them
-    /// may be lost.
+    /// The handles a ``close()`` could not free because a blocking call was
+    /// still using one. The last such call to finish frees them all: a backend
+    /// closed and reopened while one runs parks a second handle, and neither of
+    /// them may be lost.
     private var handlesAwaitingFree: [OpaquePointer] = []
-    /// The blocking vote-tree syncs running right now.
+    /// The blocking calls running on this handle right now.
     private let calls = VotingBlockingCalls()
 
     public init() {}
@@ -82,8 +80,8 @@ public final class VotingRustBackend: @unchecked Sendable {
         if let handle {
             zcashlc_voting_db_free(handle)
         }
-        // A parked handle outlives its `close()` only while the sync using it
-        // runs, and that sync holds this backend — so reaching here with one
+        // A parked handle outlives its `close()` only while the call using it
+        // runs, and that call holds this backend — so reaching here with one
         // parked should not happen. It is freed rather than trusted to: the
         // alternative is a leaked sidecar connection nothing can reach.
         for parked in handlesAwaitingFree {
@@ -132,12 +130,12 @@ public final class VotingRustBackend: @unchecked Sendable {
     ///
     /// The backend is closed to new calls the moment this returns: every
     /// database-bound call throws ``VotingRustBackendError/databaseNotOpen``
-    /// from here on. It does not wait for a
-    /// ``syncVoteTree(roundId:nodeUrl:)`` still in flight — this call does not
-    /// block, and a sync cannot be interrupted — so the handle, and with it the
-    /// sidecar connection, is freed when that sync returns instead of here. A
-    /// host that means to delete the sidecar file, rather than just stop using
-    /// it, should let the sync it started finish first.
+    /// from here on. This call never blocks, so a blocking call still in flight
+    /// keeps the handle, and with it the sidecar connection, alive until it
+    /// returns. A host that means to delete the sidecar file, rather than just
+    /// stop using it, should let anything it started finish first — and close
+    /// the sessions before the backend, since a session holds its own reference
+    /// to the same sidecar.
     public func close() {
         lock.lock()
         defer { lock.unlock() }
@@ -209,50 +207,6 @@ public final class VotingRustBackend: @unchecked Sendable {
                 zcashlc_voting_pending_share_rounds(dbh)
             }
         }
-    }
-
-    /// Sync a round's vote-commitment tree from `nodeUrl`, returning the height
-    /// it synced to.
-    ///
-    /// The one store call that reaches the network, and it blocks for the whole
-    /// sync, so it runs its FFI call on the voting surface's own threads rather
-    /// than on the caller's executor — and without the backend lock, which
-    /// would otherwise hold up every other call on this handle, ``close()``
-    /// included, for the duration of a network round trip. The handle stays
-    /// valid while it runs: a close during a sync frees the handle when the
-    /// sync returns.
-    public func syncVoteTree(roundId: String, nodeUrl: String) async throws -> UInt32 {
-        let id = [UInt8](roundId.utf8)
-        let url = [UInt8](nodeUrl.utf8)
-
-        let height = try await runBlocking { dbh -> Int64 in
-            let synced = id.withUnsafeBufferPointer { idBytes in
-                url.withUnsafeBufferPointer { urlBytes in
-                    zcashlc_voting_sync_vote_tree(
-                        dbh,
-                        idBytes.baseAddress,
-                        UInt(idBytes.count),
-                        urlBytes.baseAddress,
-                        UInt(urlBytes.count)
-                    )
-                }
-            }
-
-            // Read here rather than after the await: the FFI's last-error slot
-            // is per-thread, and this is the thread that made the call.
-            guard synced >= 0 else {
-                throw Self.votingError(fallback: "`voting_sync_vote_tree` failed")
-            }
-            return synced
-        }
-
-        guard let synced = UInt32(exactly: height) else {
-            throw VotingError(
-                kind: .internal,
-                message: "vote tree synced to height \(height), which is not a block height"
-            )
-        }
-        return synced
     }
 
     /// Drop the cached vote-tree state for one round.
@@ -359,13 +313,12 @@ public final class VotingRustBackend: @unchecked Sendable {
 
     /// Open a session for one round over this backend's sidecar.
     ///
-    /// `torRuntime` selects the route the session's chain and helper traffic
-    /// takes for its whole life: `nil` is the direct HTTP route, and a runtime
-    /// is used through an isolated client taken during this call, so the
-    /// round's circuits are not linkable to the rest of the wallet's Tor use. A
-    /// session opened on Tor never falls back to a direct connection. PIR and
-    /// vote-tree traffic take the shared direct transport either way, because a
-    /// PIR query names no voter and its volume does not belong on Tor.
+    /// `torRuntime` selects the route every service the session touches takes
+    /// for its whole life — chain and helper traffic, PIR queries and vote-tree
+    /// sync alike: `nil` is the direct HTTP route, and a runtime is used
+    /// through an isolated client taken during this call, so the round's
+    /// circuits are not linkable to the rest of the wallet's Tor use. A session
+    /// opened on Tor never falls back to a direct connection.
     ///
     /// The runtime is borrowed for this call only; the caller keeps ownership
     /// of it. Nothing here reaches the network: every failure is a decision
@@ -675,8 +628,14 @@ extension VotingRustBackend {
 
 // MARK: - Blocking calls
 
-/// Internal to the SDK: the seam the one blocking store call runs through, and
+/// Internal to the SDK: the seam a blocking store call would run through, and
 /// what the tests over the handle's lifetime read.
+///
+/// No store call blocks today — vote-tree sync, the last one that did, belongs
+/// to the session now. The seam and the handle parking stay because a store
+/// call that blocks again needs somewhere to run and `close()` needs to stay
+/// non-blocking while it does; the tests below are what keep both honest in the
+/// meantime.
 extension VotingRustBackend {
     /// Runs `body` on the voting surface's own threads, registered as in
     /// flight, without holding the lock while it runs.
