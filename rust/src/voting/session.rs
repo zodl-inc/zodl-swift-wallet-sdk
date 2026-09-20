@@ -561,16 +561,22 @@ impl VotingSession {
     /// syncs the tree from scratch rather than continuing the last session's.
     /// It is paid wherever a round is reopened, and worst where a route change
     /// forces a new session: toggling Tor mid-round buys a full resync over
-    /// Tor.
+    /// Tor. It is not paid only here: [`Self::run`] syncs the same tree over
+    /// the same transport when it casts a vote, so a host that never calls
+    /// this pays it too.
     ///
     /// The old client is not dropped with the session either. A routed client
-    /// outlives every clone of the transport it was built over for as long as
-    /// it holds any round's tree state, so that state stays in memory until
+    /// holds the transport it was built over — for a Tor session, this
+    /// session's isolated Tor client — and outlives every other clone of that
+    /// transport for as long as it holds any round's tree state, so both stay
+    /// in memory, past the host disabling Tor, until
     /// [`super::store::reset_vote_tree`] forgets its rounds or the last
     /// connection to the sidecar closes. Nothing here resets on close, on
     /// purpose: the crate's round-scoped reset drops that round's state on
     /// *every* client the wallet has, so a session tidying up after itself
-    /// would throw away a concurrent session's sync.
+    /// would throw away a concurrent session's sync. That reset is also keyed
+    /// by the wallet id the handle is bound to when it runs, so a wallet
+    /// switch resets before `zcashlc_voting_set_wallet_id`, never after.
     pub(super) fn sync_vote_tree(&self, node_url: &str) -> anyhow::Result<u32> {
         zcash_voting::precompute::sync_vote_tree_with(
             &self.database,

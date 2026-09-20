@@ -184,7 +184,7 @@ case .syncStalled(let attempt, let gaveUp):
 }
 ```
 
-## Coinholder voting: the `zcash_voting` 4.0 round session
+## Coinholder voting: the `zcash_voting` 5.x round session
 
 The SDK drives a voting round itself now. `VotingRoundSession` replaces the step-by-step
 `VotingRustBackend` calls a host used to sequence: building and proving delegations, signing them,
@@ -193,9 +193,10 @@ call, `run(signer:policy:overrides:events:)`, which returns a `VotingRoundRunRep
 stopped and why. Nothing in this area keeps its old call site, so this is a rewrite of the voting
 host rather than a set of edits.
 
-Two things to know before reading the sequence. The 4.0 delegation circuit is not the 3.x one, so a
-wallet built on this SDK can only vote on a chain that has been upgraded to it — see the rollout
-note at the end. And `VotingRustBackendError.rustError(_:)` and `.invalidData(_:)` are gone: every
+Two things to know before reading the sequence. The delegation circuit (voting-circuits 0.12) is
+unchanged from the 4.0.x line this SDK already shipped, so it does not gate this upgrade by itself —
+see the rollout note at the end for what a vote chain must serve instead. And
+`VotingRustBackendError.rustError(_:)` and `.invalidData(_:)` are gone: every
 failure from the crate now arrives as `VotingError`, with `kind`, `retryable` and `message`, so a
 `catch` that bound their `String` is rewritten as
 
@@ -250,6 +251,15 @@ let session = try await synchronizer.makeVotingRoundSession(
 // and every later write needs that row: a `setBallotIntents` on a round the
 // sidecar has never seen fails on its foreign key as `VotingErrorKind.storage`.
 var plan = try session.plan()
+
+// A round an older SDK left mid-submission is display-only: bundle setup,
+// precompute and `run` would re-dispatch what it already sent. See "Rounds
+// caught mid-submission by the upgrade" below.
+guard !plan.hasLegacyInFlightSubmission else {
+    showRecordedRoundWithoutDriving(plan)
+    return
+}
+
 if plan.needsDraftSetup || plan.needsBundleSetup {
     do {
         _ = try await session.setupBundles()
@@ -307,6 +317,9 @@ let report = try await session.run(signer: .keystoneStored) { event in render(ev
 session reports `alreadyPresent` instead of failing. It refuses an empty batch and a repeated bundle
 index as `VotingErrorKind.invalidInput`: a set that covers nothing, or that shows a bundle twice, is
 not the set of QRs that covers a round.
+
+Keep one signer mode for a round: a round signed with stored Keystone signatures is not switched to
+the software signer on a later run, and the reverse.
 
 ### Handling every quiescence
 
@@ -398,21 +411,54 @@ its next boundary.
 
 **A route change means a new session.** The route is chosen once, at
 `makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, and is fixed for the session's whole
-life: there is no setter, and `.tor` never falls back to `.direct`. So a Tor toggle in the middle of
-a voting flow — the voter turning Tor on or off, or the synchronizer losing its Tor client — is
-handled the same way as a wallet switch: `cancel()`, bump `setOperationEpoch(_:)` so anything still
-in flight stops at its next boundary, `await close()` the session, and open a new one with the new
-route. Nothing durable is lost by doing so: bundle rows, proofs and stored signatures live in the
-sidecar, and the new session picks the round up where the old one left it.
+life: there is no setter, and `.tor` never falls back to `.direct`. It governs every service the
+session touches, not only chain traffic — helper delivery, PIR queries and vote-tree sync all ride
+the same route, because a PIR query hides which rows are fetched, not who fetches them. So a Tor
+toggle in the middle of a voting flow — the voter turning Tor on or off, or the synchronizer losing
+its Tor client — is handled the same way as a wallet switch: `cancel()`, bump
+`setOperationEpoch(_:)` so anything still in flight stops at its next boundary, `await close()` the
+session, then `VotingRustBackend.resetVoteTree(roundId:)` for the round, and open a new one with the
+new route. Nothing durable is lost by doing so: bundle rows, proofs and stored signatures live in
+the sidecar, and the new session picks the round up where the old one left it.
+
+The reset is the step that is easy to miss, and skipping it keeps the old route alive. The tree
+client the closed session synced on outlives it for as long as it holds any round's state, and it
+owns the transport it was built over — on a `.tor` session, that session's isolated Tor client. A
+voter who turns Tor off therefore leaves that client in memory until the round's tree is reset or
+the sidecar is closed. The new session resyncs from scratch either way, so the reset costs nothing
+the route change was not already paying for.
+
+An account switch needs the same reset, and needs it in the right order: the reset addresses the
+sidecar and the wallet id **bound at the time of the call**, so it must run before
+`VotingRustBackend.setWalletId(_:)`. After the switch it resets the new wallet's clients and
+silently leaves the old wallet's tree, and the transport it holds, in memory:
+
+```swift
+// Leaving a round, switching accounts: cancel, close, reset, THEN rebind.
+session.cancel()
+session.setOperationEpoch(nextEpoch)
+await session.close()
+try backend.resetVoteTree(roundId: roundId)   // still the OLD wallet id
+try backend.setWalletId(newWalletId)
+```
+
+Not every configuration change needs that. The helper fleet, the vote-tree nodes and the round's
+timing are not fixed the way the route is: `updateHostConfiguration(_:)` replaces any of them on a
+live session at any time, including while a run or a tracking pass is in flight, with no `cancel()`
+and no new session. A field it names replaces the session's current value, a field it leaves absent
+keeps whatever is there, and what it merges outlives the call — a later run that names nothing is
+still driven against it.
 
 `close()` cancels, waits for every call still in flight, and frees the handle; every call afterwards
-throws `VotingRustBackendError.sessionClosed`. It does not drain the event queue, so one more call
-into the events closure can arrive after `close()` has returned — what it carries is an already
-decoded Swift value, nothing the freed handle owned, but a host that tears down the state its closure
-writes to should expect that last callback. Close the sessions before closing the backend, and
-close both before deleting the sidecar file — `VotingRustBackend.close()` never blocks, so a host
-that means to delete the file rather than stop using it should let everything it started finish
-first.
+throws `VotingRustBackendError.sessionClosed`. Because neither a running proof nor
+`syncVoteTree(nodeUrl:)` takes a cancellation signal, `close()` called while one is in flight does not
+return until that call finishes — cancelling orders the wait, it does not shorten it. It does not
+drain the event queue, so one more call into the events closure can arrive after `close()` has
+returned — what it carries is an already decoded Swift value, nothing the freed handle owned, but a
+host that tears down the state its closure writes to should expect that last callback. Close the
+sessions before closing the backend, and close both before deleting the sidecar file —
+`VotingRustBackend.close()` never blocks, so a host that means to delete the file rather than stop
+using it should let everything it started finish first.
 
 ### What replaced each removed call
 
@@ -422,6 +468,7 @@ first.
 | `getRoundState`, `getBundleCount` | `VotingRoundSession.plan()` or `VotingRustBackend.roundPlan(roundId:proposalIds:)`, both answering `VotingRoundPlan`. Read its derived flags (`needsBundleSetup`, `needsDelegationSigning`, `hasUnconfirmedShares`, `primaryAction`) instead of matching step kinds. |
 | `precomputeDelegationPir` | `VotingRoundSession.precomputePir(bundleIndex:)` — no notes, endpoints or layout arguments; the session holds them. Its endpoint-picking helpers (`PirSnapshotResolver`, `PirSnapshotResolverError`, `PirSnapshotProbeOutcome`, `PirSnapshotProbing`, `HTTPPirSnapshotProbe`) are removed with it; see the note below. |
 | `buildPczt`, `buildAndProveDelegation`, `generateDelegationInputs`, `generateNoteWitnesses`, `generateVanWitness`, `verifyWitness`, `validatePirProof`, `vanCommitment` | `VotingRoundSession.precomputeDelegationProof(bundleIndex:progress:)` for a proof ahead of time; otherwise `run(signer:policy:overrides:events:)` does it. |
+| `VotingProvingIntent` and the `intent:` parameter of `buildAndProveDelegation` | No replacement: a proving call no longer takes an intent. The priority is the host's own scope instead — `VotingRustBackend.withInteractiveProvingBoost` wraps `run(signer:policy:overrides:events:)` and `precomputeDelegationProof(bundleIndex:progress:)`, and a proof outside that scope runs at the pool's resting priority. What is gone is the `.speculative` distinction: within one boosted scope a precompute prepared ahead of the voter's Confirm and a proof the voter is waiting on are proved alike. |
 | `signDelegationRequest`, `extractPcztSighash`, `extractSpendAuthSig` | `run(signer: .software(seed:))`. Sighashes, PCZTs and signatures no longer cross into Swift for a software wallet. |
 | `storeKeystoneSignature`, `clearKeystoneSignature`, `getStoredPcztSighash` | `VotingRoundSession.keystoneSigningRequests(bundleIndices:)` and `storeKeystoneSignatures(_:)`, then `run(signer: .keystoneStored)`. |
 | `getKeystoneSignatures` | `VotingRustBackend.keystoneSignatures(roundId:)` (renamed; `sig`, `sighash` and `randomizedKey` are `Data` now). |
@@ -431,6 +478,7 @@ first.
 | `restoreRecoveredDelegation`, `clearRecoveryState` | No replacement. A round recovers from its own persisted state when a session runs it again; the only deliberate discard is `deleteRound(roundId:discardingRecovery: true)`. |
 | `clearRound` | `deleteRound(roundId:discardingRecovery:)`, which refuses by default once part of the round has reached the network. |
 | `resetTreeClient` | `resetVoteTree(roundId:)`, which now refuses an empty round id rather than resetting every round's cached tree state. |
+| `syncVoteTree(roundId:nodeUrl:)` | `VotingRoundSession.syncVoteTree(nodeUrl:)`, `async` and taking no round id — the session is already bound to one, so the sync takes the session's route instead of reaching the node directly. |
 
 `listRounds()` survives but its `VotingRoundSummary` changed: `phase` is a `String` rather than the
 removed `VotingRoundPhase`, and it gained `walletId` and `network`. `deleteSkippedBundles(roundId:keepCount:)`
@@ -468,7 +516,8 @@ migration does not do is adopt a transaction an older SDK already dispatched: th
 lifecycle owns only submissions it reserved itself. A delegation or vote **this wallet built** that
 had a transaction hash but no confirmation when the app was updated therefore has no lifecycle row,
 and upstream does not support resuming it. If the round is run anyway, the driver plans an advance
-step for it and re-dispatches the same transaction bytes; the nullifier makes a double count
+step for it and re-dispatches the same transaction — rebuilt from its persisted inputs and re-signed
+over the stored sighash, so the bytes need not be identical; the nullifier makes a double count
 impossible, but nothing is promised about how that ends.
 
 `VotingRoundPlan.hasLegacyInFlightSubmission` is `true` for exactly those rounds. Check it on the
@@ -481,9 +530,21 @@ A delegation **imported from a capability package** is not covered by the flag, 
 recorded phase is the same. Its transaction was broadcast by whoever exported the capability, and
 this wallet holds no delegation key that could re-sign it: the lifecycle adopts the hash on its
 first pass and never dispatches anything again. There is nothing to re-dispatch, so such a round
-reports `false` and must be driven normally — the plan's step for it is
-`advanceImportedDelegation`, and the ballot cannot be cast until it confirms. A host that treated it
-as display-only would strand the voter.
+reports `false` and must be driven normally, and the ballot cannot be cast until the delegation
+confirms. A host that treated it as display-only would strand the voter.
+
+`VotingRoundPlan` exposes no steps, so that state is not something to match on the plan. What a host
+can read there is the bundle's `VotingDelegationStatus` — its `phase`, its `txHash`, and `terminal`
+still `false` — together with `hasInFlightDelegation` and the bundle's presence in
+`delegationBundlesNeedingWork`. The step itself appears only where the SDK surfaces one: the
+`VotingNextStep` on a `VotingRoundStepProgress`, a `VotingRoundStepFailure`, a
+`VotingRoundQuiescence` or a `VotingRoundDriveEvent`, whose `kind` is then
+`VotingNextStepKind.advanceImportedDelegation`.
+
+Capability import and export are not part of this SDK, so the upstream guide's imported-delegation
+steps do not apply here. A round in this state was imported by an older build, before that surface
+was removed (see Removed in `CHANGELOG.md`); there is no call in this SDK that creates one today,
+only the advance the driver plans for it on its own.
 
 The three calls that answer it are `VotingRoundSession.plan()`,
 `VotingRoundSession.setBallotIntents(_:)` and `VotingRustBackend.roundPlan(roundId:proposalIds:)`.
@@ -492,11 +553,37 @@ The plans embedded in a `VotingRoundRunReport` and in the event stream do not ca
 
 ### Rollout: upgraded chains only
 
-The 4.0 delegation circuit differs from the 3.x one, and there is no fallback and no negotiation: a
-chain that has not been upgraded to the 4.0 circuit rejects what this SDK builds, and a 3.x client
-cannot follow a round this SDK started. Ship the wallet build that carries this SDK together with the
-network upgrade it votes on, not ahead of it, and keep the voting entry point closed on any network
-that has not been upgraded.
+This build needs a vote chain that serves the `delegate-and-cast-vote-batch` and `cast-vote-batch`
+routes. The former has no fallback: a chain that does not yet serve it is not reachable through some
+older, separate pair of calls, so shipping this SDK ahead of that chain upgrade leaves voting closed
+on it, exactly as an unupgraded delegation circuit did before. An HTTP 404 or 405 from either route is
+not proof that a mutation was never dispatched — it is an ambiguous outcome, not a clean rejection, so
+read it under the same rule as "A transaction hash is not proof a vote finished" above rather than as
+license to resubmit blind. What a host sees for one is a `VotingChainSubmissionOutcome` whose
+`diagnosticKind` is `VotingChainDiagnosticKind.endpointUnsupported`, when the answer carries the
+gateway's own `{"error": ...}` envelope, or `.routeAnswerReplaced`, when it does not — a bare 404 or
+405, or an HTML page returned with status 200. The second says only that something that is not the
+gateway answered: a proxy can produce either after forwarding the POST upstream, which is why
+neither establishes non-dispatch. Ship the wallet build that carries this SDK together with the chain upgrade
+it depends on, not ahead of it, and keep the voting entry point closed on any network that has not
+been upgraded.
+
+### Validate every stage before shipping
+
+Exercise each of these explicitly before shipping against a live network — every one is a distinct
+path through the round session, not a variation the others happen to cover:
+
+- a fresh software vote, start to finish
+- Keystone signing carried across a restart
+- recovery after a restart
+- share tracking carried through to vote end
+- an account switch during work
+- opening a completed legacy sidecar
+- opening a legacy in-flight sidecar (`VotingRoundPlan.hasLegacyInFlightSubmission`)
+- a delegation imported from a capability under the previous SDK
+- both routes, Tor and direct
+- PIR and vote-tree sync over Tor, timed — Tor's latency makes both slower than direct, and only a
+  wall-clock run surfaces whether a host's own timeouts or progress UI assumed the direct-route pace
 
 ## Proposal errors carry `RedactedRustError` instead of `String`
 

@@ -10,7 +10,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
 
-### Coinholder voting on zcash_voting 4.0
+### Coinholder voting on zcash_voting 5.1
 
 - The voting API is now a round session. `VotingRoundSession` — opened through
   `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` — plans a round,
@@ -31,9 +31,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingRustBackendError.sessionClosed` on a closed session.
   Every writer merges into that configuration field by field: a `VotingHostOverrides` field that is
   named replaces the current value, one left absent keeps whatever is in place. The `overrides` a
-  run or a tracking call passes are merged in the same way as that call starts, so they hold for the
-  session rather than for the one call — a host that wants a later call driven against the values
-  the session was opened with names those values on that call.
+  run or a tracking call passes are merged in the same way as that call starts, before the call does
+  anything else, so they hold for the session rather than for the one call even when the call goes on
+  to fail — a signer `run(signer:policy:overrides:events:)` cannot build, for instance — and a host
+  that wants a later call driven against the values the session was opened with names those values on
+  that call.
 - New on the surviving `VotingRustBackend` surface, alongside the session:
   `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
   share-tracking schedule are built from), `resetVoteTree(roundId:)`,
@@ -57,43 +59,52 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches takes that route — chain and helper traffic, PIR queries and vote-tree sync — because a
   PIR query hides which rows are fetched, not who fetches them.
   That route owns the vote-tree client, which costs bandwidth and memory a host should budget for:
-  a session's first `VotingRoundSession.syncVoteTree(nodeUrl:)` for a round syncs the tree from
-  scratch rather than continuing the previous session's, so reopening an already-synced round pays
-  for the whole tree again, and a route change — always a new session — resyncs over the new route.
-  The previous session's tree also stays in memory after `close()`, for as long as its client holds
-  any round's state; `VotingRustBackend.resetVoteTree(roundId:)` releases it, as does closing the
-  sidecar once nothing holds it open. Reset when the voter leaves the round rather than on every
-  `close()`: the reset forgets that round on every tree client of the wallet, a concurrent
-  session's included.
+  a session's first sync of a round's tree starts from scratch rather than continuing the previous
+  session's, so reopening an already-synced round pays for the whole tree again, and a route change
+  — always a new session — resyncs over the new route. This is not only the cost of calling
+  `VotingRoundSession.syncVoteTree(nodeUrl:)`: `run(signer:policy:overrides:events:)` syncs the same
+  tree, on the same session route, whenever it casts a vote, so a host that never calls
+  `syncVoteTree(nodeUrl:)` itself pays it too.
+  The tree also stays in memory after `close()`, for as long as its client holds any round's state
+  — and the client owns the session's transport, which on a `.tor` session is that session's
+  isolated Tor client. It therefore outlives both the session and the voter switching Tor off.
+  `VotingRustBackend.resetVoteTree(roundId:)` releases it, as does closing the sidecar once nothing
+  holds it open. Reset when the voter leaves the round rather than on every `close()`: the reset
+  forgets that round on every tree client of the wallet, a concurrent session's included.
+  The reset is scoped to the sidecar and the wallet id currently bound, so on an account switch call
+  it **before** `VotingRustBackend.setWalletId(_:)` — after the switch it resets the new wallet's
+  clients and leaves the old wallet's tree, and its Tor client, in memory.
 - A run's live events are a best-effort narration and may be dropped under load: the
   `VotingRoundRunReport` a call returns, not the `VotingRoundDriveEvent` stream, is the authoritative
   account of what a run did. Events are delivered one at a time on a serial queue per session, and
   every event of a call arrives before that call returns. The closure must not block that queue, and
   must not wait on the call that is emitting into it.
-- `VotingBundleLayout` gains `privacyTrimDroppedValueZatoshi`, `skippedSuffixBundles`,
-  `skippedSuffixNotes` and `skippedSuffixValueZatoshi`; `VotingEligibilityReport` gains
+- `VotingBundleLayout` carries `privacyTrimDroppedBundles`, `privacyTrimDroppedNotes`,
+  `privacyTrimDroppedValueZatoshi`, `skippedSuffixBundles`, `skippedSuffixNotes` and
+  `skippedSuffixValueZatoshi`; `VotingEligibilityReport` carries `privacyTrimDroppedValueZatoshi`,
   `skippedSuffixBundles`, `skippedSuffixNotes` and `skippedSuffixValueZatoshi` — the raw note value a
   privacy trim withheld and the trailing bundles a host removed with
   `deleteSkippedBundles(roundId:keepCount:)`, so a screen can show what a round no longer counts.
-- `VotingRoundRunReport` gains `shareDeliveries` and `delegations`; `VotingRoundStepFailure` gains
-  `strongestChainState`, `chainOutcome`, `plan`, `shareDeliveries` and `delegation`;
-  `VotingRoundStepProgress` gains `step`, `voteCommitStage`, `voteKeys`, `chainOutcome`,
-  `shareDelivery` and `share`; `VotingShareTrackingRunReport` gains `resubmitted` and `ambiguous` —
-  durable helper-share deliveries, signed delegations, and chain context that a host previously had
-  to do without. `VotingChainSubmissionOutcome` gains `diagnosticKind: VotingChainDiagnosticKind?`
-  alongside the existing `diagnosticMessage`: branch on the kind, never the message text. New types:
-  `VotingChainDiagnosticKind`, `VotingVoteKey`, `VotingShareDeliveryOutcome`,
-  `VotingShareBatchDeliveryReport`, `VotingSignedDelegation` (a signed bundle is not proof its
-  transaction was submitted or confirmed), `VotingChainSubmissionState`,
+  Both report raw note value, not the bundle-quantized voting weight the round counts.
+- The reports carry the round's durable evidence: `VotingRoundRunReport` has `shareDeliveries` and
+  `delegations`, `VotingRoundStepFailure` has `strongestChainState`, `chainOutcome`, `plan`,
+  `shareDeliveries` and `delegation`, `VotingRoundStepProgress` has `step`, `voteCommitStage`,
+  `voteKeys`, `chainOutcome`, `shareDelivery` and `share`, and `VotingShareTrackingRunReport` has
+  `resubmitted` and `ambiguous`. `VotingChainSubmissionOutcome` carries
+  `diagnosticKind: VotingChainDiagnosticKind?` beside `diagnosticMessage`: branch on the kind, never
+  on the message text. The supporting types are `VotingChainDiagnosticKind`, `VotingVoteKey`,
+  `VotingShareDeliveryOutcome`, `VotingShareBatchDeliveryReport`, `VotingSignedDelegation` (a signed
+  bundle is not proof its transaction was submitted or confirmed), `VotingChainSubmissionState`,
   `VotingChainSubmissionStateEvidence`, `VotingChainSubmissionFailureState`, `VotingVoteCommitStage`
-  and `VotingResubmittedShare`. Every new field decodes leniently, defaulting to empty or absent when
-  an older payload omits it, so no existing call site needs a change.
+  and `VotingResubmittedShare`. Every one of these fields decodes leniently, defaulting to empty or
+  absent when a payload omits it, so a report an older core produced still decodes.
 - `VotingRoundPlan.hasLegacyInFlightSubmission` reports a round holding a delegation or a vote this
   wallet built that an older SDK dispatched and never saw confirmed. Upgrading keeps every row of
   the voting database, but the chain lifecycle this SDK drives owns only the submissions it reserved
   itself, so such a transaction is not adopted and resuming it is unsupported: running the round
-  plans an advance step and re-dispatches the same transaction bytes, with no guarantee about the
-  outcome. Check it before bundle setup, precompute or `run(signer:policy:overrides:events:)`, and
+  plans an advance step and re-dispatches the same transaction — rebuilt from its persisted inputs
+  and re-signed over the stored sighash, so the bytes need not be identical — with no guarantee
+  about the outcome. Check it before bundle setup, precompute or `run(signer:policy:overrides:events:)`, and
   treat such a round as display-only. `VotingRoundSession.plan()`,
   `VotingRoundSession.setBallotIntents(_:)` and `VotingRustBackend.roundPlan(roundId:proposalIds:)`
   answer it; the plans embedded in run reports and events do not carry it and read as `false`. Share
@@ -116,15 +127,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
 
-### Coinholder voting on zcash_voting 4.0
+### Coinholder voting on zcash_voting 5.1
 
-- Voting runs on `zcash_voting` 4.0 with its `lrz` backend, tracked as a git revision until 4.0.0 is
-  published; building the Rust core from source now requires Rust 1.91. The 4.0 delegation circuit
-  is not the 3.x one, so **this SDK can only vote on a chain that has been upgraded to the 4.0
-  circuit**: a wallet that ships it before that upgrade reaches the network it points at cannot cast
-  a vote there at all, and the upgrade cannot be detected from the SDK — ship it with the chain
-  upgrade, not ahead of it.
-- The voting sidecar at `Documents/voting.sqlite3` is migrated in place, from schema 13 to 24, the
+- Voting runs on `zcash_voting` 5.1.0 (pinned exactly) with its `lrz` backend. The delegation
+  circuit (voting-circuits 0.12) is unchanged from the 4.0.x line this SDK already shipped, so it
+  does not gate this upgrade. What does: a vote chain must serve the `delegate-and-cast-vote-batch`
+  and `cast-vote-batch` routes. The former has no fallback, and an HTTP 404 or 405 from either route
+  is not proof that a mutation was never dispatched — a host sees it as
+  `VotingChainDiagnosticKind.endpointUnsupported` when the answer carries the gateway's own error
+  envelope, and as `.routeAnswerReplaced` when it does not. See `MIGRATING.md`'s rollout note before
+  shipping against a chain that has not been upgraded.
+- The host's existing sidecar file is migrated in place, from schema 13 to 24, the
   first time `VotingRustBackend.open(path:networkId:)` opens it. Nothing changes at the call site,
   and rounds already stored survive; an SDK build older than this one can no longer open the
   migrated file, so a downgrade leaves the voting sidecar unusable.
@@ -158,18 +171,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proving pool, and starting it fixes the policy, after which `configureProving(_:)` returns `false`
   for any policy that disagrees with the one already in force and leaves the running pool alone. A
   host that cares which policy is live must treat `false` as "mine was not applied".
+- `VotingRustBackend.withInteractiveProvingBoost` (public since 4.5.0) survives the rewrite. It now
+  wraps `VotingRoundSession.run(signer:policy:overrides:events:)` and
+  `precomputeDelegationProof(bundleIndex:progress:)` rather than the removed
+  `buildAndProveDelegation(intent:)`, so every delegation proof pays the interactive boost, whether it
+  runs ahead of time through precompute or during a run; the `.speculative`, non-boosted intent that
+  call took has no replacement.
 - Voting hotkey generation (`generateHotkey(networkId:)`, `hotkey(fromStoredSecret:networkId:)`),
   the software signer, and `open(path:networkId:)` now accept the regtest network id and resolve
   their voting identity through the registered custom network's base network — a modified-mainnet
   chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
   the call rather than silently treated as regtest.
-- New rounds use the crate's default bundle policy, privacy trim included (at most two bundles
-  dropped within 1% of the selected value, capped at 1,000 ZEC); `VotingBundleLayout` reports what
-  was dropped.
+- New rounds use the crate's default bundle policy, privacy trim included: trailing low-value
+  bundles are dropped until at most two remain, as long as what is dropped stays within 1% of the
+  selected value and 1,000 ZEC. Any number of bundles can go that way, so a wallet with a long dust
+  tail loses the whole tail rather than two of it; `VotingBundleLayout` reports what was dropped.
 
 ## Removed
 
-### Coinholder voting on zcash_voting 4.0
+### Coinholder voting on zcash_voting 5.1
 
 - Removed from `VotingRustBackend` (45 methods): `addSentServers`, `buildAndProveDelegation`,
   `buildPczt`, `clearKeystoneSignature`, `clearRecoveryState`, `clearRound`, `commitVote`,
@@ -207,18 +227,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `keystoneSignatures(roundId:)`, and `precomputeDelegationPir(roundId:bundleIndex:notes:…)` is
     `VotingRoundSession.precomputePir(bundleIndex:)`, which takes neither notes nor endpoints
     because the session already holds them.
-- Removed public types (30): `HTTPPirSnapshotProbe`, `PirSnapshotProbeOutcome`,
+- Removed public types (31): `HTTPPirSnapshotProbe`, `PirSnapshotProbeOutcome`,
   `PirSnapshotProbing`, `PirSnapshotResolver`, `PirSnapshotResolverError`,
   `RecoveredDelegationBundle`, `RecoveredDelegationRestoreRequest`,
   `RecoveredDelegationRestoreResult`, `VotingBuildPcztParams`, `VotingBundleSetupResult`,
   `VotingDelegationInputs`, `VotingDelegationKeyInputs`, `VotingDelegationPirPrecomputeResult`,
   `VotingDelegationProofParams`, `VotingDelegationProofResult`, `VotingDelegationSignature`,
   `VotingDelegationSubmission`, `VotingNoteInfo`, `VotingPczt`, `VotingPirProof`,
-  `VotingRoundPhase`, `VotingRoundState`, `VotingShareDelegation`, `VotingStoredCommitmentBundle`,
-  `VotingVanWitness`, `VotingVoteCommit`, `VotingVoteConfirmation`, `VotingVoteRecord`,
-  `VotingWireEncryptedShare` and `VotingWitnessData`. The wire and witness types are gone because
-  those payloads no longer cross the boundary; `VotingNoteInfo` is gone because the session selects
-  notes from the wallet itself, so a host no longer assembles a note list to vote with.
+  `VotingProvingIntent`, `VotingRoundPhase`, `VotingRoundState`, `VotingShareDelegation`,
+  `VotingStoredCommitmentBundle`, `VotingVanWitness`, `VotingVoteCommit`, `VotingVoteConfirmation`,
+  `VotingVoteRecord`, `VotingWireEncryptedShare` and `VotingWitnessData`. The wire and witness types
+  are gone because those payloads no longer cross the boundary; `VotingNoteInfo` is gone because the
+  session selects notes from the wallet itself, so a host no longer assembles a note list to vote
+  with; `VotingProvingIntent` is gone with `buildAndProveDelegation(intent:)`, the only call that
+  took one — see the Changed section for what its boost behavior folds into.
 - The five `PirSnapshot*` types went with `precomputeDelegationPir`, the only call that used them:
   `VotingSessionInputs.pirEndpoints` now goes straight to the crate's PIR fleet, which normalizes
   and dedupes the list but does not probe it for the round's snapshot. A server serving a different

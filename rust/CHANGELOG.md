@@ -84,7 +84,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Opening a sidecar written by that SDK migrates it in place and keeps every row, but the 5.x
     chain lifecycle owns only the submissions it reserved itself, so such a transaction gets no
     lifecycle row and resuming it is unsupported: the driver plans an advance step and re-dispatches
-    the same transaction bytes, with nothing promised about the outcome. Read it before bundle
+    the same transaction, rebuilt from its persisted inputs and re-signed over the stored sighash —
+    so the bytes need not be identical — with nothing promised about the outcome. Read it before bundle
     setup, precompute or `_run`, and drive no such round. A delegation imported from a capability
     package is excluded and reports false: its transaction was broadcast elsewhere, the lifecycle
     adopts the hash rather than sending anything again, and the round is driven normally. The plans
@@ -357,7 +358,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   balance whose canonical split the notes cannot fund now reports the whole spendable balance where
   the call used to fail. It costs one planning pass per remaining run, like the estimate.
 - Coinholder voting hosts the `zcash_voting` 5.x native round driver with the `lrz` (librustzcash)
-  backend, pinned to the published `=5.1.0` release. Building requires Rust 1.91. Opening a voting
+  backend, pinned to the published `=5.1.0` release. Opening a voting
   database migrates schema 13 to 24 in place; older cores cannot reopen it.
   The step-by-step entry points a host used to drive are gone (see Removed) and the session surface
   that replaces them is new (see Added); what changed for the entry points that survive is:
@@ -382,29 +383,39 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     votes with mainnet hotkeys and HRPs, and an unconfigured custom network is rejected.
   - Every voting service a session touches rides the route the session was opened on: chain and
     helper traffic, PIR queries and vote-tree sync alike. A PIR query hides which rows are
-    fetched, not who fetches them, so PIR and vote-tree traffic previously showed the PIR server
-    and the tree node the device's address, the round and one fetch burst per bundle whatever
-    route the session chose. A Tor session now fails closed for all four, and vote-tree sync is
-    a session call (`zcashlc_voting_session_sync_vote_tree`) rather than a store call, because
-    only a session carries a route to take it on.
+    fetched, not who fetches them — the PIR server and the tree node see the device's address,
+    the round and one fetch burst per bundle — so a Tor session fails closed for all four rather
+    than letting any of them out some other way. Vote-tree sync is a session call
+    (`zcashlc_voting_session_sync_vote_tree`) rather than a store call, because only a session
+    carries a route to take it on.
     The vote-tree client follows the route rather than the round, which costs bandwidth and
     memory the caller should budget for. The crate keeps one tree client per wallet and
-    transport, and each session has its own transport, so a session's first
-    `zcashlc_voting_session_sync_vote_tree` for a round syncs the tree FROM SCRATCH instead of
-    continuing the previous session's — paid whenever a round is reopened, and always on a route
-    change, which requires a new session. The previous session's tree is also retained after the
-    session is freed, for as long as its client holds any round's state:
-    `zcashlc_voting_reset_vote_tree` for those rounds releases it, as does closing the last
-    connection to the sidecar. Reset when the voter leaves the round, not on every session free —
-    a round-scoped reset drops that round's state on every tree client of the wallet, including
-    one a concurrent session is syncing on.
-  - `zcashlc_voting_session_setup_bundles`'s JSON gains `privacy_trim_dropped_value_zatoshi`,
-    `skipped_suffix_bundles`, `skipped_suffix_notes` and `skipped_suffix_value_zatoshi`;
-    `zcashlc_voting_session_eligibility`'s gains `skipped_suffix_bundles`, `skipped_suffix_notes`
-    and `skipped_suffix_value_zatoshi`. A new round is now seeded with the crate's default bundle
-    policy — privacy trim included, at most two bundles dropped within 1% of the selected value and
-    capped at 1,000 ZEC — instead of it disabled; a round that already has a persisted policy keeps
-    it.
+    transport, and each session has its own transport, so a session's first sync of a round's
+    tree starts FROM SCRATCH instead of continuing the previous session's — paid whenever a round
+    is reopened, and always on a route change, which requires a new session. That cost is not
+    confined to `zcashlc_voting_session_sync_vote_tree`: `zcashlc_voting_session_run` syncs the
+    same tree over the same transport whenever it casts a vote, so a caller that never syncs
+    explicitly pays it too.
+    The previous session's tree is also retained after the session is freed, for as long as its
+    client holds any round's state — and that client owns the transport it was built over, so a
+    Tor session's isolated Tor client stays alive with it, past the session and past the host
+    disabling Tor. `zcashlc_voting_reset_vote_tree` for those rounds releases it, as does closing
+    the last connection to the sidecar. Reset when the voter leaves the round, not on every
+    session free — a round-scoped reset drops that round's state on every tree client of the
+    wallet, including one a concurrent session is syncing on. The reset is keyed by the sidecar
+    and the wallet id bound at the time of the call, so on a wallet switch it must run BEFORE
+    `zcashlc_voting_set_wallet_id`; afterwards it addresses the new wallet's clients and leaves
+    the old wallet's tree and transport in memory.
+  - `zcashlc_voting_session_setup_bundles`'s JSON carries `privacy_trim_dropped_bundles`,
+    `privacy_trim_dropped_notes`, `privacy_trim_dropped_value_zatoshi`, `skipped_suffix_bundles`,
+    `skipped_suffix_notes` and `skipped_suffix_value_zatoshi`;
+    `zcashlc_voting_session_eligibility`'s carries `privacy_trim_dropped_value_zatoshi`,
+    `skipped_suffix_bundles`, `skipped_suffix_notes`
+    and `skipped_suffix_value_zatoshi`. A new round is seeded with the crate's default bundle
+    policy, privacy trim included: trailing low-value bundles are dropped until at most two remain,
+    as long as what is dropped stays within 1% of the selected value and 1,000 ZEC. Any number of
+    bundles can go that way, so a wallet with a long dust tail loses the whole tail rather than two
+    of it. A round that already has a persisted policy keeps it.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`

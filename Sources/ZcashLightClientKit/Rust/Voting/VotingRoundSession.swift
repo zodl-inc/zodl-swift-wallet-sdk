@@ -230,15 +230,23 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// continuing the last session's, so reopening a round that was already
     /// synced pays for the whole tree again — and because a route change is
     /// always a new session, toggling Tor mid-round means resyncing over Tor.
+    /// This is not a cost only a caller of this method pays:
+    /// ``run(signer:policy:overrides:events:)`` syncs the same tree, on the
+    /// same route, whenever it casts a vote.
     /// The session that synced also leaves its tree in memory after
     /// ``close()``: that client outlives the session for as long as it holds
-    /// any round's state. ``VotingRustBackend/resetVoteTree(roundId:)``
+    /// any round's state, and it owns the session's transport — on a
+    /// ``VotingTransportRoute/tor`` session, that session's isolated Tor
+    /// client, which therefore stays alive after the voter turns Tor off.
+    /// ``VotingRustBackend/resetVoteTree(roundId:)``
     /// releases it, and so does closing the sidecar once no session and no
     /// ``VotingRustBackend`` still hold it open.
     ///
     /// Reset when the voter leaves the round, not on every ``close()``: the
     /// reset forgets that round on every tree client the wallet has, including
-    /// one a concurrent session is still syncing on.
+    /// one a concurrent session is still syncing on. It is scoped to the
+    /// wallet id the backend is bound to when it is called, so an account
+    /// switch resets before ``VotingRustBackend/setWalletId(_:)``, never after.
     public func syncVoteTree(nodeUrl: String) async throws -> UInt32 {
         let url = [UInt8](nodeUrl.utf8)
 

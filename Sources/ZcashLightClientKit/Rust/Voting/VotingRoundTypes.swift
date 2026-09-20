@@ -321,9 +321,11 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     /// every row, but it does not hand such a transaction to the chain
     /// lifecycle this SDK drives, which owns only the submissions it reserved
     /// itself. Running the round anyway plans an advance step and re-dispatches
-    /// the same transaction bytes, and nothing is promised about how that ends,
-    /// so treat the round as display-only: show what it recorded and do not
-    /// drive it. Share tracking is unaffected.
+    /// the same transaction — rebuilt from its persisted inputs and re-signed
+    /// over the stored sighash, so the bytes need not be identical — and
+    /// nothing is promised about how that ends, so treat the round as
+    /// display-only: show what it recorded and do not drive it. Share tracking
+    /// is unaffected.
     ///
     /// A delegation imported from a capability package is deliberately not
     /// covered. Its transaction was broadcast elsewhere and this wallet holds

@@ -96,9 +96,10 @@ pub(super) struct RoundPlanDto {
     /// that an older SDK dispatched and never saw confirmed. The 5.x chain
     /// lifecycle never adopted it — it owns only submissions it reserved
     /// itself — so running the round would plan an advance step and
-    /// re-dispatch the same transaction bytes, with nothing promised about how
-    /// that ends. Upstream does not support resuming such a round; a host
-    /// should show it and not drive it.
+    /// re-dispatch the same transaction, rebuilt from its persisted inputs and
+    /// re-signed over the stored sighash (so the bytes need not be identical),
+    /// with nothing promised about how that ends. Upstream does not support
+    /// resuming such a round; a host should show it and not drive it.
     ///
     /// A delegation imported from a capability package is not covered, even
     /// though it reaches the same phase: the lifecycle adopts its hash and
