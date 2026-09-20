@@ -62,6 +62,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skippedSuffixBundles`, `skippedSuffixNotes` and `skippedSuffixValueZatoshi` — the raw note value a
   privacy trim withheld and the trailing bundles a host removed with
   `deleteSkippedBundles(roundId:keepCount:)`, so a screen can show what a round no longer counts.
+- `VotingRoundRunReport` gains `shareDeliveries` and `delegations`; `VotingRoundStepFailure` gains
+  `strongestChainState`, `chainOutcome`, `plan`, `shareDeliveries` and `delegation`;
+  `VotingRoundStepProgress` gains `step`, `voteCommitStage`, `voteKeys`, `chainOutcome`,
+  `shareDelivery` and `share`; `VotingShareTrackingRunReport` gains `resubmitted` and `ambiguous` —
+  durable helper-share deliveries, signed delegations, and chain context that a host previously had
+  to do without. `VotingChainSubmissionOutcome` gains `diagnosticKind: VotingChainDiagnosticKind?`
+  alongside the existing `diagnosticMessage`: branch on the kind, never the message text. New types:
+  `VotingChainDiagnosticKind`, `VotingVoteKey`, `VotingShareDeliveryOutcome`,
+  `VotingShareBatchDeliveryReport`, `VotingSignedDelegation` (a signed bundle is not proof its
+  transaction was submitted or confirmed), `VotingChainSubmissionState`,
+  `VotingChainSubmissionStateEvidence`, `VotingChainSubmissionFailureState`, `VotingVoteCommitStage`
+  and `VotingResubmittedShare`. Every new field decodes leniently, defaulting to empty or absent when
+  an older payload omits it, so no existing call site needs a change.
 
 ## Fixed
 

@@ -30,6 +30,20 @@ public enum VotingDelegationProgressKind: String, Equatable, Sendable, Decodable
     }
 }
 
+/// Vote proving and signing stage inside a `voteCommit` step.
+public enum VotingVoteCommitStage: String, Equatable, Sendable, Decodable {
+    case proofStarting = "proof_starting"
+    case proofProgress = "proof_progress"
+    case sharePayloadsBuilding = "share_payloads_building"
+    case signing
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingVoteCommitStage(rawValue: raw) ?? .unknown
+    }
+}
+
 /// What one progress observation from inside a running step describes.
 public enum VotingRoundStepProgressKind: String, Equatable, Sendable, Decodable {
     case selected
@@ -52,30 +66,76 @@ public enum VotingRoundStepProgressKind: String, Equatable, Sendable, Decodable 
 
 /// One progress observation from inside a running step.
 ///
-/// `kind` says which fields are populated: `bundleIndex`,
+/// `kind` says which fields are populated: `step` for
+/// ``VotingRoundStepProgressKind/selected``; `bundleIndex`,
 /// `delegationProgress` and `proofProgress` for
 /// ``VotingRoundStepProgressKind/delegation``; `treeHeight` for
-/// ``VotingRoundStepProgressKind/treeSynced``; `bundleIndex`, `proposalId` and
-/// `proofProgress` for ``VotingRoundStepProgressKind/voteCommit``;
+/// ``VotingRoundStepProgressKind/treeSynced``; `bundleIndex`, `proposalId`,
+/// `voteCommitStage` and `proofProgress` for
+/// ``VotingRoundStepProgressKind/voteCommit``; `voteKeys` for
+/// ``VotingRoundStepProgressKind/helperPlansPrepared``; `chainOutcome` for
+/// ``VotingRoundStepProgressKind/chainOutcome``; `shareDelivery` for
+/// ``VotingRoundStepProgressKind/shareOutcome``; `share` and
 /// `shareConfirmed` for ``VotingRoundStepProgressKind/shareConfirmed``.
 public struct VotingRoundStepProgress: Equatable, Sendable, Decodable {
     public let kind: VotingRoundStepProgressKind
+    /// The step this progress belongs to, present for `selected`.
+    public let step: VotingNextStep?
     public let bundleIndex: UInt32?
     public let proposalId: UInt32?
     public let delegationProgress: VotingDelegationProgressKind?
+    /// Vote proving and signing stage, present for `voteCommit`.
+    public let voteCommitStage: VotingVoteCommitStage?
     /// Proving progress in `0...1`.
     public let proofProgress: Double?
     public let treeHeight: UInt32?
+    /// The votes helper plans were prepared for, present for
+    /// `helperPlansPrepared`.
+    public let voteKeys: [VotingVoteKey]
+    public let chainOutcome: VotingChainSubmissionOutcome?
+    /// The helper delivery outcome, present for `shareOutcome`.
+    public let shareDelivery: VotingShareBatchDeliveryReport?
+    /// The share this progress belongs to, present for `shareConfirmed`.
+    public let share: VotingShareKey?
     public let shareConfirmed: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case kind
+        case step
         case bundleIndex = "bundle_index"
         case proposalId = "proposal_id"
         case delegationProgress = "delegation_progress"
+        case voteCommitStage = "vote_commit_stage"
         case proofProgress = "proof_progress"
         case treeHeight = "tree_height"
+        case voteKeys = "vote_keys"
+        case chainOutcome = "chain_outcome"
+        case shareDelivery = "share_delivery"
+        case share
         case shareConfirmed = "share_confirmed"
+    }
+
+    // `voteKeys` is a plain (non-defaulted) list upstream, decoded leniently
+    // here like every other list this SDK mirrors: a host reading progress
+    // events should never lose the whole observation over one absent list.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(VotingRoundStepProgressKind.self, forKey: .kind)
+        step = try container.decodeIfPresent(VotingNextStep.self, forKey: .step)
+        bundleIndex = try container.decodeIfPresent(UInt32.self, forKey: .bundleIndex)
+        proposalId = try container.decodeIfPresent(UInt32.self, forKey: .proposalId)
+        delegationProgress = try container.decodeIfPresent(
+            VotingDelegationProgressKind.self,
+            forKey: .delegationProgress
+        )
+        voteCommitStage = try container.decodeIfPresent(VotingVoteCommitStage.self, forKey: .voteCommitStage)
+        proofProgress = try container.decodeIfPresent(Double.self, forKey: .proofProgress)
+        treeHeight = try container.decodeIfPresent(UInt32.self, forKey: .treeHeight)
+        voteKeys = try container.decodeIfPresent([VotingVoteKey].self, forKey: .voteKeys) ?? []
+        chainOutcome = try container.decodeIfPresent(VotingChainSubmissionOutcome.self, forKey: .chainOutcome)
+        shareDelivery = try container.decodeIfPresent(VotingShareBatchDeliveryReport.self, forKey: .shareDelivery)
+        share = try container.decodeIfPresent(VotingShareKey.self, forKey: .share)
+        shareConfirmed = try container.decodeIfPresent(Bool.self, forKey: .shareConfirmed)
     }
 }
 
@@ -208,11 +268,28 @@ public struct VotingShareTrackingEvent: Equatable, Sendable, Decodable {
     }
 }
 
+/// One share that reached a new helper during tracking or recovery.
+public struct VotingResubmittedShare: Equatable, Sendable, Decodable {
+    public let share: VotingShareKey
+    public let serverUrl: String
+
+    private enum CodingKeys: String, CodingKey {
+        case share
+        case serverUrl = "server_url"
+    }
+}
+
 /// Everything one share-tracking run did.
 public struct VotingShareTrackingRunReport: Equatable, Sendable, Decodable {
     public let quiescence: VotingShareTrackingQuiescence
     public let passes: UInt32
     public let confirmed: [VotingShareKey]
+    /// Shares that reached a new helper during this run's recovery. Durable
+    /// evidence: the resubmission happened even if the run went on to stop
+    /// for another reason.
+    public let resubmitted: [VotingResubmittedShare]
+    /// Shares resubmitted to a helper whose acceptance is unconfirmed.
+    public let ambiguous: [VotingResubmittedShare]
     /// From the most recent pass, not accumulated: a share stops being
     /// unrecoverable once its material is restored.
     public let unrecoverable: [VotingShareKey]
@@ -222,18 +299,22 @@ public struct VotingShareTrackingRunReport: Equatable, Sendable, Decodable {
         case quiescence
         case passes
         case confirmed
+        case resubmitted
+        case ambiguous
         case unrecoverable
         case failures
     }
 
-    // The three lists are `#[serde(default)]` upstream: a run that confirmed
-    // nothing and failed at nothing omits them, and the report must still say
-    // why it stopped and how many passes it took.
+    // Every list but `quiescence`/`passes` is `#[serde(default)]` upstream: a
+    // run that confirmed nothing and failed at nothing omits them, and the
+    // report must still say why it stopped and how many passes it took.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         quiescence = try container.decode(VotingShareTrackingQuiescence.self, forKey: .quiescence)
         passes = try container.decode(UInt32.self, forKey: .passes)
         confirmed = try container.decodeIfPresent([VotingShareKey].self, forKey: .confirmed) ?? []
+        resubmitted = try container.decodeIfPresent([VotingResubmittedShare].self, forKey: .resubmitted) ?? []
+        ambiguous = try container.decodeIfPresent([VotingResubmittedShare].self, forKey: .ambiguous) ?? []
         unrecoverable = try container.decodeIfPresent([VotingShareKey].self, forKey: .unrecoverable) ?? []
         failures = try container.decodeIfPresent([String].self, forKey: .failures) ?? []
     }

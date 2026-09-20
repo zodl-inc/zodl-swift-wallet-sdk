@@ -102,6 +102,22 @@ public struct VotingShareKey: Equatable, Sendable, Decodable {
     }
 }
 
+/// Durable identity of one committed vote.
+public struct VotingVoteKey: Equatable, Sendable, Decodable {
+    public let bundleIndex: UInt32
+    public let proposalId: UInt32
+
+    public init(bundleIndex: UInt32, proposalId: UInt32) {
+        self.bundleIndex = bundleIndex
+        self.proposalId = proposalId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bundleIndex = "bundle_index"
+        case proposalId = "proposal_id"
+    }
+}
+
 // MARK: - Chain submission
 
 /// How one chain submission ended.
@@ -120,12 +136,38 @@ public enum VotingChainOutcomeKind: String, Equatable, Sendable, Decodable {
     }
 }
 
+/// Category of a chain submission diagnostic.
+///
+/// A host branches on this kind; `VotingChainSubmissionOutcome.diagnosticMessage`
+/// is bounded, redacted text meant for display only and must never be parsed
+/// or pattern-matched to decide what happened.
+public enum VotingChainDiagnosticKind: String, Equatable, Sendable, Decodable {
+    case ambiguousDispatch = "ambiguous_dispatch"
+    case ambiguousAttemptsExhausted = "ambiguous_attempts_exhausted"
+    case nullifierAlreadySpent = "nullifier_already_spent"
+    case trackingWindowExpired = "tracking_window_expired"
+    case chainRejected = "chain_rejected"
+    case reconciliationPending = "reconciliation_pending"
+    case invalidProtocolResponse = "invalid_protocol_response"
+    case storageFailure = "storage_failure"
+    case endpointUnsupported = "endpoint_unsupported"
+    case routeAnswerReplaced = "route_answer_replaced"
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingChainDiagnosticKind(rawValue: raw) ?? .unknown
+    }
+}
+
 /// Flat view of one chain submission result.
 ///
 /// `diagnosticMessage` is the bounded, redacted text of the crate's nested
 /// diagnostic: it is what a host shows for the terminal outcomes
 /// (``VotingChainOutcomeKind/submittedWithoutHash`` and
 /// ``VotingChainOutcomeKind/rejected``), which schedule no further work.
+/// `diagnosticKind` is present alongside it for the same outcomes: branch on
+/// the kind, never on the message text.
 public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
     public let kind: VotingChainOutcomeKind
     /// How a confirmation was established: `hash` or `tree`.
@@ -134,6 +176,7 @@ public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
     public let candidateTransactionHash: String?
     public let finalVanPosition: UInt64?
     public let voteCommitmentPositions: [UInt64]
+    public let diagnosticKind: VotingChainDiagnosticKind?
     public let diagnosticMessage: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -146,8 +189,9 @@ public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
         case diagnostic
     }
 
-    /// The nested diagnostic, of which only the message crosses into Swift.
+    /// The nested diagnostic: both its kind and its message cross into Swift.
     private struct Diagnostic: Decodable {
+        let kind: VotingChainDiagnosticKind
         let message: String
     }
 
@@ -159,7 +203,9 @@ public struct VotingChainSubmissionOutcome: Equatable, Sendable, Decodable {
         candidateTransactionHash = try container.decodeIfPresent(String.self, forKey: .candidateTransactionHash)
         finalVanPosition = try container.decodeIfPresent(UInt64.self, forKey: .finalVanPosition)
         voteCommitmentPositions = try container.decodeIfPresent([UInt64].self, forKey: .voteCommitmentPositions) ?? []
-        diagnosticMessage = try container.decodeIfPresent(Diagnostic.self, forKey: .diagnostic)?.message
+        let diagnostic = try container.decodeIfPresent(Diagnostic.self, forKey: .diagnostic)
+        diagnosticKind = diagnostic?.kind
+        diagnosticMessage = diagnostic?.message
     }
 }
 
@@ -327,6 +373,104 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     }
 }
 
+// MARK: - Share delivery and delegation evidence
+
+/// Delivery result for one share of a helper-share batch.
+public struct VotingShareDeliveryOutcome: Equatable, Sendable, Decodable {
+    public let shareIndex: UInt32
+    /// Helper URLs that accepted this share.
+    public let acceptedUrls: [String]
+    /// Helper URLs whose acceptance is unconfirmed: the request may or may
+    /// not have reached them.
+    public let ambiguousUrls: [String]
+    /// How many helpers this share targeted.
+    public let targetCount: UInt32
+
+    private enum CodingKeys: String, CodingKey {
+        case shareIndex = "share_index"
+        case acceptedUrls = "accepted_urls"
+        case ambiguousUrls = "ambiguous_urls"
+        case targetCount = "target_count"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        shareIndex = try container.decode(UInt32.self, forKey: .shareIndex)
+        acceptedUrls = try container.decodeIfPresent([String].self, forKey: .acceptedUrls) ?? []
+        ambiguousUrls = try container.decodeIfPresent([String].self, forKey: .ambiguousUrls) ?? []
+        targetCount = try container.decode(UInt32.self, forKey: .targetCount)
+    }
+}
+
+/// Result of one initial helper delivery for a confirmed vote.
+///
+/// Durable evidence a round produced: the shares were delivered even if the
+/// step that produced this report went on to fail or the round stopped.
+public struct VotingShareBatchDeliveryReport: Equatable, Sendable, Decodable {
+    /// The vote this batch of shares belongs to.
+    public let vote: VotingVoteKey
+    public let deliveries: [VotingShareDeliveryOutcome]
+    /// Shares still awaiting a delivery outcome.
+    public let pendingShareIndices: [UInt32]
+    public let cancelled: Bool
+    /// True when the persisted plan predates complete-plan persistence.
+    public let legacyBestEffort: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case vote
+        case deliveries
+        case pendingShareIndices = "pending_share_indices"
+        case cancelled
+        case legacyBestEffort = "legacy_best_effort"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        vote = try container.decode(VotingVoteKey.self, forKey: .vote)
+        deliveries = try container.decodeIfPresent([VotingShareDeliveryOutcome].self, forKey: .deliveries) ?? []
+        pendingShareIndices = try container.decodeIfPresent([UInt32].self, forKey: .pendingShareIndices) ?? []
+        cancelled = try container.decode(Bool.self, forKey: .cancelled)
+        legacyBestEffort = try container.decode(Bool.self, forKey: .legacyBestEffort)
+    }
+}
+
+/// One delegation bundle a round run signed.
+///
+/// Signed, not submitted: the payload's own `status` is always
+/// `ready_for_submission`, which is not a submission state. A signed bundle
+/// is not proof that its transaction was ever submitted or confirmed — read
+/// `VotingRoundPlan.delegationStatuses` for the durable submission phase, the
+/// transaction hash, and whether it is terminal. This type deliberately does
+/// not model the raw PCZT bytes or the chain submission payload: a
+/// round-session host never submits them itself.
+public struct VotingSignedDelegation: Equatable, Sendable, Decodable {
+    public let status: String
+    public let message: String?
+    public let eligibleWeightZatoshi: UInt64
+    public let delegatedWeightZatoshi: UInt64
+    public let bundleCount: UInt32
+    public let bundleIndex: UInt32
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case message
+        case eligibleWeightZatoshi = "eligible_weight_zatoshi"
+        case delegatedWeightZatoshi = "delegated_weight_zatoshi"
+        case bundleCount = "bundle_count"
+        case bundleIndex = "bundle_index"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        message = try container.decodeIfPresent(String.self, forKey: .message)
+        eligibleWeightZatoshi = try container.decode(UInt64.self, forKey: .eligibleWeightZatoshi)
+        delegatedWeightZatoshi = try container.decode(UInt64.self, forKey: .delegatedWeightZatoshi)
+        bundleCount = try container.decode(UInt32.self, forKey: .bundleCount)
+        bundleIndex = try container.decode(UInt32.self, forKey: .bundleIndex)
+    }
+}
+
 // MARK: - Run report
 
 /// Why one round run stopped.
@@ -433,11 +577,91 @@ public enum VotingRoundStepFailureKind: String, Equatable, Sendable, Decodable {
     }
 }
 
+/// Durable chain submission state, as known when a step failed.
+public enum VotingChainSubmissionState: String, Equatable, Sendable, Decodable {
+    case submitting
+    case tracking
+    case recovering
+    case submittedWithoutHash = "submitted_without_hash"
+    case confirmed
+    case rejected
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingChainSubmissionState(rawValue: raw) ?? .unknown
+    }
+}
+
+/// How strongly a step failure's chain state is known.
+public enum VotingChainSubmissionStateEvidence: String, Equatable, Sendable, Decodable {
+    /// Read from durable storage: the state is authoritative.
+    case durable
+    /// Known from an in-flight dispatch that may or may not have reached the
+    /// chain; the state is a best guess, not a durable read.
+    case knownPossiblyDispatched = "known_possibly_dispatched"
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingChainSubmissionStateEvidence(rawValue: raw) ?? .unknown
+    }
+}
+
+/// The strongest chain state known for a step when it failed, with how
+/// strongly that state is known.
+public struct VotingChainSubmissionFailureState: Equatable, Sendable, Decodable {
+    public let state: VotingChainSubmissionState
+    public let evidence: VotingChainSubmissionStateEvidence
+}
+
 /// One step failure, with the step it belongs to when the run knows it.
 public struct VotingRoundStepFailure: Equatable, Sendable, Decodable {
     public let kind: VotingRoundStepFailureKind
     public let step: VotingNextStep?
+    /// The strongest known chain state when this step failed, present only
+    /// when the failure followed a chain submission attempt.
+    public let strongestChainState: VotingChainSubmissionFailureState?
+    public let chainOutcome: VotingChainSubmissionOutcome?
     public let message: String
+    /// The plan the run re-read after the failure, when it could read one.
+    public let plan: VotingRoundPlan?
+    /// Helper delivery reports accumulated before the failure. Durable
+    /// evidence: the shares were delivered even though the step went on to
+    /// fail.
+    public let shareDeliveries: [VotingShareBatchDeliveryReport]
+    /// The delegation signed before the failure, for the same reason as
+    /// `shareDeliveries`: the bundle is durable and the step produced it.
+    public let delegation: VotingSignedDelegation?
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case step
+        case strongestChainState = "strongest_chain_state"
+        case chainOutcome = "chain_outcome"
+        case message
+        case plan
+        case shareDeliveries = "share_deliveries"
+        case delegation
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(VotingRoundStepFailureKind.self, forKey: .kind)
+        step = try container.decodeIfPresent(VotingNextStep.self, forKey: .step)
+        strongestChainState = try container.decodeIfPresent(
+            VotingChainSubmissionFailureState.self,
+            forKey: .strongestChainState
+        )
+        chainOutcome = try container.decodeIfPresent(VotingChainSubmissionOutcome.self, forKey: .chainOutcome)
+        message = try container.decode(String.self, forKey: .message)
+        plan = try container.decodeIfPresent(VotingRoundPlan.self, forKey: .plan)
+        shareDeliveries = try container.decodeIfPresent(
+            [VotingShareBatchDeliveryReport].self,
+            forKey: .shareDeliveries
+        ) ?? []
+        delegation = try container.decodeIfPresent(VotingSignedDelegation.self, forKey: .delegation)
+    }
 }
 
 /// One failure a run isolated, with the bundle it is attributed to.
@@ -482,6 +706,15 @@ public struct VotingRoundRunReport: Equatable, Sendable, Decodable {
     public let skippedBundles: [UInt32]
     /// Every chain outcome the run observed, terminal or not.
     public let chainOutcomes: [VotingRoundChainOutcome]
+    /// Every helper delivery the run made for a confirmed vote, in dispatch
+    /// order. Durable evidence: the shares were delivered even if the round
+    /// later hit a failure or stopped.
+    public let shareDeliveries: [VotingShareBatchDeliveryReport]
+    /// Delegation bundles the run signed, in the order it produced them.
+    /// Signed, not necessarily submitted — read `plan.delegationStatuses` for
+    /// the durable submission phase, transaction hash, and whether it is
+    /// terminal.
+    public let delegations: [VotingSignedDelegation]
 
     private enum CodingKeys: String, CodingKey {
         case quiescence
@@ -490,11 +723,14 @@ public struct VotingRoundRunReport: Equatable, Sendable, Decodable {
         case failures
         case skippedBundles = "skipped_bundles"
         case chainOutcomes = "chain_outcomes"
+        case shareDeliveries = "share_deliveries"
+        case delegations
     }
 
-    // `failures`, `skippedBundles` and `chainOutcomes` are `#[serde(default)]`
-    // upstream: a clean run may omit all three, and the report is what a host
-    // acts on, so it must survive their absence.
+    // `failures`, `skippedBundles`, `chainOutcomes`, `shareDeliveries` and
+    // `delegations` are `#[serde(default)]` upstream: a clean run may omit
+    // all five, and the report is what a host acts on, so it must survive
+    // their absence.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         quiescence = try container.decode(VotingRoundQuiescence.self, forKey: .quiescence)
@@ -503,5 +739,10 @@ public struct VotingRoundRunReport: Equatable, Sendable, Decodable {
         failures = try container.decodeIfPresent([VotingRoundStepFailureRecord].self, forKey: .failures) ?? []
         skippedBundles = try container.decodeIfPresent([UInt32].self, forKey: .skippedBundles) ?? []
         chainOutcomes = try container.decodeIfPresent([VotingRoundChainOutcome].self, forKey: .chainOutcomes) ?? []
+        shareDeliveries = try container.decodeIfPresent(
+            [VotingShareBatchDeliveryReport].self,
+            forKey: .shareDeliveries
+        ) ?? []
+        delegations = try container.decodeIfPresent([VotingSignedDelegation].self, forKey: .delegations) ?? []
     }
 }

@@ -131,6 +131,97 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertNil(report.chainOutcomes.first?.outcome.diagnosticMessage)
     }
 
+    // MARK: - Durable evidence in reports and progress
+
+    func testDecodesRunReportShareDeliveriesAndDelegations() throws {
+        let json = """
+        {
+          "quiescence": {"kind": "background_share_work_only"},
+          "plan": null,
+          "tally": {"completed_proposals": 1, "total_proposals": 1, "remaining_obligations": 0},
+          "share_deliveries": [{
+            "vote": {"bundle_index": 0, "proposal_id": 3},
+            "deliveries": [{"share_index": 2, "accepted_urls": ["https://h1/"], "ambiguous_urls": ["https://h2/"], "target_count": 2}],
+            "pending_share_indices": [4, 5],
+            "cancelled": false,
+            "legacy_best_effort": false
+          }],
+          "delegations": [{
+            "pczt_bytes": [1, 2, 3], "status": "signed", "message": null,
+            "submission": {}, "eligible_weight_zatoshi": 900, "delegated_weight_zatoshi": 800,
+            "bundle_count": 2, "bundle_index": 1
+          }]
+        }
+        """
+        let report = try decode(VotingRoundRunReport.self, from: json)
+        XCTAssertEqual(report.shareDeliveries.count, 1)
+        XCTAssertEqual(report.shareDeliveries[0].vote, VotingVoteKey(bundleIndex: 0, proposalId: 3))
+        XCTAssertEqual(report.shareDeliveries[0].deliveries[0].ambiguousUrls, ["https://h2/"])
+        XCTAssertEqual(report.shareDeliveries[0].pendingShareIndices, [4, 5])
+        XCTAssertEqual(report.delegations.count, 1)
+        XCTAssertEqual(report.delegations[0].bundleIndex, 1)
+        XCTAssertEqual(report.delegations[0].delegatedWeightZatoshi, 800)
+    }
+
+    func testDecodesChainOutcomeDiagnosticKindAndUnknownKind() throws {
+        let known = try decode(VotingChainSubmissionOutcome.self, from: """
+        {"kind": "rejected", "vote_commitment_positions": [],
+         "diagnostic": {"kind": "nullifier_already_spent", "message": "spent"}}
+        """)
+        XCTAssertEqual(known.diagnosticKind, .nullifierAlreadySpent)
+        XCTAssertEqual(known.diagnosticMessage, "spent")
+        let unknown = try decode(VotingChainSubmissionOutcome.self, from: """
+        {"kind": "rejected", "vote_commitment_positions": [],
+         "diagnostic": {"kind": "something_new", "message": "m"}}
+        """)
+        XCTAssertEqual(unknown.diagnosticKind, .unknown)
+        let none = try decode(VotingChainSubmissionOutcome.self, from: """
+        {"kind": "confirmed", "vote_commitment_positions": [7]}
+        """)
+        XCTAssertNil(none.diagnosticKind)
+    }
+
+    func testDecodesStepFailureChainContext() throws {
+        let failure = try decode(VotingRoundStepFailure.self, from: """
+        {"kind": "transport", "step": null, "message": "m",
+         "strongest_chain_state": {"state": "recovering", "evidence": "known_possibly_dispatched"},
+         "chain_outcome": {"kind": "recovering", "vote_commitment_positions": []},
+         "plan": null, "share_deliveries": [], "delegation": null}
+        """)
+        XCTAssertEqual(failure.strongestChainState?.state, .recovering)
+        XCTAssertEqual(failure.strongestChainState?.evidence, .knownPossiblyDispatched)
+        XCTAssertEqual(failure.chainOutcome?.kind, .recovering)
+        XCTAssertNil(failure.plan)
+        XCTAssertTrue(failure.shareDeliveries.isEmpty)
+    }
+
+    func testDecodesStepProgressVoteStageShareAndOutcome() throws {
+        let progress = try decode(VotingRoundStepProgress.self, from: """
+        {"kind": "share_outcome", "bundle_index": 0, "proposal_id": 3,
+         "vote_commit_stage": "signing", "vote_keys": [{"bundle_index": 0, "proposal_id": 3}],
+         "chain_outcome": {"kind": "tracking", "vote_commitment_positions": []},
+         "share": {"bundle_index": 0, "proposal_id": 3, "share_index": 9},
+         "share_delivery": {"vote": {"bundle_index": 0, "proposal_id": 3}, "deliveries": [],
+                            "pending_share_indices": [], "cancelled": true, "legacy_best_effort": false}}
+        """)
+        XCTAssertEqual(progress.voteCommitStage, .signing)
+        XCTAssertEqual(progress.voteKeys, [VotingVoteKey(bundleIndex: 0, proposalId: 3)])
+        XCTAssertEqual(progress.chainOutcome?.kind, .tracking)
+        XCTAssertEqual(progress.share?.shareIndex, 9)
+        XCTAssertEqual(progress.shareDelivery?.cancelled, true)
+    }
+
+    func testDecodesShareTrackingResubmittedAndAmbiguous() throws {
+        let report = try decode(VotingShareTrackingRunReport.self, from: """
+        {"quiescence": {"kind": "failing"}, "passes": 2,
+         "resubmitted": [{"share": {"bundle_index": 0, "proposal_id": 1, "share_index": 2}, "server_url": "https://h1/"}],
+         "ambiguous": [{"share": {"bundle_index": 0, "proposal_id": 1, "share_index": 3}, "server_url": "https://h2/"}]}
+        """)
+        XCTAssertEqual(report.resubmitted.count, 1)
+        XCTAssertEqual(report.resubmitted[0].serverUrl, "https://h1/")
+        XCTAssertEqual(report.ambiguous[0].share.shareIndex, 3)
+    }
+
     // MARK: - Round plan
 
     func testDecodesRoundPlanFieldNames() throws {

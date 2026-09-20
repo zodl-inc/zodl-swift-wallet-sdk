@@ -1045,4 +1045,30 @@ mod tests {
         assert_eq!(json["skipped_suffix_value_zatoshi"], 70);
         assert_eq!(json["bundle_count"], 2);
     }
+
+    /// Pins the top-level keys of the crate's own `RoundRunReportView` JSON,
+    /// which the Swift mirrors decode unchanged: a future crate bump that
+    /// renames one of these fails here, not silently in Swift.
+    #[test]
+    fn run_report_json_carries_the_keys_the_swift_mirrors_decode() {
+        let report: zcash_voting::wire::RoundRunReportView = serde_json::from_value(serde_json::json!({
+            "quiescence": {"kind": "no_work_left"},
+            "plan": null,
+            "tally": {"completed_proposals": 0, "total_proposals": 0, "remaining_obligations": 0}
+        }))
+        .expect("minimal report decodes");
+        let json = serde_json::to_value(&report).expect("json");
+        for key in [
+            "quiescence",
+            "plan",
+            "tally",
+            "failures",
+            "skipped_bundles",
+            "chain_outcomes",
+            "share_deliveries",
+            "delegations",
+        ] {
+            assert!(json.get(key).is_some(), "run report lost `{key}`");
+        }
+    }
 }
