@@ -38,7 +38,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zcash_voting::VotingError;
 use zcash_voting::delegate::KeystoneSigningRequest;
 use zcash_voting::storage::KeystoneSignatureInput;
 use zeroize::Zeroizing;
