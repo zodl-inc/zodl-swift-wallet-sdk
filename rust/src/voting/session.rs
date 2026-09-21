@@ -335,11 +335,11 @@ impl VotingSession {
             })?;
 
         // What follows resolves the branch id from `store.network` alone, which
-        // carries no custom activation heights, so a chain whose own heights
-        // select a different branch at this snapshot would delegate under the
-        // wrong one. Refused here rather than built: this is the last point
-        // where both the registered parameters and the flattened identity the
-        // crate uses are in hand.
+        // carries no custom activation heights. A chain whose own heights
+        // select a different branch at this snapshot is refused here, where
+        // both the registered parameters and the flattened identity the crate
+        // uses are in hand and the refusal can name them, rather than later as
+        // an unsupported note version or an unsupported branch id.
         let params = crate::parse_network(store.network_id).map_err(envelope_or_invalid_input)?;
         super::helpers::require_branch_agreement(
             &params,

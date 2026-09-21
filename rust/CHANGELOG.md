@@ -398,10 +398,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_set_custom_network` selects a different consensus branch at the round's snapshot
     height than the base network does. The message names both branches and the height. Note
     selection resolves its note version through the registered activation heights, but delegation
-    derives its branch from the base network alone and refuses any other, so a round whose
-    snapshot falls where the two schedules disagree cannot be delegated at all — it is refused
-    before anything is built rather than signed against the wrong branch. A caller on a standard
-    network id sees no change: the two schedules are then the same one.
+    derives its branch from the base network alone and refuses any other. Voting runs on NU6.3 on
+    both sides, so where the two differ at least one has not reached NU6.3 at that height and the
+    round has no complete path through either half; the check reports that as one clear refusal at
+    open rather than as an unsupported note version or an unsupported branch id from deeper in.
+    A caller on a standard network id is unaffected: the two schedules are then the same one. On a
+    regtest base they are not — the crate's regtest schedule activates NU6.3 at height 10, so a
+    round whose snapshot height is below 10 is refused unless the registered heights say the same.
   - Every voting service a session touches rides the route the session was opened on: chain and
     helper traffic, PIR queries and vote-tree sync alike. A PIR query hides which rows are
     fetched, not who fetches them — the PIR server and the tree node see the device's address,

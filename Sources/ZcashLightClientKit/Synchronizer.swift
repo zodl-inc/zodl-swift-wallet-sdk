@@ -688,6 +688,13 @@ public protocol Synchronizer: AnyObject {
     /// it here, and the `.tor` route then takes as long as reaching the Tor
     /// network takes.
     ///
+    /// On a custom network, opening throws ``VotingError`` with
+    /// ``VotingErrorKind/invalidInput`` when the registered activation heights
+    /// and the base network select different consensus branches at the round's
+    /// snapshot height — naming both branches and the height, because voting
+    /// delegation follows the base network's schedule alone. See
+    /// `MIGRATING.md`.
+    ///
     /// - Parameters:
     ///    - backend: The voting backend whose sidecar the round persists to.
     ///    - inputs: The round's parameters and endpoints.

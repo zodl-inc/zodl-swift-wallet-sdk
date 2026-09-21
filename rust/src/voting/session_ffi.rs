@@ -167,6 +167,12 @@ struct ProofStatusResponse {
 /// connect fails the request, because putting the voter's traffic on the clear
 /// network after they asked for Tor is worse than failing.
 ///
+/// On a custom network, this fails with `invalid_input` when the heights
+/// registered through [`zcashlc_set_custom_network`](crate::zcashlc_set_custom_network)
+/// and the base network select different consensus branches at the round's
+/// snapshot height, naming both branches and the height: voting delegation
+/// follows the base network's schedule alone.
+///
 /// `epoch` is the host's operation epoch at open; move it with
 /// [`zcashlc_voting_session_set_epoch`]. Nothing here reaches the network:
 /// every failure is a decision about the arguments. Returns null on error.
@@ -482,9 +488,13 @@ pub unsafe extern "C" fn zcashlc_voting_session_keystone_signing_requests(
 ///
 /// `entries_json` is a JSON array of `KeystoneSignedBundleDto`. As with
 /// [`zcashlc_voting_session_keystone_signing_requests`], an empty batch and a
-/// repeated bundle index are refused as `invalid_input`. The write is one
-/// atomic idempotent batch, so a retry after an interrupted QR session reports
-/// what was already there rather than failing on it. Returns null on error.
+/// repeated bundle index are refused as `invalid_input`. So is an entry this
+/// wallet cannot use — bytes no spend-authorization signature can be lifted
+/// from, and a signature that does not sign that bundle's current signing
+/// request — with the error JSON's `bundle_index` naming the bundle to collect
+/// again and nothing of the batch stored. The write is one atomic idempotent
+/// batch, so a retry after an interrupted QR session reports what was already
+/// there rather than failing on it. Returns null on error.
 ///
 /// # Safety
 ///

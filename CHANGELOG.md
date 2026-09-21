@@ -204,13 +204,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Voting on a custom network is supported only where its consensus branch at the round's snapshot
   height is the same one the base network selects there. Note selection honours the registered
   activation heights, but delegation does not and cannot: the voting crate derives the delegation
-  branch from the base network alone and rejects any other. So
-  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` now throws
-  `VotingError` with `kind == .invalidInput` when the two disagree, naming both branches and the
-  snapshot height, instead of building a delegation for a branch the chain is not on. A host on a
-  custom chain either picks rounds whose snapshot falls where the schedules agree, or registers the
-  base network's own heights. Mainnet and testnet are unaffected — a standard network is its own
-  schedule and agrees at every height.
+  branch from the base network alone and rejects any other. Voting runs on NU6.3 on both sides, so
+  where the two differ at least one has not reached NU6.3 at that height and the round has no
+  complete path through either half.
+  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and
+  throws `VotingError` with `kind == .invalidInput` when they disagree, naming both branches and the
+  snapshot height, as the first thing it does once its inputs decode. A host on a custom chain picks
+  the rounds whose snapshot falls where the schedules agree, and keeps the registered heights
+  mirroring the node's own `nuparams`, which is what sync and spending resolve against. Mainnet and
+  testnet are unaffected — a standard network is its own schedule and agrees at every height. A
+  regtest base is the one stock configuration this turns away:
+  `ZcashNetworkBuilder.network(for: .regtest)` activates NU6.3 at height 1 while the voting crate's
+  own regtest schedule activates it at height 10, so a round whose snapshot height is below 10 is
+  refused there.
 - New rounds use the crate's default bundle policy, privacy trim included: trailing low-value
   bundles are dropped until at most two remain, as long as what is dropped stays within 1% of the
   selected value and 1,000 ZEC. Any number of bundles can go that way, so a wallet with a long dust
