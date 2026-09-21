@@ -635,11 +635,17 @@ mod tests {
     }
 
     /// The custom slot's voting identity must follow the registered base
-    /// network: a modified-mainnet chain keeps mainnet hotkeys and HRPs. This
-    /// is the only test that touches the process-global custom-network slot —
-    /// keep it that way (parallel tests share the global).
+    /// network: a modified-mainnet chain keeps mainnet hotkeys and HRPs.
+    ///
+    /// The registration is process-global and parallel tests share it, so this
+    /// runs under [`crate::lock_custom_network`], which serializes it against
+    /// every other test that registers a custom network and restores what was
+    /// registered before. The unconfigured assertion below depends on that:
+    /// it holds only because no test leaves a registration behind.
     #[test]
     fn db_open_custom_network_derives_voting_network_from_base() {
+        let _custom_network = crate::lock_custom_network();
+
         let mut path = std::env::temp_dir();
         path.push(format!(
             "zcashlc_voting_db_custom_network_{}.sqlite",

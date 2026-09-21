@@ -1309,6 +1309,10 @@ Ironwood testing backend) whose network upgrades activate at arbitrary heights:
   `evaluateBestOf(endpoints:...)` skip the chain-name and consensus-branch-ID checks (the server of a
   modified chain may identify with its base chain's name and a nonstandard branch id). The
   Sapling-activation-height check still applies.
+- Coinholder voting is the one feature these heights do not carry all the way through: a round
+  session opens only where the custom network's consensus branch at the round's snapshot height
+  equals the base network's, and throws `VotingError` with `kind == .invalidInput` otherwise. See
+  "Voting on a custom network: only where the consensus branch agrees" below.
 
 **Process-global registration and ordering.** The custom network's parameters are registered with
 the Rust core **once per process** (the first `Initializer` created with a custom network does this).
@@ -1505,6 +1509,37 @@ An unknown network id now throws from `open` rather than from each later call.
 A custom (regtest) network takes its voting identity from the registered base
 network, so a modified-mainnet chain votes with mainnet hotkeys and address
 HRPs; `open` throws if `zcashlc_set_custom_network` has not run yet.
+
+### Voting on a custom network: only where the consensus branch agrees
+
+The voting identity a custom network resolves to carries the base network's
+identity, and nothing else — not the activation heights registered with it.
+That is not an omission this SDK can fix: the voting crate derives the
+consensus branch for a delegation from that identity alone, re-checks it in
+three separate validators, and refuses a branch id supplied from outside. Note
+selection *does* honour the registered heights, so the two halves of a round
+can disagree.
+
+So a round session refuses to open when they would:
+
+```swift
+do {
+    let session = try await synchronizer.makeVotingRoundSession(
+        backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch
+    )
+} catch let error as VotingError where error.kind == .invalidInput {
+    // "…select consensus branch Nu6_2 at the round's snapshot height 4200000,
+    //  but voting delegation follows the Mainnet schedule, which selects Nu6_3…"
+    showRoundUnavailableOnThisChain(error.message)
+}
+```
+
+The rule is per round, not per chain: the comparison is made at that round's
+snapshot height, so a custom chain whose schedule differs elsewhere but selects
+the same branch there votes normally. A host on a custom chain therefore either
+drives rounds whose snapshot falls where the two schedules agree, or registers
+the base network's own activation heights. Mainnet and testnet are unaffected —
+a standard network is compared against itself and agrees at every height.
 
 ### Other API changes
 

@@ -197,6 +197,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their voting identity through the registered custom network's base network — a modified-mainnet
   chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
   the call rather than silently treated as regtest.
+- Voting on a custom network is supported only where its consensus branch at the round's snapshot
+  height is the same one the base network selects there. Note selection honours the registered
+  activation heights, but delegation does not and cannot: the voting crate derives the delegation
+  branch from the base network alone and rejects any other. So
+  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` now throws
+  `VotingError` with `kind == .invalidInput` when the two disagree, naming both branches and the
+  snapshot height, instead of building a delegation for a branch the chain is not on. A host on a
+  custom chain either picks rounds whose snapshot falls where the schedules agree, or registers the
+  base network's own heights. Mainnet and testnet are unaffected — a standard network is its own
+  schedule and agrees at every height.
 - New rounds use the crate's default bundle policy, privacy trim included: trailing low-value
   bundles are dropped until at most two remain, as long as what is dropped stays within 1% of the
   selected value and 1,000 ZEC. Any number of bundles can go that way, so a wallet with a long dust

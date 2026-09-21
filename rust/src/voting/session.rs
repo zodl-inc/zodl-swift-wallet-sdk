@@ -334,6 +334,19 @@ impl VotingSession {
                 ))
             })?;
 
+        // What follows resolves the branch id from `store.network` alone, which
+        // carries no custom activation heights, so a chain whose own heights
+        // select a different branch at this snapshot would delegate under the
+        // wrong one. Refused here rather than built: this is the last point
+        // where both the registered parameters and the flattened identity the
+        // crate uses are in hand.
+        let params = crate::parse_network(store.network_id).map_err(envelope_or_invalid_input)?;
+        super::helpers::require_branch_agreement(
+            &params,
+            store.network,
+            round_params.snapshot_height,
+        )?;
+
         // Resolves the consensus branch id active at the snapshot height, so
         // delegation PCZTs are built for the same upgrade the notes were
         // selected under.
@@ -1277,6 +1290,69 @@ mod tests {
     fn open_binds_the_round_id_from_the_round_params() {
         let (_store, _dir, session) = open_session(0x20);
         assert_eq!(session.round_id(), hex_round_id(0x20));
+    }
+
+    /// A custom network whose activation heights select a different consensus
+    /// branch than its base network does at the round's snapshot height cannot
+    /// delegate: `zcash_voting` re-derives that branch from the base identity
+    /// alone and refuses anything else. Opening must fail with the typed
+    /// refusal rather than build a delegation for a branch this chain is not
+    /// on.
+    ///
+    /// The custom network is registered for real here, through the FFI a host
+    /// calls, because the registration is what the session resolves at open.
+    /// That slot is process-global, so this runs under the shared guard that
+    /// serializes it against the other test which registers one
+    /// (`store_ffi::tests::db_open_custom_network_derives_voting_network_from_base`)
+    /// and puts the previous registration back when the test ends.
+    #[test]
+    fn a_session_on_a_custom_network_with_a_diverging_branch_refuses_to_open() {
+        let _custom_network = crate::lock_custom_network();
+
+        // Modified mainnet: mainnet's own heights, except that this deployment
+        // has not activated NU6.3 yet. Mainnet is on NU6.3 well below the
+        // synthetic snapshot, so the two schedules disagree there.
+        assert!(crate::zcashlc_set_custom_network(
+            1, 347_500, 419_200, 653_600, 903_000, 1_046_400, 1_687_104, 2_726_400, 3_146_400,
+            3_364_600, 10_000_000,
+        ));
+
+        let store = open_memory_store(crate::NETWORK_ID_REGTEST, "w");
+        let (_dir, wallet_path, account_uuid) =
+            temp_wallet_db_with_account(crate::NETWORK_ID_REGTEST);
+        let mut inputs = synthetic_session_inputs(0x2b, &wallet_path, &account_uuid);
+        // A mainnet-based chain is a production vote chain to the crate, which
+        // refuses a plain-HTTP endpoint for one. Still the discard port, so
+        // nothing is dialed; the scheme only keeps the chain configuration from
+        // being what fails, so this case fails on the branch or not at all.
+        inputs.chain_endpoints = vec!["https://127.0.0.1:9/".to_string()];
+        let err = match VotingSession::open(
+            &store,
+            inputs,
+            synthetic_binding(1, None),
+            SdkRoute::direct(),
+            1,
+        ) {
+            Ok(_) => panic!("a custom network whose branch differs must not open a session"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            error_kind(&err),
+            "invalid_input",
+            "unexpected refusal: {err}"
+        );
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("typed JSON error");
+        assert!(
+            view.message.contains("Nu6_2") && view.message.contains("Nu6_3"),
+            "the refusal must name both branches: {}",
+            view.message
+        );
+
+        // The refusal belongs to the custom slot alone: a standard network
+        // still opens, in this same process, with that registration live.
+        let (_store, _dir, session) = open_session(0x2c);
+        assert_eq!(session.round_id(), hex_round_id(0x2c));
     }
 
     #[test]

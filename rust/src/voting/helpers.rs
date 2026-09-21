@@ -97,6 +97,15 @@ pub(super) fn usk_from_seed(
 /// its voting network follows the registered base network. Deriving it through
 /// [`crate::parse_network`] also means an unconfigured custom slot errors here
 /// rather than silently passing for Regtest.
+///
+/// **Only the base network survives this mapping — the registered activation
+/// heights do not.** `zcash_voting::Network` is a three-variant enum with
+/// librustzcash's own heights baked in and no room for caller-supplied ones,
+/// and the crate re-derives the delegation branch id from that enum in three
+/// independent validators, so there is nowhere to put them. A custom chain is
+/// therefore only safe to vote on where the branch its heights select equals
+/// the one the base network selects; [`require_branch_agreement`] is what
+/// enforces that, at session open, before any delegation is built.
 pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network> {
     match network_id {
         crate::NETWORK_ID_TESTNET => Ok(voting::Network::Testnet),
@@ -124,6 +133,63 @@ pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network>
     }
 }
 
+/// Refuse a round whose consensus branch the voting crate would get wrong.
+///
+/// `params` is the chain the wallet really runs on — for the custom slot, the
+/// activation heights a host registered — and `network` is the flattened
+/// identity `voting_network` handed `zcash_voting`. Note selection resolves the
+/// voting note version through `params`, but everything the crate builds for
+/// delegation resolves its consensus branch from `network` alone (and rejects
+/// any branch id supplied from outside, in three separate validators). Where
+/// the two schedules select different branches at the round's snapshot height,
+/// the delegation would be built for a branch this chain is not on, so the
+/// round is refused here instead — before the anchor is read, before a PCZT
+/// exists and before anything reaches the network.
+///
+/// Standard networks are unaffected: `params` and `network` are then the same
+/// schedule and agree at every height. So is a custom chain that agrees at the
+/// snapshot height, even when its schedule differs elsewhere; the branch at
+/// that one height is all delegation depends on.
+///
+/// Pure: reads no global state, so a caller that already resolved its
+/// parameters can check any height without re-entering the network registry.
+pub(super) fn require_branch_agreement(
+    params: &impl zcash_protocol::consensus::Parameters,
+    network: voting::Network,
+    snapshot_height: u64,
+) -> anyhow::Result<()> {
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+    // `zcash_voting::lwd::branch_id_for_height` refuses anything wider than a
+    // `u32`, so a height that does not fit has no branch on either side.
+    let height = u32::try_from(snapshot_height)
+        .map(BlockHeight::from_u32)
+        .map_err(|_| {
+            invalid_input(format!(
+                "the round's snapshot height {snapshot_height} does not fit in u32"
+            ))
+        })?;
+
+    let registered = BranchId::for_height(params, height);
+    // The crate's own derivation: `zcash_voting::Network` implements
+    // `zcash_protocol::consensus::Parameters` with librustzcash's heights, and
+    // `lwd::branch_id_for_height` is exactly this call. Going through the same
+    // trait rather than restating the schedule keeps this from drifting when
+    // the crate's baked-in heights move.
+    let assumed = BranchId::for_height(&network, height);
+
+    if registered != assumed {
+        return Err(invalid_input(format!(
+            "this network's activation heights select consensus branch {registered:?} at the \
+             round's snapshot height {snapshot_height}, but voting delegation follows the \
+             {network:?} schedule, which selects {assumed:?}; voting on a custom network is \
+             supported only where the two agree"
+        )));
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Internal helpers
 // =============================================================================
@@ -149,7 +215,237 @@ pub(super) fn voting_hotkey_to_ffi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
+    use zcash_protocol::consensus::{
+        BlockHeight, BranchId, MAIN_NETWORK, Network, NetworkType, NetworkUpgrade, Parameters,
+        TEST_NETWORK,
+    };
+    use zcash_protocol::local_consensus::LocalNetwork;
+
+    /// Every upgrade a `LocalNetwork` can carry, oldest first.
+    ///
+    /// `zcashlc_set_custom_network` takes a height for each of these, so a case
+    /// that walks them walks the whole surface a host can move.
+    const UPGRADES: &[NetworkUpgrade] = &[
+        NetworkUpgrade::Overwinter,
+        NetworkUpgrade::Sapling,
+        NetworkUpgrade::Blossom,
+        NetworkUpgrade::Heartwood,
+        NetworkUpgrade::Canopy,
+        NetworkUpgrade::Nu5,
+        NetworkUpgrade::Nu6,
+        NetworkUpgrade::Nu6_1,
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_3,
+    ];
+
+    /// The standard network behind `base`, as the SDK's own parameters type.
+    fn standard(base: NetworkType) -> crate::NetworkParams {
+        match base {
+            NetworkType::Main => crate::NetworkParams::Standard(Network::MainNetwork),
+            NetworkType::Test => crate::NetworkParams::Standard(Network::TestNetwork),
+            NetworkType::Regtest => panic!("these cases modify a standard base network"),
+        }
+    }
+
+    /// `base`'s own activation heights with NU6.3 moved to `nu6_3`, in the shape
+    /// [`crate::zcashlc_set_custom_network`] stores: a base identity plus a
+    /// [`LocalNetwork`]. Building it here rather than registering it keeps these
+    /// cases off the process-global slot.
+    fn custom_with_nu6_3(base: NetworkType, nu6_3: u32) -> crate::NetworkParams {
+        let standard = standard(base);
+        let at = |nu| standard.activation_height(nu);
+        crate::NetworkParams::Custom {
+            base,
+            local: LocalNetwork {
+                overwinter: at(NetworkUpgrade::Overwinter),
+                sapling: at(NetworkUpgrade::Sapling),
+                blossom: at(NetworkUpgrade::Blossom),
+                heartwood: at(NetworkUpgrade::Heartwood),
+                canopy: at(NetworkUpgrade::Canopy),
+                nu5: at(NetworkUpgrade::Nu5),
+                nu6: at(NetworkUpgrade::Nu6),
+                nu6_1: at(NetworkUpgrade::Nu6_1),
+                nu6_2: at(NetworkUpgrade::Nu6_2),
+                nu6_3: Some(BlockHeight::from_u32(nu6_3)),
+            },
+        }
+    }
+
+    /// The voting identity a custom network with `base` resolves to, which is
+    /// what `voting_network` hands the crate.
+    fn voting_identity(base: NetworkType) -> voting::Network {
+        match base {
+            NetworkType::Main => voting::Network::Mainnet,
+            NetworkType::Test => voting::Network::Testnet,
+            NetworkType::Regtest => voting::Network::Regtest,
+        }
+    }
+
+    /// The `message` of a failure that crossed as `VotingErrorView` JSON, after
+    /// asserting the kind, so a case reads text only once the envelope is right.
+    fn invalid_input_message(err: &anyhow::Error) -> String {
+        let view: voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
+        view.message
+    }
+
+    /// A standard network is its own schedule, so the check must never refuse
+    /// one: mainnet and testnet, on both sides of every upgrade.
+    #[test]
+    fn a_standard_network_always_agrees_with_itself() {
+        for base in [NetworkType::Main, NetworkType::Test] {
+            let params = standard(base);
+            let network = voting_identity(base);
+            let mut heights = vec![0u64, 1, u64::from(u32::MAX)];
+            for nu in UPGRADES {
+                let activation = u64::from(u32::from(
+                    params.activation_height(*nu).expect("standard activation"),
+                ));
+                heights.extend([activation - 1, activation, activation + 1]);
+            }
+            for height in heights {
+                require_branch_agreement(&params, network, height)
+                    .unwrap_or_else(|e| panic!("{network:?} at {height} must agree: {e}"));
+            }
+        }
+    }
+
+    /// The branch this check credits to the crate must be the branch the crate
+    /// will really use, so it is compared against `zcash_voting`'s own public
+    /// derivation (`lwd::branch_id_for_height`, which every delegation
+    /// validator re-derives through) at every upgrade boundary of every network
+    /// the crate has.
+    #[test]
+    fn the_assumed_branch_matches_the_crates_own_derivation_at_every_boundary() {
+        for network in [
+            voting::Network::Mainnet,
+            voting::Network::Testnet,
+            voting::Network::Regtest,
+        ] {
+            let mut heights = vec![0u64, 1, u64::from(u32::MAX)];
+            for nu in UPGRADES {
+                if let Some(activation) = network.activation_height(*nu) {
+                    let activation = u64::from(u32::from(activation));
+                    heights.extend([activation.saturating_sub(1), activation, activation + 1]);
+                }
+            }
+            for height in heights {
+                let ours = BranchId::for_height(
+                    &network,
+                    BlockHeight::from_u32(u32::try_from(height).expect("test height fits")),
+                );
+                let theirs = voting::lwd::branch_id_for_height(network, height)
+                    .expect("the crate resolves a branch for a u32 height");
+                assert_eq!(
+                    u32::from(ours),
+                    theirs,
+                    "{network:?} at {height}: this check credits the crate with {ours:?}, \
+                     but the crate derives 0x{theirs:08X}"
+                );
+            }
+        }
+    }
+
+    /// A deployment that activated NU6.3 early: at a height where the base
+    /// network is still pre-Overwinter, the two disagree and the round must be
+    /// refused rather than delegated under the wrong branch.
+    #[test]
+    fn a_modified_mainnet_with_an_earlier_upgrade_is_refused_at_a_height_where_the_branches_differ()
+    {
+        let params = custom_with_nu6_3(NetworkType::Main, 100);
+        let err = require_branch_agreement(&params, voting::Network::Mainnet, 200)
+            .expect_err("an early NU6.3 must be refused at a height the base has not reached");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("Nu6_3"), "{message}");
+        assert!(message.contains("Sprout"), "{message}");
+    }
+
+    /// The other direction: the deployment has not activated NU6.3 yet at a
+    /// height where mainnet already runs it, so the crate would build the
+    /// delegation for a branch this chain is not on.
+    #[test]
+    fn a_custom_upgrade_later_than_the_standard_one_is_refused_too() {
+        let params = custom_with_nu6_3(NetworkType::Main, 10_000_000);
+        let err = require_branch_agreement(&params, voting::Network::Mainnet, 4_200_000)
+            .expect_err("a not-yet-activated NU6.3 must be refused where mainnet has activated it");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("Nu6_2"), "{message}");
+        assert!(message.contains("Nu6_3"), "{message}");
+    }
+
+    /// Custom heights are not refused for being custom. A deployment whose
+    /// schedule differs from the base but selects the same branch at the
+    /// round's snapshot height votes exactly as the base network does.
+    #[test]
+    fn a_custom_network_that_agrees_at_the_snapshot_height_is_accepted() {
+        // Mainnet's own schedule, re-registered by a host that mirrors the node
+        // it connects to.
+        let mirrored = custom_with_nu6_3(NetworkType::Main, 3_428_143);
+        require_branch_agreement(&mirrored, voting::Network::Mainnet, 4_200_000)
+            .expect("a mirrored mainnet schedule agrees");
+
+        // NU6.3 moved, but still the newest upgrade at the snapshot height: the
+        // branch is the same one, so the delegation the crate builds is valid.
+        let moved = custom_with_nu6_3(NetworkType::Main, 3_400_000);
+        require_branch_agreement(&moved, voting::Network::Mainnet, 4_200_000)
+            .expect("a different schedule that selects the same branch agrees");
+    }
+
+    /// The same early-activation refusal on a testnet-based deployment.
+    #[test]
+    fn a_modified_testnet_with_an_earlier_upgrade_is_refused_at_a_height_where_the_branches_differ()
+    {
+        let params = custom_with_nu6_3(NetworkType::Test, 100);
+        let err = require_branch_agreement(&params, voting::Network::Testnet, 200)
+            .expect_err("an early NU6.3 must be refused on testnet too");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("Nu6_3"), "{message}");
+        assert!(message.contains("Testnet"), "{message}");
+    }
+
+    /// And the same late-activation refusal on a testnet-based deployment.
+    #[test]
+    fn a_custom_upgrade_later_than_the_standard_one_is_refused_on_a_modified_testnet_too() {
+        let params = custom_with_nu6_3(NetworkType::Test, 10_000_000);
+        let err = require_branch_agreement(&params, voting::Network::Testnet, 4_200_000)
+            .expect_err("a not-yet-activated NU6.3 must be refused on testnet too");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("Nu6_2"), "{message}");
+        assert!(message.contains("Nu6_3"), "{message}");
+    }
+
+    /// A host that sees this refusal has to know which two schedules disagreed
+    /// and where. It must not learn anything else it supplied: the registered
+    /// activation heights are the host's own configuration and stay out of the
+    /// message, which is the rule for every error text crossing this boundary.
+    #[test]
+    fn the_refusal_names_both_branches_and_the_height() {
+        let params = custom_with_nu6_3(NetworkType::Main, 111_111);
+        let err = require_branch_agreement(&params, voting::Network::Mainnet, 222_222)
+            .expect_err("the branches differ at this height");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("Nu6_3"), "registered branch: {message}");
+        assert!(message.contains("Sprout"), "assumed branch: {message}");
+        assert!(message.contains("222222"), "snapshot height: {message}");
+        assert!(
+            !message.contains("111111"),
+            "the registered activation heights are not the host's to read back: {message}"
+        );
+    }
+
+    /// The crate resolves a branch for `u32` heights only, so a height it could
+    /// not take is the caller's input error, reported here rather than as
+    /// whatever the crate makes of it later.
+    #[test]
+    fn a_snapshot_height_beyond_u32_is_refused_as_invalid_input() {
+        let params = standard(NetworkType::Main);
+        let err =
+            require_branch_agreement(&params, voting::Network::Mainnet, u64::from(u32::MAX) + 1)
+                .expect_err("a height beyond u32 has no branch");
+        let message = invalid_input_message(&err);
+        assert!(message.contains("4294967296"), "{message}");
+    }
 
     #[test]
     fn bytes_from_ptr_zero_len_accepts_null() {
