@@ -200,13 +200,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the software signer, and `open(path:networkId:)` now accept the regtest network id and resolve
   their voting identity through the registered custom network's base network — a modified-mainnet
   chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
-  the call rather than silently treated as regtest.
+  the call.
 - Voting on a custom network is supported only where its consensus branch at the round's snapshot
   height is the same one the base network selects there. Note selection honours the registered
   activation heights, but delegation does not and cannot: the voting crate derives the delegation
   branch from the base network alone and rejects any other. Voting runs on NU6.3 on both sides, so
-  where the two differ at least one has not reached NU6.3 at that height and the round has no
-  complete path through either half.
+  where the two differ at least one has not reached NU6.3 at that height, and at least one half
+  refuses the round on its own.
   `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and
   throws `VotingError` with `kind == .invalidInput` when they disagree, naming both branches and the
   snapshot height, as the first thing it does once its inputs decode. A host on a custom chain picks

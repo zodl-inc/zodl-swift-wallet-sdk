@@ -80,8 +80,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     request, both fail the call as `invalid_input` and store nothing of the batch, leaving that
     bundle rescannable. The error JSON's `bundle_index` names the bundle whose response was
     refused. Nothing replaces a stored signature — the first one stored for a bundle is the one it
-    keeps — so this is where a wrong response has to be stopped. A run with no signer reports the bundles that owe one instead of
-    dispatching them.
+    keeps — so this is where a wrong response has to be stopped. A run with no signer reports the
+    bundles that owe one instead of dispatching them.
   - `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
     describes, for a network id, so a caller that persisted only the secret can hand the SDK the
     full hotkey again. Free with `zcashlc_voting_free_hotkey`.
@@ -399,8 +399,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     height than the base network does. The message names both branches and the height. Note
     selection resolves its note version through the registered activation heights, but delegation
     derives its branch from the base network alone and refuses any other. Voting runs on NU6.3 on
-    both sides, so where the two differ at least one has not reached NU6.3 at that height and the
-    round has no complete path through either half; the check reports that as one clear refusal at
+    both sides, so where the two differ at least one has not reached NU6.3 at that height, and at
+    least one half refuses the round on its own; the check reports that as one clear refusal at
     open rather than as an unsupported note version or an unsupported branch id from deeper in.
     A caller on a standard network id is unaffected: the two schedules are then the same one. On a
     regtest base they are not — the crate's regtest schedule activates NU6.3 at height 10, so a

@@ -167,8 +167,8 @@ pub(super) fn sign_delegation_request(
 }
 
 /// Lifts the SpendAuth signature a Keystone device produced out of the PCZT it
-/// signed: the action the request named, or, failing that, whichever action of
-/// the governance PCZT's single signable one carries a signature.
+/// signed: the action the request named, or, failing that, the first action
+/// that carries a signature.
 ///
 /// The signature bytes are the only thing taken from the device's PCZT.
 /// Whether they are the signature this wallet asked for is

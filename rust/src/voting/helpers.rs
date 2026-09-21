@@ -450,8 +450,7 @@ mod tests {
     /// every upgrade active from genesis, while the voting crate holds its own
     /// regtest NU6.3 back to height 10. So a round whose snapshot falls in that
     /// window is refused, and one at or after it is accepted — which is what
-    /// makes a local test chain's early blocks unusable for voting rather than
-    /// silently wrong.
+    /// makes a local test chain's early blocks unusable for voting.
     #[test]
     fn a_regtest_base_is_refused_below_the_crates_own_nu6_3_height_and_accepted_from_it() {
         let params = standard(NetworkType::Regtest);

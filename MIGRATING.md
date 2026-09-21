@@ -392,11 +392,11 @@ case .persistedChainTerminal:
     // Durable chain state this run could not advance. The reason is on the
     // persisted plan and survives a restart, which is where to read it: a live
     // `chainOutcome` exists only for a submission the run itself observed.
-    // A row with a diagnostic and `terminal == false` is a bundle whose
-    // combined cast the chain keeps refusing; its `bundleIndex` is the one to
-    // name in `retryBlockedCombinedCast(roundId:bundleIndex:)` below, and this
-    // loop is where a host learns it. A `terminal` row needs manual handling
-    // instead: no further delegation step is ever planned for it.
+    // A row with a diagnostic, `terminal == false` and `phase == .signed` is a
+    // bundle whose combined cast the chain keeps refusing; its `bundleIndex` is
+    // the one to name in `retryBlockedCombinedCast(roundId:bundleIndex:)` below,
+    // and this loop is where a host learns it. A `terminal` row needs manual
+    // handling instead: no further delegation step is ever planned for it.
     for status in report.plan?.delegationStatuses ?? [] where status.diagnosticMessage != nil {
         show(
             bundle: status.bundleIndex,
@@ -646,7 +646,7 @@ honour the registered heights, so the two halves of a round can resolve differen
 same height.
 
 Voting runs on NU6.3 on both sides, so where the two differ at least one of them has not reached
-NU6.3 at that height and the round has no complete path through either half.
+NU6.3 at that height, and at least one half refuses the round on its own.
 `makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and refuses, naming both
 branches and the snapshot height, as the first thing it does once its inputs decode — so a host
 reads one clear reason rather than an unsupported note version from note selection or an unsupported
@@ -1401,8 +1401,8 @@ Ironwood testing backend) whose network upgrades activate at arbitrary heights:
 - Coinholder voting reads these heights for note selection but not for its delegation branch, which
   the voting crate derives from the base network alone. A round session opens only where the custom
   network's consensus branch at the round's snapshot height equals the base network's, and throws
-  `VotingError` with `kind == .invalidInput` otherwise — which for a plain regtest base means every
-  round whose snapshot height is below 10. See "Voting on a custom network: only where the consensus
+  `VotingError` with `kind == .invalidInput` otherwise — which for the stock heights of `network(for: .regtest)` means
+  every round whose snapshot height is from 1 to 9. See "Voting on a custom network: only where the consensus
   branch agrees" above.
 
 **Process-global registration and ordering.** The custom network's parameters are registered with
