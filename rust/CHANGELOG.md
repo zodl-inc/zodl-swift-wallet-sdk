@@ -74,8 +74,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     PCZT; a Keystone wallet exchanges per-bundle signing requests through
     `zcashlc_voting_session_keystone_signing_requests` and
     `zcashlc_voting_session_store_keystone_signatures`, and later runs reuse the stored
-    signatures. A run with no signer reports the bundles that owe one instead of dispatching
-    them.
+    signatures. `_store_keystone_signatures` verifies every response against the request it
+    answers before it stores any of them: a signed PCZT that does not carry a spend-authorization
+    signature over its bundle's current signing request fails the call as `invalid_input` and
+    stores nothing of the batch, leaving that bundle rescannable. Nothing replaces a stored
+    signature — the first one stored for a bundle is the one it keeps — so this is where a wrong
+    response has to be stopped. A run with no signer reports the bundles that owe one instead of
+    dispatching them.
   - `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
     describes, for a network id, so a caller that persisted only the secret can hand the SDK the
     full hotkey again. Free with `zcashlc_voting_free_hotkey`.

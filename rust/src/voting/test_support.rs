@@ -3,6 +3,7 @@
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::init_wallet_db;
+use zip32::AccountId;
 
 /// An initialized, empty wallet database in a fresh temporary directory.
 ///
@@ -51,6 +52,71 @@ pub(crate) fn synthetic_round_params(
         nc_root: vec![8u8; 32],
         nullifier_imt_root: vec![9u8; 32],
     }
+}
+
+/// A Keystone signing request whose every field is filler.
+///
+/// Nothing below the signature pairing reads the PCZT bytes or the memo, so a
+/// test that cares about one field states that field and leaves the rest here.
+/// The `rk` and `pczt_sighash` are *not* real RedPallas material — use
+/// [`keystone_request_signed_under`] when they have to be.
+pub(crate) fn synthetic_keystone_request() -> zcash_voting::delegate::KeystoneSigningRequest {
+    zcash_voting::delegate::KeystoneSigningRequest {
+        pczt_bytes: vec![1, 2, 3],
+        redacted_pczt_bytes: vec![4, 5, 6],
+        pczt_sighash: vec![7u8; 32],
+        rk: vec![8u8; 32],
+        action_index: 0,
+        display_memo: "round".to_string(),
+        eligible_weight_zatoshi: 10,
+        delegated_weight_zatoshi: 10,
+        bundle_count: 1,
+        bundle_index: 0,
+    }
+}
+
+/// A fresh randomizer, drawn the way the crate draws one per bundle.
+pub(crate) fn random_alpha() -> pasta_curves::pallas::Scalar {
+    <pasta_curves::pallas::Scalar as ff::Field>::random(rand::rngs::OsRng)
+}
+
+/// A Keystone request carrying real RedPallas material, with the signature a
+/// device that signed exactly that request would send back.
+///
+/// The `rk` is the fixture seed's account SpendAuth key randomized by `alpha`,
+/// which is the key the crate puts on a bundle row, and the signature is over
+/// `sighash` alone — the raw 32 bytes, no prefix and no personalization, which
+/// is how both the crate's own verifier and the software signer treat it. So a
+/// test built from these holds against the real primitive rather than against
+/// a stand-in for it.
+pub(crate) fn keystone_request_signed_under(
+    alpha: &pasta_curves::pallas::Scalar,
+    sighash: [u8; 32],
+) -> (zcash_voting::delegate::KeystoneSigningRequest, [u8; 64]) {
+    let usk = crate::voting::helpers::usk_from_seed(
+        crate::NETWORK_ID_TESTNET,
+        &[1u8; 32],
+        AccountId::ZERO,
+    )
+    .expect("unified spending key");
+    let randomized = orchard::keys::SpendAuthorizingKey::from(usk.orchard()).randomize(alpha);
+    let rk = <[u8; 32]>::from(&orchard::primitives::redpallas::VerificationKey::from(
+        &randomized,
+    ));
+    let sig = <[u8; 64]>::from(&randomized.sign(rand::rngs::OsRng, &sighash));
+
+    let mut request = synthetic_keystone_request();
+    request.pczt_sighash = sighash.to_vec();
+    request.rk = rk.to_vec();
+    (request, sig)
+}
+
+/// [`keystone_request_signed_under`] with a randomizer nobody else holds, for
+/// the cases where all that matters is that the key is a different one.
+pub(crate) fn keystone_request_signed(
+    sighash: [u8; 32],
+) -> (zcash_voting::delegate::KeystoneSigningRequest, [u8; 64]) {
+    keystone_request_signed_under(&random_alpha(), sighash)
 }
 
 /// An empty in-memory voting store already scoped to `wallet_id`.

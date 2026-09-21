@@ -2,8 +2,10 @@
 //!
 //! Two ways to reach the same 64-byte RedPallas SpendAuth signature the crate
 //! needs for one delegation bundle. A software wallet derives it here from its
-//! own seed; a Keystone wallet's device produced it, and [`keystone_signature_input`]
-//! is where it is lifted out of the PCZT the device signed.
+//! own seed; a Keystone wallet's device produced it, and [`keystone_signature`]
+//! is where it is lifted out of the PCZT the device signed — after which
+//! [`verified_signature_input`] checks that it signs what this wallet asked
+//! for, whichever of the two produced it.
 //!
 //! The crate stopped deriving account keys on the caller's behalf in 2.0 and
 //! documents the replacement on `delegate::DelegationSigningRequest`: a
@@ -23,6 +25,7 @@
 //! of a seed worth the risk that someone prints one.
 
 use ff::PrimeField;
+use orchard::primitives::redpallas::{Signature, SpendAuth, VerificationKey};
 use pasta_curves::pallas;
 use zcash_voting::delegate::{
     DelegationSigningRequest, KeystoneSigningRequest, spend_auth_signature,
@@ -164,16 +167,61 @@ pub(super) fn sign_delegation_request(
 }
 
 /// Lifts the SpendAuth signature a Keystone device produced out of the PCZT it
-/// signed, as the tuple the sidecar stores for the bundle.
+/// signed, at the action index the request named.
 ///
-/// The sighash and `rk` come from the request the device was given, not from
-/// the PCZT it returned: they are what the stored signature is later verified
-/// against, so they must be the values this wallet set up the bundle with.
-pub(super) fn keystone_signature_input(
+/// The signature bytes are the only thing taken from the device's PCZT.
+/// Whether they are the signature this wallet asked for is
+/// [`verified_signature_input`]'s question, not this one's.
+pub(super) fn keystone_signature(
     request: &KeystoneSigningRequest,
     signed_pczt: &[u8],
+) -> Result<[u8; 64], VotingError> {
+    spend_auth_signature(signed_pczt, request.action_index as usize)
+}
+
+/// Pairs a signature with the request it was asked for, after checking that it
+/// is one: a RedPallas spend-authorization signature over the request's
+/// sighash under the request's randomized key.
+///
+/// The sighash and `rk` stored beside the signature come from the request this
+/// wallet built, not from the PCZT the device returned, because they are what
+/// the signature is verified against later — here and again when the
+/// delegation is proved.
+///
+/// Checking before storing is the only moment this can be caught. The sidecar
+/// keeps the first signature it is given for a bundle and compares only the
+/// signing context afterwards, never the signature bytes, and it offers no way
+/// to clear one bundle's row; a signature that does not verify would therefore
+/// sit there until the whole round was thrown away.
+pub(super) fn verified_signature_input(
+    request: &KeystoneSigningRequest,
+    sig: [u8; 64],
 ) -> Result<KeystoneSignatureInput, VotingError> {
-    let sig = spend_auth_signature(signed_pczt, request.action_index as usize)?;
+    // One refusal for every way the pairing can fail. A host can act on all of
+    // them the same way — scan the response for this bundle again — and the
+    // values that would distinguish them are exactly the ones that must not be
+    // rendered into a message.
+    let refused = || {
+        invalid_input(format!(
+            "the signed PCZT for bundle {} does not carry a signature over that bundle's signing request",
+            request.bundle_index
+        ))
+    };
+
+    let rk: [u8; 32] = request.rk.as_slice().try_into().map_err(|_| refused())?;
+    let sighash: [u8; 32] = request
+        .pczt_sighash
+        .as_slice()
+        .try_into()
+        .map_err(|_| refused())?;
+    let key = VerificationKey::<SpendAuth>::try_from(rk).map_err(|_| refused())?;
+    // The message is the raw 32 sighash bytes, with no prefix and no
+    // personalization: the same thing the crate's own verifier passes when it
+    // checks a stored signature, and the same thing the software path above
+    // signs. Anything else here would accept signatures the crate then refuses.
+    key.verify(&sighash, &Signature::<SpendAuth>::from(sig))
+        .map_err(|_| refused())?;
+
     Ok(KeystoneSignatureInput {
         bundle_index: request.bundle_index,
         sig: sig.to_vec(),
@@ -200,6 +248,10 @@ fn internal(message: impl Into<String>) -> VotingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voting::test_support::{
+        keystone_request_signed, keystone_request_signed_under, random_alpha,
+        synthetic_keystone_request,
+    };
     use zcash_voting::Network;
     use zcash_voting::delegate::DelegationSigningRequest;
 
@@ -408,29 +460,124 @@ mod tests {
         assert!(err.to_string().contains("network"), "unexpected: {err}");
     }
 
-    fn keystone_request() -> zcash_voting::delegate::KeystoneSigningRequest {
-        zcash_voting::delegate::KeystoneSigningRequest {
-            pczt_bytes: vec![1, 2, 3],
-            redacted_pczt_bytes: vec![4, 5, 6],
-            pczt_sighash: vec![7u8; 32],
-            rk: vec![8u8; 32],
-            action_index: 0,
-            display_memo: "round".to_string(),
-            eligible_weight_zatoshi: 10,
-            delegated_weight_zatoshi: 10,
-            bundle_count: 1,
-            bundle_index: 0,
-        }
-    }
-
     /// A signature can only be stored against a PCZT the crate can read, so
     /// bytes that are not one must not reach storage as an empty signature.
     #[test]
-    fn keystone_signature_input_rejects_bytes_that_are_not_a_pczt() {
-        let request = keystone_request();
+    fn keystone_signature_rejects_bytes_that_are_not_a_pczt() {
+        let request = synthetic_keystone_request();
 
-        let err = keystone_signature_input(&request, b"not a pczt").unwrap_err();
+        let err = keystone_signature(&request, b"not a pczt").unwrap_err();
 
         assert!(err.to_string().contains("PCZT"), "unexpected error: {err}");
+    }
+
+    fn assert_refused(request: &KeystoneSigningRequest, sig: [u8; 64]) -> VotingError {
+        let err = match verified_signature_input(request, sig) {
+            Ok(input) => panic!(
+                "a signature that does not sign the request must not be stored: {:?}",
+                input.bundle_index
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
+        err
+    }
+
+    /// The pairing the sidecar stores is the request's own context beside the
+    /// device's bytes, so what comes back must carry the request's bundle,
+    /// sighash and `rk` — not anything re-derived from the signature.
+    #[test]
+    fn a_signature_over_the_requests_sighash_under_its_rk_is_accepted() {
+        let (request, sig) = keystone_request_signed([0x11u8; 32]);
+
+        let input = verified_signature_input(&request, sig).expect("the request's own signature");
+
+        assert_eq!(input.bundle_index, request.bundle_index);
+        assert_eq!(input.sig, sig.to_vec());
+        assert_eq!(input.sighash, request.pczt_sighash);
+        assert_eq!(input.rk, request.rk);
+    }
+
+    /// The defect this guards: a second QR scanned against the wrong bundle is
+    /// a well-formed signature for a different request entirely.
+    #[test]
+    fn a_signature_made_for_another_request_is_refused() {
+        let (a, _) = keystone_request_signed([0x11u8; 32]);
+        let (b, b_sig) = keystone_request_signed([0x22u8; 32]);
+        assert_ne!(a.rk, b.rk);
+        assert_ne!(a.pczt_sighash, b.pczt_sighash);
+
+        assert_refused(&a, b_sig);
+    }
+
+    #[test]
+    fn a_signature_over_another_sighash_is_refused() {
+        let alpha = random_alpha();
+        let (request, _) = keystone_request_signed_under(&alpha, [0x11u8; 32]);
+        let (other, other_sig) = keystone_request_signed_under(&alpha, [0x22u8; 32]);
+        assert_eq!(request.rk, other.rk, "the same key signed both messages");
+
+        assert_refused(&request, other_sig);
+    }
+
+    #[test]
+    fn a_signature_under_another_key_is_refused() {
+        let sighash = [0x33u8; 32];
+        let (request, _) = keystone_request_signed(sighash);
+        let (other, other_sig) = keystone_request_signed(sighash);
+        assert_ne!(request.rk, other.rk);
+        assert_eq!(
+            request.pczt_sighash, other.pczt_sighash,
+            "the same message was signed twice"
+        );
+
+        assert_refused(&request, other_sig);
+    }
+
+    /// A request the wallet could not have built is still a refusal rather
+    /// than a panic: the check decodes before it verifies.
+    #[test]
+    fn a_request_whose_rk_is_not_a_valid_key_is_refused() {
+        let (mut request, sig) = keystone_request_signed([0x44u8; 32]);
+        request.rk = vec![0xffu8; 32];
+
+        assert_refused(&request, sig);
+    }
+
+    #[test]
+    fn a_request_with_a_short_sighash_or_rk_is_refused() {
+        let (request, sig) = keystone_request_signed([0x55u8; 32]);
+
+        let mut short_sighash = request.clone();
+        short_sighash.pczt_sighash.truncate(31);
+        let mut short_rk = request.clone();
+        short_rk.rk.truncate(31);
+
+        for bad in [short_sighash, short_rk] {
+            assert_refused(&bad, sig);
+        }
+    }
+
+    /// The refusal reaches a host's log, so it says which bundle to rescan and
+    /// nothing else: not the signature, not the key, not the sighash.
+    #[test]
+    fn a_refusal_names_the_bundle_and_nothing_secret() {
+        let (mut request, _) = keystone_request_signed([0x66u8; 32]);
+        request.bundle_index = 3;
+        let (_, other_sig) = keystone_request_signed([0x77u8; 32]);
+
+        let message = assert_refused(&request, other_sig).to_string();
+
+        assert!(message.contains("bundle 3"), "unexpected: {message}");
+        for secret in [
+            hex::encode(other_sig),
+            hex::encode(&request.rk),
+            hex::encode(&request.pczt_sighash),
+        ] {
+            assert!(
+                !message.contains(&secret),
+                "a refusal must not carry key, signature or sighash bytes: {message}"
+            );
+        }
     }
 }

@@ -335,13 +335,22 @@ public final class VotingRoundSession: @unchecked Sendable {
         }
     }
 
-    /// Lift the signatures off the PCZTs a Keystone device returned and store
-    /// them for this round.
+    /// Lift the signatures off the PCZTs a Keystone device returned, check each
+    /// one against the request it answers, and store them for this round.
+    ///
+    /// A response that does not sign its bundle's current signing request — the
+    /// wrong bundle's QR, or a stale one from a round whose bundles were rebuilt
+    /// — is refused as ``VotingErrorKind/invalidInput``, and nothing of the
+    /// batch is stored, not even the entries that did verify. Scanning the right
+    /// response for that bundle afterwards stores it. This is the only moment
+    /// the refusal can happen: the sidecar keeps the first signature stored for
+    /// a bundle, so a wrong one that got in could not be replaced.
     ///
     /// One atomic idempotent batch, so a retry after an interrupted QR session
-    /// reports what was already there rather than failing on it. An empty batch
-    /// and a repeated bundle index are refused as
-    /// ``VotingErrorKind/invalidInput``.
+    /// reports what was already there rather than failing on it: a response that
+    /// already verified and was stored is reported through `alreadyPresent`
+    /// rather than stored twice. An empty batch and a repeated bundle index are
+    /// refused as ``VotingErrorKind/invalidInput``.
     public func storeKeystoneSignatures(
         _ signed: [VotingKeystoneSignedBundle]
     ) async throws -> VotingKeystoneSignatureBatchResult {
