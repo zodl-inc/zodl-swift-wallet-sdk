@@ -314,6 +314,14 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     public let hotkeyBound: Bool
     public let completedForDisplay: Bool
     public let completedVoteDisplay: VotingCompletedVoteDisplay?
+    /// True when the wallet should collect or restore draft choices for
+    /// ``openProposals``. This is not a signal about bundles — that is
+    /// ``needsBundleSetup`` — so it stays true across a bundle setup that
+    /// happens while proposals are still open. To decide whether a round
+    /// needs its *first* setup, read `needsBundleSetup ||
+    /// delegationStatuses.isEmpty`, or simply call the idempotent
+    /// ``VotingRoundSession/setupBundles()`` regardless: existing bundle rows
+    /// are reused rather than rebuilt.
     public let needsDraftSetup: Bool
     /// True when the round holds a ballot choice but no bundle rows yet, so
     /// the bundle plan must be persisted before any vote work is planned.
@@ -337,12 +345,20 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     public let hasRecoverableVoteOrShareWork: Bool
     public let primaryAction: VotingRoundPlanAction
     public let delegationStatuses: [VotingDelegationStatus]
-    /// Proposals with no terminal decision yet.
+    /// Proposals with no terminal decision yet. Recording a choice clears a
+    /// proposal from this list immediately, the same as recording an explicit
+    /// skip — long before ``allDecided`` can turn true for it.
     public let openProposals: [UInt32]
-    /// Durable intents for proposals outside the authenticated roster; casting
-    /// is withheld until the host clears them.
+    /// Durable intents for proposals outside the authenticated roster;
+    /// casting is withheld until the host clears them with
+    /// ``VotingRustBackend/clearBallotIntents(roundId:proposalIds:)``.
     public let unrosteredIntents: [UInt32]
     public let immediateShareConfirmed: Bool
+    /// A completion flag, not a readiness check: true once every rostered
+    /// proposal is either skipped or has its chosen vote confirmed on every
+    /// bundle. A freshly recorded choice leaves this false. Judge whether the
+    /// ballot itself is complete from ``openProposals`` and
+    /// ``unrosteredIntents`` instead.
     public let allDecided: Bool
     /// True when the round holds a delegation or a vote this wallet built that
     /// an older SDK dispatched and never saw confirmed.

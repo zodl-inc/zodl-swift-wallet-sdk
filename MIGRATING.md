@@ -274,7 +274,8 @@ if plan.needsDraftSetup || plan.needsBundleSetup {
 
 // Record the ballot against the roster the host authenticated; it answers the
 // refreshed plan. A round whose bundles could not be laid out yet still owes
-// them, and says so through `needsBundleSetup`.
+// them, and says so through `needsBundleSetup`. Whether the ballot itself is
+// answered is a separate question from bundle setup, checked below.
 plan = try session.setBallotIntents([
     VotingBallotIntent(proposalId: 1, decision: .choice(0)),
     VotingBallotIntent(proposalId: 2, decision: .skipped)
@@ -291,6 +292,17 @@ for bundleIndex in plan.delegationBundlesNeedingWork {
     _ = try await session.precomputeDelegationProof(bundleIndex: bundleIndex) { progress in
         show(progress)            // VotingDelegationProgress: stage and fraction
     }
+}
+
+// The ballot is answered once every rostered proposal has an intent and no
+// unrostered intents remain outstanding: `openProposals.isEmpty &&
+// unrosteredIntents.isEmpty`. Proceed to `run` on that — never on `allDecided`,
+// which only turns true after the votes those intents describe are confirmed
+// on chain, and confirming them is what `run` itself does. Waiting for
+// `allDecided` here waits on something this call cannot produce yet.
+guard plan.openProposals.isEmpty && plan.unrosteredIntents.isEmpty else {
+    askVoter(plan.openProposals, plan.unrosteredIntents)    // keep collecting, then call setBallotIntents again
+    return
 }
 
 // Drive the round. Use `.software(seed:)` once the voter has authenticated; use

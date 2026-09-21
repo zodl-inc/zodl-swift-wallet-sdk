@@ -1638,4 +1638,73 @@ mod tests {
         assert_eq!(session_diagnostic.kind, "nullifier_already_spent");
         assert_eq!(session_diagnostic.message, "nullifier already spent");
     }
+
+    /// A ballot with every rostered proposal answered — a real choice for one
+    /// proposal, explicit skips for the rest — is what a host has once it has
+    /// finished walking its own UI: `open_proposals` and `unrostered_intents`
+    /// are both empty the moment the last intent is recorded, because every
+    /// proposal in the roster now has some intent. `all_decided` stays false
+    /// regardless, because the crate only counts a `Choice` as decided once
+    /// its vote is confirmed on every bundle, and nothing here has cast a
+    /// vote yet. Reading `all_decided` as "the ballot is answered" waits on a
+    /// fact that recording the ballot can never by itself produce.
+    #[test]
+    fn a_fresh_fully_answered_ballot_has_no_open_proposals_and_is_not_all_decided() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::SetUpOnly);
+        let db = handle.scoped().expect("scoped");
+        db.set_ballot_intent(&round_id, 1, zcash_voting::session::Decision::Skipped, 2)
+            .expect("skip proposal 1");
+        db.set_ballot_intent(
+            &round_id,
+            LEGACY_PROPOSAL,
+            zcash_voting::session::Decision::Choice(LEGACY_CHOICE),
+            2,
+        )
+        .expect("choose proposal 2");
+        db.set_ballot_intent(&round_id, 3, zcash_voting::session::Decision::Skipped, 2)
+            .expect("skip proposal 3");
+
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER)
+            .expect("plan")
+            .plan;
+
+        assert!(plan.open_proposals.is_empty());
+        assert!(plan.unrostered_intents.is_empty());
+        assert!(!plan.all_decided);
+        assert!(!plan.needs_bundle_setup);
+        assert_eq!(plan.delegation_statuses.len(), 1);
+    }
+
+    /// The mirror of the test above: a ballot where every rostered proposal
+    /// is an explicit skip is `all_decided` immediately, with the same
+    /// prepared bundle in place and no vote ever cast. A skip is decided the
+    /// moment it is recorded; only a `Choice` waits on a vote confirmed on
+    /// every bundle. That asymmetry is why `all_decided` cannot stand in for
+    /// "every proposal has an answer" — a ballot of choices does not reach it
+    /// the way a ballot of skips does, even though both answer every
+    /// proposal.
+    #[test]
+    fn a_ballot_of_skips_only_is_all_decided() {
+        let (handle, round_id, _dir) = migrated_schema13_sidecar(LegacyFixture::SetUpOnly);
+        let db = handle.scoped().expect("scoped");
+        db.set_ballot_intent(&round_id, 1, zcash_voting::session::Decision::Skipped, 2)
+            .expect("skip proposal 1");
+        db.set_ballot_intent(
+            &round_id,
+            LEGACY_PROPOSAL,
+            zcash_voting::session::Decision::Skipped,
+            2,
+        )
+        .expect("skip proposal 2");
+        db.set_ballot_intent(&round_id, 3, zcash_voting::session::Decision::Skipped, 2)
+            .expect("skip proposal 3");
+
+        let plan = round_plan(&handle, &round_id, LEGACY_ROSTER)
+            .expect("plan")
+            .plan;
+
+        assert!(plan.open_proposals.is_empty());
+        assert!(plan.unrostered_intents.is_empty());
+        assert!(plan.all_decided);
+    }
 }
