@@ -257,13 +257,23 @@ public struct VotingDelegationStatus: Equatable, Sendable, Decodable {
     /// further delegation step will be planned for it. Read this rather than
     /// inferring from `phase`: a dispatch that reached the chain without a
     /// usable transaction hash reports the same phase as a healthy submission,
-    /// and retrying it would resubmit.
+    /// and retrying it would resubmit. It is a terminal failure, not a
+    /// terminal state: a confirmed delegation reads `false`, and so does a
+    /// bundle the wallet stopped re-casting after repeated chain refusals.
     public let terminal: Bool
-    /// What kind of chain answer ended this delegation, when the sidecar
-    /// recorded one. Present on terminal rows, which schedule no further
-    /// lifecycle call, so this and ``diagnosticMessage`` are what a host shows
-    /// after a restart, when no live chain outcome exists any more. Branch on
-    /// this; never on the message text.
+    /// What kind of chain answer this bundle's delegation last drew, when the
+    /// sidecar recorded one. This and ``diagnosticMessage`` are what a host
+    /// shows after a restart, when no live chain outcome exists any more.
+    /// Branch on this; never on the message text.
+    ///
+    /// Always recorded on a ``terminal`` row, which schedules no further
+    /// lifecycle call. Also recorded for a bundle whose combined
+    /// delegate-and-cast batch the chain keeps refusing — that bundle is
+    /// retired to a state it can be cast from again, so it reads
+    /// `terminal == false` while carrying the chain's own words — and it may
+    /// be recorded while a submission the lifecycle still manages recovers
+    /// from an ambiguous dispatch. So read the diagnostic from whichever rows
+    /// carry one rather than from the terminal ones alone.
     public let diagnosticKind: VotingChainDiagnosticKind?
     /// Bounded, redacted text for display only. Present whenever the sidecar
     /// recorded a diagnostic, even one whose kind this SDK does not know.
@@ -319,9 +329,15 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     /// ``needsBundleSetup`` — so it stays true across a bundle setup that
     /// happens while proposals are still open. To decide whether a round
     /// needs its *first* setup, read `needsBundleSetup ||
-    /// delegationStatuses.isEmpty`, or simply call the idempotent
-    /// ``VotingRoundSession/setupBundles()`` regardless: existing bundle rows
-    /// are reused rather than rebuilt.
+    /// delegationStatuses.isEmpty`.
+    ///
+    /// ``VotingRoundSession/setupBundles()`` can be called on a round that
+    /// already has bundle rows, but it is a validation rather than a no-op: it
+    /// lays the round out again from the notes the account is eligible with
+    /// now, keeps the stored rows when that layout reproduces them exactly,
+    /// and refuses as ``VotingErrorKind/invalidInput`` when it does not. It
+    /// never rebuilds them, so it cannot repair a round whose eligible notes
+    /// have moved.
     public let needsDraftSetup: Bool
     /// True when the round holds a ballot choice but no bundle rows yet, so
     /// the bundle plan must be persisted before any vote work is planned.

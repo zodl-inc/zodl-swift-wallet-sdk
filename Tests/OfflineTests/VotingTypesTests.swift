@@ -131,9 +131,9 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertNil(report.chainOutcomes.first?.outcome.diagnosticMessage)
     }
 
-    /// A `persistedChainTerminal` quiescence means nothing was dispatched in
-    /// this run, so there is no live `chainOutcome` — the persisted plan is
-    /// the only place the reason survives.
+    /// A `persistedChainTerminal` quiescence reports durable chain state the
+    /// run could not advance, so there is no live `chainOutcome` for it — the
+    /// persisted plan is the only place the reason survives.
     func testARunReportThatQuiescedOnAPersistedTerminalStillCarriesTheReason() throws {
         let json = """
         {
@@ -1115,6 +1115,25 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(keyNull.phase, .confirmed)
         XCTAssertEqual(keyNull.txHash, "ab")
         XCTAssertFalse(keyNull.terminal)
+    }
+
+    /// A bundle whose combined delegate-and-cast batch the chain keeps
+    /// refusing is retired to a state it can be cast from again, so it reads
+    /// `terminal == false` while still carrying the chain's own words. A host
+    /// that showed only terminal rows would have nothing for it — and nothing
+    /// to name in `retryBlockedCombinedCast(roundId:bundleIndex:)` either.
+    func testABlockedBundleCarriesItsDiagnosticWithoutBeingTerminal() throws {
+        let json = """
+        {"bundle_index": 2, "phase": "signed", "tx_hash": null, "terminal": false,
+         "submission_diagnostic": {"kind": "chain_rejected", "message": "the chain refused the batch"}}
+        """
+
+        let status = try decode(VotingDelegationStatus.self, from: json)
+
+        XCTAssertFalse(status.terminal)
+        XCTAssertEqual(status.bundleIndex, 2)
+        XCTAssertEqual(status.diagnosticKind, .chainRejected)
+        XCTAssertEqual(status.diagnosticMessage, "the chain refused the batch")
     }
 
     /// `kind` is optional on the persisted diagnostic for the same reason it

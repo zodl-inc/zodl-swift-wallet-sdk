@@ -260,6 +260,12 @@ guard !plan.hasLegacyInFlightSubmission else {
     return
 }
 
+// `needsDraftSetup` says the voter still has proposals to answer, not that the
+// bundles are missing — `needsBundleSetup` says that — so this lays a round out
+// on its first pass and, on a later one, hands `setupBundles()` a round that
+// already has rows. That is allowed but not free: the call lays the round out
+// again from the notes the account is eligible with now, and refuses as
+// `invalidInput` when that layout does not reproduce the stored rows exactly.
 if plan.needsDraftSetup || plan.needsBundleSetup {
     do {
         _ = try await session.setupBundles()
@@ -297,9 +303,11 @@ for bundleIndex in plan.delegationBundlesNeedingWork {
 // The ballot is answered once every rostered proposal has an intent and no
 // unrostered intents remain outstanding: `openProposals.isEmpty &&
 // unrosteredIntents.isEmpty`. Proceed to `run` on that — never on `allDecided`,
-// which only turns true after the votes those intents describe are confirmed
-// on chain, and confirming them is what `run` itself does. Waiting for
-// `allDecided` here waits on something this call cannot produce yet.
+// which is a completion flag: it turns true once every rostered proposal is
+// either skipped or has its chosen vote confirmed on every bundle. A ballot of
+// nothing but skips satisfies it at once, while a ballot carrying a single
+// fresh choice waits for a confirmation that `run` itself is what produces. So
+// a host gating on it here stalls exactly the rounds that have voting to do.
 guard plan.openProposals.isEmpty && plan.unrosteredIntents.isEmpty else {
     askVoter(plan.openProposals, plan.unrosteredIntents)    // keep collecting, then call setBallotIntents again
     return
@@ -381,12 +389,26 @@ case .chainTerminal, .chainRecoveryStalled:
     // see the note on `retryBlockedCombinedCast(roundId:bundleIndex:)` below.
     show(report.quiescence.chainOutcome?.diagnosticMessage)
 case .persistedChainTerminal:
-    // Nothing was dispatched in this run, so there is no live `chainOutcome`.
-    // What ended the bundle earlier is on the persisted plan, and it survives
-    // a restart.
-    for status in report.plan?.delegationStatuses ?? [] where status.terminal {
-        show(kind: status.diagnosticKind, message: status.diagnosticMessage)
+    // Durable chain state this run could not advance. The reason is on the
+    // persisted plan and survives a restart, which is where to read it: a live
+    // `chainOutcome` exists only for a submission the run itself observed.
+    // A row with a diagnostic and `terminal == false` is a bundle whose
+    // combined cast the chain keeps refusing; its `bundleIndex` is the one to
+    // name in `retryBlockedCombinedCast(roundId:bundleIndex:)` below, and this
+    // loop is where a host learns it. A `terminal` row needs manual handling
+    // instead: no further delegation step is ever planned for it.
+    for status in report.plan?.delegationStatuses ?? [] where status.diagnosticMessage != nil {
+        show(
+            bundle: status.bundleIndex,
+            terminal: status.terminal,
+            kind: status.diagnosticKind,
+            message: status.diagnosticMessage
+        )
     }
+    // A vote submission that ended the same way quiesces here too, and leaves
+    // no diagnostic on any delegation status. The plan carries no per-vote
+    // status at all, so for that case `report.plan?.blockingRecovery` is the
+    // whole of what a host has once the run that observed it is over.
 case .failures:
     // `report.failures` carries each `VotingRoundStepFailureRecord`; `skippedBundles`
     // is the authoritative list of what a failure isolated.
