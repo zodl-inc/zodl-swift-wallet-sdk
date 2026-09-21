@@ -690,14 +690,17 @@ impl VotingSession {
     /// handed back by the host: what a stored signature is later verified
     /// against is then the wallet's own, whatever the device returned.
     ///
-    /// A signature that does not sign the bundle's own request under that
-    /// bundle's randomized key refuses the whole call, and nothing of the
-    /// batch is stored — not even the entries that did verify. That is the
-    /// only moment it can be refused: what the store keeps for a bundle is the
-    /// first signature it is given, it compares only the signing context
-    /// afterwards, and it offers no way to clear one bundle. Scanning the
-    /// right response afterwards stores it; scanning a response that already
-    /// verified again reports it as already present.
+    /// A response no signature can be lifted from, and a signature that does
+    /// not sign the bundle's own request under that bundle's randomized key,
+    /// each refuse the whole call, and nothing of the batch is stored — not
+    /// even the entries that did verify. Both name their bundle on the error
+    /// envelope, because a host collected one response per bundle and needs to
+    /// know which to ask for again. That is the only moment either can be
+    /// refused: what the store keeps for a bundle is the first signature it is
+    /// given, it compares only the signing context afterwards, and it offers
+    /// no way to clear one bundle. Scanning the right response afterwards
+    /// stores it; scanning a response that already verified again reports it
+    /// as already present.
     ///
     /// The write is one atomic idempotent batch: every named bundle is stored
     /// or none is, and a retry after a QR session that was interrupted halfway
@@ -715,11 +718,12 @@ impl VotingSession {
             .iter()
             .map(|entry| {
                 let request = self.pipeline.keystone_request(entry.bundle_index).ffi()?;
-                let sig = super::signer::keystone_signature(&request, &entry.signed_pczt).ffi()?;
+                let sig = super::signer::keystone_signature(&request, &entry.signed_pczt)
+                    .ffi_for_bundle(entry.bundle_index)?;
                 Ok((request, sig))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let inputs = verified_signature_inputs(prepared).ffi()?;
+        let inputs = verified_signature_inputs(prepared)?;
         let stored = self
             .database
             .store_keystone_signatures_batch(&self.round_id, &inputs)
@@ -1187,10 +1191,13 @@ fn require_distinct_bundles(bundle_indices: &[u32]) -> anyhow::Result<()> {
 /// signature it never sees if the refusal happens on this side of the call.
 fn verified_signature_inputs(
     prepared: Vec<(KeystoneSigningRequest, [u8; 64])>,
-) -> Result<Vec<KeystoneSignatureInput>, VotingError> {
+) -> anyhow::Result<Vec<KeystoneSignatureInput>> {
     prepared
         .into_iter()
-        .map(|(request, sig)| super::signer::verified_signature_input(&request, sig))
+        .map(|(request, sig)| {
+            super::signer::verified_signature_input(&request, sig)
+                .ffi_for_bundle(request.bundle_index)
+        })
         .collect()
 }
 
@@ -1262,6 +1269,13 @@ mod tests {
             .as_str()
             .expect("kind is a string")
             .to_string()
+    }
+
+    /// The bundle a voting failure names on its envelope, if any.
+    fn error_bundle_index(err: &anyhow::Error) -> Option<u32> {
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("typed JSON error");
+        view.bundle_index
     }
 
     #[test]
@@ -1955,6 +1969,10 @@ mod tests {
     /// first refusal and no inputs at all, so `store_keystone_signatures_batch`
     /// is never reached and the bundle that did verify stays unsigned and
     /// rescannable.
+    ///
+    /// The refusal names its bundle on the envelope as well as in its text,
+    /// which is what lets a host ask for that one QR again instead of the
+    /// whole set.
     #[test]
     fn a_batch_with_one_signature_that_does_not_verify_yields_no_inputs_at_all() {
         let (good_request, good_sig) = keystone_request_signed([0x11u8; 32]);
@@ -1965,15 +1983,21 @@ mod tests {
         verified_signature_inputs(vec![(good_request.clone(), good_sig)])
             .expect("a batch whose every signature verifies converts");
 
+        // A signature input carries the signature, the sighash and the
+        // randomized key, so the failure says how many converted and no more.
         let err = match verified_signature_inputs(vec![
             (good_request, good_sig),
             (wrong_request, someone_elses_sig),
         ]) {
-            Ok(inputs) => panic!("one unusable signature must refuse the batch: {inputs:?}"),
+            Ok(inputs) => panic!(
+                "one unusable signature must refuse the batch, not convert {}",
+                inputs.len()
+            ),
             Err(err) => err,
         };
 
-        assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
+        assert_eq!(error_kind(&err), "invalid_input");
+        assert_eq!(error_bundle_index(&err), Some(1));
         assert!(err.to_string().contains("bundle 1"), "unexpected: {err}");
     }
 

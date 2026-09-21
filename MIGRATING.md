@@ -330,15 +330,24 @@ session reports `alreadyPresent` instead of failing. It refuses an empty batch a
 index as `VotingErrorKind.invalidInput`: a set that covers nothing, or that shows a bundle twice, is
 not the set of QRs that covers a round.
 
-Each response is checked against the request it answers before anything is stored. A response that
-does not carry a signature over its bundle's current signing request — the wrong bundle's QR, or one
-from before the round's bundles were rebuilt — is refused as `VotingErrorKind.invalidInput`, and
-nothing of the batch is stored, not even the entries that did verify. Scanning the right response
-for that bundle afterwards stores it, and a response that already verified is reported through
-`alreadyPresent` rather than stored again. Let the user rescan on that error rather than treating it
-as a round that has to be started over: the check exists because the sidecar keeps the first
-signature stored for a bundle and offers no way to replace it, so a wrong one that got in would
-strand that bundle for the whole round.
+Each response is read and then checked against the request it answers before anything is stored. A
+response this wallet cannot use is refused as `VotingErrorKind.invalidInput`, and nothing of the
+batch is stored, not even the entries that did verify. Two ways it can be unusable, one refusal for
+both: bytes that are not a signed PCZT carrying a spend-authorization signature, and a signature
+that does not sign that bundle's current signing request — the wrong bundle's QR, or one from
+before the round's bundles were rebuilt. `VotingError.bundleIndex` names the bundle whose response
+was refused, so the host can ask for that one QR again rather than the whole set; scanning the right
+response for it afterwards stores it, and a response that already verified is reported through
+`alreadyPresent` rather than stored again.
+
+When the round's bundles were rebuilt, fetch `keystoneSigningRequests(bundleIndices:)` again before
+asking the user to scan. A request is built from the bundle's stored PCZT, sighash and randomized
+key, so a response to the request that preceded the rebuild cannot verify however often it is
+rescanned.
+
+Let the user rescan on that error rather than treating it as a round that has to be started over:
+the check exists because the sidecar keeps the first signature stored for a bundle and offers no way
+to replace it, so a wrong one that got in would strand that bundle for the whole round.
 
 Keep one signer mode for a round: a round signed with stored Keystone signatures is not switched to
 the software signer on a later run, and the reverse.

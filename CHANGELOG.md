@@ -238,11 +238,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Keystone signing is `VotingRoundSession.keystoneSigningRequests(bundleIndices:)` and
     `storeKeystoneSignatures(_:)`, with `VotingRustBackend.keystoneSignatures(roundId:)` for what is
     stored. Signatures are stored one batch at a time, idempotently; there is no single-signature
-    store or clear. Each response is checked against the request it answers first: one that does not
-    carry a signature over its bundle's current signing request throws
-    `VotingErrorKind.invalidInput` and stores nothing of the batch, so a host offers a rescan of that
-    bundle rather than restarting the round. That check is why there is nothing to undo — the first
-    signature stored for a bundle is the one it keeps.
+    store or clear. Each response is read and then checked against the request it answers first: one
+    that is not a signed PCZT carrying a spend-authorization signature, and one whose signature does
+    not sign its bundle's current signing request, both throw `VotingErrorKind.invalidInput` and
+    store nothing of the batch. `VotingError.bundleIndex` names the bundle whose response was
+    refused, so a host offers a rescan of that bundle rather than restarting the round; a response
+    from before the round's bundles were rebuilt needs a fresh
+    `keystoneSigningRequests(bundleIndices:)` first, because a request is built from the bundle's
+    stored PCZT, sighash and randomized key. Those checks are why there is nothing to undo — the
+    first signature stored for a bundle is the one it keeps.
   - Reading what a round owes is `VotingRoundSession.plan()` or
     `VotingRustBackend.roundPlan(roundId:proposalIds:)`, both answering `VotingRoundPlan`, plus
     `listRounds()` and `pendingShareRounds()`. A plan is made against the proposal roster the host

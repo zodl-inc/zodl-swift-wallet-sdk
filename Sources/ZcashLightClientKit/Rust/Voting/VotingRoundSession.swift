@@ -338,13 +338,24 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// Lift the signatures off the PCZTs a Keystone device returned, check each
     /// one against the request it answers, and store them for this round.
     ///
-    /// A response that does not sign its bundle's current signing request — the
-    /// wrong bundle's QR, or a stale one from a round whose bundles were rebuilt
-    /// — is refused as ``VotingErrorKind/invalidInput``, and nothing of the
-    /// batch is stored, not even the entries that did verify. Scanning the right
-    /// response for that bundle afterwards stores it. This is the only moment
-    /// the refusal can happen: the sidecar keeps the first signature stored for
-    /// a bundle, so a wrong one that got in could not be replaced.
+    /// A response this wallet cannot use is refused as
+    /// ``VotingErrorKind/invalidInput``, and nothing of the batch is stored,
+    /// not even the entries that did verify. Two ways it can be unusable, one
+    /// refusal for both: bytes that are not a signed PCZT carrying a
+    /// spend-authorization signature, and a signature that does not sign that
+    /// bundle's current signing request — the wrong bundle's QR, or a stale one
+    /// from a round whose bundles were rebuilt. ``VotingError/bundleIndex``
+    /// names the bundle whose response was refused, so the host can ask for
+    /// that one again; scanning the right response for it afterwards stores it.
+    /// When the round's bundles were rebuilt, call
+    /// ``keystoneSigningRequests(bundleIndices:)`` again first: a request is
+    /// built from the bundle's stored PCZT, sighash and randomized key, so a
+    /// response to the request that preceded the rebuild cannot verify however
+    /// often it is rescanned.
+    ///
+    /// Storing is the only moment the refusal can happen: the sidecar keeps the
+    /// first signature stored for a bundle, so a wrong one that got in could not
+    /// be replaced.
     ///
     /// One atomic idempotent batch, so a retry after an interrupted QR session
     /// reports what was already there rather than failing on it: a response that

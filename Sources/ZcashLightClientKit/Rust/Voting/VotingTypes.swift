@@ -533,11 +533,14 @@ public enum VotingErrorKind: String, Equatable, Sendable, Decodable {
 
 /// A failure from the voting FFI, in the crate's own wire shape.
 ///
-/// The structured fields carry the payload of the kinds that have one:
-/// `bundleIndex` for the bundle-scoped kinds, `httpStatus` and `endpoint` for
-/// ``VotingErrorKind/pirUnavailable``. `retryable` says whether the same call
-/// can be repeated as it stands; it is the crate's answer, not an inference
-/// from `kind`.
+/// The structured fields carry the payload of the failures that have one:
+/// `bundleIndex` wherever the failure belongs to one bundle — the
+/// bundle-scoped kinds, and a refusal of one bundle's Keystone response —
+/// `httpStatus` and `endpoint` for ``VotingErrorKind/pirUnavailable``. Each is
+/// absent for a failure that does not carry it, so read it as extra context
+/// rather than as something a kind guarantees. `retryable` says whether the
+/// same call can be repeated as it stands; it is the crate's answer, not an
+/// inference from `kind`.
 public struct VotingError: Error, Equatable, Sendable, Decodable, LocalizedError {
     public let kind: VotingErrorKind
     public let retryable: Bool

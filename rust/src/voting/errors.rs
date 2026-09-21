@@ -3,7 +3,25 @@
 use zcash_voting::{VotingError, VotingErrorView};
 
 pub(super) fn voting_error(error: VotingError) -> anyhow::Error {
-    let view = VotingErrorView::from(&error);
+    envelope(VotingErrorView::from(&error), &error)
+}
+
+/// [`voting_error`], with the bundle the failure is about named on the
+/// envelope.
+///
+/// The crate fills `bundle_index` only for the kinds that carry one in their
+/// own payload, so a refusal the SDK raises about a single bundle of a batch
+/// would otherwise reach a host as text it has to read. A host that collected
+/// one signature per bundle needs the index to ask for that one again.
+pub(super) fn voting_error_for_bundle(error: VotingError, bundle_index: u32) -> anyhow::Error {
+    let mut view = VotingErrorView::from(&error);
+    view.bundle_index = Some(bundle_index);
+    envelope(view, &error)
+}
+
+/// The view as JSON, falling back to the error's own text if it will not
+/// serialize: a host is better served by an untyped message than by nothing.
+fn envelope(view: VotingErrorView, error: &VotingError) -> anyhow::Error {
     match serde_json::to_string(&view) {
         Ok(json) => anyhow::anyhow!(json),
         Err(_) => anyhow::anyhow!(error.to_string()),
@@ -40,11 +58,17 @@ pub(super) fn envelope_or_invalid_input(error: anyhow::Error) -> anyhow::Error {
 
 pub(super) trait VotingResultExt<T> {
     fn ffi(self) -> anyhow::Result<T>;
+    /// [`VotingResultExt::ffi`], naming `bundle_index` on the envelope.
+    fn ffi_for_bundle(self, bundle_index: u32) -> anyhow::Result<T>;
 }
 
 impl<T> VotingResultExt<T> for Result<T, VotingError> {
     fn ffi(self) -> anyhow::Result<T> {
         self.map_err(voting_error)
+    }
+
+    fn ffi_for_bundle(self, bundle_index: u32) -> anyhow::Result<T> {
+        self.map_err(|error| voting_error_for_bundle(error, bundle_index))
     }
 }
 
@@ -91,6 +115,23 @@ mod tests {
         }));
         let view: VotingErrorView = serde_json::from_str(&already.to_string()).expect("json");
         assert_eq!(view.message, "Invalid input: network id 0 is Testnet");
+    }
+
+    /// A refusal about one response of a batch reaches a host as a typed
+    /// error that names the bundle, so it can ask for that signature again
+    /// without reading the message.
+    #[test]
+    fn an_envelope_can_name_the_bundle_a_refusal_is_about() {
+        let error = voting_error_for_bundle(
+            VotingError::InvalidInput {
+                message: "unusable response".into(),
+            },
+            7,
+        );
+
+        let view: VotingErrorView = serde_json::from_str(&error.to_string()).expect("json");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
+        assert_eq!(view.bundle_index, Some(7));
     }
 
     #[test]

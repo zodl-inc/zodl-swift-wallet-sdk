@@ -167,16 +167,29 @@ pub(super) fn sign_delegation_request(
 }
 
 /// Lifts the SpendAuth signature a Keystone device produced out of the PCZT it
-/// signed, at the action index the request named.
+/// signed: the action the request named, or, failing that, whichever action of
+/// the governance PCZT's single signable one carries a signature.
 ///
 /// The signature bytes are the only thing taken from the device's PCZT.
 /// Whether they are the signature this wallet asked for is
 /// [`verified_signature_input`]'s question, not this one's.
+///
+/// Every way the lift can fail — bytes that are not a PCZT, a PCZT the wallet
+/// cannot read a governance action out of, a readable one carrying no
+/// signature at all — is a fault of the response the host handed over, so all
+/// of them are the same refusal a host is told to expect and can act on by
+/// scanning that bundle's QR again. The response's own bytes stay out of the
+/// message.
 pub(super) fn keystone_signature(
     request: &KeystoneSigningRequest,
     signed_pczt: &[u8],
 ) -> Result<[u8; 64], VotingError> {
-    spend_auth_signature(signed_pczt, request.action_index as usize)
+    spend_auth_signature(signed_pczt, request.action_index as usize).map_err(|_| {
+        invalid_input(format!(
+            "the response for bundle {} is not a signed PCZT this wallet can read a delegation signature out of",
+            request.bundle_index
+        ))
+    })
 }
 
 /// Pairs a signature with the request it was asked for, after checking that it
@@ -469,6 +482,52 @@ mod tests {
         let err = keystone_signature(&request, b"not a pczt").unwrap_err();
 
         assert!(err.to_string().contains("PCZT"), "unexpected error: {err}");
+    }
+
+    /// A PCZT a device could have produced and this wallet can read, holding
+    /// no shielded action and so no spend-authorization signature to lift.
+    fn pczt_carrying_no_signature() -> Vec<u8> {
+        pczt::roles::creator::Creator::new(
+            u32::from(zcash_protocol::consensus::BranchId::Nu6_3),
+            0,
+            1,
+            None,
+            None,
+        )
+        .expect("a v6 PCZT for the branch voting builds on")
+        .build()
+        .expect("an empty PCZT needs no anchor")
+        .serialize()
+        .expect("an empty PCZT encodes")
+    }
+
+    /// Both ways a response can fail to yield a signature are the device's
+    /// answer being unusable, not the wallet asking for the wrong thing, so
+    /// both are the typed refusal every document promises for a response that
+    /// cannot be used — and both name the bundle whose QR to scan again.
+    #[test]
+    fn a_response_no_signature_can_be_lifted_from_is_refused_as_invalid_input() {
+        let mut request = synthetic_keystone_request();
+        request.bundle_index = 4;
+
+        for response in [b"not a pczt".to_vec(), pczt_carrying_no_signature()] {
+            let err = match keystone_signature(&request, &response) {
+                Ok(sig) => panic!(
+                    "a response carrying no signature must not yield {} bytes",
+                    sig.len()
+                ),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
+            let message = err.to_string();
+            assert!(message.contains("bundle 4"), "unexpected: {message}");
+            assert!(message.contains("PCZT"), "unexpected: {message}");
+            assert!(
+                !message.contains(&hex::encode(&response)),
+                "a refusal must not carry the response's bytes: {message}"
+            );
+        }
     }
 
     fn assert_refused(request: &KeystoneSigningRequest, sig: [u8; 64]) -> VotingError {
