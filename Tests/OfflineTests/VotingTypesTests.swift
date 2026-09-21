@@ -131,6 +131,70 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertNil(report.chainOutcomes.first?.outcome.diagnosticMessage)
     }
 
+    /// A `persistedChainTerminal` quiescence means nothing was dispatched in
+    /// this run, so there is no live `chainOutcome` — the persisted plan is
+    /// the only place the reason survives.
+    func testARunReportThatQuiescedOnAPersistedTerminalStillCarriesTheReason() throws {
+        let json = """
+        {
+          "quiescence": {
+            "kind": "persisted_chain_terminal",
+            "open_proposals": [],
+            "unrostered_intents": [],
+            "bundles": [],
+            "shares": [],
+            "step": null,
+            "chain_outcome": null,
+            "remaining": []
+          },
+          "plan": {
+            "round_id": "round-1",
+            "pending_recovery": false,
+            "blocking_recovery": true,
+            "blocking_share_work": false,
+            "has_unconfirmed_shares": false,
+            "hotkey_bound": true,
+            "completed_for_display": false,
+            "needs_draft_setup": false,
+            "needs_bundle_setup": false,
+            "needs_delegation_signing": false,
+            "has_in_flight_delegation": false,
+            "needs_vote_polling": false,
+            "has_remaining_vote_or_share_work": false,
+            "has_recoverable_vote_or_share_work": false,
+            "primary_action": "idle",
+            "delegation_statuses": [
+              {
+                "bundle_index": 0,
+                "phase": "submission_rejected",
+                "tx_hash": null,
+                "submission_diagnostic": {"kind": "nullifier_already_spent", "message": "nullifier already spent"},
+                "terminal": true
+              }
+            ],
+            "open_proposals": [],
+            "immediate_share_confirmed": false,
+            "all_decided": true
+          },
+          "tally": {"completed_proposals": 1, "total_proposals": 1, "remaining_obligations": 0},
+          "failures": [],
+          "skipped_bundles": [],
+          "chain_outcomes": [],
+          "share_deliveries": [],
+          "delegations": []
+        }
+        """
+
+        let report = try decode(VotingRoundRunReport.self, from: json)
+
+        XCTAssertEqual(report.quiescence.kind, .persistedChainTerminal)
+        XCTAssertNil(report.quiescence.chainOutcome)
+        XCTAssertTrue(report.chainOutcomes.isEmpty)
+        XCTAssertEqual(report.plan?.delegationStatuses.first?.terminal, true)
+        XCTAssertEqual(report.plan?.delegationStatuses.first?.diagnosticKind, .nullifierAlreadySpent)
+        XCTAssertEqual(report.plan?.delegationStatuses.first?.diagnosticMessage, "nullifier already spent")
+    }
+
     // MARK: - Durable evidence in reports and progress
 
     func testDecodesRunReportShareDeliveriesAndDelegations() throws {
@@ -290,6 +354,49 @@ final class VotingTypesTests: XCTestCase {
 
         XCTAssertEqual(plan.primaryAction, .unknown)
         XCTAssertEqual(plan.delegationStatuses.last?.phase, .unknown)
+    }
+
+    /// A persisted diagnostic kind this SDK does not recognize collapses to
+    /// `.unknown`, the same tolerance every other enum on this surface has —
+    /// and the round plan it is embedded in decodes rather than failing over
+    /// one unrecognized classification.
+    func testDelegationStatusDiagnosticWithAnUnknownKindKeepsTheMessage() throws {
+        let json = """
+        {
+          "round_id": "round-1",
+          "pending_recovery": false,
+          "blocking_recovery": false,
+          "blocking_share_work": false,
+          "has_unconfirmed_shares": false,
+          "hotkey_bound": true,
+          "completed_for_display": false,
+          "needs_draft_setup": false,
+          "needs_bundle_setup": false,
+          "needs_delegation_signing": false,
+          "has_in_flight_delegation": false,
+          "needs_vote_polling": false,
+          "has_remaining_vote_or_share_work": false,
+          "has_recoverable_vote_or_share_work": false,
+          "primary_action": "idle",
+          "delegation_statuses": [
+            {
+              "bundle_index": 0,
+              "phase": "submission_rejected",
+              "tx_hash": null,
+              "submission_diagnostic": {"kind": "some_future_kind", "message": "m"},
+              "terminal": true
+            }
+          ],
+          "open_proposals": [],
+          "immediate_share_confirmed": false,
+          "all_decided": true
+        }
+        """
+
+        let plan = try decode(VotingRoundPlan.self, from: json)
+
+        XCTAssertEqual(plan.delegationStatuses.first?.diagnosticKind, .unknown)
+        XCTAssertEqual(plan.delegationStatuses.first?.diagnosticMessage, "m")
     }
 
     // MARK: - Events
@@ -971,6 +1078,59 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(status.phase, .confirmed)
         XCTAssertEqual(status.txHash, "ab")
         XCTAssertFalse(status.terminal)
+    }
+
+    func testDelegationStatusDecodesAPersistedSubmissionDiagnostic() throws {
+        let json = """
+        {"bundle_index": 3, "phase": "confirmed", "tx_hash": "ab", "terminal": true,
+         "submission_diagnostic": {"kind": "nullifier_already_spent", "message": "nullifier already spent"}}
+        """
+
+        let status = try decode(VotingDelegationStatus.self, from: json)
+
+        XCTAssertEqual(status.diagnosticKind, .nullifierAlreadySpent)
+        XCTAssertEqual(status.diagnosticMessage, "nullifier already spent")
+    }
+
+    /// Absent the same way whether the key is missing entirely or present as
+    /// JSON `null` — the crate always emits the key, but an older payload or a
+    /// hand-built fixture may omit it, and both must decode identically.
+    func testDelegationStatusWithoutADiagnosticDecodesAsNil() throws {
+        let keyMissing = try decode(VotingDelegationStatus.self, from: """
+        {"bundle_index": 3, "phase": "confirmed", "tx_hash": "ab", "terminal": false}
+        """)
+        XCTAssertNil(keyMissing.diagnosticKind)
+        XCTAssertNil(keyMissing.diagnosticMessage)
+        XCTAssertEqual(keyMissing.bundleIndex, 3)
+        XCTAssertEqual(keyMissing.phase, .confirmed)
+        XCTAssertEqual(keyMissing.txHash, "ab")
+        XCTAssertFalse(keyMissing.terminal)
+
+        let keyNull = try decode(VotingDelegationStatus.self, from: """
+        {"bundle_index": 3, "phase": "confirmed", "tx_hash": "ab", "terminal": false, "submission_diagnostic": null}
+        """)
+        XCTAssertNil(keyNull.diagnosticKind)
+        XCTAssertNil(keyNull.diagnosticMessage)
+        XCTAssertEqual(keyNull.bundleIndex, 3)
+        XCTAssertEqual(keyNull.phase, .confirmed)
+        XCTAssertEqual(keyNull.txHash, "ab")
+        XCTAssertFalse(keyNull.terminal)
+    }
+
+    /// `kind` is optional on the persisted diagnostic for the same reason it
+    /// is on a live chain outcome: a diagnostic that carries only a message
+    /// still decodes, rather than losing the message over one absent
+    /// classification.
+    func testDelegationStatusDiagnosticWithoutAKindKeepsTheMessage() throws {
+        let json = """
+        {"bundle_index": 3, "phase": "confirmed", "tx_hash": "ab", "terminal": true,
+         "submission_diagnostic": {"message": "m"}}
+        """
+
+        let status = try decode(VotingDelegationStatus.self, from: json)
+
+        XCTAssertNil(status.diagnosticKind)
+        XCTAssertEqual(status.diagnosticMessage, "m")
     }
 
     func testDecodesRoundQuiescenceWithDefaultedListsAbsent() throws {

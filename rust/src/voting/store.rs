@@ -575,7 +575,12 @@ pub(super) fn keystone_signatures(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voting::test_support::{hex_round_id, open_memory_store, synthetic_round_params};
+    use crate::voting::route::SdkRoute;
+    use crate::voting::session::VotingSession;
+    use crate::voting::test_support::{
+        hex_round_id, open_memory_store, synthetic_binding, synthetic_round_params,
+        synthetic_session_inputs, temp_wallet_db_with_account,
+    };
     // The two crate enums the characterization assertions below name, aliased
     // because they read as the plan's own vocabulary at the assertion site.
     use zcash_voting::wire::{NextStepKind as Step, WorkflowPhaseView as Phase};
@@ -1554,5 +1559,83 @@ mod tests {
         .expect("open through the symlink");
 
         assert!(Arc::ptr_eq(&first.root, &second.root));
+    }
+
+    /// A rejected delegation is a real chain answer, not silence: the
+    /// persisted diagnostic that explains it must survive both
+    /// plan-returning entry points — the store's own `round_plan` and a
+    /// session's `plan()` — after a restart, when nothing about the
+    /// rejection is held in memory any more.
+    ///
+    /// The row is written the way `zcash_voting`'s own round-driver tests
+    /// write a persisted rejection: a raw SQL statement against
+    /// `chain_submissions`, through the same `VotingDb::conn()` accessor,
+    /// because nothing here drives a real chain submission — only the
+    /// durable row a rejection leaves behind matters to what is under test.
+    #[test]
+    fn a_terminal_delegation_keeps_its_persisted_diagnostic_in_the_plan() {
+        let store = open_memory_store(crate::NETWORK_ID_TESTNET, "w");
+        let (_dir, wallet_path, account_uuid) =
+            temp_wallet_db_with_account(crate::NETWORK_ID_TESTNET);
+        let round_id = hex_round_id(0x72);
+        let session = VotingSession::open(
+            &store,
+            synthetic_session_inputs(0x72, &wallet_path, &account_uuid),
+            synthetic_binding(1, None),
+            SdkRoute::direct(),
+            1,
+        )
+        .expect("open");
+
+        // `setup_bundles` persists the round row before note selection fails
+        // on the fixture's note-less wallet, the same sequence
+        // `plan_after_a_refused_bundle_setup_keeps_the_round_and_owes_a_draft`
+        // in `session.rs` relies on; everything below attaches to that row.
+        session.setup_bundles().unwrap_err();
+
+        {
+            let db = store.scoped().expect("scoped");
+            db.set_ballot_intent(&round_id, 1, zcash_voting::session::Decision::Choice(0), 3)
+                .expect("ballot intent");
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO bundles(round_id, wallet_id, bundle_index, note_positions_blob, \
+                 note_identity_hashes_blob, total_note_value, address_index) \
+                 VALUES (?1, 'w', 0, ?2, ?3, 12500000, 0)",
+                (&round_id, vec![0u8; 8], vec![0x81u8; 32]),
+            )
+            .expect("bundle row");
+            // The columns and values a real rejection writes, matching
+            // `zcash_voting`'s own `round_drive::tests::repoll` fixtures: a
+            // terminal `chain_submissions` row for this bundle's delegation,
+            // carrying the diagnostic a chain answer records.
+            conn.execute(
+                "INSERT INTO chain_submissions(identity_key, round_id, wallet_id, network, \
+                 bundle_index, kind, generation_digest, state, diagnostic_kind, diagnostic, \
+                 created_at, updated_at) \
+                 VALUES (?1, ?2, 'w', 'testnet', 0, 'delegation', ?3, 'rejected', \
+                 'nullifier_already_spent', 'nullifier already spent', 1, 1)",
+                (vec![0xAAu8; 32], &round_id, vec![0xBBu8; 32]),
+            )
+            .expect("chain submission row");
+        }
+
+        let plan = round_plan(&store, &round_id, &[1]).expect("plan");
+        assert!(plan.plan.delegation_statuses[0].terminal);
+        let diagnostic = plan.plan.delegation_statuses[0]
+            .submission_diagnostic
+            .as_ref()
+            .expect("plan diagnostic");
+        assert_eq!(diagnostic.kind, "nullifier_already_spent");
+        assert_eq!(diagnostic.message, "nullifier already spent");
+
+        let session_plan = session.plan().expect("session plan");
+        assert!(session_plan.plan.delegation_statuses[0].terminal);
+        let session_diagnostic = session_plan.plan.delegation_statuses[0]
+            .submission_diagnostic
+            .as_ref()
+            .expect("session diagnostic");
+        assert_eq!(session_diagnostic.kind, "nullifier_already_spent");
+        assert_eq!(session_diagnostic.message, "nullifier already spent");
     }
 }

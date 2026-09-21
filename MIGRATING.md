@@ -344,11 +344,18 @@ case .backgroundShareWorkOnly:
     // Helper shares are delivered but unconfirmed. Nothing blocks the voter;
     // schedule `trackShares` (below) rather than running again.
     scheduleShareTracking(report.quiescence.shares)
-case .chainTerminal, .persistedChainTerminal, .chainRecoveryStalled:
+case .chainTerminal, .chainRecoveryStalled:
     // `step` and `chainOutcome` name what ended; `chainOutcome.diagnosticMessage`
     // is the redacted text to show. Running again does not move it by itself —
     // see the note on `retryBlockedCombinedCast(roundId:bundleIndex:)` below.
     show(report.quiescence.chainOutcome?.diagnosticMessage)
+case .persistedChainTerminal:
+    // Nothing was dispatched in this run, so there is no live `chainOutcome`.
+    // What ended the bundle earlier is on the persisted plan, and it survives
+    // a restart.
+    for status in report.plan?.delegationStatuses ?? [] where status.terminal {
+        show(kind: status.diagnosticKind, message: status.diagnosticMessage)
+    }
 case .failures:
     // `report.failures` carries each `VotingRoundStepFailureRecord`; `skippedBundles`
     // is the authoritative list of what a failure isolated.

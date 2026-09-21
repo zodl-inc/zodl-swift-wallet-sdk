@@ -139,8 +139,9 @@ public enum VotingChainOutcomeKind: String, Equatable, Sendable, Decodable {
 /// Category of a chain submission diagnostic.
 ///
 /// A host branches on this kind; `VotingChainSubmissionOutcome.diagnosticMessage`
-/// is bounded, redacted text meant for display only and must never be parsed
-/// or pattern-matched to decide what happened.
+/// and `VotingDelegationStatus.diagnosticMessage` are bounded, redacted text
+/// meant for display only and must never be parsed or pattern-matched to
+/// decide what happened.
 public enum VotingChainDiagnosticKind: String, Equatable, Sendable, Decodable {
     case ambiguousDispatch = "ambiguous_dispatch"
     case ambiguousAttemptsExhausted = "ambiguous_attempts_exhausted"
@@ -258,12 +259,29 @@ public struct VotingDelegationStatus: Equatable, Sendable, Decodable {
     /// usable transaction hash reports the same phase as a healthy submission,
     /// and retrying it would resubmit.
     public let terminal: Bool
+    /// What kind of chain answer ended this delegation, when the sidecar
+    /// recorded one. Present on terminal rows, which schedule no further
+    /// lifecycle call, so this and ``diagnosticMessage`` are what a host shows
+    /// after a restart, when no live chain outcome exists any more. Branch on
+    /// this; never on the message text.
+    public let diagnosticKind: VotingChainDiagnosticKind?
+    /// Bounded, redacted text for display only. Present whenever the sidecar
+    /// recorded a diagnostic, even one whose kind this SDK does not know.
+    public let diagnosticMessage: String?
 
     private enum CodingKeys: String, CodingKey {
         case bundleIndex = "bundle_index"
         case phase
         case txHash = "tx_hash"
         case terminal
+        case submissionDiagnostic = "submission_diagnostic"
+    }
+
+    /// `kind` is optional for the same reason it is on a live chain outcome:
+    /// requiring it would fail the whole plan over one absent classification.
+    private struct SubmissionDiagnostic: Decodable {
+        let kind: VotingChainDiagnosticKind?
+        let message: String
     }
 
     // `terminal` is `#[serde(default)]` upstream: a payload that predates the
@@ -274,6 +292,9 @@ public struct VotingDelegationStatus: Equatable, Sendable, Decodable {
         phase = try container.decode(VotingWorkflowPhase.self, forKey: .phase)
         txHash = try container.decodeIfPresent(String.self, forKey: .txHash)
         terminal = try container.decodeIfPresent(Bool.self, forKey: .terminal) ?? false
+        let diagnostic = try container.decodeIfPresent(SubmissionDiagnostic.self, forKey: .submissionDiagnostic)
+        diagnosticKind = diagnostic?.kind
+        diagnosticMessage = diagnostic?.message
     }
 }
 

@@ -101,6 +101,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent when a payload omits it, so a report an older core produced still decodes — including a
   diagnostic that carries a message without a classification, which reads as a `nil`
   `diagnosticKind` beside an intact `diagnosticMessage` rather than failing the whole outcome.
+  `VotingDelegationStatus` carries the same `diagnosticKind: VotingChainDiagnosticKind?` and
+  `diagnosticMessage: String?` for the diagnostic a sidecar persisted, present on a terminal row so
+  a host can show why a delegation ended even after a restart, when no live chain outcome exists any
+  more.
 - `VotingRoundPlan.hasLegacyInFlightSubmission` reports a round holding a delegation or a vote this
   wallet built that an older SDK dispatched and never saw confirmed. Upgrading keeps every row of
   the voting database, but the chain lifecycle this SDK drives owns only the submissions it reserved
