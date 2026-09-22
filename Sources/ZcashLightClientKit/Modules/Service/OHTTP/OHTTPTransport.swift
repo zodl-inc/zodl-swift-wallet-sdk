@@ -61,7 +61,7 @@ actor OHTTPTransport {
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
         httpSender: @escaping HTTPSender = { request in
-            let (data, response) = try await Self.session.data(for: request)
+            let (data, response) = try await OHTTPTransport.session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw OHTTPError.transportError("Invalid response type")
             }
