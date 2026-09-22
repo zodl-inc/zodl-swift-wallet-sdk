@@ -13,6 +13,26 @@ actor OHTTPTransport {
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
     typealias HTTPSender = (URLRequest) async throws -> (Data, HTTPURLResponse)
 
+    /// Dedicated session for the OHTTP hops. Ephemeral + no cookies + no cache so that nothing a relay
+    /// or gateway returns (e.g. Set-Cookie) can be stored and replayed, which would link a wallet's
+    /// requests across IPs / Tor circuits. Scoped to this transport; the app's URLSession.shared is untouched.
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpCookieAcceptPolicy = .never
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieStorage = nil
+        cfg.urlCache = nil
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.httpAdditionalHeaders = nil
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
+    /// Test-only accessor for the session configuration.
+    internal static var sessionConfigurationForTesting: URLSessionConfiguration {
+        session.configuration
+    }
+
     private let relayURL: String
     private let keyConfigURL: String
     private let connectTimeoutMS: Int
@@ -41,7 +61,7 @@ actor OHTTPTransport {
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
         httpSender: @escaping HTTPSender = { request in
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await Self.session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw OHTTPError.transportError("Invalid response type")
             }

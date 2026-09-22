@@ -662,4 +662,17 @@ final class OHTTPTests: XCTestCase {
         // The transport should be created successfully with default httpSender
         XCTAssertNotNil(transport, "Transport should initialize with default httpSender")
     }
+
+    func testSessionConfigurationIsEphemeralWithNoCookiesOrCache() {
+        // Verify the dedicated OHTTP session has ephemeral configuration with cookies and caching disabled.
+        // This prevents a relay or gateway from storing Set-Cookie headers or cached responses that would
+        // link a wallet's requests across IPs or Tor circuits.
+        let config = OHTTPTransport.sessionConfigurationForTesting
+
+        XCTAssertEqual(config.httpCookieAcceptPolicy, .never, "Cookie accept policy should be .never")
+        XCTAssertFalse(config.httpShouldSetCookies, "httpShouldSetCookies should be false")
+        XCTAssertNil(config.httpCookieStorage, "httpCookieStorage should be nil")
+        XCTAssertNil(config.urlCache, "urlCache should be nil")
+        XCTAssertEqual(config.requestCachePolicy, .reloadIgnoringLocalAndRemoteCacheData, "Cache policy should ignore all caching")
+    }
 }
