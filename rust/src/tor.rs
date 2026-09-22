@@ -91,7 +91,7 @@ impl TorRuntime {
         let tor_dir = self.tor_dir.clone();
         let conn = self
             .runtime
-            .block_on(async { TorConn::bootstrap(&tor_dir, true).await })
+            .block_on(async { TorConn::bootstrap(&tor_dir, true, None).await })
             .map_err(|e| anyhow!("OHTTP-over-Tor bootstrap: {e}"))?;
         *slot = Some(conn.clone());
         Ok(conn)
