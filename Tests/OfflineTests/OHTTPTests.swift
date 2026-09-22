@@ -715,50 +715,69 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(capturedNewRequest, "Delegate should refuse redirects by returning nil")
     }
 
-    func testNonHTTPSRelayURLFails() {
-        // Verify that a non-https relay URL is rejected at init time.
+    func testNonHTTPSRelayURLFails() async throws {
+        // Verify that a non-https relay URL throws at request time (not init).
         let validKeyConfig = makeValidKeyConfig()
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (validKeyConfig, response)
         }
 
-        // https:// relay should succeed
+        // Init succeeds with http:// relay (validation is lazy)
         let transport = OHTTPTransport(
-            relayURL: "https://operator-relay.example.invalid/relay",
+            relayURL: "http://operator-relay.example.invalid/relay",
             keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
             httpSender: mockSender
         )
-        XCTAssertNotNil(transport, "https relay URL should succeed")
 
-        // Document that http:// would fail at init:
-        // let badTransport = OHTTPTransport(
-        //     relayURL: "http://operator-relay.example.invalid/relay",  // Would trigger fatalError
-        //     keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
-        //     httpSender: mockSender
-        // )
+        // First call (roundTrip → relay POST) throws with https requirement
+        do {
+            _ = try await transport.roundTrip(
+                request: BinaryHTTP.Request(
+                    method: "GET",
+                    scheme: "https",
+                    authority: "example.zodl.com",
+                    path: "/test",
+                    headers: [],
+                    body: Data()
+                ),
+                timeoutMS: 5000
+            )
+            XCTFail("Should have thrown for http relay URL")
+        } catch let error as OHTTPError {
+            if case .transportError(let message) = error {
+                XCTAssertTrue(message.contains("must use https"), "Error should mention https requirement")
+            } else {
+                XCTFail("Wrong error type")
+            }
+        }
     }
 
-    func testNonHTTPSKeyConfigURLFails() {
-        // Verify that a non-https key-config URL is rejected at init time.
+    func testNonHTTPSKeyConfigURLFails() async throws {
+        // Verify that a non-https key-config URL throws at request time (not init).
         let validKeyConfig = makeValidKeyConfig()
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (validKeyConfig, response)
         }
 
+        // Init succeeds with http:// key-config (validation is lazy)
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "http://gateway.zodl.com/ohttp-configs",
             httpSender: mockSender
         )
-        XCTAssertNotNil(transport, "https key-config URL should succeed")
 
-        // Document that http:// would fail at init:
-        // let badTransport = OHTTPTransport(
-        //     relayURL: "https://operator-relay.example.invalid/relay",
-        //     keyConfigURL: "http://gateway.zodl.com/ohttp-configs",  // Would trigger fatalError
-        //     httpSender: mockSender
-        // )
+        // First call (keyConfig → GET) throws with https requirement
+        do {
+            _ = try await transport.keyConfig()
+            XCTFail("Should have thrown for http key-config URL")
+        } catch let error as OHTTPError {
+            if case .transportError(let message) = error {
+                XCTAssertTrue(message.contains("must use https"), "Error should mention https requirement")
+            } else {
+                XCTFail("Wrong error type")
+            }
+        }
     }
 }

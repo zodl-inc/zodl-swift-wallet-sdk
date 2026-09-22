@@ -87,14 +87,7 @@ actor OHTTPTransport {
             return (data, httpResponse)
         }
     ) {
-        // Enforce https for relay and key-config URLs to prevent downgrade attacks
-        guard relayURL.lowercased().hasPrefix("https://") else {
-            fatalError("OHTTP relay URL must use https: \(relayURL)")
-        }
-        guard keyConfigURL.lowercased().hasPrefix("https://") else {
-            fatalError("OHTTP key-config URL must use https: \(keyConfigURL)")
-        }
-
+        // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
         self.relayURL = relayURL
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
@@ -180,6 +173,11 @@ actor OHTTPTransport {
     // MARK: - HTTP
 
     private func httpGet(url: String, timeoutMS: Int) async throws -> Data {
+        // Validate https at request time to prevent downgrade attacks without crashing the app
+        guard url.lowercased().hasPrefix("https://") else {
+            throw OHTTPError.transportError("OHTTP endpoints must use https: \(url)")
+        }
+
         guard let urlObj = URL(string: url) else {
             throw OHTTPError.transportError("Invalid URL: \(url)")
         }
@@ -198,6 +196,11 @@ actor OHTTPTransport {
     }
 
     private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> Data {
+        // Validate https at request time to prevent downgrade attacks without crashing the app
+        guard url.lowercased().hasPrefix("https://") else {
+            throw OHTTPError.transportError("OHTTP endpoints must use https: \(url)")
+        }
+
         guard let urlObj = URL(string: url) else {
             throw OHTTPError.transportError("Invalid URL: \(url)")
         }
