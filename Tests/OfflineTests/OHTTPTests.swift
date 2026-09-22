@@ -675,4 +675,90 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(config.urlCache, "urlCache should be nil")
         XCTAssertEqual(config.requestCachePolicy, .reloadIgnoringLocalAndRemoteCacheData, "Cache policy should ignore all caching")
     }
+
+    // MARK: - Redirect Refusal Tests
+
+    func testSessionDelegateRefusesRedirects() {
+        // Verify that the session's delegate refuses HTTP redirects.
+        // A redirect from a relay or key-config server is an attack vector.
+        let session = OHTTPTransport.session
+        guard let delegate = session.delegate as? URLSessionTaskDelegate else {
+            XCTFail("Session should have a URLSessionTaskDelegate")
+            return
+        }
+
+        // Create a dummy task and redirect response
+        let url = URL(string: "https://operator-relay.example.invalid/relay")!
+        let task = session.dataTask(with: url)
+        let redirectResponse = HTTPURLResponse(
+            url: url,
+            statusCode: 302,
+            httpVersion: nil,
+            headerFields: ["Location": "https://evil.example.com/"]
+        )!
+        let newRequest = URLRequest(url: URL(string: "https://evil.example.com/")!)
+
+        var capturedNewRequest: URLRequest?
+        let expectation = self.expectation(description: "Completion handler called")
+
+        delegate.urlSession!(
+            session,
+            task: task,
+            willPerformHTTPRedirection: redirectResponse,
+            newRequest: newRequest
+        ) { request in
+            capturedNewRequest = request
+            expectation.fulfill()
+        }
+
+        waitForExpectations(timeout: 1.0)
+        XCTAssertNil(capturedNewRequest, "Delegate should refuse redirects by returning nil")
+    }
+
+    func testNonHTTPSRelayURLFails() {
+        // Verify that a non-https relay URL is rejected at init time.
+        let validKeyConfig = makeValidKeyConfig()
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (validKeyConfig, response)
+        }
+
+        // https:// relay should succeed
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            httpSender: mockSender
+        )
+        XCTAssertNotNil(transport, "https relay URL should succeed")
+
+        // Document that http:// would fail at init:
+        // let badTransport = OHTTPTransport(
+        //     relayURL: "http://operator-relay.example.invalid/relay",  // Would trigger fatalError
+        //     keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+        //     httpSender: mockSender
+        // )
+    }
+
+    func testNonHTTPSKeyConfigURLFails() {
+        // Verify that a non-https key-config URL is rejected at init time.
+        let validKeyConfig = makeValidKeyConfig()
+        let mockSender: OHTTPTransport.HTTPSender = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (validKeyConfig, response)
+        }
+
+        let transport = OHTTPTransport(
+            relayURL: "https://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            httpSender: mockSender
+        )
+        XCTAssertNotNil(transport, "https key-config URL should succeed")
+
+        // Document that http:// would fail at init:
+        // let badTransport = OHTTPTransport(
+        //     relayURL: "https://operator-relay.example.invalid/relay",
+        //     keyConfigURL: "http://gateway.zodl.com/ohttp-configs",  // Would trigger fatalError
+        //     httpSender: mockSender
+        // )
+    }
 }

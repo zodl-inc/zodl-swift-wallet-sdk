@@ -8,6 +8,24 @@
 
 import Foundation
 
+/// Delegate that refuses HTTP redirects to prevent tracking and fingerprinting.
+/// A relay or key-config server attempting a redirect is an attack vector.
+private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static let shared = RedirectRefusingDelegate()
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // Refuse all redirects by passing nil to the completion handler.
+        // The task will complete with the redirect response instead of following it.
+        completionHandler(nil)
+    }
+}
+
 actor OHTTPTransport {
     /// Pluggable HTTP sender for the relay POST (and the key-config GET).
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
@@ -15,8 +33,9 @@ actor OHTTPTransport {
 
     /// Dedicated session for the OHTTP hops. Ephemeral + no cookies + no cache so that nothing a relay
     /// or gateway returns (e.g. Set-Cookie) can be stored and replayed, which would link a wallet's
-    /// requests across IPs / Tor circuits. Scoped to this transport; the app's URLSession.shared is untouched.
-    private static let session: URLSession = {
+    /// requests across IPs / Tor circuits. Delegate refuses redirects (3xx responses surface as errors
+    /// rather than being followed). Scoped to this transport; the app's URLSession.shared is untouched.
+    internal static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
         cfg.httpShouldSetCookies = false
@@ -25,7 +44,7 @@ actor OHTTPTransport {
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         cfg.httpAdditionalHeaders = nil
         cfg.waitsForConnectivity = false
-        return URLSession(configuration: cfg)
+        return URLSession(configuration: cfg, delegate: RedirectRefusingDelegate.shared, delegateQueue: nil)
     }()
 
     /// Test-only accessor for the session configuration.
@@ -68,6 +87,14 @@ actor OHTTPTransport {
             return (data, httpResponse)
         }
     ) {
+        // Enforce https for relay and key-config URLs to prevent downgrade attacks
+        guard relayURL.lowercased().hasPrefix("https://") else {
+            fatalError("OHTTP relay URL must use https: \(relayURL)")
+        }
+        guard keyConfigURL.lowercased().hasPrefix("https://") else {
+            fatalError("OHTTP key-config URL must use https: \(keyConfigURL)")
+        }
+
         self.relayURL = relayURL
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS

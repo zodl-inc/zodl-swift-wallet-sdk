@@ -144,9 +144,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 return try await torClient.httpRequest(for: request, retryLimit: 3)
             }
         } else {
-            // Clearnet sender
+            // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
             httpSender = { request in
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await OHTTPTransport.session.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")
                 }
