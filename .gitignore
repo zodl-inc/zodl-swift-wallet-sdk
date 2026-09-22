@@ -104,6 +104,3 @@ BuildSupport/products/
 .plans/
 .worktrees/
 
-# Vendored slipstream engine (rust/vendor/zodl-slipstream): build artifacts only; the root Cargo.lock governs
-rust/vendor/zodl-slipstream/target/
-rust/vendor/zodl-slipstream/Cargo.lock

@@ -153,10 +153,10 @@ crate-type = ["staticlib"]
 lto = true
 
 [patch.crates-io]
-# The slipstream engine rides a vendored copy with OHTTP + Tor-over-OHTTP transport support, not
-# yet upstreamed. Byte-identical in src/ to published 0.2.0 + the unreleased OHTTP layer (same
-# pattern as Android backend-lib). Once upstreamed, revert to a pinned rev or release tag.
-zodl-slipstream = { path = "rust/vendor/zodl-slipstream" }
+# The slipstream engine's OHTTP transport lives in slipstream-internal until upstreamed to
+# the public repo and published. Git dependency on the feature/ohttp-connector branch (PR #16).
+# Once 0.3.0 is published to crates.io, revert to a version pin.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "1c276ac8c510a459762190d1c521c7a61a2df796" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a

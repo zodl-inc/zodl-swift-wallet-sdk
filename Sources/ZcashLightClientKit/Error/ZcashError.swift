@@ -86,6 +86,9 @@ public enum ZcashError: Equatable, Error {
     /// TorClient is called but SDKFlags are set as Tor disabled
     /// ZTSRV0005
     case torNotEnabled
+    /// Tor request exceeded the specified timeout
+    /// ZTSRV0009
+    case torRequestTimeout
     /// httpRequestOverOHTTP was called with a URL whose host is not in OHTTPEndpoints.
     /// ZTSRV0006
     case ohttpUnsupportedHost

@@ -1265,6 +1265,46 @@ public class SDKSynchronizer: Synchronizer {
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
     }
 
+    public func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+        let torEnabled = await sdkFlags.torEnabled
+        let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+        guard torEnabled || exchangeRateEnabled else {
+            throw ZcashError.torNotEnabled
+        }
+
+        if httpTor == nil {
+            logger.info("Bootstrapping Tor client for making http requests")
+            if let torService = initializer.container.resolve(LightWalletService.self) as? LightWalletGRPCServiceOverTor {
+                httpTor = try await torService.tor.isolatedClient()
+            }
+        }
+
+        guard let httpTor else {
+            throw ZcashError.torClientUnavailable
+        }
+
+        let timeoutNanoseconds = timeoutMilliseconds * 1_000_000
+
+        return try await withThrowingTaskGroup(of: (data: Data, response: HTTPURLResponse).self) { group in
+            group.addTask {
+                try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                throw ZcashError.torRequestTimeout
+            }
+
+            guard let result = try await group.next() else {
+                throw ZcashError.torRequestTimeout
+            }
+
+            group.cancelAll()
+            return result
+        }
+    }
+
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
     /// destination service. The request URL must use a hostname registered in `OHTTPEndpoints`
     /// (e.g. `cmc.zodl.com`, `near.zodl.com`). Use `OHTTPEndpoints.proxyURL(for:)` to convert a

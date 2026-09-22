@@ -658,6 +658,17 @@ public protocol Synchronizer: AnyObject {
     ///    - retryLimit: How many times the request will be retried in case of failure
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
 
+    /// Makes an HTTP GET request over Tor with a bounded timeout.
+    ///
+    /// This is a specialized version of httpRequestOverTor that enforces a timeout constraint
+    /// for time-sensitive GET requests.
+    ///
+    /// - Parameters:
+    ///    - for: URLRequest
+    ///    - retryLimit: How many times the request will be retried in case of failure
+    ///    - timeoutMilliseconds: Maximum time to wait for the request in milliseconds
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse)
+
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
     /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`).
     ///
