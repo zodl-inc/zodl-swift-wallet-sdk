@@ -57,8 +57,6 @@ public enum ZcashErrorCode: String {
     case torClientUnavailable = "ZTSRV0004"
     /// TorClient is called but SDKFlags are set as Tor disabled
     case torNotEnabled = "ZTSRV0005"
-    /// Tor request exceeded the specified timeout
-    case torRequestTimeout = "ZTSRV0009"
     /// httpRequestOverOHTTP host not in OHTTPEndpoints
     case ohttpUnsupportedHost = "ZTSRV0006"
     /// OHTTP response could not be converted to HTTPURLResponse

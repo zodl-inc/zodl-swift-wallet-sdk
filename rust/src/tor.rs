@@ -6,6 +6,8 @@
 //! gateway and the relay leg is an arti stream (the relay sees a Tor exit, the gateway sees the
 //! relay).
 
+pub(crate) mod http;
+
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

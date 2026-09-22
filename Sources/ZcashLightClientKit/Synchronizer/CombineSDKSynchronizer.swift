@@ -309,9 +309,21 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.httpGetOverTor(for: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        }
+    }
+
     public func httpRequestOverOHTTP(for request: URLRequest) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
             try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
+        }
+    }
         }
     }
 

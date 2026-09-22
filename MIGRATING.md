@@ -1,5 +1,48 @@
 # Migrating from previous versions to _Unreleased_
 
+## Bounded Tor GET requests
+
+After successful Tor enablement, use
+`httpGetOverTor(for:retryLimit:timeoutMilliseconds:)` for GET requests that need one
+positive timeout. The original budget starts before synchronizer and Tor actor
+admission and includes executor waiting, native retries, and response-body collection.
+Set `retryLimit: 0` to disable retries. A missing prepared runtime throws
+`torClientUnavailable`; this method does not bootstrap Tor.
+
+Cancellation or expiry before the request acquires runtime ownership can complete
+while a synchronizer or Tor actor remains busy. If admission occurs later, it observes
+the same original cancellation or deadline and performs no HTTP work. Once runtime
+ownership begins, cancellation waits for the bounded native operation and safe cleanup.
+All clients share a limit of two active bounded GETs, and a slot remains occupied until
+disposal finishes. Cleanup, including shutdown when the request is the runtime's final
+owner, can extend caller completion beyond the HTTP timer.
+
+`httpRequestOverTor(for:retryLimit:)` and its existing GET/POST behavior remain
+available unchanged. The admission and cleanup hardening adds no further public
+signature changes.
+
+Custom `Synchronizer` conformers and test doubles must add:
+
+```swift
+func httpGetOverTor(
+    for request: URLRequest,
+    retryLimit: UInt8,
+    timeoutMilliseconds: UInt64
+) async throws -> (data: Data, response: HTTPURLResponse)
+```
+
+Custom `ClosureSynchronizer` conformers add the same three arguments followed by
+`completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void`.
+Custom `CombineSynchronizer` conformers return
+`SinglePublisher<(data: Data, response: HTTPURLResponse), Error>` instead of using
+`async throws`. The SDK's `ClosureSDKSynchronizer` and `CombineSDKSynchronizer` already
+forward these requests to their underlying async synchronizer. The closure adapter
+exposes no cancellation handle. The inherited Combine gateway does not propagate
+subscriber cancellation to its underlying async task, so cancelling a subscription is
+not guaranteed to cancel or stop the request. There is no unbounded fallback
+implementation. Direct `TorClient` users can call
+`httpGet(for:retryLimit:timeoutMilliseconds:)` on a prepared client.
+
 ## `ZIP318Kind` gained a case — `canonicalCrossingPayment`
 
 `ZcashTransaction.Overview.ZIP318Kind`, the type of `zip318Kind`, has a fifth case,

@@ -87,9 +87,6 @@ public enum ZcashError: Equatable, Error {
     /// ZTSRV0005
     case torNotEnabled
     /// Tor request exceeded the specified timeout
-    /// ZTSRV0009
-    case torRequestTimeout
-    /// httpRequestOverOHTTP was called with a URL whose host is not in OHTTPEndpoints.
     /// ZTSRV0006
     case ohttpUnsupportedHost
     /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.

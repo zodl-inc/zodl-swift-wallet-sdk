@@ -1190,7 +1190,7 @@ public class SDKSynchronizer: Synchronizer {
         let isExchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
         // turn Tor on
-        if enabled && !isExchangeRateEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1206,7 +1206,7 @@ public class SDKSynchronizer: Synchronizer {
         let isTorEnabled = await sdkFlags.torEnabled
 
         // turn Tor on
-        if enabled && !isTorEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1265,7 +1265,27 @@ public class SDKSynchronizer: Synchronizer {
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
     }
 
-    public func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.httpGetOverTor(for: request, retryLimit: retryLimit, context: context)
+        }
+    }
+
+    private func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        context: TorHTTPRequestContext
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try context.checkCancellation()
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1273,36 +1293,8 @@ public class SDKSynchronizer: Synchronizer {
             throw ZcashError.torNotEnabled
         }
 
-        if httpTor == nil {
-            logger.info("Bootstrapping Tor client for making http requests")
-            if let torService = initializer.container.resolve(LightWalletService.self) as? LightWalletGRPCServiceOverTor {
-                httpTor = try await torService.tor.isolatedClient()
-            }
-        }
-
-        guard let httpTor else {
-            throw ZcashError.torClientUnavailable
-        }
-
-        let timeoutNanoseconds = timeoutMilliseconds * 1_000_000
-
-        return try await withThrowingTaskGroup(of: (data: Data, response: HTTPURLResponse).self) { group in
-            group.addTask {
-                try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
-            }
-
-            group.addTask {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                throw ZcashError.torRequestTimeout
-            }
-
-            guard let result = try await group.next() else {
-                throw ZcashError.torRequestTimeout
-            }
-
-            group.cancelAll()
-            return result
-        }
+        let torClient = initializer.container.resolve(TorClient.self)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
     }
 
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
@@ -1384,6 +1376,7 @@ public class SDKSynchronizer: Synchronizer {
             throw ZcashError.ohttpResponseError
         }
         return (bhttpResponse.body, httpResponse)
+    }
     }
 
     public func debugDatabase(sql: String) -> String {

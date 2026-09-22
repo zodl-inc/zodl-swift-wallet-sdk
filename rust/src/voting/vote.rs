@@ -180,6 +180,36 @@ mod tests {
     use crate::voting::test_helpers::open_memory_db;
     use voting::vote::VAN_AUTH_PATH_LEN;
 
+    #[derive(Default)]
+    struct VoteStoreGateState {
+        busy_observed: bool,
+        release_writer: bool,
+        completed: bool,
+    }
+
+    type VoteStoreGate = std::sync::Arc<(std::sync::Mutex<VoteStoreGateState>, std::sync::Condvar)>;
+
+    thread_local! {
+        static VOTE_STORE_GATE: std::cell::RefCell<Option<VoteStoreGate>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn wait_for_vote_store_writer(_attempt: i32) -> bool {
+        VOTE_STORE_GATE.with(|slot| {
+            let gate = slot.borrow().as_ref().expect("worker gate").clone();
+            let (lock, changed) = &*gate;
+            let mut state = lock.lock().expect("gate lock");
+            state.busy_observed = true;
+            changed.notify_all();
+            let (state, _) = changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(10), |state| {
+                    !state.release_writer
+                })
+                .expect("writer release wait");
+            state.release_writer
+        })
+    }
+
     /// A stored hotkey secret that `zcash_voting` accepts, produced the same way
     /// a wallet would produce it rather than by guessing at the encoding.
     fn valid_stored_secret() -> Vec<u8> {
@@ -329,6 +359,104 @@ mod tests {
 
         unsafe { zcashlc_voting_db_free(db) };
         assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn vote_storage_waits_for_competing_wal_writer() {
+        use crate::voting::db::{zcashlc_voting_db_open, zcashlc_voting_set_wallet_id};
+        use crate::voting::test_helpers::{TEST_WALLET_ID, insert_round_and_bundle};
+        use rusqlite::TransactionBehavior;
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("temporary voting directory");
+        let path = directory.path().join("voting.sqlite");
+        let path_text = path.to_str().expect("UTF-8 test path");
+        let path_bytes = path_text.as_bytes();
+        let handle = unsafe {
+            zcashlc_voting_db_open(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                crate::NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(!handle.is_null(), "open voting database");
+        let wallet = TEST_WALLET_ID.as_bytes();
+        assert_eq!(
+            unsafe { zcashlc_voting_set_wallet_id(handle, wallet.as_ptr(), wallet.len()) },
+            0,
+        );
+        insert_round_and_bundle(handle, "round");
+        let vote_db = Arc::clone(&unsafe { handle.as_ref() }.expect("voting handle").db);
+        unsafe { zcashlc_voting_db_free(handle) };
+
+        let writer_db = voting::storage::VotingDb::open(path_text).expect("writer database");
+        let mut writer_conn = writer_db.conn();
+        let transaction = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("reserve competing writer");
+        let gate = Arc::new((Mutex::new(VoteStoreGateState::default()), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let worker = std::thread::spawn(move || {
+            VOTE_STORE_GATE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&worker_gate)));
+            let conn = vote_db.conn();
+            assert!(
+                conn.is_autocommit(),
+                "production storage entry is autocommit"
+            );
+            conn.busy_handler(Some(wait_for_vote_store_writer))
+                .expect("busy handler");
+            let result = voting::storage::queries::store_vote(
+                &conn,
+                "round",
+                TEST_WALLET_ID,
+                0,
+                1,
+                1,
+                &[0xAB; 32],
+            )
+            .map_err(|error| error.to_string());
+            VOTE_STORE_GATE.with(|slot| *slot.borrow_mut() = None);
+            let (lock, changed) = &*worker_gate;
+            lock.lock().expect("completion gate").completed = true;
+            changed.notify_all();
+            result
+        });
+
+        let (lock, changed) = &*gate;
+        let state = lock.lock().expect("controller gate");
+        let (state, _) = changed
+            .wait_timeout_while(state, Duration::from_secs(10), |state| {
+                !state.busy_observed && !state.completed
+            })
+            .expect("contention observation");
+        let observed = state.busy_observed;
+        let completed_before_release = state.completed;
+        drop(state);
+
+        // Release and join before assertions so the failing rc1 case cleans up too.
+        let release_result = transaction.commit();
+        lock.lock().expect("release gate").release_writer = true;
+        changed.notify_all();
+        let result = worker.join().expect("storage worker");
+        release_result.expect("release competing writer");
+        assert!(observed, "busy handler was bypassed: {result:?}");
+        assert!(
+            !completed_before_release,
+            "store completed before writer release"
+        );
+        result.expect("store succeeds after writer release");
+
+        let stored: (u32, Vec<u8>) = writer_conn
+            .query_row(
+                "SELECT choice, commitment FROM votes
+                 WHERE round_id = 'round' AND wallet_id = 'wallet'
+                 AND bundle_index = 0 AND proposal_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("persisted vote");
+        assert_eq!(stored, (1, vec![0xAB; 32]));
     }
 
     // The former `mark_vote_submitted_marks_existing_vote_row` test is gone: it

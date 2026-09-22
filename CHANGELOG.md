@@ -8,6 +8,33 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
+
+## Fixed
+
+- [MOB-1963] Concurrent voting work now waits for a competing database writer when storing a
+  vote, avoiding an immediate database-locked failure during ballot submission. No call-site
+  changes are required.
+- [MOB-1963] `VotingRustBackend` reuses a healthy snapshot-matching PIR endpoint across delegation
+  precompute and proof work for the same wallet, round, snapshot, layout, and endpoint list. It
+  revalidates that endpoint before reuse and selects another matching endpoint when needed. Existing
+  call sites remain compatible, and wallet or database lifecycle changes discard the selection.
+- A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
+  Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
+  Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
+  final-owner runtime shutdown can extend completion beyond the HTTP timer. This hardening adds no further
+  public signature changes, and the existing GET/POST routes remain unchanged.
+- `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
+- `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
+
+## Changed
+
+- Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
+
+# 4.5.0 - 2026-09-15
+
+## Added
+
 ### Transaction outputs in one read
 
 - `Synchronizer.getTransactionOutputs(for transactions:)` returns the outputs of many transactions
@@ -40,6 +67,29 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
   v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
   Rust core from source now requires Rust 1.91.
+- The PIR client is connected once per voting database handle and reused across the bundles and
+  phases of a round (delegation PIR precompute and delegation proof), instead of once per call. The
+  connection is keyed by endpoint, layout, and the round's persisted snapshot root, so a server,
+  geometry, or snapshot change reconnects. A connected client's actual circuit root must match the
+  stored round before the SDK caches or reuses it.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3480000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3482500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4340000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4350000.json
+````
 
 # 4.4.0 - 2026-09-10
 
