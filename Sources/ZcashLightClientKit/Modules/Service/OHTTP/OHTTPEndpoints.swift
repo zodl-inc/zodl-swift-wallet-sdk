@@ -94,8 +94,6 @@ public enum OHTTPEndpoints {
         }
         return relayURL
     }
-        return relayURL.replacingOccurrences(of: "/relay", with: "/ohttp-configs")
-    }
 
     /// Maps a real external-service URL to its OHTTP proxy hostname.
     /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
