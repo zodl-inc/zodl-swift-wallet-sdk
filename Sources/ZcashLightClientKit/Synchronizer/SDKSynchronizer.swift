@@ -873,13 +873,21 @@ public class SDKSynchronizer: Synchronizer {
     static func makeService(
         endpoint: LightWalletEndpoint,
         tor: TorClient,
-        singleCallTimeout: Int64? = nil
+        singleCallTimeout: Int64? = nil,
+        sdkFlags: SDKFlags? = nil
     ) -> LightWalletGRPCServiceOverTor {
         if OHTTPEndpoints.isGateway(endpoint.host) {
-            if let singleCallTimeout {
-                return LightWalletOHTTPService(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+            if let sdkFlags {
+                if let singleCallTimeout {
+                    return LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: singleCallTimeout, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+                }
+                return LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: 30_000, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+            } else {
+                if let singleCallTimeout {
+                    return LightWalletOHTTPService(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+                }
+                return LightWalletOHTTPService(endpoint: endpoint, tor: tor)
             }
-            return LightWalletOHTTPService(endpoint: endpoint, tor: tor)
         }
         if let singleCallTimeout {
             return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
@@ -970,12 +978,13 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Initialize services for the endpoints
         let services = endpoints.map {
             Service(
                 originalEndpoint: $0,
-                service: Self.makeService(endpoint: $0, tor: torClient),
+                service: Self.makeService(endpoint: $0, tor: torClient, sdkFlags: sdkFlags),
                 // The scheme-qualified form so endpoints differing only in the TLS flag —
                 // distinct servers under `isSameServer` — cannot collide on one key.
                 url: $0.urlString
@@ -1312,7 +1321,7 @@ public class SDKSynchronizer: Synchronizer {
     /// of the client after decrypting the OHTTP-encapsulated request.
     ///
     /// Authored on Linux — compile validation pending on macOS.
-    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool = false) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
         guard let host = request.url?.host,
               OHTTPEndpoints.isGateway(host) else {
             throw ZcashError.ohttpUnsupportedHost
@@ -1329,7 +1338,7 @@ public class SDKSynchronizer: Synchronizer {
             }
         } else {
             httpSender = { request in
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await OHTTPTransport.session.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")
                 }
@@ -1688,11 +1697,12 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Validation of the server is first because any custom endpoint can be passed here
         // Extra instance of the service is created with lower timeout for a single call
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000)
+            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000, sdkFlags: sdkFlags)
         }
 
         let validateSever = ValidateServerAction(
@@ -1713,7 +1723,7 @@ public class SDKSynchronizer: Synchronizer {
 
         // LightWalletService dependency update
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            Self.makeService(endpoint: endpoint, tor: torClient)
+            Self.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags)
         }
 
         // DEPENDENCIES

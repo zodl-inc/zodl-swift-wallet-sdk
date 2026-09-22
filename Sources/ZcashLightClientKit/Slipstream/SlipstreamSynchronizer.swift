@@ -2806,7 +2806,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
-    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool = false) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
         guard let host = request.url?.host, OHTTPEndpoints.isGateway(host) else {
             throw ZcashError.ohttpUnsupportedHost
         }
@@ -2822,7 +2822,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             }
         } else {
             httpSender = { request in
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await OHTTPTransport.session.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")
                 }

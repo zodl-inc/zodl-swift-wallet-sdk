@@ -214,7 +214,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
 
     override func blockRange(_ range: CompactBlockRange, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: mode) else {
                         // Fall back to parent implementation
@@ -239,6 +239,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceBlockRangeFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -311,7 +312,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
 
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: mode) else {
                         // Fall back to parent implementation
@@ -348,6 +349,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceFetchUTXOsFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -357,7 +359,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         mode: ServiceMode
     ) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: mode) else {
                         // Fall back to parent implementation
@@ -382,6 +384,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceBlockStreamFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -389,7 +392,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         // Note: getMempoolStream doesn't take a mode parameter in the protocol
         // We default to .direct mode for backward compatibility
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: .direct) else {
                         // Fall back to parent implementation
@@ -414,12 +417,13 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceGetMempoolStreamFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
     override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: mode) else {
                         // Fall back to parent implementation
@@ -444,6 +448,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceSubtreeRootsStreamFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -460,7 +465,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
 
     override func getTaddressTransactions(_ request: TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<RawTransaction, Error> {
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     guard let client = try await self.ensureOHTTPClient(mode: mode) else {
                         // Fall back to parent implementation
@@ -485,6 +490,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     continuation.finish(throwing: ZcashError.serviceGetTaddressTxidsFailed(serviceError))
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
