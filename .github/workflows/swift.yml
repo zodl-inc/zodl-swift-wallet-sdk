@@ -58,8 +58,8 @@ jobs:
       if: steps.cache-ffi.outputs.cache-hit != 'true' || github.event.pull_request.head.repo.full_name == github.repository
       uses: ./.github/actions/authorize-slipstream
       with:
-        app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
-        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY }}
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
     # Needed unconditionally: even on an FFI cache hit, the Rust test step below
     # compiles the crate's test profile and so needs the toolchain.
