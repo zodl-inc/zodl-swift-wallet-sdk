@@ -81,13 +81,19 @@ public enum OHTTPEndpoints {
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
-
-    /// Key config URL, derived from the gateway's relay URL by replacing `/relay` with `/ohttp-configs`.
+    /// Key config URL, derived from the gateway's relay URL by replacing the path `/relay` with `/ohttp-configs`.
     /// The relay proxies `/ohttp-configs` to the gateway's key endpoint.
     public static func keyConfigURL(for gatewayHost: String) -> String {
-        guard let relayURL = try? relayURL(for: gatewayHost) else {
+        guard var relayURL = try? relayURL(for: gatewayHost) else {
             fatalError("keyConfigURL called for gateway \(gatewayHost) with no relay mapping")
         }
+        // Replace only the path suffix, not the hostname (relay-simulator stays relay-simulator)
+        if relayURL.hasSuffix("/relay") {
+            relayURL.removeLast("/relay".count)
+            relayURL += "/ohttp-configs"
+        }
+        return relayURL
+    }
         return relayURL.replacingOccurrences(of: "/relay", with: "/ohttp-configs")
     }
 
