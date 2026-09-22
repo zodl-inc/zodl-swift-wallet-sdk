@@ -1377,7 +1377,6 @@ public class SDKSynchronizer: Synchronizer {
         }
         return (bhttpResponse.body, httpResponse)
     }
-    }
 
     public func debugDatabase(sql: String) -> String {
         transactionRepository.debugDatabase(sql: sql)

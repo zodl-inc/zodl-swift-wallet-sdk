@@ -329,8 +329,6 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
             try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
         }
     }
-        }
-    }
 
     public var broadcaster: Broadcaster { synchronizer.broadcaster }
 
