@@ -8,19 +8,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
-### Spendable balance masking
-
-- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
-  is currently masked because the engine has not yet confirmed a fresh chain tip — the only signal
-  that separates "the wallet cannot spend this" from "the SDK is not willing to say yet," which a
-  zero balance alone cannot express (an empty wallet, funds still confirming, and a masked balance
-  all read as zero). It clears once the refreshed tip's chain-tip range has been scanned (or the
-  pass completes), so the value it uncovers is one the wallet database can already vouch for and a
-  client can safely drive a "working it out" affordance from it. The property is additive: the
-  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
-  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
-  without reporting it here.
-
 ### Transaction outputs in one read
 
 - `Synchronizer.getTransactionOutputs(for transactions:)` returns the outputs of many transactions
@@ -34,6 +21,42 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no entry. The protocol requirement ships with a default implementation that falls back to one
   single-transaction read per transaction, so custom `Synchronizer` conformers and test doubles
   keep compiling unchanged; both shipped synchronizers override it with the batched read.
+
+### Coinholder polling
+
+- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
+  (default) behaves as before; `.speculative` runs the proof at utility priority without the
+  pool-wide boost, for a proof a host prepares before the user asks for it.
+  `withInteractiveProvingBoost` and `interactiveProvingBoostCount` are public so a host can raise
+  the pool while it waits on a speculative proof.
+
+## Changed
+
+### Coinholder polling
+
+- Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
+  voting-circuits 0.12.0 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
+  and a wallet built on it votes only on chains upgraded to that circuit. No existing voting
+  signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
+  v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
+  Rust core from source now requires Rust 1.91.
+
+# 4.4.0 - 2026-09-10
+
+## Added
+
+### Spendable balance masking
+
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
+  is currently masked because the engine has not yet confirmed a fresh chain tip — the only signal
+  that separates "the wallet cannot spend this" from "the SDK is not willing to say yet," which a
+  zero balance alone cannot express (an empty wallet, funds still confirming, and a masked balance
+  all read as zero). It clears once the refreshed tip's chain-tip range has been scanned (or the
+  pass completes), so the value it uncovers is one the wallet database can already vouch for and a
+  client can safely drive a "working it out" affordance from it. The property is additive: the
+  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
+  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
+  without reporting it here.
 
 ### Submissions
 
@@ -74,13 +97,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method has a default implementation that does nothing, so custom `Broadcaster` conformers
   without submit-plan bookkeeping keep compiling unchanged.
 
-### Coinholder voting
-
-- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
-  (default) behaves as before; `.speculative` runs the proof at utility priority without the
-  pool-wide boost, for a proof a host prepares before the user asks for it.
-  `withInteractiveProvingBoost` and `interactiveProvingBoostCount` are public so a host can raise
-  the pool while it waits on a speculative proof.
 
 ## Changed
 
@@ -133,14 +149,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
   as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
 
-### Coinholder voting
-
-- Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
-  voting-circuits 0.12.0 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
-  and a wallet built on it votes only on chains upgraded to that circuit. No existing voting
-  signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
-  v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
-  Rust core from source now requires Rust 1.91.
 
 ## Fixed
 
@@ -176,6 +184,29 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips the transaction, instead of reading the missing file as a never-written store and
   broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
   already reported no status for that case.
+- The state `start()` publishes before its first pass and the `.stopped` state `stop()` publishes
+  now carry `fullyScannedHeight`, like every in-pass state. Previously they omitted it, so it read
+  as 0 next to a real chain tip, and a client sizing "blocks remaining" as
+  `latestBlockHeight − fullyScannedHeight` saw the whole chain as unsynced for the moment before
+  the first in-pass state arrived.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3392500.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3477500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4100000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4330000.json
+````
 
 # 4.3.0 - 2026-09-08
 
