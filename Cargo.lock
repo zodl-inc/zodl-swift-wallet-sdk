@@ -8559,4 +8559,4 @@ dependencies = [
 [[patch.unused]]
 name = "zodl-slipstream"
 version = "0.3.0-alpha.1"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=1c276ac8c510a459762190d1c521c7a61a2df796#1c276ac8c510a459762190d1c521c7a61a2df796"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=5daed7cb18e646c6c50369eac63a1d43320f9e3e#5daed7cb18e646c6c50369eac63a1d43320f9e3e"
