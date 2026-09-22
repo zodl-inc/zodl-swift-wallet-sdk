@@ -572,7 +572,7 @@ final class OHTTPE2ETests: ZcashTestCase {
             let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
 
             // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
-            let authority = OHTTPEndpoints.isProxyAllowlisted(host: originalHost) ? originalHost : proxyHost
+            let authority = (proxyHost.lowercased() != originalHost.lowercased()) ? proxyHost : originalHost
 
             var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
             let rawPath = comps.path.isEmpty ? "/" : comps.path
