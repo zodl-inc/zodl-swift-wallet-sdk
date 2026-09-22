@@ -93,21 +93,27 @@ public enum OHTTPEndpoints {
     /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
     /// For static mappings, returns the rewritten proxy host.
     /// Returns nil if the host has no configured proxy (caller should fall through to clearnet or Tor).
+    /// Static hostname mappings — checked BEFORE the suffix allowlist so that hosts with a gateway
+    /// alias (credential injection happens only for aliases) are never sent as their real name.
+    static let proxyHostMapping: [String: String] = [
+        "pro-api.coinmarketcap.com": "cmc.zodl.com",
+        "1click.chaindefuser.com":   "near.zodl.com",
+        "voting.valargroup.dev":     "vote.zodl.com",
+    ]
+
     public static func proxyHost(for url: URL) -> String? {
         guard let host = url.host else { return nil }
 
-        // Allowlisted hosts pass through unchanged
+        // Static hostname mappings first (aliases carry gateway-injected credentials)
+        if let mapped = proxyHostMapping[host.lowercased()] {
+            return mapped
+        }
+
+        // Allowlisted hosts pass through unchanged (vote servers learned at run time)
         if isProxyAllowlisted(host: host) {
             return host
         }
-
-        // Static hostname mappings
-        let mapping: [String: String] = [
-            "pro-api.coinmarketcap.com": "cmc.zodl.com",
-            "1click.chaindefuser.com":   "near.zodl.com",
-            "voting.valargroup.dev":     "vote.zodl.com",
-        ]
-        return mapping[host.lowercased()]
+        return nil
     }
 
     /// Rewrites `url` to go through the OHTTP proxy.
@@ -117,9 +123,9 @@ public enum OHTTPEndpoints {
     public static func proxyURL(for url: URL) -> URL? {
         guard let proxyHost = proxyHost(for: url) else { return nil }
 
-        // Allowlisted hosts: return unchanged URL (proxyHost == original host)
+        // Allowlisted hosts without a static mapping: return unchanged URL (proxyHost == original host)
         guard let originalHost = url.host else { return nil }
-        if isProxyAllowlisted(host: originalHost) {
+        if proxyHost.lowercased() == originalHost.lowercased() {
             return url
         }
 

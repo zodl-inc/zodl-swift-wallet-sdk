@@ -278,8 +278,14 @@ final class OHTTPTests: XCTestCase {
         let url1 = URL(string: "https://prod.vote-chain-primary.valargroup.org/path")!
         XCTAssertEqual(OHTTPEndpoints.proxyHost(for: url1), "prod.vote-chain-primary.valargroup.org")
 
+        // Static mapping wins over the suffix allowlist: NEAR goes to the gateway alias so the
+        // gateway injects the 1Click credential (allowlisted vote servers keep their real host).
         let url2 = URL(string: "https://1click.chaindefuser.com/api")!
-        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: url2), "1click.chaindefuser.com")
+        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: url2), "near.zodl.com")
+        XCTAssertEqual(OHTTPEndpoints.proxyURL(for: URL(string: "https://1click.chaindefuser.com/v0/tokens")!)?.host, "near.zodl.com")
+        XCTAssertEqual(OHTTPEndpoints.proxyURL(for: URL(string: "https://1click.chaindefuser.com/v0/tokens")!)?.path, "/v0/tokens")
+        let voteURL = URL(string: "https://prod.vote-chain-primary.valargroup.org/x")!
+        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: voteURL), "prod.vote-chain-primary.valargroup.org")
     }
 
     func testProxyAllowlistProxyURLPassthrough() {
