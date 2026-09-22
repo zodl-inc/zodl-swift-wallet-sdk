@@ -123,7 +123,7 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # code nobody reviewed, whereas a stale hash fails loudly. The engine rides the
 # same librustzcash rev as this package, so the graph stays a single family
 # instance.
-slipstream-core = { version = "0.2", package = "zodl-slipstream" }
+slipstream-core = { version = "0.3.0-alpha.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
