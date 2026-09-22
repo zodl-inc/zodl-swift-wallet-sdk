@@ -9,6 +9,9 @@
 //
 //    app ──HPKE-encrypted──▶ relay (sees IP, not content) ──▶ gateway (sees content, not IP) ──▶ lightwalletd
 //
+//  The gateway's HPKE key configuration is fetched through the relay at `https://<relay-host>/ohttp-configs`
+//  (the relay passes it through from the gateway).
+//
 //  Non-LWD proxy hosts (CMC, NEAR, voting) also route through the same relay→gateway
 //  pair. The gateway proxies these to their real backends; the destination never sees the client IP.
 //  When Tor is OFF: OHTTP hides the client IP from all external services.
@@ -79,14 +82,13 @@ public enum OHTTPEndpoints {
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
 
-    /// Key config URL. Proxy hosts (static mappings and allowlisted) share the mainnet gateway's
-    /// HPKE key config — the gateway decrypts on their behalf regardless of which backend it eventually calls.
+    /// Key config URL, derived from the gateway's relay URL by replacing `/relay` with `/ohttp-configs`.
+    /// The relay proxies `/ohttp-configs` to the gateway's key endpoint.
     public static func keyConfigURL(for gatewayHost: String) -> String {
-        if gatewayHost.hasPrefix("ohttp-gateway") {
-            return "https://\(gatewayHost)/ohttp-configs"
+        guard let relayURL = try? relayURL(for: gatewayHost) else {
+            fatalError("keyConfigURL called for gateway \(gatewayHost) with no relay mapping")
         }
-        // Static mappings and allowlisted hosts use mainnet gateway config
-        return "https://ohttp-gateway.example/ohttp-configs"
+        return relayURL.replacingOccurrences(of: "/relay", with: "/ohttp-configs")
     }
 
     /// Maps a real external-service URL to its OHTTP proxy hostname.

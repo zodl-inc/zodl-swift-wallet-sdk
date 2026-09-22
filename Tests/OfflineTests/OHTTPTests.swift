@@ -181,7 +181,24 @@ final class OHTTPTests: XCTestCase {
 
     func testOHTTPEndpointsKeyConfigURL() {
         let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(url, "https://ohttp-gateway-testnet.example/ohttp-configs")
+        XCTAssertEqual(url, "https://testnet-simulator-relay.example.invalid/ohttp-configs")
+    }
+
+    func testOHTTPEndpointsKeyConfigURLMainnet() {
+        let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway.example")
+        XCTAssertEqual(url, "https://simulator-relay.example.invalid/ohttp-configs")
+    }
+
+    func testOHTTPEndpointsKeyConfigURLProxyHosts() {
+        // Proxy hosts (static mappings and allowlisted) should use mainnet relay config
+        let cmcURL = OHTTPEndpoints.keyConfigURL(for: "cmc.zodl.com")
+        XCTAssertEqual(cmcURL, "https://simulator-relay.example.invalid/ohttp-configs")
+        
+        let nearURL = OHTTPEndpoints.keyConfigURL(for: "near.zodl.com")
+        XCTAssertEqual(nearURL, "https://simulator-relay.example.invalid/ohttp-configs")
+        
+        let voteURL = OHTTPEndpoints.keyConfigURL(for: "vote.zodl.com")
+        XCTAssertEqual(voteURL, "https://simulator-relay.example.invalid/ohttp-configs")
     }
 
     // MARK: - I2OSP Tests
@@ -379,7 +396,7 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: nil,
             httpSender: mockSender
         )
@@ -427,7 +444,7 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test-wallet",
             httpSender: mockSender
         )
@@ -480,7 +497,7 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test",
             httpSender: mockSender
         )
@@ -527,7 +544,7 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test@wallet#123",
             httpSender: mockSender
         )
@@ -579,7 +596,7 @@ final class OHTTPTests: XCTestCase {
         let longPrefix = String(repeating: "a", count: 60)
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: longPrefix,
             httpSender: mockSender
         )
@@ -631,7 +648,7 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             httpSender: torSender
         )
 
@@ -662,7 +679,7 @@ final class OHTTPTests: XCTestCase {
         // without mocking URLSession, so this is more of a smoke test that the default path compiles.
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs"
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs"
         )
 
         // The transport should be created successfully with default httpSender
@@ -732,7 +749,7 @@ final class OHTTPTests: XCTestCase {
         // Init succeeds with http:// relay (validation is lazy)
         let transport = OHTTPTransport(
             relayURL: "http://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             httpSender: mockSender
         )
 
@@ -770,7 +787,7 @@ final class OHTTPTests: XCTestCase {
         // Init succeeds with http:// key-config (validation is lazy)
         let transport = OHTTPTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "http://gateway.zodl.com/ohttp-configs",
+            keyConfigURL: "http://simulator-relay.example.invalid/ohttp-configs",
             httpSender: mockSender
         )
 
