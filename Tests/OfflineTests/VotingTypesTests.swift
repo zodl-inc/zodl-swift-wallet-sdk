@@ -1080,7 +1080,7 @@ final class VotingTypesTests: XCTestCase {
                 {"kind": "delegate", "bundle_index": 1, "proposal_id": 0, "choice": 0, "share_index": 0},
                 {"kind": "cast_vote", "bundle_index": 1, "proposal_id": 7, "choice": 2, "share_index": 0},
                 {"kind": "a_future_step", "bundle_index": 3, "proposal_id": 8, "choice": 0, "share_index": 1}
-              ]
+            ]
             """
         )
         XCTAssertTrue(json.contains("a_future_step"), "the fixture must carry the steps under test")
