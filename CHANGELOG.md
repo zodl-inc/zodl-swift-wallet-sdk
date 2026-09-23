@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 5.0.0 - 2026-09-23
+
 ## Added
 
 - `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
