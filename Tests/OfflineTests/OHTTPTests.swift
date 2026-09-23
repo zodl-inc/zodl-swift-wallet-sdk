@@ -371,18 +371,18 @@ final class OHTTPTests: XCTestCase {
         return config
     }
 
-    /// Creates a valid signed config JSON envelope for testing. Uses the deterministic test vector
-    /// from docs/signed-configs-test-vector.json in zodl-inc/ohttp (valid signature, testnet).
+    /// Creates a valid signed config JSON envelope for testing. Snapshot from the live testnet endpoint
+    /// (testnet-simulator-relay.example.invalid/ohttp-configs/signed, fetched 2026-09-23). Valid for ~6 hours.
     private func makeValidSignedConfigJSON() -> Data {
         let json = """
         {
             "v": 1,
             "network": "testnet",
-            "configs": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKg==",
-            "not_before": 1700000000,
-            "not_after": 1700021600,
-            "key_id": "1325b850",
-            "sig": "eaavjMihe2EGm3giQq5NArYVD+G1A5AxVzQxXwvGz8C8qKRIEXl/T0TpOZe2bL+OkNmSAIX95uYgA4zGQGXbCg=="
+            "configs": "ACkBACD5n9d/1dHDOsx+Qq9aQrpq8+ugQkPE/IRGEAm1cHK+NgAEAAEAAQ==",
+            "not_before": 1790163543,
+            "not_after": 1790185443,
+            "key_id": "a3620fb6",
+            "sig": "3ymfwnUUGH7NJ8WFTihmyYK7aVjeD9W17xGZdnfwZ7that/K47/Pr/+XyDnugt5BHAn9cQpBu9KptRIhYdA1Cg=="
         }
         """
         return json.data(using: .utf8)!
