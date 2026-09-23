@@ -22,10 +22,10 @@ final class OHTTPAuditFixTests: XCTestCase {
         // Mock HTTP sender that returns HTTP 500 with "HTTP 400" in body (attack scenario)
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
-            if url.hasSuffix("/ohttp-configs") {
+            if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                // Return a minimal key config
-                let keyConfig = self.generateMockKeyConfig()
+                // Return a signed config JSON (mock - tests don't actually verify signature)
+                let keyConfig = self.generateMockSignedConfig()
                 return (keyConfig, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 // Relay POST - return HTTP 500 with malicious body
@@ -35,11 +35,18 @@ final class OHTTPAuditFixTests: XCTestCase {
             }
         }
 
+        // Use test key parameters to bypass signature verification
+        let testKeyId = "test-key-2099"
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+
         let transport = OHTTPTransport(
             network: "testnet",
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: nil,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -78,9 +85,9 @@ final class OHTTPAuditFixTests: XCTestCase {
         // Mock HTTP sender that returns HTTP 400 on first attempt, then 200
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
-            if url.hasSuffix("/ohttp-configs") {
+            if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                let keyConfig = self.generateMockKeyConfig()
+                let keyConfig = self.generateMockSignedConfig()
                 return (keyConfig, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -95,11 +102,18 @@ final class OHTTPAuditFixTests: XCTestCase {
             }
         }
 
+        // Use test key parameters to bypass signature verification
+        let testKeyId = "test-key-2099"
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+
         let transport = OHTTPTransport(
             network: "testnet",
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: nil,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -189,6 +203,24 @@ final class OHTTPAuditFixTests: XCTestCase {
     }
 
     // MARK: - Helper Methods
+
+    /// Generates a minimal mock signed config JSON for testing.
+    private func generateMockSignedConfig() -> Data {
+        // Generate key config bytes
+        let keyConfigBytes = generateMockKeyConfig()
+        let keyConfigHex = keyConfigBytes.map { String(format: "%02x", $0) }.joined()
+
+        // Create mock signed config with test key ID and far-future expiry
+        let json = """
+        {
+            "keyConfig": "\(keyConfigHex)",
+            "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+            "keyId": "test-key-2099",
+            "validUntil": "2099-12-31T23:59:59Z"
+        }
+        """
+        return json.data(using: .utf8)!
+    }
 
     /// Generates a minimal mock key config for testing.
     private func generateMockKeyConfig() -> Data {

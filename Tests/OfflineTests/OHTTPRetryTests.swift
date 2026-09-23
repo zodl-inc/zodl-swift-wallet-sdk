@@ -126,8 +126,7 @@ final class OHTTPRetryTests: XCTestCase {
 
         // Verify OHTTPTransport.roundTrip has HTTP 400 retry with fresh key config
         XCTAssertTrue(
-            source.contains("case .transportError(let message) = error") &&
-            source.contains("HTTP 400") &&
+            source.contains("case .httpStatusError(statusCode: 400") &&
             source.contains("keyConfig(forceRefresh: true)"),
             "OHTTPTransport.roundTrip should retry on HTTP 400 with refreshed key config"
         )
@@ -142,7 +141,7 @@ final class OHTTPRetryTests: XCTestCase {
         // Verify encapsulation happens in roundTripWith (fresh ciphertext each call)
         XCTAssertTrue(
             source.contains("private func roundTripWith") &&
-            source.contains("let context = try OHTTPHPKE.setupBaseS") &&
+            source.contains("var context = try OHTTPHPKE.setupBaseS") &&
             source.contains("let ciphertext = try context.seal"),
             "roundTripWith should perform HPKE encapsulation (seal), creating new ciphertext for each call"
         )
