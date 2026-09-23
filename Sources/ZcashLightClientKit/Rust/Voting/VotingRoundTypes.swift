@@ -360,6 +360,14 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     /// unconditionally.
     public let hasRecoverableVoteOrShareWork: Bool
     public let primaryAction: VotingRoundPlanAction
+    /// Every step the plan still owes, in the planner's deterministic order.
+    ///
+    /// The derived flags above answer whether any work is left; this answers
+    /// which work, on which bundle. A host measuring how far a submission has
+    /// got across bundles reads from here which bundles still owe vote steps.
+    /// A step kind this SDK does not name decodes as
+    /// ``VotingNextStepKind/unknown`` with its bundle and proposal intact.
+    public let nextSteps: [VotingNextStep]
     public let delegationStatuses: [VotingDelegationStatus]
     /// Proposals with no terminal decision yet. Recording a choice clears a
     /// proposal from this list immediately, the same as recording an explicit
@@ -421,6 +429,7 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         case hasRemainingVoteOrShareWork = "has_remaining_vote_or_share_work"
         case hasRecoverableVoteOrShareWork = "has_recoverable_vote_or_share_work"
         case primaryAction = "primary_action"
+        case nextSteps = "next_steps"
         case delegationStatuses = "delegation_statuses"
         case openProposals = "open_proposals"
         case unrosteredIntents = "unrostered_intents"
@@ -433,6 +442,10 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     // `#[serde(default)]` upstream: a payload that omits one must still yield a
     // plan, because losing the whole plan over a missing list is the worse
     // failure. Everything else the planner always writes.
+    //
+    // `nextSteps` is always written by the crate's plan view, but it decodes
+    // the same lenient way: a plan without it is still a plan, read as owing
+    // no listed step.
     //
     // `hasLegacyInFlightSubmission` is absent for the same reason and defaults
     // the same way: only the three calls its documentation names add it to the
@@ -458,6 +471,7 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         hasRemainingVoteOrShareWork = try container.decode(Bool.self, forKey: .hasRemainingVoteOrShareWork)
         hasRecoverableVoteOrShareWork = try container.decode(Bool.self, forKey: .hasRecoverableVoteOrShareWork)
         primaryAction = try container.decode(VotingRoundPlanAction.self, forKey: .primaryAction)
+        nextSteps = try container.decodeIfPresent([VotingNextStep].self, forKey: .nextSteps) ?? []
         delegationStatuses = try container.decode([VotingDelegationStatus].self, forKey: .delegationStatuses)
         openProposals = try container.decode([UInt32].self, forKey: .openProposals)
         unrosteredIntents = try container.decodeIfPresent([UInt32].self, forKey: .unrosteredIntents) ?? []

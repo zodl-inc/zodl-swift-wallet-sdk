@@ -343,6 +343,7 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(plan.delegationStatuses.last?.phase, .prepared)
         XCTAssertNil(plan.delegationStatuses.last?.txHash)
         XCTAssertEqual(plan.delegationStatuses.last?.terminal, true)
+        XCTAssertTrue(plan.nextSteps.isEmpty)
     }
 
     func testDecodesUnknownEnumRawValuesAsUnknown() throws {
@@ -1059,12 +1060,38 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertTrue(plan.delegationBundlesNeedingWork.isEmpty)
         XCTAssertTrue(plan.delegationBundlesNeedingSigning.isEmpty)
         XCTAssertTrue(plan.unrosteredIntents.isEmpty)
+        XCTAssertTrue(plan.nextSteps.isEmpty)
         XCTAssertEqual(plan.primaryAction, .idle)
         XCTAssertTrue(plan.allDecided)
         // Not every plan carries the key: the ones embedded in run reports and
         // events are the crate's own view, and a host must read them as "no
         // legacy submission known" rather than lose the plan.
         XCTAssertFalse(plan.hasLegacyInFlightSubmission)
+    }
+
+    /// The plan's own steps, in the planner's order, so a host can tell which
+    /// bundles still owe vote work. A step kind this SDK does not name decodes
+    /// as `.unknown` with its identity intact rather than failing the plan.
+    func testDecodesTheRoundPlanNextSteps() throws {
+        let json = Self.roundPlanJson.replacingOccurrences(
+            of: "\"next_steps\": []",
+            with: """
+            "next_steps": [
+                {"kind": "delegate", "bundle_index": 1, "proposal_id": 0, "choice": 0, "share_index": 0},
+                {"kind": "cast_vote", "bundle_index": 1, "proposal_id": 7, "choice": 2, "share_index": 0},
+                {"kind": "a_future_step", "bundle_index": 3, "proposal_id": 8, "choice": 0, "share_index": 1}
+              ]
+            """
+        )
+        XCTAssertTrue(json.contains("a_future_step"), "the fixture must carry the steps under test")
+
+        let plan = try decode(VotingRoundPlan.self, from: json)
+
+        XCTAssertEqual(plan.nextSteps.map(\.kind), [.delegate, .castVote, .unknown])
+        XCTAssertEqual(plan.nextSteps.map(\.bundleIndex), [1, 1, 3])
+        XCTAssertEqual(plan.nextSteps.map(\.proposalId), [0, 7, 8])
+        XCTAssertEqual(plan.nextSteps[1].choice, 2)
+        XCTAssertEqual(plan.nextSteps[2].shareIndex, 1)
     }
 
     func testDecodesDelegationStatusWithTerminalAbsent() throws {
