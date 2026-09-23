@@ -748,9 +748,15 @@ final class OHTTPTests: XCTestCase {
     // MARK: - Tor Mode Tests
 
     func testTorModeUsesCustomSenderForKeyConfigAndRelay() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+        let testNow = Date(timeIntervalSince1970: 1700010000)
+        
         var keyConfigRequestCaptured = false
         var relayRequestCaptured = false
-        let validKeyConfig = makeValidKeyConfig()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let torSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
@@ -759,9 +765,9 @@ final class OHTTPTests: XCTestCase {
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 relayRequestCaptured = true
                 throw OHTTPError.transportError("test abort after relay POST")
@@ -772,6 +778,9 @@ final class OHTTPTests: XCTestCase {
             network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: torSender
         )
 
