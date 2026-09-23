@@ -138,10 +138,15 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 throw ZcashError.torClientUnavailable
             }
 
+            // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
+            // OHTTPTransport.roundTrip seals the request once, creating ciphertext with a random nonce.
+            // If Tor retries (retryLimit > 0), the SAME ciphertext gets re-sent multiple times, violating
+            // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
+            // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
+            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400), which is safe because it
+            // re-encapsulates (new nonce, new ciphertext).
             httpSender = { request in
-                // Use the Tor client's httpRequest method, which returns synchronously
-                // but needs to be called on the actor (hence the await).
-                return try await torClient.httpRequest(for: request, retryLimit: 3)
+                return try await torClient.httpRequest(for: request, retryLimit: 0)
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)

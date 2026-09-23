@@ -2816,9 +2816,16 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
+            // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
+            // OHTTPTransport.roundTrip seals the request once, creating ciphertext with a random nonce.
+            // If Tor retries (retryLimit > 0), the SAME ciphertext gets re-sent multiple times, violating
+            // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
+            // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
+            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400), which is safe because it
+            // re-encapsulates (new nonce, new ciphertext).
             httpSender = { [weak self] request in
                 guard let self else { throw ZcashError.ohttpTransportError }
-                return try await self.httpRequestOverTor(for: request, retryLimit: 3)
+                return try await self.httpRequestOverTor(for: request, retryLimit: 0)
             }
         } else {
             httpSender = { request in
