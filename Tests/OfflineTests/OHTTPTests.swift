@@ -372,8 +372,9 @@ final class OHTTPTests: XCTestCase {
     }
 
     /// Deterministic test vector: valid OHTTP key config (X25519/HKDF-SHA256/AES-128-GCM) signed
-    /// with test Ed25519 key (seed 0x22...22, pubkey a09aa5f4..., key_id 1325b850). Valid
-    /// 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
+    /// with test Ed25519 key (seed 0x22...22, pubkey a09aa5f4..., key_id 1325b850). Signed
+    /// message format: "zodl-ohttp-configs-v1\0<network>\0<notBefore:BE64><notAfter:BE64><configs>".
+    /// Valid 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
     private func makeValidSignedConfigJSON() -> Data {
         let json = """
         {
@@ -383,7 +384,7 @@ final class OHTTPTests: XCTestCase {
             "not_before": 1700000000,
             "not_after": 1700021600,
             "key_id": "1325b850",
-            "sig": "8l3J430E5Lu8Mxr51cGgki1LFv8kXsgo2mFrqaJs804DVxnqMrylJ8URffAN4RBHts0wxQ3x9MVJqw05alxwDg=="
+            "sig": "YThL5yak5SGRQVzcZVim5UMEgZqsKZWxghMHDuncsPuja+0JgGqtVNhRN612G2lcJKPIjzz6Yn3gcQCm9IIpAg=="
         }
         """
         return json.data(using: .utf8)!
