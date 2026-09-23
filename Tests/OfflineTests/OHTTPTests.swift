@@ -911,25 +911,34 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testNonHTTPSKeyConfigURLFails() async throws {
-        // Verify that a non-https key-config URL throws at request time (not init).
-        let validKeyConfig = makeValidKeyConfig()
+        // Verify that a non-https relay URL causes derived signed-config URL validation to fail
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+        let testNow = Date(timeIntervalSince1970: 1700010000)
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (validKeyConfig, response)
+            // Stub that would return valid envelope if called (but shouldn't be for http://)
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+            return (validSignedConfig, response)
         }
 
-        // Init succeeds with http:// key-config (validation is lazy)
+        // Init succeeds with http:// relay (validation is lazy)
         let transport = OHTTPTransport(
             network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "http://simulator-relay.example.invalid/ohttp-configs",
+            relayURL: "http://operator-relay.example.invalid/relay",
+            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
-        // First call (keyConfig → GET) throws with https requirement
+        // First call (keyConfig → derived URL validation) throws before any GET or decoding
         do {
             _ = try await transport.keyConfig()
-            XCTFail("Should have thrown for http key-config URL")
+            XCTFail("Should have thrown for http-derived signed-config URL")
         } catch let error as OHTTPError {
             if case .transportError(let message) = error {
                 XCTAssertTrue(message.contains("must use https"), "Error should mention https requirement")

@@ -132,6 +132,14 @@ actor OHTTPTransport {
             signedURL += "/ohttp-configs/signed"
         }
 
+        // Validate the derived URL before any network call or decoding
+        guard signedURL.lowercased().hasPrefix("https://") else {
+            throw OHTTPError.transportError("OHTTP endpoints must use https: \(signedURL)")
+        }
+        guard let signedURLObj = URL(string: signedURL), signedURLObj.host != nil, !(signedURLObj.host!.isEmpty) else {
+            throw OHTTPError.transportError("Invalid URL: \(signedURL)")
+        }
+
         // Fetch JSON via hardened httpSender (not URLSession.shared)
         let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS)
 
