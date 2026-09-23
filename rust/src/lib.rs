@@ -101,6 +101,7 @@ mod error_report;
 mod ext_schema;
 mod ffi;
 mod interactive_qos;
+mod log_filter;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
@@ -259,7 +260,7 @@ pub(crate) fn account_uuid_from_bytes(
 /// This method panics if called more than once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
-    let log_filter = if log_level.is_null() {
+    let host_level = if log_level.is_null() {
         eprintln!("log_level not provided, falling back on 'debug' level");
         LevelFilter::DEBUG
     } else {
@@ -276,18 +277,9 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
             })
     };
 
-    // Per-target filter instead of a bare global level:
-    // upstream `zcash_client_backend` #[instrument]s every block and batch
-    // (~600k spans per fresh restore) at INFO, and through the os_log +
-    // signpost layers each span costs syscalls on the scan producer thread
-    // — measured as production pass1 3.4 s vs 0.5 s in the filtered
-    // CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
-    // host-chosen level still governs everything else (engine logs
-    // unchanged). Mirrors the filter the CLI and bench probe ship since
-    // v0.6 P6.
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_default(log_filter)
-        .with_target("zcash_client_backend", LevelFilter::WARN);
+    // Per-target filter: the host level for the SDK and Zcash crates, INFO at most for every
+    // other dependency, WARN for zcash_client_backend (see `log_filter`).
+    let log_filter = log_filter::rust_log_filter(host_level);
 
     // Set up the tracing layers for the Apple OS logging framework.
     #[cfg(target_vendor = "apple")]
@@ -304,8 +296,8 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
-        "tracing initialized (zcash_client_backend capped at WARN)"
+        zcashlc_build = "2026-09-23.v0.15-third-party-log-cap",
+        "tracing initialized (third-party crates capped at INFO, zcash_client_backend at WARN)"
     );
 
     // Log panics instead of writing them to stderr.
