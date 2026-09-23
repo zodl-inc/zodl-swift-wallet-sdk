@@ -7,6 +7,7 @@
 
 import XCTest
 @testable import ZcashLightClientKit
+import CryptoKit
 
 final class OHTTPTests: XCTestCase {
 
@@ -375,32 +376,87 @@ final class OHTTPTests: XCTestCase {
     /// with test Ed25519 key (seed 0x22...22, pubkey a09aa5f4..., key_id 1325b850). Signed
     /// message format: "zodl-ohttp-configs-v1\0<network>\0<notBefore:BE64><notAfter:BE64><configs>".
     /// Valid 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
-    private func makeValidSignedConfigJSON() -> Data {
-        let json = """
-        {
-            "v": 1,
-            "network": "testnet",
-            "configs": "ACgBACBQSjaZn0ic0v28CLr/PYj6AFadIXQFEJ552mYFPF8E7wAEAAEAAQ==",
-            "not_before": 1700000000,
-            "not_after": 1700021600,
-            "key_id": "1325b850",
-            "sig": "YThL5yak5SGRQVzcZVim5UMEgZqsKZWxghMHDuncsPuja+0JgGqtVNhRN612G2lcJKPIjzz6Yn3gcQCm9IIpAg=="
-        }
-        """
-        return json.data(using: .utf8)!
+    /// Helper to generate a self-signed OHTTP config envelope for testing.
+    private func makeSignedEnvelope(
+        network: String,
+        notBefore: Int64,
+        notAfter: Int64,
+        signingKey: Curve25519.Signing.PrivateKey
+    ) throws -> Data {
+        let publicKeyData = signingKey.publicKey.rawRepresentation
+        
+        // Compute key ID (first 8 hex chars of SHA-256(public key))
+        var hasher = SHA256()
+        hasher.update(data: publicKeyData)
+        let hash = hasher.finalize()
+        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
+        
+        // Build a valid 43-byte OHTTP key config
+        var configBytes = Data()
+        configBytes.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
+        configBytes.append(0x01)  // key_id
+        configBytes.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
+        // Generate a random X25519 public key for the config
+        let x25519Key = Curve25519.KeyAgreement.PrivateKey()
+        configBytes.append(x25519Key.publicKey.rawRepresentation)
+        configBytes.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
+        configBytes.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
+        configBytes.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
+        
+        // Build signed message: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 || notBefore || notAfter || configs
+        var message = Data()
+        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
+        message.append(0x00)
+        message.append(network.data(using: .ascii)!)
+        message.append(0x00)
+        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
+        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
+        message.append(configBytes)
+        
+        // Sign the message
+        let signature = try signingKey.signature(for: message)
+        
+        // Build JSON envelope
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: network,
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: keyId,
+            sig: Data(signature).base64EncodedString()
+        )
+        
+        return try JSONEncoder().encode(envelope)
+    }
+    
+    /// Generate a fresh signing key and corresponding test parameters for injection.
+    private func makeTestKeyParams() -> (key: Curve25519.Signing.PrivateKey, keyId: String, publicKeyHex: String) {
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let publicKeyData = signingKey.publicKey.rawRepresentation
+        
+        var hasher = SHA256()
+        hasher.update(data: publicKeyData)
+        let hash = hasher.finalize()
+        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
+        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
+        
+        return (signingKey, keyId, publicKeyHex)
     }
 
     /// Fixed clock for tests (midpoint of test vector validity window).
     private let testNow = Date(timeIntervalSince1970: 1700010800)
 
-    /// Test key parameters (from zodl-inc/ohttp test vector).
-    private let testKeyId = "1325b850"
-    private let testPublicKeyHex = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
 
     func testClientTraceIdAbsentWhenNotSet() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+
         var capturedRequest: URLRequest?
         var callCount = 0
-        let validSignedConfig = makeValidSignedConfigJSON()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             callCount += 1
@@ -454,8 +510,13 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testClientTraceIdPresentWhenSet() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+
         var capturedRequest: URLRequest?
-        let validSignedConfig = makeValidSignedConfigJSON()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
@@ -511,8 +572,13 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testClientTraceIdNeverSetsXRequestId() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+
         var capturedRequest: URLRequest?
-        let validSignedConfig = makeValidSignedConfigJSON()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
@@ -562,8 +628,13 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testClientTraceIdSanitization() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+
         var capturedRequest: URLRequest?
-        let validSignedConfig = makeValidSignedConfigJSON()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
@@ -617,8 +688,13 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testClientTraceIdTruncation() async throws {
+        // Generate test signing key
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700020000
+
         var capturedRequest: URLRequest?
-        let validSignedConfig = makeValidSignedConfigJSON()
+        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
@@ -854,3 +930,79 @@ final class OHTTPTests: XCTestCase {
         }
     }
 }
+
+    // MARK: - Self-Signed Envelope Verification
+
+    func testSignedEnvelopeVerifierAcceptsSelfSignedEnvelope() throws {
+        // Generate a fresh Ed25519 key pair for testing
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let publicKeyData = signingKey.publicKey.rawRepresentation
+        
+        // Compute key ID (first 8 hex chars of SHA-256(public key))
+        var hasher = SHA256()
+        hasher.update(data: publicKeyData)
+        let hash = hasher.finalize()
+        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
+        
+        // Build a valid 43-byte OHTTP key config
+        // Format: [length: u16] [key_id: u8] [kem_id: u16] [public_key: 32 bytes] [suites_length: u16] [kdf_id: u16] [aead_id: u16]
+        var configBytes = Data()
+        configBytes.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
+        configBytes.append(0x01)  // key_id
+        configBytes.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
+        // Generate a random X25519 public key for the config
+        let x25519Key = Curve25519.KeyAgreement.PrivateKey()
+        configBytes.append(x25519Key.publicKey.rawRepresentation)
+        configBytes.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
+        configBytes.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
+        configBytes.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
+        
+        XCTAssertEqual(configBytes.count, 43, "Config must be 43 bytes")
+        
+        // Build signed message: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 || notBefore || notAfter || configs
+        let network = "testnet"
+        let notBefore: Int64 = 1700000000
+        let notAfter: Int64 = 1700010000
+        
+        var message = Data()
+        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
+        message.append(0x00)
+        message.append(network.data(using: .ascii)!)
+        message.append(0x00)
+        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
+        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
+        message.append(configBytes)
+        
+        // Sign the message
+        let signature = try signingKey.signature(for: message)
+        
+        // Build JSON envelope
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: network,
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: keyId,
+            sig: Data(signature).base64EncodedString()
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        // Verify with injected test key
+        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
+        let testNow = Date(timeIntervalSince1970: 1700005000)  // midpoint of validity window
+        
+        do {
+            let verified = try OHTTPSignedConfigVerifier.verifyAndParse(
+                jsonData: jsonData,
+                network: network,
+                now: testNow,
+                testKeyId: keyId,
+                testPublicKeyHex: publicKeyHex
+            )
+            XCTAssertNotNil(verified.keyConfig)
+        } catch {
+            XCTFail("Self-signed envelope verification failed: \(error)")
+        }
+    }
