@@ -211,6 +211,11 @@ actor OHTTPTransport {
         request.httpMethod = "GET"
         request.setValue(Self.keysMediaType, forHTTPHeaderField: "Accept")
 
+        if let prefix = clientTraceIdPrefix {
+            let traceId = generateClientTraceId(prefix: prefix)
+            request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
+        }
+
         let (data, httpResponse) = try await httpSender(request)
 
         guard httpResponse.statusCode == 200 else {

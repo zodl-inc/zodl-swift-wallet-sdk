@@ -349,7 +349,7 @@ final class OHTTPTests: XCTestCase {
     private func makeValidKeyConfig() -> Data {
         var config = Data()
         var configBody = Data()
-        
+
         configBody.append(0x01)  // key_id
         configBody.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
         // Use a non-zero public key (arbitrary but non-zero to avoid potential edge cases)
@@ -362,31 +362,48 @@ final class OHTTPTests: XCTestCase {
         configBody.append(contentsOf: [0x00, 0x04])  // suites_length = 4
         configBody.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
         configBody.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
-        
+
         let length = UInt16(configBody.count)
         config.append(UInt8(length >> 8))
         config.append(UInt8(length & 0xFF))
         config.append(configBody)
-        
+
         return config
+    }
+
+    /// Creates a valid signed config JSON envelope for testing. Uses the deterministic test vector
+    /// from docs/signed-configs-test-vector.json in zodl-inc/ohttp (valid signature, testnet).
+    private func makeValidSignedConfigJSON() -> Data {
+        let json = """
+        {
+            "v": 1,
+            "network": "testnet",
+            "configs": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKg==",
+            "not_before": 1700000000,
+            "not_after": 1700021600,
+            "key_id": "1325b850",
+            "sig": "eaavjMihe2EGm3giQq5NArYVD+G1A5AxVzQxXwvGz8C8qKRIEXl/T0TpOZe2bL+OkNmSAIX95uYgA4zGQGXbCg=="
+        }
+        """
+        return json.data(using: .utf8)!
     }
 
     func testClientTraceIdAbsentWhenNotSet() async throws {
         var capturedRequest: URLRequest?
         var callCount = 0
-        let validKeyConfig = makeValidKeyConfig()
-        
+        let validSignedConfig = makeValidSignedConfigJSON()
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             callCount += 1
-            // Return valid key config for GET, capture POST where trace ID should be
+            // Return valid signed config for GET, capture POST where trace ID should be
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 // POST to relay - capture and throw to abort the test early
                 capturedRequest = request
@@ -426,17 +443,17 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdPresentWhenSet() async throws {
         var capturedRequest: URLRequest?
-        let validKeyConfig = makeValidKeyConfig()
-        
+        let validSignedConfig = makeValidSignedConfigJSON()
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 capturedRequest = request
                 throw OHTTPError.transportError("test abort")
@@ -480,17 +497,17 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdNeverSetsXRequestId() async throws {
         var capturedRequest: URLRequest?
-        let validKeyConfig = makeValidKeyConfig()
-        
+        let validSignedConfig = makeValidSignedConfigJSON()
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 capturedRequest = request
                 throw OHTTPError.transportError("test abort")
@@ -528,17 +545,17 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdSanitization() async throws {
         var capturedRequest: URLRequest?
-        let validKeyConfig = makeValidKeyConfig()
-        
+        let validSignedConfig = makeValidSignedConfigJSON()
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 capturedRequest = request
                 throw OHTTPError.transportError("test abort")
@@ -580,17 +597,17 @@ final class OHTTPTests: XCTestCase {
 
     func testClientTraceIdTruncation() async throws {
         var capturedRequest: URLRequest?
-        let validKeyConfig = makeValidKeyConfig()
-        
+        let validSignedConfig = makeValidSignedConfigJSON()
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
                 let response = HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
                     httpVersion: nil,
-                    headerFields: ["Content-Type": "application/ohttp-keys"]
+                    headerFields: ["Content-Type": "application/json"]
                 )!
-                return (validKeyConfig, response)
+                return (validSignedConfig, response)
             } else {
                 capturedRequest = request
                 throw OHTTPError.transportError("test abort")
