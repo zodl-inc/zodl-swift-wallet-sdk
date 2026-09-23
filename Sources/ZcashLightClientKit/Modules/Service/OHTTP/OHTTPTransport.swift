@@ -70,6 +70,12 @@ actor OHTTPTransport {
     private let network: String
     /// Expiry time for the cached key configuration.
     private var cachedExpiry: Date?
+    /// Test-only: fixed clock for signature verification (bypasses Date()).
+    private let testNow: Date?
+    /// Test-only: expected key ID for test vectors (bypasses production keys).
+    private let testKeyId: String?
+    /// Test-only: public key hex for test vectors (bypasses production keys).
+    private let testPublicKeyHex: String?
 
     private static let requestMediaType = "message/ohttp-req"
     private static let responseMediaType = "message/ohttp-res"
@@ -84,6 +90,9 @@ actor OHTTPTransport {
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
+        testNow: Date? = nil,
+        testKeyId: String? = nil,
+        testPublicKeyHex: String? = nil,
         httpSender: @escaping HTTPSender = { request in
             let (data, response) = try await OHTTPTransport.session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -99,6 +108,9 @@ actor OHTTPTransport {
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
         self.clientTraceIdPrefix = clientTraceIdPrefix
+        self.testNow = testNow
+        self.testKeyId = testKeyId
+        self.testPublicKeyHex = testPublicKeyHex
         self.httpSender = httpSender
     }
 
@@ -124,7 +136,13 @@ actor OHTTPTransport {
         let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS)
 
         // Verify and parse through pure verifier (fail-closed: any verification failure throws)
-        let verified = try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: network)
+        let verified = try OHTTPSignedConfigVerifier.verifyAndParse(
+            jsonData: jsonData,
+            network: network,
+            now: testNow ?? Date(),
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex
+        )
 
         // Cache both config and expiry
         cachedKeyConfig = verified.keyConfig

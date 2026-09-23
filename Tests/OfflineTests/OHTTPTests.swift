@@ -371,22 +371,30 @@ final class OHTTPTests: XCTestCase {
         return config
     }
 
-    /// Creates a valid signed config JSON envelope for testing. Snapshot from the live testnet endpoint
-    /// (testnet-simulator-relay.example.invalid/ohttp-configs/signed, fetched 2026-09-23). Valid for ~6 hours.
+    /// Deterministic test vector from zodl-inc/ohttp docs/signed-configs-test-vector.json.
+    /// Signed with test key (public_key_hex: a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0).
+    /// Valid 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
     private func makeValidSignedConfigJSON() -> Data {
         let json = """
         {
             "v": 1,
             "network": "testnet",
-            "configs": "ACkBACD5n9d/1dHDOsx+Qq9aQrpq8+ugQkPE/IRGEAm1cHK+NgAEAAEAAQ==",
-            "not_before": 1790163543,
-            "not_after": 1790185443,
-            "key_id": "a3620fb6",
-            "sig": "3ymfwnUUGH7NJ8WFTihmyYK7aVjeD9W17xGZdnfwZ7that/K47/Pr/+XyDnugt5BHAn9cQpBu9KptRIhYdA1Cg=="
+            "configs": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKg==",
+            "not_before": 1700000000,
+            "not_after": 1700021600,
+            "key_id": "1325b850",
+            "sig": "eaavjMihe2EGm3giQq5NArYVD+G1A5AxVzQxXwvGz8C8qKRIEXl/T0TpOZe2bL+OkNmSAIX95uYgA4zGQGXbCg=="
         }
         """
         return json.data(using: .utf8)!
     }
+
+    /// Fixed clock for tests (midpoint of test vector validity window).
+    private let testNow = Date(timeIntervalSince1970: 1700010800)
+
+    /// Test key parameters (from zodl-inc/ohttp test vector).
+    private let testKeyId = "1325b850"
+    private let testPublicKeyHex = "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
 
     func testClientTraceIdAbsentWhenNotSet() async throws {
         var capturedRequest: URLRequest?
@@ -416,6 +424,9 @@ final class OHTTPTests: XCTestCase {
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: nil,
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -465,6 +476,9 @@ final class OHTTPTests: XCTestCase {
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test-wallet",
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -519,6 +533,9 @@ final class OHTTPTests: XCTestCase {
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test",
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -567,6 +584,9 @@ final class OHTTPTests: XCTestCase {
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test@wallet#123",
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 
@@ -620,6 +640,9 @@ final class OHTTPTests: XCTestCase {
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: longPrefix,
+            testNow: testNow,
+            testKeyId: testKeyId,
+            testPublicKeyHex: testPublicKeyHex,
             httpSender: mockSender
         )
 

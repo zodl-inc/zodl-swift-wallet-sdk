@@ -63,27 +63,41 @@ enum OHTTPSignedConfigVerifier {
     /// - Parameters:
     ///   - jsonData: Raw JSON envelope bytes
     ///   - network: Expected network identifier ("mainnet" or "testnet")
+    ///   - now: Clock for time validation (default: system time; tests inject fixed clock)
+    ///   - testKeyId: Test key ID (for tests only; bypasses production key selection)
+    ///   - testPublicKeyHex: Test public key hex (for tests only; bypasses production key)
     /// - Returns: Verified config and expiry time
     /// - Throws: KeyConfigVerificationError if verification fails
-    static func verifyAndParse(jsonData: Data, network: String) throws -> VerifiedOHTTPConfig {
+    static func verifyAndParse(
+        jsonData: Data,
+        network: String,
+        now: @autoclosure () -> Date = Date(),
+        testKeyId: String? = nil,
+        testPublicKeyHex: String? = nil
+    ) throws -> VerifiedOHTTPConfig {
         let decoder = JSONDecoder()
         let envelope = try decoder.decode(SignedOHTTPConfigEnvelope.self, from: jsonData)
-        
+
         // 1. Check protocol version
         guard envelope.v == 1 else {
             throw KeyConfigVerificationError.invalidEnvelope("Unsupported protocol version: \(envelope.v)")
         }
-        
+
         // 2. Check network
         guard envelope.network == network else {
             throw KeyConfigVerificationError.invalidEnvelope(
                 "Network mismatch: expected \(network), got \(envelope.network)"
             )
         }
-        
+
         // 3. Select public key and verify key ID
-        let (publicKeyHex, expectedKeyId) = try selectKey(for: network)
-        
+        let (publicKeyHex, expectedKeyId): (String, String)
+        if let testKey = testPublicKeyHex, let testId = testKeyId {
+            (publicKeyHex, expectedKeyId) = (testKey, testId)
+        } else {
+            (publicKeyHex, expectedKeyId) = try selectKey(for: network)
+        }
+
         guard envelope.key_id == expectedKeyId else {
             throw KeyConfigVerificationError.invalidEnvelope(
                 "Key ID mismatch: expected \(expectedKeyId), got \(envelope.key_id)"
@@ -113,16 +127,16 @@ enum OHTTPSignedConfigVerifier {
         }
         
         // 5. Check time validity
-        let nowSeconds = Int64(Date().timeIntervalSince1970)
+        let nowSeconds = Int64(now().timeIntervalSince1970)
         let minValid = envelope.not_before - timeTolerance
         let maxValid = envelope.not_after + timeTolerance
-        
+
         guard nowSeconds >= minValid && nowSeconds <= maxValid else {
             throw KeyConfigVerificationError.verificationFailed(
                 "Config not valid at current time: now=\(nowSeconds), valid=[\(minValid), \(maxValid)]"
             )
         }
-        
+
         // 6. Enforce maximum validity period (24 hours)
         let validityPeriod = envelope.not_after - envelope.not_before
         guard validityPeriod <= maxValiditySeconds else {
@@ -130,7 +144,7 @@ enum OHTTPSignedConfigVerifier {
                 "Validity period \(validityPeriod)s exceeds maximum \(maxValiditySeconds)s"
             )
         }
-        
+
         // Additional check: notAfter must not be more than 24h in the future
         let maxFutureTime = nowSeconds + maxValiditySeconds
         guard envelope.not_after <= maxFutureTime else {
