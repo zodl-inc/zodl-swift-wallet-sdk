@@ -30,9 +30,13 @@ public enum SaplingParameterDownloader {
     ///     - `saplingParamsInvalidSpendParams` if the downloaded file is invalid.
     @discardableResult
     public static func downloadSpendParameter(_ at: URL, sourceURL: URL, logger: Logger, torClient: TorClient? = nil) async throws -> URL {
-        let resultURL = try await downloadFileWithRequestWithContinuation(sourceURL, logger: logger, at: at, torClient: torClient)
-        try isSpendParamsSHA1Valid(url: resultURL)
-        return resultURL
+        return try await downloadFileWithRequestWithContinuation(
+            sourceURL,
+            logger: logger,
+            at: at,
+            torClient: torClient,
+            validator: isSpendParamsSHA1Valid
+        )
     }
 
     /// Download an Output parameter from default host and stores it at given URL
@@ -45,9 +49,13 @@ public enum SaplingParameterDownloader {
     ///     - `saplingParamsInvalidOutputParams` if the downloaded file is invalid.
     @discardableResult
     public static func downloadOutputParameter(_ at: URL, sourceURL: URL, logger: Logger, torClient: TorClient? = nil) async throws -> URL {
-        let resultURL = try await downloadFileWithRequestWithContinuation(sourceURL, logger: logger, at: at, torClient: torClient)
-        try isOutputParamsSHA1Valid(url: resultURL)
-        return resultURL
+        return try await downloadFileWithRequestWithContinuation(
+            sourceURL,
+            logger: logger,
+            at: at,
+            torClient: torClient,
+            validator: isOutputParamsSHA1Valid
+        )
     }
 
     /// Downloads the parameters if not present and provides the resulting URLs for both parameters
@@ -143,13 +151,14 @@ private extension SaplingParameterDownloader {
     _ sourceURL: URL,
     logger: Logger,
     at destination: URL,
-    torClient: TorClient? = nil
+    torClient: TorClient? = nil,
+    validator: @escaping (URL) throws -> Void
     ) async throws -> URL {
         if let torClient = torClient {
-            return try await downloadFileWithTor(sourceURL, at: destination, logger: logger, torClient: torClient)
+            return try await downloadFileWithTor(sourceURL, at: destination, logger: logger, torClient: torClient, validator: validator)
         } else {
             return try await withCheckedThrowingContinuation { continuation in
-                downloadFileWithRequest(sourceURL, at: destination, logger: logger) { result in
+                downloadFileWithRequest(sourceURL, at: destination, logger: logger, validator: validator) { result in
                     switch result {
                     case .success(let outputResultURL):
                         continuation.resume(returning: outputResultURL)
@@ -165,6 +174,7 @@ private extension SaplingParameterDownloader {
         _ sourceURL: URL,
         at destination: URL,
         logger: Logger,
+        validator: @escaping (URL) throws -> Void,
         result: @escaping (Result<URL, Error>) -> Void
     ) {
         logger.debug("Downloading sapling file from \(sourceURL) via HTTPS")
@@ -175,10 +185,18 @@ private extension SaplingParameterDownloader {
                 return
             } else if let localUrl = url {
                 do {
-                    _ = try FileManager.default.replaceItemAt(destination, withItemAt: localUrl)
+                    // Validate BEFORE moving to destination (atomic: download → validate → move)
+                    try validator(localUrl)
+                    try safelyMoveItem(from: localUrl, to: destination)
                     result(.success(destination))
                 } catch {
-                    result(.failure(ZcashError.saplingParamsCantMoveDownloadedFile(error, sourceURL, destination)))
+                    // Clean up temp file on validation or move failure
+                    try? FileManager.default.removeItem(at: localUrl)
+                    if error is ZcashError {
+                        result(.failure(error))
+                    } else {
+                        result(.failure(ZcashError.saplingParamsCantMoveDownloadedFile(error, sourceURL, destination)))
+                    }
                 }
             }
         }
@@ -192,7 +210,8 @@ private extension SaplingParameterDownloader {
         _ sourceURL: URL,
         at destination: URL,
         logger: Logger,
-        torClient: TorClient
+        torClient: TorClient,
+        validator: @escaping (URL) throws -> Void
     ) async throws -> URL {
         logger.debug("Downloading sapling file from \(sourceURL) via Tor")
 
@@ -206,17 +225,40 @@ private extension SaplingParameterDownloader {
             )
         }
 
-        // Write data to a temp file first, then move to destination
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempFile = tempDir.appendingPathComponent(UUID().uuidString)
+        // Write data to a temp file in the same directory as destination (atomic operations require same filesystem)
+        let parentDir = destination.deletingLastPathComponent()
+        let tempFile = parentDir.appendingPathComponent(UUID().uuidString)
 
         do {
             try data.write(to: tempFile, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: tempFile)
+            // Validate BEFORE moving to destination (atomic: download → validate → move)
+            try validator(tempFile)
+            try safelyMoveItem(from: tempFile, to: destination)
             return destination
         } catch {
             try? FileManager.default.removeItem(at: tempFile)
-            throw ZcashError.saplingParamsCantMoveDownloadedFile(error, sourceURL, destination)
+            if error is ZcashError {
+                throw error
+            } else {
+                throw ZcashError.saplingParamsCantMoveDownloadedFile(error, sourceURL, destination)
+            }
+        }
+    }
+
+    /// Safely moves an item to a destination, handling both first-install (destination doesn't exist)
+    /// and update (destination exists) scenarios atomically.
+    static func safelyMoveItem(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        let destinationExists = (try? fm.attributesOfItem(atPath: destination.path)) != nil
+
+        if destinationExists {
+            // Update scenario: use replaceItemAt for atomic replacement
+            _ = try fm.replaceItemAt(destination, withItemAt: source)
+        } else {
+            // First-install scenario: ensure parent directory exists, then move
+            let parentDir = destination.deletingLastPathComponent()
+            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true, attributes: nil)
+            try fm.moveItem(at: source, to: destination)
         }
     }
 }
