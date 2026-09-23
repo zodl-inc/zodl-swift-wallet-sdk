@@ -110,8 +110,15 @@ actor OHTTPTransport {
             return cached
         }
 
-        // Derive signed config URL from relayURL (replaces /relay with /ohttp-configs/signed)
-        let signedURL = relayURL.replacingOccurrences(of: "/relay", with: "/ohttp-configs/signed")
+        // Derive signed config URL from relayURL (replace path suffix /relay with /ohttp-configs/signed)
+        var signedURL = relayURL
+        if signedURL.hasSuffix("/relay") {
+            signedURL.removeLast("/relay".count)
+            signedURL += "/ohttp-configs/signed"
+        } else {
+            // Fallback: relay URL doesn't end with /relay (unexpected, but handle gracefully)
+            signedURL += "/ohttp-configs/signed"
+        }
 
         // Fetch JSON via hardened httpSender (not URLSession.shared)
         let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS)
