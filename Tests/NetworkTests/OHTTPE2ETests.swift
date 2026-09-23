@@ -569,7 +569,8 @@ final class OHTTPE2ETests: ZcashTestCase {
             // OHTTP only (clearnet → relay → gateway)
             let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
             let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
-            let transport = OHTTPTransport(relayURL: relayURL, keyConfigURL: keyConfigURL)
+            let network = OHTTPEndpoints.network(for: proxyHost)
+            let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL)
 
             // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
             let authority = (proxyHost.lowercased() != originalHost.lowercased()) ? proxyHost : originalHost

@@ -395,6 +395,7 @@ final class OHTTPTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: nil,
@@ -443,6 +444,7 @@ final class OHTTPTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test-wallet",
@@ -496,6 +498,7 @@ final class OHTTPTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test",
@@ -543,6 +546,7 @@ final class OHTTPTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: "test@wallet#123",
@@ -595,6 +599,7 @@ final class OHTTPTests: XCTestCase {
 
         let longPrefix = String(repeating: "a", count: 60)
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             clientTraceIdPrefix: longPrefix,
@@ -647,6 +652,7 @@ final class OHTTPTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             httpSender: torSender
@@ -678,6 +684,7 @@ final class OHTTPTests: XCTestCase {
         // it works as expected for clearnet. We can't easily test the actual URLSession call
         // without mocking URLSession, so this is more of a smoke test that the default path compiles.
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs"
         )
@@ -748,6 +755,7 @@ final class OHTTPTests: XCTestCase {
 
         // Init succeeds with http:// relay (validation is lazy)
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "http://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             httpSender: mockSender
@@ -786,6 +794,7 @@ final class OHTTPTests: XCTestCase {
 
         // Init succeeds with http:// key-config (validation is lazy)
         let transport = OHTTPTransport(
+            network: "testnet",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "http://simulator-relay.example.invalid/ohttp-configs",
             httpSender: mockSender
