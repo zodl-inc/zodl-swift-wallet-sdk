@@ -12,32 +12,6 @@ import XCTest
 
 final class OHTTPRetryTests: XCTestCase {
 
-    /// Mock TorClient that tracks retry attempts and can be configured to fail
-    class MockTorClient: TorClient {
-        var requestCallCount = 0
-        var shouldFail = false
-        var failureError: Error?
-        var capturedRetryLimits: [UInt8] = []
-
-        override func httpRequest(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
-            requestCallCount += 1
-            capturedRetryLimits.append(retryLimit)
-
-            if shouldFail {
-                throw failureError ?? ZcashError.torClientUnavailable
-            }
-
-            // Return a mock success response
-            let response = HTTPURLResponse(
-                url: request.url!,
-                statusCode: 200,
-                httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": "application/json"]
-            )!
-            return (Data(), response)
-        }
-    }
-
     /// Test that OHTTP requests over Tor use retryLimit: 0, preventing replay of sealed ciphertext.
     /// This test proves the C-08 fix: the httpSender in SDKSynchronizer.httpRequestOverOHTTP now
     /// passes retryLimit: 0 to httpRequestOverTor when viaTor is true, ensuring the OHTTP layer's
