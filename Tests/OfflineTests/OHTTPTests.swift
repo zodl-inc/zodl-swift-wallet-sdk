@@ -371,19 +371,19 @@ final class OHTTPTests: XCTestCase {
         return config
     }
 
-    /// Deterministic test vector from zodl-inc/ohttp docs/signed-configs-test-vector.json.
-    /// Signed with test key (public_key_hex: a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0).
-    /// Valid 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
+    /// Deterministic test vector: valid OHTTP key config (X25519/HKDF-SHA256/AES-128-GCM) signed
+    /// with test Ed25519 key (seed 0x22...22, pubkey a09aa5f4..., key_id 1325b850). Valid
+    /// 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
     private func makeValidSignedConfigJSON() -> Data {
         let json = """
         {
             "v": 1,
             "network": "testnet",
-            "configs": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKg==",
+            "configs": "ACgBACBQSjaZn0ic0v28CLr/PYj6AFadIXQFEJ552mYFPF8E7wAEAAEAAQ==",
             "not_before": 1700000000,
             "not_after": 1700021600,
             "key_id": "1325b850",
-            "sig": "eaavjMihe2EGm3giQq5NArYVD+G1A5AxVzQxXwvGz8C8qKRIEXl/T0TpOZe2bL+OkNmSAIX95uYgA4zGQGXbCg=="
+            "sig": "8l3J430E5Lu8Mxr51cGgki1LFv8kXsgo2mFrqaJs804DVxnqMrylJ8URffAN4RBHts0wxQ3x9MVJqw05alxwDg=="
         }
         """
         return json.data(using: .utf8)!
