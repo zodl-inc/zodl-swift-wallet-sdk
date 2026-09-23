@@ -25,31 +25,25 @@ struct SignedOHTTPConfigEnvelope: Codable {
 
 /// Verified OHTTP configuration from signed envelope.
 struct VerifiedOHTTPConfig {
-    let configBytes: Data
-    let keyId: UInt8
-    let validUntil: Int64
+    let keyConfig: OHTTPKeyConfig
+    let validUntil: Date
 }
 
 /// Exception thrown when signed config verification fails.
 enum KeyConfigVerificationError: Error, CustomStringConvertible {
-    case networkError(String)
     case invalidEnvelope(String)
     case verificationFailed(String)
     
     var description: String {
         switch self {
-        case .networkError(let msg): return "Network error: \(msg)"
         case .invalidEnvelope(let msg): return "Invalid envelope: \(msg)"
         case .verificationFailed(let msg): return "Verification failed: \(msg)"
         }
     }
 }
 
-/// Fetches and verifies signed OHTTP key configurations.
-///
-/// Implements fail-closed security: any verification failure results in
-/// OHTTP being unavailable (no fallback to unsigned configs in production).
-enum OHTTPSignedConfigFetcher {
+/// Pure verifier for signed OHTTP key configurations. No network I/O.
+enum OHTTPSignedConfigVerifier {
     // Embedded signing public keys (32 bytes raw Ed25519 public keys, hex)
     private static let mainnetPublicKeyHex = "REDACTED-SIGNING-PUBKEY-MAINNET"
     private static let testnetPublicKeyHex = "REDACTED-SIGNING-PUBKEY-TESTNET"
@@ -61,88 +55,34 @@ enum OHTTPSignedConfigFetcher {
     // Time tolerance (±60 seconds for clock skew)
     private static let timeTolerance: Int64 = 60
     
-    /// Fetches and verifies signed OHTTP configs from the relay endpoint.
+    // Maximum validity period (24 hours)
+    private static let maxValiditySeconds: Int64 = 86400
+    
+    /// Verifies and parses a signed OHTTP config envelope (pure function, no network I/O).
     ///
     /// - Parameters:
-    ///   - relayBaseURL: Base URL of the relay (e.g. "https://testnet-simulator-relay.example.invalid")
-    ///   - network: Network identifier ("mainnet" or "testnet")
-    ///   - allowUnsignedFallback: If true, falls back to unsigned /ohttp-configs on verification failure (DEBUG ONLY)
-    /// - Returns: Verified configuration ready for use
-    /// - Throws: KeyConfigVerificationError if verification fails and no fallback allowed
-    static func fetchAndVerify(
-        relayBaseURL: String,
-        network: String,
-        allowUnsignedFallback: Bool = false
-    ) async throws -> VerifiedOHTTPConfig {
-        let signedURL = deriveSignedConfigURL(from: relayBaseURL)
-        
-        do {
-            let envelope = try await fetchEnvelope(from: signedURL)
-            return try verifyAndExtract(envelope: envelope, expectedNetwork: network)
-        } catch {
-            if allowUnsignedFallback {
-                print("[OHTTP] WARNING: Falling back to unsigned configs (DEBUG MODE)")
-                return try await fetchUnsignedFallback(relayBaseURL: relayBaseURL)
-            }
-            throw KeyConfigVerificationError.verificationFailed("Failed to fetch or verify signed OHTTP configs: \(error)")
-        }
-    }
-    
-    /// Derives the signed config URL from the relay base URL.
-    /// Replaces the path with /ohttp-configs/signed.
-    private static func deriveSignedConfigURL(from relayBaseURL: String) -> String {
-        var url = relayBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if let range = url.range(of: "/relay", options: .backwards) {
-            url = String(url[..<range.lowerBound])
-        } else if let lastSlash = url.lastIndex(of: "/") {
-            url = String(url[..<lastSlash])
-        }
-        return url + "/ohttp-configs/signed"
-    }
-    
-    /// Fetches the signed envelope from the given URL.
-    private static func fetchEnvelope(from urlString: String) async throws -> SignedOHTTPConfigEnvelope {
-        guard let url = URL(string: urlString) else {
-            throw KeyConfigVerificationError.networkError("Invalid URL: \(urlString)")
-        }
-        
-        let (data, response) = try await URLSession.shared.data(from: url)
-        
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw KeyConfigVerificationError.networkError("HTTP \(code) fetching signed configs")
-        }
-        
+    ///   - jsonData: Raw JSON envelope bytes
+    ///   - network: Expected network identifier ("mainnet" or "testnet")
+    /// - Returns: Verified config and expiry time
+    /// - Throws: KeyConfigVerificationError if verification fails
+    static func verifyAndParse(jsonData: Data, network: String) throws -> VerifiedOHTTPConfig {
         let decoder = JSONDecoder()
-        return try decoder.decode(SignedOHTTPConfigEnvelope.self, from: data)
-    }
-    
-    /// Verifies the envelope signature and extracts the config.
-    ///
-    /// Checks:
-    /// 1. Protocol version == 1
-    /// 2. Network matches expected
-    /// 3. Key ID matches embedded public key
-    /// 4. Signature is valid (Ed25519)
-    /// 5. Current time within [not_before - tolerance, not_after + tolerance]
-    private static func verifyAndExtract(
-        envelope: SignedOHTTPConfigEnvelope,
-        expectedNetwork: String
-    ) throws -> VerifiedOHTTPConfig {
+        let envelope = try decoder.decode(SignedOHTTPConfigEnvelope.self, from: jsonData)
+        
         // 1. Check protocol version
         guard envelope.v == 1 else {
             throw KeyConfigVerificationError.invalidEnvelope("Unsupported protocol version: \(envelope.v)")
         }
         
         // 2. Check network
-        guard envelope.network == expectedNetwork else {
+        guard envelope.network == network else {
             throw KeyConfigVerificationError.invalidEnvelope(
-                "Network mismatch: expected \(expectedNetwork), got \(envelope.network)"
+                "Network mismatch: expected \(network), got \(envelope.network)"
             )
         }
         
         // 3. Select public key and verify key ID
-        let (publicKeyHex, expectedKeyId) = try selectKey(for: expectedNetwork)
+        let (publicKeyHex, expectedKeyId) = try selectKey(for: network)
         
         guard envelope.key_id == expectedKeyId else {
             throw KeyConfigVerificationError.invalidEnvelope(
@@ -183,10 +123,29 @@ enum OHTTPSignedConfigFetcher {
             )
         }
         
-        // Extract key ID from first byte of configs
-        let keyId = configData.first ?? 0
+        // 6. Enforce maximum validity period (24 hours)
+        let validityPeriod = envelope.not_after - envelope.not_before
+        guard validityPeriod <= maxValiditySeconds else {
+            throw KeyConfigVerificationError.verificationFailed(
+                "Validity period \(validityPeriod)s exceeds maximum \(maxValiditySeconds)s"
+            )
+        }
         
-        return VerifiedOHTTPConfig(configBytes: configData, keyId: keyId, validUntil: envelope.not_after)
+        // Additional check: notAfter must not be more than 24h in the future
+        let maxFutureTime = nowSeconds + maxValiditySeconds
+        guard envelope.not_after <= maxFutureTime else {
+            throw KeyConfigVerificationError.verificationFailed(
+                "notAfter \(envelope.not_after) exceeds maximum future time \(maxFutureTime)"
+            )
+        }
+        
+        // 7. Parse the config bytes into OHTTPKeyConfig
+        let parsedConfig = try OHTTPKeyConfig.parseSupported(configData)
+        
+        return VerifiedOHTTPConfig(
+            keyConfig: parsedConfig,
+            validUntil: Date(timeIntervalSince1970: TimeInterval(envelope.not_after))
+        )
     }
     
     /// Selects the public key and expected key ID for the given network.
@@ -230,29 +189,6 @@ enum OHTTPSignedConfigFetcher {
         }
         
         return key.isValidSignature(signature, for: message)
-    }
-    
-    /// Unsigned fallback (DEBUG ONLY) - fetches raw RFC 9458 configs without signature verification.
-    private static func fetchUnsignedFallback(relayBaseURL: String) async throws -> VerifiedOHTTPConfig {
-        var url = relayBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if let range = url.range(of: "/relay", options: .backwards) {
-            url = String(url[..<range.lowerBound])
-        }
-        url += "/ohttp-configs"
-        
-        guard let fetchURL = URL(string: url) else {
-            throw KeyConfigVerificationError.networkError("Invalid unsigned config URL")
-        }
-        
-        let (data, response) = try await URLSession.shared.data(from: fetchURL)
-        
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw KeyConfigVerificationError.networkError("HTTP \(code) fetching unsigned configs")
-        }
-        
-        let keyId = data.first ?? 0
-        return VerifiedOHTTPConfig(configBytes: data, keyId: keyId, validUntil: Int64.max)
     }
 }
 

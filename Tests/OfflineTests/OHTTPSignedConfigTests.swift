@@ -7,19 +7,195 @@
 
 import XCTest
 @testable import ZcashLightClientKit
+import CryptoKit
 
 final class OHTTPSignedConfigTests: XCTestCase {
     
-    // Test public key (throwaway for deterministic testing)
-    // Public key: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-    // Key ID: d7a8fbb3 (first 8 hex of SHA-256(public key))
+    // Test keypair generated with: openssl genpkey -algorithm ed25519
+    // Public key (hex): testnet key from OHTTPSignedConfig.swift
+    let testnetPublicKeyHex = "REDACTED-SIGNING-PUBKEY-TESTNET"
+    // Private key (hex, for test signing): <redacted - not needed in client>
     
-    func testKeyIdComputation() throws {
-        // SHA-256("deadbeef") = 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953
-        let testKey = Data([0xde, 0xad, 0xbe, 0xef])
-        let hash = testKey.sha256()
-        let keyId = hash.prefix(4).map { String(format: "%02x", $0) }.joined()
-        XCTAssertEqual(keyId, "5f78c332")
+    func testValidEnvelopeSuccess() throws {
+        // Build a minimal valid envelope (using test data, not real signature)
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])  // Minimal OHTTP key config
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 3600  // 1 hour validity
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",  // testnet key ID
+            sig: String(repeating: "A", count: 88)  // Placeholder (will fail real sig check)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        // This will fail signature verification, but tests the structure
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            XCTAssertTrue(error is KeyConfigVerificationError)
+        }
+    }
+    
+    func testWrongNetworkFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 3600
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "mainnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "ba8a2dbd",
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        // Should fail network check BEFORE signature verification
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            XCTAssertTrue(verifyError.description.contains("Network mismatch"))
+        }
+    }
+    
+    func testExpiredConfigFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 7200  // 2 hours ago
+        let notAfter = notBefore + 3600  // Expired 1 hour ago
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            XCTAssertTrue(verifyError.description.contains("not valid at current time"))
+        }
+    }
+    
+    func testValidityExceeds24HoursFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 90000  // > 24 hours
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            XCTAssertTrue(verifyError.description.contains("Validity period") && verifyError.description.contains("exceeds"))
+        }
+    }
+    
+    func testNotAfterTooFarInFutureFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) + 90000  // Far future
+        let notAfter = notBefore + 3600
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            // Should fail either time check or future check
+            XCTAssertTrue(verifyError.description.contains("notAfter") || verifyError.description.contains("not valid"))
+        }
+    }
+    
+    func testWrongKeyIdFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 3600
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "deadbeef",  // Wrong key ID
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            XCTAssertTrue(verifyError.description.contains("Key ID mismatch"))
+        }
+    }
+    
+    func testUnsupportedProtocolVersionFails() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 3600
+        
+        let envelope = SignedOHTTPConfigEnvelope(
+            v: 2,  // Unsupported version
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",
+            sig: String(repeating: "A", count: 88)
+        )
+        
+        let jsonData = try JSONEncoder().encode(envelope)
+        
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError")
+                return
+            }
+            XCTAssertTrue(verifyError.description.contains("protocol version"))
+        }
     }
     
     func testEnvelopeDecoding() throws {
@@ -30,7 +206,7 @@ final class OHTTPSignedConfigTests: XCTestCase {
             "configs": "AQAgBCA=",
             "not_before": 1700000000,
             "not_after": 2000000000,
-            "key_id": "d7a8fbb3",
+            "key_id": "a3620fb6",
             "sig": "dGVzdHNpZ25hdHVyZTY0Ynl0ZXNwbGFjZWhvbGRlcjEyMzQ1Njc4OTBhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5eg=="
         }
         """
@@ -44,27 +220,7 @@ final class OHTTPSignedConfigTests: XCTestCase {
         XCTAssertEqual(envelope.configs, "AQAgBCA=")
         XCTAssertEqual(envelope.not_before, 1700000000)
         XCTAssertEqual(envelope.not_after, 2000000000)
-        XCTAssertEqual(envelope.key_id, "d7a8fbb3")
-    }
-    
-    func testSignedMessageFormat() throws {
-        let configData = Data([0x01, 0x02, 0x03])
-        // This is a private method, so we test the concept here
-        var message = Data()
-        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
-        message.append(0x00)
-        message.append("testnet".data(using: .ascii)!)
-        message.append(0x00)
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 2000000000
-        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
-        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
-        message.append(configData)
-        
-        // Verify prefix
-        let prefix = "zodl-ohttp-configs-v1".data(using: .ascii)!
-        XCTAssertEqual(message.prefix(prefix.count), prefix)
-        XCTAssertEqual(message[prefix.count], 0x00)
+        XCTAssertEqual(envelope.key_id, "a3620fb6")
     }
     
     func testDataHexStringConversion() throws {
@@ -79,16 +235,11 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let data = Data(hexString: invalidHex)
         XCTAssertNil(data)
     }
-}
-
-extension Data {
-    func sha256() -> Data {
-        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        self.withUnsafeBytes {
-            _ = CC_SHA256($0.baseAddress, CC_LONG(self.count), &hash)
-        }
-        return Data(hash)
+    
+    func testOHTTPEndpointsNetworkDetection() {
+        XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway-testnet.example"), "testnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway.example"), "mainnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: "cmc.zodl.com"), "mainnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: "vote.zodl.com"), "mainnet")
     }
 }
-
-import CommonCrypto

@@ -140,4 +140,10 @@ public enum OHTTPEndpoints {
         comps.host = proxyHost
         return comps.url
     }
+
+    /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.
+    /// Testnet gateway hosts contain "-testnet"; all others default to mainnet.
+    public static func network(for gatewayHost: String) -> String {
+        return gatewayHost.lowercased().contains("-testnet") ? "testnet" : "mainnet"
+    }
 }

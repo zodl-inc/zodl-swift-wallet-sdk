@@ -66,6 +66,10 @@ actor OHTTPTransport {
     /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     private let clientTraceIdPrefix: String?
+    /// Network identifier for signed config verification ("mainnet" or "testnet").
+    private let network: String
+    /// Expiry time for the cached key configuration.
+    private var cachedExpiry: Date?
 
     private static let requestMediaType = "message/ohttp-req"
     private static let responseMediaType = "message/ohttp-res"
@@ -74,6 +78,7 @@ actor OHTTPTransport {
     private static let responseLabel = "message/bhttp response".data(using: .ascii)!
 
     init(
+        network: String,
         relayURL: String,
         keyConfigURL: String,
         connectTimeoutMS: Int = 15000,
@@ -88,6 +93,7 @@ actor OHTTPTransport {
         }
     ) {
         // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
+        self.network = network
         self.relayURL = relayURL
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
@@ -96,16 +102,28 @@ actor OHTTPTransport {
         self.httpSender = httpSender
     }
 
-    /// Fetches (or returns the cached) gateway key configuration.
+    /// Fetches (or returns the cached) gateway key configuration using signed envelope.
+    /// Derives the signed config URL from relayURL and verifies via the pure verifier.
     func keyConfig(forceRefresh: Bool = false) async throws -> OHTTPKeyConfig {
-        if !forceRefresh, let cached = cachedKeyConfig {
+        // Check cache validity (both config and expiry must be present and not expired)
+        if !forceRefresh, let cached = cachedKeyConfig, let expiry = cachedExpiry, Date() < expiry {
             return cached
         }
 
-        let bytes = try await httpGet(url: keyConfigURL, timeoutMS: keyFetchTimeoutMS)
-        let parsed = try OHTTPKeyConfig.parseSupported(bytes)
-        cachedKeyConfig = parsed
-        return parsed
+        // Derive signed config URL from relayURL (replaces /relay with /ohttp-configs/signed)
+        let signedURL = relayURL.replacingOccurrences(of: "/relay", with: "/ohttp-configs/signed")
+
+        // Fetch JSON via hardened httpSender (not URLSession.shared)
+        let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS)
+
+        // Verify and parse through pure verifier (fail-closed: any verification failure throws)
+        let verified = try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: network)
+
+        // Cache both config and expiry
+        cachedKeyConfig = verified.keyConfig
+        cachedExpiry = verified.validUntil
+
+        return verified.keyConfig
     }
 
     /// Performs one OHTTP round trip. A gateway rejection (HTTP 400 from the relay/gateway pair) is

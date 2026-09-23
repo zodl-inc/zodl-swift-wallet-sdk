@@ -154,7 +154,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
         }
 
+        let network = OHTTPEndpoints.network(for: host)
         let transport = OHTTPTransport(
+            network: network,
             relayURL: relayURL,
             keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix,
