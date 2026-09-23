@@ -122,6 +122,16 @@ public enum OHTTPEndpoints {
         return nil
     }
 
+    /// Returns true if the host is an alias that carries gateway-injected secrets (CMC, NEAR, voting).
+    /// These hosts require header stripping before sending to the gateway.
+    /// Case-insensitive check.
+    public static func needsHeaderStripping(host: String) -> Bool {
+        let lowerHost = host.lowercased()
+        // Check if it's one of the alias hosts (values in proxyHostMapping)
+        let aliasHosts = Set(proxyHostMapping.values.map { $0.lowercased() })
+        return aliasHosts.contains(lowerHost)
+    }
+
     /// Rewrites `url` to go through the OHTTP proxy.
     /// For allowlisted hosts: returns the SAME URL (no hostname rewrite; gateway proxies by `:authority`).
     /// For static mappings: substitutes the proxy hostname.

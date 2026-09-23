@@ -167,8 +167,8 @@ actor OHTTPTransport {
         do {
             return try await roundTripWith(keyConfig: keyConfig, request: request, timeoutMS: timeoutMS)
         } catch let error as OHTTPError {
-            // Check if it's a 400 error
-            if case .transportError(let message) = error, message.contains("HTTP 400") {
+            // Check if it's a 400 error (gateway rejection due to key rotation)
+            if case .httpStatusError(statusCode: 400, message: _) = error {
                 // Refresh key config and retry
                 keyConfig = try await self.keyConfig(forceRefresh: true)
                 return try await roundTripWith(keyConfig: keyConfig, request: request, timeoutMS: timeoutMS)
@@ -277,7 +277,8 @@ actor OHTTPTransport {
 
         guard httpResponse.statusCode == 200 else {
             let detail = String(data: data.prefix(200), encoding: .utf8) ?? ""
-            throw OHTTPError.transportError("Relay/gateway returned HTTP \(httpResponse.statusCode)\(detail.isEmpty ? "" : ": \(detail)")")
+            let message = "Relay/gateway returned HTTP \(httpResponse.statusCode)\(detail.isEmpty ? "" : ": \(detail)")"
+            throw OHTTPError.httpStatusError(statusCode: httpResponse.statusCode, message: message)
         }
 
         return data

@@ -251,5 +251,6 @@ enum OHTTPError: Error {
     case hpkeError(String)
     case binaryHttpError(String)
     case transportError(String)
+    case httpStatusError(statusCode: Int, message: String)
     case keyConfigError(String)
 }

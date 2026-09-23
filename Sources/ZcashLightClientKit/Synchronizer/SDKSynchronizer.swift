@@ -1363,7 +1363,10 @@ public class SDKSynchronizer: Synchronizer {
         if viaTor {
             httpSender = { [weak self] request in
                 guard let self else { throw ZcashError.ohttpTransportError }
-                return try await self.httpRequestOverTor(for: request, retryLimit: 3)
+                // C-08 fix: OHTTP ciphertext must not be retried (gateway replay cache returns 409).
+                // The OHTTP layer already retries on key rotation (HTTP 400). Tor transport retries
+                // would resend the same sealed ciphertext, violating the nonce-once invariant.
+                return try await self.httpRequestOverTor(for: request, retryLimit: 0)
             }
         } else {
             httpSender = { request in
@@ -1379,12 +1382,13 @@ public class SDKSynchronizer: Synchronizer {
         let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
 
         let scheme = request.url?.scheme ?? "https"
-        let rawPath = request.url?.path ?? "/"
+        // Use percent-encoded path to preserve special characters
+        let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
         let queryStr = request.url?.query.map { "?\($0)" } ?? ""
 
-        // Strip gateway-injected secrets for mapped hosts (CMC, NEAR).
+        // Strip gateway-injected secrets for alias hosts (CMC, NEAR, voting).
         var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
-        if OHTTPEndpoints.proxyHost(for: request.url!) != nil {
+        if OHTTPEndpoints.needsHeaderStripping(host: host) {
             let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
             let originalCount = headers.count
             headers = headers.filter { !strippedHeaders.contains($0.0) }

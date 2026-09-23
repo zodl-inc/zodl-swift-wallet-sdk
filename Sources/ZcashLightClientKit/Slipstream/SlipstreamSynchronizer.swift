@@ -2833,11 +2833,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
         let network = OHTTPEndpoints.network(for: host)
         let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
         let scheme = request.url?.scheme ?? "https"
-        let path = (request.url?.path ?? "/") + (request.url?.query.map { "?\($0)" } ?? "")
+        // Use percent-encoded path to preserve special characters
+        let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
+        let path = rawPath + (request.url?.query.map { "?\($0)" } ?? "")
 
-        // Strip gateway-injected secrets for mapped hosts (CMC, NEAR).
+        // Strip gateway-injected secrets for alias hosts (CMC, NEAR, voting).
         var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
-        if OHTTPEndpoints.proxyHost(for: request.url!) != nil {
+        if OHTTPEndpoints.needsHeaderStripping(host: host) {
             let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
             let originalCount = headers.count
             headers = headers.filter { !strippedHeaders.contains($0.0) }
