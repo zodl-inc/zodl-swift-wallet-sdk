@@ -431,13 +431,13 @@ final class OHTTPTests: XCTestCase {
         
         // Build JSON envelope
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: network,
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: keyId,
-            sig: Data(signature).base64EncodedString()
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: keyId,
+            signature: Data(signature).base64EncodedString()
         )
         
         return try JSONEncoder().encode(envelope)
@@ -976,7 +976,7 @@ final class OHTTPTests: XCTestCase {
         let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
         
         // Build a valid 43-byte OHTTP key config
-        // Format: [length: u16] [key_id: u8] [kem_id: u16] [public_key: 32 bytes] [suites_length: u16] [kdf_id: u16] [aead_id: u16]
+        // Format: [length: u16] [keyId: u8] [kem_id: u16] [public_key: 32 bytes] [suites_length: u16] [kdf_id: u16] [aead_id: u16]
         var configBytes = Data()
         configBytes.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
         configBytes.append(0x01)  // key_id
@@ -1009,13 +1009,13 @@ final class OHTTPTests: XCTestCase {
         
         // Build JSON envelope
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: network,
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: keyId,
-            sig: Data(signature).base64EncodedString()
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: keyId,
+            signature: Data(signature).base64EncodedString()
         )
         
         let jsonData = try JSONEncoder().encode(envelope)

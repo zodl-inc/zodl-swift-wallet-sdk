@@ -210,13 +210,13 @@ final class OHTTPBehavioralTests: XCTestCase {
         let notAfter = notBefore + 3600
         
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: oversizedConfigBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -240,13 +240,13 @@ final class OHTTPBehavioralTests: XCTestCase {
         let notAfter = notBefore  // Equal (invalid)
         
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -264,13 +264,13 @@ final class OHTTPBehavioralTests: XCTestCase {
         
         // Also test not_before > not_after
         let invalidEnvelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore + 1000,
-            not_after: notBefore,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore + 1000,
+            notAfter: notBefore,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let invalidJsonData = try JSONEncoder().encode(invalidEnvelope)
@@ -313,13 +313,13 @@ final class OHTTPBehavioralTests: XCTestCase {
         let notAfter = notBefore + 3600
         
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configsData.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -345,13 +345,13 @@ final class OHTTPBehavioralTests: XCTestCase {
 
         // Create mainnet envelope
         let mainnetEnvelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "mainnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "ba8a2dbd",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "ba8a2dbd",
+            signature: String(repeating: "A", count: 88)
         )
 
         let mainnetJsonData = try JSONEncoder().encode(mainnetEnvelope)
@@ -370,13 +370,13 @@ final class OHTTPBehavioralTests: XCTestCase {
 
         // Create testnet envelope
         let testnetEnvelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
 
         let testnetJsonData = try JSONEncoder().encode(testnetEnvelope)

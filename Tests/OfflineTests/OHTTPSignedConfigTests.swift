@@ -192,12 +192,12 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let decoder = JSONDecoder()
         let envelope = try decoder.decode(SignedOHTTPConfigEnvelope.self, from: data)
         
-        XCTAssertEqual(envelope.v, 1)
+        XCTAssertEqual(envelope.version, 1)
         XCTAssertEqual(envelope.network, "testnet")
         XCTAssertEqual(envelope.configs, "AQAgBCA=")
-        XCTAssertEqual(envelope.not_before, 1700000000)
-        XCTAssertEqual(envelope.not_after, 2000000000)
-        XCTAssertEqual(envelope.key_id, "a3620fb6")
+        XCTAssertEqual(envelope.notBefore, 1700000000)
+        XCTAssertEqual(envelope.notAfter, 2000000000)
+        XCTAssertEqual(envelope.keyId, "a3620fb6")
     }
     
     func testDataHexStringConversion() throws {
