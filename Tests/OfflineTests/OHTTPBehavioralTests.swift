@@ -227,7 +227,7 @@ final class OHTTPBehavioralTests: XCTestCase {
     
     /// Tests that signed config with not_before >= not_after is rejected.
     func testSignedConfigRejectsInvalidTimeRange() throws {
-        let (signingKey, keyId, _) = makeTestKeyParams()
+        let (signingKey, keyId, publicKeyHex) = makeTestKeyParams()
         let keyConfigBytes = generateMockKeyConfig()
         let notBefore = Int64(Date().timeIntervalSince1970)
         let notAfter = notBefore  // Equal (invalid)
@@ -241,7 +241,12 @@ final class OHTTPBehavioralTests: XCTestCase {
             notAfter: notAfter
         )
 
-        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(
+            jsonData: jsonData,
+            network: "testnet",
+            testKeyId: keyId,
+            testPublicKeyHex: publicKeyHex
+        )) { error in
             guard let verifyError = error as? KeyConfigVerificationError else {
                 XCTFail("Expected KeyConfigVerificationError for invalid time range")
                 return
@@ -261,7 +266,12 @@ final class OHTTPBehavioralTests: XCTestCase {
             notAfter: notBefore
         )
 
-        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: invalidJsonData, network: "testnet")) { error in
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(
+            jsonData: invalidJsonData,
+            network: "testnet",
+            testKeyId: keyId,
+            testPublicKeyHex: publicKeyHex
+        )) { error in
             guard let verifyError = error as? KeyConfigVerificationError else {
                 XCTFail("Expected KeyConfigVerificationError for not_before > not_after")
                 return
@@ -276,7 +286,7 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// Tests that signed config with duplicate key IDs is rejected.
     /// This requires creating a configs blob with multiple key configs having the same keyId.
     func testSignedConfigRejectsDuplicateKeyIds() throws {
-        let (signingKey, keyId, _) = makeTestKeyParams()
+        let (signingKey, keyId, publicKeyHex) = makeTestKeyParams()
 
         // Create two OHTTP key configs with the same keyId (both using keyId=1)
         var configsData = Data()
@@ -313,7 +323,12 @@ final class OHTTPBehavioralTests: XCTestCase {
             notAfter: notAfter
         )
 
-        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: jsonData, network: "testnet")) { error in
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(
+            jsonData: jsonData,
+            network: "testnet",
+            testKeyId: keyId,
+            testPublicKeyHex: publicKeyHex
+        )) { error in
             guard let verifyError = error as? KeyConfigVerificationError else {
                 XCTFail("Expected KeyConfigVerificationError for duplicate keyIds")
                 return
