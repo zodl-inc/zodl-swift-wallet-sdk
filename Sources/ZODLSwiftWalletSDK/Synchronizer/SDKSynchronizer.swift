@@ -665,6 +665,10 @@ public class SDKSynchronizer: Synchronizer {
         return (try? await transactionRepository.getTransactionOutputs(for: transaction.rawID)) ?? []
     }
 
+    public func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        return (try? await transactionRepository.getTransactionOutputs(for: transactions.map(\.rawID))) ?? [:]
+    }
+
     public func latestHeight() async throws -> BlockHeight {
         try await blockProcessor.latestHeight(mode: await sdkFlags.ifTor(.torInGroup("SDKSynchronizer.latestHeight")))
     }
@@ -682,6 +686,10 @@ public class SDKSynchronizer: Synchronizer {
         guard latestState.internalSyncStatus.isPrepared else { return nil }
         guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
         return try await provider.getLocalAccountBalances()
+    }
+
+    public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        await submitPlanStore.plan(for: rawID)?.submissionStatus
     }
 
     /// Fetches the latest ZEC-USD exchange rate.
@@ -1155,7 +1163,7 @@ public class SDKSynchronizer: Synchronizer {
         let isExchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
         // turn Tor on
-        if enabled && !isExchangeRateEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1171,7 +1179,7 @@ public class SDKSynchronizer: Synchronizer {
         let isTorEnabled = await sdkFlags.torEnabled
 
         // turn Tor on
-        if enabled && !isTorEnabled {
+        if enabled {
             try await enableAndStartupTorClient()
         }
 
@@ -1208,6 +1216,35 @@ public class SDKSynchronizer: Synchronizer {
         await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession {
+        switch route {
+        case .direct:
+            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+        case .tor:
+            let torEnabled = await sdkFlags.torEnabled
+            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+            guard torEnabled || exchangeRateEnabled else {
+                throw ZcashError.torNotEnabled
+            }
+
+            let torClient = initializer.container.resolve(TorClient.self)
+
+            return try await torClient.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
@@ -1228,6 +1265,38 @@ public class SDKSynchronizer: Synchronizer {
         }
 
         return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+    }
+
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.httpGetOverTor(for: request, retryLimit: retryLimit, context: context)
+        }
+    }
+
+    private func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        context: TorHTTPRequestContext
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try context.checkCancellation()
+        let torEnabled = await sdkFlags.torEnabled
+        let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+        guard torEnabled || exchangeRateEnabled else {
+            throw ZcashError.torNotEnabled
+        }
+
+        let torClient = initializer.container.resolve(TorClient.self)
+        return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
     }
 
     public func debugDatabase(sql: String) -> String {
@@ -1634,6 +1703,21 @@ public class SDKSynchronizer: Synchronizer {
         if status != .unprepared {
             try await start(retry: true)
         }
+    }
+
+    /// [MOB-1850] The bounded rebuild: switch to `endpoint` first when it names a different server
+    /// (reusing `switchTo`'s own reopen + restart), then start unconditionally. `switchTo` never
+    /// gates on `endpoint` — it always tears down and rebuilds the dependency graph regardless of
+    /// whether the server actually changed — so this only calls it for an actual change, to avoid
+    /// that needless rebuild; `start(retry:)` alone then covers the case `switchTo` does not: the
+    /// synchronizer was not running before the call. `start(retry:)` is idempotent against an
+    /// already-syncing processor (see its `.syncing` case), so calling it after a `switchTo` that
+    /// already restarted one is harmless.
+    public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        if !endpoint.isSameServer(as: initializer.endpoint) {
+            try await switchTo(endpoint: endpoint)
+        }
+        try await start(retry: true)
     }
 
     // MARK: notify state

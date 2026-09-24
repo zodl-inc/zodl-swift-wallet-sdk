@@ -85,6 +85,10 @@ extension MockTransactionRepository: TransactionRepository {
         []
     }
 
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZODLSwiftWalletSDK.ZcashTransaction.Output]] {
+        [:]
+    }
+
     func findPendingTransactions(latestHeight: ZODLSwiftWalletSDK.BlockHeight, offset: Int, limit: Int) async throws -> [ZcashTransaction.Overview] {
         []
     }

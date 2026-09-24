@@ -632,6 +632,21 @@ class BroadcasterMock: Broadcaster {
         }
     }
 
+    // MARK: - releaseForResubmission
+
+    var releaseForResubmissionTransactionsToCallsCount = 0
+    var releaseForResubmissionTransactionsToCalled: Bool {
+        return releaseForResubmissionTransactionsToCallsCount > 0
+    }
+    var releaseForResubmissionTransactionsToReceivedArguments: (transactions: [CreatedTransaction], endpoints: [LightWalletEndpoint])?
+    var releaseForResubmissionTransactionsToClosure: (([CreatedTransaction], [LightWalletEndpoint]) async -> Void)?
+
+    func releaseForResubmission(transactions: [CreatedTransaction], to endpoints: [LightWalletEndpoint]) async {
+        releaseForResubmissionTransactionsToCallsCount += 1
+        releaseForResubmissionTransactionsToReceivedArguments = (transactions: transactions, endpoints: endpoints)
+        await releaseForResubmissionTransactionsToClosure!(transactions, endpoints)
+    }
+
 }
 class CompactBlockRepositoryMock: CompactBlockRepository {
 
@@ -2106,6 +2121,26 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForTransactionsCallsCount = 0
+    var getTransactionOutputsForTransactionsCalled: Bool {
+        return getTransactionOutputsForTransactionsCallsCount > 0
+    }
+    var getTransactionOutputsForTransactionsReceivedTransactions: [ZcashTransaction.Overview]?
+    var getTransactionOutputsForTransactionsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForTransactionsClosure: (([ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] {
+        getTransactionOutputsForTransactionsCallsCount += 1
+        getTransactionOutputsForTransactionsReceivedTransactions = transactions
+        if let closure = getTransactionOutputsForTransactionsClosure {
+            return await closure(transactions)
+        } else {
+            return getTransactionOutputsForTransactionsReturnValue
+        }
+    }
+
     // MARK: - allTransactions
 
     var allTransactionsThrowableError: Error?
@@ -2401,6 +2436,25 @@ class SynchronizerMock: Synchronizer {
         try await switchToEndpointClosure!(endpoint)
     }
 
+    // MARK: - restartSync
+
+    var restartSyncAtThrowableError: Error?
+    var restartSyncAtCallsCount = 0
+    var restartSyncAtCalled: Bool {
+        return restartSyncAtCallsCount > 0
+    }
+    var restartSyncAtReceivedEndpoint: LightWalletEndpoint?
+    var restartSyncAtClosure: ((LightWalletEndpoint) async throws -> Void)?
+
+    func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        if let error = restartSyncAtThrowableError {
+            throw error
+        }
+        restartSyncAtCallsCount += 1
+        restartSyncAtReceivedEndpoint = endpoint
+        try await restartSyncAtClosure!(endpoint)
+    }
+
     // MARK: - isSeedRelevantToAnyDerivedAccount
 
     var isSeedRelevantToAnyDerivedAccountSeedThrowableError: Error?
@@ -2585,6 +2639,54 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - httpGetOverTor
+
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError: Error?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount = 0
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsCalled: Bool {
+        return httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount > 0
+    }
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments: (request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64)?
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue: (data: Data, response: HTTPURLResponse)!
+    var httpGetOverTorForRetryLimitTimeoutMillisecondsClosure: ((URLRequest, UInt8, UInt64) async throws -> (data: Data, response: HTTPURLResponse))?
+
+    func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+        if let error = httpGetOverTorForRetryLimitTimeoutMillisecondsThrowableError {
+            throw error
+        }
+        httpGetOverTorForRetryLimitTimeoutMillisecondsCallsCount += 1
+        httpGetOverTorForRetryLimitTimeoutMillisecondsReceivedArguments = (request: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        if let closure = httpGetOverTorForRetryLimitTimeoutMillisecondsClosure {
+            return try await closure(request, retryLimit, timeoutMilliseconds)
+        } else {
+            return httpGetOverTorForRetryLimitTimeoutMillisecondsReturnValue
+        }
+    }
+
+    // MARK: - makeVotingRoundSession
+
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError: Error?
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount = 0
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochCalled: Bool {
+        return makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount > 0
+    }
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64)?
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue: VotingRoundSession!
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, UInt64) async throws -> VotingRoundSession)?
+
+    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64) async throws -> VotingRoundSession {
+        if let error = makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError {
+            throw error
+        }
+        makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount += 1
+        makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch)
+        if let closure = makeVotingRoundSessionBackendInputsBindingRouteEpochClosure {
+            return try await closure(backend, inputs, binding, route, epoch)
+        } else {
+            return makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue
+        }
+    }
+
     // MARK: - debugDatabase
 
     var debugDatabaseSqlCallsCount = 0
@@ -2761,6 +2863,26 @@ class SynchronizerMock: Synchronizer {
         deleteAccountCallsCount += 1
         deleteAccountReceivedAccountUUID = accountUUID
         try await deleteAccountClosure!(accountUUID)
+    }
+
+    // MARK: - transactionSubmissionStatus
+
+    var transactionSubmissionStatusForCallsCount = 0
+    var transactionSubmissionStatusForCalled: Bool {
+        return transactionSubmissionStatusForCallsCount > 0
+    }
+    var transactionSubmissionStatusForReceivedRawID: Data?
+    var transactionSubmissionStatusForReturnValue: TransactionSubmissionStatus?
+    var transactionSubmissionStatusForClosure: ((Data) async -> TransactionSubmissionStatus?)?
+
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        transactionSubmissionStatusForCallsCount += 1
+        transactionSubmissionStatusForReceivedRawID = rawID
+        if let closure = transactionSubmissionStatusForClosure {
+            return await closure(rawID)
+        } else {
+            return transactionSubmissionStatusForReturnValue
+        }
     }
 
     // MARK: - migrationAdvanceStep
@@ -3978,6 +4100,30 @@ class TransactionRepositoryMock: TransactionRepository {
             return try await closure(rawID)
         } else {
             return getTransactionOutputsForReturnValue
+        }
+    }
+
+    // MARK: - getTransactionOutputs
+
+    var getTransactionOutputsForRawIDsThrowableError: Error?
+    var getTransactionOutputsForRawIDsCallsCount = 0
+    var getTransactionOutputsForRawIDsCalled: Bool {
+        return getTransactionOutputsForRawIDsCallsCount > 0
+    }
+    var getTransactionOutputsForRawIDsReceivedRawIDs: [Data]?
+    var getTransactionOutputsForRawIDsReturnValue: [Data: [ZcashTransaction.Output]]!
+    var getTransactionOutputsForRawIDsClosure: (([Data]) async throws -> [Data: [ZcashTransaction.Output]])?
+
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
+        if let error = getTransactionOutputsForRawIDsThrowableError {
+            throw error
+        }
+        getTransactionOutputsForRawIDsCallsCount += 1
+        getTransactionOutputsForRawIDsReceivedRawIDs = rawIDs
+        if let closure = getTransactionOutputsForRawIDsClosure {
+            return try await closure(rawIDs)
+        } else {
+            return getTransactionOutputsForRawIDsReturnValue
         }
     }
 

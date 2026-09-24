@@ -10,6 +10,553 @@ Changes are relative to `4.1.0`.
 
 ## Added
 
+- `TorClient.httpGet(for:retryLimit:timeoutMilliseconds:)` provides isolated GET requests with a positive timeout covering queue wait, retries, and response body collection. It requires a prepared Tor client.
+
+### Coinholder voting on zcash_voting 5.1
+
+- The voting API is now a round session. `VotingRoundSession` — opened through
+  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` — plans a round,
+  records the ballot, lays out bundles, precomputes, proves, signs, submits, delivers helper shares
+  and confirms them, and answers with a `VotingRoundRunReport` saying where it stopped and why. The
+  step-by-step `VotingRustBackend` calls a host used to sequence itself are gone, so a voting host
+  is rewritten around the session rather than adjusted; `MIGRATING.md` carries the call sequence and
+  the replacement for each removed call. `VotingRustBackend` keeps only the sidecar: opening it,
+  binding it to a wallet, the reads a round list is rendered from, and the maintenance calls made
+  outside a round.
+- A session holds one service configuration — the helper fleet, the vote-tree nodes and the round's
+  timing — over the inputs it was opened with, and both drivers read it on every dispatch rather
+  than capturing it when a run starts. `VotingRoundSession.updateHostConfiguration(_:)` replaces it
+  at any time, including while `run(signer:policy:overrides:events:)` or
+  `trackShares(policy:overrides:events:)` is in flight: a run can take minutes, and this is how a
+  host whose service configuration has moved on gets it to a round already under way. It returns as
+  soon as the merge is recorded, whatever else the session is doing, and throws
+  `VotingRustBackendError.sessionClosed` on a closed session.
+  Every writer merges into that configuration field by field: a `VotingHostOverrides` field that is
+  named replaces the current value, one left absent keeps whatever is in place. The `overrides` a
+  run or a tracking call passes are merged once that call has been admitted — a `sessionBusy` or
+  `sessionClosed` refusal merges nothing — and before its signer is built, so they hold for the
+  session rather than for the one call even when the call goes on to fail, as
+  `run(signer:policy:overrides:events:)` does on a seed it cannot build a signer from. Nothing rolls
+  that merge back, so a host that wants a later call driven against the values the session was
+  opened with names those values on that call.
+- New on the surviving `VotingRustBackend` surface, alongside the session:
+  `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
+  share-tracking schedule are built from), `resetVoteTree(roundId:)`,
+  `deleteRound(roundId:discardingRecovery:)`, `clearBallotIntents(roundId:proposalIds:)`,
+  `keystoneSignatures(roundId:)`, `configureProving(_:)`, and
+  `validateRoundId(_:)`, which reports whether a string is a canonical round id without needing a
+  database or a session. `retryBlockedCombinedCast(roundId:bundleIndex:)` forgets a bundle's
+  combined-cast rejection streak and answers whether there was one: the wallet stops re-proving a
+  delegation the chain keeps refusing, and this is the voter's explicit "the cause is fixed", so it
+  belongs behind a deliberate retry rather than an automatic one. `VotingRoundSession.eligibility()`
+  answers a `VotingEligibilityReport` — distinct note count, eligible weight, whether this account
+  can vote at all, and the value a privacy trim would drop — without persisting anything, so a
+  screen can say "you cannot vote in this round" before a round row exists.
+- `Synchronizer` gained `makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, with the
+  matching `ClosureSynchronizer` and `CombineSynchronizer` counterparts. `VotingTransportRoute`
+  names the route the session's traffic takes for its whole life: `.tor` fails
+  closed, throwing `ZcashError.torNotEnabled` when Tor is off and `ZcashError.torClientUnavailable`
+  when the conformer has no Tor client at all, and never falls back to a direct connection. All
+  three protocols carry a default implementation that opens `.direct` sessions and refuses `.tor`,
+  so existing conformers and test doubles keep compiling unchanged. Every service the session
+  touches takes that route — chain and helper traffic, PIR queries and vote-tree sync — because a
+  PIR query hides which rows are fetched, not who fetches them.
+  That route owns the vote-tree client, which costs bandwidth and memory a host should budget for:
+  a session's first sync of a round's tree starts from scratch rather than continuing the previous
+  session's, so reopening an already-synced round pays for the whole tree again, and a route change
+  — always a new session — resyncs over the new route. This is not only the cost of calling
+  `VotingRoundSession.syncVoteTree(nodeUrl:)`: `run(signer:policy:overrides:events:)` syncs the same
+  tree, on the same session route, whenever it casts a vote, so a host that never calls
+  `syncVoteTree(nodeUrl:)` itself pays it too.
+  The tree also stays in memory after `close()`, for as long as its client holds any round's state
+  — and the client owns the session's transport, which on a `.tor` session is that session's
+  isolated Tor client. It therefore outlives both the session and the voter switching Tor off.
+  `VotingRustBackend.resetVoteTree(roundId:)` releases it, as does closing the sidecar once nothing
+  holds it open. Reset when the voter leaves the round rather than on every `close()`: the reset
+  forgets that round on every tree client of the wallet, a concurrent session's included.
+  The reset is scoped to the sidecar and the wallet id currently bound, so on an account switch call
+  it **before** `VotingRustBackend.setWalletId(_:)` — after the switch it resets the new wallet's
+  clients and leaves the old wallet's tree, and its Tor client, in memory.
+- A run's live events are a best-effort narration and may be dropped under load: the
+  `VotingRoundRunReport` a call returns, not the `VotingRoundDriveEvent` stream, is the authoritative
+  account of what a run did. Events are delivered one at a time on a serial queue per session, and
+  every event of a call arrives before that call returns. The closure must not block that queue, and
+  must not wait on the call that is emitting into it.
+- `VotingBundleLayout` carries `privacyTrimDroppedBundles`, `privacyTrimDroppedNotes`,
+  `privacyTrimDroppedValueZatoshi`, `skippedSuffixBundles`, `skippedSuffixNotes` and
+  `skippedSuffixValueZatoshi`; `VotingEligibilityReport` carries `privacyTrimDroppedValueZatoshi`,
+  `skippedSuffixBundles`, `skippedSuffixNotes` and `skippedSuffixValueZatoshi` — the raw note value a
+  privacy trim withheld and the trailing bundles a host removed with
+  `deleteSkippedBundles(roundId:keepCount:)`, so a screen can show what a round no longer counts.
+  Both report raw note value, not the bundle-quantized voting weight the round counts.
+- The reports carry the round's durable evidence: `VotingRoundRunReport` has `shareDeliveries` and
+  `delegations`, `VotingRoundStepFailure` has `strongestChainState`, `chainOutcome`, `plan`,
+  `shareDeliveries` and `delegation`, `VotingRoundStepProgress` has `step`, `voteCommitStage`,
+  `voteKeys`, `chainOutcome`, `shareDelivery` and `share`, and `VotingShareTrackingRunReport` has
+  `resubmitted` and `ambiguous`. `VotingChainSubmissionOutcome` carries
+  `diagnosticKind: VotingChainDiagnosticKind?` beside `diagnosticMessage`: branch on the kind, never
+  on the message text. The supporting types are `VotingChainDiagnosticKind`, `VotingVoteKey`,
+  `VotingShareDeliveryOutcome`, `VotingShareBatchDeliveryReport`, `VotingSignedDelegation` (a signed
+  bundle is not proof its transaction was submitted or confirmed), `VotingChainSubmissionState`,
+  `VotingChainSubmissionStateEvidence`, `VotingChainSubmissionFailureState`, `VotingVoteCommitStage`
+  and `VotingResubmittedShare`. Every one of these fields decodes leniently, defaulting to empty or
+  absent when a payload omits it, so a report an older core produced still decodes — including a
+  diagnostic that carries a message without a classification, which reads as a `nil`
+  `diagnosticKind` beside an intact `diagnosticMessage` rather than failing the whole outcome.
+  `VotingDelegationStatus` carries the same `diagnosticKind: VotingChainDiagnosticKind?` and
+  `diagnosticMessage: String?` for the diagnostic a sidecar persisted, so a host can show what a
+  delegation drew from the chain even after a restart, when no live chain outcome exists any more.
+  It is always recorded on a `terminal` row; it is also recorded for a bundle whose combined
+  delegate-and-cast batch the chain keeps refusing, which reads `terminal == false` because the
+  bundle is retired to a state it can be cast from again, and it may be recorded while a submission
+  the lifecycle still manages recovers from an ambiguous dispatch. Read the diagnostic from whichever
+  rows carry one rather than from the terminal ones alone.
+- `VotingRoundPlan.hasLegacyInFlightSubmission` reports a round holding a delegation or a vote this
+  wallet built that an older SDK dispatched and never saw confirmed. Upgrading keeps every row of
+  the voting database, but the chain lifecycle this SDK drives owns only the submissions it reserved
+  itself, so such a transaction is not adopted and resuming it is unsupported: running the round
+  plans an advance step and re-dispatches the same transaction — rebuilt from its persisted inputs
+  and re-signed over the stored sighash, so the bytes need not be identical — with no guarantee
+  about the outcome. Check it before bundle setup, precompute or `run(signer:policy:overrides:events:)`, and
+  treat such a round as display-only. `VotingRoundSession.plan()`,
+  `VotingRoundSession.setBallotIntents(_:)` and `VotingRustBackend.roundPlan(roundId:proposalIds:)`
+  answer it; the plans embedded in run reports and events do not carry it and read as `false`. Share
+  tracking is unaffected, and rounds the older build only set up or saw through to confirmation
+  report `false`. A delegation imported from a capability package also reports `false` and is driven
+  normally: its transaction was broadcast elsewhere and the lifecycle adopts the hash rather than
+  dispatching anything again. See `MIGRATING.md`.
+
+## Fixed
+
+- A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
+  Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
+  Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
+  final-owner runtime shutdown can extend completion beyond the HTTP timer. This hardening adds no further
+  public signature changes, and the existing GET/POST routes remain unchanged.
+- `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
+- `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
+
+## Changed
+
+- Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
+
+### Coinholder voting on zcash_voting 5.1
+
+- Voting runs on `zcash_voting` 5.1.0 (pinned exactly) with its `lrz` backend. The delegation
+  circuit (voting-circuits 0.12) is unchanged from the 4.0.x line this SDK already shipped, so it
+  does not gate this upgrade. What does: a vote chain must serve the `delegate-and-cast-vote-batch`
+  and `cast-vote-batch` routes. The former has no fallback, and an HTTP 404 or 405 from either route
+  is not proof that a mutation was never dispatched — a host sees it as
+  `VotingChainDiagnosticKind.endpointUnsupported` when the answer carries the gateway's own error
+  envelope, and as `.routeAnswerReplaced` when it does not. See `MIGRATING.md`'s rollout note before
+  shipping against a chain that has not been upgraded.
+- The host's existing sidecar file is migrated in place, from schema 13 to 24, the
+  first time `VotingRustBackend.open(path:networkId:)` opens it. Nothing changes at the call site,
+  and rounds already stored survive; an SDK build older than this one can no longer open the
+  migrated file, so a downgrade leaves the voting sidecar unusable.
+- Voting backends opened on one sidecar path share one connection to it. A second
+  `VotingRustBackend.open(path:networkId:)` on a path already open — through another backend or
+  through a `VotingRoundSession` still holding it — reuses that connection instead of opening a
+  second one, so writers serialize on it rather than contending for the file lock, and only the
+  first open migrates the file. A path whose file has been deleted or replaced since it was opened
+  is not reused: the open creates a fresh database there, while whatever still holds the old
+  connection keeps writing into a database no path names any more. Close every session, then the
+  backend, before deleting a sidecar; see `MIGRATING.md`.
+- Every failing voting call now throws the crate's own `VotingError`, which carries `kind`
+  (`VotingErrorKind`: `invalidInput`, `keystoneSignatureConflict`, `proofFailed`, `busy`, `storage`,
+  `internal`, `insufficientEligibility`, `noSpendableNotes`, `setupAlreadyPersisted`,
+  `delegationPcztUnavailable`, `dbBusy`, `pirUnavailable`, `delegationTargetMismatch`,
+  `delegationAlreadyBroadcast`, `other`), `retryable`, `message`, and `bundleIndex`, `httpStatus`
+  and `endpoint` for the kinds that have them. `VotingRustBackendError.rustError(_:)` and
+  `.invalidData(_:)` are removed with it: a `catch` that bound their `String` stops compiling, and
+  the replacement is `catch let error as VotingError` with a `switch` on `error.kind` — the kinds a
+  screen shows rather than reports (`noSpendableNotes`, `insufficientEligibility`) are states, not
+  faults. `VotingRustBackendError` keeps `databaseAlreadyOpen` and `databaseNotOpen` and gains
+  `sessionClosed` and `sessionBusy`, which are the wrapper's own refusals before any call is made;
+  an exhaustive `switch` over it stops compiling until those two are handled.
+- Members that kept their name and changed: `listRounds()` answers the new `VotingRoundSummary`,
+  whose `phase` is a `String` rather than the removed `VotingRoundPhase` enum and which gained
+  `walletId` and `network` — a `switch` over the old enum is replaced by a comparison against the
+  crate's phase strings, or better by `VotingRoundPlan.primaryAction`.
+  `syncVoteTree(roundId:nodeUrl:)` is `VotingRoundSession.syncVoteTree(nodeUrl:)`, `async` and
+  taking no round id — the session is already bound to one — so the sync takes the session's
+  route instead of reaching the node directly.
+  `deleteSkippedBundles(roundId:keepCount:)` returns `UInt64` instead of `UInt32`.
+  `setupBundles(roundId:notes:)` is `VotingRoundSession.setupBundles()`, `async` and returning
+  `VotingBundleLayout` instead of `VotingBundleSetupResult`. `resetSessionState(roundId:)` and the
+  new `resetVoteTree(roundId:)` refuse an empty round id rather than resetting every round's cached
+  tree state. `VotingKeystoneSignatureRecord`'s `sig`, `sighash` and `randomizedKey` are `Data`
+  instead of `[UInt8]`.
+- `warmProvingCaches()` returns at once and warms in the background instead of warming on the
+  calling thread, and the new `configureProving(_:)` must run **before** it: warming starts the
+  proving pool, and starting it fixes the policy, after which `configureProving(_:)` returns `false`
+  for any policy that disagrees with the one already in force and leaves the running pool alone. A
+  host that cares which policy is live must treat `false` as "mine was not applied".
+- `VotingRustBackend.withInteractiveProvingBoost` (public since 4.5.0) survives the rewrite. It now
+  wraps `VotingRoundSession.run(signer:policy:overrides:events:)` and
+  `precomputeDelegationProof(bundleIndex:progress:)` rather than the removed
+  `buildAndProveDelegation(intent:)`, so every delegation proof pays the interactive boost, whether it
+  runs ahead of time through precompute or during a run; the `.speculative`, non-boosted intent that
+  call took has no replacement.
+- Voting hotkey generation (`generateHotkey(networkId:)`, `hotkey(fromStoredSecret:networkId:)`),
+  the software signer, and `open(path:networkId:)` now accept the regtest network id and resolve
+  their voting identity through the registered custom network's base network — a modified-mainnet
+  chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
+  the call.
+- Voting on a custom network is supported only where its consensus branch at the round's snapshot
+  height is the same one the base network selects there. Note selection honours the registered
+  activation heights, but delegation does not and cannot: the voting crate derives the delegation
+  branch from the base network alone and rejects any other. Voting runs on NU6.3 on both sides, so
+  where the two differ at least one has not reached NU6.3 at that height, and at least one half
+  refuses the round on its own.
+  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and
+  throws `VotingError` with `kind == .invalidInput` when they disagree, naming both branches and the
+  snapshot height, as the first thing it does once its inputs decode. A host on a custom chain picks
+  the rounds whose snapshot falls where the schedules agree, and keeps the registered heights
+  mirroring the node's own `nuparams`, which is what sync and spending resolve against. Mainnet and
+  testnet are unaffected — a standard network is its own schedule and agrees at every height. A
+  regtest base is the one stock configuration this turns away:
+  `ZcashNetworkBuilder.network(for: .regtest)` activates NU6.3 at height 1 while the voting crate's
+  own regtest schedule activates it at height 10, so a round whose snapshot height is below 10 is
+  refused there.
+- New rounds use the crate's default bundle policy, privacy trim included: trailing low-value
+  bundles are dropped until at most two remain, as long as what is dropped stays within 1% of the
+  selected value and 1,000 ZEC. Any number of bundles can go that way, so a wallet with a long dust
+  tail loses the whole tail rather than two of it; `VotingBundleLayout` reports what was dropped.
+
+## Removed
+
+### Coinholder voting on zcash_voting 5.1
+
+- Removed from `VotingRustBackend` (45 methods): `addSentServers`, `buildAndProveDelegation`,
+  `buildPczt`, `clearKeystoneSignature`, `clearRecoveryState`, `clearRound`, `commitVote`,
+  `computeShareNullifier`, `confirmVoteSubmission`, `extractPcztSighash`, `extractSpendAuthSig`,
+  `generateDelegationInputs`, `generateNoteWitnesses`, `generateVanWitness`, `getBundleCount`,
+  `getCommitmentBundle`, `getDelegationSubmission`, `getDelegationTxHash`, `getKeystoneSignatures`,
+  `getRoundState`, `getShareDelegations`, `getStoredPcztSighash`, `getUnconfirmedDelegations`,
+  `getVoteTxHash`, `getVotes`, `getWalletNotes`, `initRound`, `markShareConfirmed`,
+  `markVoteSubmitted`, `precomputeDelegationPir`, `recordShareDelegation`, `recordVcPosition`,
+  `recoverWireJson`, `recoverableShareIndices`, `resetTreeClient`, `restoreRecoveredDelegation`,
+  `signDelegationRequest`, `storeDelegationTxHash`, `storeKeystoneSignature`, `storeTreeState`,
+  `storeVanPosition`, `storeVoteTxHash`, `validatePirProof`, `vanCommitment` and `verifyWitness`.
+  What to call instead:
+  - Proving, signing, submitting, casting, delivering shares and confirming them are
+    `VotingRoundSession.run(signer:policy:overrides:events:)`, with
+    `VotingDelegationSigner.software(seed:)` or `.keystoneStored` naming the signing material. The
+    seed reaches only the Rust signer, for that call, and is zeroized there: sighashes, PCZTs and
+    spend-auth signatures no longer cross into Swift for a software wallet at all.
+  - Preparing one bundle ahead of a run is `VotingRoundSession.precomputePir(bundleIndex:)` and
+    `precomputeDelegationProof(bundleIndex:progress:)`.
+  - Keystone signing is `VotingRoundSession.keystoneSigningRequests(bundleIndices:)` and
+    `storeKeystoneSignatures(_:)`, with `VotingRustBackend.keystoneSignatures(roundId:)` for what is
+    stored. Signatures are stored one batch at a time, idempotently; there is no single-signature
+    store or clear. Each response is read and then checked against the request it answers first: one
+    that is not a signed PCZT carrying a spend-authorization signature, and one whose signature does
+    not sign its bundle's current signing request, both throw `VotingErrorKind.invalidInput` and
+    store nothing of the batch. `VotingError.bundleIndex` names the bundle whose response was
+    refused, so a host offers a rescan of that bundle rather than restarting the round; a response
+    from before the round's bundles were rebuilt needs a fresh
+    `keystoneSigningRequests(bundleIndices:)` first, because a request is built from the bundle's
+    stored PCZT, sighash and randomized key. Those checks are why there is nothing to undo — the
+    first signature stored for a bundle is the one it keeps.
+  - Reading what a round owes is `VotingRoundSession.plan()` or
+    `VotingRustBackend.roundPlan(roundId:proposalIds:)`, both answering `VotingRoundPlan`, plus
+    `listRounds()` and `pendingShareRounds()`. A plan is made against the proposal roster the host
+    authenticated, so a proposal the host cannot vouch for is never planned for.
+  - Chasing unconfirmed helper shares is `VotingRoundSession.trackShares(policy:overrides:events:)`.
+  - `restoreRecoveredDelegation` and `clearRecoveryState` have no replacement: a round recovers from
+    its own persisted state when a session runs it again, and the only deliberate discard is
+    `deleteRound(roundId:discardingRecovery: true)`.
+  - Three of the removed names are moves rather than lost capability: `clearRound(roundId:)` is now
+    `deleteRound(roundId:discardingRecovery:)`, `getKeystoneSignatures(roundId:)` is
+    `keystoneSignatures(roundId:)`, and `precomputeDelegationPir(roundId:bundleIndex:notes:…)` is
+    `VotingRoundSession.precomputePir(bundleIndex:)`, which takes neither notes nor endpoints
+    because the session already holds them.
+- Removed public types (31): `HTTPPirSnapshotProbe`, `PirSnapshotProbeOutcome`,
+  `PirSnapshotProbing`, `PirSnapshotResolver`, `PirSnapshotResolverError`,
+  `RecoveredDelegationBundle`, `RecoveredDelegationRestoreRequest`,
+  `RecoveredDelegationRestoreResult`, `VotingBuildPcztParams`, `VotingBundleSetupResult`,
+  `VotingDelegationInputs`, `VotingDelegationKeyInputs`, `VotingDelegationPirPrecomputeResult`,
+  `VotingDelegationProofParams`, `VotingDelegationProofResult`, `VotingDelegationSignature`,
+  `VotingDelegationSubmission`, `VotingNoteInfo`, `VotingPczt`, `VotingPirProof`,
+  `VotingProvingIntent`, `VotingRoundPhase`, `VotingRoundState`, `VotingShareDelegation`,
+  `VotingStoredCommitmentBundle`, `VotingVanWitness`, `VotingVoteCommit`, `VotingVoteConfirmation`,
+  `VotingVoteRecord`, `VotingWireEncryptedShare` and `VotingWitnessData`. The wire and witness types
+  are gone because those payloads no longer cross the boundary; `VotingNoteInfo` is gone because the
+  session selects notes from the wallet itself, so a host no longer assembles a note list to vote
+  with; `VotingProvingIntent` is gone with `buildAndProveDelegation(intent:)`, the only call that
+  took one — see the Changed section for what its boost behavior folds into.
+- The five `PirSnapshot*` types went with `precomputeDelegationPir`, the only call that used them:
+  `VotingSessionInputs.pirEndpoints` now goes straight to the crate's PIR fleet, which normalizes
+  and dedupes the list but does not probe it for the round's snapshot. A server serving a different
+  snapshot is caught where it matters — the circuit root is compared against the round's stored
+  `nullifier_imt_root` and a mismatch fails the call — but it fails as `VotingErrorKind.invalidInput`
+  rather than as a transport failure, so the fleet does **not** fail over to the next endpoint. A
+  host is therefore responsible for supplying endpoints that serve the round's snapshot: filter them
+  before opening the session if the fleet may hold servers that are behind or ahead.
+
+# 4.5.0 - 2026-09-15
+
+## Added
+
+### Transaction outputs in one read
+
+- `Synchronizer.getTransactionOutputs(for transactions:)` returns the outputs of many transactions
+  at once, keyed by `rawID`, in one `v_tx_outputs` query per 500 transactions. The
+  single-transaction `getTransactionOutputs(for:)` runs one query per call, and every such query
+  first materialises the wallet's whole notes union, so a client that mapped a long history one
+  row at a time paid transactions × notes for it — 1,256 queries and 25 seconds for a
+  1,255-transaction wallet on an iPhone 15, before any contention. The same rows come back in
+  milliseconds through this call. Output order within a transaction is by pool and then output
+  index, for this call and for the single-transaction one alike; a transaction without outputs has
+  no entry. The protocol requirement ships with a default implementation that falls back to one
+  single-transaction read per transaction, so custom `Synchronizer` conformers and test doubles
+  keep compiling unchanged; both shipped synchronizers override it with the batched read.
+
+### Coinholder polling
+
+- `VotingRustBackend.buildAndProveDelegation` takes a `VotingProvingIntent`. `.interactive`
+  (default) behaves as before; `.speculative` runs the proof at utility priority without the
+  pool-wide boost, for a proof a host prepares before the user asks for it.
+  `withInteractiveProvingBoost` and `interactiveProvingBoostCount` are public so a host can raise
+  the pool while it waits on a speculative proof.
+
+## Changed
+
+### Coinholder polling
+
+- Voting runs on `zcash_voting` 4.0.0-rc.1. The 4.0 line keeps the 3.0 API and adopts the
+  voting-circuits 0.12.0 delegation circuit, so rounds may carry proposal ids 1 to 50 (was 1 to 15)
+  and a wallet built on it votes only on chains upgraded to that circuit. No existing voting
+  signature changed (the one addition is under Added); the crate now also accepts `vote_protocol`
+  v1 configs alongside v0 and writes its sidecar under immediate SQLite transactions. Building the
+  Rust core from source now requires Rust 1.91.
+- The PIR client is connected once per voting database handle and reused across the bundles and
+  phases of a round (delegation PIR precompute and delegation proof), instead of once per call. The
+  connection is keyed by endpoint, layout, and the round's persisted snapshot root, so a server,
+  geometry, or snapshot change reconnects. A connected client's actual circuit root must match the
+  stored round before the SDK caches or reuses it.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3480000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3482500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4340000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4350000.json
+````
+
+# 4.4.0 - 2026-09-10
+
+## Added
+
+### Spendable balance masking
+
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
+  is currently masked because the engine has not yet confirmed a fresh chain tip — the only signal
+  that separates "the wallet cannot spend this" from "the SDK is not willing to say yet," which a
+  zero balance alone cannot express (an empty wallet, funds still confirming, and a masked balance
+  all read as zero). It clears once the refreshed tip's chain-tip range has been scanned (or the
+  pass completes), so the value it uncovers is one the wallet database can already vouch for and a
+  client can safely drive a "working it out" affordance from it. The property is additive: the
+  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
+  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
+  without reporting it here.
+
+### Submissions
+
+- `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
+  has got with the servers, so a sent transaction can be shown as handed over instead of as still
+  sending for the minutes it waits to be mined. It returns the new `TransactionSubmissionStatus`:
+  `.awaiting` (created, not sent yet), `.submitted` (sent, no server has acknowledged it), or
+  `.accepted(host:)`, whose `host` is the `host:port` of the server that took it into its mempool.
+  `nil` means the SDK has nothing to say — a transaction it never recorded, or a moment when its
+  record cannot be read. The method has a default implementation returning `nil`, so custom
+  `Synchronizer` conformers and test doubles keep compiling unchanged; the same method, and the
+  same default, is on `ClosureSynchronizer` and `CombineSynchronizer`. Acceptance describes
+  submission only, never mining: the SDK keeps resubmitting an accepted transaction until it is
+  mined or expires, exactly as before. The SDK's submit-plan database gained one nullable column
+  to record this; the change is additive and the file stays readable and writable by older SDK
+  builds on the same device.
+
+### Recovery
+
+- `Synchronizer.restartSync(at:)` rebuilds the sync engine at the given endpoint — the same server
+  or a different one — and starts a pass regardless of whether one was running. Call it when the
+  SDK's own stall recovery has given up (`SynchronizerEvent.syncStalled(attempt:gaveUp: true)`): a
+  plain `start()` cannot rebuild a handle a failed reopen left behind, and the Slipstream
+  `switchTo(endpoint:)` only restarts a pass that was already running and no-ops on the current
+  server. Throws what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
+  engine start errors), plus whatever the engine rebuild itself throws. The method has a default
+  implementation that reports the capability as unavailable, so custom `Synchronizer` conformers
+  and test doubles keep compiling unchanged; the same method, with the same default, is on
+  `ClosureSynchronizer` (`restartSync(at:completion:)`) and `CombineSynchronizer` (`restartSync(at:)
+  -> CompletablePublisher<Error>`).
+
+### Resubmission
+
+- `Broadcaster.releaseForResubmission(transactions:to:)` records a submit plan for transactions
+  the app created but could not hand to a server itself, so the SDK's background resubmission
+  broadcasts them on its normal cadence with the same transaction ids. Makes no network attempt
+  of its own; an empty endpoint list records nothing and the transactions stay awaiting. The
+  method has a default implementation that does nothing, so custom `Broadcaster` conformers
+  without submit-plan bookkeeping keep compiling unchanged.
+
+
+## Changed
+
+- `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
+  `restartSync(at:)` now throw `ZcashError.slipstreamEngineNotQuiescent` (`ZRUST0155`), and
+  `rewind(_:)` and `wipe()` now fail their publisher with it, leaving the wallet untouched, when
+  the engine could not confirm within its bounded stop budget that its previous pass and wallet
+  writer had stopped; previously the mutation proceeded on the assumption that they had. The pass
+  and its writer are each given their own budget, and a refused call that had stopped a running
+  pass restarts it before reporting the failure, so the wait can be noticeably longer than a
+  single budget. The refusal
+  persists across repeated stops: an aborted pass that outlived one stop's budget keeps every
+  later stop refusing until that pass has actually finished, not only the most recent one. The
+  SDK's own stall recovery meets the same refusal when it reopens the engine and reports it as
+  `.error(ZcashError.slipstreamEngineNotQuiescent)` on the state stream together with
+  `SynchronizerEvent.syncStalled(attempt:gaveUp: true)`. `SlipstreamEngine.stop()` now returns
+  whether the stop was quiescent. `SDKSynchronizer` is unaffected.
+- `SlipstreamSynchronizer.restartSync(at:)` now throws `CancellationError` and leaves the engine
+  untouched when the calling task was cancelled before the restart began executing (a restart
+  already under way completes). Hosts that cancel a restart, for example when the app enters the
+  background, no longer get a pass started behind their own stop. `SDKSynchronizer` is unaffected.
+  The call still returns only once its queued lifecycle operation is reached, so a cancelled call
+  is not necessarily prompt to return.
+- `SlipstreamSynchronizer` now bounds each candidate's `getInfo` probe to 5 s instead of the
+  endpoint's much longer gRPC single-call default, so a slow or unreachable server can no longer
+  make a call take an unbounded amount of time. `evaluateServerSwitch` and `evaluateBestOf` share
+  that benchmark, and a server that does not answer within the bound is now dropped from it rather
+  than ranked late: `evaluateBestOf` can return FEWER endpoints than the `kServers` it was asked
+  for, and an empty array when nothing answers in time, where it previously ranked the slow server
+  and returned a full list. A caller that indexes into the result, or that assumes it is
+  non-empty, must handle the shorter list — an empty result means "no server qualified", not "stay
+  where you are". `evaluateServerSwitch` keeps its shape: a benchmark nothing survives leaves it
+  returning `nil`, as it already did whenever no candidate was worth a switch. On both
+  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server is now skipped when the first
+  benchmark round produced no results at all — nothing answered, so a second call could not have
+  fared any better; the outcome is unchanged.
+- `SynchronizerEvent` gained the case `syncStalled(attempt:gaveUp:)`. An exhaustive `switch` over
+  `SynchronizerEvent` stops compiling until the new case is handled; matching with `if case`, or a
+  `switch` with a `default`, needs no change — see `MIGRATING.md`. The event reports a sync pass
+  that made no progress for the stall window. The Slipstream synchronizer no longer merely logs
+  such a pass — it restarts it, up to 3 times per engine handle, and reopens the endpoint already
+  in use rather than moving the user to another server. Three restarts have two waits between
+  them: the SDK waits at least 60 seconds before the second and at least 120 before the third. In
+  practice the observed gap is about 120 seconds throughout, because a restarted pass cannot be
+  seen to stall again until the 120-second stall window of the new pass has elapsed. The event is
+  emitted before each restart begins (`gaveUp == false`, `attempt` 1-based), and once more when
+  the SDK stops trying (`gaveUp == true`) — because the cap is reached, or because a restart could
+  not bring the pass back up at all; only that second case additionally moves the sync status to
+  `.error`. The budget belongs to the handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each
+  hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
+  as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
+
+
+## Fixed
+
+- Slipstream lifecycle operations (start, stop, server switch, account import and delete, rewind,
+  wipe, and the stall recovery restart) now run one at a time on a single lifecycle queue, and a
+  poll tick that was suspended while one of them ran no longer emits events or schedules a recovery
+  for a pass that is gone. Previously a stale tick could resurrect a deliberately stopped
+  synchronizer, and a recovery restart could tear down a newer pass or start the engine inside an
+  account mutation's stopped interval.
+- `SynchronizerState.isSpendableMasked` now always describes the balances carried in the same
+  emission: a poll that falls back to the previous balances carries their mask flag, and a
+  standalone `getAccountsBalances()` read no longer changes the flag the next emission reports.
+- A server acceptance that arrives for a submission started before `wipe()` no longer recreates
+  the deleted submit-plan store; the store tracks its lifecycle and ignores writes from a previous
+  one.
+- Cancelling a delegation proof while the PIR servers are still being probed no longer lets the
+  proof start afterwards: the resolver and the proving call now check for cancellation before
+  entering the FFI.
+- A transaction created through `Broadcaster` while a `wipe()` lands mid-creation no longer has
+  its "awaiting submission" mark recreate the deleted submit-plan store; like the existing
+  acceptance guard, the mark is dropped when it belongs to a lifecycle the store has since wiped.
+- `Synchronizer.deleteAccount(_:)` now restarts sync after a failed deletion too, the same way a
+  failed account import or rewind already do. Previously a deletion that failed before reaching
+  the engine left the synchronizer stopped, with no automatic recovery.
+- A restart that fails after a successful account import, delete, or rewind is now reported on
+  `SynchronizerState.internalSyncStatus` as `.error`, the same way a failed stall-recovery restart
+  already is. Previously the failure was silent: the mutation itself had already succeeded, so
+  nothing was thrown, and the synchronizer was left reporting `.syncing` with no pass running.
+- A submit-plan release that arrives after `wipe()` no longer recreates the wiped store: reads
+  never create the store file, and only a transaction created in the current wallet lifecycle can
+  be released to background resubmission.
+- Background resubmission treats a submit-plan store whose creation failed as unavailable again and
+  skips the transaction, instead of reading the missing file as a never-written store and
+  broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
+  already reported no status for that case.
+- The state `start()` publishes before its first pass and the `.stopped` state `stop()` publishes
+  now carry `fullyScannedHeight`, like every in-pass state. Previously they omitted it, so it read
+  as 0 next to a real chain tip, and a client sizing "blocks remaining" as
+  `latestBlockHeight − fullyScannedHeight` saw the whole chain as unsynced for the moment before
+  the first in-pass state arrived.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3392500.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3477500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4100000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4330000.json
+````
+
+# 4.3.0 - 2026-09-08
+
+## Added
+
+### Voting
+
+- `VotingRustBackend.restoreRecoveredDelegation(_:)`, `RecoveredDelegationRestoreRequest`,
+  `RecoveredDelegationBundle` and `RecoveredDelegationRestoreResult` restore a delegation from
+  recovered `(bundle_index, total_note_value, van_comm_rand, delegation_tx_hash)` tuples. The
+  call refuses to clear a round that holds votes, shares, Keystone signatures, or any bundle
+  the package does not restore, and reports `.alreadyRestored` without writing when the round
+  already holds the package. The package must be contiguous from bundle zero and cover every
+  bundle the round holds; it may extend a prefix restored earlier. Each
+  bundle carries `van`, the commitment the recovered row held; the call refuses a bundle whose
+  blinding and weight do not open it before clearing anything. The request takes a
+  `VotingHotkey`; its secret is unwrapped only at the FFI boundary, and the recovered blinding
+  factors are `Undescribable`.
+- `VotingRustBackend.vanCommitment(hotkey:networkId:roundId:totalNoteValue:vanCommRand:)` returns
+  the VAN commitment those inputs open, the value the restore recomputes per bundle.
+- `VotingRustBackend.hotkey(fromStoredSecret:networkId:)` returns the `VotingHotkey` a persisted
+  stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
+  that want the semantic type.
+
+## Changed
+
+- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
+  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
+  on-chain shape as a migration `transfer`, but not a migration this account made. Such
+  transactions were previously reported as `notClassified`. An exhaustive `switch` over
+  `ZIP318Kind` stops compiling until the new case is handled.
+
+# 4.2.0 - 2026-09-03
+
+## Added
+
 ### Balances
 
 - `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
@@ -74,14 +621,13 @@ Changes are relative to `4.1.0`.
   certificate of that — `detail` renders a payload only when it has that type, so the raw strings
   still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
   device at `debug!` level.
-- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
-  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
-  on-chain shape as a migration `transfer`, but not a migration this account made. Such
-  transactions were previously reported as `notClassified`. An exhaustive `switch` over
-  `ZIP318Kind` stops compiling until the new case is handled.
 
 ## Fixed
 
+- `SyncStatus.==` now reports `.stopped` equal to `.stopped`. Previously two `.stopped` values
+  compared unequal, so any `Equatable` type that embeds a `SyncStatus`, such as `SynchronizerState`,
+  could never equal itself while the synchronizer was stopped, and code diffing consecutive states
+  saw a change on every stopped tick. No call-site edit is needed.
 - The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
   endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
   stream previously recorded a near-zero time and won the ranking outright.

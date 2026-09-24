@@ -115,7 +115,7 @@ mod voting;
 mod os_log;
 
 use crate::error_report::{ClassifiedError, ErrorKind};
-use crate::tor::TorRuntime;
+use crate::tor::{TorRuntime, http::with_http_timeout};
 
 fn unwrap_exc_or<T>(exc: Result<T, ()>, def: T) -> T {
     match exc {
@@ -3759,6 +3759,68 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
     headers_len: usize,
     retry_limit: u8,
 ) -> *mut ffi::HttpResponseBytes {
+    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None) }
+}
+
+/// Makes an HTTP GET request over Tor with a whole-operation timeout.
+///
+/// `retry_limit` is the maximum number of times that a failed request should be retried.
+/// You can disable retries by setting this to 0.
+///
+/// `timeout_ms` must be positive. It limits the whole request, including connecting, all request
+/// attempts and retries, and response-body collection. If the deadline expires, this function
+/// returns null and stores `Tor HTTP request timed out` in the thread-local error channel.
+///
+/// # Safety
+///
+/// - `tor_runtime` must be a non-null pointer returned by a `zcashlc_*` method with
+///   return type `*mut TorRuntime` that has not previously been freed.
+/// - `tor_runtime` must not be passed to two FFI calls at the same time.
+/// - `url` must be non-null and must point to a null-terminated UTF-8 string.
+/// - `headers` must be non-null and valid for reads for
+///   `headers_len * size_of::<ffi::HttpRequestHeader>()` bytes, and it must be properly
+///   aligned. This means in particular:
+///   - The entire memory range of this slice must be contained within a single allocated
+///     object! Slices can never span across multiple allocated objects.
+///   - `headers` must be non-null and aligned even for zero-length slices.
+/// - `headers` must point to `headers_len` consecutive properly initialized values of
+///   type `ffi::HttpRequestHeader`.
+/// - The memory referenced by `headers` must not be mutated for the duration of the function
+///   call.
+/// - The total size `headers_len * size_of::<ffi::HttpRequestHeader>()` of the slice must
+///   be no larger than `isize::MAX`, and adding that size to `headers` must not "wrap
+///   around" the address space. See the safety documentation of pointer::offset.
+/// - Call [`zcashlc_free_http_response_bytes`] to free the memory associated with the
+///   returned pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_get_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    retry_limit: u8,
+    timeout_ms: u64,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_get_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            retry_limit,
+            Some(timeout_ms),
+        )
+    }
+}
+
+unsafe fn tor_http_get_impl(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    retry_limit: u8,
+    timeout_ms: Option<u64>,
+) -> *mut ffi::HttpResponseBytes {
     // SAFETY: Callers would have to do the following for unwind safety (#194):
     // - using `*mut TorRuntime` and respecting mutability rules on the Swift side, to
     //   avoid observing the effects of a panic in another thread.
@@ -3766,6 +3828,10 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
     let tor_runtime = AssertUnwindSafe(tor_runtime);
 
     let res = catch_panic(|| {
+        if timeout_ms == Some(0) {
+            anyhow::bail!("Tor HTTP timeout must be positive");
+        }
+
         let tor_runtime =
             unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
 
@@ -3783,29 +3849,57 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let request_headers = |builder: http::request::Builder| {
+            headers.iter().fold(builder, |builder, (key, value)| {
+                builder.header(*key, *value)
+            })
+        };
+        let collect_response_body = |body| collect_http_response_body(body);
+        let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            #[cfg(test)]
+            crate::tor::http::network_tests::observe_retry(
+                res.as_ref().map(|status| status.as_u16()).map_err(|_| ()),
+            );
+            res.is_err()
+                .then_some(zcash_client_backend::tor::http::Retry::Same)
+        };
+
         let response = tor_runtime.runtime().block_on(async {
-            tor_runtime
-                .client()
-                .http_get(
-                    url,
-                    |builder| {
-                        headers.iter().fold(builder, |builder, (key, value)| {
-                            builder.header(*key, *value)
-                        })
-                    },
-                    |body| async { Ok(body.collect().await.map_err(HttpError::from)?.to_bytes()) },
-                    retry_limit,
-                    |res| {
-                        res.is_err()
-                            .then_some(zcash_client_backend::tor::http::Retry::Same)
-                    },
-                )
-                .await
+            let operation = async {
+                let response = tor_runtime
+                    .client()
+                    .http_get(
+                        url,
+                        request_headers,
+                        collect_response_body,
+                        retry_limit,
+                        retry_filter,
+                    )
+                    .await?;
+                anyhow::Ok(response)
+            };
+
+            match timeout_ms {
+                Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
+                None => operation.await,
+            }
         })?;
 
         ffi::HttpResponseBytes::from_rust(response)
     });
     unwrap_exc_or_null(res)
+}
+
+async fn collect_http_response_body<B>(
+    body: B,
+) -> Result<bytes::Bytes, zcash_client_backend::tor::Error>
+where
+    B: BodyExt,
+    HttpError: From<B::Error>,
+{
+    #[cfg(test)]
+    crate::tor::http::network_tests::observe_body();
+    Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
 }
 
 /// Makes an HTTP POST request over Tor.
@@ -4640,6 +4734,52 @@ impl Parameters for NetworkParams {
 static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
     std::sync::RwLock::new(None);
 
+/// Serializes the tests that write [`CUSTOM_PARAMS`].
+///
+/// The slot is process-global and the harness runs tests in parallel threads of
+/// a single process, so a test that registers a custom network is visible to
+/// every other test in the binary — including the ones that assert the slot is
+/// unset, or that a *different* network is registered. Every test that touches
+/// it holds [`CustomNetworkGuard`] for its whole body instead.
+#[cfg(test)]
+static CUSTOM_PARAMS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Exclusive use of the process-global custom-network slot for one test, with
+/// whatever was registered before put back when the test ends.
+///
+/// There is no FFI way to clear the slot — [`zcashlc_set_custom_network`] only
+/// ever writes a registration — so restoring is this guard's job.
+#[cfg(test)]
+pub(crate) struct CustomNetworkGuard {
+    /// Held for the guard's lifetime; dropped after [`Drop::drop`] restores.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<(NetworkType, LocalNetwork)>,
+}
+
+#[cfg(test)]
+impl Drop for CustomNetworkGuard {
+    fn drop(&mut self) {
+        // A test that panicked while holding a lock poisons it, and the slot
+        // still has to go back: otherwise every test that runs afterwards
+        // inherits the network of whichever test failed.
+        let mut slot = CUSTOM_PARAMS.write().unwrap_or_else(|e| e.into_inner());
+        *slot = self.previous;
+    }
+}
+
+/// Take the custom-network slot for the duration of the calling test.
+#[cfg(test)]
+pub(crate) fn lock_custom_network() -> CustomNetworkGuard {
+    let lock = CUSTOM_PARAMS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = *CUSTOM_PARAMS.read().unwrap_or_else(|e| e.into_inner());
+    CustomNetworkGuard {
+        _lock: lock,
+        previous,
+    }
+}
+
 /// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
 fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
     match network_id {
@@ -4835,6 +4975,160 @@ mod tests {
             TEST_ANCHOR_RETENTION_INTERVAL,
         );
     }
+
+    /// [MOB-1850] A wallet writer still holding the gate when the drain's budget runs out is a
+    /// NON-QUIESCENT stop, and the drain must say so. Logging the timeout away and answering
+    /// "quiescent" is what let the host mutate the wallet on top of a live engine writer.
+    #[test]
+    fn drain_reports_a_writer_that_outlives_the_deadline() {
+        let progress = slipstream_core::ProgressArc::default();
+        // The RAII gate is the engine's own way of holding the counter up for the life of a
+        // commit, so the test raises it exactly as the persist lane does.
+        let gate = slipstream_core::events::WalletWriterGate::hold(progress.clone());
+        let quiescent =
+            drain_slipstream_wallet_writers_until(&progress, std::time::Duration::from_millis(50));
+        assert!(
+            !quiescent,
+            "a writer still running at the deadline must be reported, not logged away"
+        );
+        drop(gate);
+        assert!(drain_slipstream_wallet_writers_until(
+            &progress,
+            std::time::Duration::from_millis(50)
+        ));
+    }
+
+    /// Releases a `spawn_gated_pass` loop, explicitly via `release()` or implicitly when this
+    /// guard is dropped. A failing assertion panics and unwinds BEFORE a test reaches its explicit
+    /// release, and local variables are dropped in reverse declaration order during unwinding, so a
+    /// guard declared after the runtime is always dropped — and so releases its worker thread —
+    /// before the runtime itself is. Without that, `Runtime::drop` would block forever joining a
+    /// worker still parked in the gated loop, turning a failing assertion into a hang.
+    struct PassRelease(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl PassRelease {
+        fn release(&self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for PassRelease {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Spawns a pass parked in a synchronous loop (no await point, so `abort()` cannot take it
+    /// down) and returns its join handle plus the guard that releases it.
+    fn spawn_gated_pass(
+        runtime: &tokio::runtime::Runtime,
+    ) -> (tokio::task::JoinHandle<()>, PassRelease) {
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held, running) = (release.clone(), started.clone());
+        let task = runtime.spawn(async move {
+            running.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !held.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (task, PassRelease(release))
+    }
+
+    /// [MOB-1850] The pass half of the same contract, and the reason a pass has to STAY on record.
+    /// `abort()` cannot interrupt a task that is inside a synchronous stretch, so one that is still
+    /// there when the budget runs out must be reported — and it must go on being reported by every
+    /// later stop, because taking the handle out of the slot is not the same as the pass finishing.
+    #[test]
+    fn a_repeated_stop_stays_non_quiescent_while_the_original_pass_is_unfinished() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = std::time::Duration::from_millis(50);
+        let (first, release_first) = spawn_gated_pass(&runtime);
+        let observer = first.abort_handle();
+        let mut slot = Some(first.abort_handle());
+        let mut unfinished: Vec<tokio::task::AbortHandle> = Vec::new();
+
+        assert!(
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "first stop: the pass outlives the budget"
+        );
+        assert!(
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "second stop must not claim quiescence while the first pass still runs"
+        );
+        assert!(!observer.is_finished());
+
+        // A start-style replacement installs a new pass while the old one is still unfinished.
+        let (second, release_second) = spawn_gated_pass(&runtime);
+        let _ = settle_engine_passes(&mut slot, &mut unfinished, budget);
+        slot = Some(second.abort_handle());
+        assert!(
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "a stop after a replacement must still see the original unfinished pass"
+        );
+        assert_eq!(
+            unfinished.len(),
+            2,
+            "both unfinished passes stay on record after the replacement"
+        );
+
+        release_first.release();
+        release_second.release();
+        assert!(
+            settle_engine_passes(
+                &mut slot,
+                &mut unfinished,
+                std::time::Duration::from_secs(5)
+            ),
+            "quiescence once every pass has actually finished"
+        );
+        assert!(unfinished.is_empty());
+    }
+
+    /// [MOB-1852] `update_chain_tip` re-queues the blocks up to the new tip as unscanned, and until
+    /// they are scanned the wallet database reports every non-stabilized note as unspendable. A
+    /// refresh alone therefore proves the tip moved, not that the spendable value can be trusted:
+    /// freshness has to wait for the ChainTip-priority range to complete (`spendable_hint == 1`).
+    #[test]
+    fn a_refreshed_tip_is_not_fresh_until_its_chain_tip_range_is_scanned() {
+        assert!(
+            !fresh_tip_decision(false, true, 1, 0),
+            "refreshed but not yet scanned to: the mask must stay on"
+        );
+        assert!(
+            fresh_tip_decision(false, true, 1, 1),
+            "refreshed and the chain-tip range completed: fresh"
+        );
+    }
+
+    /// [MOB-1852] The rest of the rule is unchanged: the latch holds for the run, a pass that
+    /// reached Done proves the tip, and nothing else does.
+    #[test]
+    fn tip_freshness_keeps_its_latch_and_its_done_rule() {
+        assert!(
+            fresh_tip_decision(true, false, 1, 0),
+            "a latched fresh tip stays fresh within the run"
+        );
+        assert!(
+            fresh_tip_decision(false, false, 3, 0),
+            "a pass that reached Done proves the tip"
+        );
+        assert!(
+            !fresh_tip_decision(false, false, 1, 0),
+            "no refresh and not Done: not fresh"
+        );
+        assert!(
+            !fresh_tip_decision(false, false, 1, 1),
+            "a completed range without a refresh this run proves nothing"
+        );
+    }
 }
 
 // ── Slipstream FFI surface ────────────────────────────────────────────────────
@@ -4894,6 +5188,12 @@ pub struct SlipstreamHandle {
     /// [API v2.1 E-2] `stop()` timestamp: freshness survives a stop→start hop shorter than
     /// 120 s (the SDK's `SDKFlags.sdkStarted` quick-background parity).
     last_stop_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// [MOB-1850] Aborted passes that had not finished when a stop or start gave up waiting; a
+    /// later stop reports quiescence only once this is empty. The only handle the engine itself
+    /// keeps is `inner.task`, and the stop that aborts a pass TAKES it — so without this record
+    /// the next stop finds an empty slot and reports a pass quiescent that it never watched
+    /// finish, while that pass is still inside a synchronous wallet write.
+    unfinished_passes: Vec<tokio::task::AbortHandle>,
     /// [v0.7 P1b] Alternate lightwalletd servers for probe-then-commit + wire
     /// failover. Set via [`zcashlc_slipstream_set_alternate_servers`]; each
     /// `start()` merges them into the pass config, deduped against the
@@ -4971,11 +5271,14 @@ pub struct FfiSlipstreamSnapshot {
     pub stalled_seconds: u32,
     // ── API v2.1 fields (appended at END for padding stability) ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]
-    /// stale-tip fact, engine-owned): the engine's tip-refresh counter advanced past its
-    /// `start()` baseline (bumped only after `update_chain_tip` succeeds), or a pass
-    /// reached Done. Survives stop→start hops shorter than 120 s. While 0, hosts must
-    /// mask spendable balances (the mask transform stays host-side because the C
-    /// `AccountBalance` cannot express the awaiting-resolution shift).
+    /// stale-tip fact, engine-owned) AND has since completed a ChainTip-priority scan range
+    /// (`spendable_hint` = 1), or once a pass reached Done. The tip-refresh counter advancing
+    /// past its `start()` baseline (bumped only after `update_chain_tip` succeeds) proves the
+    /// tip moved; the completed range proves the wallet database can vouch for the spendable
+    /// value at that tip — between the two it reports every non-stabilized note as unspendable.
+    /// Survives stop→start hops shorter than 120 s. While 0, hosts must mask spendable balances
+    /// (the mask transform stays host-side because the C `AccountBalance` cannot express the
+    /// awaiting-resolution shift).
     pub tip_fresh: u8,
     /// [E-4] Monotonic version of the wallet's stored transaction set: bumps exactly when
     /// enhancement stores/updates a tx, the mempool monitor stores a 0-conf hit, a range
@@ -5174,6 +5477,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             tip_refreshes_at_run_start: std::sync::atomic::AtomicU64::new(0),
             tip_fresh: std::sync::atomic::AtomicBool::new(false),
             last_stop_at: std::sync::Mutex::new(None),
+            unfinished_passes: Vec::new(),
             alternate_servers: std::sync::Mutex::new(Vec::new()),
             post_flip_hold: std::sync::Mutex::new(PostFlipHold::default()),
         })))
@@ -5318,19 +5622,32 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let h = &mut handle.inner;
-
         // Cancel any in-flight task before spawning a new one.
-        if let Some(task) = h.task.take() {
-            task.abort();
-            join_aborted_slipstream_task(&task);
-        }
+        // [MOB-1850] The result is deliberately ignored HERE: a start proceeds either way, as it
+        // always has (a same-handle restart is safe). Only the stop-then-mutate callers act on the
+        // flag, and they reach it through `zcashlc_slipstream_stop` — but a pass this start could
+        // not wait out STAYS on record, so the next stop still answers for it. The borrow is split
+        // in its own scope so the rest of the function keeps the plain `&mut handle.inner` it had.
+        let _ = {
+            let SlipstreamHandle {
+                inner,
+                unfinished_passes,
+                ..
+            } = &mut *handle;
+            settle_engine_passes(
+                &mut inner.task,
+                unfinished_passes,
+                std::time::Duration::from_secs(10),
+            )
+        };
+
+        let h = &mut handle.inner;
         // [B4-16 drain] The aborted pass's write-behind commit may still be running
         // (`spawn_blocking` — uncancellable); wait it out BEFORE spawning the new
         // session, so the new pass's first writes never collide with an orphan
         // ("database is locked" at pass start) and no orphan Scanned-mark can land
         // after this point. Kills the B4-12 orphan-overlap class at the root.
-        drain_slipstream_wallet_writers(&h.progress);
+        let _ = drain_slipstream_wallet_writers(&h.progress);
         *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Syncing;
 
         let ufvk_str: Option<String> = if ufvk.is_null() || ufvk_len == 0 {
@@ -5513,10 +5830,15 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
     unwrap_exc_or(res, false)
 }
 
-/// Stops any in-flight Slipstream sync (non-blocking — task abort is async).
+/// Stops any in-flight Slipstream sync and waits, bounded, for the wallet file to fall quiet.
 ///
-/// Returns `true` immediately. The handle remains live; poll
-/// [`zcashlc_slipstream_snapshot`] to confirm state transitions to idle.
+/// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the aborted pass finished
+/// unwinding AND no wallet writer was still in flight by the time the ten-second budget ran out,
+/// `false` when either outlived it. A `false` answer does not mean the stop failed — the engine
+/// is Idle either way — it means the wallet file was never proved free of the engine's own
+/// writers, so a caller about to mutate that file (import, delete, truncate) should refuse rather
+/// than write on top of one. The handle remains live; poll [`zcashlc_slipstream_snapshot`] to
+/// confirm state transitions to idle.
 ///
 /// # Safety
 ///
@@ -5534,21 +5856,94 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
             .last_stop_at
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+        // [MOB-1850] Every pass this handle has aborted and not yet watched finish is settled
+        // here, not just the one in the slot: a previous stop that gave up waiting TOOK that
+        // slot's handle, and the pass it gave up on is exactly the writer this stop must not
+        // report away. Split borrow so `unfinished_passes` and `inner` are held at once.
+        let settled = {
+            let SlipstreamHandle {
+                inner,
+                unfinished_passes,
+                ..
+            } = &mut *handle;
+            settle_engine_passes(
+                &mut inner.task,
+                unfinished_passes,
+                std::time::Duration::from_secs(10),
+            )
+        };
         let h = &mut handle.inner;
-        if let Some(task) = h.task.take() {
-            task.abort();
-            join_aborted_slipstream_task(&task);
-        }
         // [B4-16 drain] abort() cannot cancel an in-flight write-behind commit
         // (`spawn_blocking`) — drain it so a returned stop means the wallet file is
         // QUIESCENT: the host's next write (deleteAccount / importAccount / rewind
         // truncate) can no longer interleave with an orphan commit. Swift hops this
         // call off the cooperative pool (the drain is a real, bounded wait).
-        drain_slipstream_wallet_writers(&h.progress);
+        let drained = drain_slipstream_wallet_writers(&h.progress);
         *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Idle;
-        Ok(true)
+        // [MOB-1850] The pass is stopped either way — the state goes Idle above regardless. What
+        // the answer reports is whether the wallet file was PROVED quiescent, which is the only
+        // thing a caller about to mutate it can act on.
+        Ok(settled && drained)
     });
     unwrap_exc_or(res, false)
+}
+
+/// [MOB-1852] The freshness rule behind `SlipstreamHandle::tip_fresh_now`, kept free of the
+/// handle so it can be tested as a table. A refresh proves the wallet-database tip moved; only
+/// a completed ChainTip-priority scan (`spendable_hint == 1`) or a pass that reached Done
+/// (`state == 3`) proves the database can also vouch for the spendable value at that tip —
+/// between the two, `update_chain_tip` has queued the blocks up to the new tip as unscanned and
+/// librustzcash reports every non-stabilized note as unspendable, so lifting the mask at the
+/// refresh would uncover a transient zero. A latched tip stays fresh for the run.
+fn fresh_tip_decision(
+    latched: bool,
+    refresh_advanced: bool,
+    state: u8,
+    spendable_hint: u8,
+) -> bool {
+    if latched {
+        return true;
+    }
+    state == 3 || (refresh_advanced && spendable_hint == 1)
+}
+
+/// Aborts the running pass (if any), keeps every pass that has not finished yet on record, and
+/// waits within `budget` for all of them to finish. Returns whether the engine is quiescent with
+/// respect to its passes. A pass that outlives the budget STAYS on record, so a later stop cannot
+/// claim quiescence merely because the most recent handle has already been taken.
+///
+/// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
+/// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
+/// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
+/// window failed its read→write lock upgrade, "error + try again") can land AFTER
+/// `abort()` returns. Wait (bounded) for the task to finish unwinding. Combined with
+/// `drain_slipstream_wallet_writers` (the persist lane's `spawn_blocking` commit — the
+/// engine's ONLY detached writer), a stop/start-abort that returns `true` means the wallet
+/// file is FULLY quiescent; `false` means it could not be proved so within the budget.
+fn settle_engine_passes(
+    task_slot: &mut Option<tokio::task::AbortHandle>,
+    unfinished: &mut Vec<tokio::task::AbortHandle>,
+    budget: std::time::Duration,
+) -> bool {
+    if let Some(task) = task_slot.take() {
+        task.abort();
+        unfinished.push(task);
+    }
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        unfinished.retain(|task| !task.is_finished());
+        if unfinished.is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "slipstream stop/start: {} aborted pass(es) still unwinding at the deadline — reporting a non-quiescent stop",
+                unfinished.len()
+            );
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// [B4-16 drain] Bounded wait for the engine's in-flight wallet-file writer — the
@@ -5557,39 +5952,29 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
 /// restart, collided with the new pass's first writes ("database is locked" →
 /// non-transient failure, absorbed by the revival loop) and — worse — landed its
 /// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
-/// account's scan scope. Called by stop() and start() right after aborting the task.
-/// 10 s cap ≫ the worst observed device commit (a few seconds, A10); on timeout we
-/// proceed with a warning — the busy_timeouts remain the backstop.
-/// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
-/// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
-/// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
-/// window failed its read→write lock upgrade, "error + try again") can land AFTER
-/// `abort()` returns. Wait (bounded) for the task to finish unwinding. Combined with
-/// `drain_slipstream_wallet_writers` (the persist lane's `spawn_blocking` commit — the
-/// engine's ONLY detached writer), a completed stop/start-abort means the wallet file is
-/// FULLY quiescent.
-fn join_aborted_slipstream_task(task: &tokio::task::AbortHandle) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !task.is_finished() {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "slipstream stop/start: aborted pass still unwinding after 10 s — proceeding"
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+/// account's scan scope. Called by stop() and start() right after settling the passes.
+/// 10 s cap ≫ the worst observed device commit (a few seconds, A10). [MOB-1850] A timeout
+/// is REPORTED (`false`) rather than logged away: a caller that is about to mutate the wallet
+/// needs to know the file was never proved quiescent, and can refuse instead of writing on top
+/// of a live writer. The busy_timeouts remain the backstop for the callers that proceed anyway.
+fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) -> bool {
+    drain_slipstream_wallet_writers_until(progress, std::time::Duration::from_secs(10))
 }
 
-fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+/// The bounded body of [`drain_slipstream_wallet_writers`], with the budget as a parameter so a
+/// test can exercise the deadline branch without waiting ten seconds for it.
+fn drain_slipstream_wallet_writers_until(
+    progress: &slipstream_core::ProgressArc,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
     let mut waited = false;
     while progress.wallet_writers() > 0 {
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "slipstream stop/start: in-flight wallet commit still running after 10 s — proceeding (busy_timeouts remain the backstop)"
+                "slipstream stop/start: in-flight wallet commit still running at the deadline — reporting a non-quiescent stop"
             );
-            return;
+            return false;
         }
         waited = true;
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -5597,6 +5982,7 @@ fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) {
     if waited {
         tracing::info!("slipstream stop/start: drained in-flight wallet commit");
     }
+    true
 }
 
 /// Reads a snapshot of current Slipstream progress atomics (non-blocking, poll-based — D8).
@@ -5631,7 +6017,11 @@ pub unsafe extern "C" fn zcashlc_slipstream_snapshot(
             is_recovering: s.is_recovering,
             progress_permille: s.progress_permille,
             stalled_seconds: s.stalled_seconds,
-            tip_fresh: if handle.tip_fresh_now(s.state) { 1 } else { 0 },
+            tip_fresh: if handle.tip_fresh_now(s.state, s.spendable_hint) {
+                1
+            } else {
+                0
+            },
             tx_set_version: s.tx_set_version,
         })
     });
@@ -5639,27 +6029,28 @@ pub unsafe extern "C" fn zcashlc_slipstream_snapshot(
 }
 
 impl SlipstreamHandle {
-    /// [API v2.1 E-2] Lazily evaluates + latches tip freshness — the exact
-    /// `shouldMarkChainTipUpdated` semantics the SDK derived host-side:
+    /// [API v2.1 E-2] Lazily evaluates + latches tip freshness — the `shouldMarkChainTipUpdated`
+    /// semantics the SDK derived host-side, tightened by [MOB-1852]; the rule itself is
+    /// `fresh_tip_decision`:
     /// - already fresh → stays fresh (until a >120 s stop→start gap re-masks in `start()`);
-    /// - the refresh counter advanced past its `start()` baseline → the engine bumps it
-    ///   only AFTER `session.update_chain_tip` succeeds, so an advance proves THIS run
-    ///   refreshed the wallet-DB tip (counter-based so the E-3 DB-seeded tip can neither
-    ///   fake freshness nor mask a refresh that fetched the same height);
+    /// - the refresh counter advanced past its `start()` baseline AND this pass has completed a
+    ///   ChainTip-priority range (`spendable_hint == 1`) → fresh. The engine bumps the counter
+    ///   only AFTER `session.update_chain_tip` succeeds, so an advance proves THIS run refreshed
+    ///   the wallet-DB tip (counter-based so the E-3 DB-seeded tip can neither fake freshness nor
+    ///   mask a refresh that fetched the same height); the hint proves the database has been
+    ///   scanned to that tip, without which it reports every non-stabilized note as unspendable;
     /// - otherwise → trust only a pass that reached Done (state 3): `sync_once` cannot
-    ///   complete without `update_chain_tip` having succeeded.
-    fn tip_fresh_now(&self, state: u8) -> bool {
+    ///   complete without `update_chain_tip` having succeeded and the tip range scanned.
+    fn tip_fresh_now(&self, state: u8, spendable_hint: u8) -> bool {
         use std::sync::atomic::Ordering;
-        if self.tip_fresh.load(Ordering::Relaxed) {
-            return true;
-        }
+        let latched = self.tip_fresh.load(Ordering::Relaxed);
         let advanced = self.inner.progress.tip_refreshes()
             > self.tip_refreshes_at_run_start.load(Ordering::Relaxed);
-        if advanced || state == 3 {
+        let fresh = fresh_tip_decision(latched, advanced, state, spendable_hint);
+        if fresh && !latched {
             self.tip_fresh.store(true, Ordering::Relaxed);
-            return true;
         }
-        false
+        fresh
     }
 }
 

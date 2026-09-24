@@ -195,11 +195,37 @@ public protocol ClosureSynchronizer {
     func getAccountsBalances(_ completion: @escaping (Result<[AccountUUID: AccountBalance], Error>) -> Void)
     func getLocalAccountBalances(_ completion: @escaping (Result<[AccountUUID: AccountBalance]?, Error>) -> Void)
 
+    /// Closure counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
+    func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void)
+
+    /// Closure counterpart of `Synchronizer.restartSync(at:)`.
+    func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void)
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date, completion: @escaping (BlockHeight) -> Void)
 
+    // swiftlint:disable:next function_parameter_count
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64,
+        completion: @escaping (Result<VotingRoundSession, Error>) -> Void
+    )
+
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
+
+    /// Closure adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    /// It preserves that method's original timeout budget, late-admission prevention, and owned cleanup.
+    /// This adapter exposes no cancellation handle; the completion reports the underlying async result.
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    )
 
     var broadcaster: Broadcaster { get }
 

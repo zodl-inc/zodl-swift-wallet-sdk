@@ -279,6 +279,18 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
+        AsyncToCombineGateway.executeAction() {
+            await self.synchronizer.transactionSubmissionStatus(for: rawID)
+        }
+    }
+
+    public func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.restartSync(at: endpoint)
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }
@@ -291,9 +303,37 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         return subject.eraseToAnyPublisher()
     }
 
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) -> SinglePublisher<VotingRoundSession, Error> {
+        AsyncToCombineGateway.executeThrowingAction {
+            try await self.synchronizer.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                route: route,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
             try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)
+        }
+    }
+
+    public func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.httpGetOverTor(for: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
         }
     }
 
