@@ -249,19 +249,20 @@ final class OHTTPAuditFixTests: XCTestCase {
 
     /// Generates a minimal mock key config for testing.
     private func generateMockKeyConfig() -> Data {
-        // Minimal key config: keyId=1, KEM=0x0020 (DHKEM(X25519, HKDF-SHA256)), 32-byte public key
+        // Build a valid 43-byte OHTTP key config
+        // Format: [length: u16] [keyId: u8] [kem_id: u16] [public_key: 32 bytes] [suites_length: u16] [kdf_id: u16] [aead_id: u16]
         var config = Data()
-        config.append(1)  // keyId
-        config.append(contentsOf: [0x00, 0x20])  // KEM ID (DHKEM X25519)
+        config.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
+        config.append(0x01)  // key_id
+        config.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
 
-        // Generate a random 32-byte X25519 public key for testing
+        // Generate a random X25519 public key for the config
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let publicKeyData = privateKey.publicKey.rawRepresentation
-        config.append(publicKeyData)
+        config.append(privateKey.publicKey.rawRepresentation)
 
-        // KDF and AEAD suite IDs (HKDF-SHA256, AES-128-GCM)
-        config.append(contentsOf: [0x00, 0x01])  // KDF: HKDF-SHA256
-        config.append(contentsOf: [0x00, 0x01])  // AEAD: AES-128-GCM
+        config.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
+        config.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
+        config.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
 
         return config
     }
