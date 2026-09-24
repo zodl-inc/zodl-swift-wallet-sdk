@@ -33,13 +33,16 @@ public enum OHTTPEndpoints {
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
     private static let relayByGatewayHost: [String: String] = [
-        // LWD gateways (Fastly-hosted; temporary hostnames pending COR-1830)
+        // LWD gateways
         "ohttp-gateway-testnet.example": "https://testnet-relay.example.invalid/relay",
-        "ohttp-gateway.example":         "https://mainnet-relay.example.invalid/relay",
+        // TODO(COR-1830): Switch to mainnet-relay.example.invalid/relay once Fastly prod
+        // serves /ohttp-configs (currently 501; only POST /relay works). Mainnet clients fetch signed
+        // key config via the relay.
+        "ohttp-gateway.example":         "https://simulator-relay.example.invalid/relay",
         // External API proxies — all through the mainnet relay→gateway
-        "cmc.zodl.com":    "https://mainnet-relay.example.invalid/relay",  // CoinMarketCap price feed
-        "near.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // NEAR 1click intents API
-        "vote.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // Voting config / vote servers
+        "cmc.zodl.com":    "https://simulator-relay.example.invalid/relay",  // CoinMarketCap price feed
+        "near.zodl.com":   "https://simulator-relay.example.invalid/relay",  // NEAR 1click intents API
+        "vote.zodl.com":   "https://simulator-relay.example.invalid/relay",  // Voting config / vote servers
     ]
 
     /// Proxy allowlist suffixes. Gateway v1.4.5+ proxies inner requests whose `:authority` ends
@@ -79,7 +82,8 @@ public enum OHTTPEndpoints {
             return relay
         }
         if isProxyAllowlisted(host: gatewayHost) {
-            return "https://mainnet-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
+            // TODO(COR-1830): Switch to Fastly prod once it serves /ohttp-configs
+            return "https://simulator-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }

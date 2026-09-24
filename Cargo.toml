@@ -162,8 +162,8 @@ lto = true
 # The slipstream engine's OHTTP transport lives in slipstream-internal until upstreamed to
 # the public repo and published. Git dependency on the feature/ohttp-connector branch (PR #16).
 # Once 0.3.0 is published to crates.io, revert to a version pin.
-# Rev 7353873f: Fastly relays in prod, test fixes, relay debug override
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "7353873fae0321f37745baaa9e82ada9168dec3a" }
+# Rev 339f672d: Fastly testnet relay, mainnet stays on simulator until prod relay serves /ohttp-configs
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "339f672d38fcf95f2f7bf38724e8cf88cbd0c72c" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
