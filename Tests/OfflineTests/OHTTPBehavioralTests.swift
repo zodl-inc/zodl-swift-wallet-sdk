@@ -398,14 +398,21 @@ final class OHTTPBehavioralTests: XCTestCase {
     
     private func generateMockSignedConfig() -> Data {
         let keyConfigBytes = generateMockKeyConfig()
-        let keyConfigHex = keyConfigBytes.map { String(format: "%02x", $0) }.joined()
-        
+        let keyConfigBase64 = keyConfigBytes.base64EncodedString()
+
+        // Current time + 1 hour validity
+        let notBefore = Int64(Date().timeIntervalSince1970)
+        let notAfter = notBefore + 3600
+
         let json = """
         {
-            "keyConfig": "\(keyConfigHex)",
-            "signature": "0000000000000000000000000000000000000000000000000000000000000000",
-            "keyId": "test-key-2099",
-            "validUntil": "2099-12-31T23:59:59Z"
+            "v": 1,
+            "network": "testnet",
+            "configs": "\(keyConfigBase64)",
+            "not_before": \(notBefore),
+            "not_after": \(notAfter),
+            "key_id": "a3620fb6",
+            "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
         }
         """
         return json.data(using: .utf8)!
