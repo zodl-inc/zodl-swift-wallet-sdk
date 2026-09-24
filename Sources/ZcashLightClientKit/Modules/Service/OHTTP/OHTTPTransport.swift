@@ -159,21 +159,29 @@ actor OHTTPTransport {
         return verified.keyConfig
     }
 
-    /// Performs one OHTTP round trip. A gateway rejection (HTTP 400 from the relay/gateway pair) is
-    /// retried once after refreshing the key configuration, which handles gateway key rotation.
+    /// Performs one OHTTP round trip. Gateway rejections (HTTP 400/422) are retried once after
+    /// refreshing the key configuration. 422 with ohttp-key problem type indicates signed config issues.
     func roundTrip(request: BinaryHTTP.Request, timeoutMS: Int) async throws -> BinaryHTTP.Response {
         var keyConfig = try await self.keyConfig()
+        var hasRetriedKeyRefresh = false
 
-        do {
-            return try await roundTripWith(keyConfig: keyConfig, request: request, timeoutMS: timeoutMS)
-        } catch let error as OHTTPError {
-            // Check if it's a 400 error (gateway rejection due to key rotation)
-            if case .httpStatusError(statusCode: 400, message: _) = error {
-                // Refresh key config and retry
-                keyConfig = try await self.keyConfig(forceRefresh: true)
+        while true {
+            do {
                 return try await roundTripWith(keyConfig: keyConfig, request: request, timeoutMS: timeoutMS)
+            } catch let error as OHTTPError {
+                // Check for key-related errors that warrant cache drop + retry
+                if case .httpStatusError(statusCode: let code, message: let msg) = error,
+                   (code == 400 || (code == 422 && msg.contains("ohttp-key"))),
+                   !hasRetriedKeyRefresh {
+                    // Drop cache and refetch signed config, then retry once
+                    cachedKeyConfig = nil
+                    cachedExpiry = nil
+                    keyConfig = try await self.keyConfig(forceRefresh: true)
+                    hasRetriedKeyRefresh = true
+                    continue
+                }
+                throw error
             }
-            throw error
         }
     }
 

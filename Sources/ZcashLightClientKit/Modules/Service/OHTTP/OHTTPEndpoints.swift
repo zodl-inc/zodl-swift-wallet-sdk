@@ -67,9 +67,11 @@ public enum OHTTPEndpoints {
         return false
     }
 
-    /// True only for hosts that have a configured relay (static mappings or allowlisted). Case-insensitive.
+    /// True only for hosts that have a configured relay (static mappings). Case-insensitive.
+    /// F-13 fix: exact host match only; suffix matching removed to prevent custom LWD hosts
+    /// with allowlisted suffixes from being incorrectly forced through OHTTP.
     public static func isGateway(_ host: String) -> Bool {
-        return relayByGatewayHost[host.lowercased()] != nil || isProxyAllowlisted(host: host)
+        return relayByGatewayHost[host.lowercased()] != nil
     }
 
     public static func relayURL(for gatewayHost: String) throws -> String {

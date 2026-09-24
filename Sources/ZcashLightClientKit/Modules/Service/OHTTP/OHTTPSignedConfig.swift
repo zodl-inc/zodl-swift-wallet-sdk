@@ -75,6 +75,9 @@ enum OHTTPSignedConfigVerifier {
         testKeyId: String? = nil,
         testPublicKeyHex: String? = nil
     ) throws -> VerifiedOHTTPConfig {
+        // P6: Detect duplicate JSON keys before decoding
+        try validateNoDuplicateKeys(jsonData)
+
         let decoder = JSONDecoder()
         let envelope = try decoder.decode(SignedOHTTPConfigEnvelope.self, from: jsonData)
 
@@ -110,6 +113,13 @@ enum OHTTPSignedConfigVerifier {
               let publicKeyData = Data(hexString: publicKeyHex) else {
             throw KeyConfigVerificationError.invalidEnvelope("Failed to decode base64/hex data")
         }
+
+        // P4: Reject configs exceeding 4096 bytes (decoded)
+        guard configData.count <= 4096 else {
+            throw KeyConfigVerificationError.invalidEnvelope(
+                "Decoded configs size \(configData.count) exceeds 4096 byte limit"
+            )
+        }
         
         let message = buildSignedMessage(
             network: envelope.network,
@@ -130,6 +140,13 @@ enum OHTTPSignedConfigVerifier {
         let nowSeconds = Int64(now().timeIntervalSince1970)
         let minValid = envelope.not_before - timeTolerance
         let maxValid = envelope.not_after + timeTolerance
+
+        // P5: Strict ordering check (not_before < not_after)
+        guard envelope.not_before < envelope.not_after else {
+            throw KeyConfigVerificationError.invalidEnvelope(
+                "Invalid time bounds: not_before (\(envelope.not_before)) must be < not_after (\(envelope.not_after))"
+            )
+        }
 
         guard nowSeconds >= minValid && nowSeconds <= maxValid else {
             throw KeyConfigVerificationError.verificationFailed(
@@ -201,8 +218,39 @@ enum OHTTPSignedConfigVerifier {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey) else {
             throw KeyConfigVerificationError.verificationFailed("Invalid Ed25519 public key")
         }
-        
+
         return key.isValidSignature(signature, for: message)
+    }
+
+    /// P6: Validates that JSON contains no duplicate keys by parsing with JSONSerialization
+    /// and checking that re-serialization matches in key count.
+    private static func validateNoDuplicateKeys(_ jsonData: Data) throws {
+        guard let jsonObject = try? JSONSerialization.jsonObject(with: jsonData),
+              let dict = jsonObject as? [String: Any] else {
+            throw KeyConfigVerificationError.invalidEnvelope("Invalid JSON structure")
+        }
+
+        // Parse the raw JSON string to count actual keys (including duplicates)
+        guard let jsonString = String(data: jsonData, encoding: .utf8) else {
+            throw KeyConfigVerificationError.invalidEnvelope("JSON data not UTF-8")
+        }
+
+        // Simple heuristic: count occurrences of quoted keys vs dictionary size
+        // A proper check would require a streaming parser, but for the envelope's 7 known keys,
+        // we can detect duplicates by checking if JSONSerialization's dict has fewer keys than
+        // the number of key patterns in the raw string.
+        let expectedKeys = ["v", "network", "configs", "not_before", "not_after", "key_id", "sig"]
+        var keyCount = 0
+        for key in expectedKeys {
+            // Count occurrences of "key": in the JSON (simple pattern, assumes standard formatting)
+            let pattern = "\"\(key)\""
+            keyCount += jsonString.components(separatedBy: pattern).count - 1
+        }
+
+        // If we found more key occurrences than dictionary entries, there are duplicates
+        guard keyCount == dict.count else {
+            throw KeyConfigVerificationError.invalidEnvelope("Duplicate JSON keys detected")
+        }
     }
 }
 

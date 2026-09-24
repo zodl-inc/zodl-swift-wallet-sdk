@@ -205,10 +205,11 @@ actor OHTTPGRPCClient {
     private func httpStatusToGRPCCode(_ httpStatus: Int) -> Int {
         switch httpStatus {
         case 400: return 13  // INTERNAL
-        case 401: return 16  // UNAUTHENTICATED
+        case 401: return 14  // UNAVAILABLE (per ZIP, outer auth failure)
         case 403: return 7   // PERMISSION_DENIED
         case 404: return 12  // UNIMPLEMENTED
-        case 429, 502, 503, 504: return 14  // UNAVAILABLE
+        case 426: return 14  // UNAVAILABLE (per ZIP, non-encapsulated/wrong protocol)
+        case 429, 500, 502, 503, 504: return 14  // UNAVAILABLE
         default: return 2    // UNKNOWN
         }
     }
