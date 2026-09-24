@@ -16,15 +16,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 60
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -37,15 +37,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 60
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "mainnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "ba8a2dbd",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "ba8a2dbd",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -64,15 +64,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 7200
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -85,15 +85,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 60
         let notAfter = notBefore + 90000
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -106,15 +106,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) + 90000
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -127,15 +127,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 60
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 1,
+            version: 1,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "deadbeef",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "deadbeef",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)
@@ -153,15 +153,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
         let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
         let notBefore = Int64(Date().timeIntervalSince1970) - 60
         let notAfter = notBefore + 3600
-        
+
         let envelope = SignedOHTTPConfigEnvelope(
-            v: 2,
+            version: 2,
             network: "testnet",
             configs: configBytes.base64EncodedString(),
-            not_before: notBefore,
-            not_after: notAfter,
-            key_id: "a3620fb6",
-            sig: String(repeating: "A", count: 88)
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: "a3620fb6",
+            signature: String(repeating: "A", count: 88)
         )
         
         let jsonData = try JSONEncoder().encode(envelope)

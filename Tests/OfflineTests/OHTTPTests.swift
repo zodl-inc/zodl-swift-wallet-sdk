@@ -172,7 +172,7 @@ final class OHTTPTests: XCTestCase {
 
     func testOHTTPEndpointsRelayMapping() throws {
         let relay1 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(relay1, "https://testnet-simulator-relay.example.invalid/relay")
+        XCTAssertEqual(relay1, "https://testnet-relay.example.invalid/relay")
 
         let relay2 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway.example")
         XCTAssertEqual(relay2, "https://simulator-relay.example.invalid/relay")
@@ -182,7 +182,7 @@ final class OHTTPTests: XCTestCase {
 
     func testOHTTPEndpointsKeyConfigURL() {
         let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(url, "https://testnet-simulator-relay.example.invalid/ohttp-configs")
+        XCTAssertEqual(url, "https://testnet-relay.example.invalid/ohttp-configs")
     }
 
     func testOHTTPEndpointsKeyConfigURLMainnet() {
