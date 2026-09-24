@@ -285,10 +285,23 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testProxyAllowlistGatewayDetection() {
-        // Allowlisted hosts should be recognized as gateways
-        XCTAssertTrue(OHTTPEndpoints.isGateway("prod.vote-chain-primary.valargroup.org"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("1click.chaindefuser.com"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("voting.valargroup.dev"))
+        // F-13: isGateway now uses exact host matching for configured relays only.
+        // Zodl gateways and proxy hosts (in relayByGatewayHost) return true:
+        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway.example"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway-testnet.example"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("cmc.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("near.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway("vote.zodl.com"))
+
+        // External allowlisted hosts (valargroup, chaindefuser) are NOT gateways (F-13 fix):
+        XCTAssertFalse(OHTTPEndpoints.isGateway("prod.vote-chain-primary.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("1click.chaindefuser.com"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("voting.valargroup.dev"))
+
+        // But they ARE proxy-allowlisted:
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "prod.vote-chain-primary.valargroup.org"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "voting.valargroup.dev"))
     }
 
     func testProxyAllowlistProxyHostPassthrough() {
