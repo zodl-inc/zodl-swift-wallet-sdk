@@ -46,7 +46,9 @@ public struct SlipstreamSnapshot {
     /// Blessed progress, 0...1000, session-monotonic (never regresses while the handle lives;
     /// Done forces 1000). Replaces host-side progress math.
     public let progressPermille: UInt16
-    /// Seconds since last forward progress while syncing; 0 otherwise.
+    /// Seconds without forward progress while syncing; 0 otherwise — the longer of the time
+    /// since the last progress and the time the block download has kept failing at the same
+    /// block.
     public let stalledSeconds: UInt32
     // ── Engine API v2.1 fields ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]

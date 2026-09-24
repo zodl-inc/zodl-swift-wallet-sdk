@@ -296,7 +296,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-09-23.v0.15-third-party-log-cap",
+        zcashlc_build = "2026-09-24.v0.19-slipstream-download-failure-stall",
         "tracing initialized (third-party crates capped at INFO, zcash_client_backend at WARN)"
     );
 
@@ -5259,7 +5259,9 @@ pub struct FfiSlipstreamSnapshot {
     /// Blessed progress, 0..=1000, session-monotonic (never regresses while the handle
     /// lives; Done forces 1000). Replaces host-side progress math.
     pub progress_permille: u16,
-    /// Seconds since last forward progress while syncing; 0 otherwise.
+    /// Seconds without forward progress while syncing; 0 otherwise — the longer of the time
+    /// since the last progress and the time the block download has kept failing at the same
+    /// block.
     pub stalled_seconds: u32,
     // ── API v2.1 fields (appended at END for padding stability) ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]

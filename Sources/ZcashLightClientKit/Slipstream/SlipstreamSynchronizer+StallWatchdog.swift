@@ -56,10 +56,12 @@ extension SlipstreamSynchronizer {
         watchdogStallLogged = true
         watchdogLogger.error(
             """
-            Slipstream stall watchdog: state==Syncing but NO progress counter changed for \(Int(elapsed))s. \
+            Slipstream stall watchdog: state==Syncing but the engine reports no forward progress for \(Int(elapsed))s — \
+            no progress counter moved, or its block download keeps failing at the same block. \
             Last snapshot: chainTip=\(snap.chainTip) fetched=\(snap.fetchedBlocks) scanned=\(snap.scannedBlocks) \
             enhanced=\(snap.enhancedTxs) rangesCompleted=\(snap.rangesCompleted) passTotal=\(snap.passTotalBlocks) \
-            rangeEnd=\(snap.currentRangeEnd). The engine sync task appears hung (transport stall) or dead (panic). \
+            rangeEnd=\(snap.currentRangeEnd). The sync task may be hung (transport stall), dead (panic), or retrying \
+            a block range its server cannot deliver. \
             The SDK restarts the pass up to \(Self.maxStallRestartsPerHandle) times for this handle, then gives up and reports it.
             """,
             file: #file,
