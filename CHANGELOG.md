@@ -135,6 +135,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public signature changes, and the existing GET/POST routes remain unchanged.
 - `SDKSynchronizer.tor(enabled: true)` and `exchangeRateOverTor(enabled: true)` now ensure the shared Tor client is prepared even when the other feature is already enabled. Existing prepared runtimes are reused, and preparation failures propagate to the caller before the enabled flag is updated. This makes successful enablement sufficient for the bounded GET API's readiness prerequisite.
 - `SlipstreamSynchronizer.tor(enabled: false)` preserves the shared Tor client while exchange-rate routing remains enabled, so bounded GET stays available until both features are disabled. Repeated disable calls preserve the same ownership rule.
+- When the Rust backend logs at debug level — with `Initializer.LoggingPolicy.default(.debug)`, or
+  a `.custom` logger whose `maxLogLevel()` is `.debug` — third-party crates no longer pass on their
+  debug output: the HTTP/2 and gRPC stack, TLS, Tor and database migrations are capped at info. The
+  HTTP/2 client logged one line per downloaded block, which with a debugger attached could slow
+  Slipstream sync to a crawl and stall it. The SDK's own crates and the core Zcash crates
+  (Slipstream, librustzcash, Orchard, Sapling) keep their debug output; `zcash_client_backend`
+  stays capped at warnings, as before. With `.noLogging` the Rust backend is now fully silent,
+  where previously `zcash_client_backend` warnings still reached the unified log.
 
 ## Changed
 
