@@ -278,7 +278,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     };
 
     // Per-target filter: the host level for the SDK and Zcash crates, INFO at most for every
-    // other dependency, WARN for zcash_client_backend (see `log_filter`).
+    // other dependency, WARN at most for zcash_client_backend (see `log_filter`).
     let log_filter = log_filter::rust_log_filter(host_level);
 
     // Set up the tracing layers for the Apple OS logging framework.

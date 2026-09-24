@@ -1,10 +1,11 @@
 //! The `tracing` filter the FFI installs at load time.
 //!
-//! The host picks one level for the whole Rust backend. Only the SDK's own code and the Zcash
-//! crates it drives honour it in full; every other dependency is capped at INFO. The HTTP/2 stack
-//! alone (h2 under hyper and tonic) logs one DEBUG line per received frame — lightwalletd sends
-//! one frame per compact block — and under a debugger that mirrors every log line synchronously
-//! into its console, that slowed block download to the console's drain rate.
+//! The host picks one level for the whole Rust backend. The SDK's own code and the Zcash crates
+//! it drives log at that level, except `zcash_client_backend`, which is capped at WARN; every
+//! other dependency is capped at INFO. The HTTP/2 stack alone (h2 under hyper and tonic) logs one
+//! DEBUG line per received frame — lightwalletd sends one frame per compact block — and under a
+//! debugger that mirrors every log line synchronously into its console, that slowed block download
+//! to the console's drain rate.
 
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
@@ -33,8 +34,9 @@ pub(crate) fn rust_log_filter(host_level: LevelFilter) -> Targets {
         )
         // Upstream `zcash_client_backend` #[instrument]s every block and batch (~600k spans per
         // fresh restore) at INFO, and through the os_log + signpost layers each span costs
-        // syscalls on the scan producer thread. It stays at WARN whatever the host asks for.
-        .with_target("zcash_client_backend", LevelFilter::WARN)
+        // syscalls on the scan producer thread. It is capped at WARN: never louder whatever the
+        // host asks for, and silent like everything else when the host turns logging off.
+        .with_target("zcash_client_backend", host_level.min(LevelFilter::WARN))
 }
 
 #[cfg(test)]
@@ -75,8 +77,14 @@ mod tests {
     fn debug_host_caps_third_party_crates_at_info() {
         let filter = rust_log_filter(LevelFilter::DEBUG);
         for target in CAPPED {
-            assert!(!filter.would_enable(target, &Level::DEBUG), "{target} must not log DEBUG");
-            assert!(filter.would_enable(target, &Level::INFO), "{target} must still log INFO");
+            assert!(
+                !filter.would_enable(target, &Level::DEBUG),
+                "{target} must not log DEBUG"
+            );
+            assert!(
+                filter.would_enable(target, &Level::INFO),
+                "{target} must still log INFO"
+            );
         }
     }
 
@@ -84,7 +92,10 @@ mod tests {
     fn debug_host_keeps_sdk_and_zcash_crates_at_debug() {
         let filter = rust_log_filter(LevelFilter::DEBUG);
         for target in HOST_LEVEL {
-            assert!(filter.would_enable(target, &Level::DEBUG), "{target} must log DEBUG");
+            assert!(
+                filter.would_enable(target, &Level::DEBUG),
+                "{target} must log DEBUG"
+            );
         }
     }
 
@@ -93,6 +104,19 @@ mod tests {
         let filter = rust_log_filter(LevelFilter::DEBUG);
         assert!(!filter.would_enable("zcash_client_backend::scanning", &Level::INFO));
         assert!(filter.would_enable("zcash_client_backend::scanning", &Level::WARN));
+    }
+
+    #[test]
+    fn trace_host_still_caps_zcash_client_backend_at_warn() {
+        let filter = rust_log_filter(LevelFilter::TRACE);
+        assert!(!filter.would_enable("zcash_client_backend::scanning", &Level::INFO));
+        assert!(filter.would_enable("zcash_client_backend::scanning", &Level::WARN));
+    }
+
+    #[test]
+    fn off_host_silences_zcash_client_backend() {
+        let filter = rust_log_filter(LevelFilter::OFF);
+        assert!(!filter.would_enable("zcash_client_backend::scanning", &Level::ERROR));
     }
 
     #[test]
@@ -114,8 +138,16 @@ mod tests {
     #[test]
     fn off_host_silences_first_and_third_party_crates() {
         let filter = rust_log_filter(LevelFilter::OFF);
-        for target in ["zcashlc", "zodl_slipstream::fetch", "h2::codec::framed_read", "tonic::transport"] {
-            assert!(!filter.would_enable(target, &Level::ERROR), "{target} must be silent");
+        for target in [
+            "zcashlc",
+            "zodl_slipstream::fetch",
+            "h2::codec::framed_read",
+            "tonic::transport",
+        ] {
+            assert!(
+                !filter.would_enable(target, &Level::ERROR),
+                "{target} must be silent"
+            );
         }
     }
 }
