@@ -343,6 +343,8 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(plan.delegationStatuses.last?.phase, .prepared)
         XCTAssertNil(plan.delegationStatuses.last?.txHash)
         XCTAssertEqual(plan.delegationStatuses.last?.terminal, true)
+        XCTAssertTrue(plan.nextSteps.isEmpty)
+        XCTAssertTrue(plan.recoveredVoteWork.isEmpty)
     }
 
     func testDecodesUnknownEnumRawValuesAsUnknown() throws {
@@ -1059,12 +1061,71 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertTrue(plan.delegationBundlesNeedingWork.isEmpty)
         XCTAssertTrue(plan.delegationBundlesNeedingSigning.isEmpty)
         XCTAssertTrue(plan.unrosteredIntents.isEmpty)
+        XCTAssertTrue(plan.nextSteps.isEmpty)
+        XCTAssertTrue(plan.recoveredVoteWork.isEmpty)
         XCTAssertEqual(plan.primaryAction, .idle)
         XCTAssertTrue(plan.allDecided)
         // Not every plan carries the key: the ones embedded in run reports and
         // events are the crate's own view, and a host must read them as "no
         // legacy submission known" rather than lose the plan.
         XCTAssertFalse(plan.hasLegacyInFlightSubmission)
+    }
+
+    /// The plan's own steps, in the planner's order, so a host can tell which
+    /// bundles still owe vote work. A step kind this SDK does not name decodes
+    /// as `.unknown` with its identity intact rather than failing the plan.
+    func testDecodesTheRoundPlanNextSteps() throws {
+        let json = Self.roundPlanJson.replacingOccurrences(
+            of: "\"next_steps\": []",
+            with: """
+            "next_steps": [
+                {"kind": "delegate", "bundle_index": 1, "proposal_id": 0, "choice": 0, "share_index": 0},
+                {"kind": "cast_vote", "bundle_index": 1, "proposal_id": 7, "choice": 2, "share_index": 0},
+                {"kind": "a_future_step", "bundle_index": 3, "proposal_id": 8, "choice": 0, "share_index": 1}
+            ]
+            """
+        )
+        XCTAssertTrue(json.contains("a_future_step"), "the fixture must carry the steps under test")
+
+        let plan = try decode(VotingRoundPlan.self, from: json)
+
+        XCTAssertEqual(plan.nextSteps.map(\.kind), [.delegate, .castVote, .unknown])
+        XCTAssertEqual(plan.nextSteps.map(\.bundleIndex), [1, 1, 3])
+        XCTAssertEqual(plan.nextSteps.map(\.proposalId), [0, 7, 8])
+        XCTAssertEqual(plan.nextSteps[1].choice, 2)
+        XCTAssertEqual(plan.nextSteps[2].shareIndex, 1)
+    }
+
+    /// The vote work the plan recovered from durable state, in the planner's
+    /// order. A vote whose blocking helper share is being recovered owes a
+    /// `confirm_share` step in `next_steps` and appears here as share
+    /// submission work, so a host counting which bundles still owe vote work
+    /// reads both lists. A kind this SDK does not name decodes as `.unknown`
+    /// with its identity intact rather than failing the plan.
+    func testDecodesTheRoundPlanRecoveredVoteWork() throws {
+        let json = Self.roundPlanJson.replacingOccurrences(
+            of: "\"recovered_vote_work\": []",
+            with: """
+            "recovered_vote_work": [
+                {"kind": "advance_vote", "bundle_index": 1, "proposal_id": 7, "tx_hash": "ab", "vc_tree_position": null, "share_indexes": []},
+                {"kind": "advance_vote_batch", "bundle_index": 2, "proposal_id": 7, "tx_hash": null, "vc_tree_position": null, "share_indexes": []},
+                {"kind": "submit_shares", "bundle_index": 0, "proposal_id": 8, "tx_hash": null, "vc_tree_position": 99, "share_indexes": [0, 1]},
+                {"kind": "a_future_work", "bundle_index": 3, "proposal_id": 9, "tx_hash": null, "vc_tree_position": null, "share_indexes": []}
+            ]
+            """
+        )
+        XCTAssertTrue(json.contains("a_future_work"), "the fixture must carry the work under test")
+
+        let plan = try decode(VotingRoundPlan.self, from: json)
+
+        XCTAssertEqual(plan.recoveredVoteWork.map(\.kind), [.advanceVote, .advanceVoteBatch, .submitShares, .unknown])
+        XCTAssertEqual(plan.recoveredVoteWork.map(\.bundleIndex), [1, 2, 0, 3])
+        XCTAssertEqual(plan.recoveredVoteWork.map(\.proposalId), [7, 7, 8, 9])
+        XCTAssertEqual(plan.recoveredVoteWork[0].txHash, "ab")
+        XCTAssertNil(plan.recoveredVoteWork[0].vcTreePosition)
+        XCTAssertNil(plan.recoveredVoteWork[2].txHash)
+        XCTAssertEqual(plan.recoveredVoteWork[2].vcTreePosition, 99)
+        XCTAssertEqual(plan.recoveredVoteWork[2].shareIndexes, [0, 1])
     }
 
     func testDecodesDelegationStatusWithTerminalAbsent() throws {

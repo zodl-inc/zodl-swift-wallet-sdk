@@ -125,6 +125,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report `false`. A delegation imported from a capability package also reports `false` and is driven
   normally: its transaction was broadcast elsewhere and the lifecycle adopts the hash rather than
   dispatching anything again. See `MIGRATING.md`.
+- `VotingRoundPlan.nextSteps` lists every step a plan still owes, in the planner's deterministic
+  order, so a host can see which bundles still owe vote work, for example to measure how far a
+  submission has got across bundles. A step kind this SDK does not name decodes as `.unknown` with
+  its bundle and proposal intact, and a plan without the list reads it as empty.
+- `VotingRoundPlan.recoveredVoteWork` lists the vote work a plan recovered from durable state: chain
+  submissions to follow up and helper shares to submit, per bundle and proposal. It is not redundant
+  with `nextSteps`: a vote whose blocking helper share is being recovered appears here as share
+  submission work while its next step is a share confirmation, so a host measuring which bundles
+  still owe vote work reads both. Unknown kinds decode as `.unknown`, and a plan without the list
+  reads it as empty.
 
 ## Fixed
 
