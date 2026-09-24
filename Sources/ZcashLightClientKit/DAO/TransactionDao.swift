@@ -52,10 +52,20 @@ class TransactionSQLDAO: TransactionRepository {
     private let txOutputsView = View("v_tx_outputs")
     private let traceClosure: ((String) -> Void)?
 
-    init(dbProvider: ConnectionProvider, traceClosure: ((String) -> Void)? = nil) {
+    /// SQLite.swift runs every statement through one serial queue per connection, so a read waits behind every
+    /// other read and can wait on the busy timeout. Reads run through `blockingCalls` so that wait happens on a
+    /// dispatch thread and the awaiting task suspends instead of holding a cooperative thread.
+    private let blockingCalls: BlockingCallRunning
+
+    init(
+        dbProvider: ConnectionProvider,
+        traceClosure: ((String) -> Void)? = nil,
+        blockingCalls: BlockingCallRunning = BlockingCall.shared
+    ) {
         self.dbProvider = dbProvider
         self.blockDao = BlockSQLDAO(dbProvider: dbProvider)
         self.traceClosure = traceClosure
+        self.blockingCalls = blockingCalls
     }
 
     private func connection() throws -> Connection {
@@ -106,59 +116,69 @@ class TransactionSQLDAO: TransactionRepository {
             .filter(transactionsView[UserMetadata.memoCount] > 0)
             .filter(txOutputsView[UserMetadata.memo].like("%\(searchTerm)%"))
 
-        var txids: [Data] = []
-        for row in try connection().prepare(query) {
-            let txidBlob = try row.get(txOutputsView[UserMetadata.txid])
-            let txid = Data(blob: txidBlob)
-            txids.append(txid)
-        }
+        return try await blockingCalls.run { [self] in
+            var txids: [Data] = []
+            for row in try connection().prepare(query) {
+                let txidBlob = try row.get(txOutputsView[UserMetadata.txid])
+                let txid = Data(blob: txidBlob)
+                txids.append(txid)
+            }
 
-        return txids
+            return txids
+        }
     }
 
     // DB-READ (audited 2026-08-03): SELECT over the ext_slipstream_v_tx_reconciled VIEW — read-only
     // by construction.
     func unreconciledTxids() async throws -> Set<Data> {
-        // [#1755] Reads the slipstream-owned `ext_slipstream_v_tx_reconciled` view (a VIEW over upstream's
-        // nullifier_map / *_received_notes — see slipstream `reconcile.rs`). Returns the txids whose
-        // delta is not yet final because a recent-first restore scanned the spend before its input's
-        // origin block. Defensive: a DB the slipstream engine never opened has no such view, so the
-        // query throws — we swallow it and return an empty set (nothing held back; legacy behavior).
-        do {
-            let statement = try connection().prepare("SELECT txid FROM ext_slipstream_v_tx_reconciled WHERE reconciled = 0")
-            var result: Set<Data> = []
-            for row in statement {
-                if let blob = row[0] as? Blob {
-                    result.insert(Data(blob: blob))
+        try await blockingCalls.run { [self] in
+            // [#1755] Reads the slipstream-owned `ext_slipstream_v_tx_reconciled` view (a VIEW over upstream's
+            // nullifier_map / *_received_notes — see slipstream `reconcile.rs`). Returns the txids whose
+            // delta is not yet final because a recent-first restore scanned the spend before its input's
+            // origin block. Defensive: a DB the slipstream engine never opened has no such view, so the
+            // query throws — we swallow it and return an empty set (nothing held back; legacy behavior).
+            do {
+                let statement = try connection().prepare("SELECT txid FROM ext_slipstream_v_tx_reconciled WHERE reconciled = 0")
+                var result: Set<Data> = []
+                for row in statement {
+                    if let blob = row[0] as? Blob {
+                        result.insert(Data(blob: blob))
+                    }
                 }
+                return result
+            } catch {
+                return []
             }
-            return result
-        } catch {
-            return []
         }
     }
 
     // DB-READ (audited 2026-08-03): blocks table via BlockSQLDAO.block(at:) — filter+limit
     // SELECT.
     func blockForHeight(_ height: BlockHeight) async throws -> Block? {
-        try blockDao.block(at: height)
+        try await blockingCalls.run { [self] in
+            try blockDao.block(at: height)
+        }
     }
 
     // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions.
     func countAll() async throws -> Int {
-        do {
-            return try connection().scalar(transactionsView.count)
-        } catch {
-            throw ZcashError.transactionRepositoryCountAll(error)
+        try await blockingCalls.run { [self] in
+            do {
+                return try connection().scalar(transactionsView.count)
+            } catch {
+                throw ZcashError.transactionRepositoryCountAll(error)
+            }
         }
     }
 
     // DB-READ (audited 2026-08-03): scalar COUNT over v_transactions filtered unmined.
     func countUnmined() async throws -> Int {
-        do {
-            return try connection().scalar(transactionsView.filter(ZcashTransaction.Overview.Column.minedHeight == nil).count)
-        } catch {
-            throw ZcashError.transactionRepositoryCountUnmined(error)
+        try await blockingCalls.run { [self] in
+            do {
+                return try connection().scalar(transactionsView.filter(ZcashTransaction.Overview.Column.minedHeight == nil).count)
+            } catch {
+                throw ZcashError.transactionRepositoryCountUnmined(error)
+            }
         }
     }
 
@@ -254,6 +274,46 @@ class TransactionSQLDAO: TransactionRepository {
         return try await execute(query) { try ZcashTransaction.Overview(row: $0) }
     }
 
+    private func execute<Entity>(_ query: View, createEntity: @escaping @Sendable (Row) throws -> Entity) async throws -> Entity {
+        let entities: [Entity] = try await execute(query, createEntity: createEntity)
+
+        guard let entity = entities.first else {
+            throw ZcashError.transactionRepositoryEntityNotFound
+        }
+
+        return entity
+    }
+
+    // DB-READ (audited 2026-08-03): connection().prepare(query).map — every caller passes a
+    // view-based SELECT.
+    private func execute<Entity>(_ query: View, createEntity: @escaping @Sendable (Row) throws -> Entity) async throws -> [Entity] {
+        try await blockingCalls.run { [self] in
+            do {
+                let entities = try connection()
+                    .prepare(query)
+                    .map(createEntity)
+
+                return entities
+            } catch {
+                if let error = error as? ZcashError {
+                    throw error
+                } else {
+                    throw ZcashError.transactionRepositoryQueryExecute(error)
+                }
+            }
+        }
+    }
+
+    func debugDatabase(sql: String) -> String {
+        guard let connection = try? debugConnection() else {
+            return "Connection failed"
+        }
+
+        return connection.debugQuery(sql)
+    }
+}
+
+extension TransactionSQLDAO {
     func findMemos(for rawID: Data) async throws -> [Memo] {
         do {
             return try await getTransactionOutputs(for: rawID)
@@ -296,76 +356,43 @@ class TransactionSQLDAO: TransactionRepository {
     func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashTransaction.Output]] {
         var seen: Set<Data> = []
         let uniqueRawIDs = rawIDs.filter { seen.insert($0).inserted }
+        guard !uniqueRawIDs.isEmpty else { return [:] }
 
-        var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
-        var start = 0
-        while start < uniqueRawIDs.count {
-            let end = min(start + Self.outputsQueryChunkSize, uniqueRawIDs.count)
-            let chunk = uniqueRawIDs[start..<end].map { Blob(bytes: $0.bytes) }
-            let query = txOutputsView
-                .filter(chunk.contains(ZcashTransaction.Output.Column.rawID))
-                .order(ZcashTransaction.Output.Column.pool, ZcashTransaction.Output.Column.index)
+        return try await blockingCalls.run { [self] in
+            var outputsByRawID: [Data: [ZcashTransaction.Output]] = [:]
+            var start = 0
+            while start < uniqueRawIDs.count {
+                let end = min(start + Self.outputsQueryChunkSize, uniqueRawIDs.count)
+                let chunk = uniqueRawIDs[start..<end].map { Blob(bytes: $0.bytes) }
+                let query = txOutputsView
+                    .filter(chunk.contains(ZcashTransaction.Output.Column.rawID))
+                    .order(ZcashTransaction.Output.Column.pool, ZcashTransaction.Output.Column.index)
 
-            do {
-                for row in try connection().prepare(query) {
-                    guard let output = try? ZcashTransaction.Output(row: row) else {
-                        // Deliberately says nothing about the row itself: an output carries a
-                        // recipient address and a memo, neither of which belongs in a trace.
-                        traceClosure?("getTransactionOutputs(for rawIDs:): skipped an output row that failed to decode.")
-                        continue
+                do {
+                    for row in try connection().prepare(query) {
+                        guard let output = try? ZcashTransaction.Output(row: row) else {
+                            // Deliberately says nothing about the row itself: an output carries a
+                            // recipient address and a memo, neither of which belongs in a trace.
+                            traceClosure?("getTransactionOutputs(for rawIDs:): skipped an output row that failed to decode.")
+                            continue
+                        }
+                        outputsByRawID[output.rawID, default: []].append(output)
                     }
-                    outputsByRawID[output.rawID, default: []].append(output)
+                } catch {
+                    if let error = error as? ZcashError {
+                        throw error
+                    } else {
+                        throw ZcashError.transactionRepositoryQueryExecute(error)
+                    }
                 }
-            } catch {
-                if let error = error as? ZcashError {
-                    throw error
-                } else {
-                    throw ZcashError.transactionRepositoryQueryExecute(error)
-                }
+                start = end
             }
-            start = end
+            return outputsByRawID
         }
-        return outputsByRawID
     }
 
     func getRecipients(for rawID: Data) async throws -> [TransactionRecipient] {
         try await getTransactionOutputs(for: rawID).map { $0.recipient }
-    }
-
-    private func execute<Entity>(_ query: View, createEntity: (Row) throws -> Entity) async throws -> Entity {
-        let entities: [Entity] = try await execute(query, createEntity: createEntity)
-
-        guard let entity = entities.first else {
-            throw ZcashError.transactionRepositoryEntityNotFound
-        }
-
-        return entity
-    }
-
-    // DB-READ (audited 2026-08-03): connection().prepare(query).map — every caller passes a
-    // view-based SELECT.
-    private func execute<Entity>(_ query: View, createEntity: (Row) throws -> Entity) async throws -> [Entity] {
-        do {
-            let entities = try connection()
-                .prepare(query)
-                .map(createEntity)
-
-            return entities
-        } catch {
-            if let error = error as? ZcashError {
-                throw error
-            } else {
-                throw ZcashError.transactionRepositoryQueryExecute(error)
-            }
-        }
-    }
-
-    func debugDatabase(sql: String) -> String {
-        guard let connection = try? debugConnection() else {
-            return "Connection failed"
-        }
-
-        return connection.debugQuery(sql)
     }
 }
 

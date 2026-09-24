@@ -160,6 +160,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `refreshUTXOs(address:from:)`, the Orchard → Ironwood migration steps and, on `SDKSynchronizer`, the sync
   `start(retry:)` runs — and `SlipstreamEngine`'s calls into Rust no longer hold one of Swift's cooperative threads
   while they wait on the database or the engine. No call-site change.
+- Reading transactions through the synchronizer — `transactions`, `sentTransactions`, `receivedTransactions`,
+  `allTransactions()`, `allTransactions(from:limit:)`, `getMemos(for:)`, `getRecipients(for:)`,
+  `getTransactionOutputs(for:)` and `fetchTxidsWithMemoContaining(searchTerm:)` — no longer holds one of
+  Swift's cooperative threads while the read waits on the database, so a long transaction history read no
+  longer delays the host's other `async` work. No call-site change.
 
 ## Changed
 
