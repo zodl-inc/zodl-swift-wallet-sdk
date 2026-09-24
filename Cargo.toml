@@ -162,8 +162,8 @@ lto = true
 # The slipstream engine's OHTTP transport lives in slipstream-internal until upstreamed to
 # the public repo and published. Git dependency on the feature/ohttp-connector branch (PR #16).
 # Once 0.3.0 is published to crates.io, revert to a version pin.
-# Rev 9f2b2888: C-01 audit fix (signed config with Ed25519 verification) + cargo fmt + doc fixes
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "9f2b2888d5cfadd191ca23f923a5d47d2e37384b" }
+# Rev 90833bf0: F-01 fix (correct Ed25519 pubkeys, `sig` field, network/key_id checks) + 422 handling
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "90833bf0456c76a89fc9897bb741b0f785f89d12" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
