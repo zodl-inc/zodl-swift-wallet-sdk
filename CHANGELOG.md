@@ -152,6 +152,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `performMigrationBroadcast(accountUUID:_:options:)` makes. A host that sends several requests over Tor at once, or
   starts Tor while other work runs, no longer starves its own `async` work — its UI effects included. No call-site
   change.
+- `Synchronizer` calls that write the wallet database — `createProposedTransactions(proposal:spendingKey:)`,
+  `createPCZTFromProposal(accountUUID:proposal:)`, `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)`,
+  `importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`, `deleteAccount(_:)`,
+  `prepare(with:walletBirthday:name:keySource:)`, `rewind(_:)`, `rescanFrom(height:)`, `enhanceTransactionBy(txId:)`,
+  `getSingleUseTransparentAddress(accountUUID:)`, `getCustomUnifiedAddress(accountUUID:receivers:)`,
+  `refreshUTXOs(address:from:)`, the Orchard → Ironwood migration steps and, on `SDKSynchronizer`, the sync
+  `start(retry:)` runs — and `SlipstreamEngine`'s calls into Rust no longer hold one of Swift's cooperative threads
+  while they wait on the database or the engine. No call-site change.
 
 ## Changed
 
