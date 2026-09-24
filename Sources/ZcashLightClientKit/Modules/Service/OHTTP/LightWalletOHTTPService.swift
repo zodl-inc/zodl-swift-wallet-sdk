@@ -13,6 +13,7 @@ import Foundation
 /// Server-streaming methods buffer all frames from the gateway and surface them as AsyncThrowingStreams.
 /// The base class's grpc-swift connection is never created when using OHTTP (all `.direct` calls are
 /// intercepted before `compactTxStreamer` is accessed).
+// swiftlint:disable:next type_body_length
 final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private var ohttpClientClearnet: OHTTPGRPCClient?
     private var ohttpClientTor: OHTTPGRPCClient?
