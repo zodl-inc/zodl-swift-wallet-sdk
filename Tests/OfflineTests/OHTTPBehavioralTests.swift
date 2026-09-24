@@ -24,13 +24,13 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// would fail the same way. The transport should fail immediately without retry.
     func testNoRetryOn409ReplayCache() async throws {
         var requestCount = 0
-        let testKeyId = "test-key-2099"
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 // Return mock signed config
-                return (self.generateMockSignedConfig(keyId: testKeyId),
+                return (try! self.generateMockSignedConfig(keyId: testKeyId, signingKey: signingKey),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 // Gateway POST - return 409 Conflict
@@ -38,9 +38,6 @@ final class OHTTPBehavioralTests: XCTestCase {
                 return (Data(), HTTPURLResponse(url: request.url!, statusCode: 409, httpVersion: nil, headerFields: nil)!)
             }
         }
-
-        let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
         let transport = OHTTPTransport(
             network: "testnet",
@@ -84,13 +81,13 @@ final class OHTTPBehavioralTests: XCTestCase {
     func test422TriggersConfigRefetchAndSingleRetry() async throws {
         var keyConfigFetchCount = 0
         var roundTripAttempts = 0
-        let testKeyId = "test-key-2099"
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                return (self.generateMockSignedConfig(keyId: testKeyId),
+                return (try! self.generateMockSignedConfig(keyId: testKeyId, signingKey: signingKey),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -109,9 +106,6 @@ final class OHTTPBehavioralTests: XCTestCase {
                 }
             }
         }
-
-        let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
         let transport = OHTTPTransport(
             network: "testnet",
@@ -148,12 +142,12 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// Tests that 422 without successful retry propagates the error correctly.
     func test422RetryFailurePropagatesError() async throws {
         var roundTripAttempts = 0
-        let testKeyId = "test-key-2099"
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
 
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
-                return (self.generateMockSignedConfig(keyId: testKeyId),
+                return (try! self.generateMockSignedConfig(keyId: testKeyId, signingKey: signingKey),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -162,9 +156,6 @@ final class OHTTPBehavioralTests: XCTestCase {
                 return (errorBody, HTTPURLResponse(url: request.url!, statusCode: 422, httpVersion: nil, headerFields: nil)!)
             }
         }
-
-        let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
         let transport = OHTTPTransport(
             network: "testnet",
@@ -394,28 +385,55 @@ final class OHTTPBehavioralTests: XCTestCase {
         }
     }
 
-    // MARK: - Helper Methods (reused from OHTTPAuditFixTests)
+    // MARK: - Helper Methods
 
-    private func generateMockSignedConfig(keyId: String = "a3620fb6") -> Data {
+    /// Generate a fresh signing key and corresponding test parameters for injection.
+    private func makeTestKeyParams() -> (key: Curve25519.Signing.PrivateKey, keyId: String, publicKeyHex: String) {
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let publicKeyData = signingKey.publicKey.rawRepresentation
+
+        var hasher = SHA256()
+        hasher.update(data: publicKeyData)
+        let hash = hasher.finalize()
+        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
+        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
+
+        return (signingKey, keyId, publicKeyHex)
+    }
+
+    private func generateMockSignedConfig(keyId: String, signingKey: Curve25519.Signing.PrivateKey) throws -> Data {
         let keyConfigBytes = generateMockKeyConfig()
-        let keyConfigBase64 = keyConfigBytes.base64EncodedString()
 
         // Current time + 1 hour validity
         let notBefore = Int64(Date().timeIntervalSince1970)
         let notAfter = notBefore + 3600
+        let network = "testnet"
 
-        let json = """
-        {
-            "v": 1,
-            "network": "testnet",
-            "configs": "\(keyConfigBase64)",
-            "not_before": \(notBefore),
-            "not_after": \(notAfter),
-            "key_id": "\(keyId)",
-            "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
-        }
-        """
-        return json.data(using: .utf8)!
+        // Build signature message per spec
+        var message = Data()
+        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
+        message.append(0x00)
+        message.append(network.data(using: .ascii)!)
+        message.append(0x00)
+        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
+        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
+        message.append(keyConfigBytes)
+
+        // Sign the message
+        let signature = try signingKey.signature(for: message)
+
+        // Build JSON envelope
+        let envelope = SignedOHTTPConfigEnvelope(
+            version: 1,
+            network: network,
+            configs: keyConfigBytes.base64EncodedString(),
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: keyId,
+            signature: Data(signature).base64EncodedString()
+        )
+
+        return try JSONEncoder().encode(envelope)
     }
     
     private func generateMockKeyConfig() -> Data {

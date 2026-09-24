@@ -18,14 +18,15 @@ final class OHTTPAuditFixTests: XCTestCase {
     func testRetryDoesNotTriggerOnBodyContainingHTTP400() async throws {
         var keyConfigFetchCount = 0
         var roundTripAttempts = 0
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
 
         // Mock HTTP sender that returns HTTP 500 with "HTTP 400" in body (attack scenario)
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                // Return a signed config JSON (mock - tests don't actually verify signature)
-                let keyConfig = self.generateMockSignedConfig()
+                // Return a signed config JSON
+                let keyConfig = try! self.generateMockSignedConfig(keyId: testKeyId, signingKey: signingKey)
                 return (keyConfig, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 // Relay POST - return HTTP 500 with malicious body
@@ -34,11 +35,6 @@ final class OHTTPAuditFixTests: XCTestCase {
                 return (maliciousBody, HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
             }
         }
-
-        // Use test key parameters to bypass signature verification
-        let testKeyId = "test-key-2099"
-        let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
 
         let transport = OHTTPTransport(
             network: "testnet",
@@ -81,13 +77,14 @@ final class OHTTPAuditFixTests: XCTestCase {
     func testRetryTriggersOnRealHTTP400() async throws {
         var keyConfigFetchCount = 0
         var roundTripAttempts = 0
+        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
 
         // Mock HTTP sender that returns HTTP 400 on first attempt, then 200
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                let keyConfig = self.generateMockSignedConfig()
+                let keyConfig = try! self.generateMockSignedConfig(keyId: testKeyId, signingKey: signingKey)
                 return (keyConfig, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -101,11 +98,6 @@ final class OHTTPAuditFixTests: XCTestCase {
                 }
             }
         }
-
-        // Use test key parameters to bypass signature verification
-        let testKeyId = "test-key-2099"
-        let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
 
         let transport = OHTTPTransport(
             network: "testnet",
@@ -204,28 +196,55 @@ final class OHTTPAuditFixTests: XCTestCase {
 
     // MARK: - Helper Methods
 
+    /// Generate a fresh signing key and corresponding test parameters for injection.
+    private func makeTestKeyParams() -> (key: Curve25519.Signing.PrivateKey, keyId: String, publicKeyHex: String) {
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let publicKeyData = signingKey.publicKey.rawRepresentation
+
+        var hasher = SHA256()
+        hasher.update(data: publicKeyData)
+        let hash = hasher.finalize()
+        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
+        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
+
+        return (signingKey, keyId, publicKeyHex)
+    }
+
     /// Generates a minimal mock signed config JSON for testing.
-    private func generateMockSignedConfig() -> Data {
+    private func generateMockSignedConfig(keyId: String, signingKey: Curve25519.Signing.PrivateKey) throws -> Data {
         // Generate key config bytes
         let keyConfigBytes = generateMockKeyConfig()
-        let keyConfigBase64 = keyConfigBytes.base64EncodedString()
 
         // Current time + 1 hour validity
         let notBefore = Int64(Date().timeIntervalSince1970)
         let notAfter = notBefore + 3600
+        let network = "testnet"
 
-        let json = """
-        {
-            "v": 1,
-            "network": "testnet",
-            "configs": "\(keyConfigBase64)",
-            "not_before": \(notBefore),
-            "not_after": \(notAfter),
-            "key_id": "test-key-2099",
-            "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
-        }
-        """
-        return json.data(using: .utf8)!
+        // Build signature message per spec
+        var message = Data()
+        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
+        message.append(0x00)
+        message.append(network.data(using: .ascii)!)
+        message.append(0x00)
+        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
+        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
+        message.append(keyConfigBytes)
+
+        // Sign the message
+        let signature = try signingKey.signature(for: message)
+
+        // Build JSON envelope
+        let envelope = SignedOHTTPConfigEnvelope(
+            version: 1,
+            network: network,
+            configs: keyConfigBytes.base64EncodedString(),
+            notBefore: notBefore,
+            notAfter: notAfter,
+            keyId: keyId,
+            signature: Data(signature).base64EncodedString()
+        )
+
+        return try JSONEncoder().encode(envelope)
     }
 
     /// Generates a minimal mock key config for testing.
