@@ -83,6 +83,47 @@ public struct VotingNextStep: Equatable, Sendable, Decodable {
     }
 }
 
+/// What one piece of recovered vote work still owes.
+public enum VotingVoteRecoveryWorkKind: String, Equatable, Sendable, Decodable {
+    case advanceVote = "advance_vote"
+    case advanceVoteBatch = "advance_vote_batch"
+    case submitShares = "submit_shares"
+    case unknown
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingVoteRecoveryWorkKind(rawValue: raw) ?? .unknown
+    }
+}
+
+/// One vote the plan recovered from durable state that still owes work: a
+/// chain submission to follow up, or helper shares to submit.
+///
+/// A vote whose blocking helper share is being recovered is listed here as
+/// share submission work while its step in ``VotingRoundPlan/nextSteps`` is
+/// a share confirmation, so a host counting which bundles still owe vote work
+/// reads both lists.
+public struct VotingVoteRecoveryWork: Equatable, Sendable, Decodable {
+    public let kind: VotingVoteRecoveryWorkKind
+    public let bundleIndex: UInt32
+    public let proposalId: UInt32
+    /// The chain submission to follow up, when its hash is known.
+    public let txHash: String?
+    /// The vote's position in the vote commitment tree, for share work.
+    public let vcTreePosition: UInt64?
+    /// The helper shares still to submit, ascending.
+    public let shareIndexes: [UInt32]
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case bundleIndex = "bundle_index"
+        case proposalId = "proposal_id"
+        case txHash = "tx_hash"
+        case vcTreePosition = "vc_tree_position"
+        case shareIndexes = "share_indexes"
+    }
+}
+
 /// Durable identity of one helper share.
 public struct VotingShareKey: Equatable, Sendable, Decodable {
     public let bundleIndex: UInt32
@@ -368,6 +409,13 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     /// A step kind this SDK does not name decodes as
     /// ``VotingNextStepKind/unknown`` with its bundle and proposal intact.
     public let nextSteps: [VotingNextStep]
+    /// Vote work the plan recovered from durable state, in the planner's
+    /// order. Not redundant with ``nextSteps``: a vote whose blocking helper
+    /// share is being recovered is listed here as share submission work while
+    /// its next step is a share confirmation. A host measuring which bundles
+    /// still owe vote work reads the bundles of both. A kind this SDK does not
+    /// name decodes as ``VotingVoteRecoveryWorkKind/unknown``.
+    public let recoveredVoteWork: [VotingVoteRecoveryWork]
     public let delegationStatuses: [VotingDelegationStatus]
     /// Proposals with no terminal decision yet. Recording a choice clears a
     /// proposal from this list immediately, the same as recording an explicit
@@ -430,6 +478,7 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         case hasRecoverableVoteOrShareWork = "has_recoverable_vote_or_share_work"
         case primaryAction = "primary_action"
         case nextSteps = "next_steps"
+        case recoveredVoteWork = "recovered_vote_work"
         case delegationStatuses = "delegation_statuses"
         case openProposals = "open_proposals"
         case unrosteredIntents = "unrostered_intents"
@@ -443,9 +492,9 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
     // plan, because losing the whole plan over a missing list is the worse
     // failure. Everything else the planner always writes.
     //
-    // `nextSteps` is always written by the crate's plan view, but it decodes
-    // the same lenient way: a plan without it is still a plan, read as owing
-    // no listed step.
+    // `nextSteps` and `recoveredVoteWork` are always written by the crate's
+    // plan view, but they decode the same lenient way: a plan without one is
+    // still a plan, read as owing no listed step or recovered work.
     //
     // `hasLegacyInFlightSubmission` is absent for the same reason and defaults
     // the same way: only the three calls its documentation names add it to the
@@ -472,6 +521,10 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         hasRecoverableVoteOrShareWork = try container.decode(Bool.self, forKey: .hasRecoverableVoteOrShareWork)
         primaryAction = try container.decode(VotingRoundPlanAction.self, forKey: .primaryAction)
         nextSteps = try container.decodeIfPresent([VotingNextStep].self, forKey: .nextSteps) ?? []
+        recoveredVoteWork = try container.decodeIfPresent(
+            [VotingVoteRecoveryWork].self,
+            forKey: .recoveredVoteWork
+        ) ?? []
         delegationStatuses = try container.decode([VotingDelegationStatus].self, forKey: .delegationStatuses)
         openProposals = try container.decode([UInt32].self, forKey: .openProposals)
         unrosteredIntents = try container.decodeIfPresent([UInt32].self, forKey: .unrosteredIntents) ?? []
