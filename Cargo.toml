@@ -166,7 +166,7 @@ lto = true
 # it in step with the librustzcash generation the versions above declare: a rev built against an
 # older generation cannot resolve against them.
 # Update the rev via `cargo check` (not `cargo update -p zodl-slipstream`); confirm h2 stays 0.4.15.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "84ac43e6264ae669c7119a85e250119f3b55746e" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "6445170c3c9cc8102a4b285cf3c6a931c0d8398c" }
 
 # DO NOT ALTER THIS COMMENT
 #
