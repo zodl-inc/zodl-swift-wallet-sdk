@@ -24,12 +24,13 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// would fail the same way. The transport should fail immediately without retry.
     func testNoRetryOn409ReplayCache() async throws {
         var requestCount = 0
-        
+        let testKeyId = "test-key-2099"
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 // Return mock signed config
-                return (self.generateMockSignedConfig(), 
+                return (self.generateMockSignedConfig(keyId: testKeyId),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 // Gateway POST - return 409 Conflict
@@ -37,8 +38,7 @@ final class OHTTPBehavioralTests: XCTestCase {
                 return (Data(), HTTPURLResponse(url: request.url!, statusCode: 409, httpVersion: nil, headerFields: nil)!)
             }
         }
-        
-        let testKeyId = "test-key-2099"
+
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
@@ -84,12 +84,13 @@ final class OHTTPBehavioralTests: XCTestCase {
     func test422TriggersConfigRefetchAndSingleRetry() async throws {
         var keyConfigFetchCount = 0
         var roundTripAttempts = 0
-        
+        let testKeyId = "test-key-2099"
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
-                return (self.generateMockSignedConfig(), 
+                return (self.generateMockSignedConfig(keyId: testKeyId),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -99,7 +100,7 @@ final class OHTTPBehavioralTests: XCTestCase {
                     return (errorBody, HTTPURLResponse(url: request.url!, statusCode: 422, httpVersion: nil, headerFields: nil)!)
                 } else if roundTripAttempts == 2 {
                     // Second attempt after key refresh: success
-                    return (self.generateMockEncapsulatedResponse(), 
+                    return (self.generateMockEncapsulatedResponse(),
                             HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
                 } else {
                     // Should not reach here (only one retry expected)
@@ -108,8 +109,7 @@ final class OHTTPBehavioralTests: XCTestCase {
                 }
             }
         }
-        
-        let testKeyId = "test-key-2099"
+
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
@@ -148,11 +148,12 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// Tests that 422 without successful retry propagates the error correctly.
     func test422RetryFailurePropagatesError() async throws {
         var roundTripAttempts = 0
-        
+        let testKeyId = "test-key-2099"
+
         let mockSender: OHTTPTransport.HTTPSender = { request in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
-                return (self.generateMockSignedConfig(), 
+                return (self.generateMockSignedConfig(keyId: testKeyId),
                         HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             } else {
                 roundTripAttempts += 1
@@ -161,8 +162,7 @@ final class OHTTPBehavioralTests: XCTestCase {
                 return (errorBody, HTTPURLResponse(url: request.url!, statusCode: 422, httpVersion: nil, headerFields: nil)!)
             }
         }
-        
-        let testKeyId = "test-key-2099"
+
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         let testPublicKeyHex = privateKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
         
@@ -395,8 +395,8 @@ final class OHTTPBehavioralTests: XCTestCase {
     }
 
     // MARK: - Helper Methods (reused from OHTTPAuditFixTests)
-    
-    private func generateMockSignedConfig() -> Data {
+
+    private func generateMockSignedConfig(keyId: String = "a3620fb6") -> Data {
         let keyConfigBytes = generateMockKeyConfig()
         let keyConfigBase64 = keyConfigBytes.base64EncodedString()
 
@@ -411,7 +411,7 @@ final class OHTTPBehavioralTests: XCTestCase {
             "configs": "\(keyConfigBase64)",
             "not_before": \(notBefore),
             "not_after": \(notAfter),
-            "key_id": "a3620fb6",
+            "key_id": "\(keyId)",
             "sig": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
         }
         """
