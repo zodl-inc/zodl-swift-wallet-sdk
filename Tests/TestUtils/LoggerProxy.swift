@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 var logger = OSLogger(logLevel: .debug)
 

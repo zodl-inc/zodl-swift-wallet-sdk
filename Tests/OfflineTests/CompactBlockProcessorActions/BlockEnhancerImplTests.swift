@@ -10,7 +10,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A tiny thread-safe counter — the generated mock closures are not isolated, so a captured
 /// mutable `var` would be unsafe under concurrent access.

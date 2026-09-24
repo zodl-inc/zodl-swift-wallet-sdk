@@ -1,13 +1,13 @@
 //
 //  MaxSpendModeTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Michal Fousek on 2026-07-29.
 //
 
 import XCTest
 import libzcashlc
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class MaxSpendModeTests: XCTestCase {
     func testMaxSpendableMapsToFfiMaxSpendable() throws {

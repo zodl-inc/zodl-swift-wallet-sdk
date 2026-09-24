@@ -7,7 +7,7 @@
 
 import Combine
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 @testable import TestUtils
 
 class SynchronizerTests: ZcashTestCase {

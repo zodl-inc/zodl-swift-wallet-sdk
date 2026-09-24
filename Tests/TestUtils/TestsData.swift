@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class TestsData {
     let networkType: NetworkType

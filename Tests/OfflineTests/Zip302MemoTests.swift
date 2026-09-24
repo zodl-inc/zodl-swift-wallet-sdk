@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class Zip302MemoTests: XCTestCase {
     /// Zip-302 specifies "the byte 0xF6 followed by 511 0x00 bytes, indicating 'no memo'"

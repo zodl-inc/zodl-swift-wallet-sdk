@@ -9,7 +9,7 @@ import Combine
 import Foundation
 @testable import TestUtils
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /*
  This test creates multiple instances of the `SDKSynchronizer` and then run sync on those in parallel. To achieve this it's required to run multiple

@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 import KRProgressHUD
 class GetUTXOsViewController: UIViewController {
     @IBOutlet weak var transparentAddressLabel: UILabel!

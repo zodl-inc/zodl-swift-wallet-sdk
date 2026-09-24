@@ -7,7 +7,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class FetchUTXOsActionTests: ZcashTestCase {
     func testFetchUTXOsAction_NextAction() async throws {

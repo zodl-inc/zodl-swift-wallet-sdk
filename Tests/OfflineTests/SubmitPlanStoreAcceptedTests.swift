@@ -1,12 +1,12 @@
 //
 //  SubmitPlanStoreAcceptedTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import SQLite
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
     private var databaseURL: URL!

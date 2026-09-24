@@ -1,12 +1,12 @@
 //
 //  SlipstreamStallRecoveryPolicyTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Coverage for the stall watchdog's recovery restart (MOB-1850): the pure policy
 /// `SlipstreamSynchronizer.stallRecoveryDecision(...)`, and the reporting the restart owes its host

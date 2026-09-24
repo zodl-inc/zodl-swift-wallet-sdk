@@ -1,6 +1,6 @@
 //
 //  TestCoordinator.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 4/29/20.
 //
@@ -8,7 +8,7 @@
 import Combine
 import Foundation
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// This is the TestCoordinator
 /// What does it do? quite a lot.

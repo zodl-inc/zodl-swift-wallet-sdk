@@ -1,6 +1,6 @@
 //
 //  DerivatioToolTestnetTests.swift
-//  ZcashLightClientKit-Unit-DerivationToolTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 7/26/21.
 //
@@ -8,7 +8,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class DerivationToolTestnetTests: XCTestCase {
     var seedData = Data(base64Encoded: "9VDVOZZZOWWHpZtq1Ebridp3Qeux5C+HwiRR0g7Oi7HgnMs8Gfln83+/Q1NnvClcaSwM4ADFL1uZHxypEWlWXg==")!

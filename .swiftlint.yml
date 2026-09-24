@@ -2,23 +2,22 @@
 # https://github.com/raywenderlich/swift-style-guide
 
 included:
-  - Sources/ZcashLightClientKit/
+  - Sources/ZODLSwiftWalletSDK/
   - Example/ZcashLightClientSample/ZcashLightClientSample
   - Example/ZcashLightClientSample/ZcashLightClientSampleTests
 
 excluded:
   - xctemplates/
-  - Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/compact_formats.pb.swift
-  - Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/service.pb.swift
-  - Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/service.grpc.swift
-  - Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/proposal.pb.swift
+  - Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/compact_formats.pb.swift
+  - Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/service.pb.swift
+  - Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/service.grpc.swift
+  - Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/proposal.pb.swift
   - Tests/
-  - ZcashLightClientKitTests/Constants.generated.swift
   - build/
   - docs/
   - Tests/TestUtils/Sourcery/GeneratedMocks/AutoMockable.generated.swift
-  - Sources/ZcashLightClientKit/Error/ZcashError.swift
-  - Sources/ZcashLightClientKit/Error/ZcashErrorCode.swift
+  - Sources/ZODLSwiftWalletSDK/Error/ZcashError.swift
+  - Sources/ZODLSwiftWalletSDK/Error/ZcashErrorCode.swift
 
 disabled_rules:
   - notification_center_detachment

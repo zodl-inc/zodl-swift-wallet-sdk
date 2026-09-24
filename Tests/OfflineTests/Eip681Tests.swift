@@ -1,10 +1,10 @@
 //
 //  Eip681Tests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class Eip681Tests: XCTestCase {
     // MARK: - Native transfer parsing

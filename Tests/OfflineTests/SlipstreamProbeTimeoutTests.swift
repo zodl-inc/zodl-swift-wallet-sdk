@@ -1,11 +1,11 @@
 //
 //  SlipstreamProbeTimeoutTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Coverage for `SlipstreamSynchronizer.probe(_:timeoutSeconds:using:)`, the per-endpoint
 /// benchmark probe extracted so it can be bounded independently of the endpoint's own gRPC

@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 class TestServersViewController: UIViewController {
     let endpoints: [LightWalletEndpoint] = [

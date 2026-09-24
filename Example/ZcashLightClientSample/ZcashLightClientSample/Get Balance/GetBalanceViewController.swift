@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 import Combine
 
 class GetBalanceViewController: UIViewController {

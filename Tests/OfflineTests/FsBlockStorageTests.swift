@@ -6,7 +6,7 @@
 //
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 var logger = OSLogger(logLevel: .debug)
 

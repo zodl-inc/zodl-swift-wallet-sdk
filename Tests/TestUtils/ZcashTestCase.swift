@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import XCTest
 
 class ZcashTestCase: XCTestCase {

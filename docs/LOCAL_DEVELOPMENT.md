@@ -39,8 +39,8 @@ You **must** run `init-local-ffi.sh` before opening the project in Xcode. Withou
 
 ```bash
 # Clone the repository
-git clone https://github.com/zodl-inc/zcash-swift-wallet-sdk
-cd zcash-swift-wallet-sdk
+git clone https://github.com/zodl-inc/zodl-swift-wallet-sdk
+cd zodl-swift-wallet-sdk
 
 # Initialize local FFI (builds from source)
 ./Scripts/init-local-ffi.sh
@@ -175,7 +175,7 @@ The `LocalPackages` directory contains a Swift package named `libzcashlc` with t
 
 ## Automatic FFI Rebuilds
 
-The shared `ZcashLightClientKit` scheme in `ZcashSDK.xcworkspace` includes `FFIBuilder` as a build dependency. FFIBuilder runs `rebuild-local-ffi.sh` with the appropriate platform based on your selected destination, so Rust code is automatically recompiled when you build in Xcode.
+The shared `ZODLSwiftWalletSDK` scheme in `ZcashSDK.xcworkspace` includes `FFIBuilder` as a build dependency. FFIBuilder runs `rebuild-local-ffi.sh` with the appropriate platform based on your selected destination, so Rust code is automatically recompiled when you build in Xcode.
 
 **Note:** The FFIBuilder target requires `init-local-ffi.sh` to have been run first — it calls `rebuild-local-ffi.sh`, which expects `LocalPackages/` to exist.
 

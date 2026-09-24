@@ -7,6 +7,6 @@
 //
 
 import Foundation
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 let kZcashNetwork = ZcashNetworkBuilder.network(for: .mainnet)
