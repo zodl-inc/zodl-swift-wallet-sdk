@@ -143,12 +143,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Slipstream, librustzcash, Orchard, Sapling) keep their debug output; `zcash_client_backend`
   stays capped at warnings, as before. With `.noLogging` the Rust backend is now fully silent,
   where previously `zcash_client_backend` warnings still reached the unified log.
-- Slipstream sync on slow connections — including over Tor — no longer restarts itself or starts
-  over. Data arriving from the server now counts as sync progress, a slow block download keeps what
-  it already received instead of downloading it again, and a block range that exhausts its retries
-  fails the sync pass at once (the SDK retries it) instead of leaving sync stuck.
-  `SynchronizerEvent.syncStalled` now reports a stall only when nothing arrives from the server
-  for the whole stall window.
+- Slipstream sync on slow connections, including over Tor, is no longer restarted by the SDK or
+  started over by the engine for being slow: data arriving from the server counts as sync
+  progress, and a slow or interrupted block download keeps what it received. A block range the
+  server cannot deliver now fails the sync pass at once, and the sync is retried automatically
+  (`syncStatus` reads `.error(ZcashError.synchronizerDisconnected)` between attempts) instead of
+  hanging. `SynchronizerEvent.syncStalled` fires only when neither data nor local work has moved for
+  the whole stall window, so an unreachable or failing server shows up as retried passes rather
+  than as stall events. With `alternateEndpoints` on a non-Tor connection, a collapsed download
+  still fails over to another endpoint.
 
 ## Changed
 

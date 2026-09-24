@@ -159,12 +159,14 @@ crate-type = ["staticlib"]
 lto = true
 
 [patch.crates-io]
-# The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
-# repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
-# build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
-# the librustzcash generation the versions above declare: a rev built against an older generation
-# cannot resolve against them.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "00ac463c455533700f6d05a2658881d7e96f6642" }
+# This pin carries Slipstream commits that are not in a crates.io release yet; once the next
+# zodl-slipstream release includes them, drop it and return to the published version. It names a
+# COMMIT HASH of the canonical repo rather than a branch: a branch pin silently follows a
+# force-push, so a build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep
+# it in step with the librustzcash generation the versions above declare: a rev built against an
+# older generation cannot resolve against them.
+# Update the rev via `cargo check` (not `cargo update -p zodl-slipstream`); confirm h2 stays 0.4.15.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "84ac43e6264ae669c7119a85e250119f3b55746e" }
 
 # DO NOT ALTER THIS COMMENT
 #

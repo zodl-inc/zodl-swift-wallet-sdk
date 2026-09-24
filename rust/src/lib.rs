@@ -296,7 +296,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-09-23.v0.15-third-party-log-cap",
+        zcashlc_build = "2026-09-24.v0.16-slipstream-stall-liveness",
         "tracing initialized (third-party crates capped at INFO, zcash_client_backend at WARN)"
     );
 
