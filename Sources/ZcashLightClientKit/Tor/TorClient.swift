@@ -9,6 +9,17 @@ import Foundation
 import libzcashlc
 
 public actor TorClient {
+    /// Every native call this client makes blocks its thread until Arti answers — a bootstrap, a request with its
+    /// retries, an exchange-rate lookup, a lightwalletd connection — and over Tor that takes seconds, a bootstrap
+    /// with no cached consensus much longer. The client runs on a queue of its own so those waits never hold one of
+    /// Swift's cooperative threads. Every isolated client gets its own queue, so requests on separate circuits still
+    /// run in parallel.
+    nonisolated let executor = DispatchQueueSerialExecutor(label: "cash.z.wallet.sdk.tor-client")
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
     private var underlyingRuntime: OpaquePointer?
     private var torDir: URL
     private let httpGetNative: TorHTTPGetNative
@@ -507,7 +518,7 @@ public class TorLwdConn {
         dbData: (String, UInt),
         networkType: NetworkType,
         accountUUID: AccountUUID
-    ) async throws -> TransparentAddressCheckResult {
+    ) throws -> TransparentAddressCheckResult {
         let addressCheckResultPtr = zcashlc_tor_lwd_conn_check_single_use_taddr(
             conn,
             dbData.0,
@@ -539,7 +550,7 @@ public class TorLwdConn {
         end: BlockHeight,
         dbData: (String, UInt),
         networkType: NetworkType
-    ) async throws -> TransparentAddressCheckResult {
+    ) throws -> TransparentAddressCheckResult {
         let addressCheckResultPtr = zcashlc_tor_lwd_conn_update_transparent_address_transactions(
             conn,
             dbData.0,
@@ -572,7 +583,7 @@ public class TorLwdConn {
         dbData: (String, UInt),
         networkType: NetworkType,
         accountUUID: AccountUUID
-    ) async throws -> TransparentAddressCheckResult {
+    ) throws -> TransparentAddressCheckResult {
         let addressCheckResultPtr = zcashlc_tor_lwd_conn_fetch_utxos_by_address(
             conn,
             dbData.0,

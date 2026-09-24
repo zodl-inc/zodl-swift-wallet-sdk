@@ -252,7 +252,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         // window covers the submit, not the bootstrap).
         onWillSubmit()
         do {
-            let response = try connection.submit(spendTransaction: rawTransaction)
+            let response = try await BlockingCall.shared.run { try connection.submit(spendTransaction: rawTransaction) }
             return outcome(from: response)
         } catch {
             logger.error("MigrationBroadcaster: Tor submit transport failure: \(error)")
