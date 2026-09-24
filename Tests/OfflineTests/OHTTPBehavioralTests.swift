@@ -335,7 +335,65 @@ final class OHTTPBehavioralTests: XCTestCase {
             )
         }
     }
-    
+
+    /// Tests that signed config with wrong network is rejected.
+    /// A mainnet config should be rejected when verifying for testnet and vice versa.
+    func testSignedConfigRejectsWrongNetwork() throws {
+        let configBytes = Data([0x01, 0x00, 0x20, 0x04, 0x20])
+        let notBefore = Int64(Date().timeIntervalSince1970) - 60
+        let notAfter = notBefore + 3600
+
+        // Create mainnet envelope
+        let mainnetEnvelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "mainnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "ba8a2dbd",
+            sig: String(repeating: "A", count: 88)
+        )
+
+        let mainnetJsonData = try JSONEncoder().encode(mainnetEnvelope)
+
+        // Verify for testnet should reject mainnet envelope
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: mainnetJsonData, network: "testnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError for wrong network")
+                return
+            }
+            XCTAssertTrue(
+                verifyError.description.contains("Network") || verifyError.description.contains("network"),
+                "Error should mention network mismatch: \(verifyError.description)"
+            )
+        }
+
+        // Create testnet envelope
+        let testnetEnvelope = SignedOHTTPConfigEnvelope(
+            v: 1,
+            network: "testnet",
+            configs: configBytes.base64EncodedString(),
+            not_before: notBefore,
+            not_after: notAfter,
+            key_id: "a3620fb6",
+            sig: String(repeating: "A", count: 88)
+        )
+
+        let testnetJsonData = try JSONEncoder().encode(testnetEnvelope)
+
+        // Verify for mainnet should reject testnet envelope
+        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(jsonData: testnetJsonData, network: "mainnet")) { error in
+            guard let verifyError = error as? KeyConfigVerificationError else {
+                XCTFail("Expected KeyConfigVerificationError for wrong network")
+                return
+            }
+            XCTAssertTrue(
+                verifyError.description.contains("Network") || verifyError.description.contains("network"),
+                "Error should mention network mismatch: \(verifyError.description)"
+            )
+        }
+    }
+
     // MARK: - Helper Methods (reused from OHTTPAuditFixTests)
     
     private func generateMockSignedConfig() -> Data {
