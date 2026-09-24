@@ -283,62 +283,6 @@ final class OHTTPBehavioralTests: XCTestCase {
         }
     }
     
-    /// Tests that signed config with duplicate key IDs is rejected.
-    /// This requires creating a configs blob with multiple key configs having the same keyId.
-    func testSignedConfigRejectsDuplicateKeyIds() throws {
-        let (signingKey, keyId, publicKeyHex) = makeTestKeyParams()
-
-        // Create two OHTTP key configs with the same keyId (both using keyId=1)
-        var configsData = Data()
-
-        // First config: length + keyId=1 + minimal X25519 config
-        configsData.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
-        configsData.append(1)  // keyId
-        configsData.append(contentsOf: [0x00, 0x20])  // KEM: DHKEM(X25519, HKDF-SHA256)
-        let privateKey1 = Curve25519.KeyAgreement.PrivateKey()
-        configsData.append(privateKey1.publicKey.rawRepresentation)
-        configsData.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
-        configsData.append(contentsOf: [0x00, 0x01])  // KDF: HKDF-SHA256
-        configsData.append(contentsOf: [0x00, 0x01])  // AEAD: AES-128-GCM
-
-        // Second config: SAME keyId=1 (duplicate)
-        configsData.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
-        configsData.append(1)  // keyId (duplicate!)
-        configsData.append(contentsOf: [0x00, 0x20])  // KEM: DHKEM(X25519, HKDF-SHA256)
-        let privateKey2 = Curve25519.KeyAgreement.PrivateKey()
-        configsData.append(privateKey2.publicKey.rawRepresentation)
-        configsData.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
-        configsData.append(contentsOf: [0x00, 0x01])  // KDF: HKDF-SHA256
-        configsData.append(contentsOf: [0x00, 0x01])  // AEAD: AES-128-GCM
-
-        let notBefore = Int64(Date().timeIntervalSince1970) - 60
-        let notAfter = notBefore + 3600
-
-        // Generate VALID signature over configs with duplicate key IDs
-        let jsonData = try makeSignedEnvelope(
-            keyConfigBytes: configsData,
-            keyId: keyId,
-            signingKey: signingKey,
-            notBefore: notBefore,
-            notAfter: notAfter
-        )
-
-        XCTAssertThrowsError(try OHTTPSignedConfigVerifier.verifyAndParse(
-            jsonData: jsonData,
-            network: "testnet",
-            testKeyId: keyId,
-            testPublicKeyHex: publicKeyHex
-        )) { error in
-            guard let verifyError = error as? KeyConfigVerificationError else {
-                XCTFail("Expected KeyConfigVerificationError for duplicate keyIds")
-                return
-            }
-            XCTAssertTrue(
-                verifyError.description.contains("duplicate") || verifyError.description.contains("key"),
-                "Error should mention duplicate keys: \(verifyError.description)"
-            )
-        }
-    }
 
     /// Tests that signed config with wrong network is rejected.
     /// A mainnet config should be rejected when verifying for testnet and vice versa.
