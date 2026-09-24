@@ -164,7 +164,7 @@ lto = true
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with
 # the librustzcash generation the versions above declare: a rev built against an older generation
 # cannot resolve against them.
-#slipstream-core = { git = "https://github.com/zodl-inc/slipstream.git", rev = "ab89ada45f2ef893a05fcefa0ead99f87d848a4e" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "00ac463c455533700f6d05a2658881d7e96f6642" }
 
 # DO NOT ALTER THIS COMMENT
 #
