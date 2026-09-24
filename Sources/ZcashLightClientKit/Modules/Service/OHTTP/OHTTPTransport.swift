@@ -126,10 +126,10 @@ actor OHTTPTransport {
         var signedURL = relayURL
         if signedURL.hasSuffix("/relay") {
             signedURL.removeLast("/relay".count)
-            signedURL += "/ohttp-configs/signed"
+            signedURL = "\(signedURL)/ohttp-configs/signed"
         } else {
             // Fallback: relay URL doesn't end with /relay (unexpected, but handle gracefully)
-            signedURL += "/ohttp-configs/signed"
+            signedURL = "\(signedURL)/ohttp-configs/signed"
         }
 
         // Validate the derived URL before any network call or decoding

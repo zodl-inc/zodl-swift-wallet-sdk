@@ -92,7 +92,7 @@ public enum OHTTPEndpoints {
         // Replace only the path suffix, not the hostname (relay-simulator stays relay-simulator)
         if relayURL.hasSuffix("/relay") {
             relayURL.removeLast("/relay".count)
-            relayURL += "/ohttp-configs"
+            relayURL = "\(relayURL)/ohttp-configs"
         }
         return relayURL
     }
