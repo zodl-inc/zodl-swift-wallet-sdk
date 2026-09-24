@@ -465,22 +465,13 @@ final class OHTTPE2ETests: ZcashTestCase {
             synchronizer = sync
         }
 
-        // Test 1: CMC key/info endpoint — the gateway should inject X-CMC_PRO_API_KEY and return 200.
-        // If Tor is off (OHTTP only), the request lacks the key so 401 is expected (gateway not yet configured).
-        // If Tor is on (Tor+OHTTP), the gateway injects the key and 200 is expected.
-        let cmcURL = URL(string: "https://pro-api.coinmarketcap.com/v1/key/info")!
+        // Test 1: CMC quotes endpoint — the gateway should inject X-CMC_PRO_API_KEY and return 200.
+        // Uses the exact endpoint allowed by mainnet BACKENDS_POLICY (GET /v1/cryptocurrency/quotes/latest).
+        let cmcURL = URL(string: "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=ZEC")!
         if OHTTPEndpoints.proxyURL(for: cmcURL) != nil {
             log("CMC: routing via cmc.zodl.com OHTTP proxy (\(mode))")
             let (_, response) = try await externalAPIRequest(url: cmcURL, viaTor: tor, synchronizer: synchronizer)
-            let acceptedStatuses: [Int] = tor ? [200] : [200, 400, 401, 403]
-            if tor {
-                XCTAssertEqual(response.statusCode, 200, "CMC via Tor+OHTTP must return 200 (gateway-injected key)")
-            } else {
-                XCTAssertTrue(
-                    acceptedStatuses.contains(response.statusCode),
-                    "CMC via OHTTP must return a real HTTP status (got \(response.statusCode))"
-                )
-            }
+            XCTAssertEqual(response.statusCode, 200, "CMC via OHTTP must return 200 (gateway-injected key, policy-allowed operation)")
             log("RESULT external=cmc via=\(mode) status=\(response.statusCode)")
         } else {
             log("SKIP external=cmc no proxy configured")
