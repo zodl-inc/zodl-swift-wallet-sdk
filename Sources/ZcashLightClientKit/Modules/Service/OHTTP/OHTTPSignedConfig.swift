@@ -14,13 +14,23 @@ import CryptoKit
 
 /// Signed OHTTP configuration envelope.
 struct SignedOHTTPConfigEnvelope: Codable {
-    let v: Int
+    let version: Int
     let network: String
     let configs: String  // Base64-encoded RFC 9458 key config bytes
-    let not_before: Int64
-    let not_after: Int64
-    let key_id: String
-    let sig: String  // Base64-encoded Ed25519 signature
+    let notBefore: Int64
+    let notAfter: Int64
+    let keyId: String
+    let signature: String  // Base64-encoded Ed25519 signature
+
+    enum CodingKeys: String, CodingKey {
+        case version = "v"
+        case network
+        case configs
+        case notBefore = "not_before"
+        case notAfter = "not_after"
+        case keyId = "key_id"
+        case signature = "sig"
+    }
 }
 
 /// Verified OHTTP configuration from signed envelope.
@@ -82,8 +92,8 @@ enum OHTTPSignedConfigVerifier {
         let envelope = try decoder.decode(SignedOHTTPConfigEnvelope.self, from: jsonData)
 
         // 1. Check protocol version
-        guard envelope.v == 1 else {
-            throw KeyConfigVerificationError.invalidEnvelope("Unsupported protocol version: \(envelope.v)")
+        guard envelope.version == 1 else {
+            throw KeyConfigVerificationError.invalidEnvelope("Unsupported protocol version: \(envelope.version)")
         }
 
         // 2. Check network
@@ -101,15 +111,15 @@ enum OHTTPSignedConfigVerifier {
             (publicKeyHex, expectedKeyId) = try selectKey(for: network)
         }
 
-        guard envelope.key_id == expectedKeyId else {
+        guard envelope.keyId == expectedKeyId else {
             throw KeyConfigVerificationError.invalidEnvelope(
-                "Key ID mismatch: expected \(expectedKeyId), got \(envelope.key_id)"
+                "Key ID mismatch: expected \(expectedKeyId), got \(envelope.keyId)"
             )
         }
         
         // 4. Decode and verify Ed25519 signature
         guard let configData = Data(base64Encoded: envelope.configs),
-              let signatureData = Data(base64Encoded: envelope.sig),
+              let signatureData = Data(base64Encoded: envelope.signature),
               let publicKeyData = Data(hexString: publicKeyHex) else {
             throw KeyConfigVerificationError.invalidEnvelope("Failed to decode base64/hex data")
         }
@@ -123,8 +133,8 @@ enum OHTTPSignedConfigVerifier {
         
         let message = buildSignedMessage(
             network: envelope.network,
-            notBefore: envelope.not_before,
-            notAfter: envelope.not_after,
+            notBefore: envelope.notBefore,
+            notAfter: envelope.notAfter,
             configBytes: configData
         )
         
@@ -138,13 +148,13 @@ enum OHTTPSignedConfigVerifier {
         
         // 5. Check time validity
         let nowSeconds = Int64(now().timeIntervalSince1970)
-        let minValid = envelope.not_before - timeTolerance
-        let maxValid = envelope.not_after + timeTolerance
+        let minValid = envelope.notBefore - timeTolerance
+        let maxValid = envelope.notAfter + timeTolerance
 
         // P5: Strict ordering check (not_before < not_after)
-        guard envelope.not_before < envelope.not_after else {
+        guard envelope.notBefore < envelope.notAfter else {
             throw KeyConfigVerificationError.invalidEnvelope(
-                "Invalid time bounds: not_before (\(envelope.not_before)) must be < not_after (\(envelope.not_after))"
+                "Invalid time bounds: not_before (\(envelope.notBefore)) must be < not_after (\(envelope.notAfter))"
             )
         }
 
@@ -155,7 +165,7 @@ enum OHTTPSignedConfigVerifier {
         }
 
         // 6. Enforce maximum validity period (24 hours)
-        let validityPeriod = envelope.not_after - envelope.not_before
+        let validityPeriod = envelope.notAfter - envelope.notBefore
         guard validityPeriod <= maxValiditySeconds else {
             throw KeyConfigVerificationError.verificationFailed(
                 "Validity period \(validityPeriod)s exceeds maximum \(maxValiditySeconds)s"
@@ -164,9 +174,9 @@ enum OHTTPSignedConfigVerifier {
 
         // Additional check: notAfter must not be more than 24h in the future
         let maxFutureTime = nowSeconds + maxValiditySeconds
-        guard envelope.not_after <= maxFutureTime else {
+        guard envelope.notAfter <= maxFutureTime else {
             throw KeyConfigVerificationError.verificationFailed(
-                "notAfter \(envelope.not_after) exceeds maximum future time \(maxFutureTime)"
+                "notAfter \(envelope.notAfter) exceeds maximum future time \(maxFutureTime)"
             )
         }
         
@@ -175,7 +185,7 @@ enum OHTTPSignedConfigVerifier {
         
         return VerifiedOHTTPConfig(
             keyConfig: parsedConfig,
-            validUntil: Date(timeIntervalSince1970: TimeInterval(envelope.not_after))
+            validUntil: Date(timeIntervalSince1970: TimeInterval(envelope.notAfter))
         )
     }
     
