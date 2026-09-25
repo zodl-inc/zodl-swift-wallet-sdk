@@ -1227,7 +1227,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         summary: WalletSummary?,
         localBalances: [AccountUUID: AccountBalance]
     ) {
-        guard let localSummary = try getUnmaskedWalletSummary() else { return (nil, [:]) }
+        guard let localSummary = try await unmaskedWalletSummaryOffThePool() else { return (nil, [:]) }
 
         // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
         if await !sdkFlags.chainTipUpdated {
@@ -1240,7 +1240,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     // DB-READ (audited 2026-09-01): delegates to getUnmaskedWalletSummary(), whose
     // get_wallet_summary FFI read is audited below; performs no writes.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
-        try getUnmaskedWalletSummary()?.accountBalances ?? [:]
+        try await unmaskedWalletSummaryOffThePool()?.accountBalances ?? [:]
+    }
+
+    /// `get_wallet_summary` walks the whole wallet and can wait on the database while the sync engine writes, so it
+    /// runs on a dispatch thread instead of holding one of Swift's cooperative threads.
+    private func unmaskedWalletSummaryOffThePool() async throws -> WalletSummary? {
+        try await BlockingCall.shared.run { [self] in
+            try getUnmaskedWalletSummary()
+        }
     }
 
     // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL

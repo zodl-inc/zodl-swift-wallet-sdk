@@ -111,6 +111,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // changes the VISIBLE list with no engine write — is host-observed. Together with the
     // version compare this is the WHOLE emission rule.
     private var lastRevealRecovering = false
+    // When the poll tick last walked the wallet for the local balances, and what it saw then. It compares the same
+    // per-handle `txSetVersion`, so it is reset wherever `lastTxSetVersion` is.
+    private var localBalanceRefresh = LocalBalanceRefreshPolicy()
 
     // [v2.1 Phase 2] The F2 boundary-refresh mirror and the [#1591] chain-tip-flag parity
     // machinery are GONE: the engine refreshes the unified summary at its own boundaries
@@ -441,7 +444,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
             eventSubject: eventSubjectRef,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
-            statusCheck: {}
+            statusCheck: {},
+            // A send through the broadcaster changes the wallet where the engine cannot see it, so it bumps the
+            // transaction-set version for the same reason the migration writes do (see `bumpingTxSetVersion(after:)`).
+            // Fire-and-forget, like the poke in `submitTransactions(_:)`: a send's result must not wait on the engine's
+            // queue. Weak, so a broadcaster the host keeps after this synchronizer is gone does not keep the engine
+            // alive with it.
+            transactionsChanged: { [weak engine] in
+                guard let engine else {
+                    return
+                }
+                Task {
+                    await engine.notifyTxChange()
+                }
+            }
         )
     }
 
@@ -833,15 +849,41 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // recovering (re-read per call ⇒ the mid-restore climb stays per-tick), upstream
         // passthrough otherwise, [#1591]-masked while snapshot.tipFresh == 0 (E-2).
         // [E-3] A plain local: the host-side summary CACHE is gone with the warm-start
-        // machinery it fed (the engine serves its own cache; a nil here only means
-        // "engine mid-close", and every consumer falls back to `latestState`).
-        let summaries = await walletBalanceSnapshots()
+        // machinery it fed (the engine serves its own cache; a nil visible summary here only
+        // means "engine mid-close", and every consumer falls back to `latestState`).
+        // The local balances are the exception: the engine does not ration their walk, so the
+        // tick runs it only when `localBalanceRefresh` says they can have moved.
+        let visible = await visibleBalanceSnapshot()
+        let isRecoveringNow = snap.isRecovering == 1
+        let now = ProcessInfo.processInfo.systemUptime
+        var local: [AccountUUID: AccountBalance]?
+        if localBalanceRefresh.shouldRefresh(
+            txSetVersion: snap.txSetVersion,
+            visibleSummary: visible.summary,
+            isRecovering: isRecoveringNow,
+            now: now
+        ) {
+            local = await localBalancesWalk()
+        }
+        // A nil `local` means this tick skipped the walk (or the walk failed), and every branch below then carries
+        // the previously published local balances forward (`summaries.local ?? latestState.localAccountsBalances`).
+        let summaries = WalletBalanceSnapshots(visible: visible.summary, local: local, isSpendableMasked: visible.isSpendableMasked)
         // [MOB-1850] The last suspension before this tick publishes anything. Everything from here
         // to the end of the method is one uninterrupted actor turn plus the `foundTransactions`
         // fetch, so this is the check that keeps a stale tick from emitting state for a pass that
         // is gone, driving the resubmission check into a wipe's deleted files, or announcing
         // transactions for a wallet that no longer has them.
         guard isCurrent() else { return }
+        // Recorded only past the re-check: a walk can outlast a switch, a restart or a wipe, each of which resets the
+        // policy for the new handle, and a stale tick must not write its old handle's values back into it.
+        if local != nil {
+            localBalanceRefresh.recordRefresh(
+                txSetVersion: snap.txSetVersion,
+                visibleSummary: visible.summary,
+                isRecovering: isRecoveringNow,
+                at: now
+            )
+        }
         let summary = summaries.visible
         // [MOB-1852] Computed once, from the tuple THIS tick just fetched, and reused
         // by every branch below — never read from `currentlySpendableMasked` directly, which a
@@ -1108,6 +1150,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // otherwise the first tick of the new pass reads the reset `txSetVersion` as "unchanged".
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        localBalanceRefresh = LocalBalanceRefreshPolicy()
         // Re-arm the log and the handle-lifetime clamp for the new pass, but KEEP the recovery
         // budget: it is what bounds this very restart, and a full re-arm would clear it.
         resetStallWatchdog(resetRecoveryBudget: false)
@@ -1345,14 +1388,25 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return secondsSinceLastCheck >= resubmissionCheckInterval
     }
 
-    /// [MOB-1852] The result of one `walletBalanceSnapshots()` call — see that function's doc for
-    /// what `nil` means on each member.
+    /// [MOB-1852] The balances one read produced: a `walletBalanceSnapshots()` call, or a poll tick that assembles
+    /// them itself from ``visibleBalanceSnapshot()`` and, when it walks, ``localBalancesWalk()``.
+    ///
+    /// `visible` and `isSpendableMasked` are `nil` together when no visible summary was obtained (see
+    /// ``visibleBalanceSnapshot()``). `local` is `nil` when the walk failed or the backend cannot provide local
+    /// balances, and in a poll tick also when the tick skipped the walk because ``LocalBalanceRefreshPolicy`` found
+    /// nothing that could have moved them.
+    ///
+    /// A named result type rather than a tuple — SwiftLint's `large_tuple` caps tuples at 2
+    /// members — but every call site's `.visible` / `.local` / `.isSpendableMasked` member access
+    /// reads identically either way.
     private struct WalletBalanceSnapshots {
         let visible: WalletSummary?
         let local: [AccountUUID: AccountBalance]?
         let isSpendableMasked: Bool?
     }
 
+    /// The engine's visible summary and its [#1591] mask flag — no local walk.
+    ///
     /// [v2.1 Phase 2] THE summary source for the slipstream path: the engine's unified
     /// phase-resolving summary (`zcashlc_slipstream_wallet_summary`, ENGINE_API_V2.md §0.5) —
     /// correct at EVERY phase (recovering ⇒ per-account Σ-reconciled balances, never over-shows;
@@ -1365,9 +1419,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// (E-2); only the 3-line transform stays host-side (the C `AccountBalance` cannot express
     /// the awaiting-resolution shift). Recovery balances are never masked — parity with the
     /// old path, where the recovery display bypassed the legacy summary's mask entirely.
-    /// The visible summary is engine-owned and recovery-safe. The local snapshot always comes
-    /// directly from the shared wallet database and is display-only; it remains available while
-    /// the engine handle is closed during server replacement.
+    /// The visible summary is engine-owned and recovery-safe.
     ///
     /// [MOB-1852] No side effects: `isSpendableMasked` is returned rather than written
     /// to `currentlySpendableMasked` directly, so the flag this call computed can never be read by
@@ -1375,24 +1427,36 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// unrelated concurrent call before ITS caller gets to read it. `nil` means no visible summary
     /// was obtained (the engine mid-close, say); every caller then carries its own previous
     /// balances AND their mask flag forward together, never one without the other.
-    ///
-    /// A named result type rather than a tuple — SwiftLint's `large_tuple` caps tuples at 2
-    /// members — but every call site's `.visible` / `.local` / `.isSpendableMasked` member access
-    /// reads identically either way.
-    private func walletBalanceSnapshots() async -> WalletBalanceSnapshots {
+    private func visibleBalanceSnapshot() async -> (summary: WalletSummary?, isSpendableMasked: Bool?) {
         // [MOB-1850] The policy is spelled out for the same reason the drain capacity is: it is the
         // concrete engine's own default, restated because a protocol requirement cannot carry one.
         let summary = await engine.walletSummary(confirmationsPolicy: ConfirmationsPolicy.defaultTransferPolicy())
-        let provider = initializer.rustBackend as? LocalBalanceProviding
-        let local = try? await provider?.getLocalAccountBalances()
-        guard let summary else {
-            return WalletBalanceSnapshots(visible: nil, local: local, isSpendableMasked: nil)
-        }
+        guard let summary else { return (nil, nil) }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
-            return WalletBalanceSnapshots(visible: summary.withSpendableMasked(), local: local, isSpendableMasked: true)
+            return (summary.withSpendableMasked(), true)
         }
-        return WalletBalanceSnapshots(visible: summary, local: local, isSpendableMasked: false)
+        return (summary, false)
+    }
+
+    /// The unmasked local balances: a full `get_wallet_summary` walk over the wallet database.
+    ///
+    /// The local snapshot always comes directly from the shared wallet database and is display-only; it remains
+    /// available while the engine handle is closed during server replacement. The engine does not ration this walk the
+    /// way it rations its own summary, which is why the poll tick asks ``LocalBalanceRefreshPolicy`` before calling
+    /// it. `nil` means the walk failed or the backend cannot provide local balances.
+    private func localBalancesWalk() async -> [AccountUUID: AccountBalance]? {
+        let provider = initializer.rustBackend as? LocalBalanceProviding
+        return try? await provider?.getLocalAccountBalances()
+    }
+
+    /// Visible + local: ``visibleBalanceSnapshot()`` and then ``localBalancesWalk()``, for a caller that wants both at
+    /// once. The engine rations only the visible half, so the poll tick calls the two halves itself and walks for the
+    /// local one only when ``LocalBalanceRefreshPolicy`` says those balances can have moved.
+    private func walletBalanceSnapshots() async -> WalletBalanceSnapshots {
+        let visible = await visibleBalanceSnapshot()
+        let local = await localBalancesWalk()
+        return WalletBalanceSnapshots(visible: visible.summary, local: local, isSpendableMasked: visible.isSpendableMasked)
     }
 
     // ── Accounts / Balances ────────────────────────────────────────────────────
@@ -1401,8 +1465,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [v2.1 Phase 2] ONE call, correct at every phase: the engine resolves recovery
         // (Σ-reconciled view values) vs normal (upstream passthrough) inside the unified
         // summary FFI and rations the expensive walk itself — no host-side branching.
-        let summaries = await walletBalanceSnapshots()
-        return summaries.visible?.accountBalances ?? [:]
+        // Only the visible summary — the local walk this used to run was thrown away.
+        await visibleBalanceSnapshot().summary?.accountBalances ?? [:]
     }
 
     public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
@@ -2172,6 +2236,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         //     destroyed, so the Rust-side monotonic counter restarts at 0 on next open().
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        localBalanceRefresh = LocalBalanceRefreshPolicy()
 
         // 3a-B4. Re-arm the stall watchdog: the handle is destroyed.
         resetStallWatchdog()
@@ -2221,7 +2286,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     //
     // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
     // for the three wallet-scope gate members, to the host itself) -- mirrors `SDKSynchronizer`'s
-    // "MARK: Migration" section exactly. The two members that can broadcast (`submitNoteSplit`,
+    // "MARK: Migration" section, except that the members which write the wallet database then bump
+    // the engine's transaction-set version (see `bumpingTxSetVersion(after:)`), a step
+    // `SDKSynchronizer` has no engine for. The two members that can broadcast (`submitNoteSplit`,
     // `performMigrationBroadcast`) are guarded here by `throwIfSyncingForMigrationBroadcast()`
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
@@ -2233,6 +2300,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // engine's knowledge of a broadcast that already happened.
 
     public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
+        // Deliberately not `bumpingTxSetVersion(after:)`: a crank can persist the engine's own determinations, but
+        // none of them changes a transaction or a balance, and hosts crank on a timer. A bump here would re-fetch the
+        // transactions on every crank and, since a bump counts as sync progress, would hide a real stall from the
+        // watchdog for as long as the host kept cranking.
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
@@ -2245,11 +2316,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ instruction: [MigrationProveTarget],
         maxProofs: Int
     ) async throws -> MigrationProveOutcome {
-        try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
+        let outcome = try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
+        // The bump `bumpingTxSetVersion(after:)` makes, but only for a pass that proved something: a pass that proved
+        // nothing stored nothing, and hosts repeat such passes on a timer while the wallet catches up, so each would
+        // cost a transaction re-fetch, and count as sync progress, for nothing.
+        if outcome.totalProved > 0 {
+            await engine.notifyTxChange()
+        }
+        return outcome
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        }
     }
 
     public func recordMigrationPreparationBroadcast(
@@ -2257,7 +2337,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ prepared: PreparedMigrationTransfer,
         result: MigrationTransferResult
     ) async throws {
-        try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
+        }
     }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
@@ -2293,7 +2375,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        return try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        }
     }
 
     public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -2305,7 +2389,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
-        try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+        }
     }
 
     public func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
@@ -2313,11 +2399,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
-        try await migrationHost.migration(for: accountUUID).lockMigrationResidual()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).lockMigrationResidual()
+        }
     }
 
     public func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
-        try await migrationHost.migration(for: accountUUID).unlockMigrationResidual()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).unlockMigrationResidual()
+        }
     }
 
     public func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
@@ -2325,7 +2415,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
-        try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+        }
     }
 
     public func performMigrationBroadcast(
@@ -2334,7 +2426,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        return try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        }
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -2354,33 +2448,45 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+        }
     }
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+        }
     }
 
     public func createUnsignedNoteSplitPCZTs(
         accountUUID: AccountUUID,
         for schedule: MigrationSchedule
     ) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs(for: schedule)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs(for: schedule)
+        }
     }
 
     public func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+        }
     }
 
     public func createUnsignedMigrationTransferPCZTs(
         accountUUID: AccountUUID,
         for schedule: MigrationSchedule
     ) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+        }
     }
 
     public func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
-        try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+        }
     }
 
     // ── Migration Keystone batch-signing (external signer ceremony) ───────────
@@ -2446,6 +2552,32 @@ public actor SlipstreamSynchronizer: Synchronizer {
         if case .syncing = latestState.internalSyncStatus {
             throw ZcashError.migrationBroadcastDuringSync
         }
+    }
+
+    /// Runs `write`, a migration call that writes the wallet database, and once it has returned bumps the engine's
+    /// transaction-set version, as `deleteAccount(_:)` and every send do (`submitTransactions(_:)` and the
+    /// broadcaster's `transactionsChanged` hook, set in `init`).
+    ///
+    /// The engine cannot see a write the SDK makes on the host's behalf. The poll tick re-fetches the transactions when
+    /// that version moves, and re-reads `SynchronizerState.localAccountsBalances` before
+    /// `LocalBalanceRefreshPolicy.maximumAge` is up when the version, the engine's visible summary or the recovery
+    /// phase changes. A host write moves neither of the other two, so the bump is what makes the next tick re-read
+    /// them. Without it, the transfers a migration step stored stay out of Activity until something else moves the
+    /// version, and the tick keeps publishing the local balances from before the write.
+    ///
+    /// Bumping the version, rather than resetting `localBalanceRefresh`, also holds against a tick that is walking the
+    /// wallet right now: that tick captured the version before it walked, so the bump still reads as a change to the
+    /// next tick, where a reset would be overwritten once the walk is recorded. A call that throws bumps nothing.
+    ///
+    /// A bump also counts as sync progress for the stall watchdog: `notify_tx_change` → `bump_tx_set_version()` →
+    /// `touch()` restamps the engine's `last_progress_unix`, from which the snapshot's `stalledSeconds` derives. So a
+    /// call a host makes on a timer may bump only when it actually wrote something. A bump on every call would keep a
+    /// real stall below `stallWatchdogThresholdSeconds` for as long as the timer runs, which is the second reason
+    /// `migrationAdvanceStep(accountUUID:)` never bumps.
+    private func bumpingTxSetVersion<T>(after write: () async throws -> T) async rethrows -> T {
+        let result = try await write()
+        await engine.notifyTxChange()
+        return result
     }
 
     // ── Server switch ─────────────────────────────────────────────────────────
@@ -2526,6 +2658,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // Also reset the tx-set-version mirror: the new handle's counter starts from zero.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        localBalanceRefresh = LocalBalanceRefreshPolicy()
         // B4: re-arm the stall watchdog for the new handle.
         resetStallWatchdog()
 
@@ -2591,6 +2724,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        localBalanceRefresh = LocalBalanceRefreshPolicy()
         resetStallWatchdog(resetRecoveryBudget: true)
 
         // `startImpl`, not the public `start()`: this operation is holding the queue, and a queued
