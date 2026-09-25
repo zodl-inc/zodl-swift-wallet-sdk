@@ -20,7 +20,9 @@ import Foundation
 /// the FFI's `open_read` (SQLITE_OPEN_READ_ONLY on both connections), so their read-only-ness
 /// is enforced by SQLite itself, not by audit.
 ///
-/// WHAT THIS ACTOR GUARANTEES: no two Swift-initiated writes ever interleave.
+/// WHAT THIS ACTOR GUARANTEES: no two Swift-initiated writes ever interleave. Its writes run on
+/// ``DBActor/executor``'s queue, so a write waiting on the database never holds a cooperative
+/// thread.
 ///
 /// WHAT IT DOES NOT AND CANNOT GUARANTEE: the slipstream engine writes to the same database
 /// files from Rust-managed threads continuously, outside any Swift actor — Swift-side
@@ -33,7 +35,20 @@ import Foundation
 enum DBActor {
     typealias ActorType = Actor
 
-    actor Actor { }
+    actor Actor {
+        nonisolated var unownedExecutor: UnownedSerialExecutor {
+            DBActor.executor.asUnownedSerialExecutor()
+        }
+    }
+
+    /// Where every Swift-initiated write runs — and waits, for as long as the FFI and SQLite's 15-second busy timeout
+    /// make it wait, including behind the sync engine's commits. A queue of its own rather than Swift's cooperative
+    /// pool: a write stuck there holds a dispatch thread, not one of the few cooperative threads the host's own
+    /// `async` work needs. Writes still run one at a time, but in the order they arrive, each at the QoS of whoever
+    /// queued it, where a default actor would run the highest-priority one first. Arrival order is what keeps a long
+    /// migration proving run from holding queued writers for more than one proof: it yields between proofs and
+    /// re-queues behind them.
+    static let executor = DispatchQueueSerialExecutor(label: "cash.z.wallet.sdk.db-writes")
     static let shared = Actor()
 
     static var sharedUnownedExecutor: UnownedSerialExecutor {

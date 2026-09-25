@@ -19,8 +19,20 @@ import libzcashlc
 //   full T4.4 darkside test suite is green and the server-switch path is wired up.
 
 /// Swift actor wrapping the Rust Slipstream engine handle.
-/// All calls into the C FFI surface are serialised by the actor's executor.
+/// Calls on the handle are serialised by the actor's executor, except the ones `start` and `stop` make: those can wait
+/// up to ten seconds for the engine's in-flight wallet commit to drain, so they run on a global queue and leave the
+/// actor free meanwhile.
 public actor SlipstreamEngine {
+    /// The engine's FFI calls are synchronous and can wait on the engine's own locks and on the wallet database —
+    /// `open()` and `walletSummary()` in particular. The actor runs on a queue of its own so those waits never hold
+    /// one of Swift's cooperative threads. Its calls still run one at a time, but in the order they arrive rather than
+    /// by priority, each at the QoS of whoever queued it.
+    nonisolated let executor = DispatchQueueSerialExecutor(label: "cash.z.wallet.sdk.slipstream-engine")
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
     // ── Storage ────────────────────────────────────────────────────────────────
     private var handle: OpaquePointer?
     private let dbURL: URL
@@ -146,8 +158,9 @@ public actor SlipstreamEngine {
         let torBytes: [UInt8] = torDir.map { Array($0.utf8) } ?? []
         let ufvkBytes: [UInt8]? = ufvk.map { Array($0.utf8) }
         // [B4-16 drain] The FFI now DRAINS the aborted pass's in-flight write-behind
-        // commit (bounded ≤10 s) before spawning the new session — a real wait, so hop
-        // off the cooperative pool (same pattern as restoreAnchor).
+        // commit (bounded ≤10 s) before spawning the new session — a real wait, so it runs
+        // on a global queue: the actor's own queue stays free meanwhile, and `snapshot()`,
+        // `drainEvents()` and `walletSummary()` are not stuck behind the drain.
         let result: Bool = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let ok: Bool = torBytes.withUnsafeBufferPointer { torPtr in
@@ -176,8 +189,9 @@ public actor SlipstreamEngine {
 
     /// Stops the in-flight sync AND drains the engine's in-flight wallet commit
     /// ([B4-16] — `abort()` cannot cancel a `spawn_blocking` write-behind commit, so the
-    /// FFI blocks, bounded ≤10 s, waiting for the wallet file to fall quiet). Hopped off
-    /// the cooperative pool — the drain is a real wait; never block an actor thread.
+    /// FFI blocks, bounded ≤10 s, waiting for the wallet file to fall quiet). The drain is
+    /// a real wait, so it runs on a global queue rather than the actor's own: `snapshot()`,
+    /// `drainEvents()` and `walletSummary()` are not stuck behind it.
     ///
     /// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the engine confirmed that
     /// both its aborted pass and its wallet writer had finished, `false` when either was still
