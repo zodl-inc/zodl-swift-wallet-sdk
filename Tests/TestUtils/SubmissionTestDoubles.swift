@@ -15,13 +15,15 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     private(set) var endpoint: LightWalletEndpoint!
 
     private let sendResponse: SendResponse
+    private let fetchedTransaction: RawTransaction?
     private let eventLoopGroup = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
     private let queue = DispatchQueue(label: "RecordingCompactTxStreamerService.queue")
     private var submittedTransactions: [Data] = []
     private var server: Server?
 
-    init(sendResponse: SendResponse) throws {
+    init(sendResponse: SendResponse, fetchedTransaction: RawTransaction? = nil) throws {
         self.sendResponse = sendResponse
+        self.fetchedTransaction = fetchedTransaction
         self.endpoint = LightWalletEndpoint(address: "127.0.0.1", port: 0, secure: false)
 
         let server = try Server.insecure(group: eventLoopGroup)
@@ -69,7 +71,10 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     }
 
     func getTransaction(request: TxFilter, context: StatusOnlyCallContext) -> EventLoopFuture<RawTransaction> {
-        unimplementedUnary(on: context.eventLoop)
+        guard let fetchedTransaction else {
+            return unimplementedUnary(on: context.eventLoop)
+        }
+        return context.eventLoop.makeSucceededFuture(fetchedTransaction)
     }
 
     func sendTransaction(request: RawTransaction, context: StatusOnlyCallContext) -> EventLoopFuture<SendResponse> {

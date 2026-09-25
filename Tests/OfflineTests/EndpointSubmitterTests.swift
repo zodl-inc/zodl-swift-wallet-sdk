@@ -56,6 +56,22 @@ final class EndpointSubmitterTests: ZcashTestCase {
         }
     }
 
+    func testSubmitTreatsRejectionAsSuccessWhenSameServerKnowsTransaction() async throws {
+        let transaction = makeTransaction()
+        var fetchedTransaction = RawTransaction()
+        fetchedTransaction.data = transaction.raw
+        let service = try RecordingCompactTxStreamerService(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "already known"),
+            fetchedTransaction: fetchedTransaction
+        )
+        defer { try? service.stop() }
+        let submitter = try makeSubmitter()
+
+        try await submitter.submit(transaction: transaction, to: service.endpoint)
+
+        XCTAssertEqual(service.recordedTransactions(), [transaction.raw])
+    }
+
     func testSubmitThrowsTransportErrorForUnreachableEndpoint() async throws {
         let submitter = try makeSubmitter()
         // Nothing listens on this port; expect a transport-level failure.
