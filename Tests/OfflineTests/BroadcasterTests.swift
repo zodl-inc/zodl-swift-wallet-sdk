@@ -716,6 +716,129 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "Legacy path must not register submit plans")
     }
 
+    // MARK: - Telling the owner the transaction set changed
+    //
+    // `SlipstreamSynchronizer` bumps its engine's transaction-set version from this hook, and that bump is what makes
+    // its poll tick re-read the local balances early after a send, so a send the hook misses keeps the pre-send
+    // balances on screen until the tick's backstop re-reads them. These tests build the broadcaster directly, because
+    // `SDKSynchronizer` gives its broadcaster no hook.
+
+    /// Pins "after", not merely "as well": creation runs its stand-in for the store while no change is reported yet.
+    func testCreateProposedTransactionsReportsTheChangeOnceTheTransactionsAreStored() async throws {
+        let rawID = Data(repeating: 0xAB, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let changes = TransactionsChangedRecorder()
+        var changesDuringCreation: Int?
+        transactionEncoder.onCreateProposedTransactions = {
+            changesDuringCreation = changes.count
+        }
+        let broadcaster = try makeBroadcaster(transactionEncoder: transactionEncoder, transactionsChanged: { changes.record() })
+
+        let created = try await broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(created.map(\.txId), [rawID])
+        XCTAssertEqual(changesDuringCreation, 0, "the change must be reported once the transactions are stored, not before")
+        XCTAssertEqual(changes.count, 1)
+    }
+
+    func testCreateTransactionFromPCZTReportsTheChange() async throws {
+        let rawID = Data(repeating: 0xCD, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x05, 0x06]), rawID: rawID)])
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        let changes = TransactionsChangedRecorder()
+        let broadcaster = try makeBroadcaster(
+            transactionEncoder: transactionEncoder,
+            rustBackend: rustBackend,
+            transactionsChanged: { changes.record() }
+        )
+
+        let created = try await broadcaster.createTransactionFromPCZT(
+            pcztWithProofs: Pczt([0x10, 0x11]),
+            pcztWithSigs: Pczt([0x12, 0x13])
+        )
+
+        XCTAssertEqual(created.map(\.txId), [rawID])
+        XCTAssertEqual(changes.count, 1)
+    }
+
+    func testFailedCreationReportsNoChange() async throws {
+        struct ProvingFailure: Error {}
+        let rawID = Data(repeating: 0xAB, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.createError = ProvingFailure()
+        let changes = TransactionsChangedRecorder()
+        let broadcaster = try makeBroadcaster(transactionEncoder: transactionEncoder, transactionsChanged: { changes.record() })
+
+        do {
+            _ = try await broadcaster.createProposedTransactions(
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                spendingKey: TestsData(networkType: .testnet).spendingKey
+            )
+            XCTFail("expected the creation failure to propagate")
+        } catch is ProvingFailure {
+            // expected
+        }
+
+        XCTAssertEqual(changes.count, 0)
+    }
+
+    func testCreationThatStoredNothingReportsNoChange() async throws {
+        let changes = TransactionsChangedRecorder()
+        let broadcaster = try makeBroadcaster(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            transactionsChanged: { changes.record() }
+        )
+
+        let created = try await broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertTrue(created.isEmpty)
+        XCTAssertEqual(changes.count, 0)
+    }
+
+    func testAcceptedSubmissionReportsTheChange() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: endpoint)
+        let changes = TransactionsChangedRecorder()
+        let broadcaster = try makeBroadcaster(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock,
+            transactionsChanged: { changes.record() }
+        )
+
+        let outcome = await broadcaster.submit(transaction: makeCreatedTransaction(), to: [endpoint])
+
+        XCTAssertEqual(outcome, TransactionSubmissionOutcome.accepted(by: endpoint))
+        XCTAssertEqual(changes.count, 1)
+    }
+
+    /// Neither a rejection nor a submission with nowhere to go put the transaction on the network.
+    func testSubmissionNoServerAcceptedReportsNoChange() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -25, message: "rejected"), for: endpoint)
+        let changes = TransactionsChangedRecorder()
+        let broadcaster = try makeBroadcaster(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock,
+            transactionsChanged: { changes.record() }
+        )
+
+        let rejected = await broadcaster.submit(transaction: makeCreatedTransaction(seed: 0x01), to: [endpoint])
+        let unreachable = await broadcaster.submit(transaction: makeCreatedTransaction(seed: 0x02), to: [])
+
+        XCTAssertEqual(rejected, TransactionSubmissionOutcome.rejected(code: -25, message: "rejected"))
+        XCTAssertEqual(unreachable, TransactionSubmissionOutcome.unreachable)
+        XCTAssertEqual(changes.count, 0)
+    }
+
     // MARK: - Helpers
 
     private func makeSynchronizer(
@@ -723,6 +846,48 @@ final class BroadcasterTests: ZcashTestCase {
         rustBackend: ZcashRustBackendWelding? = nil,
         endpointSubmitter: EndpointSubmitter? = nil
     ) throws -> SDKSynchronizer {
+        let initializer = try makeInitializer(rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+
+        let blockProcessor = CompactBlockProcessor(
+            initializer: initializer,
+            walletBirthdayProvider: { initializer.walletBirthday }
+        )
+
+        return SDKSynchronizer(
+            status: .unprepared,
+            initializer: initializer,
+            transactionEncoder: transactionEncoder,
+            transactionRepository: initializer.transactionRepository,
+            blockProcessor: blockProcessor,
+            syncSessionTicker: .live
+        )
+    }
+
+    /// An `SDKBroadcaster` over the same doubles `makeSynchronizer` wires, carrying the test's own
+    /// `transactionsChanged`.
+    private func makeBroadcaster(
+        transactionEncoder: TransactionEncoder,
+        rustBackend: ZcashRustBackendWelding? = nil,
+        endpointSubmitter: EndpointSubmitter? = nil,
+        transactionsChanged: @escaping @Sendable () async -> Void
+    ) throws -> SDKBroadcaster {
+        let initializer = try makeInitializer(rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+        return SDKBroadcaster(
+            transactionEncoder: transactionEncoder,
+            initializer: initializer,
+            logger: submissionLifecycleLogger(),
+            eventSubject: PassthroughSubject<SynchronizerEvent, Never>(),
+            submitPlanStore: mockContainer.resolve(SubmitPlanStoring.self),
+            multiEndpointSubmitter: mockContainer.resolve(MultiEndpointSubmitter.self),
+            statusCheck: {},
+            transactionsChanged: transactionsChanged
+        )
+    }
+
+    private func makeInitializer(
+        rustBackend: ZcashRustBackendWelding?,
+        endpointSubmitter: EndpointSubmitter?
+    ) throws -> Initializer {
         let serviceMock = LightWalletServiceMock()
         let transactionRepository = TransactionRepositoryMock()
 
@@ -736,7 +901,7 @@ final class BroadcasterTests: ZcashTestCase {
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in transactionRepository }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in submissionLifecycleLogger() }
 
-        let initializer = Initializer(
+        return Initializer(
             container: mockContainer,
             cacheDbURL: nil,
             fsBlockDbRoot: testTempDirectory,
@@ -750,20 +915,6 @@ final class BroadcasterTests: ZcashTestCase {
             saplingParamsSourceURL: SaplingParamsSourceURL.tests,
             isTorEnabled: false,
             isExchangeRateEnabled: false
-        )
-
-        let blockProcessor = CompactBlockProcessor(
-            initializer: initializer,
-            walletBirthdayProvider: { initializer.walletBirthday }
-        )
-
-        return SDKSynchronizer(
-            status: .unprepared,
-            initializer: initializer,
-            transactionEncoder: transactionEncoder,
-            transactionRepository: transactionRepository,
-            blockProcessor: blockProcessor,
-            syncSessionTicker: .live
         )
     }
 
@@ -807,6 +958,8 @@ private final class StubTransactionEncoder: TransactionEncoder {
     /// Runs at the start of `createProposedTransactions`, standing in for the (potentially slow)
     /// proving work it represents — e.g. to land a `wipe()` while a transaction is mid-creation.
     var onCreateProposedTransactions: (() async -> Void)?
+    /// When set, `createProposedTransactions` throws it after `onCreateProposedTransactions`, as a failed proof would.
+    var createError: Error?
 
     init(
         createdTransactions overviews: [ZcashTransaction.Overview],
@@ -864,6 +1017,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
         if let onCreateProposedTransactions {
             await onCreateProposedTransactions()
         }
+        if let createError {
+            throw createError
+        }
         return createdTransactions
     }
 
@@ -902,4 +1058,23 @@ private final class StubTransactionEncoder: TransactionEncoder {
     }
 
     func closeDBConnection() { }
+}
+
+/// Counts the broadcaster's `transactionsChanged` calls. The hook is `@Sendable` and can run on any thread, so the
+/// count is lock-guarded, with `NSLock` for the package's iOS 13 / macOS 12 floor, like `Gate`'s.
+private final class TransactionsChangedRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func record() {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+    }
 }

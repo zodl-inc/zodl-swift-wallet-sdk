@@ -14,6 +14,13 @@ final class SDKBroadcaster: Broadcaster {
     private let submitPlanStore: SubmitPlanStoring
     private let multiEndpointSubmitter: MultiEndpointSubmitter
     private let statusCheck: () throws -> Void
+    /// Called once a create path has stored new transactions in the wallet, and again once a server accepts one of
+    /// them: the two moments a send changes what a host shows for it. `SlipstreamSynchronizer` bumps its engine's
+    /// transaction-set version here: the engine does not see a send made through this broadcaster, and the bump is
+    /// what makes its poll tick re-fetch the transactions and re-read the local balances early. `SDKSynchronizer`
+    /// leaves it a no-op. It is awaited before the call returns, so an owner that must not hold up a send does its
+    /// work asynchronously.
+    private let transactionsChanged: @Sendable () async -> Void
 
     init(
         transactionEncoder: TransactionEncoder,
@@ -22,7 +29,8 @@ final class SDKBroadcaster: Broadcaster {
         eventSubject: PassthroughSubject<SynchronizerEvent, Never>,
         submitPlanStore: SubmitPlanStoring,
         multiEndpointSubmitter: MultiEndpointSubmitter,
-        statusCheck: @escaping () throws -> Void
+        statusCheck: @escaping () throws -> Void,
+        transactionsChanged: @escaping @Sendable () async -> Void = {}
     ) {
         self.transactionEncoder = transactionEncoder
         self.initializer = initializer
@@ -31,6 +39,7 @@ final class SDKBroadcaster: Broadcaster {
         self.submitPlanStore = submitPlanStore
         self.multiEndpointSubmitter = multiEndpointSubmitter
         self.statusCheck = statusCheck
+        self.transactionsChanged = transactionsChanged
     }
 
     // MARK: - Broadcaster conformance
@@ -78,6 +87,7 @@ final class SDKBroadcaster: Broadcaster {
         // mined. Retrying continues either way — a mempool is not a commitment.
         if case .accepted(by: let endpoint) = outcome {
             await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)", lifecycle: lifecycle)
+            await transactionsChanged()
         }
 
         return outcome
@@ -252,6 +262,12 @@ final class SDKBroadcaster: Broadcaster {
 
         if !overviews.isEmpty {
             eventSubject.send(.foundTransactions(overviews, nil))
+        }
+
+        // Reached only once creation has succeeded, so every transaction here is stored. A batch that created nothing
+        // changed nothing.
+        if !createdTransactions.isEmpty {
+            await transactionsChanged()
         }
 
         return createdTransactions

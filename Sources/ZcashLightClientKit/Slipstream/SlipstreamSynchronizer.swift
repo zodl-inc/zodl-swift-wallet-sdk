@@ -444,7 +444,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
             eventSubject: eventSubjectRef,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
-            statusCheck: {}
+            statusCheck: {},
+            // A send through the broadcaster changes the wallet where the engine cannot see it, so it bumps the
+            // transaction-set version for the same reason the migration writes do (see `bumpingTxSetVersion(after:)`).
+            // Fire-and-forget, like the poke in `submitTransactions(_:)`: a send's result must not wait on the engine's
+            // queue. Weak, so a broadcaster the host keeps after this synchronizer is gone does not keep the engine
+            // alive with it.
+            transactionsChanged: { [weak engine] in
+                guard let engine else {
+                    return
+                }
+                Task {
+                    await engine.notifyTxChange()
+                }
+            }
         )
     }
 
@@ -2273,7 +2286,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     //
     // Thin forwards to `migrationHost.migration(for:)`'s per-account `OrchardMigration` actor (or,
     // for the three wallet-scope gate members, to the host itself) -- mirrors `SDKSynchronizer`'s
-    // "MARK: Migration" section exactly. The two members that can broadcast (`submitNoteSplit`,
+    // "MARK: Migration" section, except that the members which write the wallet database then bump
+    // the engine's transaction-set version (see `bumpingTxSetVersion(after:)`), a step
+    // `SDKSynchronizer` has no engine for. The two members that can broadcast (`submitNoteSplit`,
     // `performMigrationBroadcast`) are guarded here by `throwIfSyncingForMigrationBroadcast()`
     // -- an advisory point-in-time check, not a hard mutual-exclusion lock: sync and migration
     // broadcasts must never share a session, and hosts still sequence sessions themselves.
@@ -2285,6 +2300,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     // engine's knowledge of a broadcast that already happened.
 
     public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
+        // Deliberately not `bumpingTxSetVersion(after:)`: a crank can persist the engine's own determinations, but
+        // none of them changes a transaction or a balance, and hosts crank on a timer. A bump here would re-fetch the
+        // transactions on every crank and, since a bump counts as sync progress, would hide a real stall from the
+        // watchdog for as long as the host kept cranking.
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
@@ -2297,11 +2316,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ instruction: [MigrationProveTarget],
         maxProofs: Int
     ) async throws -> MigrationProveOutcome {
-        try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
+        let outcome = try await migrationHost.migration(for: accountUUID).proveTransactions(instruction, maxProofs: maxProofs)
+        // The bump `bumpingTxSetVersion(after:)` makes, but only for a pass that proved something: a pass that proved
+        // nothing stored nothing, and hosts repeat such passes on a timer while the wallet catches up, so each would
+        // cost a transaction re-fetch, and count as sync progress, for nothing.
+        if outcome.totalProved > 0 {
+            await engine.notifyTxChange()
+        }
+        return outcome
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        }
     }
 
     public func recordMigrationPreparationBroadcast(
@@ -2309,7 +2337,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         _ prepared: PreparedMigrationTransfer,
         result: MigrationTransferResult
     ) async throws {
-        try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).recordPreparationBroadcast(prepared, result: result)
+        }
     }
 
     public func migrationSyncWakeups(accountUUID: AccountUUID) async throws -> [MigrationSyncWakeup] {
@@ -2345,7 +2375,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        return try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        }
     }
 
     public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -2357,7 +2389,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func recordImmediateMigration(accountUUID: AccountUUID, txid: Data) async throws {
-        try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).recordImmediateMigration(txid: txid)
+        }
     }
 
     public func residualAfterMigration(accountUUID: AccountUUID) async throws -> Zatoshi? {
@@ -2365,11 +2399,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func lockMigrationResidual(accountUUID: AccountUUID) async throws -> Zatoshi {
-        try await migrationHost.migration(for: accountUUID).lockMigrationResidual()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).lockMigrationResidual()
+        }
     }
 
     public func unlockMigrationResidual(accountUUID: AccountUUID) async throws -> Int {
-        try await migrationHost.migration(for: accountUUID).unlockMigrationResidual()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).unlockMigrationResidual()
+        }
     }
 
     public func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate {
@@ -2377,7 +2415,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws {
-        try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).signAndStoreMigrationSchedule(schedule, usk: usk)
+        }
     }
 
     public func performMigrationBroadcast(
@@ -2386,7 +2426,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
         try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        return try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        }
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -2406,33 +2448,45 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+        }
     }
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
-        try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).refreshStaleTransfers(usk: usk)
+        }
     }
 
     public func createUnsignedNoteSplitPCZTs(
         accountUUID: AccountUUID,
         for schedule: MigrationSchedule
     ) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs(for: schedule)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).createUnsignedNoteSplitPCZTs(for: schedule)
+        }
     }
 
     public func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).storeSignedNoteSplitPCZTs(signed)
+        }
     }
 
     public func createUnsignedMigrationTransferPCZTs(
         accountUUID: AccountUUID,
         for schedule: MigrationSchedule
     ) async throws -> [MigrationUnsignedTransferPczt] {
-        try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).createUnsignedTransferPCZTs(for: schedule)
+        }
     }
 
     public func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws {
-        try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+        try await bumpingTxSetVersion {
+            try await migrationHost.migration(for: accountUUID).storeSignedSchedulePCZTs(signed)
+        }
     }
 
     // ── Migration Keystone batch-signing (external signer ceremony) ───────────
@@ -2498,6 +2552,32 @@ public actor SlipstreamSynchronizer: Synchronizer {
         if case .syncing = latestState.internalSyncStatus {
             throw ZcashError.migrationBroadcastDuringSync
         }
+    }
+
+    /// Runs `write`, a migration call that writes the wallet database, and once it has returned bumps the engine's
+    /// transaction-set version, as `deleteAccount(_:)` and every send do (`submitTransactions(_:)` and the
+    /// broadcaster's `transactionsChanged` hook, set in `init`).
+    ///
+    /// The engine cannot see a write the SDK makes on the host's behalf. The poll tick re-fetches the transactions when
+    /// that version moves, and re-reads `SynchronizerState.localAccountsBalances` before
+    /// `LocalBalanceRefreshPolicy.maximumAge` is up when the version, the engine's visible summary or the recovery
+    /// phase changes. A host write moves neither of the other two, so the bump is what makes the next tick re-read
+    /// them. Without it, the transfers a migration step stored stay out of Activity until something else moves the
+    /// version, and the tick keeps publishing the local balances from before the write.
+    ///
+    /// Bumping the version, rather than resetting `localBalanceRefresh`, also holds against a tick that is walking the
+    /// wallet right now: that tick captured the version before it walked, so the bump still reads as a change to the
+    /// next tick, where a reset would be overwritten once the walk is recorded. A call that throws bumps nothing.
+    ///
+    /// A bump also counts as sync progress for the stall watchdog: `notify_tx_change` → `bump_tx_set_version()` →
+    /// `touch()` restamps the engine's `last_progress_unix`, from which the snapshot's `stalledSeconds` derives. So a
+    /// call a host makes on a timer may bump only when it actually wrote something. A bump on every call would keep a
+    /// real stall below `stallWatchdogThresholdSeconds` for as long as the timer runs, which is the second reason
+    /// `migrationAdvanceStep(accountUUID:)` never bumps.
+    private func bumpingTxSetVersion<T>(after write: () async throws -> T) async rethrows -> T {
+        let result = try await write()
+        await engine.notifyTxChange()
+        return result
     }
 
     // ── Server switch ─────────────────────────────────────────────────────────

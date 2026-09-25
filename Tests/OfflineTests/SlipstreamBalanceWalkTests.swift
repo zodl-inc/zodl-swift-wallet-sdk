@@ -92,4 +92,32 @@ final class SlipstreamBalanceWalkTests: ZcashTestCase {
         try await Task.sleep(nanoseconds: 2_500_000_000)
         XCTAssertEqual(welding.walkCount, 2)
     }
+
+    /// A host sends through `broadcaster`, which stores the transaction where the engine cannot see it. Unless the
+    /// engine hears about it, the version the tick compares never moves, and the pre-send local balances stay on screen
+    /// until the backstop re-reads them.
+    func testASendThroughTheBroadcasterNotifiesTheEngine() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        let rawID = Data(repeating: 0xAB, count: 32)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.createProposedTransactionsProposalUskReturnValue = [rawID]
+        welding.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01, 0x02, 0x03]), expiryHeight: 123_456)
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        // Creation enriches its event from the transaction history. A failed read there is only logged, and the
+        // generated repository mock would otherwise crash on an answer nobody stubbed.
+        let repository = try XCTUnwrap(mockContainer.resolve(TransactionRepository.self) as? TransactionRepositoryMock)
+        repository.findRawIDThrowableError = ZcashError.transactionRepositoryEntityNotFound
+
+        let created = try await sync.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(created.map(\.txId), [rawID])
+        // The notification does not hold up the send, so it is waited for rather than read straight away.
+        let notified = await waitUntil {
+            await engine.calls.contains("notifyTxChange")
+        }
+        XCTAssertTrue(notified, "a send through the broadcaster must tell the engine the transaction set changed")
+    }
 }

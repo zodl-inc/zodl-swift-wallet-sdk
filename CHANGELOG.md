@@ -176,7 +176,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
 - `SlipstreamSynchronizer` re-reads `SynchronizerState.localAccountsBalances` from the wallet database when the
   wallet's transactions, the engine's visible balances or the recovery phase change, and at least every 10 seconds —
-  no longer on every two-second poll tick. No call-site change.
+  no longer on every two-second poll tick. Transactions created or submitted through `Synchronizer.broadcaster` on a
+  `SlipstreamSynchronizer` now bump the engine's transaction-set version, and so do its Orchard → Ironwood migration
+  calls that store or record transfers, or lock or unlock notes, so the next poll tick re-reads
+  `SynchronizerState.localAccountsBalances` and publishes the transactions again in a `foundTransactions` event. On
+  the broadcaster, `createProposedTransactions(proposal:spendingKey:)` and
+  `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)` bump once their transactions are stored, and
+  `submit(transaction:to:timing:)` and `submit(transactions:to:timing:)`, with their forms without `timing:`, bump for
+  each transaction a server accepts. The migration calls bump once they return:
+  `signAndStoreMigrationSchedule(accountUUID:_:usk:)`, `proveMigrationTransactions(accountUUID:_:maxProofs:)` (when
+  it proves at least one transaction), `takeMigrationPreparation(accountUUID:byTxid:)`,
+  `recordMigrationPreparationBroadcast(accountUUID:_:result:)`, `submitNoteSplit(accountUUID:proposal:usk:options:)`,
+  `performMigrationBroadcast(accountUUID:_:options:)`, `recordImmediateMigration(accountUUID:txid:)`,
+  `lockMigrationResidual(accountUUID:)`, `unlockMigrationResidual(accountUUID:)`,
+  `restartCurrentMigrationStep(accountUUID:)`, `refreshStaleMigrationTransfers(accountUUID:usk:)`,
+  `createUnsignedNoteSplitPCZTs(accountUUID:for:)`, `storeSignedNoteSplitPCZTs(accountUUID:_:)`,
+  `createUnsignedMigrationTransferPCZTs(accountUUID:for:)` and `storeSignedMigrationSchedulePCZTs(accountUUID:_:)`.
+  No call-site change.
 
 ### Coinholder voting on zcash_voting 5.1
 

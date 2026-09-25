@@ -780,6 +780,137 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.account, accountUUID)
     }
 
+    // MARK: - The engine hears about migration writes
+    //
+    // The poll tick re-fetches the transactions, and re-reads the local balances ahead of their 10 s backstop, when the
+    // engine's transaction-set version moves. A migration call writes the wallet database on the host's behalf, so the
+    // engine cannot see that write unless the synchronizer tells it, the way it does after an account delete or a send
+    // it submits. These tests drive the synchronizer over the recording fake engine and read its call log.
+
+    /// Pins "after", not merely "as well": the closure runs inside the write and sees no notification yet.
+    func testSignAndStoreMigrationScheduleNotifiesTheEngineAfterItsWrite() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let engine = GatedFakeSlipstreamEngine()
+        var notificationsDuringTheWrite: Int?
+        welding.migrationSignAndStoreScheduleUskForClosure = { _, _, _ in
+            notificationsDuringTheWrite = await engine.calls.filter { $0 == "notifyTxChange" }.count
+        }
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 7, preparations: [])
+        let usk = TestsData(networkType: .testnet).spendingKey
+
+        try await synchronizer.signAndStoreMigrationSchedule(accountUUID: accountUUID, schedule, usk: usk)
+
+        XCTAssertEqual(welding.migrationSignAndStoreScheduleUskForCallsCount, 1)
+        XCTAssertEqual(notificationsDuringTheWrite, 0, "the engine must hear about the write once it has landed, not before")
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 1)
+    }
+
+    func testProveMigrationTransactionsNotifiesTheEngineWhenItProves() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationProveTransactionsIdsMaxProofsForReturnValue = MigrationProveOutcome(totalProved: 1, preparationTxids: [])
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        let outcome = try await synchronizer.proveMigrationTransactions(
+            accountUUID: accountUUID,
+            [MigrationProveTarget(id: 3, kind: .transfer(crossing: 0))],
+            maxProofs: 2
+        )
+
+        XCTAssertEqual(outcome.totalProved, 1)
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 1)
+    }
+
+    /// A pass that proved nothing stored nothing, and a host re-runs such passes on its own timer while the wallet
+    /// catches up, so it must not cost a transaction re-fetch.
+    func testProveMigrationTransactionsLeavesTheEngineAloneWhenItProvesNothing() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationProveTransactionsIdsMaxProofsForReturnValue = MigrationProveOutcome(totalProved: 0, preparationTxids: [])
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        let outcome = try await synchronizer.proveMigrationTransactions(
+            accountUUID: accountUUID,
+            [MigrationProveTarget(id: 3, kind: .transfer(crossing: 0))],
+            maxProofs: 2
+        )
+
+        XCTAssertEqual(outcome.totalProved, 0)
+        XCTAssertEqual(welding.migrationProveTransactionsIdsMaxProofsForCallsCount, 1)
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 0)
+    }
+
+    /// A writer that returns a value still returns it untouched.
+    func testLockMigrationResidualNotifiesTheEngineAndKeepsItsResult() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.lockMigrationResidualAccountUUIDReturnValue = Zatoshi(21_500)
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        let locked = try await synchronizer.lockMigrationResidual(accountUUID: accountUUID)
+
+        XCTAssertEqual(locked, Zatoshi(21_500))
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 1)
+    }
+
+    /// A lock that fails locks nothing, so there is nothing for the tick to pick up.
+    func testAFailedMigrationWriteLeavesTheEngineAlone() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.lockMigrationResidualAccountUUIDThrowableError = ZcashError.rustMigrationLockResidual("concurrent lock race")
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        do {
+            _ = try await synchronizer.lockMigrationResidual(accountUUID: accountUUID)
+            XCTFail("expected rustMigrationLockResidual to propagate")
+        } catch ZcashError.rustMigrationLockResidual {
+            // expected
+        } catch {
+            XCTFail("expected rustMigrationLockResidual, got \(error)")
+        }
+
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 0)
+    }
+
+    func testMigrationProgressLeavesTheEngineAlone() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationProgressForReturnValue = MigrationProgress(
+            completedTransfers: 1,
+            totalTransfers: 4,
+            remainingOrchard: Zatoshi(300_000),
+            nextTransferReadyAtHeight: 1_000_100
+        )
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        let progress = try await synchronizer.migrationProgress(accountUUID: accountUUID)
+
+        XCTAssertEqual(progress?.totalTransfers, 4)
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 0)
+    }
+
+    /// A crank can persist the engine's own bookkeeping, but nothing the transactions or the balances show, and a host
+    /// cranks on a timer, so a notification here would re-fetch the transactions on every crank.
+    func testMigrationAdvanceStepLeavesTheEngineAlone() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationAdvanceStepForEstimatedTipReturnValue = MigrationAdvance(step: .waiting, next: nil)
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding), engine: engine, welding: welding)
+
+        let advance = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+
+        XCTAssertEqual(advance?.step, .waiting)
+        let notifications = await txChangeNotifications(of: engine)
+        XCTAssertEqual(notifications, 0)
+    }
+
     // MARK: - Helpers
 
     /// Builds a `SlipstreamSynchronizer` whose one `OrchardMigrationHost` is `migrationHost`,
@@ -805,6 +936,23 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         )
 
         return SlipstreamSynchronizer(initializer: initializer)
+    }
+
+    /// Builds a `SlipstreamSynchronizer` over `engine`, a recording fake, with `migrationHost` as its one host.
+    /// `makeSynchronizer(migrationHost:)` cannot serve the engine-notification tests: the public initializer gives the
+    /// synchronizer a real engine, whose handle these tests never open, so a notification would leave no trace.
+    private func makeSynchronizer(
+        migrationHost: OrchardMigrationHost,
+        engine: GatedFakeSlipstreamEngine,
+        welding: ZcashRustBackendWeldingMock
+    ) throws -> SlipstreamSynchronizer {
+        mockContainer.mock(type: OrchardMigrationHost.self, isSingleton: true) { _ in migrationHost }
+        return try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+    }
+
+    /// How many times the synchronizer told `engine` that the wallet's transaction set changed.
+    private func txChangeNotifications(of engine: GatedFakeSlipstreamEngine) async -> Int {
+        await engine.calls.filter { $0 == "notifyTxChange" }.count
     }
 
     /// Builds an `OrchardMigrationHost` via its injecting initializer, following R4-A/R4-B's seam
