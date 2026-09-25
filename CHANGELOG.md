@@ -165,10 +165,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `getTransactionOutputs(for:)` and `fetchTxidsWithMemoContaining(searchTerm:)` — no longer holds one of
   Swift's cooperative threads while the read waits on the database, so a long transaction history read no
   longer delays the host's other `async` work. No call-site change.
+- The wallet-summary read, which walks the whole wallet, no longer holds one of Swift's cooperative threads. It is
+  behind `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` on both
+  synchronizers, and on `SDKSynchronizer` also behind `getAccountsBalances()`, `SynchronizerState.accountsBalances`
+  and `start(retry:)`. `SlipstreamSynchronizer.getAccountsBalances()` no longer makes that read at all, so it answers
+  without walking the wallet. No call-site change.
 
 ## Changed
 
 - Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
+- `SlipstreamSynchronizer` re-reads `SynchronizerState.localAccountsBalances` from the wallet database when the
+  wallet's transactions, the engine's visible balances or the recovery phase change, and at least every 10 seconds —
+  no longer on every two-second poll tick. No call-site change.
 
 ### Coinholder voting on zcash_voting 5.1
 
