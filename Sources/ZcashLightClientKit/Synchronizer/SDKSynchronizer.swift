@@ -1351,8 +1351,12 @@ public class SDKSynchronizer: Synchronizer {
     ///
     /// Authored on Linux — compile validation pending on macOS.
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        // Allowlisted passthrough hosts (vote servers learned at run time, e.g.
+        // prod.vote-chain-primary.valargroup.org) keep their own name: proxyURL(for:) returns them
+        // unchanged and relayURL(for:) routes them to the mainnet relay. Only checking isGateway
+        // rejected them with ohttpUnsupportedHost before any request was sent.
         guard let host = request.url?.host,
-              OHTTPEndpoints.isGateway(host) else {
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host) else {
             throw ZcashError.ohttpUnsupportedHost
         }
         let relayURL = try OHTTPEndpoints.relayURL(for: host)
