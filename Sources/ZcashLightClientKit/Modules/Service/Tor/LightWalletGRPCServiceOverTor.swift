@@ -68,9 +68,12 @@ actor ServiceConnections {
     }
 }
 
+/// `TorLwdConn` calls block until the server answers over Tor; they run through this so the awaiting task suspends
+/// instead of holding a cooperative thread.
 class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     var tor: TorClient
     let serviceConnections: ServiceConnections
+    let blockingCalls: BlockingCallRunning
 
     convenience init(endpoint: LightWalletEndpoint, tor: TorClient) {
         self.init(
@@ -94,10 +97,12 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         endpoint: LightWalletEndpoint,
         singleCallTimeout: Int64,
         streamingCallTimeout: Int64,
-        tor: TorClient
+        tor: TorClient,
+        blockingCalls: BlockingCallRunning = BlockingCall.shared
     ) {
         self.tor = tor
         serviceConnections = ServiceConnections(endpoint: endpoint, tor: tor)
+        self.blockingCalls = blockingCalls
 
         super.init(
             host: endpoint.host,
@@ -114,7 +119,8 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).getInfo()
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run { try connection.getInfo() }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -135,7 +141,8 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).latestBlock()
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run { try connection.latestBlock() }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -148,7 +155,8 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).submit(spendTransaction: spendTransaction)
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run { try connection.submit(spendTransaction: spendTransaction) }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw ZcashError.serviceSubmitFailed(LightWalletServiceError.genericError(error: error))
@@ -161,7 +169,8 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).fetchTransaction(txId: txId)
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run { try connection.fetchTransaction(txId: txId) }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -174,7 +183,8 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).getTreeState(height: BlockHeight(id.height))
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run { try connection.getTreeState(height: BlockHeight(id.height)) }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -192,11 +202,14 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).checkSingleUseTransparentAddresses(
-                dbData: dbData,
-                networkType: networkType,
-                accountUUID: accountUUID
-            )
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run {
+                try connection.checkSingleUseTransparentAddresses(
+                    dbData: dbData,
+                    networkType: networkType,
+                    accountUUID: accountUUID
+                )
+            }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -223,13 +236,16 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).updateTransparentAddressTransactions(
-                address: address,
-                start: start,
-                end: end,
-                dbData: dbData,
-                networkType: networkType
-            )
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run {
+                try connection.updateTransparentAddressTransactions(
+                    address: address,
+                    start: start,
+                    end: end,
+                    dbData: dbData,
+                    networkType: networkType
+                )
+            }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
@@ -254,12 +270,15 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
 
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).fetchUTXOsByAddress(
-                address: address,
-                dbData: dbData,
-                networkType: networkType,
-                accountUUID: accountUUID
-            )
+            let connection = try await serviceConnections.connectToLightwalletd(mode)
+            return try await blockingCalls.run {
+                try connection.fetchUTXOsByAddress(
+                    address: address,
+                    dbData: dbData,
+                    networkType: networkType,
+                    accountUUID: accountUUID
+                )
+            }
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error
