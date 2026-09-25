@@ -126,6 +126,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Transaction submission through `Broadcaster` now treats a server rejection as accepted when that same server confirms it already knows the transaction. No caller changes are required.
+
 - A bounded Tor GET cancelled or expired before runtime ownership now completes without waiting for a busy
   Tor or synchronizer actor. Later actor admission observes the original deadline and starts no HTTP work.
   Once native resources are owned, cancellation still waits for the bounded operation and safe cleanup;
