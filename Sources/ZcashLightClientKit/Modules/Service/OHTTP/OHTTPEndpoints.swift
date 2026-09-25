@@ -49,11 +49,29 @@ public enum OHTTPEndpoints {
     /// with one of these suffixes to `https://<authority>` — no hostname rewrite needed.
     public static let proxyAllowedSuffixes = [".valargroup.org", ".valargroup.dev", "chaindefuser.com"]
 
+    /// Exact third-party vote servers the gateway maps host-bound (infra `ohttp-gateway`
+    /// BACKENDS/BACKEND_POLICIES). Exact match only: these domains also serve unrelated hosts.
+    /// Keep in sync with the gateway; a host missing here fails closed in the app.
+    public static let proxyAllowedHosts: Set<String> = [
+        "ru.zcash.space",
+        "147-182-192-212.sslip.io",
+        "134-209-215-69.sslip.io",
+        "mnval01.zcash.legends.sh",
+        "zvote-1.stardust.rest",
+        "zvote.zodl.com",
+        "zvote.keplr.app",
+        "zvote.zfnd.org",
+        "v.ombie.cash",
+    ]
+
     /// Returns true if the host is allowlisted for passthrough OHTTP proxying.
     /// Suffix rule: leading-dot suffix (`.valargroup.org`) matches `x.valargroup.org` but NOT `valargroup.org`.
     /// Bare domain (`chaindefuser.com`) matches itself or `*.chaindefuser.com`.
     public static func isProxyAllowlisted(host: String) -> Bool {
         let lower = host.lowercased()
+        if proxyAllowedHosts.contains(lower) {
+            return true
+        }
         for suffix in proxyAllowedSuffixes {
             if suffix.hasPrefix(".") {
                 // Leading-dot suffix: only matches subdomains
