@@ -56,13 +56,26 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
             throw error
         }
 
-        await service.closeConnections()
-
         guard response.errorCode >= 0 else {
+            let isKnown = await service.isTransactionKnownToServer(txId: transaction.txId, mode: mode)
+            await service.closeConnections()
+
+            if isKnown {
+                logger.debug(
+                    """
+                    Transaction \(transaction.txId.toHexStringTxId()) submission was rejected, but the same \
+                    server confirmed it is known.
+                    """
+                )
+                return
+            }
+
             throw TransactionEncoderError.submitError(
                 code: Int(response.errorCode),
                 message: response.errorMessage
             )
         }
+
+        await service.closeConnections()
     }
 }

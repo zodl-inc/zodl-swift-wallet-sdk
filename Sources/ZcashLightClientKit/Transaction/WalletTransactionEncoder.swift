@@ -185,17 +185,12 @@ class WalletTransactionEncoder: TransactionEncoder {
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {
-        do {
-            let response = try await self.lightWalletService.fetchTransaction(
-                txId: txId,
-                mode: await sdkFlags.torEnabled
-                ? ServiceMode.txIdGroup(prefix: "submit", txId: txId)
-                : ServiceMode.direct
-            )
-            return response.status != .txidNotRecognized
-        } catch {
-            return false
-        }
+        await lightWalletService.isTransactionKnownToServer(
+            txId: txId,
+            mode: await sdkFlags.torEnabled
+            ? ServiceMode.txIdGroup(prefix: "submit", txId: txId)
+            : ServiceMode.direct
+        )
     }
 
     func ensureParams(spend: URL, output: URL) -> Bool {
