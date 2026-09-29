@@ -4734,6 +4734,52 @@ impl Parameters for NetworkParams {
 static CUSTOM_PARAMS: std::sync::RwLock<Option<(NetworkType, LocalNetwork)>> =
     std::sync::RwLock::new(None);
 
+/// Serializes the tests that write [`CUSTOM_PARAMS`].
+///
+/// The slot is process-global and the harness runs tests in parallel threads of
+/// a single process, so a test that registers a custom network is visible to
+/// every other test in the binary — including the ones that assert the slot is
+/// unset, or that a *different* network is registered. Every test that touches
+/// it holds [`CustomNetworkGuard`] for its whole body instead.
+#[cfg(test)]
+static CUSTOM_PARAMS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Exclusive use of the process-global custom-network slot for one test, with
+/// whatever was registered before put back when the test ends.
+///
+/// There is no FFI way to clear the slot — [`zcashlc_set_custom_network`] only
+/// ever writes a registration — so restoring is this guard's job.
+#[cfg(test)]
+pub(crate) struct CustomNetworkGuard {
+    /// Held for the guard's lifetime; dropped after [`Drop::drop`] restores.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<(NetworkType, LocalNetwork)>,
+}
+
+#[cfg(test)]
+impl Drop for CustomNetworkGuard {
+    fn drop(&mut self) {
+        // A test that panicked while holding a lock poisons it, and the slot
+        // still has to go back: otherwise every test that runs afterwards
+        // inherits the network of whichever test failed.
+        let mut slot = CUSTOM_PARAMS.write().unwrap_or_else(|e| e.into_inner());
+        *slot = self.previous;
+    }
+}
+
+/// Take the custom-network slot for the duration of the calling test.
+#[cfg(test)]
+pub(crate) fn lock_custom_network() -> CustomNetworkGuard {
+    let lock = CUSTOM_PARAMS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = *CUSTOM_PARAMS.read().unwrap_or_else(|e| e.into_inner());
+    CustomNetworkGuard {
+        _lock: lock,
+        previous,
+    }
+}
+
 /// Maps an FFI `network_id` to its [`NetworkType`], used to select the base identity of a custom network.
 fn network_type_for_id(network_id: u32) -> Option<NetworkType> {
     match network_id {

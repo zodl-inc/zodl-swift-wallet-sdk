@@ -13,25 +13,93 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body collection. It otherwise accepts the same arguments and returns the same response as
   `zcashlc_tor_http_get`; expiry or an invalid zero timeout returns null with the thread-local error
   set. Existing GET and POST call sites require no changes.
-- `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
-  was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
-  `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no
-  votes, shares, or Keystone signatures and every bundle row it holds is restored by the
-  package under its accepted hash, and only then clears the round and runs
-  `zcash_voting::import_delegation_capability`. The package must be contiguous from bundle
-  zero and cover every stored row; it may extend a prefix restored earlier. Replies
-  `{"outcome":"restored"}` or
-  `{"outcome":"already_restored"}` as a boxed slice; null with the error set otherwise.
-  Each bundle carries `van`, the commitment the recovered row held; the call recomputes the
-  VAN from the hotkey, weight and blinding and refuses, before clearing anything, when it
-  differs. The stored weight becomes the canonical whole-ballot total, as for every capability
-  import; the VAN is unaffected because `construct_van` commits to `num_ballots`.
-- `zcashlc_voting_van_commitment` returns the 32-byte VAN commitment a hotkey secret, network,
-  round id, weight and blinding open, as a boxed slice. It is the value the restore recomputes
-  per bundle, exposed so a caller can check a recovered row the same way.
-- `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
-  describes, for a network id, so a caller that persisted only the secret can hand the SDK the
-  full hotkey again. Free with `zcashlc_voting_free_hotkey`.
+- The coinholder-voting C surface for driving a round. Requests and reports cross as UTF-8 JSON in
+  an `FfiBoxedSlice` (freed with `zcashlc_free_boxed_slice`), and every failure records a
+  `VotingErrorView` JSON object as the thread's last error, so a caller branches on its `kind`
+  rather than on message text.
+  - Process setup: `zcashlc_voting_configure` fixes the proving policy for the process from a
+    JSON policy — `0` when this call fixed it, `1` when one was already fixed, `-1` on error.
+    Unset, it defaults to one CPU worker per available core and one heavy proof or keygen job at
+    a time; a host that raises the heavy-job ceiling accepts the memory cost.
+    `zcashlc_voting_validate_round_id` reports whether a round id is a canonical field encoding,
+    without touching a database.
+  - Store operations on an open `VotingDatabaseHandle`, for the reads and destructive edits a
+    screen performs outside a round: `zcashlc_voting_round_plan` (the plan for one round against
+    the caller's authenticated proposal roster), `zcashlc_voting_pending_share_rounds` (the
+    rounds still owing helper-share delivery), `zcashlc_voting_reset_vote_tree`,
+    `zcashlc_voting_reset_session_state` (drops the cached tree state and the locally prepared
+    UNSIGNED delegation setup, so an abandoned Keystone request can be rebuilt; proved or
+    submitted bundles, imported capabilities and stored signatures are untouched, and an empty
+    round id drops only the cached tree state, wallet-wide, clearing no persisted column),
+    `zcashlc_voting_delete_round`, `zcashlc_voting_retry_blocked_combined_cast` and
+    `zcashlc_voting_clear_ballot_intents`.
+  - Round sessions. `zcashlc_voting_session_open` takes the handle, the round inputs and binding
+    as JSON, an optional `TorRuntime` and the host's operation epoch, and returns a
+    `VotingSessionHandle` freed with `zcashlc_voting_session_free`. It performs no network I/O,
+    so a bad round configuration is reported immediately rather than through a timeout. The
+    session then drives the round: `zcashlc_voting_session_{plan, set_ballot_intents,
+    setup_bundles, eligibility, sync_vote_tree, precompute_pir, precompute_delegation_proof,
+    keystone_signing_requests, store_keystone_signatures, run, track_shares, cancel, set_epoch,
+    update_host_configuration}`.
+    `_run` and `_track_shares` block for the whole drive — minutes on a round with proofs to
+    generate — and stream progress to an optional host callback that is invoked on runtime
+    worker threads, possibly concurrently, and must not block; the event stream is lossy by
+    design and the returned report is authoritative. One run at a time per session.
+    `_sync_vote_tree` takes the session handle and a node URL — no database handle and no round
+    id, because the session is already bound to a round — blocks for the sync, and returns the
+    height synced to, or -1 on error.
+  - A session holds one service configuration — the helper fleet, the vote-tree nodes and the
+    round's timing — over the inputs it was opened with, and both drivers read it on every
+    dispatch rather than capturing it when a run starts.
+    `zcashlc_voting_session_update_host_configuration(session, host_json, host_json_len)` merges
+    a `HostOverridesDto` into it and returns 0, or -1 with `VotingErrorView` JSON in the
+    last-error slot for a null handle or a payload it cannot parse. It takes that configuration's
+    own lock alone, so it returns at once even while `_run` or `_track_shares` is blocked, and a
+    fleet pushed mid-run reaches that run's next dispatch. Every writer merges field by field: a
+    field the JSON names replaces the current value, one it leaves absent keeps whatever is in
+    place — `{}` changes nothing, and a zero-length payload is not a JSON document and is
+    refused. The `host_json` of `_run` and `_track_shares` is merged in the same way once the
+    call's own arguments have decoded and before its signer is built, so it holds for the session
+    rather than for that one call — including when the call then fails, as `_run` does on a seed
+    it cannot build a signer from. Nothing rolls that merge back; a caller that wants a later call
+    driven against the values the session was opened with names those values on it.
+  - The route a session is opened on governs every service it touches for the session's whole
+    life — chain and helper traffic, PIR queries and vote-tree sync: a null `TorRuntime` is the
+    direct HTTP route, and a Tor runtime is used through an isolated client, never falling back
+    to a direct connection when Tor cannot connect. A PIR query hides which rows are fetched, not
+    who fetches them, so a Tor session fails closed for all four rather than letting any of them
+    show the PIR server or the tree node the device's address.
+  - Delegation signing is stated per run. A software wallet passes its seed, which reaches the
+    SDK's signer for that call only and never returns to the caller as a sighash, randomizer or
+    PCZT; a Keystone wallet exchanges per-bundle signing requests through
+    `zcashlc_voting_session_keystone_signing_requests` and
+    `zcashlc_voting_session_store_keystone_signatures`, and later runs reuse the stored
+    signatures. `_store_keystone_signatures` reads every response and verifies it against the
+    request it answers before it stores any of them: bytes that are not a signed PCZT carrying a
+    spend-authorization signature, and a signature that does not sign its bundle's current signing
+    request, both fail the call as `invalid_input` and store nothing of the batch, leaving that
+    bundle rescannable. The error JSON's `bundle_index` names the bundle whose response was
+    refused. Nothing replaces a stored signature — the first one stored for a bundle is the one it
+    keeps — so this is where a wrong response has to be stopped. A run with no signer reports the
+    bundles that owe one instead of dispatching them.
+  - `zcashlc_voting_hotkey_from_stored_secret` derives the `FfiVotingHotkey` a stored secret
+    describes, for a network id, so a caller that persisted only the secret can hand the SDK the
+    full hotkey again. Free with `zcashlc_voting_free_hotkey`.
+  - The plan JSON of `zcashlc_voting_round_plan`, `zcashlc_voting_session_plan` and
+    `zcashlc_voting_session_set_ballot_intents` carries one key beside the crate's own, at the
+    same level: `has_legacy_in_flight_submission` (bool). It is true when the round holds a
+    delegation or a vote this wallet built that an older SDK dispatched and never saw confirmed.
+    Opening a sidecar written by that SDK migrates it in place and keeps every row, but the 5.x
+    chain lifecycle owns only the submissions it reserved itself, so such a transaction gets no
+    lifecycle row and resuming it is unsupported: the driver plans an advance step and re-dispatches
+    the same transaction, rebuilt from its persisted inputs and re-signed over the stored sighash —
+    so the bytes need not be identical — with nothing promised about the outcome. Read it before bundle
+    setup, precompute or `_run`, and drive no such round. A delegation imported from a capability
+    package is excluded and reports false: its transaction was broadcast elsewhere, the lifecycle
+    adopts the hash rather than sending anything again, and the round is driven normally. The plans
+    nested in a run report and in the event stream are the crate's view unchanged and carry no such
+    key, so a caller that must gate on it reads one of the three calls above.
+
 - `zcashlc_take_last_error_report`, `zcashlc_free_error_report`, and `FfiErrorReport` expose the
   most recent error as a classified, redacted report. `kind` is an `ErrorKind` discriminant
   (`u32`): `0` is unclassified, `1` scan required, `2` insufficient funds; the remaining values are
@@ -248,25 +316,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
-- `zcashlc_voting_reset_session_state(db, round_id, round_id_len) -> i32` clears one round's
-  cached vote tree state and locally prepared unsigned delegation setup fields so an
-  interrupted Keystone signing request can be rebuilt. Bundles with a stored Keystone
-  signature, a stored delegation tx hash, or a recorded VAN position are untouched, unlike
-  `zcashlc_voting_clear_round`. Returns 0 on success, -1 on error. No existing call sites
-  change.
-  A zero-length `round_id` is rejected with `-1` (per-round semantics require a
-  non-empty id; `zcashlc_voting_reset_tree_client` remains the way to drop every
-  round's cached tree client).
-- `zcashlc_voting_get_stored_pczt_sighash` returns the stored ZIP-244 sighash of a
-  bundle's persisted delegation PCZT as a JSON-encoded byte array (`FfiBoxedSlice`),
-  or null when delegation setup is incomplete for the bundle. It takes only the round
-  id and bundle index, scoped to the handle's wallet id — no delegation-key inputs.
-  (It replaces a keys-taking form of the same readback that never shipped in a release.)
-- `zcashlc_voting_clear_keystone_signature` deletes one bundle's persisted Keystone
-  signature (0 on success, including when no row exists; -1 on error). Deleting the
-  signature makes the bundle eligible again for `zcashlc_voting_reset_session_state`'s
-  guarded cleanup, so a wallet that discards a stale signature can clear and rebuild
-  that bundle's delegation setup.
 
 ### Changed
 
@@ -316,58 +365,81 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the run completes the remaining dust is now reported where `-1` was returned before, and a
   balance whose canonical split the notes cannot fund now reports the whole spendable balance where
   the call used to fail. It costs one planning pass per remaining run, like the estimate.
-- The `zcashlc_voting_*` FFI is compiled again, against the Ironwood (NU6.3)
-  dependency stack. It had been gated behind `#[cfg(zcash_voting)]` on the
-  grounds that `zcash_voting` could not resolve against the Ironwood `orchard`
-  release; that held for `zcash_voting 1.0.0`, which pins the pre-Ironwood
-  librustzcash family, but not for `zcash_voting 2.0.0-rc.3`, which this crate
-  now depends on directly from crates.io.
-
-  Voting is compiled unconditionally rather than behind a Cargo feature. The
-  Swift package cannot gate voting for its consumers, so a Rust-only feature
-  would gate nothing reachable while leaving a bare `cargo build` producing a
-  library the Swift layer could not link against.
-
-  The FFI surface changed substantially, because `zcash_voting` absorbed
-  orchestration this crate used to hand-roll and made the intermediate steps
-  private:
-
-  - Removed: `zcashlc_voting_build_vote_commitment`,
-    `zcashlc_voting_sign_cast_vote`, `zcashlc_voting_build_share_payloads` and
-    `zcashlc_voting_encrypt_shares`, all four superseded by the new
-    `zcashlc_voting_commit_vote`; `zcashlc_voting_decompose_weight`, which has no
-    upstream equivalent; `zcashlc_voting_get_delegation_submission` and
-    `zcashlc_voting_get_delegation_submission_with_keystone_sig`, superseded by
-    `zcashlc_voting_get_delegation_submission_with_signature`; and
-    `zcashlc_voting_store_commitment_bundle`, superseded by
-    `zcashlc_voting_record_vc_position`.
-  - Added: `zcashlc_voting_commit_vote`,
-    `zcashlc_voting_get_delegation_submission_with_signature`, and
-    `zcashlc_voting_record_vc_position`.
-  - Changed: `zcashlc_voting_db_open` takes a network id, fixing the voting
-    network for the lifetime of the returned handle. A custom (regtest) network
-    derives its voting identity from the registered base network, so a
-    modified-mainnet chain votes with mainnet hotkeys and HRPs, and opening
-    fails if that network was never configured. Because the handle carries it,
-    `zcashlc_voting_init_round`, `zcashlc_voting_build_pczt`,
-    `zcashlc_voting_commit_vote`, `zcashlc_voting_precompute_delegation_pir`
-    and `zcashlc_voting_build_and_prove_delegation` no longer take a network
-    id, and an unknown one is rejected once at open rather than by each call.
-    `zcashlc_voting_init_round` still persists the round's network, so
-    governance PCZT branch identifiers can be validated against it.
-    `zcashlc_voting_generate_hotkey` drops its database and seed parameters and
-    takes a network, because voting hotkeys are now app-owned random values
-    rather than wallet-seed derivations; the caller must persist the returned
-    stored secret. `zcashlc_voting_build_pczt` and
-    `zcashlc_voting_build_and_prove_delegation` take a hotkey stored secret in
-    place of a raw hotkey address, since delegation keys can only be
-    constructed from a reconstructed hotkey. `zcashlc_voting_mark_vote_submitted`
-    requires the cast-vote transaction hash.
-    `zcashlc_voting_record_share_delegation` no longer accepts a nullifier,
-    which the crate derives from the vote's recovery state so a caller cannot
-    record one that disagrees with its share.
-  - `FfiVotingHotkey` and `FfiBundleSetupResult` changed shape; the latter gained
-    `dropped_count`, exposing notes the canonical bundling policy discarded.
+- Coinholder voting hosts the `zcash_voting` 5.x native round driver with the `lrz` (librustzcash)
+  backend, pinned to the published `=5.1.0` release. Opening a voting
+  database migrates schema 13 to 24 in place; older cores cannot reopen it.
+  The step-by-step entry points a host used to drive are gone (see Removed) and the session surface
+  that replaces them is new (see Added); what changed for the entry points that survive is:
+  - `zcashlc_voting_db_open` takes a network id, fixing the voting network for the lifetime of
+    the returned handle; an unknown one is rejected once at open rather than by each call.
+  - Voting database handles opened on the same sidecar path share one connection instead of each
+    opening its own, so writers serialize on it rather than contending for the file lock and only
+    the first open migrates the file. A path whose file has been deleted or replaced since it was
+    opened is excepted: `zcashlc_voting_db_open` then opens a fresh database there. Whatever still
+    holds the old connection — another handle, or a session that outlived the handle it was opened
+    from — keeps it, writing into a database no path names any more. Free the sessions, then the
+    handles, before deleting a sidecar file.
+  - `zcashlc_voting_generate_hotkey` drops its database and seed parameters and takes a network
+    id, because voting hotkeys are app-owned random values rather than wallet-seed derivations;
+    the caller must persist the returned stored secret. `FfiVotingHotkey` carries
+    `stored_secret`, `raw_orchard_address` and `address_index` in place of its former key pair.
+  - `zcashlc_voting_list_rounds` returns JSON in an `FfiBoxedSlice` instead of an
+    `FfiRoundSummaries` struct; every voting result is JSON now, and the `#[repr(C)]` result
+    structs and their destructors are gone with it (see Removed).
+  - `zcashlc_voting_extract_nc_root` reads the TreeState's IRONWOOD tree, not its Orchard one —
+    rounds anchor to the Ironwood pool, and the two roots never coincide, so a caller that kept
+    the old value fails every round.
+  - `zcashlc_voting_warm_proving_caches` starts the warm-up in the background and returns rather
+    than performing it on the calling thread.
+  - Hotkey generation and the software signer accept a regtest or custom network id, which
+    resolves its voting identity through the registered base network: a modified-mainnet chain
+    votes with mainnet hotkeys and HRPs, and an unconfigured custom network is rejected.
+  - `zcashlc_voting_session_open` fails with `invalid_input` when the network registered through
+    `zcashlc_set_custom_network` selects a different consensus branch at the round's snapshot
+    height than the base network does. The message names both branches and the height. Note
+    selection resolves its note version through the registered activation heights, but delegation
+    derives its branch from the base network alone and refuses any other. Voting runs on NU6.3 on
+    both sides, so where the two differ at least one has not reached NU6.3 at that height, and at
+    least one half refuses the round on its own; the check reports that as one clear refusal at
+    open rather than as an unsupported note version or an unsupported branch id from deeper in.
+    A caller on a standard network id is unaffected: the two schedules are then the same one. On a
+    regtest base they are not — the crate's regtest schedule activates NU6.3 at height 10, so a
+    round whose snapshot height is below 10 is refused unless the registered heights say the same.
+  - Every voting service a session touches rides the route the session was opened on: chain and
+    helper traffic, PIR queries and vote-tree sync alike. A PIR query hides which rows are
+    fetched, not who fetches them — the PIR server and the tree node see the device's address,
+    the round and one fetch burst per bundle — so a Tor session fails closed for all four rather
+    than letting any of them out some other way. Vote-tree sync is a session call
+    (`zcashlc_voting_session_sync_vote_tree`) rather than a store call, because only a session
+    carries a route to take it on.
+    The vote-tree client follows the route rather than the round, which costs bandwidth and
+    memory the caller should budget for. The crate keeps one tree client per wallet and
+    transport, and each session has its own transport, so a session's first sync of a round's
+    tree starts FROM SCRATCH instead of continuing the previous session's — paid whenever a round
+    is reopened, and always on a route change, which requires a new session. That cost is not
+    confined to `zcashlc_voting_session_sync_vote_tree`: `zcashlc_voting_session_run` syncs the
+    same tree over the same transport whenever it casts a vote, so a caller that never syncs
+    explicitly pays it too.
+    The previous session's tree is also retained after the session is freed, for as long as its
+    client holds any round's state — and that client owns the transport it was built over, so a
+    Tor session's isolated Tor client stays alive with it, past the session and past the host
+    disabling Tor. `zcashlc_voting_reset_vote_tree` for those rounds releases it, as does closing
+    the last connection to the sidecar. Reset when the voter leaves the round, not on every
+    session free — a round-scoped reset drops that round's state on every tree client of the
+    wallet, including one a concurrent session is syncing on. The reset is keyed by the sidecar
+    and the wallet id bound at the time of the call, so on a wallet switch it must run BEFORE
+    `zcashlc_voting_set_wallet_id`; afterwards it addresses the new wallet's clients and leaves
+    the old wallet's tree and transport in memory.
+  - `zcashlc_voting_session_setup_bundles`'s JSON carries `privacy_trim_dropped_bundles`,
+    `privacy_trim_dropped_notes`, `privacy_trim_dropped_value_zatoshi`, `skipped_suffix_bundles`,
+    `skipped_suffix_notes` and `skipped_suffix_value_zatoshi`;
+    `zcashlc_voting_session_eligibility`'s carries `privacy_trim_dropped_value_zatoshi`,
+    `skipped_suffix_bundles`, `skipped_suffix_notes`
+    and `skipped_suffix_value_zatoshi`. A new round is seeded with the crate's default bundle
+    policy, privacy trim included: trailing low-value bundles are dropped until at most two remain,
+    as long as what is dropped stays within 1% of the selected value and 1,000 ZEC. Any number of
+    bundles can go that way, so a wallet with a long dust tail loses the whole tail rather than two
+    of it. A round that already has a persisted policy keeps it.
 - Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
@@ -470,15 +542,82 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
-- Dependency `zcash_voting` moves from 3.0.0 to 4.0.0-rc.1 (voting-circuits 0.12.0), which raises
-  the crate's `rust-version` to 1.91. The 4.0 line keeps the 3.0 API: proposal ids widen to 1 to
-  50, and the crate now writes its sidecar under immediate SQLite transactions. No FFI change.
-- `zcashlc_voting_precompute_delegation_pir` and `zcashlc_voting_build_and_prove_delegation` reuse
-  one PIR client per `VotingDatabaseHandle`, keyed by endpoint URL, layout, and the persisted round
-  snapshot root. A client's actual circuit root must match the stored round before it is cached or
-  reused; a different round snapshot reconnects.
 
 ### Removed
+- The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
+  orchestration this crate used to drive one call at a time, and a host now opens a session and
+  lets the round driver run (see Changed). What each group is replaced by:
+  - Delegation setup, proving and submission — `zcashlc_voting_build_and_prove_delegation`,
+    `zcashlc_voting_build_pczt`, `zcashlc_voting_extract_pczt_sighash`,
+    `zcashlc_voting_extract_spend_auth_sig`, `zcashlc_voting_generate_delegation_inputs`,
+    `zcashlc_voting_generate_delegation_inputs_with_fvk`, `zcashlc_voting_generate_note_witnesses`,
+    `zcashlc_voting_generate_van_witness`, `zcashlc_voting_get_commitment_bundle`,
+    `zcashlc_voting_get_wallet_notes`, `zcashlc_voting_verify_witness`,
+    `zcashlc_voting_precompute_delegation_pir`, `zcashlc_voting_validate_pir_proof`,
+    `zcashlc_voting_get_stored_pczt_sighash`, `zcashlc_voting_get_delegation_submission`,
+    `zcashlc_voting_get_delegation_submission_with_keystone_sig` and
+    `zcashlc_voting_get_delegation_submission_with_signature` — are replaced by
+    `zcashlc_voting_session_setup_bundles`, `zcashlc_voting_session_precompute_pir`,
+    `zcashlc_voting_session_precompute_delegation_proof` and `zcashlc_voting_session_run`. The
+    intermediate material (witnesses, PCZTs, sighashes, delegation inputs) is no longer handed
+    out at all for a software wallet; a Keystone wallet sees only the redacted per-bundle
+    request, which carries the sighash its signature is verified against, so there is nothing
+    left to read back separately.
+  - Software delegation signing — `zcashlc_voting_sign_delegation_request` — is replaced by the
+    per-run signer inside `zcashlc_voting_session_run`: a software wallet hands the run its
+    seed, which reaches the SDK's signer for that call only, and no sighash, randomizer,
+    signature or PCZT comes back to the caller.
+  - Vote construction and casting — `zcashlc_voting_build_vote_commitment`,
+    `zcashlc_voting_sign_cast_vote`, `zcashlc_voting_build_share_payloads`,
+    `zcashlc_voting_encrypt_shares`, `zcashlc_voting_decompose_weight`,
+    `zcashlc_voting_store_commitment_bundle`, `zcashlc_voting_commit_vote` and
+    `zcashlc_voting_get_votes` — are replaced by
+    `zcashlc_voting_session_set_ballot_intents`, which records the ballot, and
+    `zcashlc_voting_session_run`, which builds, casts and delivers it.
+  - Chain recording — `zcashlc_voting_store_delegation_tx_hash`,
+    `zcashlc_voting_store_vote_tx_hash`, `zcashlc_voting_store_van_position`,
+    `zcashlc_voting_mark_vote_submitted`, `zcashlc_voting_record_vc_position`,
+    `zcashlc_voting_confirm_vote_submission`, `zcashlc_voting_get_delegation_tx_hash` and
+    `zcashlc_voting_get_vote_tx_hash` — are the driver's own: `zcashlc_voting_session_run`
+    submits and records, and its report plus `zcashlc_voting_round_plan` are the readbacks.
+  - Share journaling — `zcashlc_voting_record_share_delegation`,
+    `zcashlc_voting_mark_share_confirmed`, `zcashlc_voting_add_sent_servers`,
+    `zcashlc_voting_get_share_delegations`, `zcashlc_voting_get_unconfirmed_delegations`,
+    `zcashlc_voting_compute_share_nullifier`, `zcashlc_voting_recover_wire_json` and
+    `zcashlc_voting_recoverable_share_indices` — are replaced by
+    `zcashlc_voting_session_track_shares`, which rebuilds and delivers an owed share itself,
+    and `zcashlc_voting_pending_share_rounds`, which says which rounds still owe one.
+  - Round lifecycle and stored state — `zcashlc_voting_init_round`, `zcashlc_voting_clear_round`,
+    `zcashlc_voting_setup_bundles`, `zcashlc_voting_get_round_state`,
+    `zcashlc_voting_get_bundle_count` and `zcashlc_voting_clear_recovery_state` — are replaced by
+    `zcashlc_voting_session_open` with `zcashlc_voting_session_setup_bundles`, and by
+    `zcashlc_voting_round_plan`, `zcashlc_voting_reset_session_state` and
+    `zcashlc_voting_delete_round`.
+  - Vote-tree state — `zcashlc_voting_store_tree_state` and `zcashlc_voting_reset_tree_client` —
+    are replaced by `zcashlc_voting_session_sync_vote_tree` and `zcashlc_voting_reset_vote_tree`;
+    the round's anchor tree state is now an input to `zcashlc_voting_session_open`.
+  - `zcashlc_voting_store_keystone_signature` is replaced by
+    `zcashlc_voting_session_store_keystone_signatures`, which stores a whole round's signatures
+    in one batch and reports how many were already present.
+    `zcashlc_voting_clear_keystone_signature` has no replacement: there is no per-bundle delete,
+    and the batch store reports a stored signature as already present rather than replacing it,
+    so a bundle whose stored signature no longer matches its delegation setup is discarded with
+    its round (`zcashlc_voting_delete_round`) and set up again.
+  - Delegation recovery import — `zcashlc_voting_restore_recovered_delegation` and
+    `zcashlc_voting_van_commitment`, which recomputed the VAN commitment a recovered row had to
+    reproduce — has no replacement: importing a delegation capability rebuilt from a package is
+    no longer part of the C surface.
+  - The `#[repr(C)]` result structs `FfiRoundSummaries`, `FfiRoundState`, `FfiVoteRecords` and
+    `FfiBundleSetupResult`, with their destructors `zcashlc_voting_free_round_summaries`,
+    `zcashlc_voting_free_round_state`, `zcashlc_voting_free_vote_records` and
+    `zcashlc_voting_free_bundle_setup_result`, are gone: every voting result is JSON in an
+    `FfiBoxedSlice`, freed with `zcashlc_free_boxed_slice`.
+- `zcashlc_voting_sync_vote_tree` is removed, and `zcashlc_voting_session_sync_vote_tree`
+  replaces it. The store-level call had no route to take, so vote-tree traffic reached the node
+  directly even for a round whose session had been opened on Tor. The replacement takes the
+  `VotingSessionHandle` and the node URL in place of the database handle and the round id, and
+  syncs over the session's route; a host that synced outside a round opens the round's session
+  first.
 - `zcashlc_migration_debug_reschedule_transfers` is removed. It was the only FFI entry point that
   wrote raw SQL directly against the engine-owned pool-migration tables, retro-compressing a
   committed schedule so its transfers become due in quick succession for manual broadcast testing.
@@ -505,8 +644,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
-- `zcashlc_voting_commit_vote` uses `zcash_voting` 4.0.0-rc.2 to wait for a competing
-  database writer before storing a vote. Existing FFI signatures are unchanged.
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously
   omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood
