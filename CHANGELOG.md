@@ -136,6 +136,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- **Breaking: `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` (and the
+  `ClosureSynchronizer`, `CombineSynchronizer` and `VotingRustBackend.makeSession` counterparts)
+  gain a required `isCustomServer: Bool` parameter, between `route` and `epoch`.** Pass `true` for
+  a custom voting config (vote, chain or PIR endpoints the voter added) and `false` for the
+  predefined servers. PIR is not opened separately on iOS: `VotingRoundSession.precomputePir`
+  and the delegation proof ride the session's own route, so this one parameter routes the
+  delegation PIR traffic and the voting driver HTTP traffic the same way. Tor ON (`.tor`): Tor
+  directly to the vote and PIR servers, unchanged. Tor OFF (`.direct`) + predefined servers: OHTTP
+  (the relay sees the client IP but not the request; the gateway and backend servers never see the
+  client IP), failing closed — opening throws `VotingError` with `.invalidInput` when a chain or
+  PIR endpoint is not one the gateway carries, and never falls back to a direct connection.
+  Tor OFF + custom servers: direct (choosing a custom endpoint implies accepting direct routing).
+  Without this parameter, custom configs with endpoints not in the gateway's allowlist would fail
+  closed instead of routing direct. Also, the OHTTP host allowlist in `OHTTPEndpoints` now matches
+  the gateway's exact host list rather than suffixes (see below).
+
 - Custom `Synchronizer`, `ClosureSynchronizer`, and `CombineSynchronizer` conformers and test doubles must implement `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; see MIGRATING.md for the async, closure, and publisher signatures. Both shipped engines and adapters provide this bounded GET API. One original budget covers actor admission, executor waiting, retries, and body collection. At most two bounded requests own executor slots across the process, with slots held through disposal. Cancellation or expiry before runtime ownership starts no native work; after ownership begins, cancellation waits for the bounded operation and cleanup. Cleanup, including final-owner runtime shutdown, can extend completion beyond the HTTP timer. Tor must already be enabled successfully; an unprepared runtime throws `torClientUnavailable`. Existing GET/POST APIs are unchanged.
 
 ### Coinholder voting on zcash_voting 5.1

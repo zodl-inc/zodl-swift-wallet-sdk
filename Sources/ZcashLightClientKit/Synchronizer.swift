@@ -683,6 +683,7 @@ public protocol Synchronizer: AnyObject {
     ///              uses clearnet to reach the relay (device → relay → gateway). Default false.
     func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
 
+    // swiftlint:disable function_parameter_count
     /// Open a voting round session on the explicitly selected route.
     ///
     /// The route is fixed for the session's whole life. `.tor` requires an
@@ -710,14 +711,25 @@ public protocol Synchronizer: AnyObject {
     ///    - inputs: The round's parameters and endpoints.
     ///    - binding: The proposal roster the session is bound to.
     ///    - route: Which route every service the session touches takes.
+    ///    - isCustomServer: Whether the voter chose the round's vote and PIR servers
+    ///      themselves rather than taking the predefined ones. Required. Read only on
+    ///      `.direct`, where it decides between the two clearnet-side routes: `false`
+    ///      (predefined servers) opens the session over OHTTP through the relay and
+    ///      gateway and fails closed with ``VotingErrorKind/invalidInput`` when a chain
+    ///      or PIR endpoint is not one the gateway carries; `true` (custom servers)
+    ///      opens it on a plain direct connection. On `.tor` it has no effect: Tor
+    ///      reaches the servers directly either way. PIR queries always share the
+    ///      session's route.
     ///    - epoch: The submission epoch the session starts at.
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession
+    // swiftlint:enable function_parameter_count
 
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!
@@ -1636,6 +1648,7 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    // swiftlint:disable function_parameter_count
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route.
     ///
     /// Only a conformer that owns a Tor client can open a round on Tor, and the refusal is the
@@ -1646,15 +1659,23 @@ public extension Synchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             throw ZcashError.torClientUnavailable
         }
     }
+    // swiftlint:enable function_parameter_count
 
     /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
     /// source-compatible and report that the capability is unavailable.
@@ -1915,13 +1936,20 @@ public extension ClosureSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64,
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     ) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
             switch route {
             case .direct:
-                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+                return try backend.makeSession(
+                    inputs: inputs,
+                    binding: binding,
+                    torRuntime: nil,
+                    isCustomServer: isCustomServer,
+                    epoch: epoch
+                )
             case .tor:
                 throw ZcashError.torClientUnavailable
             }
@@ -1950,6 +1978,7 @@ public extension ClosureSynchronizer {
 }
 
 public extension CombineSynchronizer {
+    // swiftlint:disable function_parameter_count
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route,
     /// matching `Synchronizer`'s own default.
     func makeVotingRoundSession(
@@ -1957,17 +1986,25 @@ public extension CombineSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) -> SinglePublisher<VotingRoundSession, Error> {
         AsyncToCombineGateway.executeThrowingAction {
             switch route {
             case .direct:
-                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+                return try backend.makeSession(
+                    inputs: inputs,
+                    binding: binding,
+                    torRuntime: nil,
+                    isCustomServer: isCustomServer,
+                    epoch: epoch
+                )
             case .tor:
                 throw ZcashError.torClientUnavailable
             }
         }
     }
+    // swiftlint:enable function_parameter_count
 
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast

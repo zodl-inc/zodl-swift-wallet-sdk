@@ -2689,25 +2689,25 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - makeVotingRoundSession
 
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError: Error?
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount = 0
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochCalled: Bool {
-        return makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount > 0
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochThrowableError: Error?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount = 0
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCalled: Bool {
+        return makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount > 0
     }
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64)?
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue: VotingRoundSession!
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, UInt64) async throws -> VotingRoundSession)?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, isCustomServer: Bool, epoch: UInt64)?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReturnValue: VotingRoundSession!
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, Bool, UInt64) async throws -> VotingRoundSession)?
 
-    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64) async throws -> VotingRoundSession {
-        if let error = makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError {
+    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, isCustomServer: Bool, epoch: UInt64) async throws -> VotingRoundSession {
+        if let error = makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochThrowableError {
             throw error
         }
-        makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount += 1
-        makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch)
-        if let closure = makeVotingRoundSessionBackendInputsBindingRouteEpochClosure {
-            return try await closure(backend, inputs, binding, route, epoch)
+        makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount += 1
+        makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, isCustomServer: isCustomServer, epoch: epoch)
+        if let closure = makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochClosure {
+            return try await closure(backend, inputs, binding, route, isCustomServer, epoch)
         } else {
-            return makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue
+            return makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReturnValue
         }
     }
 

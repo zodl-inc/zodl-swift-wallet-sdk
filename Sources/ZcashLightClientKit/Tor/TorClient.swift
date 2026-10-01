@@ -102,9 +102,16 @@ public actor TorClient {
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
+        isCustomServer: Bool,
         epoch: UInt64
     ) throws -> VotingRoundSession {
-        try backend.makeSession(inputs: inputs, binding: binding, torRuntime: resolveRuntime(), epoch: epoch)
+        try backend.makeSession(
+            inputs: inputs,
+            binding: binding,
+            torRuntime: resolveRuntime(),
+            isCustomServer: isCustomServer,
+            epoch: epoch
+        )
     }
 
     public func isolatedClient() throws -> TorClient {

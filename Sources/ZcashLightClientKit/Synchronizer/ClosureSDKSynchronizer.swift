@@ -313,6 +313,7 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64,
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     ) {
@@ -322,6 +323,7 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
                 inputs: inputs,
                 binding: binding,
                 route: route,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }

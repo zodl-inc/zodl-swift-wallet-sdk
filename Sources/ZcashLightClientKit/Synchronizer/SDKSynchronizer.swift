@@ -1252,16 +1252,24 @@ public class SDKSynchronizer: Synchronizer {
         await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    // swiftlint:disable function_parameter_count
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let torEnabled = await sdkFlags.torEnabled
             let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
@@ -1276,10 +1284,12 @@ public class SDKSynchronizer: Synchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
         let torEnabled = await sdkFlags.torEnabled

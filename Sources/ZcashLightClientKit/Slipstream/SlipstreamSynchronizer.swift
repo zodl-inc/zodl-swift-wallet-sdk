@@ -2878,6 +2878,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return (response.body, httpResp)
     }
 
+    // swiftlint:disable function_parameter_count
     /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
     /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
@@ -2887,11 +2888,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let sdkFlags = initializer.container.resolve(SDKFlags.self)
             let torEnabled = await sdkFlags.torEnabled
@@ -2907,10 +2915,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)

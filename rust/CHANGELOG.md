@@ -319,6 +319,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `zcashlc_voting_session_open` gains an `is_custom_server: bool`
+  argument (after `tor`, before `epoch`).** With `tor` non-null the session rides Tor as before.
+  With `tor` null it rides OHTTP through the relay and gateway when `is_custom_server` is false
+  (every chain and PIR endpoint must be one of the gateway's exact hosts, otherwise the open fails
+  with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
+  when it is true. PIR queries share the session's route.
 - `zcashlc_slipstream_snapshot` reports `tip_fresh = 1` only once the run that refreshed the
   chain tip has also completed a ChainTip-priority scan range (`spendable_hint = 1`) or reached
   Done, so a host that lifts a spendable-balance mask on `tip_fresh` never uncovers the transient

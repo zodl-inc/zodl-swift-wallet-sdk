@@ -118,9 +118,14 @@ public struct VotingRoundParameters: Equatable, Sendable, Encodable {
 /// vote-tree sync. A PIR query hides which rows are fetched, not who fetches
 /// them, so none of it may leave a Tor session any other way.
 ///
+/// ``direct`` is the route for a session without Tor, and what it means depends on the
+/// `isCustomServer` argument of `Synchronizer.makeVotingRoundSession`: for the predefined servers it
+/// is OHTTP through the relay and gateway (failing closed, never a plain connection), for a
+/// custom server a plain direct connection.
+///
 /// The runtime the ``tor`` route needs belongs to the synchronizer rather than
 /// to the caller, which is why a route is named here instead of a client being
-/// handed over — see `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)`.
+/// handed over — see `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)`.
 public enum VotingTransportRoute: Sendable, Equatable {
     case direct
     case tor
