@@ -7,159 +7,8 @@
 
 import XCTest
 @testable import ZcashLightClientKit
-import CryptoKit
 
 final class OHTTPTests: XCTestCase {
-
-    // MARK: - HKDF Tests (RFC 5869 Test Case 1)
-
-    func testHKDFRFC5869TestCase1() throws {
-        // RFC 5869 Test Case 1 (Appendix A.1)
-        // IKM  = 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b (22 octets)
-        // salt = 0x000102030405060708090a0b0c (13 octets)
-        // info = 0xf0f1f2f3f4f5f6f7f8f9 (10 octets)
-        // L    = 42
-        //
-        // Expected OKM (42 octets):
-        // 0x3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf
-        // 34007208d5b887185865
-
-        let ikm = Data(repeating: 0x0b, count: 22)
-        let salt = Data([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c])
-        let info = Data([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9])
-        let length = 42
-
-        let prk = OHTTPHPKE.hkdfExtract(salt: salt, ikm: ikm)
-        let okm = try OHTTPHPKE.hkdfExpand(prk: prk, info: info, length: length)
-
-        let expected = Data([
-            0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
-            0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
-            0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
-            0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
-            0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
-            0x58, 0x65
-        ])
-
-        XCTAssertEqual(okm, expected, "HKDF output doesn't match RFC 5869 test case 1")
-    }
-
-    // MARK: - Binary HTTP Tests
-
-    func testBinaryHTTPRequestEncodeDecode() throws {
-        let request = BinaryHTTP.Request(
-            method: "POST",
-            scheme: "https",
-            authority: "example.com",
-            path: "/test",
-            headers: [("content-type", "application/json")],
-            body: Data("test body".utf8)
-        )
-
-        let encoded = try BinaryHTTP.encodeRequest(request)
-        XCTAssertGreaterThan(encoded.count, 0, "Encoded request should not be empty")
-
-        // Basic validation: check that framing indicator is 0 (known-length request)
-        XCTAssertEqual(encoded[0], 0, "First byte should be framing indicator 0")
-    }
-
-    func testBinaryHTTPKnownLengthResponse() throws {
-        // Construct a minimal known-length response:
-        // framing (1), status (200), empty headers section (length 0), empty body (length 0), empty trailers (length 0)
-        var response = Data()
-        BinaryHTTP.writeVarint(&response, 1)  // framing: known-length response
-        BinaryHTTP.writeVarint(&response, 200)  // status
-        BinaryHTTP.writeVarint(&response, 0)  // headers section length
-        BinaryHTTP.writeVarint(&response, 0)  // body length
-        BinaryHTTP.writeVarint(&response, 0)  // trailers section length
-
-        let decoded = try BinaryHTTP.decodeResponse(response)
-        XCTAssertEqual(decoded.status, 200)
-        XCTAssertTrue(decoded.headers.isEmpty)
-        XCTAssertTrue(decoded.body.isEmpty)
-        XCTAssertTrue(decoded.trailers.isEmpty)
-    }
-
-    func testBinaryHTTPResponseWithHeaders() throws {
-        // Construct a response with headers
-        var response = Data()
-        BinaryHTTP.writeVarint(&response, 1)  // framing
-        BinaryHTTP.writeVarint(&response, 200)  // status
-
-        // Headers section
-        var headersSection = Data()
-        BinaryHTTP.writeVarint(&headersSection, UInt64("content-type".count))
-        headersSection.append("content-type".data(using: .ascii)!)
-        BinaryHTTP.writeVarint(&headersSection, UInt64("text/plain".count))
-        headersSection.append("text/plain".data(using: .isoLatin1)!)
-
-        BinaryHTTP.writeVarint(&response, UInt64(headersSection.count))
-        response.append(headersSection)
-
-        BinaryHTTP.writeVarint(&response, 0)  // body length
-        BinaryHTTP.writeVarint(&response, 0)  // trailers length
-
-        let decoded = try BinaryHTTP.decodeResponse(response)
-        XCTAssertEqual(decoded.status, 200)
-        XCTAssertEqual(decoded.headers.count, 1)
-        XCTAssertEqual(decoded.headers[0].0, "content-type")
-        XCTAssertEqual(decoded.headers[0].1, "text/plain")
-    }
-
-    // MARK: - OHTTP Key Config Tests
-
-    func testOHTTPKeyConfigParsing() throws {
-        // Construct a minimal key config document for the supported suite
-        var config = Data()
-
-        // Config length (will be calculated)
-        let configStart = config.count + 2
-        var configBody = Data()
-
-        configBody.append(0x01)  // key_id = 1
-        configBody.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
-        configBody.append(Data(count: 32))  // 32-byte public key (all zeros for test)
-
-        // Symmetric suites
-        var suites = Data()
-        suites.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
-        suites.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
-
-        configBody.append(contentsOf: [UInt8(suites.count >> 8), UInt8(suites.count & 0xFF)])
-        configBody.append(suites)
-
-        // Write config length
-        config.append(contentsOf: [UInt8(configBody.count >> 8), UInt8(configBody.count & 0xFF)])
-        config.append(configBody)
-
-        let parsed = try OHTTPKeyConfig.parseSupported(config)
-        XCTAssertEqual(parsed.keyId, 1)
-        XCTAssertEqual(parsed.kemId, 0x0020)
-        XCTAssertEqual(parsed.kdfId, 0x0001)
-        XCTAssertEqual(parsed.aeadId, 0x0001)
-        XCTAssertEqual(parsed.publicKey.count, 32)
-    }
-
-    func testOHTTPKeyConfigUnsupportedSuite() {
-        // Config with unsupported KEM
-        var config = Data()
-        var configBody = Data()
-
-        configBody.append(0x01)  // key_id
-        configBody.append(contentsOf: [0x00, 0x10])  // kem_id = 0x0010 (DHKEM(P-256))
-        configBody.append(Data(count: 32))  // public key
-        configBody.append(contentsOf: [0x00, 0x00])  // empty suites
-
-        config.append(contentsOf: [UInt8(configBody.count >> 8), UInt8(configBody.count & 0xFF)])
-        config.append(configBody)
-
-        XCTAssertThrowsError(try OHTTPKeyConfig.parseSupported(config)) { error in
-            guard case OHTTPError.keyConfigError = error else {
-                XCTFail("Expected keyConfigError")
-                return
-            }
-        }
-    }
 
     // MARK: - OHTTP Endpoints Tests
 
@@ -202,40 +51,9 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(voteURL, "https://simulator-relay.example.invalid/ohttp-configs")
     }
 
-    // MARK: - I2OSP Tests
-
-    func testI2OSP() {
-        let result1 = OHTTPHPKE.i2osp(UInt16(0x1234), 2)
-        XCTAssertEqual(result1, Data([0x12, 0x34]))
-
-        let result2 = OHTTPHPKE.i2osp(UInt64(0x12345678), 4)
-        XCTAssertEqual(result2, Data([0x12, 0x34, 0x56, 0x78]))
-
-        let result3 = OHTTPHPKE.i2osp(UInt64(0), 2)
-        XCTAssertEqual(result3, Data([0x00, 0x00]))
-    }
-
-    // MARK: - QUIC Varint Tests
-
-    func testQUICVarintEncode() {
-        var data = Data()
-
-        // 1-byte encoding
-        BinaryHTTP.writeVarint(&data, 63)
-        XCTAssertEqual(data, Data([63]))
-
-        data = Data()
-        // 2-byte encoding
-        BinaryHTTP.writeVarint(&data, 16383)
-        XCTAssertEqual(data, Data([0x7F, 0xFF]))
-
-        data = Data()
-        // 4-byte encoding
-        BinaryHTTP.writeVarint(&data, 1073741823)
-        XCTAssertEqual(data, Data([0xBF, 0xFF, 0xFF, 0xFF]))
-    }
 
     // MARK: - gRPC Frame Parsing Tests
+
 
     func testGRPCFrameEncoding() {
         // Test that a frame is encoded correctly (uncompressed flag + 4-byte length + payload)
@@ -252,6 +70,7 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(frame[3], 0)
         XCTAssertEqual(frame[4], UInt8(payload.count))
     }
+
 
     // MARK: - Proxy Allowlist Tests
 
@@ -376,342 +195,41 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(OHTTPEndpoints.proxyHost(for: clearnetURL), "example.com should NOT be mapped")
     }
 
+
     // MARK: - Client Trace ID Tests
 
-    /// Creates a valid OHTTP key config for testing (X25519 / HKDF-SHA256 / AES-128-GCM).
-    private func makeValidKeyConfig() -> Data {
-        var config = Data()
-        var configBody = Data()
-
-        configBody.append(0x01)  // key_id
-        configBody.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
-        // Use a non-zero public key (arbitrary but non-zero to avoid potential edge cases)
-        configBody.append(Data([
-            0x50, 0x4a, 0x36, 0x99, 0x9f, 0x48, 0x9c, 0xd2,
-            0xfd, 0xbc, 0x08, 0xba, 0xff, 0x3d, 0x88, 0xfa,
-            0x00, 0x56, 0x9d, 0x21, 0x74, 0x05, 0x10, 0x9e,
-            0x79, 0xda, 0x66, 0x05, 0x3c, 0x5f, 0x04, 0xef
-        ]))
-        configBody.append(contentsOf: [0x00, 0x04])  // suites_length = 4
-        configBody.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
-        configBody.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
-
-        let length = UInt16(configBody.count)
-        config.append(UInt8(length >> 8))
-        config.append(UInt8(length & 0xFF))
-        config.append(configBody)
-
-        return config
-    }
-
-    /// Deterministic test vector: valid OHTTP key config (X25519/HKDF-SHA256/AES-128-GCM) signed
-    /// with test Ed25519 key (seed 0x22...22, pubkey a09aa5f4..., key_id 1325b850). Signed
-    /// message format: "zodl-ohttp-configs-v1\0<network>\0<notBefore:BE64><notAfter:BE64><configs>".
-    /// Valid 1700000000..1700021600 (Nov 2023, fixed for time-independent tests).
-    /// Helper to generate a self-signed OHTTP config envelope for testing.
-    private func makeSignedEnvelope(
-        network: String,
-        notBefore: Int64,
-        notAfter: Int64,
-        signingKey: Curve25519.Signing.PrivateKey
-    ) throws -> Data {
-        let publicKeyData = signingKey.publicKey.rawRepresentation
-        
-        // Compute key ID (first 8 hex chars of SHA-256(public key))
-        var hasher = SHA256()
-        hasher.update(data: publicKeyData)
-        let hash = hasher.finalize()
-        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
-        
-        // Build a valid 43-byte OHTTP key config
-        var configBytes = Data()
-        configBytes.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
-        configBytes.append(0x01)  // key_id
-        configBytes.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
-        // Generate a random X25519 public key for the config
-        let x25519Key = Curve25519.KeyAgreement.PrivateKey()
-        configBytes.append(x25519Key.publicKey.rawRepresentation)
-        configBytes.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
-        configBytes.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
-        configBytes.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
-        
-        // Build signed message: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 || notBefore || notAfter || configs
-        var message = Data()
-        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
-        message.append(0x00)
-        message.append(network.data(using: .ascii)!)
-        message.append(0x00)
-        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
-        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
-        message.append(configBytes)
-        
-        // Sign the message
-        let signature = try signingKey.signature(for: message)
-        
-        // Build JSON envelope
-        let envelope = SignedOHTTPConfigEnvelope(
-            version: 1,
-            network: network,
-            configs: configBytes.base64EncodedString(),
-            notBefore: notBefore,
-            notAfter: notAfter,
-            keyId: keyId,
-            signature: Data(signature).base64EncodedString()
-        )
-        
-        return try JSONEncoder().encode(envelope)
-    }
-    
-    /// Generate a fresh signing key and corresponding test parameters for injection.
-    private func makeTestKeyParams() -> (key: Curve25519.Signing.PrivateKey, keyId: String, publicKeyHex: String) {
-        let signingKey = Curve25519.Signing.PrivateKey()
-        let publicKeyData = signingKey.publicKey.rawRepresentation
-        
-        var hasher = SHA256()
-        hasher.update(data: publicKeyData)
-        let hash = hasher.finalize()
-        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
-        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
-        
-        return (signingKey, keyId, publicKeyHex)
-    }
-
-    /// Fixed clock for tests (midpoint of test vector validity window).
-    private let testNow = Date(timeIntervalSince1970: 1700010800)
-
-
     func testClientTraceIdAbsentWhenNotSet() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
+        let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: nil)
 
-        var capturedRequest: URLRequest?
-        var callCount = 0
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            callCount += 1
-            // Return valid signed config for GET, capture POST where trace ID should be
-            if request.httpMethod == "GET" {
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
-            } else {
-                // POST to relay - capture and throw to abort the test early
-                capturedRequest = request
-                throw OHTTPError.transportError("test abort")
-            }
-        }
-
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            clientTraceIdPrefix: nil,
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
-
-        do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
-            XCTFail("Should have thrown")
-        } catch {
-            // Expected - mock sender throws on POST
-        }
-
-        XCTAssertNotNil(capturedRequest, "Request should have been captured (callCount=\(callCount))")
-        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id"), "X-Client-Trace-Id should be absent")
-        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
+        XCTAssertNotNil(post, "Request should have been captured")
+        XCTAssertNil(post?.value(forHTTPHeaderField: "X-Client-Trace-Id"), "X-Client-Trace-Id should be absent")
+        XCTAssertNil(post?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
     }
 
     func testClientTraceIdPresentWhenSet() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
+        let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: "test-wallet")
 
-        var capturedRequest: URLRequest?
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            if request.httpMethod == "GET" {
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
-            } else {
-                capturedRequest = request
-                throw OHTTPError.transportError("test abort")
-            }
-        }
-
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            clientTraceIdPrefix: "test-wallet",
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
-
-        do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
-            XCTFail("Should have thrown")
-        } catch {
-            // Expected
-        }
-
-        XCTAssertNotNil(capturedRequest, "Request should have been captured")
-        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        XCTAssertNotNil(post, "Request should have been captured")
+        let traceId = post?.value(forHTTPHeaderField: "X-Client-Trace-Id")
         XCTAssertNotNil(traceId, "X-Client-Trace-Id should be present")
         XCTAssertTrue(traceId?.hasPrefix("test-wallet-") ?? false, "Trace ID should start with prefix")
         XCTAssertLessThanOrEqual(traceId?.count ?? 0, 64, "Trace ID should be ≤ 64 chars")
         XCTAssertTrue(traceId?.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$", options: .regularExpression) != nil,
                       "Trace ID should match allowed charset")
-        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
+        XCTAssertNil(post?.value(forHTTPHeaderField: "X-Request-Id"), "X-Request-Id should never be set by SDK")
     }
 
     func testClientTraceIdNeverSetsXRequestId() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
+        let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: "test")
 
-        var capturedRequest: URLRequest?
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            if request.httpMethod == "GET" {
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
-            } else {
-                capturedRequest = request
-                throw OHTTPError.transportError("test abort")
-            }
-        }
-
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            clientTraceIdPrefix: "test",
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
-
-        do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
-            XCTFail("Should have thrown")
-        } catch {
-            // Expected
-        }
-
-        XCTAssertNotNil(capturedRequest, "Request should have been captured")
-        XCTAssertNil(capturedRequest?.value(forHTTPHeaderField: "X-Request-Id"), "SDK must never set X-Request-Id")
+        XCTAssertNotNil(post, "Request should have been captured")
+        XCTAssertNil(post?.value(forHTTPHeaderField: "X-Request-Id"), "SDK must never set X-Request-Id")
     }
 
     func testClientTraceIdSanitization() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
+        let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: "test@wallet#123")
 
-        var capturedRequest: URLRequest?
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            if request.httpMethod == "GET" {
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
-            } else {
-                capturedRequest = request
-                throw OHTTPError.transportError("test abort")
-            }
-        }
-
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            clientTraceIdPrefix: "test@wallet#123",
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
-
-        do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
-            XCTFail("Should have thrown")
-        } catch {
-            // Expected
-        }
-
-        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        let traceId = post?.value(forHTTPHeaderField: "X-Client-Trace-Id")
         XCTAssertNotNil(traceId, "Trace ID should be present")
         XCTAssertFalse(traceId?.contains("@") ?? true, "Trace ID should not contain @")
         XCTAssertFalse(traceId?.contains("#") ?? true, "Trace ID should not contain #")
@@ -720,114 +238,84 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testClientTraceIdTruncation() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
+        let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: String(repeating: "a", count: 60))
 
-        var capturedRequest: URLRequest?
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            if request.httpMethod == "GET" {
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
-            } else {
-                capturedRequest = request
-                throw OHTTPError.transportError("test abort")
-            }
-        }
-
-        let longPrefix = String(repeating: "a", count: 60)
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            clientTraceIdPrefix: longPrefix,
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
-
-        do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
-            XCTFail("Should have thrown")
-        } catch {
-            // Expected
-        }
-
-        let traceId = capturedRequest?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+        let traceId = post?.value(forHTTPHeaderField: "X-Client-Trace-Id")
         XCTAssertNotNil(traceId, "Trace ID should be present")
         XCTAssertEqual(traceId?.count, 64, "Trace ID should be truncated to exactly 64 chars")
+    }
+
+    func testTraceIdAlsoRidesTheKeyConfigurationFetch() async throws {
+        // The iOS profile sends the trace id on the key fetch as well as on the post.
+        var fetch: URLRequest?
+        let transport = OHTTPTestSupport.makeTransport(clientTraceIdPrefix: "trace") { request in
+            if request.httpMethod == "GET" {
+                fetch = request
+                return (
+                    OHTTPTestSupport.stubEnvelope,
+                    OHTTPTestSupport.response(for: request.url, status: 200)
+                )
+            }
+            throw OHTTPError.transportError("test abort")
+        }
+
+        _ = try? await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+
+        XCTAssertNotNil(fetch?.value(forHTTPHeaderField: "X-Client-Trace-Id"))
+    }
+
+    func testRequestsCarryTheProfileHeaders() async throws {
+        var fetch: URLRequest?
+        var post: URLRequest?
+        let transport = OHTTPTestSupport.makeTransport { request in
+            if request.httpMethod == "GET" {
+                fetch = request
+                return (
+                    OHTTPTestSupport.stubEnvelope,
+                    OHTTPTestSupport.response(for: request.url, status: 200)
+                )
+            }
+            post = request
+            throw OHTTPError.transportError("test abort")
+        }
+
+        _ = try? await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+
+        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept"), "application/ohttp-keys")
+        XCTAssertEqual(post?.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-req")
+        XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept"), "message/ohttp-res")
+        XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
+        XCTAssertEqual(post?.httpMethod, "POST")
+        XCTAssertGreaterThan(post?.httpBody?.count ?? 0, 0)
     }
 
     // MARK: - Tor Mode Tests
 
     func testTorModeUsesCustomSenderForKeyConfigAndRelay() async throws {
-        // Generate test signing key
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
-        let testNow = Date(timeIntervalSince1970: 1700010000)
-        
         var keyConfigRequestCaptured = false
         var relayRequestCaptured = false
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
 
         let torSender: OHTTPTransport.HTTPSender = { request in
             if request.httpMethod == "GET" {
                 keyConfigRequestCaptured = true
-                let response = HTTPURLResponse(
-                    url: request.url!,
-                    statusCode: 200,
-                    httpVersion: nil,
-                    headerFields: ["Content-Type": "application/json"]
-                )!
-                return (validSignedConfig, response)
+                return (
+                    OHTTPTestSupport.stubEnvelope,
+                    OHTTPTestSupport.response(for: request.url, status: 200, headers: ["Content-Type": "application/json"])
+                )
             } else {
                 relayRequestCaptured = true
                 throw OHTTPError.transportError("test abort after relay POST")
             }
         }
 
-        let transport = OHTTPTransport(
-            network: "testnet",
+        let transport = OHTTPTestSupport.makeTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: torSender
+            sender: torSender
         )
 
         do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
             XCTFail("Should have thrown")
         } catch {
             // Expected
@@ -842,7 +330,7 @@ final class OHTTPTests: XCTestCase {
         // it works as expected for clearnet. We can't easily test the actual URLSession call
         // without mocking URLSession, so this is more of a smoke test that the default path compiles.
         let transport = OHTTPTransport(
-            network: "testnet",
+            gatewayHost: "ohttp-gateway-testnet.example",
             relayURL: "https://operator-relay.example.invalid/relay",
             keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs"
         )
@@ -903,35 +391,17 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNil(capturedNewRequest, "Delegate should refuse redirects by returning nil")
     }
 
+
     func testNonHTTPSRelayURLFails() async throws {
         // Verify that a non-https relay URL throws at request time (not init).
-        let validKeyConfig = makeValidKeyConfig()
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (validKeyConfig, response)
+        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request in
+            (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
         }
 
-        // Init succeeds with http:// relay (validation is lazy)
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "http://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
-            httpSender: mockSender
-        )
-
-        // First call (roundTrip → relay POST) throws with https requirement
+        // First call (roundTrip, which first derives the signed-config URL from the relay) throws with the
+        // https requirement
         do {
-            _ = try await transport.roundTrip(
-                request: BinaryHTTP.Request(
-                    method: "GET",
-                    scheme: "https",
-                    authority: "example.zodl.com",
-                    path: "/test",
-                    headers: [],
-                    body: Data()
-                ),
-                timeoutMS: 5000
-            )
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
             XCTFail("Should have thrown for http relay URL")
         } catch let error as OHTTPError {
             if case .transportError(let message) = error {
@@ -943,29 +413,11 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testNonHTTPSKeyConfigURLFails() async throws {
-        // Verify that a non-https relay URL causes derived signed-config URL validation to fail
-        let (signingKey, testKeyId, testPublicKeyHex) = makeTestKeyParams()
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700020000
-        let testNow = Date(timeIntervalSince1970: 1700010000)
-        let validSignedConfig = try makeSignedEnvelope(network: "testnet", notBefore: notBefore, notAfter: notAfter, signingKey: signingKey)
-
-        let mockSender: OHTTPTransport.HTTPSender = { request in
-            // Stub that would return valid envelope if called (but shouldn't be for http://)
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
-            return (validSignedConfig, response)
+        var senderCalls = 0
+        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request in
+            senderCalls += 1
+            return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
         }
-
-        // Init succeeds with http:// relay (validation is lazy)
-        let transport = OHTTPTransport(
-            network: "testnet",
-            relayURL: "http://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://gateway.zodl.com/ohttp-configs",
-            testNow: testNow,
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex,
-            httpSender: mockSender
-        )
 
         // First call (keyConfig → derived URL validation) throws before any GET or decoding
         do {
@@ -978,81 +430,31 @@ final class OHTTPTests: XCTestCase {
                 XCTFail("Wrong error type")
             }
         }
+        XCTAssertEqual(senderCalls, 0, "No request may be sent for a non-https URL")
     }
-}
 
-    // MARK: - Self-Signed Envelope Verification
+    func testKeyConfigurationRejectedByTheCoreFailsClosed() async throws {
+        // No test verifier: the native core checks the envelope against the pinned key, and refuses a body
+        // that is not a signed envelope.
+        let transport = OHTTPTransport(
+            gatewayHost: "ohttp-gateway-testnet.example",
+            relayURL: "https://testnet-operator-relay.example.invalid/relay",
+            keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs"
+        ) { request in
+            if request.httpMethod == "GET" {
+                return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+            XCTFail("Nothing may be posted without a verified key")
+            throw OHTTPError.transportError("unexpected post")
+        }
 
-    func testSignedEnvelopeVerifierAcceptsSelfSignedEnvelope() throws {
-        // Generate a fresh Ed25519 key pair for testing
-        let signingKey = Curve25519.Signing.PrivateKey()
-        let publicKeyData = signingKey.publicKey.rawRepresentation
-        
-        // Compute key ID (first 8 hex chars of SHA-256(public key))
-        var hasher = SHA256()
-        hasher.update(data: publicKeyData)
-        let hash = hasher.finalize()
-        let keyId = Data(hash.prefix(4)).map { String(format: "%02x", $0) }.joined()
-        
-        // Build a valid 43-byte OHTTP key config
-        // Format: [length: u16] [keyId: u8] [kem_id: u16] [public_key: 32 bytes] [suites_length: u16] [kdf_id: u16] [aead_id: u16]
-        var configBytes = Data()
-        configBytes.append(contentsOf: [0x00, 0x29])  // length = 41 bytes
-        configBytes.append(0x01)  // key_id
-        configBytes.append(contentsOf: [0x00, 0x20])  // kem_id = 0x0020 (X25519)
-        // Generate a random X25519 public key for the config
-        let x25519Key = Curve25519.KeyAgreement.PrivateKey()
-        configBytes.append(x25519Key.publicKey.rawRepresentation)
-        configBytes.append(contentsOf: [0x00, 0x04])  // suites_length = 4 bytes
-        configBytes.append(contentsOf: [0x00, 0x01])  // kdf_id = 0x0001 (HKDF-SHA256)
-        configBytes.append(contentsOf: [0x00, 0x01])  // aead_id = 0x0001 (AES-128-GCM)
-        
-        XCTAssertEqual(configBytes.count, 43, "Config must be 43 bytes")
-        
-        // Build signed message: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 || notBefore || notAfter || configs
-        let network = "testnet"
-        let notBefore: Int64 = 1700000000
-        let notAfter: Int64 = 1700010000
-        
-        var message = Data()
-        message.append("zodl-ohttp-configs-v1".data(using: .ascii)!)
-        message.append(0x00)
-        message.append(network.data(using: .ascii)!)
-        message.append(0x00)
-        message.append(contentsOf: withUnsafeBytes(of: notBefore.bigEndian) { Data($0) })
-        message.append(contentsOf: withUnsafeBytes(of: notAfter.bigEndian) { Data($0) })
-        message.append(configBytes)
-        
-        // Sign the message
-        let signature = try signingKey.signature(for: message)
-        
-        // Build JSON envelope
-        let envelope = SignedOHTTPConfigEnvelope(
-            version: 1,
-            network: network,
-            configs: configBytes.base64EncodedString(),
-            notBefore: notBefore,
-            notAfter: notAfter,
-            keyId: keyId,
-            signature: Data(signature).base64EncodedString()
-        )
-        
-        let jsonData = try JSONEncoder().encode(envelope)
-        
-        // Verify with injected test key
-        let publicKeyHex = publicKeyData.map { String(format: "%02x", $0) }.joined()
-        let testNow = Date(timeIntervalSince1970: 1700005000)  // midpoint of validity window
-        
         do {
-            let verified = try OHTTPSignedConfigVerifier.verifyAndParse(
-                jsonData: jsonData,
-                network: network,
-                now: testNow,
-                testKeyId: keyId,
-                testPublicKeyHex: publicKeyHex
-            )
-            XCTAssertNotNil(verified.keyConfig)
-        } catch {
-            XCTFail("Self-signed envelope verification failed: \(error)")
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+            XCTFail("Should have thrown")
+        } catch let error as OHTTPError {
+            guard case .keyConfigError = error else {
+                return XCTFail("Expected keyConfigError, got \(error)")
+            }
         }
     }
+}

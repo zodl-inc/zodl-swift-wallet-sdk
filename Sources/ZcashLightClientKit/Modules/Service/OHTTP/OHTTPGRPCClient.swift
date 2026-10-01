@@ -50,7 +50,7 @@ actor OHTTPGRPCClient {
             ("grpc-timeout", "\(timeoutMS)m")
         ]
 
-        let bhttpRequest = BinaryHTTP.Request(
+        let bhttpRequest = OHTTPRequest(
             method: "POST",
             scheme: "https",
             authority: authority,
@@ -84,7 +84,7 @@ actor OHTTPGRPCClient {
             ("grpc-timeout", "\(timeoutMS)m")
         ]
 
-        let bhttpRequest = BinaryHTTP.Request(
+        let bhttpRequest = OHTTPRequest(
             method: "POST",
             scheme: "https",
             authority: authority,
@@ -112,7 +112,7 @@ actor OHTTPGRPCClient {
         return data
     }
 
-    private func parseUnaryResponse<T: SwiftProtobuf.Message>(_ response: BinaryHTTP.Response) throws -> T {
+    private func parseUnaryResponse<T: SwiftProtobuf.Message>(_ response: OHTTPResponse) throws -> T {
         try checkGRPCStatus(response)
 
         guard response.body.count >= Self.frameHeaderSize else {
@@ -127,7 +127,7 @@ actor OHTTPGRPCClient {
         return message
     }
 
-    private func parseStreamingResponse<T: SwiftProtobuf.Message>(_ response: BinaryHTTP.Response) throws -> [T] {
+    private func parseStreamingResponse<T: SwiftProtobuf.Message>(_ response: OHTTPResponse) throws -> [T] {
         try checkGRPCStatus(response)
 
         if response.body.isEmpty {
@@ -137,7 +137,7 @@ actor OHTTPGRPCClient {
         return try parseGRPCFrames(response.body)
     }
 
-    private func checkGRPCStatus(_ response: BinaryHTTP.Response) throws {
+    private func checkGRPCStatus(_ response: OHTTPResponse) throws {
         guard response.status == Self.httpOK else {
             let grpcStatus = httpStatusToGRPCCode(response.status)
             throw LightWalletServiceError.failed(

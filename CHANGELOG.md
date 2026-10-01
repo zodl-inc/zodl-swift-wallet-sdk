@@ -6,6 +6,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- The OHTTP transport (`httpRequestOverOHTTP(for:viaTor:)`, the OHTTP-routed lightwalletd calls and the
+  coinholder-voting OHTTP route) now runs its protocol on the Rust `zodl-ohttp-client` core shared with the
+  Android and Slipstream clients. No public signature changes. Behavior that a wallet can observe:
+  - An outer 400 or 422 from the relay or gateway always refetches the signed key configuration and retries the
+    request once, sealed afresh, whatever the response body says. A 422 used to be retried only when its body
+    contained `ohttp-key`. A second 400 or 422 is final.
+  - The signed key-configuration envelope may carry fields this SDK does not know (they are ignored; any field
+    repeated more than once is refused), and its `configs` and `sig` must be canonical base64: missing
+    padding, non-zero trailing bits and embedded whitespace, which Foundation's `Data(base64Encoded:)`
+    accepts in some forms, are refused.
+  - Sizes are capped: a signed key configuration at 64 KiB, a sealed request at 10 MiB (the gateway's limit; a larger
+    request fails before anything is sent) and a sealed response at 256 MiB plus 64 KiB. None was capped before.
+  - Request text that cannot be encoded (a method, scheme, authority, path or header name outside ASCII, a
+    header value outside ISO-8859-1) now throws instead of crashing the process.
+  - Building the Rust library from source requires read access to the private `zodl-inc/ohttp` repository
+    (a git dependency, like `slipstream-core`).
+
 # 5.0.0 - 2026-09-23
 
 ## Added

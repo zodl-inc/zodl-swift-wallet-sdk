@@ -2822,12 +2822,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
             // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
-            // OHTTPTransport.roundTrip seals the request once, creating ciphertext with a random nonce.
-            // If Tor retries (retryLimit > 0), the SAME ciphertext gets re-sent multiple times, violating
+            // OHTTPTransport seals every attempt afresh, each with its own ephemeral key and nonce.
+            // If Tor retried (retryLimit > 0), the SAME ciphertext would be re-sent, violating
             // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
             // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
-            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400), which is safe because it
-            // re-encapsulates (new nonce, new ciphertext).
+            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
+            // it re-encapsulates (new nonce, new ciphertext).
             httpSender = { [weak self] request in
                 guard let self else { throw ZcashError.ohttpTransportError }
                 return try await self.httpRequestOverTor(for: request, retryLimit: 0)
@@ -2842,8 +2842,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             }
         }
 
-        let network = OHTTPEndpoints.network(for: host)
-        let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
+        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
         let scheme = request.url?.scheme ?? "https"
         // Use percent-encoded path to preserve special characters
         let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
@@ -2860,7 +2859,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             }
         }
 
-        let bhttp = BinaryHTTP.Request(
+        let bhttp = OHTTPRequest(
             method: request.httpMethod ?? "GET",
             scheme: scheme,
             authority: host,

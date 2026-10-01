@@ -2,8 +2,10 @@
 //  OHTTPTransport.swift
 //  ZcashLightClientKit
 //
-//  OHTTP (RFC 9458) client transport: encapsulates a Binary HTTP request with HPKE, POSTs it to the
-//  relay and decapsulates the gateway's response.
+//  OHTTP (RFC 9458) client transport: seals a request to the gateway's key, POSTs it to the relay and opens
+//  the gateway's response. The protocol — key selection, the signed key-configuration envelope, Binary HTTP,
+//  HPKE and the rules on the relay's answer — is the shared Rust core's (see `OHTTPNative`); this actor owns
+//  the I/O, the key cache and the retry loop.
 //
 
 import Foundation
@@ -31,6 +33,10 @@ actor OHTTPTransport {
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
     typealias HTTPSender = (URLRequest) async throws -> (Data, HTTPURLResponse)
 
+    /// Test-only replacement for the native verification of the signed key configuration: the pinned
+    /// signing keys have no private half to sign a test envelope with.
+    typealias KeyVerifier = (_ envelope: Data, _ now: Date) throws -> OHTTPVerifiedKey
+
     /// Dedicated session for the OHTTP hops. Ephemeral + no cookies + no cache so that nothing a relay
     /// or gateway returns (e.g. Set-Cookie) can be stored and replayed, which would link a wallet's
     /// requests across IPs / Tor circuits. Delegate refuses redirects (3xx responses surface as errors
@@ -52,11 +58,14 @@ actor OHTTPTransport {
         session.configuration
     }
 
+    /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
+    /// signed key configuration is checked against.
+    private let gatewayHost: String
     private let relayURL: String
     private let keyConfigURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
-    private var cachedKeyConfig: OHTTPKeyConfig?
+    private var cachedKey: OHTTPVerifiedKey?
     private let httpSender: HTTPSender
     /// Optional client trace ID prefix. When set, every outer OHTTP POST to the relay carries
     /// `X-Client-Trace-Id: <prefix>-<uuid>` so a tester can tag and follow requests end-to-end in
@@ -66,33 +75,22 @@ actor OHTTPTransport {
     /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     private let clientTraceIdPrefix: String?
-    /// Network identifier for signed config verification ("mainnet" or "testnet").
-    private let network: String
-    /// Expiry time for the cached key configuration.
-    private var cachedExpiry: Date?
     /// Test-only: fixed clock for signature verification (bypasses Date()).
     private let testNow: Date?
-    /// Test-only: expected key ID for test vectors (bypasses production keys).
-    private let testKeyId: String?
-    /// Test-only: public key hex for test vectors (bypasses production keys).
-    private let testPublicKeyHex: String?
+    /// Test-only: verifies the key configuration instead of the native code.
+    private let testKeyVerifier: KeyVerifier?
 
-    private static let requestMediaType = "message/ohttp-req"
-    private static let responseMediaType = "message/ohttp-res"
-    private static let keysMediaType = "application/ohttp-keys"
-    private static let requestLabel = "message/bhttp request".data(using: .ascii)!
-    private static let responseLabel = "message/bhttp response".data(using: .ascii)!
+    private static let keyFetchSuccessStatus = 200
 
     init(
-        network: String,
+        gatewayHost: String,
         relayURL: String,
         keyConfigURL: String,
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
         testNow: Date? = nil,
-        testKeyId: String? = nil,
-        testPublicKeyHex: String? = nil,
+        testKeyVerifier: KeyVerifier? = nil,
         httpSender: @escaping HTTPSender = { request in
             let (data, response) = try await OHTTPTransport.session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -102,136 +100,111 @@ actor OHTTPTransport {
         }
     ) {
         // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
-        self.network = network
+        self.gatewayHost = gatewayHost
         self.relayURL = relayURL
         self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
         self.clientTraceIdPrefix = clientTraceIdPrefix
         self.testNow = testNow
-        self.testKeyId = testKeyId
-        self.testPublicKeyHex = testPublicKeyHex
+        self.testKeyVerifier = testKeyVerifier
         self.httpSender = httpSender
     }
 
-    /// Fetches (or returns the cached) gateway key configuration using signed envelope.
-    /// Derives the signed config URL from relayURL and verifies via the pure verifier.
-    func keyConfig(forceRefresh: Bool = false) async throws -> OHTTPKeyConfig {
-        // Check cache validity (both config and expiry must be present and not expired)
-        if !forceRefresh, let cached = cachedKeyConfig, let expiry = cachedExpiry, Date() < expiry {
+    /// Fetches (or returns the cached) gateway key using the signed envelope.
+    /// Derives the signed config URL from relayURL and verifies it in the shared core.
+    func keyConfig(forceRefresh: Bool = false) async throws -> OHTTPVerifiedKey {
+        let profile = try OHTTPNative.profileInfo()
+
+        // The cached key is used while the profile says it is fresh.
+        if !forceRefresh, let cached = cachedKey, profile.isFresh(cached, at: Date()) {
             return cached
         }
 
         // Derive signed config URL from relayURL (replace path suffix /relay with /ohttp-configs/signed)
-        var signedURL = relayURL
-        if signedURL.hasSuffix("/relay") {
-            signedURL.removeLast("/relay".count)
-            signedURL = "\(signedURL)/ohttp-configs/signed"
-        } else {
-            // Fallback: relay URL doesn't end with /relay (unexpected, but handle gracefully)
-            signedURL = "\(signedURL)/ohttp-configs/signed"
-        }
+        let signedURL = try OHTTPNative.signedConfigURL(relayURL: relayURL)
 
         // Validate the derived URL before any network call or decoding
         guard signedURL.lowercased().hasPrefix("https://") else {
             throw OHTTPError.transportError("OHTTP endpoints must use https: \(signedURL)")
         }
-        guard let signedURLObj = URL(string: signedURL), signedURLObj.host != nil, !(signedURLObj.host!.isEmpty) else {
+        guard let signedURLObj = URL(string: signedURL), let host = signedURLObj.host, !host.isEmpty else {
             throw OHTTPError.transportError("Invalid URL: \(signedURL)")
         }
 
         // Fetch JSON via hardened httpSender (not URLSession.shared)
-        let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS)
+        let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS, profile: profile)
 
-        // Verify and parse through pure verifier (fail-closed: any verification failure throws)
-        let verified = try OHTTPSignedConfigVerifier.verifyAndParse(
-            jsonData: jsonData,
-            network: network,
-            now: testNow ?? Date(),
-            testKeyId: testKeyId,
-            testPublicKeyHex: testPublicKeyHex
-        )
+        // Verify through the core (fail-closed: any verification failure throws)
+        let now = testNow ?? Date()
+        let verified: OHTTPVerifiedKey
+        if let testKeyVerifier {
+            verified = try testKeyVerifier(jsonData, now)
+        } else {
+            verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
+        }
 
-        // Cache both config and expiry
-        cachedKeyConfig = verified.keyConfig
-        cachedExpiry = verified.validUntil
-
-        return verified.keyConfig
+        cachedKey = verified
+        return verified
     }
 
-    /// Performs one OHTTP round trip. Gateway rejections (HTTP 400/422) are retried once after
-    /// refreshing the key configuration. 422 with ohttp-key problem type indicates signed config issues.
-    func roundTrip(request: BinaryHTTP.Request, timeoutMS: Int) async throws -> BinaryHTTP.Response {
-        var keyConfig = try await self.keyConfig()
-        var hasRetriedKeyRefresh = false
+    /// Performs one OHTTP round trip. When the relay or gateway answers 400 or 422 the key configuration is
+    /// fetched again and the request is sealed afresh and sent once more; a second 400 or 422 is final.
+    func roundTrip(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+        var key = try await self.keyConfig()
+        var attempt: UInt32 = 0
 
         while true {
-            do {
-                return try await roundTripWith(keyConfig: keyConfig, request: request, timeoutMS: timeoutMS)
-            } catch let error as OHTTPError {
-                // Check for key-related errors that warrant cache drop + retry
-                if case .httpStatusError(statusCode: let code, message: let msg) = error,
-                   (code == 400 || (code == 422 && msg.contains("ohttp-key"))),
-                   !hasRetriedKeyRefresh {
-                    // Drop cache and refetch signed config, then retry once
-                    cachedKeyConfig = nil
-                    cachedExpiry = nil
-                    keyConfig = try await self.keyConfig(forceRefresh: true)
-                    hasRetriedKeyRefresh = true
-                    continue
+            let completed = try await exchange(key: key, request: request, timeoutMS: timeoutMS, attempt: attempt)
+            switch completed {
+            case .response(let response):
+                return response
+
+            case .refetchKeyConfig:
+                guard attempt == 0 else {
+                    throw OHTTPError.transportError("OHTTP key configuration was refused twice")
                 }
-                throw error
+                // Discard the refused key before fetching the one that replaces it, so that a failed fetch
+                // leaves none to be used next.
+                if try OHTTPNative.profileInfo().dropBeforeRefetch {
+                    cachedKey = nil
+                }
+                key = try await self.keyConfig(forceRefresh: true)
+                attempt = 1
+
+            case .refused(let status, let detail):
+                let message = "Relay/gateway returned HTTP \(status)\(detail.isEmpty ? "" : ": \(detail)")"
+                throw OHTTPError.httpStatusError(statusCode: status, message: message)
+
+            case .wrongMediaType(let contentType):
+                throw OHTTPError.transportError("Relay/gateway answered \(contentType), not a sealed response")
             }
         }
     }
 
-    private func roundTripWith(
-        keyConfig: OHTTPKeyConfig,
-        request: BinaryHTTP.Request,
-        timeoutMS: Int
-    ) async throws -> BinaryHTTP.Response {
-        // RFC 9458 §4.3 — Encapsulation of Requests
-        let header = keyConfig.header()
-        let info = Self.requestLabel + Data([0x00]) + header
-        var context = try OHTTPHPKE.setupBaseS(recipientPublicKey: keyConfig.publicKey, info: info)
-        let plaintext = try BinaryHTTP.encodeRequest(request)
-        let ciphertext = try context.seal(aad: Data(), plaintext: plaintext)
-        let encapsulatedRequest = header + context.enc + ciphertext
+    /// One attempt: seals the request afresh, posts it and lets the core classify and open the answer.
+    private func exchange(
+        key: OHTTPVerifiedKey,
+        request: OHTTPRequest,
+        timeoutMS: Int,
+        attempt: UInt32
+    ) async throws -> OHTTPCompleted {
+        // The sealing is used for this post only. If the post fails, `sealed.pending` is released with it.
+        let sealed = try OHTTPNative.encapsulate(key: key, request: request)
 
-        let encapsulatedResponse = try await httpPost(
-            url: relayURL,
-            body: encapsulatedRequest,
-            timeoutMS: timeoutMS
+        let (data, httpResponse) = try await httpPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
+
+        return try sealed.pending.complete(
+            status: httpResponse.statusCode,
+            contentType: httpResponse.value(forHTTPHeaderField: "Content-Type"),
+            body: data,
+            attempt: attempt
         )
-
-        // RFC 9458 §4.4 — Encapsulation of Responses (client side: decapsulate)
-        let nonceLength = max(OHTTPHPKE.nN, OHTTPHPKE.nK)
-        guard encapsulatedResponse.count >= nonceLength + OHTTPHPKE.nT else {
-            throw OHTTPError.transportError("OHTTP response too short (\(encapsulatedResponse.count) bytes)")
-        }
-
-        let responseNonce = encapsulatedResponse.prefix(nonceLength)
-        let responseCiphertext = encapsulatedResponse.suffix(from: nonceLength)
-
-        let secret = try context.export(exporterContext: Self.responseLabel, length: OHTTPHPKE.nK)
-        let salt = context.enc + responseNonce
-        let prk = OHTTPHPKE.hkdfExtract(salt: salt, ikm: secret)
-        let aeadKey = try OHTTPHPKE.hkdfExpand(prk: prk, info: "key".data(using: .ascii)!, length: OHTTPHPKE.nK)
-        let aeadNonce = try OHTTPHPKE.hkdfExpand(prk: prk, info: "nonce".data(using: .ascii)!, length: OHTTPHPKE.nN)
-
-        let decrypted: Data
-        do {
-            decrypted = try OHTTPHPKE.aesGcmOpen(key: aeadKey, nonce: aeadNonce, aad: Data(), ciphertext: responseCiphertext)
-        } catch {
-            throw OHTTPError.transportError("OHTTP response authentication failed")
-        }
-
-        return try BinaryHTTP.decodeResponse(decrypted)
     }
 
     // MARK: - HTTP
 
-    private func httpGet(url: String, timeoutMS: Int) async throws -> Data {
+    private func httpGet(url: String, timeoutMS: Int, profile: OHTTPProfileInfo) async throws -> Data {
         // Validate https at request time to prevent downgrade attacks without crashing the app
         guard url.lowercased().hasPrefix("https://") else {
             throw OHTTPError.transportError("OHTTP endpoints must use https: \(url)")
@@ -243,23 +216,25 @@ actor OHTTPTransport {
 
         var request = URLRequest(url: urlObj, timeoutInterval: TimeInterval(timeoutMS) / 1000.0)
         request.httpMethod = "GET"
-        request.setValue(Self.keysMediaType, forHTTPHeaderField: "Accept")
+        for (name, value) in profile.keyFetchHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
 
-        if let prefix = clientTraceIdPrefix {
+        if profile.traceOnKeyFetch, let prefix = clientTraceIdPrefix {
             let traceId = generateClientTraceId(prefix: prefix)
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
         let (data, httpResponse) = try await httpSender(request)
 
-        guard httpResponse.statusCode == 200 else {
+        guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
             throw OHTTPError.transportError("Key config fetch failed: HTTP \(httpResponse.statusCode)")
         }
 
         return data
     }
 
-    private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> Data {
+    private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> (Data, HTTPURLResponse) {
         // Validate https at request time to prevent downgrade attacks without crashing the app
         guard url.lowercased().hasPrefix("https://") else {
             throw OHTTPError.transportError("OHTTP endpoints must use https: \(url)")
@@ -269,27 +244,20 @@ actor OHTTPTransport {
             throw OHTTPError.transportError("Invalid URL: \(url)")
         }
 
+        let profile = try OHTTPNative.profileInfo()
         var request = URLRequest(url: urlObj, timeoutInterval: TimeInterval(timeoutMS) / 1000.0)
         request.httpMethod = "POST"
         request.httpBody = body
-        request.setValue(Self.requestMediaType, forHTTPHeaderField: "Content-Type")
-        request.setValue(Self.responseMediaType, forHTTPHeaderField: "Accept")
-        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        for (name, value) in profile.postHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
 
         if let prefix = clientTraceIdPrefix {
             let traceId = generateClientTraceId(prefix: prefix)
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
-        let (data, httpResponse) = try await httpSender(request)
-
-        guard httpResponse.statusCode == 200 else {
-            let detail = String(data: data.prefix(200), encoding: .utf8) ?? ""
-            let message = "Relay/gateway returned HTTP \(httpResponse.statusCode)\(detail.isEmpty ? "" : ": \(detail)")"
-            throw OHTTPError.httpStatusError(statusCode: httpResponse.statusCode, message: message)
-        }
-
-        return data
+        return try await httpSender(request)
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to

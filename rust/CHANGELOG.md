@@ -8,6 +8,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Oblivious HTTP (RFC 9458) exchange of the iOS client, on the shared `zodl-ohttp-client` core
+  (`ClientProfile::IOS`, profile `2`). Headers cross as one byte array (for each name and value a 4-byte
+  big-endian length and the bytes), text arguments as bytes, and every failure returns null with the
+  thread's last error set; the message does not quote the request.
+  - `zcashlc_ohttp_verify_key_config(profile, host, host_len, json, json_len, now_secs)` checks a signed
+    key-configuration envelope for a gateway host against the pinned signing key of the host's network and
+    returns the gateway key as an `OhttpKey` (33 public bytes, `not_after`, network), freed with
+    `zcashlc_free_ohttp_key`.
+  - `zcashlc_ohttp_encapsulate(profile, key, method, scheme, authority, path, headers, body)` encodes a
+    request as Binary HTTP and seals it to the key, with a fresh ephemeral key: call it again for every attempt,
+    a retry included. It returns an `OhttpSealed` (the body to post and an opaque `OhttpOpener`), freed with
+    `zcashlc_free_ohttp_sealed`, which also frees an `opener` that is still set. A caller that takes the
+    opener out sets the field to null first.
+  - `zcashlc_ohttp_complete(profile, opener, outer_status, content_type, body, body_len, attempt)` classifies the
+    relay's answer and opens a sealed one. It takes the opener by value and consumes it in every case, errors
+    included. An `OhttpOutcome` says whether the response opened (`kind` 0), the key configuration must be
+    fetched again (1), the request was refused (2, with the outer status and the start of its body in `detail`)
+    or the success status was not labelled `message/ohttp-res` (3). Free it with `zcashlc_free_ohttp_outcome`.
+  - `zcashlc_ohttp_opener_free` releases an opener whose post failed before `zcashlc_ohttp_complete`.
+  - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
+    with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
+    key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
 - `zcashlc_tor_http_get_with_timeout` adds an HTTP GET entry point whose trailing positive
   `timeout_ms` bounds the complete Tor operation, including connection setup, retries, and response
   body collection. It otherwise accepts the same arguments and returns the same response as

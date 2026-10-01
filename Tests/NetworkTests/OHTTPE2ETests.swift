@@ -560,8 +560,7 @@ final class OHTTPE2ETests: ZcashTestCase {
             // OHTTP only (clearnet → relay → gateway)
             let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
             let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
-            let network = OHTTPEndpoints.network(for: proxyHost)
-            let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL)
+            let transport = OHTTPTransport(gatewayHost: proxyHost, relayURL: relayURL, keyConfigURL: keyConfigURL)
 
             // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
             let authority = (proxyHost.lowercased() != originalHost.lowercased()) ? proxyHost : originalHost
@@ -569,7 +568,7 @@ final class OHTTPE2ETests: ZcashTestCase {
             var comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)!
             let rawPath = comps.path.isEmpty ? "/" : comps.path
             let path = rawPath + (comps.query.map { "?\($0)" } ?? "")
-            let bhttp = BinaryHTTP.Request(
+            let bhttp = OHTTPRequest(
                 method: "GET",
                 scheme: "https",
                 authority: authority,

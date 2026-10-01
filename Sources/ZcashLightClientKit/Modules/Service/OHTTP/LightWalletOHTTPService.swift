@@ -140,12 +140,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
 
             // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
-            // OHTTPTransport.roundTrip seals the request once, creating ciphertext with a random nonce.
-            // If Tor retries (retryLimit > 0), the SAME ciphertext gets re-sent multiple times, violating
+            // OHTTPTransport seals every attempt afresh, each with its own ephemeral key and nonce.
+            // If Tor retried (retryLimit > 0), the SAME ciphertext would be re-sent, violating
             // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
             // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
-            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400), which is safe because it
-            // re-encapsulates (new nonce, new ciphertext).
+            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
+            // it re-encapsulates (new nonce, new ciphertext).
             httpSender = { request in
                 return try await torClient.httpRequest(for: request, retryLimit: 0)
             }
@@ -160,9 +160,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
         }
 
-        let network = OHTTPEndpoints.network(for: host)
         let transport = OHTTPTransport(
-            network: network,
+            gatewayHost: host,
             relayURL: relayURL,
             keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix,

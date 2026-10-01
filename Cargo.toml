@@ -131,6 +131,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 base64 = "0.22"
 hex = "0.4"
 
+# Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
+# key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
+# status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
+# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
+# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
+# fails loudly, a branch would follow a force-push.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "18ef6f31f81d8245ede04599f4bfbe3fb9bb7d9d", default-features = false }
+
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

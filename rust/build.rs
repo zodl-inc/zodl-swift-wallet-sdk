@@ -91,6 +91,13 @@ fn main() {
             "zcashlc_proving_interactive_begin",
             "zcashlc_proving_interactive_end",
             "zcashlc_proving_interactive_active",
+            // The OHTTP exchange the Swift transport is built on (`rust/src/ohttp.rs`).
+            "zcashlc_ohttp_verify_key_config",
+            "zcashlc_ohttp_encapsulate",
+            "zcashlc_ohttp_complete",
+            "zcashlc_ohttp_opener_free",
+            "zcashlc_ohttp_signed_config_url",
+            "zcashlc_ohttp_profile_info",
         ] {
             assert!(
                 header.contains(symbol),

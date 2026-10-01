@@ -1378,7 +1378,7 @@ public class SDKSynchronizer: Synchronizer {
             httpSender = { [weak self] request in
                 guard let self else { throw ZcashError.ohttpTransportError }
                 // C-08 fix: OHTTP ciphertext must not be retried (gateway replay cache returns 409).
-                // The OHTTP layer already retries on key rotation (HTTP 400). Tor transport retries
+                // The OHTTP layer already retries on key rotation (HTTP 400/422), sealing afresh. Tor transport retries
                 // would resend the same sealed ciphertext, violating the nonce-once invariant.
                 return try await self.httpRequestOverTor(for: request, retryLimit: 0)
             }
@@ -1392,8 +1392,7 @@ public class SDKSynchronizer: Synchronizer {
             }
         }
 
-        let network = OHTTPEndpoints.network(for: host)
-        let transport = OHTTPTransport(network: network, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
+        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
 
         let scheme = request.url?.scheme ?? "https"
         // Use percent-encoded path to preserve special characters
@@ -1413,7 +1412,7 @@ public class SDKSynchronizer: Synchronizer {
 
         let body = request.httpBody ?? Data()
 
-        let bhttpRequest = BinaryHTTP.Request(
+        let bhttpRequest = OHTTPRequest(
             method: request.httpMethod ?? "GET",
             scheme: scheme,
             authority: host,

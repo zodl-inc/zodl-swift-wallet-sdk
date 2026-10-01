@@ -168,7 +168,9 @@ public enum OHTTPEndpoints {
     }
 
     /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.
-    /// Testnet gateway hosts contain "-testnet"; all others default to mainnet.
+    /// Testnet gateway hosts contain "-testnet"; all others default to mainnet. `OHTTPTransport` does not
+    /// call this: the shared core applies the same rule to the gateway host when it verifies the signed
+    /// key configuration.
     public static func network(for gatewayHost: String) -> String {
         return gatewayHost.lowercased().contains("-testnet") ? "testnet" : "mainnet"
     }
