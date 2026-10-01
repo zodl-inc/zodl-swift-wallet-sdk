@@ -35,14 +35,11 @@ public enum OHTTPEndpoints {
     private static let relayByGatewayHost: [String: String] = [
         // LWD gateways
         "ohttp-gateway-testnet.example": "https://testnet-relay.example.invalid/relay",
-        // TODO(COR-1830): Switch to mainnet-relay.example.invalid/relay once Fastly prod
-        // serves /ohttp-configs (currently 501; only POST /relay works). Mainnet clients fetch signed
-        // key config via the relay.
-        "ohttp-gateway.example":         "https://simulator-relay.example.invalid/relay",
+        "ohttp-gateway.example":         "https://mainnet-relay.example.invalid/relay",
         // External API proxies — all through the mainnet relay→gateway
-        "cmc.zodl.com":    "https://simulator-relay.example.invalid/relay",  // CoinMarketCap price feed
-        "near.zodl.com":   "https://simulator-relay.example.invalid/relay",  // NEAR 1click intents API
-        "vote.zodl.com":   "https://simulator-relay.example.invalid/relay",  // Voting config / vote servers
+        "cmc.zodl.com":    "https://mainnet-relay.example.invalid/relay",  // CoinMarketCap price feed
+        "near.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // NEAR 1click intents API
+        "vote.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // Voting config / vote servers
     ]
 
     /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 12 vote
@@ -93,7 +90,7 @@ public enum OHTTPEndpoints {
         }
         if isProxyAllowlisted(host: gatewayHost) {
             // TODO(COR-1830): Switch to Fastly prod once it serves /ohttp-configs
-            return "https://simulator-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
+            return "https://mainnet-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
