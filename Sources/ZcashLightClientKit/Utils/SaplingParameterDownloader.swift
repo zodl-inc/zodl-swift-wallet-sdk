@@ -63,6 +63,7 @@ public enum SaplingParameterDownloader {
     ///     - spendURL: URL to check whether the parameter is already downloaded
     ///     - outputURL: URL to check whether the parameter is already downloaded
     ///     - torClientProvider: Closure that provides TorClient only when download is needed. If nil, uses direct HTTPS.
+    ///       Never consulted for `file://` sources: those are local copies and Tor cannot fetch them.
     /// - Throws:
     ///     - `saplingParamsDownload` if file downloading fails.
     ///     - `saplingParamsCantMoveDownloadedFile` if file is downloaded but moving to final destination fails.
@@ -107,7 +108,10 @@ public enum SaplingParameterDownloader {
             try isSpendParamsSHA1Valid(url: url)
             return url
         } else {
-            let torClient = await torClientProvider?()
+            var torClient: TorClient?
+            if !sourceURL.isFileURL {
+                torClient = await torClientProvider?()
+            }
             return try await downloadSpendParameter(url, sourceURL: sourceURL, logger: logger, torClient: torClient)
         }
     }
@@ -117,7 +121,10 @@ public enum SaplingParameterDownloader {
             try isOutputParamsSHA1Valid(url: url)
             return url
         } else {
-            let torClient = await torClientProvider?()
+            var torClient: TorClient?
+            if !sourceURL.isFileURL {
+                torClient = await torClientProvider?()
+            }
             return try await downloadOutputParameter(url, sourceURL: sourceURL, logger: logger, torClient: torClient)
         }
     }
