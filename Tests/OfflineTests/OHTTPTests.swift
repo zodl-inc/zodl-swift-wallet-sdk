@@ -255,33 +255,52 @@ final class OHTTPTests: XCTestCase {
 
     // MARK: - Proxy Allowlist Tests
 
-    func testProxyAllowlistLeadingDotSuffix() {
-        // Leading-dot suffix (.valargroup.org) matches subdomains only
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "prod.vote-chain-primary.valargroup.org"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "x.valargroup.org"))
-        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.org"))
-        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evilvalargroup.org"))
+    /// The gateway's exact vote + PIR host list (infra BACKENDS, mainnet).
+    private static let gatewayVoteAndPirHosts = [
+        "vote.zodl.com",
+        "prod.vote-chain-primary.valargroup.org",
+        "voting.valargroup.dev",
+        "ru.zcash.space",
+        "147-182-192-212.sslip.io",
+        "134-209-215-69.sslip.io",
+        "mnval01.zcash.legends.sh",
+        "zvote-1.stardust.rest",
+        "zvote.zodl.com",
+        "zvote.keplr.app",
+        "zvote.zfnd.org",
+        "v.ombie.cash",
+        "lb-pir-primary.valargroup.org",
+        "lb-pir-backup.valargroup.org",
+        "zpir-1.stardust.rest",
+    ]
+
+    func testProxyAllowlistIsExactlyTheGatewayHostList() {
+        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts, Set(Self.gatewayVoteAndPirHosts))
+        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts.count, 15)
+        for host in Self.gatewayVoteAndPirHosts {
+            XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: host), host)
+        }
     }
 
-    func testProxyAllowlistBareDomain() {
-        // Bare domain (chaindefuser.com) matches itself or any subdomain
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "chaindefuser.com"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "api.chaindefuser.com"))
+    func testProxyAllowlistHasNoSuffixMatching() {
+        // Subdomains and parents of listed domains are not listed hosts.
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "x.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evilvalargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "api.valargroup.dev"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.dev"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "pir.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evil.vote.zodl.com"))
+        // chaindefuser is reached only through the near.zodl.com alias, never as a passthrough host.
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "chaindefuser.com"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
         XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "evilchaindefuser.com"))
     }
 
     func testProxyAllowlistCaseInsensitive() {
         // Host matching is case-insensitive
         XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "PROD.VOTE-CHAIN-PRIMARY.VALARGROUP.ORG"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "ChainDefUser.Com"))
-    }
-
-    func testProxyAllowlistValarGroupDev() {
-        // .valargroup.dev suffix
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "voting.valargroup.dev"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "api.valargroup.dev"))
-        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "valargroup.dev"))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "LB-PIR-Primary.ValarGroup.Org"))
     }
 
     func testProxyAllowlistGatewayDetection() {
@@ -298,10 +317,10 @@ final class OHTTPTests: XCTestCase {
         XCTAssertFalse(OHTTPEndpoints.isGateway("1click.chaindefuser.com"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("voting.valargroup.dev"))
 
-        // But they ARE proxy-allowlisted:
+        // The exact vote/PIR hosts ARE proxy-allowlisted; chaindefuser only via the near alias:
         XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "prod.vote-chain-primary.valargroup.org"))
-        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
         XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "voting.valargroup.dev"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "1click.chaindefuser.com"))
     }
 
     func testProxyAllowlistProxyHostPassthrough() {

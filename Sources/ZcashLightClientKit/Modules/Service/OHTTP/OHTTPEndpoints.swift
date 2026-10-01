@@ -45,14 +45,21 @@ public enum OHTTPEndpoints {
         "vote.zodl.com":   "https://simulator-relay.example.invalid/relay",  // Voting config / vote servers
     ]
 
-    /// Proxy allowlist suffixes. Gateway v1.4.5+ proxies inner requests whose `:authority` ends
-    /// with one of these suffixes to `https://<authority>` — no hostname rewrite needed.
-    public static let proxyAllowedSuffixes = [".valargroup.org", ".valargroup.dev", "chaindefuser.com"]
-
-    /// Exact third-party vote servers the gateway maps host-bound (infra `ohttp-gateway`
-    /// BACKENDS/BACKEND_POLICIES). Exact match only: these domains also serve unrelated hosts.
-    /// Keep in sync with the gateway; a host missing here fails closed in the app.
+    /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 12 vote
+    /// servers and the 3 PIR endpoints, host-bound. Exact match only: the gateway removed suffix
+    /// routing, and several of these domains also serve unrelated hosts, so a suffix rule would
+    /// let the app send a request the gateway can only reject (or, worse, trust a lookalike).
+    ///
+    /// MUST equal the predefined vote/PIR hosts of the BACKENDS list and the Rust voting route's
+    /// `OHTTP_VOTE_HOSTS` (`rust/src/voting/route.rs`); a host missing here fails closed in the app.
+    /// The `cmc.zodl.com` and `near.zodl.com` aliases are not listed: they are gateways
+    /// (`relayByGatewayHost`) that carry gateway-injected credentials, reached through
+    /// `proxyHostMapping`.
     public static let proxyAllowedHosts: Set<String> = [
+        // Vote servers
+        "vote.zodl.com",
+        "prod.vote-chain-primary.valargroup.org",
+        "voting.valargroup.dev",
         "ru.zcash.space",
         "147-182-192-212.sslip.io",
         "134-209-215-69.sslip.io",
@@ -62,35 +69,20 @@ public enum OHTTPEndpoints {
         "zvote.keplr.app",
         "zvote.zfnd.org",
         "v.ombie.cash",
+        // PIR endpoints (delegation)
+        "lb-pir-primary.valargroup.org",
+        "lb-pir-backup.valargroup.org",
+        "zpir-1.stardust.rest",
     ]
 
-    /// Returns true if the host is allowlisted for passthrough OHTTP proxying.
-    /// Suffix rule: leading-dot suffix (`.valargroup.org`) matches `x.valargroup.org` but NOT `valargroup.org`.
-    /// Bare domain (`chaindefuser.com`) matches itself or `*.chaindefuser.com`.
+    /// Returns true if the host is allowlisted for passthrough OHTTP proxying: an exact,
+    /// case-insensitive match against `proxyAllowedHosts`. No suffix matching.
     public static func isProxyAllowlisted(host: String) -> Bool {
-        let lower = host.lowercased()
-        if proxyAllowedHosts.contains(lower) {
-            return true
-        }
-        for suffix in proxyAllowedSuffixes {
-            if suffix.hasPrefix(".") {
-                // Leading-dot suffix: only matches subdomains
-                if lower.hasSuffix(suffix) && lower != suffix.dropFirst() {
-                    return true
-                }
-            } else {
-                // Bare domain: matches itself or any subdomain
-                if lower == suffix || lower.hasSuffix(".\(suffix)") {
-                    return true
-                }
-            }
-        }
-        return false
+        proxyAllowedHosts.contains(host.lowercased())
     }
 
     /// True only for hosts that have a configured relay (static mappings). Case-insensitive.
-    /// F-13 fix: exact host match only; suffix matching removed to prevent custom LWD hosts
-    /// with allowlisted suffixes from being incorrectly forced through OHTTP.
+    /// F-13 fix: exact host match only, so custom LWD hosts are never forced through OHTTP.
     public static func isGateway(_ host: String) -> Bool {
         return relayByGatewayHost[host.lowercased()] != nil
     }
@@ -123,7 +115,7 @@ public enum OHTTPEndpoints {
     /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
     /// For static mappings, returns the rewritten proxy host.
     /// Returns nil if the host has no configured proxy (caller should fall through to clearnet or Tor).
-    /// Static hostname mappings — checked BEFORE the suffix allowlist so that hosts with a gateway
+    /// Static hostname mappings — checked BEFORE the host allowlist so that hosts with a gateway
     /// alias (credential injection happens only for aliases) are never sent as their real name.
     static let proxyHostMapping: [String: String] = [
         "pro-api.coinmarketcap.com": "cmc.zodl.com",
