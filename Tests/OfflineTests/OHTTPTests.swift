@@ -24,7 +24,7 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(relay1, "https://testnet-relay.example.invalid/relay")
 
         let relay2 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway.example")
-        XCTAssertEqual(relay2, "https://simulator-relay.example.invalid/relay")
+        XCTAssertEqual(relay2, "https://mainnet-relay.example.invalid/relay")
 
         XCTAssertThrowsError(try OHTTPEndpoints.relayURL(for: "unknown.zodl.com"))
     }
@@ -36,19 +36,19 @@ final class OHTTPTests: XCTestCase {
 
     func testOHTTPEndpointsKeyConfigURLMainnet() {
         let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway.example")
-        XCTAssertEqual(url, "https://simulator-relay.example.invalid/ohttp-configs")
+        XCTAssertEqual(url, "https://mainnet-relay.example.invalid/ohttp-configs")
     }
 
     func testOHTTPEndpointsKeyConfigURLProxyHosts() {
         // Proxy hosts (static mappings and allowlisted) should use mainnet relay config
         let cmcURL = OHTTPEndpoints.keyConfigURL(for: "cmc.zodl.com")
-        XCTAssertEqual(cmcURL, "https://simulator-relay.example.invalid/ohttp-configs")
+        XCTAssertEqual(cmcURL, "https://mainnet-relay.example.invalid/ohttp-configs")
         
         let nearURL = OHTTPEndpoints.keyConfigURL(for: "near.zodl.com")
-        XCTAssertEqual(nearURL, "https://simulator-relay.example.invalid/ohttp-configs")
+        XCTAssertEqual(nearURL, "https://mainnet-relay.example.invalid/ohttp-configs")
         
         let voteURL = OHTTPEndpoints.keyConfigURL(for: "vote.zodl.com")
-        XCTAssertEqual(voteURL, "https://simulator-relay.example.invalid/ohttp-configs")
+        XCTAssertEqual(voteURL, "https://mainnet-relay.example.invalid/ohttp-configs")
     }
 
 

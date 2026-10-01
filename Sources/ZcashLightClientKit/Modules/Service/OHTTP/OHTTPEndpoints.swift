@@ -89,7 +89,6 @@ public enum OHTTPEndpoints {
             return relay
         }
         if isProxyAllowlisted(host: gatewayHost) {
-            // TODO(COR-1830): Switch to Fastly prod once it serves /ohttp-configs
             return "https://mainnet-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
