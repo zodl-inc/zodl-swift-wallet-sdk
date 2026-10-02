@@ -28,10 +28,8 @@ use zcash_voting::{
     RouteResponse,
 };
 use zodl_ohttp_client::{
-    Client as OhttpClient, KeyConfigSource, Request as OhttpRequest,
-    outer::{GATEWAY_MAX_SEALED_RESPONSE_BYTES, SignedConfigUrlRule},
-    signed::Network,
-    signed_config_url,
+    Client as OhttpClient, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfigSource, Network,
+    Request as OhttpRequest, SignedConfigUrlRule, signed_config_url,
 };
 
 use super::errors::invalid_input;
