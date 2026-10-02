@@ -1809,17 +1809,12 @@ mod recovery_hold_tests {
 /// Set the default OHTTP client trace prefix (process-wide). This should be called before any
 /// OHTTP connections are made, typically during SDK initialization. Pass NULL to disable tracing.
 ///
+/// Swift-native OHTTP (OHTTPTransport) now handles trace prefixes directly; this FFI is a no-op.
+///
 /// # Safety
 ///
 /// - `prefix` must be NULL or a valid UTF-8 C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(prefix: *const c_char) {
-    let prefix_opt = if prefix.is_null() {
-        None
-    } else {
-        let c_str = unsafe { std::ffi::CStr::from_ptr(prefix) };
-        c_str.to_str().ok().map(|s| s.to_string())
-    };
-
-    slipstream_core::ohttp::set_default_client_trace_prefix(prefix_opt);
+pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(_prefix: *const c_char) {
+    // No-op: trace prefix handling moved to Swift layer
 }

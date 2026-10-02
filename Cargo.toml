@@ -121,23 +121,24 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # home since the personal-fork era (the old PR #6 adaptations are merged
 # there). Return to a release tag once one is cut with these aboard.
 #
-# The source rides [patch.crates-io] below: a git dependency on the
-# slipstream-internal `feature/ohttp-connector` branch, with Cargo.lock pinning
-# the exact commit so a build only moves when the lock is updated on purpose.
-# The engine rides the same librustzcash rev as this package, so the graph
-# stays a single family instance.
-slipstream-core = { version = "0.3.0-alpha.1", package = "zodl-slipstream" }
+# The rev rides [patch.crates-io] below, pinned to a COMMIT HASH rather than a
+# branch: a branch pin silently follows a force-push, so a build can pick up
+# code nobody reviewed, whereas a stale hash fails loudly. The engine rides the
+# same librustzcash rev as this package, so the graph stays a single family
+# instance.
+slipstream-core = { version = "0.2", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
 
-# Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
+# Shared OHTTP (RFC 9458) client core: the Android, iOS, and Rust clients run the same
 # key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
-# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
-# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "addee9ef9384a8ab6a3148414638c856a873644c", default-features = false }
+# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs a read token
+# (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
+# fails loudly, a branch would follow a force-push. The `client` feature enables reqwest for
+# direct HTTP usage in Rust voting routes.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "addee9ef9384a8ab6a3148414638c856a873644c", features = ["client"] }
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
@@ -167,12 +168,6 @@ crate-type = ["staticlib"]
 lto = true
 
 [patch.crates-io]
-# The slipstream engine's OHTTP transport lives in slipstream-internal until upstreamed to
-# the public repo and published. Git dependency pinned to feature/ohttp-connector c55bd862
-# (relay_for delegation + zodl-ohttp-client addee9ef).
-# Once 0.3.0 is published to crates.io, revert to a version pin.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "62f1799fbdec638a387828604612257826b15e22" }
-
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
 # build can pick up code nobody reviewed, whereas a stale hash fails loudly. Keep it in step with

@@ -1,6 +1,6 @@
 //! Tor support
 //!
-//! Lightwalletd endpoints whose host is an OHTTP gateway (`slipstream_core::ohttp::relay_for`)
+//! Lightwalletd endpoints whose host is an OHTTP gateway (`zodl_ohttp_client::relay_for`)
 //! are NOT dialled directly over Tor (the gateway refuses plain gRPC): this module routes them
 //! through the engine's OHTTP-over-Tor connector, so every RPC is HPKE-encapsulated to the
 //! gateway and the relay leg is an arti stream (the relay sees a Tor exit, the gateway sees the
@@ -75,7 +75,7 @@ impl TorRuntime {
     fn is_ohttp_gateway(endpoint: &Uri) -> bool {
         endpoint
             .host()
-            .is_some_and(|h| slipstream_core::ohttp::relay_for(h).is_some())
+            .is_some_and(|h| zodl_ohttp_client::relay_for(h).is_some())
     }
 
     /// The engine `TorConn` for OHTTP-over-Tor, bootstrapping it on this runtime on first use.
