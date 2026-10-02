@@ -28,8 +28,10 @@ use zcash_voting::{
     RouteResponse,
 };
 use zodl_ohttp_client::{
-    Client as OhttpClient, KeyConfigSource, Request as OhttpRequest, signed_config_url,
-    MAINNET_SIGNING_KEY_HEX,
+    Client as OhttpClient, KeyConfigSource, Request as OhttpRequest,
+    outer::{GATEWAY_MAX_SEALED_RESPONSE_BYTES, SignedConfigUrlRule},
+    signed::Network,
+    signed_config_url,
 };
 
 use super::errors::invalid_input;
@@ -73,8 +75,8 @@ const OHTTP_VOTE_HOSTS: &[&str] = &[
     "zpir-1.stardust.rest",
 ];
 
-/// 64 MiB response cap (matches the gateway's MAX_UPSTREAM_RESPONSE_BYTES default).
-const MAX_OHTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Response cap from zodl-ohttp-client: gateway's 256 MiB upstream limit + 64 KiB framing overhead.
+const MAX_OHTTP_RESPONSE_BYTES: usize = GATEWAY_MAX_SEALED_RESPONSE_BYTES;
 
 /// The request executor a voting session routes its traffic through.
 ///
@@ -453,11 +455,10 @@ impl OhttpRoute {
             .to_string();
 
         // Use signed key configuration with mainnet signing key
-        let signer = MAINNET_SIGNING_KEY_HEX
-            .parse()
-            .map_err(|e| RouteError::before_dispatch(format!("invalid signing key: {e}")))?;
+        let signer = Network::Mainnet.pinned_signing_key();
 
-        let key_config_url = signed_config_url(&format!("https://{gateway_host}"));
+        let key_config_url = signed_config_url(&relay_url, SignedConfigUrlRule::ReplaceRelaySuffix)
+            .map_err(|e| RouteError::before_dispatch(format!("key config URL: {e}")))?;
         let key_source = KeyConfigSource::Signed {
             url: key_config_url,
             network: "mainnet".to_string(),
@@ -503,21 +504,19 @@ impl RouteHttp for OhttpRoute {
                 .ok_or_else(|| RouteError::before_dispatch("URL missing authority"))?
                 .as_str();
 
-            let path_and_query = uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/");
+            let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-            // Build the OHTTP request
-            let mut ohttp_req = OhttpRequest::new(request.method.as_str(), authority, path_and_query);
+            // Build the OHTTP request (builder methods consume self, so chain them)
+            let mut ohttp_req =
+                OhttpRequest::new(request.method.as_str(), authority, path_and_query);
 
             // Add headers
             for (name, value) in request.headers {
-                ohttp_req.header(name, value);
+                ohttp_req = ohttp_req.header(name, value);
             }
 
             // Set body
-            ohttp_req.body(request.body);
+            let ohttp_req = ohttp_req.body(request.body);
 
             // The client fetches the key config and sends in one call, so
             // nothing more precise than "about to start" exists: everything

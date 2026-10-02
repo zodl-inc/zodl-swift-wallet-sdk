@@ -1,22 +1,12 @@
 //! Tor support
-//!
-//! Lightwalletd endpoints whose host is an OHTTP gateway (`zodl_ohttp_client::relay_for`)
-//! are NOT dialled directly over Tor (the gateway refuses plain gRPC): this module routes them
-//! through the engine's OHTTP-over-Tor connector, so every RPC is HPKE-encapsulated to the
-//! gateway and the relay leg is an arti stream (the relay sees a Tor exit, the gateway sees the
-//! relay).
 
 pub(crate) mod http;
 
-use std::convert::TryInto;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 use anyhow::anyhow;
 use tonic::transport::{Channel, Uri};
 use tor_rtcompat::{PreferredRuntime, ToplevelBlockOn};
-
-use slipstream_core::{Endpoint as EngineEndpoint, connector::TorConn};
 
 use transparent::{
     address::{Script, TransparentAddress},
@@ -38,17 +28,9 @@ use zcash_script::script;
 
 use crate::ffi;
 
-/// Second arti client used ONLY for OHTTP-gateway endpoints, bootstrapped lazily on first use
-/// from the same `tor_dir` (it runs read-only on arti's state lock, which the primary
-/// `zcash_client_backend` client holds — acceptable: it still caches its own directory).
-/// Shared (Arc) across `isolated_client()` handles so it is bootstrapped at most once.
-type SharedOhttpTor = Arc<Mutex<Option<TorConn>>>;
-
 pub struct TorRuntime {
     runtime: PreferredRuntime,
     client: Client,
-    tor_dir: PathBuf,
-    ohttp_tor: SharedOhttpTor,
 }
 
 impl TorRuntime {
@@ -63,63 +45,7 @@ impl TorRuntime {
             })
             .await
         })?;
-        Ok(Self {
-            runtime,
-            client,
-            tor_dir: tor_dir.to_path_buf(),
-            ohttp_tor: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    /// True when `endpoint` is an OHTTP gateway that must never be dialled directly.
-    fn is_ohttp_gateway(endpoint: &Uri) -> bool {
-        endpoint
-            .host()
-            .is_some_and(|h| zodl_ohttp_client::relay_for(h).is_some())
-    }
-
-    /// The engine `TorConn` for OHTTP-over-Tor, bootstrapping it on this runtime on first use.
-    fn ohttp_tor_conn(&self) -> anyhow::Result<TorConn> {
-        let mut slot = self
-            .ohttp_tor
-            .lock()
-            .map_err(|_| anyhow!("OHTTP Tor client lock poisoned"))?;
-        if let Some(t) = slot.as_ref() {
-            return Ok(t.clone());
-        }
-        tracing::info!("bootstrapping arti client for OHTTP-over-Tor (FFI Tor runtime)");
-        let tor_dir = self.tor_dir.clone();
-        let conn = self
-            .runtime
-            .block_on(async { TorConn::bootstrap(&tor_dir, true, None).await })
-            .map_err(|e| anyhow!("OHTTP-over-Tor bootstrap: {e}"))?;
-        *slot = Some(conn.clone());
-        Ok(conn)
-    }
-
-    /// OHTTP gateway endpoint: HPKE-encapsulated RPCs whose relay leg is an isolated Tor stream.
-    fn connect_ohttp_over_tor(&self, endpoint: &Uri) -> anyhow::Result<LwdConn> {
-        let host = endpoint
-            .host()
-            .ok_or_else(|| anyhow!("lightwalletd endpoint without host"))?
-            .to_string();
-        let tls = endpoint.scheme_str() != Some("http");
-        let ep = EngineEndpoint {
-            host,
-            port: endpoint.port_u16().unwrap_or(if tls { 443 } else { 80 }),
-            tls,
-        };
-        let tor = self.ohttp_tor_conn()?;
-        tracing::info!(gateway = %ep.host, "FFI Tor client: connecting via OHTTP over Tor");
-        let conn = self
-            .runtime
-            .block_on(async { tor.connect_isolated(&ep).await })
-            .map_err(|e| anyhow!("OHTTP-over-Tor connect: {e}"))?;
-        Ok(LwdConn {
-            runtime: self.runtime.clone(),
-            _client: TorHandle::Engine(tor),
-            conn,
-        })
+        Ok(Self { runtime, client })
     }
 
     pub(crate) fn runtime(&self) -> &PreferredRuntime {
@@ -146,8 +72,6 @@ impl TorRuntime {
         Self {
             runtime: self.runtime.clone(),
             client: self.client.isolated_client(),
-            tor_dir: self.tor_dir.clone(),
-            ohttp_tor: Arc::clone(&self.ohttp_tor),
         }
     }
 
@@ -169,15 +93,7 @@ impl TorRuntime {
     ///
     /// Each connection returned by this method is isolated from any other Tor usage.
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
-        // OHTTP gateways refuse plain gRPC (426) and must not learn the client IP anyway: route
-        // them through the engine's OHTTP-over-Tor connector instead of a direct Tor stream.
-        if Self::is_ohttp_gateway(&endpoint) {
-            return self.connect_ohttp_over_tor(&endpoint);
-        }
-
-        let Self {
-            runtime, client, ..
-        } = self.isolated_client();
+        let Self { runtime, client } = self.isolated_client();
 
         let allow_onion_services = false;
         let conn = runtime.block_on(async {
@@ -188,22 +104,15 @@ impl TorRuntime {
 
         Ok(LwdConn {
             runtime,
-            _client: TorHandle::Zcash(client),
+            _client: client,
             conn,
         })
     }
 }
 
-/// Keeps the Tor client behind a connection alive for as long as the connection is.
-#[allow(dead_code)]
-enum TorHandle {
-    Zcash(Client),
-    Engine(TorConn),
-}
-
 pub struct LwdConn {
     conn: CompactTxStreamerClient<Channel>,
-    _client: TorHandle,
+    _client: Client,
     runtime: PreferredRuntime,
 }
 

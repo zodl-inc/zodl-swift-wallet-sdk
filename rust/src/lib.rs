@@ -6167,7 +6167,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_restore_anchor(
         let anchor = runtime.block_on(async {
             let tor_conn = match &tor_dir_opt {
                 Some(dir) => {
-                    match slipstream_core::connector::TorConn::bootstrap(dir, false, None).await {
+                    match slipstream_core::connector::TorConn::bootstrap(dir, false).await {
                         Ok(t) => Some(t),
                         Err(e) => {
                             tracing::warn!(
