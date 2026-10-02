@@ -503,9 +503,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
   returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
-  migration is no longer registered. On the first migration call, surviving rejection rows are
-  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
-  and the table is dropped.
+  migration is no longer registered.
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
@@ -546,6 +544,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
+- `zcashlc_init_data_database` now creates the
+  `ext_zcashlc_orchard_ironwood_migration_immediate_runs` extension table, moving into it any
+  records held by the `sdk_immediate_runs` table that read-write `zcashlc_migration_*` calls used
+  to create on demand, and dropping that table. `zcashlc_migration_record_immediate_run` and
+  `zcashlc_migration_progress` read and write only the new table, so `zcashlc_init_data_database`
+  must have run with this version before either is called.
+- `zcashlc_init_data_database` drops the retired
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` table, and read-write
+  `zcashlc_migration_*` calls no longer replay its rows into the migration state first. Rejection
+  marks a wallet never replayed are discarded; the engine re-adjudicates the affected transfers on
+  their next broadcast attempt.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
@@ -689,6 +698,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
+- `zcashlc_migration_*` read-write entry points no longer create the wallet database, or any table
+  in it, when asked about a wallet that does not exist or was never initialized; they return an
+  error instead (a stray table used to make an empty file look like a wallet).
 
 ## 2.8.0-rc.2 - 2026-07-28
 
