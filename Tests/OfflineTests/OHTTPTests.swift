@@ -20,6 +20,9 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testOHTTPEndpointsRelayMapping() throws {
+        // Relay URLs come from zodl-ohttp-client (native lib) and can be overridden at build time
+        // via ZODL_OHTTP_RELAY_URL_MAINNET / ZODL_OHTTP_RELAY_URL_TESTNET. These assertions verify
+        // the default URLs (Fastly temporary hostnames until COR-1830 repoints to final hostnames).
         let relay1 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
         XCTAssertEqual(relay1, "https://testnet-relay.example.invalid/relay")
 
@@ -30,6 +33,7 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testOHTTPEndpointsKeyConfigURL() {
+        // Key config URLs derived from relay URLs by replacing /relay → /ohttp-configs
         let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway-testnet.example")
         XCTAssertEqual(url, "https://testnet-relay.example.invalid/ohttp-configs")
     }
@@ -40,13 +44,13 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testOHTTPEndpointsKeyConfigURLProxyHosts() {
-        // Proxy hosts (static mappings and allowlisted) should use mainnet relay config
+        // Proxy hosts (static mappings and allowlisted) use mainnet relay (from native lib)
         let cmcURL = OHTTPEndpoints.keyConfigURL(for: "cmc.zodl.com")
         XCTAssertEqual(cmcURL, "https://mainnet-relay.example.invalid/ohttp-configs")
-        
+
         let nearURL = OHTTPEndpoints.keyConfigURL(for: "near.zodl.com")
         XCTAssertEqual(nearURL, "https://mainnet-relay.example.invalid/ohttp-configs")
-        
+
         let voteURL = OHTTPEndpoints.keyConfigURL(for: "vote.zodl.com")
         XCTAssertEqual(voteURL, "https://mainnet-relay.example.invalid/ohttp-configs")
     }
