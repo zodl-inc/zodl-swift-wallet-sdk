@@ -31,7 +31,8 @@ public enum OHTTPEndpoints {
     /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
-    private static let mainnetRelayURL = "https://mainnet-relay.example.invalid/relay"
+    /// Derived from the native relay map for the mainnet gateway host `ohttp-gateway.example`.
+    private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: "ohttp-gateway.example") }
 
     /// Proxy-only gateway hosts that are not in the native relay map (cmc, near, vote aliases).
     private static let proxyOnlyGateways: Set<String> = [
@@ -99,11 +100,17 @@ public enum OHTTPEndpoints {
         }
         // Check proxy-only gateways
         if proxyOnlyGateways.contains(lowerHost) {
-            return mainnetRelayURL
+            guard let relay = mainnetRelayURL else {
+                throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
+            }
+            return relay
         }
         // Allowlisted hosts use mainnet relay
         if isProxyAllowlisted(host: gatewayHost) {
-            return mainnetRelayURL
+            guard let relay = mainnetRelayURL else {
+                throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
+            }
+            return relay
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
