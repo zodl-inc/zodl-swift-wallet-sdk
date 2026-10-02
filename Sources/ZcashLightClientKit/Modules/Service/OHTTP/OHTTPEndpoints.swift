@@ -28,18 +28,16 @@ public enum OHTTPEndpoints {
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     public static var clientTraceIdPrefix: String?
 
-    /// Gateway host → relay URL.
-    /// LWD gateways (mainnet/testnet) have dedicated relays with matching HPKE keys.
+    /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
-    private static let relayByGatewayHost: [String: String] = [
-        // LWD gateways
-        "ohttp-gateway-testnet.example": "https://testnet-relay.example.invalid/relay",
-        "ohttp-gateway.example":         "https://mainnet-relay.example.invalid/relay",
-        // External API proxies — all through the mainnet relay→gateway
-        "cmc.zodl.com":    "https://mainnet-relay.example.invalid/relay",  // CoinMarketCap price feed
-        "near.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // NEAR 1click intents API
-        "vote.zodl.com":   "https://mainnet-relay.example.invalid/relay",  // Voting config / vote servers
+    private static let mainnetRelayURL = "https://mainnet-relay.example.invalid/relay"
+
+    /// Proxy-only gateway hosts that are not in the native relay map (cmc, near, vote aliases).
+    private static let proxyOnlyGateways: Set<String> = [
+        "cmc.zodl.com",    // CoinMarketCap price feed
+        "near.zodl.com",   // NEAR 1click intents API
+        "vote.zodl.com",   // Voting config / vote servers
     ]
 
     /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 12 vote
@@ -78,18 +76,34 @@ public enum OHTTPEndpoints {
         proxyAllowedHosts.contains(host.lowercased())
     }
 
-    /// True only for hosts that have a configured relay (static mappings). Case-insensitive.
+    /// True only for hosts that have a configured relay. Case-insensitive.
     /// F-13 fix: exact host match only, so custom LWD hosts are never forced through OHTTP.
+    ///
+    /// Relay URLs come from the native zodl-ohttp-client library and can be overridden at build time
+    /// via environment variables `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
     public static func isGateway(_ host: String) -> Bool {
-        return relayByGatewayHost[host.lowercased()] != nil
+        let lowerHost = host.lowercased()
+        // Check native relay map first
+        if OHTTPNative.relayURL(for: lowerHost) != nil {
+            return true
+        }
+        // Check proxy-only gateways
+        return proxyOnlyGateways.contains(lowerHost)
     }
 
     public static func relayURL(for gatewayHost: String) throws -> String {
-        if let relay = relayByGatewayHost[gatewayHost.lowercased()] {
+        let lowerHost = gatewayHost.lowercased()
+        // Try native relay map first
+        if let relay = OHTTPNative.relayURL(for: lowerHost) {
             return relay
         }
+        // Check proxy-only gateways
+        if proxyOnlyGateways.contains(lowerHost) {
+            return mainnetRelayURL
+        }
+        // Allowlisted hosts use mainnet relay
         if isProxyAllowlisted(host: gatewayHost) {
-            return "https://mainnet-relay.example.invalid/relay"  // allowlisted hosts use mainnet relay
+            return mainnetRelayURL
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }

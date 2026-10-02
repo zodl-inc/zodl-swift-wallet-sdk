@@ -193,6 +193,24 @@ enum OHTTPNative {
         )
     }
 
+    /// Returns the relay URL for a given gateway host, or nil if the host is not a known gateway.
+    /// The built-in mapping can be overridden at build time via environment variables
+    /// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
+    static func relayURL(for gatewayHost: String) -> String? {
+        let host = Array(gatewayHost.utf8)
+        let result: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer { hostBuffer in
+            zcashlc_ohttp_relay_url_for(
+                hostBuffer.baseAddress,
+                UInt(hostBuffer.count)
+            )
+        }
+        guard let result else {
+            return nil
+        }
+        defer { zcashlc_string_free(result) }
+        return String(cString: result)
+    }
+
     fileprivate static func copyBytes(_ pointer: UnsafeMutablePointer<UInt8>?, _ count: UInt) -> Data {
         guard let pointer, count > 0 else { return Data() }
         return Data(bytes: pointer, count: Int(count))

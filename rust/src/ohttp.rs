@@ -460,6 +460,32 @@ pub unsafe extern "C" fn zcashlc_ohttp_signed_config_url(
     unwrap_exc_or_null(res)
 }
 
+/// Returns the relay URL for a given gateway host, or null if the host is not a known gateway.
+/// The built-in mapping can be overridden at build time via environment variables
+/// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
+///
+/// The string is freed with `zcashlc_string_free`.
+///
+/// # Safety
+///
+/// - `gateway_host` must be valid for reads for `gateway_host_len` bytes, with an alignment of `1`,
+///   or null when the length is zero, and must not be mutated for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_relay_url_for(
+    gateway_host: *const u8,
+    gateway_host_len: usize,
+) -> *mut c_char {
+    let res = catch_panic(|| {
+        let gateway_host = std::str::from_utf8(unsafe { bytes(gateway_host, gateway_host_len)? })
+            .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
+        match zodl_ohttp_client::relay_for(gateway_host) {
+            Some(relay_url) => Ok(CString::new(relay_url)?.into_raw()),
+            None => Ok(ptr::null_mut()),
+        }
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// The client's own request headers and key-configuration cache rules under the profile.
 ///
 /// Returns null for an unknown profile; the result is freed with
