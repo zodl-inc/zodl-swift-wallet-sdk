@@ -22,22 +22,20 @@ use std::sync::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
+use slipstream_core::ohttp::{Dialer, http_round_trip};
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
     RouteResponse,
-};
-use zodl_ohttp_client::{
-    Client as OhttpClient, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfigSource, Network,
-    Request as OhttpRequest, SignedConfigUrlRule, signed_config_url,
 };
 
 use super::errors::invalid_input;
 
 /// OHTTP gateway hostname for voting traffic (mainnet).
 ///
-/// The relay for this gateway is chosen by `zodl_ohttp_client::relay_for`,
-/// the same one the lightwalletd path uses.
+/// The relay for this gateway is chosen by the engine
+/// (`slipstream_core::ohttp::relay_for`), the same one the lightwalletd path
+/// uses.
 const OHTTP_GATEWAY_HOST_MAINNET: &str = "ohttp-gateway.example";
 
 /// OHTTP gateway hostname for voting traffic (testnet).
@@ -73,8 +71,8 @@ const OHTTP_VOTE_HOSTS: &[&str] = &[
     "zpir-1.stardust.rest",
 ];
 
-/// Response cap from zodl-ohttp-client: gateway's 256 MiB upstream limit + 64 KiB framing overhead.
-const MAX_OHTTP_RESPONSE_BYTES: usize = GATEWAY_MAX_SEALED_RESPONSE_BYTES;
+/// 64 MiB response cap (matches the gateway's MAX_UPSTREAM_RESPONSE_BYTES default).
+const MAX_OHTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The request executor a voting session routes its traffic through.
 ///
@@ -426,7 +424,6 @@ fn url_host(url: &str) -> Result<String, RouteError> {
 /// configs fetched through the relay, 64 MiB response cap).
 pub(super) struct OhttpRoute {
     gateway_host: String,
-    client: OhttpClient,
 }
 
 impl OhttpRoute {
@@ -441,33 +438,8 @@ impl OhttpRoute {
         }
         // TODO(COR-1830): derive the gateway from the network when testnet
         // support is added; see `OHTTP_GATEWAY_HOST_TESTNET`.
-        let gateway_host = OHTTP_GATEWAY_HOST_MAINNET.to_string();
-
-        // Get the relay URL for this gateway
-        let relay_url = zodl_ohttp_client::relay_for(&gateway_host)
-            .ok_or_else(|| {
-                RouteError::before_dispatch(format!(
-                    "no relay configured for gateway {gateway_host}"
-                ))
-            })?
-            .to_string();
-
-        // Use signed key configuration with mainnet signing key
-        let signer = Network::Mainnet.pinned_signing_key();
-
-        let key_config_url = signed_config_url(&relay_url, SignedConfigUrlRule::ReplaceRelaySuffix)
-            .map_err(|e| RouteError::before_dispatch(format!("key config URL: {e}")))?;
-        let key_source = KeyConfigSource::Signed {
-            url: key_config_url,
-            network: "mainnet".to_string(),
-            signer,
-        };
-
-        let client = OhttpClient::new(relay_url, key_source);
-
         Ok(Self {
-            gateway_host,
-            client,
+            gateway_host: OHTTP_GATEWAY_HOST_MAINNET.to_string(),
         })
     }
 }
@@ -489,63 +461,38 @@ impl RouteHttp for OhttpRoute {
                 )));
             }
 
+            let method = request.method.as_str().to_string();
             let max_response_bytes = request.max_response_bytes.min(MAX_OHTTP_RESPONSE_BYTES);
 
-            // Parse the URL to extract authority and path
-            let uri: http::Uri = request
-                .url
-                .parse()
-                .map_err(|e| RouteError::before_dispatch(format!("invalid URL: {e}")))?;
-
-            let authority = uri
-                .authority()
-                .ok_or_else(|| RouteError::before_dispatch("URL missing authority"))?
-                .as_str();
-
-            let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-            // Build the OHTTP request (builder methods consume self, so chain them)
-            let mut ohttp_req =
-                OhttpRequest::new(request.method.as_str(), authority, path_and_query);
-
-            // Add headers
-            for (name, value) in request.headers {
-                ohttp_req = ohttp_req.header(name, value);
-            }
-
-            // Set body
-            let ohttp_req = ohttp_req.body(request.body);
-
-            // The client fetches the key config and sends in one call, so
+            // The engine fetches the key config and sends in one call, so
             // nothing more precise than "about to start" exists: everything
             // after this point is reported as possibly dispatched.
             on_dispatch();
 
-            // Send the request through OHTTP
-            let response = self
-                .client
-                .send(&ohttp_req, request.timeout)
+            // The relay leg uses the device's own connection (`Dialer::Direct`).
+            let call = http_round_trip(
+                &self.gateway_host,
+                Dialer::Direct,
+                &method,
+                request.url,
+                request.headers,
+                &request.body,
+            );
+            let (status, headers, body) = tokio::time::timeout(request.timeout, call)
                 .await
-                .map_err(|e| RouteError::after_dispatch(format!("OHTTP transport: {e}")))?;
+                .map_err(|_| RouteError::after_dispatch("OHTTP request timed out"))?
+                .map_err(|error| RouteError::after_dispatch(format!("OHTTP transport: {error}")))?;
 
-            if response.body.len() > max_response_bytes {
+            if body.len() > max_response_bytes {
                 return Err(RouteError::response_read(format!(
                     "response body too large: {} > {max_response_bytes} bytes",
-                    response.body.len()
+                    body.len()
                 )));
             }
-
-            // Convert zodl_ohttp_client::Response to RouteResponse
-            let headers = response
-                .headers
-                .into_iter()
-                .map(|(name, value)| (name, value))
-                .collect();
-
             Ok(RouteResponse {
-                status: response.status,
+                status,
                 headers,
-                body: response.body,
+                body,
             })
         })
     }

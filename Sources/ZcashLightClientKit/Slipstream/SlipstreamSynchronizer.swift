@@ -1780,12 +1780,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
     }
 
     public func addProofsToPCZT(pczt: Pczt) async throws -> Pczt {
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: initializer.logger
+            logger: initializer.logger,
+            torClientProvider: {
+                let isTorEnabled = await sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
         return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
     }
@@ -2625,6 +2631,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// is fine for a real request but far too slow for a benchmark that must return promptly.
     /// Matches the app-side `evaluationTimeoutSeconds`. `internal` so tests can reference it.
     static let serverProbeTimeoutSeconds: Double = 5
+    /// Probe bound with Tor enabled: a fresh circuit plus a TLS handshake through it routinely
+    /// takes longer than the direct bound, and a benchmark that times out every clearnet fallback
+    /// leaves the wallet with nowhere to go when the gateway is down.
+    static let serverProbeTimeoutSecondsOverTor: Double = 20
 
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
@@ -2667,11 +2677,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
     static func probe(
         _ endpoint: LightWalletEndpoint,
         timeoutSeconds: Double,
-        using service: LightWalletService
+        using service: LightWalletService,
+        mode: ServiceMode = .direct
     ) async -> (roundTrip: TimeInterval, info: LightWalletdInfo)? {
         let start = DispatchTime.now()
         let info = try? await withTaskTimeout(UInt64(timeoutSeconds * 1_000_000_000)) {
-            try await service.getInfo(mode: .direct)
+            try await service.getInfo(mode: mode)
         }
         let elapsed = DispatchTime.now().secondsSince(start)
         await service.closeConnections()
@@ -2682,19 +2693,31 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
     /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// `ValidateServerAction`. Delegates to ephemeral connections built by
+    /// `SDKSynchronizer.makeService`: OHTTP gateways get `LightWalletOHTTPService` (a plain gRPC
+    /// probe to a gateway is refused with 426, so a healthy gateway would never rank), and with
+    /// Tor enabled every probe rides a Tor circuit — a benchmark of clearnet fallbacks must not
+    /// leak the device IP to servers the user has not chosen.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let probeTimeout = await sdkFlags.torEnabled ? Self.serverProbeTimeoutSecondsOverTor : Self.serverProbeTimeoutSeconds
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = LightWalletGRPCService(endpoint: endpoint)
-                    guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient)
+                    let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
+                    guard let probed = await Self.probe(
+                        endpoint,
+                        timeoutSeconds: probeTimeout,
+                        using: service,
+                        mode: mode
+                    ) else {
                         return nil
                     }
                     return (endpoint, probed.roundTrip, probed.info)
@@ -2783,6 +2806,78 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        // Allowlisted passthrough hosts (vote servers learned at run time, e.g.
+        // prod.vote-chain-primary.valargroup.org) keep their own name: proxyURL(for:) returns them
+        // unchanged and relayURL(for:) routes them to the mainnet relay. Only checking isGateway
+        // rejected them with ohttpUnsupportedHost before any request was sent.
+        guard let host = request.url?.host,
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let relayURL = try OHTTPEndpoints.relayURL(for: host)
+        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
+            // OHTTPTransport seals every attempt afresh, each with its own ephemeral key and nonce.
+            // If Tor retried (retryLimit > 0), the SAME ciphertext would be re-sent, violating
+            // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
+            // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
+            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
+            // it re-encapsulates (new nonce, new ciphertext).
+            httpSender = { [weak self] request in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpRequestOverTor(for: request, retryLimit: 0)
+            }
+        } else {
+            httpSender = { request in
+                let (data, response) = try await OHTTPTransport.session.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
+        let scheme = request.url?.scheme ?? "https"
+        // Use percent-encoded path to preserve special characters
+        let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
+        let path = rawPath + (request.url?.query.map { "?\($0)" } ?? "")
+
+        // Strip gateway-injected secrets for alias hosts (CMC, NEAR, voting).
+        var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
+        if OHTTPEndpoints.needsHeaderStripping(host: host) {
+            let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
+            let originalCount = headers.count
+            headers = headers.filter { !strippedHeaders.contains($0.0) }
+            if headers.count < originalCount {
+                initializer.logger.info("httpRequestOverOHTTP: stripped \(originalCount - headers.count) gateway-injected secret header(s) for \(host)")
+            }
+        }
+
+        let bhttp = OHTTPRequest(
+            method: request.httpMethod ?? "GET",
+            scheme: scheme,
+            authority: host,
+            path: path,
+            headers: headers,
+            body: request.httpBody ?? Data()
+        )
+        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+        guard let httpResp = HTTPURLResponse(
+            url: request.url!,
+            statusCode: response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
+        ) else { throw ZcashError.ohttpResponseError }
+        return (response.body, httpResp)
+    }
+
+    // swiftlint:disable function_parameter_count
     /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
     /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
@@ -2792,11 +2887,18 @@ public actor SlipstreamSynchronizer: Synchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let sdkFlags = initializer.container.resolve(SDKFlags.self)
             let torEnabled = await sdkFlags.torEnabled
@@ -2812,10 +2914,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
