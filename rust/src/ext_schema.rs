@@ -37,8 +37,8 @@ pub(crate) const IMMEDIATE_RUNS_TABLE: &str =
 /// the side table that recorded terminal pool-migration rejection classifications back when
 /// the engine had no failure states. The engine now records rejection testimony and adjudicates
 /// it through the sqlite satisfiability oracle, so the migration is no longer registered: fresh
-/// wallets never create the table, and `crate::migration::migrate_legacy_invalid_marks` replays
-/// surviving rejection rows as reports before dropping it. Removing the registration is
+/// wallets never create the table, and [`DropRetiredInvalidMarksTable`] drops it wherever an
+/// earlier build left it behind. Removing the registration is
 /// safe because `schemerz`'s `Migrator::up` walks REGISTERED migrations only and checks
 /// each against the applied set — a recorded id it no longer knows is simply never
 /// consulted, so wallets that already ran the migration keep its inert row in the
@@ -47,7 +47,10 @@ pub(crate) const IMMEDIATE_RUNS_TABLE: &str =
 /// [`WalletMigrator::with_external_migrations`]: zcash_client_sqlite::wallet::init::WalletMigrator::with_external_migrations
 pub(crate) fn external_migrations() -> Vec<Box<dyn RusqliteMigration<Error = WalletMigrationError>>>
 {
-    vec![Box::new(AddImmediateRunsTable)]
+    vec![
+        Box::new(AddImmediateRunsTable),
+        Box::new(DropRetiredInvalidMarksTable),
+    ]
 }
 
 const ADD_IMMEDIATE_RUNS_TABLE_ID: Uuid = Uuid::from_u128(0x9cd25140_4f7e_4bf4_9e48_de9551fa09fc);
@@ -111,6 +114,55 @@ impl RusqliteMigration for AddImmediateRunsTable {
     fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
         Err(WalletMigrationError::CannotRevert(
             ADD_IMMEDIATE_RUNS_TABLE_ID,
+        ))
+    }
+}
+
+const DROP_RETIRED_INVALID_MARKS_TABLE_ID: Uuid =
+    Uuid::from_u128(0x7c41c0f2_dd7f_4d37_b025_457796984d4e);
+
+/// The table the retired `AddInvalidTransferMarksTable` migration created (see the
+/// `# Retired migrations` note on [`external_migrations`]).
+const RETIRED_INVALID_MARKS_TABLE: &str = "ext_zcashlc_orchard_ironwood_migration_invalid_marks";
+
+/// Drops [`RETIRED_INVALID_MARKS_TABLE`] wherever an earlier build left it behind.
+///
+/// Its rows recorded node rejections of pool-migration transfers from before the engine had
+/// failure states. Earlier SDK versions replayed them into the engine state on the first
+/// read-write migration call and then dropped the table, so it survives only in a wallet that has
+/// made no such call since; those marks are discarded here, and the engine adjudicates the
+/// affected transfers afresh on their next broadcast attempt.
+struct DropRetiredInvalidMarksTable;
+
+impl schemerz::Migration<Uuid> for DropRetiredInvalidMarksTable {
+    fn id(&self) -> Uuid {
+        DROP_RETIRED_INVALID_MARKS_TABLE_ID
+    }
+
+    fn dependencies(&self) -> HashSet<Uuid> {
+        // Like the table it removes, this touches no wallet schema; anchoring on the release
+        // this SDK builds against just gives it a stable place in the graph.
+        V_0_22_0_RC6.iter().copied().collect()
+    }
+
+    fn description(&self) -> &'static str {
+        "Drops the SDK's retired invalid-transfer marks table."
+    }
+}
+
+impl RusqliteMigration for DropRetiredInvalidMarksTable {
+    type Error = WalletMigrationError;
+
+    fn up(&self, transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
+        transaction.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {RETIRED_INVALID_MARKS_TABLE}"
+        ))?;
+        Ok(())
+    }
+
+    fn down(&self, _transaction: &rusqlite::Transaction) -> Result<(), Self::Error> {
+        Err(WalletMigrationError::CannotRevert(
+            DROP_RETIRED_INVALID_MARKS_TABLE_ID,
         ))
     }
 }
@@ -242,5 +294,41 @@ mod tests {
             )
             .expect("the record counts");
         assert_eq!(count, 1);
+    }
+
+    /// A wallet an earlier build left holding the retired invalid-marks table loses it, rows and
+    /// all, at its next initialization.
+    #[test]
+    fn init_drops_the_retired_invalid_marks_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wallet.db");
+        wallet_without_sdk_tables(&path);
+        {
+            let conn = Connection::open(&path).expect("the fixture connection opens");
+            conn.execute_batch(
+                "CREATE TABLE ext_zcashlc_orchard_ironwood_migration_invalid_marks (
+                    account_uuid BLOB NOT NULL,
+                    tx_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY (account_uuid, tx_id)
+                )",
+            )
+            .expect("the retired table creates");
+            conn.execute(
+                "INSERT INTO ext_zcashlc_orchard_ironwood_migration_invalid_marks
+                    (account_uuid, tx_id, reason)
+                 VALUES (?1, 3, 'invalid_note')",
+                [&[9u8; 16][..]],
+            )
+            .expect("the retired mark inserts");
+        }
+
+        init_data_db(&path);
+
+        let conn = Connection::open(&path).expect("the database reopens");
+        assert!(!table_exists(
+            &conn,
+            "ext_zcashlc_orchard_ironwood_migration_invalid_marks"
+        ));
     }
 }

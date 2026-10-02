@@ -503,9 +503,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
   returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
-  migration is no longer registered. On the first migration call, surviving rejection rows are
-  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
-  and the table is dropped.
+  migration is no longer registered.
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
@@ -552,6 +550,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to create on demand, and dropping that table. `zcashlc_migration_record_immediate_run` and
   `zcashlc_migration_progress` read and write only the new table, so `zcashlc_init_data_database`
   must have run with this version before either is called.
+- `zcashlc_init_data_database` drops the retired
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` table, and read-write
+  `zcashlc_migration_*` calls no longer replay its rows into the migration state first. Rejection
+  marks a wallet never replayed are discarded; the engine re-adjudicates the affected transfers on
+  their next broadcast attempt.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the

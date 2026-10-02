@@ -34,8 +34,7 @@
 //!   scan-visible spends. The SDK makes no invalidity determination of its own: it has no way to
 //!   date a verdict against the scanned region, so a reorg could never withdraw one. (Earlier
 //!   versions kept an SDK-owned `ext_zcashlc_orchard_ironwood_migration_invalid_marks` side table
-//!   the engine could not consult; [`migrate_legacy_invalid_marks`] folds any surviving rows into
-//!   the engine state once, on open, and drops the table.)
+//!   the engine could not consult; `init_data_db` drops it — see [`crate::ext_schema`].)
 //! - The immediate lane (an ordinary send-max sweep, entirely outside the engine) is tracked in
 //!   the SDK's own extension table ([`crate::ext_schema::IMMEDIATE_RUNS_TABLE`]) and surfaces
 //!   ONLY through [`zcashlc_migration_progress`]: while unmined it reports a 0-of-1 progress
@@ -86,10 +85,7 @@ use zcash_client_backend::data_api::{InputSource, OutputLockStore, WalletRead};
 use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::pool_migration::orchard_ironwood::{
-    Error as PoolMigrationStoreError, PoolMigrations,
-};
-use zcash_client_sqlite::util::SystemClock;
+use zcash_client_sqlite::pool_migration::orchard_ironwood::Error as PoolMigrationStoreError;
 use zcash_protocol::consensus::{
     BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
 };
@@ -296,16 +292,8 @@ unsafe fn open(
     }));
     require_wallet_db(&db_path)?;
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
-    let mut store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadWrite)
+    let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadWrite)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
-    // One-time: fold any legacy invalid-marks rows into the engine state and drop their table
-    // (a no-op existence probe once done — see the function's doc).
-    let fully_scanned_height = wallet
-        .block_fully_scanned()
-        .map_err(|e| anyhow!("Error reading fully-scanned height: {e}"))?
-        .map(|metadata| metadata.block_height())
-        .unwrap_or(BlockHeight::from(0));
-    migrate_legacy_invalid_marks(&mut store_conn, network, fully_scanned_height)?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -319,12 +307,10 @@ unsafe fn open(
     })
 }
 
-/// Read-only twin of [`open`]: both connections opened `SQLITE_OPEN_READ_ONLY`, and the one
-/// preamble writer deliberately skipped — `migrate_legacy_invalid_marks` (a one-time fold only rw
-/// callers may perform). A path where no database exists is refused by the same
-/// [`require_wallet_db`] check. The pure read entry points open through this; a read-only
-/// connection fails any write with `SQLITE_READONLY`, so an accidental write anywhere down their
-/// call graph fails loudly instead of silently reclassifying the call.
+/// Read-only twin of [`open`]: both connections are opened read-only. A path where no database
+/// exists is refused by the same [`require_wallet_db`] check. The pure read entry points open
+/// through this; a read-only connection fails any write with `SQLITE_READONLY`, so an accidental
+/// write anywhere down their call graph fails loudly instead of silently reclassifying the call.
 ///
 /// # Safety
 /// Same contract as [`open`].
@@ -376,117 +362,6 @@ impl CallCtx {
     fn target(&self) -> anyhow::Result<BlockHeight> {
         Ok(target_from_tip(self.tip()?))
     }
-}
-
-// ----- one-time legacy invalid-marks migration -----
-//
-// Terminal rejection classifications used to live in an SDK-owned
-// `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table, because the engine had
-// no failure states. The engine now records rejection evidence as a broadcast failure and
-// determines whether a transaction is unsatisfiable when the migration is advanced. The helper
-// below replays surviving rejection rows, discards funding-spent rows for the oracle to
-// rediscover, and drops the table; fresh wallets never create it (its
-// `schemerz` migration is no longer registered — see [`crate::ext_schema`]).
-
-/// The legacy marks table's name. Only the one-time migration below refers to it now.
-const LEGACY_INVALID_MARKS_TABLE: &str = "ext_zcashlc_orchard_ironwood_migration_invalid_marks";
-
-/// Folds any surviving legacy invalid-marks rows into the engine state and drops the table.
-/// Runs at the head of [`open`] (the path that previously consulted the table), so it happens
-/// before the calling entry point reads the migration state. Idempotent: the first successful
-/// pass drops the table, so the cheap existence probe is all a second open pays.
-///
-/// The table is keyed by account, and one pass migrates EVERY account's rows (an `open` for
-/// account A must not strand — or worse, drop — account B's evidence). Per account:
-/// - no `accounts` row (the account was deleted): its run was cascade-deleted with it, so there
-///   is nothing to carry the evidence onto — the rows drop with the table;
-/// - no stored run, or a TERMINAL one: skipped. A terminal run surfaces no attention anyway
-///   (`next_step` answers `Complete` and `zcashlc_migration_has_invalid_transfers` answers
-///   `false` for it), so carrying stale verdicts onto its rows would change nothing observable;
-/// - `funding_spent` rows are discarded for the satisfiability oracle to rediscover;
-/// - other rejection rows are replayed with `report_broadcast_failure` at the current scanned
-///   height. Unknown and already-mined transactions remain unchanged.
-///
-/// Runs on the SDK's own store connection: the extension-transaction API's authorizer denies
-/// DDL, so the final `DROP TABLE` could never go through it — and the table being dropped is the
-/// SDK's own, in the namespace the wallet promises never to touch.
-fn migrate_legacy_invalid_marks(
-    conn: &mut Connection,
-    network: NetworkParams,
-    fully_scanned_height: BlockHeight,
-) -> anyhow::Result<()> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            rusqlite::params![LEGACY_INVALID_MARKS_TABLE],
-            |row| row.get(0),
-        )
-        .map_err(|e| anyhow!("legacy marks probe failed: {e}"))?;
-    if !exists {
-        return Ok(());
-    }
-
-    // All rows, grouped per account (BTreeMap for a deterministic account order). A row whose
-    // account_uuid blob is not 16 bytes cannot name an account and is dropped with the table.
-    let rows: Vec<(Vec<u8>, u32, String)> = {
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT account_uuid, tx_id, reason FROM {LEGACY_INVALID_MARKS_TABLE}"
-            ))
-            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?;
-        let mapped = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?;
-        mapped
-            .collect::<Result<_, _>>()
-            .map_err(|e| anyhow!("legacy marks read failed: {e}"))?
-    };
-    let mut per_account: std::collections::BTreeMap<[u8; 16], Vec<(u32, String)>> =
-        std::collections::BTreeMap::new();
-    for (account_bytes, tx_id, reason) in rows {
-        let Ok(account) = <[u8; 16]>::try_from(account_bytes) else {
-            continue;
-        };
-        per_account
-            .entry(account)
-            .or_default()
-            .push((tx_id, reason));
-    }
-
-    for (account_bytes, marks) in per_account {
-        let account = AccountUuid::from_uuid(uuid::Uuid::from_bytes(account_bytes));
-        let mut store = match PoolMigrations::for_account(network, SystemClock, &mut *conn, account)
-        {
-            Ok(store) => store,
-            Err(PoolMigrationStoreError::AccountUnknown) => continue,
-            Err(e) => return Err(anyhow!("legacy marks: store open failed: {e}")),
-        };
-        let Some(mut state) = store
-            .get_migration()
-            .map_err(|e| anyhow!("legacy marks: migration read failed: {e}"))?
-        else {
-            continue;
-        };
-        if state.is_terminal() {
-            continue;
-        }
-        for (tx_id, reason) in marks {
-            // Scan-discovered spends are deliberately dropped: the sqlite oracle rediscovers
-            // them with a correct evidence height on the next drive call.
-            if matches!(reason.as_str(), "foreign_spent" | "funding_spent") {
-                continue;
-            }
-            let id = MigrationTransferId::new(tx_id);
-            state.report_broadcast_failure(id, fully_scanned_height);
-        }
-        store
-            .replace_migration(&state)
-            .map_err(|e| anyhow!("legacy marks: migration persist failed: {e}"))?;
-    }
-
-    conn.execute(&format!("DROP TABLE {LEGACY_INVALID_MARKS_TABLE}"), [])
-        .map_err(|e| anyhow!("legacy marks drop failed: {e}"))?;
-    Ok(())
 }
 
 // ----- SDK-owned immediate-migration-run record -----
@@ -8241,6 +8116,7 @@ mod tests {
     // ----- refresh stale transfers (rebuild-on-expiry lanes over the FFI) -----
 
     use zcash_client_sqlite::pool_migration::orchard_ironwood::PoolMigrations;
+    use zcash_client_sqlite::util::SystemClock;
 
     /// Initializes a wallet database at a unique temp path (removing any leftover), returning the
     /// path. The refresh fixtures all start here, mirroring a real caller's `init_data_db`.
