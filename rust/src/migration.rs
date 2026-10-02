@@ -77,7 +77,7 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use orchard::keys::SpendingKey;
 use rand::rngs::OsRng;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::data_api::wallet::{
     TargetHeight,
     input_selection::{LockFilter, LockedInputPolicy},
@@ -231,8 +231,13 @@ fn target_from_tip(tip: BlockHeight) -> BlockHeight {
 }
 
 /// The common per-call context: the network parameters, the wallet handle, the migration-store
-/// connection (a second, independent connection to the same wallet database file — the
-/// account-keyed migration tables live inside it), and the raw path/account for the plan cache.
+/// connection, and the raw path/account for the plan cache.
+///
+/// The store connection is a second connection onto the same wallet database file, opened by the
+/// same [`crate::wallet_db_connection`] as the wallet handle's. The engine's account-scoped store
+/// (`PoolMigrations`) needs a connection of its own: upstream's `WalletMigration` adapter holds
+/// the wallet by a shared borrow while owning a store that must borrow its connection mutably to
+/// write, and `WalletDb` exposes no connection to share.
 struct CallCtx {
     network: NetworkParams,
     wallet: MigrationWallet,
@@ -242,80 +247,39 @@ struct CallCtx {
     account_bytes: [u8; 16],
 }
 
-/// Open the migration store connection: a second, independent connection into the same wallet
-/// database file as the wallet handle (`crate::wallet_db`), which the account-keyed migration
-/// tables live inside. Set to the same [`crate::WALLET_DB_BUSY_TIMEOUT`] the wallet handle uses --
-/// the slipstream engine's writer (write-behind commits, `deleteAccount`/`importAccount` mid-pass)
-/// can hold the file lock for seconds, and a migration call racing it must wait as long as the
-/// wallet handle would rather than failing fast on rusqlite's 5 s default.
+/// Refuses a wallet-database path where no database exists, before any connection that could
+/// create it is opened.
 ///
-/// Never creates the database file: these are rusqlite's own default flags minus
-/// `SQLITE_OPEN_CREATE`. `open()` below relies on that: it opens this connection FIRST, so a
-/// missing (or unreadable) database file fails right here, before `open()` ever reaches
-/// `crate::wallet_db`'s CREATE-capable open.
-fn open_store_conn(db_path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
-    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
-        .map_err(|e| anyhow!("Error setting migration store busy_timeout: {e}"))?;
-    Ok(conn)
-}
-
-/// Read-only twin of [`open_store_conn`]: same busy_timeout, but the connection can neither
-/// write nor create the database file. This is the Q2-1 enforcement layer — the pure read
-/// entry points open through this, so an accidental write anywhere down their call graph
-/// fails loudly with `SQLITE_READONLY` instead of silently reclassifying the call.
-fn open_store_conn_read_only(db_path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| anyhow!("Error opening read-only migration store connection: {e}"))?;
-    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
-        .map_err(|e| anyhow!("Error setting read-only migration store busy_timeout: {e}"))?;
-    Ok(conn)
-}
-
-/// Read-only twin of [`crate::wallet_db`] (lib.rs): open + array vtab + wrap, with
-/// `SQLITE_OPEN_READ_ONLY` so the wallet handle cannot write either. The vtab module load is
-/// connection-local registration, not a database write.
-unsafe fn wallet_db_read_only(
-    db_data: *const u8,
-    db_data_len: usize,
-    network: NetworkParams,
-) -> anyhow::Result<MigrationWallet> {
-    let db_data = Path::new(OsStr::from_bytes(unsafe {
-        slice::from_raw_parts(db_data, db_data_len)
-    }));
-    let conn = Connection::open_with_flags(
-        db_data,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| anyhow!("Error opening read-only wallet database connection: {e}"))?;
-    conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
-        .map_err(|e| anyhow!("Error setting read-only wallet database busy_timeout: {e}"))?;
-    rusqlite::vtab::array::load_module(&conn)
-        .map_err(|e| anyhow!("Error loading wallet database array module: {e}"))?;
-    Ok(
-        MigrationWallet::from_connection(conn, network, SystemClock, OsRng)
-            .with_anchor_retention_interval(crate::anchor_retention_interval(network)),
-    )
+/// Only `zcashlc_init_data_database` creates the wallet database, so a migration call must not
+/// let a read-write open make SQLite create an empty file at a path for a wallet that was never
+/// initialized. The path the platform passes may be a SQLite `file:` URI, which only SQLite
+/// resolves, so asking the filesystem whether it exists would refuse every real wallet. SQLite is
+/// asked instead, with a read-only open: that cannot create the file, and it fails with
+/// `SQLITE_CANTOPEN` when there is none. SQLite reports that code for a file that exists but
+/// cannot be opened too, for example on a permissions or data-protection failure, so the refusal
+/// says "does not exist or cannot be opened". Its own message for that failure carries the
+/// database path, so it is replaced by one that names no path, the same for both contexts.
+fn require_wallet_db(db_path: &Path) -> anyhow::Result<()> {
+    match crate::wallet_db_connection(db_path, crate::WalletDbAccess::ReadOnly) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::CannotOpen => {
+            Err(anyhow!(
+                "the wallet database does not exist or cannot be opened; initialize it with \
+                 zcashlc_init_data_database before using the migration surface"
+            ))
+        }
+        Err(e) => Err(anyhow!("Error checking for the wallet database: {e}")),
+    }
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
-/// drops it at the end (no persistent handle). `open()` creates neither the wallet database file
-/// nor any of its schema: all of that comes ONLY from `init_data_db`'s migrations, run beforehand
-/// by the caller -- the engine's store tables by `zcash_client_sqlite`'s own migration graph
-/// (`zcash_client_sqlite::pool_migration` registers them), and the SDK's extension tables by the
-/// external migrations in [`crate::ext_schema`]. The no-`SQLITE_OPEN_CREATE` [`open_store_conn`]
-/// is opened, and the wallet schema probed, BEFORE the CREATE-capable `crate::wallet_db` handle,
-/// so a path that does not exist, or a file with no wallet schema, errors out instead of
-/// reaching the call that could create a file there (MOB-1975).
+/// drops it at the end (no persistent handle).
+///
+/// `open()` creates neither the wallet database nor any of its schema: only
+/// `zcashlc_init_data_database` does, through `zcash_client_sqlite`'s own migrations and the SDK's
+/// external ones in [`crate::ext_schema`]. A path where no database exists is therefore refused,
+/// by [`require_wallet_db`], before the call's own connections are opened. That check asks SQLite
+/// through a read-only open, which cannot create the file.
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -330,26 +294,10 @@ unsafe fn open(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    let mut store_conn = open_store_conn(&db_path).map_err(|e| {
-        anyhow!(
-            "wallet database not found or unreadable at {}: {e}",
-            db_path.display()
-        )
-    })?;
-    let has_wallet_schema: bool = store_conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'accounts')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| anyhow!("Error checking the wallet schema: {e}"))?;
-    if !has_wallet_schema {
-        return Err(anyhow!(
-            "wallet database at {} has no wallet schema (no accounts table): init_data_db must run before the migration surface",
-            db_path.display()
-        ));
-    }
+    require_wallet_db(&db_path)?;
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
+    let mut store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadWrite)
+        .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
     // One-time: fold any legacy invalid-marks rows into the engine state and drop their table
     // (a no-op existence probe once done — see the function's doc).
     let fully_scanned_height = wallet
@@ -373,8 +321,10 @@ unsafe fn open(
 
 /// Read-only twin of [`open`]: both connections opened `SQLITE_OPEN_READ_ONLY`, and the one
 /// preamble writer deliberately skipped — `migrate_legacy_invalid_marks` (a one-time fold only rw
-/// callers may perform). The pure read entry points open through this; see
-/// `open_store_conn_read_only` for what that enforces.
+/// callers may perform). A path where no database exists is refused by the same
+/// [`require_wallet_db`] check. The pure read entry points open through this; a read-only
+/// connection fails any write with `SQLITE_READONLY`, so an accidental write anywhere down their
+/// call graph fails loudly instead of silently reclassifying the call.
 ///
 /// # Safety
 /// Same contract as [`open`].
@@ -388,8 +338,10 @@ unsafe fn open_read(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    let wallet = unsafe { wallet_db_read_only(db_data, db_data_len, network.clone())? };
-    let store_conn = open_store_conn_read_only(&db_path)?;
+    require_wallet_db(&db_path)?;
+    let wallet = unsafe { crate::wallet_db_read_only(db_data, db_data_len, network.clone())? };
+    let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadOnly)
+        .map_err(|e| anyhow!("Error opening read-only migration store connection: {e}"))?;
     let account = account_uuid_from_bytes(account_uuid_bytes)
         .map_err(|e| anyhow!("account uuid must be 16 bytes: {e}"))?;
     let account_bytes = *account.expose_uuid().as_bytes();
@@ -2951,10 +2903,7 @@ pub unsafe extern "C" fn zcashlc_migration_block_rate_samples(
             let (rows, len) = ptr_from_vec(Vec::new());
             Box::into_raw(Box::new(FfiBlockRateSamples { rows, len }))
         };
-        let conn = match Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
+        let conn = match crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadOnly) {
             Ok(conn) => conn,
             // A missing wallet-DB file is the same benign "no scanned blocks yet" answer as a
             // missing `blocks` table (A12): a read-only open cannot create the file, so a wallet
@@ -2967,8 +2916,6 @@ pub unsafe extern "C" fn zcashlc_migration_block_rate_samples(
             }
             Err(e) => return Err(anyhow!("block-rate read-only open failed: {e}")),
         };
-        conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
-            .map_err(|e| anyhow!("block-rate busy_timeout failed: {e}"))?;
         // Best-effort projection input, never load-bearing (matching Android): a failing read (no
         // `blocks` table on a fresh wallet, a transient lock) maps to "no samples", not an error
         // — but logged (A12), so a persistently failing read shows up in diagnostics instead of
@@ -6757,37 +6704,52 @@ mod tests {
 
     /// Regression pin: the migration store connection (a second, independent connection into the
     /// same wallet database file the slipstream engine writes from) must wait for a held sqlite
-    /// lock exactly as long as the wallet handle does -- `crate::wallet_db` (lib.rs) sets
-    /// `crate::WALLET_DB_BUSY_TIMEOUT` (15 s, currently) because the engine's write-behind commits
-    /// can hold the file lock for seconds; upstream sets none. Before the fix, [`open`]'s store
-    /// connection was a bare `Connection::open` with no explicit timeout, silently falling back to
-    /// rusqlite's 5 s default -- a migration call racing a long engine write could hit
-    /// `database is locked` a full 10 s earlier than the wallet handle would have given up.
+    /// lock exactly as long as the wallet handle does. `crate::wallet_db_connection` (lib.rs) sets
+    /// `crate::WALLET_DB_BUSY_TIMEOUT` (15 s, currently) on every connection it opens, the store's
+    /// included, because the engine's write-behind commits can hold the file lock for seconds;
+    /// upstream sets none. Before the fix, [`open`]'s store connection was a bare
+    /// `Connection::open` with no explicit timeout, silently falling back to rusqlite's 5 s
+    /// default -- a migration call racing a long engine write could hit `database is locked` a
+    /// full 10 s earlier than the wallet handle would have given up.
     #[test]
     fn store_conn_matches_wallet_db_busy_timeout() {
-        let path = std::env::temp_dir().join(format!(
-            "zcashlc_migration_store_conn_busy_timeout_{}.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        // `open_store_conn` never creates the file (MOB-1975) -- create it first so this test
-        // stays about the busy_timeout pragma, not about file-creation semantics.
-        {
-            Connection::open(&path).expect("the fixture file creates");
+        let path = init_fixture_db("zcashlc_migration_store_conn_busy_timeout");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = [9u8; 16];
+        for read_only in [false, true] {
+            let ctx = unsafe {
+                if read_only {
+                    open_read(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                    )
+                } else {
+                    open(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                    )
+                }
+            }
+            .expect("the call context must open");
+            let busy_timeout: u32 = ctx
+                .store_conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("PRAGMA busy_timeout must be readable");
+            // The literal (rather than comparing against `crate::WALLET_DB_BUSY_TIMEOUT` itself) is
+            // deliberate: this pins the actual wait time a caller experiences, so a future edit
+            // that changes the constant's value without meaning to still fails this test instead
+            // of silently redefining "correct".
+            assert_eq!(
+                busy_timeout, 15_000,
+                "the migration store connection must wait as long as the wallet handle \
+                 (crate::WALLET_DB_BUSY_TIMEOUT in lib.rs, currently 15 s) before giving up on a \
+                 held lock (read_only = {read_only})"
+            );
         }
-        let conn = open_store_conn(&path).expect("the store connection must open");
-        let busy_timeout: u32 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .expect("PRAGMA busy_timeout must be readable");
-        // The literal (rather than comparing against `crate::WALLET_DB_BUSY_TIMEOUT` itself) is
-        // deliberate: this pins the actual wait time a caller experiences, so a future edit that
-        // changes the constant's value without meaning to still fails this test instead of
-        // silently redefining "correct".
-        assert_eq!(
-            busy_timeout, 15_000,
-            "the migration store connection must wait as long as the wallet handle \
-             (crate::WALLET_DB_BUSY_TIMEOUT in lib.rs, currently 15 s) before giving up on a held lock"
-        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -7873,7 +7835,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ----- read-only open helpers (Q2-1 enforcement) -----
+    // ----- read-only enforcement (Q2-1) -----
 
     /// Q2-1 enforcement: the read-only store connection makes accidental writes on the pure
     /// read paths impossible — any INSERT/UPDATE/DDL errors with SQLITE_READONLY, forever,
@@ -7881,8 +7843,19 @@ mod tests {
     #[test]
     fn read_only_store_conn_rejects_writes() {
         let path = init_fixture_db("zcashlc_readonly_store");
-        let ro = open_store_conn_read_only(&path).unwrap();
-        let err = ro
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = [9u8; 16];
+        let ctx = unsafe {
+            open_read(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the read-only call context opens");
+        let err = ctx
+            .store_conn
             .execute(
                 &format!(
                     "INSERT INTO {IMMEDIATE_RUNS_TABLE} (account_uuid, txid, recorded_at_height)
@@ -7904,16 +7877,73 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A read-only open of a wallet-database FILE that does not exist must error — and must NOT
-    /// create the file (the rw `open()` path's `Connection::open` would).
+    /// The read-only context's wallet handle is as read-only as its store connection: a write made
+    /// through it fails with `SQLITE_READONLY` instead of changing the wallet. Nothing else pins
+    /// the handle's access mode, since a missing path is refused before the handle is opened.
     #[test]
-    fn read_only_store_conn_on_missing_file_errors_without_creating_it() {
+    fn read_only_wallet_handle_rejects_writes() {
+        let path = init_fixture_db("zcashlc_readonly_wallet_handle");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = [9u8; 16];
+        let mut ctx = unsafe {
+            open_read(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the read-only call context opens");
+        // The tip must be past Sapling activation: upstream ignores an earlier one without touching
+        // the database, so such a call would write nothing for the handle to refuse.
+        let err = ctx
+            .wallet
+            .update_chain_tip(h(3_600_000))
+            .expect_err("a chain-tip write through the read-only handle must fail");
+        match err {
+            SqliteClientError::DbError(rusqlite::Error::SqliteFailure(e, _)) => {
+                assert_eq!(
+                    e.code,
+                    rusqlite::ErrorCode::ReadOnly,
+                    "write must fail READONLY, got {e:?}"
+                )
+            }
+            other => panic!("expected DbError(SqliteFailure(ReadOnly)), got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The read-only context on a wallet-database path that does not exist must error and must
+    /// NOT create the file: a read-only connection cannot create one. Like `open()`, it refuses
+    /// the path up front, so the error says the database does not exist or cannot be opened,
+    /// rather than relaying SQLite's open failure, which carries the database path.
+    #[test]
+    fn read_only_open_on_a_missing_file_errors_without_creating_it() {
         let path = std::env::temp_dir().join(format!(
             "zcashlc_readonly_missing_{}.sqlite",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        assert!(open_store_conn_read_only(&path).is_err());
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = [9u8; 16];
+        let err = unsafe {
+            open_read(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .err()
+        .expect("a read-only open of a missing file must fail");
+        assert!(
+            !err.to_string().contains(path.to_str().unwrap()),
+            "the refusal must not leak the database path: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error message: {err}"
+        );
         assert!(
             !path.exists(),
             "a read-only open must not create the database file"
@@ -7923,8 +7953,9 @@ mod tests {
     // ----- rw `open()` must not manufacture a wallet database (MOB-1975) -----
 
     /// `open()` on a wallet-database path that does not exist must error, and must NOT create the
-    /// file: this is the missing-file guard added ahead of `crate::wallet_db`'s `Connection::open`,
-    /// which otherwise would.
+    /// file: only `zcashlc_init_data_database` creates the wallet database, so `open()` refuses the
+    /// path before any connection that could create it is opened, with an error that does not carry
+    /// the path.
     #[test]
     fn rw_open_on_a_missing_file_errors_without_creating_it() {
         let path = std::env::temp_dir().join(format!(
@@ -7945,8 +7976,86 @@ mod tests {
         .err()
         .expect("open() must fail on a missing wallet database file");
         assert!(
-            err.to_string().contains("wallet database not found"),
+            !err.to_string().contains(path.to_str().unwrap()),
+            "the refusal must not leak the database path: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not exist"),
             "unexpected error message: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "open() must not create the wallet database file"
+        );
+    }
+
+    /// The Swift SDK passes the wallet database to every FFI call as a `file:` URI
+    /// (`URL.absoluteString`), which only SQLite resolves. Both contexts must open a real wallet
+    /// through one, so the missing-database check cannot be a lookup in the filesystem.
+    #[test]
+    fn rw_and_read_only_open_accept_a_file_uri_wallet_path() {
+        let path = init_fixture_db("zcashlc_migration_open_file_uri");
+        // The temp path is absolute, so this is `file:///...`, the form the Swift SDK passes.
+        let uri = format!("file://{}", path.display());
+        let uri_bytes = uri.as_bytes();
+        let account = [9u8; 16];
+        let rw = unsafe {
+            open(
+                uri_bytes.as_ptr(),
+                uri_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the read-write context must open a wallet named by a file URI");
+        let ro = unsafe {
+            open_read(
+                uri_bytes.as_ptr(),
+                uri_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the read-only context must open a wallet named by a file URI");
+        drop(rw);
+        drop(ro);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `file:` URI that names no database is refused exactly like a missing plain path: with the
+    /// same error, which quotes neither the URI nor the path it resolves to, and with nothing
+    /// created.
+    #[test]
+    fn open_on_a_missing_file_uri_errors_without_creating_it() {
+        let path = std::env::temp_dir().join(format!(
+            "zcashlc_migration_open_missing_uri_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let uri = format!("file://{}", path.display());
+        let uri_bytes = uri.as_bytes();
+        let account = [9u8; 16];
+        let err = unsafe {
+            open(
+                uri_bytes.as_ptr(),
+                uri_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .err()
+        .expect("open() must fail on a file URI that names no database");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error message: {err}"
+        );
+        assert!(
+            !err.to_string().contains(path.to_str().unwrap()),
+            "the refusal must not leak the database path: {err}"
+        );
+        assert!(
+            !err.to_string().contains(&uri),
+            "the refusal must not leak the database URI: {err}"
         );
         assert!(
             !path.exists(),
@@ -11120,6 +11229,23 @@ mod tests {
 
         let (present, ..) = read_progress(path_bytes, &account);
         assert!(!present, "a mined immediate run is consumed: absent");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The Swift SDK passes the database location to the FFI as a `file:` URI, so this pins the
+    /// real calling convention end to end: a read entry point over a URI opens the wallet it names
+    /// (the account the fixture created resolves) and, with no run stored, answers ABSENT.
+    #[test]
+    fn progress_accepts_a_file_uri_wallet_path() {
+        let path = init_fixture_db("zcashlc_progress_file_uri");
+        let account = create_fixture_account(&path);
+        let uri = format!("file://{}", path.display());
+
+        let (present, ..) = read_progress(uri.as_bytes(), &account);
+        assert!(
+            !present,
+            "a wallet with no stored run must report absent progress"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -162,19 +162,89 @@ pub(crate) fn anchor_retention_interval(network: NetworkParams) -> AnchorRetenti
 
 /// The busy_timeout every connection onto the wallet database file must use while the slipstream
 /// engine is a potential concurrent writer. Upstream sets none; a host write (or a migration-store
-/// call, see `migration::open_store_conn`) landing while the engine's writer holds the lock
-/// (`deleteAccount`/`importAccount` mid-pass, or a write-behind commit) would otherwise die with an
-/// instant SQLITE_BUSY instead of waiting. 15 s matches the engine's main-connection posture
-/// (wallet_session.rs). Behavior-neutral for the legacy engine: it has no concurrent writer to wait
-/// on, so the timeout never engages.
+/// call) landing while the engine's writer holds the lock (`deleteAccount`/`importAccount`
+/// mid-pass, or a write-behind commit) would otherwise die with an instant SQLITE_BUSY instead of
+/// waiting. 15 s matches the engine's main-connection posture (wallet_session.rs). Behavior-neutral
+/// for the legacy engine: it has no concurrent writer to wait on, so the timeout never engages.
 pub(crate) const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How [`wallet_db_connection`] may touch the wallet database file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalletDbAccess {
+    /// Reads and writes, through SQLite's default open, which creates the file when it is missing.
+    /// Only `zcashlc_init_data_database` may rely on that. A caller that must not create a wallet
+    /// first asks SQLite whether the database exists, through a [`WalletDbAccess::ReadOnly`] open,
+    /// which cannot create it. A filesystem check would not do, because the path may be a `file:`
+    /// URI, which only SQLite resolves.
+    ReadWrite,
+    /// Reads only. The connection can neither write to the file nor create it, so a pure read path
+    /// that strays into a write fails with `SQLITE_READONLY` instead of changing the wallet.
+    ReadOnly,
+}
+
+/// Opens a connection onto the wallet database at `path` with the setup a wallet handle needs:
+/// [`WALLET_DB_BUSY_TIMEOUT`], and the array module that [`WalletDb::from_connection`] requires to
+/// be loaded already. The handles [`wallet_db`] and [`wallet_db_read_only`] build, the migration
+/// store's connection, and the connection the block-rate read opens all come from here, so none of
+/// them can drift from the others' lock wait.
+///
+/// `path` may be a SQLite `file:` URI, which is what the Swift SDK passes, and both accesses open
+/// with the URI flag (the read-write one through rusqlite's default flags), so resolving one does
+/// not depend on how SQLite was compiled.
+pub(crate) fn wallet_db_connection(
+    path: &Path,
+    access: WalletDbAccess,
+) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = match access {
+        WalletDbAccess::ReadWrite => rusqlite::Connection::open(path)?,
+        WalletDbAccess::ReadOnly => rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?,
+    };
+    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)?;
+    rusqlite::vtab::array::load_module(&conn)?;
+    Ok(conn)
+}
+
+/// Builds a WalletDb value from path data provided over the FFI, over a connection that
+/// [`wallet_db_connection`] opens with `access`. [`wallet_db`] and [`wallet_db_read_only`] differ
+/// only in the access they pass, so a handle is put together the same way for both.
+///
+/// A failed open is labelled by `access`. The read-write label is the one [`wallet_db`]'s callers
+/// have always seen, so its error text does not change.
+///
+/// # Safety
+///
+/// Same contract as [`wallet_db`].
+unsafe fn wallet_db_with_access(
+    db_data: *const u8,
+    db_data_len: usize,
+    network: NetworkParams,
+    access: WalletDbAccess,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
+    let db_data = Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }));
+    let conn = wallet_db_connection(db_data, access).map_err(|e| match access {
+        WalletDbAccess::ReadWrite => anyhow!("Error opening wallet database connection: {}", e),
+        WalletDbAccess::ReadOnly => {
+            anyhow!("Error opening read-only wallet database connection: {}", e)
+        }
+    })?;
+    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng)
+        .with_anchor_retention_interval(anchor_retention_interval(network)))
+}
 
 /// Helper method for construcing a WalletDb value from path data provided over the FFI.
 ///
 /// The returned handle retains its durable anchor checkpoints on the interval
 /// [`anchor_retention_interval`] selects for `network`, which is also the grid the next pool
-/// migration planned over this wallet will anchor to. Every wallet handle the FFI hands out is
-/// built here, so the two cannot be configured inconsistently.
+/// migration planned over this wallet will anchor to. [`wallet_db_with_access`] builds the handles
+/// of both this function and [`wallet_db_read_only`], so that interval and that grid cannot be
+/// configured inconsistently.
 ///
 /// # Safety
 ///
@@ -189,19 +259,22 @@ unsafe fn wallet_db(
     db_data_len: usize,
     network: NetworkParams,
 ) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
-    let db_data = Path::new(OsStr::from_bytes(unsafe {
-        slice::from_raw_parts(db_data, db_data_len)
-    }));
-    // Mirror `WalletDb::for_path` (open + array vtab + wrap) but give the connection
-    // a busy_timeout first — see `WALLET_DB_BUSY_TIMEOUT` above for the rationale.
-    let conn = rusqlite::Connection::open(db_data)
-        .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))?;
-    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)
-        .map_err(|e| anyhow!("Error setting wallet database busy_timeout: {}", e))?;
-    rusqlite::vtab::array::load_module(&conn)
-        .map_err(|e| anyhow!("Error loading wallet database array module: {}", e))?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng)
-        .with_anchor_retention_interval(anchor_retention_interval(network)))
+    unsafe { wallet_db_with_access(db_data, db_data_len, network, WalletDbAccess::ReadWrite) }
+}
+
+/// Read-only twin of [`wallet_db`]: the same handle over a [`WalletDbAccess::ReadOnly`]
+/// connection, so neither the handle nor anything built on it can write to the wallet database,
+/// or create it.
+///
+/// # Safety
+///
+/// Same contract as [`wallet_db`].
+unsafe fn wallet_db_read_only(
+    db_data: *const u8,
+    db_data_len: usize,
+    network: NetworkParams,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
+    unsafe { wallet_db_with_access(db_data, db_data_len, network, WalletDbAccess::ReadOnly) }
 }
 
 /// Helper method for construcing a FsBlockDb value from path data provided over the FFI.
