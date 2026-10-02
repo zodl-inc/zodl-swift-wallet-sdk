@@ -37,9 +37,10 @@
 //!   the engine could not consult; [`migrate_legacy_invalid_marks`] folds any surviving rows into
 //!   the engine state once, on open, and drops the table.)
 //! - The immediate lane (an ordinary send-max sweep, entirely outside the engine) is tracked in
-//!   its own SDK-owned `sdk_immediate_runs` side table and surfaces ONLY through
-//!   [`zcashlc_migration_progress`]: while unmined it reports a 0-of-1 progress snapshot (flagged
-//!   `is_immediate`); once mined or expired it reports nothing. See that function's contract.
+//!   the SDK's own extension table ([`crate::ext_schema::IMMEDIATE_RUNS_TABLE`]) and surfaces
+//!   ONLY through [`zcashlc_migration_progress`]: while unmined it reports a 0-of-1 progress
+//!   snapshot (flagged `is_immediate`); once mined or expired it reports nothing. See that
+//!   function's contract.
 //!
 //! Consent contract: plan details never cross the FFI boundary inward. Each propose/prepare call
 //! caches its plan under an opaque [`migration_plan_cache::PlanHandle`] (returned to the platform
@@ -84,6 +85,7 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::{InputSource, OutputLockStore, WalletRead};
 use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
+use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::{
     Error as PoolMigrationStoreError, PoolMigrations,
 };
@@ -113,6 +115,7 @@ use zcash_pool_migration::state::{
 };
 use zcash_pool_migration::wallet::WalletMigrationProver;
 
+use crate::ext_schema::IMMEDIATE_RUNS_TABLE;
 use crate::migration_engine::{
     AdapterError, MigrationWallet, account_migration, account_migration_with, account_store,
     planning_inputs, stored_orchard_fvk,
@@ -305,18 +308,14 @@ unsafe fn wallet_db_read_only(
 }
 
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
-/// drops it at the end (no persistent handle). `open()` itself never creates the wallet database
-/// file, and creates none of the wallet schema: ALL of that comes ONLY from `init_data_db`'s
-/// migrations, run beforehand by the caller -- the engine's store tables by
-/// `zcash_client_sqlite`'s own migration graph (`zcash_client_sqlite::pool_migration` registers
-/// them), and the SDK's extension tables by the external migrations in [`crate::ext_schema`]. The
-/// one thing this function DOES create is its own `sdk_immediate_runs` side table, lazily, and
-/// only once the wallet schema (an `accounts` table) is confirmed present. The guard against both
-/// is ordering, not a separate pre-check: the no-`SQLITE_OPEN_CREATE` [`open_store_conn`] is
-/// opened, and the wallet schema probed, BEFORE the CREATE-capable `crate::wallet_db` handle is
-/// opened at all -- a path that does not exist, or an existing file with no wallet schema, errors
-/// out of one of those two steps instead of ever reaching the call that could manufacture a file or
-/// a lone `sdk_immediate_runs` table later mistaken for an initialized wallet (MOB-1975).
+/// drops it at the end (no persistent handle). `open()` creates neither the wallet database file
+/// nor any of its schema: all of that comes ONLY from `init_data_db`'s migrations, run beforehand
+/// by the caller -- the engine's store tables by `zcash_client_sqlite`'s own migration graph
+/// (`zcash_client_sqlite::pool_migration` registers them), and the SDK's extension tables by the
+/// external migrations in [`crate::ext_schema`]. The no-`SQLITE_OPEN_CREATE` [`open_store_conn`]
+/// is opened, and the wallet schema probed, BEFORE the CREATE-capable `crate::wallet_db` handle,
+/// so a path that does not exist, or a file with no wallet schema, errors out instead of
+/// reaching the call that could create a file there (MOB-1975).
 ///
 /// # Safety
 /// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
@@ -351,8 +350,6 @@ unsafe fn open(
         ));
     }
     let wallet = unsafe { crate::wallet_db(db_data, db_data_len, network.clone())? };
-    init_immediate_runs(&store_conn)
-        .map_err(|e| anyhow!("Error initializing immediate-run table: {e}"))?;
     // One-time: fold any legacy invalid-marks rows into the engine state and drop their table
     // (a no-op existence probe once done — see the function's doc).
     let fully_scanned_height = wallet
@@ -374,11 +371,9 @@ unsafe fn open(
     })
 }
 
-/// Read-only twin of [`open`]: both connections opened `SQLITE_OPEN_READ_ONLY`, and the two
-/// preamble writers deliberately skipped — `init_immediate_runs` (its table is created by any
-/// rw migration call; pure readers tolerate its absence via
-/// [`immediate_run_row_if_table_exists`]) and `migrate_legacy_invalid_marks` (a one-time fold
-/// only rw callers may perform). The pure read entry points open through this; see
+/// Read-only twin of [`open`]: both connections opened `SQLITE_OPEN_READ_ONLY`, and the one
+/// preamble writer deliberately skipped — `migrate_legacy_invalid_marks` (a one-time fold only rw
+/// callers may perform). The pure read entry points open through this; see
 /// `open_store_conn_read_only` for what that enforces.
 ///
 /// # Safety
@@ -546,29 +541,20 @@ fn migrate_legacy_invalid_marks(
 //
 // The immediate lane (an ordinary send-max sweep to the account's own unified address, built
 // entirely outside the engine — see `zcashlc_propose_send_max_transfer`) has no engine-tracked
-// plan, preparation, or schedule at all: from the engine's point of view nothing happened. This
-// one-row-per-account table is the SDK's own record that a sweep was broadcast, so
-// `zcashlc_migration_progress` can still report its progress the way an engine-tracked transfer
-// would: the stored txid is resolved against the wallet database's own transaction history by
-// `resolve_immediate_run` (mined or expired -> no progress, unmined -> pending 0 of 1) — the same
-// kind of wallet-DB access `reconcile_mined` uses to advance an engine-tracked transaction from
-// `Broadcast` to `Mined`, here extended to also read the expiry height that `WalletRead` does not
-// expose on its own. See `zcashlc_migration_progress`'s contract for how this interacts with an
-// engine-tracked run (an active engine run always wins; a terminal or absent one defers here).
-
-fn init_immediate_runs(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sdk_immediate_runs (
-            account_uuid BLOB NOT NULL PRIMARY KEY,
-            txid BLOB NOT NULL,
-            recorded_at_height INTEGER NOT NULL
-        )",
-    )
-}
+// plan, preparation, or schedule at all: from the engine's point of view nothing happened. The
+// SDK's own extension table, `IMMEDIATE_RUNS_TABLE` (one row per account, created by
+// `init_data_db`'s external migrations — see `crate::ext_schema`), records that a sweep was
+// broadcast, so `zcashlc_migration_progress` can still report its progress the way an
+// engine-tracked transfer would: the stored txid is resolved against the wallet's own record of
+// the transaction by `resolve_immediate_run` (mined or expired -> no progress, unmined -> pending
+// 0 of 1). The record is read and written only through `WalletDb::transactionally_with_extension`,
+// whose authorizer confines writes to the `ext_` namespace and refuses schema changes. See
+// `zcashlc_migration_progress`'s contract for how this interacts with an engine-tracked run (an
+// active engine run always wins; a terminal or absent one defers here).
 
 /// One stored immediate-run record: the account's swept txid and the wallet's tip height at
 /// record time (the fallback expiry bound [`ImmediateRunLookup::expiry_bound`] uses when the
-/// wallet database does not know, or no longer knows, the transaction's real expiry height).
+/// wallet does not know, or no longer knows, the transaction's real expiry height).
 struct ImmediateRunRow {
     txid: [u8; 32],
     recorded_at_height: BlockHeight,
@@ -577,87 +563,86 @@ struct ImmediateRunRow {
 /// Persists the account's immediate-run record, replacing any previous one: only the most
 /// recently broadcast immediate sweep is ever tracked (one row per account).
 fn record_immediate_run(
-    conn: &Connection,
+    wallet: &mut MigrationWallet,
     account: &[u8; 16],
     txid: [u8; 32],
     recorded_at_height: BlockHeight,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO sdk_immediate_runs (account_uuid, txid, recorded_at_height)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![&account[..], &txid[..], u32::from(recorded_at_height)],
-    )?;
-    Ok(())
+) -> anyhow::Result<()> {
+    wallet.transactionally_with_extension(|_wdb, ext| {
+        ext.execute(
+            &format!(
+                "INSERT INTO {IMMEDIATE_RUNS_TABLE} (account_uuid, txid, recorded_at_height)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_uuid) DO UPDATE SET
+                     txid = excluded.txid,
+                     recorded_at_height = excluded.recorded_at_height"
+            ),
+            rusqlite::params![&account[..], &txid[..], u32::from(recorded_at_height)],
+        )?;
+        Ok(())
+    })
 }
 
-/// The account's raw immediate-run row, if any. Cheap (touches only this SDK-owned table), so
+/// The account's raw immediate-run row, if any. Cheap (one keyed read of the SDK's own table), so
 /// callers can check for a row's existence before paying for a wallet-database chain-tip lookup
 /// (which errors on a not-yet-synced wallet — see the caller in `zcashlc_migration_progress`).
 fn immediate_run_row(
-    conn: &Connection,
+    wallet: &mut MigrationWallet,
     account: &[u8; 16],
-) -> rusqlite::Result<Option<ImmediateRunRow>> {
-    conn.query_row(
-        "SELECT txid, recorded_at_height FROM sdk_immediate_runs WHERE account_uuid = ?1",
-        rusqlite::params![&account[..]],
-        |row| {
-            Ok(ImmediateRunRow {
-                txid: row.get(0)?,
-                recorded_at_height: BlockHeight::from(row.get::<_, u32>(1)?),
-            })
-        },
-    )
-    .optional()
-}
-
-/// [`immediate_run_row`] for the READ-ONLY paths: `sdk_immediate_runs` is created lazily by the
-/// rw [`open`], so a wallet whose migration surface has only ever been READ (fresh install,
-/// UI-before-first-drive) legitimately lacks the table — that is the "no immediate run recorded"
-/// answer, not an error.
-fn immediate_run_row_if_table_exists(
-    conn: &Connection,
-    account: &[u8; 16],
-) -> rusqlite::Result<Option<ImmediateRunRow>> {
-    match immediate_run_row(conn, account) {
-        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
-            if msg.contains("no such table: sdk_immediate_runs") =>
-        {
-            let _ = e;
-            Ok(None)
-        }
-        other => other,
-    }
-}
-
-/// Resolves an immediate-run row against the wallet database's own `transactions` table: the same
-/// underlying table [`reconcile_mined`] reads (via `WalletRead::get_tx_height`) to advance
-/// engine-tracked transactions from `Broadcast` to `Mined`, queried directly here because
-/// `WalletRead` does not expose the expiry height the immediate-run derivation also needs. A
-/// mined height beyond the current tip is filtered out (a stale/optimistic row), mirroring
-/// `zcash_client_sqlite::wallet::get_tx_height`'s own guard; an `expiry_height` of exactly zero
-/// (the wire convention for "no real expiry") is treated the same as a missing one, so it falls
-/// back to the recorded-height bound below rather than reading as "expired since block zero".
-fn resolve_immediate_run(
-    conn: &Connection,
-    row: ImmediateRunRow,
-    tip: BlockHeight,
-) -> rusqlite::Result<ImmediateRunLookup> {
-    let found = conn
-        .query_row(
-            "SELECT mined_height, expiry_height FROM transactions WHERE txid = ?1",
-            rusqlite::params![&row.txid[..]],
-            |r| {
-                let mined: Option<u32> = r.get(0)?;
-                let expiry: Option<u32> = r.get(1)?;
-                Ok((mined.map(BlockHeight::from), expiry.map(BlockHeight::from)))
+) -> anyhow::Result<Option<ImmediateRunRow>> {
+    wallet.transactionally_with_extension(|_wdb, ext| {
+        ext.query_row(
+            &format!(
+                "SELECT txid, recorded_at_height FROM {IMMEDIATE_RUNS_TABLE}
+                 WHERE account_uuid = ?1"
+            ),
+            rusqlite::params![&account[..]],
+            |row| {
+                Ok(ImmediateRunRow {
+                    txid: row.get(0)?,
+                    recorded_at_height: BlockHeight::from(row.get::<_, u32>(1)?),
+                })
             },
         )
-        .optional()?;
-    let (mined_height, expiry_height) = found.unwrap_or((None, None));
+        .optional()
+        .map_err(anyhow::Error::from)
+    })
+}
+
+/// Resolves an immediate-run row against the wallet's own record of the swept transaction,
+/// through the wallet's read API rather than its tables: [`WalletRead::get_tx_height`] for the
+/// mined height (which already treats a height beyond the chain tip as unmined, so a stale or
+/// optimistic record cannot report the sweep consumed), and [`WalletRead::get_transaction`] for
+/// the expiry height the transaction itself carries. That expiry reads as unknown, so the
+/// recorded-height bound applies instead, when it is exactly zero (the encoding for "no real
+/// expiry", which must not read as "expired since block zero") or when the wallet holds no copy
+/// of the transaction it can parse. The latter includes every unmined transaction with no real
+/// expiry, because `zcash_client_sqlite` cannot tell which consensus branch to read such a
+/// transaction under. Database failures still error.
+fn resolve_immediate_run(
+    wallet: &MigrationWallet,
+    row: ImmediateRunRow,
+) -> anyhow::Result<ImmediateRunLookup> {
+    let txid = TxId::from_bytes(row.txid);
+    let mined_height = wallet
+        .get_tx_height(txid)
+        .map_err(|e| anyhow!("mined-height lookup failed: {e}"))?;
+    let expiry_height = match wallet.get_transaction(txid) {
+        Ok(tx) => tx
+            .map(|tx| tx.expiry_height())
+            .filter(|height| u32::from(*height) > 0),
+        // The wallet reports "I hold no copy of this transaction I can parse" as an error rather
+        // than as `None`: `CorruptedData` for an unmined transaction with no real expiry, which
+        // it cannot pick a consensus branch for, and `Io` for bytes that do not parse. Either
+        // way the expiry is merely unknown, which is what the recorded-height bound exists for,
+        // so neither may fail the lookup. A database failure is a real fault and still does.
+        Err(SqliteClientError::CorruptedData(_) | SqliteClientError::Io(_)) => None,
+        Err(e) => return Err(anyhow!("expiry lookup failed: {e}")),
+    };
     Ok(ImmediateRunLookup {
         recorded_at_height: row.recorded_at_height,
-        mined_height: mined_height.filter(|h| *h <= tip),
-        expiry_height: expiry_height.filter(|h| u32::from(*h) > 0),
+        mined_height,
+        expiry_height,
     })
 }
 
@@ -2833,7 +2818,7 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
         }
         // No active engine run (none stored, or terminal): the immediate lane is the only thing
         // left that could report progress.
-        let immediate_row = immediate_run_row_if_table_exists(&ctx.store_conn, &ctx.account_bytes)
+        let immediate_row = immediate_run_row(&mut ctx.wallet, &ctx.account_bytes)
             .map_err(|e| anyhow!("immediate run read failed: {e}"))?;
         let Some(row) = immediate_row else {
             // No row either: absent, and (crucially) with no chain-tip lookup, which a
@@ -2841,7 +2826,7 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
             return Ok(Box::into_raw(Box::new(FfiMigrationProgress::absent())));
         };
         let tip = ctx.tip()?;
-        let run = resolve_immediate_run(&ctx.store_conn, row, tip)
+        let run = resolve_immediate_run(&ctx.wallet, row)
             .map_err(|e| anyhow!("wallet transaction lookup failed: {e}"))?;
         let value = if immediate_run_pending(&run, tip) {
             FfiMigrationProgress {
@@ -4007,8 +3992,7 @@ pub unsafe extern "C" fn zcashlc_migration_record_transfer_result(
 /// plan cache). The immediate lane surfaces ONLY through [`zcashlc_migration_progress`]: a
 /// pending (unmined, unexpired) recorded sweep reports a `0` of `1` snapshot flagged
 /// `is_immediate`; once mined or expired it reports nothing (mined = consumed, expired = the
-/// banner re-offers). One row per account: a new record supersedes any previous one (INSERT OR
-/// REPLACE).
+/// banner re-offers). One row per account: a new record supersedes any previous one (an upsert).
 ///
 /// # Safety
 /// See [`open`]; `txid_bytes` must be valid for reads of 32 bytes.
@@ -4021,7 +4005,7 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
     txid_bytes: *const u8,
 ) -> bool {
     let res = catch_panic(|| {
-        let ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
+        let mut ctx = unsafe { open(db_data, db_data_len, account_uuid_bytes, network_id)? };
         if txid_bytes.is_null() {
             return Err(anyhow!("txid_bytes is null"));
         }
@@ -4029,7 +4013,7 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
             .try_into()
             .expect("length 32 by construction");
         let tip = ctx.tip()?;
-        record_immediate_run(&ctx.store_conn, &ctx.account_bytes, txid, tip)
+        record_immediate_run(&mut ctx.wallet, &ctx.account_bytes, txid, tip)
             .map_err(|e| anyhow!("immediate run record failed: {e}"))?;
         Ok(true)
     });
@@ -7595,167 +7579,298 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A wallet handle onto the fixture database at `path`, opened exactly as the FFI opens one.
+    fn fixture_wallet(path: &std::path::Path) -> MigrationWallet {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let network = parse_network(NETWORK_ID_MAINNET).expect("mainnet parses");
+        unsafe { crate::wallet_db(path_bytes.as_ptr(), path_bytes.len(), network) }
+            .expect("the fixture wallet opens")
+    }
+
+    /// Every table in the existing database at `path`, sorted: the before-and-after evidence that
+    /// a call created no schema. Only call it on a file that exists, since opening a missing path
+    /// would create it.
+    fn table_names(path: &std::path::Path) -> Vec<String> {
+        let conn = Connection::open(path).expect("the fixture database reopens");
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("the schema listing prepares");
+        stmt.query_map([], |row| row.get(0))
+            .expect("the schema listing runs")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("the schema listing reads")
+    }
+
+    /// A minimal v5 transaction, with no inputs or outputs, that expires at `expiry_height`:
+    /// enough for `WalletRead::get_transaction` to parse back, which is all the immediate-run
+    /// resolution asks of it. A v5 transaction carries its consensus branch itself, so the
+    /// branch chosen here does not have to match the height it is stored at.
+    fn fixture_raw_transaction(expiry_height: u32) -> (TxId, Vec<u8>) {
+        use zcash_primitives::transaction::{Authorized, TransactionData, TxVersion};
+        use zcash_protocol::consensus::BranchId;
+
+        let tx = TransactionData::<Authorized>::from_parts(
+            TxVersion::V5,
+            BranchId::Nu6,
+            0,
+            BlockHeight::from_u32(expiry_height),
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .expect("the fixture transaction freezes");
+        let mut raw = Vec::new();
+        tx.write(&mut raw)
+            .expect("the fixture transaction serializes");
+        (tx.txid(), raw)
+    }
+
+    /// Inserts the wallet's own record of a transaction into the fixture wallet's `transactions`
+    /// table, which `WalletRead::get_tx_height` and `WalletRead::get_transaction` read back.
+    fn insert_fixture_wallet_transaction(
+        path: &std::path::Path,
+        txid: TxId,
+        raw: Option<&[u8]>,
+        mined_height: Option<u32>,
+        expiry_height: Option<u32>,
+    ) {
+        let conn = Connection::open(path).expect("the fixture connection opens");
+        conn.execute(
+            "INSERT INTO transactions (txid, raw, mined_height, expiry_height, min_observed_height)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                &txid.as_ref()[..],
+                raw,
+                mined_height,
+                expiry_height,
+                mined_height.unwrap_or(0)
+            ],
+        )
+        .expect("the fixture transaction row inserts");
+    }
+
     #[test]
     fn immediate_run_row_round_trip() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
+        let path = init_fixture_db("zcashlc_immediate_run_round_trip");
+        let mut wallet = fixture_wallet(&path);
         let account = [9u8; 16];
-        assert!(immediate_run_row(&conn, &account).unwrap().is_none());
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        let row = immediate_run_row(&conn, &account).unwrap().unwrap();
+        assert!(immediate_run_row(&mut wallet, &account).unwrap().is_none());
+        record_immediate_run(&mut wallet, &account, [1u8; 32], h(100)).unwrap();
+        let row = immediate_run_row(&mut wallet, &account).unwrap().unwrap();
         assert_eq!(row.txid, [1u8; 32]);
         assert_eq!(row.recorded_at_height, h(100));
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn immediate_run_record_replaces_the_previous_one() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
+        let path = init_fixture_db("zcashlc_immediate_run_replaces");
+        let mut wallet = fixture_wallet(&path);
         let account = [9u8; 16];
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        record_immediate_run(&conn, &account, [2u8; 32], h(150)).unwrap();
+        record_immediate_run(&mut wallet, &account, [1u8; 32], h(100)).unwrap();
+        record_immediate_run(&mut wallet, &account, [2u8; 32], h(150)).unwrap();
         // One row per account: the second record supersedes the first entirely.
-        let row = immediate_run_row(&conn, &account).unwrap().unwrap();
+        let row = immediate_run_row(&mut wallet, &account).unwrap().unwrap();
         assert_eq!(row.txid, [2u8; 32]);
         assert_eq!(row.recorded_at_height, h(150));
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn immediate_run_rows_are_isolated_per_account() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_immediate_runs(&conn).unwrap();
+        let path = init_fixture_db("zcashlc_immediate_run_per_account");
+        let mut wallet = fixture_wallet(&path);
         let account = [9u8; 16];
         let other = [8u8; 16];
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        record_immediate_run(&conn, &other, [2u8; 32], h(200)).unwrap();
+        record_immediate_run(&mut wallet, &account, [1u8; 32], h(100)).unwrap();
+        record_immediate_run(&mut wallet, &other, [2u8; 32], h(200)).unwrap();
         assert_eq!(
-            immediate_run_row(&conn, &account).unwrap().unwrap().txid,
+            immediate_run_row(&mut wallet, &account)
+                .unwrap()
+                .unwrap()
+                .txid,
             [1u8; 32]
         );
         assert_eq!(
-            immediate_run_row(&conn, &other).unwrap().unwrap().txid,
+            immediate_run_row(&mut wallet, &other)
+                .unwrap()
+                .unwrap()
+                .txid,
             [2u8; 32]
         );
         // Replacing one account's row must not disturb the other's.
-        record_immediate_run(&conn, &account, [3u8; 32], h(300)).unwrap();
+        record_immediate_run(&mut wallet, &account, [3u8; 32], h(300)).unwrap();
         assert_eq!(
-            immediate_run_row(&conn, &account).unwrap().unwrap().txid,
+            immediate_run_row(&mut wallet, &account)
+                .unwrap()
+                .unwrap()
+                .txid,
             [3u8; 32]
         );
         assert_eq!(
-            immediate_run_row(&conn, &other).unwrap().unwrap().txid,
+            immediate_run_row(&mut wallet, &other)
+                .unwrap()
+                .unwrap()
+                .txid,
             [2u8; 32]
         );
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
     }
 
+    /// The swept transaction is resolved through the wallet's own read API: its mined height from
+    /// `WalletRead::get_tx_height`, its expiry from the transaction `WalletRead::get_transaction`
+    /// parses back, and neither for a txid the wallet has never seen.
     #[test]
-    fn resolve_immediate_run_reads_mined_and_expiry_from_transactions_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        // A minimal stand-in for zcash_client_sqlite's `transactions` table: just the two columns
-        // `resolve_immediate_run`'s query reads (see `zcash_client_sqlite::wallet::get_tx_height`
-        // for the upstream query this mirrors and extends).
-        conn.execute_batch(
-            "CREATE TABLE transactions (txid BLOB PRIMARY KEY, mined_height INTEGER, expiry_height INTEGER)",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, ?2, ?3)",
-            rusqlite::params![&[1u8; 32][..], 150u32, 200u32],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, NULL, ?2)",
-            rusqlite::params![&[2u8; 32][..], 500u32],
-        )
-        .unwrap();
+    fn resolve_immediate_run_reads_mined_height_and_expiry_from_the_wallet() {
+        let path = init_fixture_db("zcashlc_resolve_immediate_run");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        create_fixture_account(&path);
+        // A chain tip at 3,600,000: `get_tx_height` bounds every answer by it.
+        set_fixture_tip(path_bytes);
+        let (mined_txid, mined_raw) = fixture_raw_transaction(3_500_200);
+        insert_fixture_wallet_transaction(
+            &path,
+            mined_txid,
+            Some(&mined_raw),
+            Some(3_500_150),
+            Some(3_500_200),
+        );
+        let (pending_txid, pending_raw) = fixture_raw_transaction(3_600_500);
+        insert_fixture_wallet_transaction(
+            &path,
+            pending_txid,
+            Some(&pending_raw),
+            None,
+            Some(3_600_500),
+        );
+        let wallet = fixture_wallet(&path);
 
         let mined = resolve_immediate_run(
-            &conn,
+            &wallet,
             ImmediateRunRow {
-                txid: [1u8; 32],
-                recorded_at_height: h(100),
+                txid: *mined_txid.as_ref(),
+                recorded_at_height: h(3_500_100),
             },
-            h(300),
         )
         .unwrap();
-        assert_eq!(mined.mined_height, Some(h(150)));
-        assert_eq!(mined.expiry_height, Some(h(200)));
+        assert_eq!(mined.mined_height, Some(h(3_500_150)));
+        assert_eq!(mined.expiry_height, Some(h(3_500_200)));
 
-        let unmined = resolve_immediate_run(
-            &conn,
+        let pending = resolve_immediate_run(
+            &wallet,
             ImmediateRunRow {
-                txid: [2u8; 32],
-                recorded_at_height: h(100),
+                txid: *pending_txid.as_ref(),
+                recorded_at_height: h(3_599_000),
             },
-            h(300),
         )
         .unwrap();
-        assert_eq!(unmined.mined_height, None);
-        assert_eq!(unmined.expiry_height, Some(h(500)));
+        assert_eq!(pending.mined_height, None);
+        assert_eq!(pending.expiry_height, Some(h(3_600_500)));
 
-        // A txid the wallet has never observed at all: both columns resolve to None.
         let unknown = resolve_immediate_run(
-            &conn,
+            &wallet,
             ImmediateRunRow {
                 txid: [9u8; 32],
-                recorded_at_height: h(100),
+                recorded_at_height: h(3_599_000),
             },
-            h(300),
         )
         .unwrap();
         assert_eq!(unknown.mined_height, None);
         assert_eq!(unknown.expiry_height, None);
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
     }
 
+    /// A mined height beyond the chain tip is a stale or optimistic record and must not report the
+    /// sweep consumed. An expiry of zero means "no real expiry" and must read as unknown, so the
+    /// recorded-height fallback bound applies rather than "expired since block zero".
     #[test]
-    fn resolve_immediate_run_filters_future_mined_height_and_zero_expiry_sentinel() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE transactions (txid BLOB PRIMARY KEY, mined_height INTEGER, expiry_height INTEGER)",
-        )
-        .unwrap();
-        // A mined_height beyond the current tip is a stale/optimistic row (mirrors
-        // `zcash_client_sqlite::wallet::get_tx_height`'s own guard) and must not report Complete.
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, ?2, ?3)",
-            rusqlite::params![&[1u8; 32][..], 500u32, 600u32],
-        )
-        .unwrap();
-        // expiry_height = 0 is the wire "no real expiry" sentinel; treated the same as missing so
-        // it does not fool the expiry check into firing immediately.
-        conn.execute(
-            "INSERT INTO transactions (txid, mined_height, expiry_height) VALUES (?1, NULL, 0)",
-            rusqlite::params![&[2u8; 32][..]],
-        )
-        .unwrap();
+    fn resolve_immediate_run_ignores_a_mined_height_beyond_the_tip_and_a_zero_expiry() {
+        let path = init_fixture_db("zcashlc_resolve_immediate_run_bounds");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let (future_txid, future_raw) = fixture_raw_transaction(3_700_100);
+        insert_fixture_wallet_transaction(
+            &path,
+            future_txid,
+            Some(&future_raw),
+            Some(3_700_000),
+            Some(3_700_100),
+        );
+        let (no_expiry_txid, no_expiry_raw) = fixture_raw_transaction(0);
+        insert_fixture_wallet_transaction(
+            &path,
+            no_expiry_txid,
+            Some(&no_expiry_raw),
+            Some(3_500_000),
+            Some(0),
+        );
+        let wallet = fixture_wallet(&path);
 
-        let future_mined = resolve_immediate_run(
-            &conn,
+        let future = resolve_immediate_run(
+            &wallet,
             ImmediateRunRow {
-                txid: [1u8; 32],
-                recorded_at_height: h(100),
+                txid: *future_txid.as_ref(),
+                recorded_at_height: h(3_599_000),
             },
-            h(300),
         )
         .unwrap();
         assert_eq!(
-            future_mined.mined_height, None,
-            "a mined height beyond tip must be filtered out"
+            future.mined_height, None,
+            "a mined height beyond the tip must be filtered out"
         );
 
-        let zero_expiry = resolve_immediate_run(
-            &conn,
+        let no_expiry = resolve_immediate_run(
+            &wallet,
             ImmediateRunRow {
-                txid: [2u8; 32],
-                recorded_at_height: h(100),
+                txid: *no_expiry_txid.as_ref(),
+                recorded_at_height: h(3_499_000),
             },
-            h(300),
         )
         .unwrap();
         assert_eq!(
-            zero_expiry.expiry_height, None,
-            "expiry_height=0 must read as missing"
+            no_expiry.expiry_height, None,
+            "an expiry of zero must read as unknown"
         );
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unmined transaction with no real expiry is the one `WalletRead::get_transaction` will not
+    /// parse back: with neither a mined height nor an expiry to choose a consensus branch under,
+    /// the wallet reports it as corrupted data. That must read as an unknown expiry, so the
+    /// recorded-height fallback bound applies, rather than fail every progress read.
+    #[test]
+    fn resolve_immediate_run_falls_back_for_an_unmined_transaction_with_no_expiry() {
+        let path = init_fixture_db("zcashlc_resolve_immediate_run_unmined_no_expiry");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        create_fixture_account(&path);
+        set_fixture_tip(path_bytes);
+        let (txid, raw) = fixture_raw_transaction(0);
+        insert_fixture_wallet_transaction(&path, txid, Some(&raw), None, Some(0));
+        let wallet = fixture_wallet(&path);
+
+        let lookup = resolve_immediate_run(
+            &wallet,
+            ImmediateRunRow {
+                txid: *txid.as_ref(),
+                recorded_at_height: h(3_599_000),
+            },
+        )
+        .expect("an unmined transaction with no expiry must still resolve");
+        assert_eq!(lookup.mined_height, None);
+        assert_eq!(
+            lookup.expiry_height, None,
+            "an unmined transaction with no expiry must read as unknown"
+        );
+        drop(wallet);
+        let _ = std::fs::remove_file(&path);
     }
 
     // ----- read-only open helpers (Q2-1 enforcement) -----
@@ -7765,19 +7880,14 @@ mod tests {
     /// including after future pin moves change what the engine calls do internally.
     #[test]
     fn read_only_store_conn_rejects_writes() {
-        let path = std::env::temp_dir().join(format!(
-            "zcashlc_readonly_store_{}.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        {
-            let rw = Connection::open(&path).unwrap();
-            init_immediate_runs(&rw).unwrap();
-        }
+        let path = init_fixture_db("zcashlc_readonly_store");
         let ro = open_store_conn_read_only(&path).unwrap();
         let err = ro
             .execute(
-                "INSERT INTO sdk_immediate_runs (account_uuid, txid, recorded_at_height) VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT INTO {IMMEDIATE_RUNS_TABLE} (account_uuid, txid, recorded_at_height)
+                     VALUES (?1, ?2, ?3)"
+                ),
                 rusqlite::params![&[9u8; 16][..], &[1u8; 32][..], 100i64],
             )
             .unwrap_err();
@@ -7844,14 +7954,14 @@ mod tests {
         );
     }
 
-    /// An existing file with no wallet schema at all (not even `init_data_db` has ever touched
-    /// it) must make `open()` error, and must NOT let it create the SDK-owned
-    /// `sdk_immediate_runs` side table -- exactly that combination (a stray table, no `accounts`)
-    /// is what made the app treat an empty file as an initialized wallet.
+    /// A read-write migration call on a file that exists but holds no wallet schema (a stray
+    /// table, nothing `init_data_db` ever wrote) must fail and leave the file exactly as it found
+    /// it: not one table of the wallet's, and none of the SDK's. That combination, a stray table
+    /// and no `accounts`, is what made the app treat an empty file as an initialized wallet.
     #[test]
-    fn rw_open_on_a_schemaless_database_creates_no_immediate_runs_table() {
+    fn rw_migration_calls_on_a_schemaless_database_create_nothing() {
         let path = std::env::temp_dir().join(format!(
-            "zcashlc_migration_open_schemaless_{}.sqlite",
+            "zcashlc_migration_schemaless_{}.sqlite",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -7860,61 +7970,58 @@ mod tests {
             conn.execute("CREATE TABLE sdk_stray (x INTEGER)", [])
                 .expect("the stray table creates");
         }
-
+        let before = table_names(&path);
         let path_bytes = path.to_str().unwrap().as_bytes();
-        let account_bytes = [9u8; 16];
-        let err = unsafe {
-            open(
+        let account = [9u8; 16];
+        let txid = [1u8; 32];
+
+        let recorded = unsafe {
+            zcashlc_migration_record_immediate_run(
                 path_bytes.as_ptr(),
                 path_bytes.len(),
-                account_bytes.as_ptr(),
+                account.as_ptr(),
                 NETWORK_ID_MAINNET,
+                txid.as_ptr(),
             )
-        }
-        .err()
-        .expect("open() must fail on a database with no wallet schema");
-        assert!(
-            err.to_string().contains("no wallet schema"),
-            "unexpected error message: {err}"
-        );
+        };
+        assert!(!recorded, "recording on a schemaless database must fail");
+        assert!(ffi_helpers::error_handling::take_last_error().is_some());
 
-        let conn = Connection::open(&path).expect("the fixture database reopens");
-        let has_immediate_runs: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sdk_immediate_runs')",
-                [],
-                |row| row.get(0),
+        let step = unsafe {
+            zcashlc_migration_advance_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                -1,
             )
-            .expect("the existence probe succeeds");
+        };
         assert!(
-            !has_immediate_runs,
-            "open() must not create sdk_immediate_runs on a database with no wallet schema"
+            step.is_null(),
+            "advancing on a schemaless database must fail"
+        );
+        assert!(ffi_helpers::error_handling::take_last_error().is_some());
+
+        assert_eq!(
+            table_names(&path),
+            before,
+            "a failed migration call must not create any table"
         );
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `open()` on an already-initialized wallet database (a real `accounts` table, from
-    /// `WalletDb::for_path` + `init_wallet_db`, the same fixture pattern `retained_marks.rs` uses)
-    /// still succeeds, and still creates `sdk_immediate_runs` lazily -- the one case that must
-    /// keep working exactly as before.
+    /// `open()` on an initialized wallet succeeds and leaves the schema exactly as it found it:
+    /// every table it relies on, the SDK's immediate-run record included, came from
+    /// `init_data_db`.
     #[test]
-    fn rw_open_on_an_initialized_wallet_still_works() {
-        use zcash_client_sqlite::WalletDb;
-        use zcash_client_sqlite::wallet::init::init_wallet_db;
-        use zcash_protocol::consensus::MAIN_NETWORK;
-
-        let path = std::env::temp_dir().join(format!(
-            "zcashlc_migration_open_initialized_{}.sqlite",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        {
-            let mut db = WalletDb::for_path(&path, MAIN_NETWORK, SystemClock, OsRng)
-                .expect("the wallet database must open");
-            init_wallet_db(&mut db, None).expect("initializes the wallet schema");
-        }
-
+    fn rw_open_on_an_initialized_wallet_creates_nothing() {
+        let path = init_fixture_db("zcashlc_migration_open_initialized");
         let path_bytes = path.to_str().unwrap().as_bytes();
+        let before = table_names(&path);
+        assert!(
+            before.iter().any(|name| name == IMMEDIATE_RUNS_TABLE),
+            "init_data_db creates the immediate-run record"
+        );
         let account_bytes = [9u8; 16];
         let ctx = unsafe {
             open(
@@ -7924,45 +8031,14 @@ mod tests {
                 NETWORK_ID_MAINNET,
             )
         }
-        .expect("open() on an already-initialized wallet must succeed");
+        .expect("open() on an initialized wallet must succeed");
         drop(ctx);
-
-        let conn = Connection::open(&path).expect("the fixture database reopens");
-        let has_immediate_runs: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sdk_immediate_runs')",
-                [],
-                |row| row.get(0),
-            )
-            .expect("the existence probe succeeds");
-        assert!(
-            has_immediate_runs,
-            "open() on an initialized wallet must still create sdk_immediate_runs"
+        assert_eq!(
+            table_names(&path),
+            before,
+            "open() must not create any table"
         );
         let _ = std::fs::remove_file(&path);
-    }
-
-    /// The pure `zcashlc_migration_progress` path may run before any rw migration call ever
-    /// created `sdk_immediate_runs` (the table is created lazily by the rw `open()`, not by the
-    /// schema graph) — the tolerant reader answers None instead of erroring on the missing table.
-    #[test]
-    fn immediate_run_row_if_table_exists_tolerates_a_missing_table() {
-        let conn = Connection::open_in_memory().unwrap();
-        let account = [9u8; 16];
-        assert!(
-            immediate_run_row_if_table_exists(&conn, &account)
-                .unwrap()
-                .is_none()
-        );
-        init_immediate_runs(&conn).unwrap();
-        record_immediate_run(&conn, &account, [1u8; 32], h(100)).unwrap();
-        assert_eq!(
-            immediate_run_row_if_table_exists(&conn, &account)
-                .unwrap()
-                .unwrap()
-                .txid,
-            [1u8; 32]
-        );
     }
 
     /// The accepted semantic shift, pinned: a pure statuses read reports what is PERSISTED — a
