@@ -22,7 +22,7 @@ use std::sync::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use slipstream_core::ohttp::{Dialer, http_round_trip};
+use slipstream_core::ohttp::{Dialer, http_round_trip, http_round_trip_with_dispatch};
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
@@ -464,19 +464,17 @@ impl RouteHttp for OhttpRoute {
             let method = request.method.as_str().to_string();
             let max_response_bytes = request.max_response_bytes.min(MAX_OHTTP_RESPONSE_BYTES);
 
-            // The engine fetches the key config and sends in one call, so
-            // nothing more precise than "about to start" exists: everything
-            // after this point is reported as possibly dispatched.
-            on_dispatch();
-
             // The relay leg uses the device's own connection (`Dialer::Direct`).
-            let call = http_round_trip(
+            // The callback fires right before the sealed request is sent, so failures
+            // during key-config fetch or relay connect are not classified as dispatched.
+            let call = http_round_trip_with_dispatch(
                 &self.gateway_host,
                 Dialer::Direct,
                 &method,
                 request.url,
                 request.headers,
                 &request.body,
+                on_dispatch,
             );
             let (status, headers, body) = tokio::time::timeout(request.timeout, call)
                 .await

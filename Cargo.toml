@@ -119,13 +119,16 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives. Consumed as a remote crate from zodl-inc/slipstream, the engine's
 # home since the personal-fork era (the old PR #6 adaptations are merged
-# there). Return to a release tag once one is cut with these aboard.
+# there).
 #
 # The source rides [patch.crates-io] below: a git dependency on the
 # slipstream-internal `feature/ohttp-connector` branch, with Cargo.lock pinning
 # the exact commit so a build only moves when the lock is updated on purpose.
-# The engine rides the same librustzcash rev as this package, so the graph
-# stays a single family instance.
+# The patch can be dropped once a published version containing the OHTTP transport
+# exists (0.3.1 or later). The rev must be repinned to the slipstream-internal
+# `main` commit once slipstream PR #16 merges (a squash merge can make a
+# feature-branch rev unreachable). The engine rides the same librustzcash rev as
+# this package, so the graph stays a single family instance.
 slipstream-core = { version = "0.3.0-alpha.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
@@ -168,10 +171,11 @@ lto = true
 
 [patch.crates-io]
 # The slipstream engine's OHTTP transport lives in slipstream-internal until upstreamed to
-# the public repo and published. Git dependency pinned to feature/ohttp-connector c55bd862
-# (relay_for delegation + zodl-ohttp-client addee9ef).
-# Once 0.3.0 is published to crates.io, revert to a version pin.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "62f1799fbdec638a387828604612257826b15e22" }
+# the public repo and published. Git dependency pinned to feature/ohttp-connector.
+# The patch can be dropped once a published version containing the OHTTP transport exists
+# (0.3.1 or later). The rev must be repinned to the slipstream-internal `main` commit once
+# slipstream PR #16 merges (a squash merge can make a feature-branch rev unreachable).
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "34452422a29d4ee58b32762afa74f258a3aac283" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
