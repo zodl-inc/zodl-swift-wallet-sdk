@@ -1,11 +1,10 @@
 name: "Authorize cargo against the private slipstream repository"
 description: >-
-  Mints a short-lived read token for the private zodl-inc repositories cargo fetches (slipstream,
-  slipstream-internal and ohttp) and points cargo's git fetches at it. `slipstream-core` and
-  `zodl-ohttp-client` are git dependencies on those private repos, and cargo fetches the source while
-  resolving the dependency graph — before feature selection — so every job that runs cargo needs
-  read access even though the `slipstream` feature is off by default. Without it cargo reports
-  "revision ... not found / failed to authenticate".
+  Mints a short-lived read token for the private zodl-inc repositories cargo fetches (slipstream
+  and ohttp) and points cargo's git fetches at it. `zodl-ohttp-client` is a git dependency on the
+  ohttp repo, and cargo fetches the source while resolving the dependency graph — before feature
+  selection — so every job that runs cargo needs read access. Without it cargo reports "revision
+  ... not found / failed to authenticate".
 
   A no-op when the inputs are empty, which is what happens on pull requests from forks: secrets
   are unavailable there by design, so those runs still cannot build the Rust library. Fixing that
@@ -14,8 +13,8 @@ description: >-
 inputs:
   app-id:
     description: >-
-      App ID of the GitHub App holding Contents:Read on zodl-inc/slipstream, slipstream-internal and ohttp. Leave empty to skip
-      the credential setup entirely.
+      App ID of the GitHub App holding Contents:Read on zodl-inc/slipstream and zodl-inc/ohttp.
+      Leave empty to skip the credential setup entirely.
     required: false
     default: ""
   app-private-key:
@@ -36,7 +35,7 @@ runs:
         # The App is installed on zodl-inc, not on this repository's owner, so the installation
         # to mint against has to be named explicitly.
         owner: zodl-inc
-        repositories: slipstream,slipstream-internal,ohttp
+        repositories: slipstream,ohttp
         # Narrow the minted token to exactly what cargo needs, rather than inheriting whatever
         # the App's installation happens to hold. Fetching a git dependency is a read of repository
         # contents and nothing more.
