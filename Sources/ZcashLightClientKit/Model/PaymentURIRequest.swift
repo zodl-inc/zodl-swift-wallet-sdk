@@ -160,5 +160,6 @@ public enum PaymentURIParserError: Error, Equatable {
 
     /// The Rust parser failed without a recognised classification -- in practice a panic caught
     /// at the FFI boundary. Distinct from `rejected` so a crash is not reported as a bad scan.
-    case parserFailure(String)
+    /// The report is redacted at the FFI boundary; raw panic text stays in device-local logs.
+    case parserFailure(RedactedRustError)
 }

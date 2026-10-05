@@ -18,23 +18,15 @@ public enum PaymentURIParser {
         // prefix of `input` instead of the whole string.
         guard !input.utf8.contains(0) else { throw PaymentURIParserError.invalidURI }
         guard let result = zcashlc_payment_uri_parse([CChar](input.utf8CString)) else {
-            // The Rust side puts a fixed classification token in the last-error slot, so the ten
-            // crate error variants no longer collapse into one value. Reading it also separates a
-            // genuine parser panic -- which `catch_panic` writes to the same slot -- from an
-            // ordinary bad URI; that used to reach the caller as a rejected scan and was never
-            // surfaced. The tokens carry no caller input.
-            let reported = lastErrorMessage(fallback: "")
-            guard let token = reported.components(separatedBy: rejectionPrefix).last,
-                  reported.hasPrefix(rejectionPrefix),
-                  let reason = PaymentURIRejection(rawValue: token) else {
-                throw PaymentURIParserError.parserFailure(reported)
-            }
-            throw PaymentURIParserError.rejected(reason)
+            throw failureFromLastError()
         }
         defer { zcashlc_string_free(result) }
 
         let data = Data(bytes: result, count: strlen(result))
+        return try decode(data)
+    }
 
+    static func decode(_ data: Data) throws -> PaymentURIRequest {
         // The version is read from a minimal envelope first. Decoding the whole payload up front
         // let a `DecodingError` escape an API documented to throw only `PaymentURIParserError`,
         // and -- worse -- it threw before the version check, so a v2 envelope that retyped a field
@@ -45,13 +37,75 @@ public enum PaymentURIParser {
         guard envelope.version == encodedVersion else {
             throw PaymentURIParserError.unsupportedEnvelope(version: envelope.version)
         }
-        guard let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: data) else {
+        guard let discriminator = try? JSONDecoder().decode(EncodedType.self, from: data) else {
             throw PaymentURIParserError.invalidEnvelope
         }
-        return try decoded.paymentRequest
+
+        do {
+            let decoder = JSONDecoder()
+            switch discriminator.type {
+            case "bitcoin":
+                return .bitcoin(try decoder.decode(EncodedUTXORequest.self, from: data).paymentRequest())
+            case "ethereum_native":
+                return .ethereum(.native(
+                    try decoder.decode(EncodedEthereumNativeRequest.self, from: data).paymentRequest()
+                ))
+            case "ethereum_erc20":
+                return .ethereum(.erc20(
+                    try decoder.decode(EncodedEthereumErc20Request.self, from: data).paymentRequest()
+                ))
+            case "ethereum_unrecognised":
+                return .ethereum(.unrecognised)
+            case "litecoin":
+                return .litecoin(try decoder.decode(EncodedUTXORequest.self, from: data).paymentRequest())
+            case "solana_transfer":
+                return .solanaTransfer(
+                    try decoder.decode(EncodedSolanaTransferRequest.self, from: data).paymentRequest()
+                )
+            case "solana_transaction":
+                return .solanaTransaction(
+                    try decoder.decode(EncodedSolanaTransactionRequest.self, from: data).paymentRequest()
+                )
+            default:
+                throw PaymentURIParserError.invalidEnvelope
+            }
+        } catch let error as PaymentURIParserError {
+            throw error
+        } catch {
+            throw PaymentURIParserError.invalidEnvelope
+        }
     }
 
     private static let encodedVersion = 1
+
+    private static func failureFromLastError() -> PaymentURIParserError {
+        classifyFailure(
+            reported: peekLastErrorMessage(fallback: ""),
+            clearRecognizedError: { zcashlc_clear_last_error() },
+            redactedReport: {
+                lastErrorReport(fallback: "the payment URI parser failed without an error report")
+            }
+        )
+    }
+
+    /// Maps the shared Rust error slot without allowing its raw text to cross the public boundary.
+    ///
+    /// The closures form an injectable error-channel seam for regression tests. Production first
+    /// peeks at the slot: known fixed rejection tokens are safe to decode directly and are then
+    /// cleared, while every other value is consumed through `lastErrorReport`, which retains the
+    /// raw detail only in Rust's device-local debug log and returns a redacted report.
+    static func classifyFailure(
+        reported: String,
+        clearRecognizedError: () -> Void,
+        redactedReport: () -> RedactedRustError
+    ) -> PaymentURIParserError {
+        guard reported.hasPrefix(rejectionPrefix),
+              let reason = PaymentURIRejection(rawValue: String(reported.dropFirst(rejectionPrefix.count))) else {
+            return .parserFailure(redactedReport())
+        }
+        clearRecognizedError()
+        return .rejected(reason)
+    }
 }
 
 /// Prefix the Rust side puts before a classification token, so a token can be told apart from a
@@ -64,108 +118,24 @@ private struct EncodedVersion: Decodable {
     let version: Int
 }
 
-struct EncodedRequest: Decodable {
-    let version: Int
+private struct EncodedType: Decodable {
     let type: String
-    let address: String?
-    let network: String?
+}
+
+private struct EncodedUTXORequest: Decodable {
+    let address: String
+    let network: String
     let amount: String?
     let label: String?
     let message: String?
-    let schemaPrefix: String?
-    let hasPay: Bool?
-    let chainId: String?
-    let recipientAddress: String?
-    let tokenContractAddress: String?
-    let valueHex: String?
-    let gasLimitHex: String?
-    let gasPriceHex: String?
-    let recipient: String?
-    let splToken: String?
-    let references: [String]?
-    let memo: String?
-    let link: String?
 
-    enum CodingKeys: String, CodingKey {
-        case version, type, address, network, amount, label, message, recipient, references, memo, link
-        case splToken = "spl_token"
-        case schemaPrefix = "schema_prefix"
-        case hasPay = "has_pay"
-        case chainId = "chain_id"
-        case recipientAddress = "recipient_address"
-        case tokenContractAddress = "token_contract_address"
-        case valueHex = "value_hex"
-        case gasLimitHex = "gas_limit_hex"
-        case gasPriceHex = "gas_price_hex"
-    }
-
-    var paymentRequest: PaymentURIRequest {
-        get throws {
-            switch type {
-            case "bitcoin": return .bitcoin(try utxoRequest())
-            case "ethereum_native": return .ethereum(try ethereumNativeRequest())
-            case "ethereum_erc20": return .ethereum(try ethereumErc20Request())
-            case "ethereum_unrecognised": return .ethereum(.unrecognised)
-            case "litecoin": return .litecoin(try utxoRequest())
-            case "solana_transfer": return .solanaTransfer(try solanaTransfer())
-            case "solana_transaction":
-                // The crate's `is_https_url` only checks that the string splits on "://", that the
-                // scheme is https, and that the authority is non-empty and whitespace-free --
-                // everything after the authority is unchecked. It also runs on the percent-DECODED
-                // payload while the reject-on-query guard tests the RAW one, so a decoded link can
-                // carry a query the guard never saw, or a userinfo "@" that makes a hostile host
-                // display as a trusted one. This re-validates rather than trusting that.
-                guard let link, let url = URL(string: link), url.isCanonicalHTTPS else {
-                    throw PaymentURIParserError.invalidURI
-                }
-                return .solanaTransaction(PaymentURILink(validated: link))
-            default: throw PaymentURIParserError.invalidURI
-            }
-        }
-    }
-
-    private func ethereumNativeRequest() throws -> Eip681TransactionRequest {
-        guard let schemaPrefix, let hasPay, let recipientAddress else {
-            throw PaymentURIParserError.invalidURI
-        }
-        return .native(Eip681NativeRequest(
-            schemaPrefix: schemaPrefix,
-            hasPay: hasPay,
-            chainId: try chainId.map(parseChainId),
-            recipientAddress: recipientAddress,
-            valueHex: valueHex,
-            gasLimitHex: gasLimitHex,
-            gasPriceHex: gasPriceHex
-        ))
-    }
-
-    private func ethereumErc20Request() throws -> Eip681TransactionRequest {
-        guard let schemaPrefix, let hasPay, let tokenContractAddress, let recipientAddress, let valueHex else {
-            throw PaymentURIParserError.invalidURI
-        }
-        return .erc20(Eip681Erc20Request(
-            schemaPrefix: schemaPrefix,
-            hasPay: hasPay,
-            chainId: try chainId.map(parseChainId),
-            tokenContractAddress: tokenContractAddress,
-            recipientAddress: recipientAddress,
-            valueHex: valueHex
-        ))
-    }
-
-    private func parseChainId(_ value: String) throws -> UInt64 {
-        guard let chainId = UInt64(value) else { throw PaymentURIParserError.invalidURI }
-        return chainId
-    }
-
-    private func utxoRequest() throws -> UTXOPaymentURIRequest {
-        guard let address, let network else { throw PaymentURIParserError.invalidURI }
+    func paymentRequest() throws -> UTXOPaymentURIRequest {
         let parsedNetwork: PaymentURINetwork
         switch network {
         case "mainnet": parsedNetwork = .mainnet
         case "testnet": parsedNetwork = .testnet
         case "regtest": parsedNetwork = .regtest
-        default: throw PaymentURIParserError.invalidURI
+        default: throw PaymentURIParserError.invalidEnvelope
         }
         return UTXOPaymentURIRequest(
             address: PaymentURIAddress(validated: address),
@@ -175,10 +145,85 @@ struct EncodedRequest: Decodable {
             message: message
         )
     }
+}
 
-    private func solanaTransfer() throws -> SolanaPayTransferRequest {
-        guard let recipient else { throw PaymentURIParserError.invalidURI }
-        return SolanaPayTransferRequest(
+private struct EncodedEthereumNativeRequest: Decodable {
+    let schemaPrefix: String
+    let hasPay: Bool
+    let chainId: String?
+    let recipientAddress: String
+    let valueHex: String?
+    let gasLimitHex: String?
+    let gasPriceHex: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schemaPrefix = "schema_prefix"
+        case hasPay = "has_pay"
+        case chainId = "chain_id"
+        case recipientAddress = "recipient_address"
+        case valueHex = "value_hex"
+        case gasLimitHex = "gas_limit_hex"
+        case gasPriceHex = "gas_price_hex"
+    }
+
+    func paymentRequest() throws -> Eip681NativeRequest {
+        Eip681NativeRequest(
+            schemaPrefix: schemaPrefix,
+            hasPay: hasPay,
+            chainId: try chainId.map(parseEncodedChainId),
+            recipientAddress: recipientAddress,
+            valueHex: valueHex,
+            gasLimitHex: gasLimitHex,
+            gasPriceHex: gasPriceHex
+        )
+    }
+}
+
+private struct EncodedEthereumErc20Request: Decodable {
+    let schemaPrefix: String
+    let hasPay: Bool
+    let chainId: String?
+    let tokenContractAddress: String
+    let recipientAddress: String
+    let valueHex: String
+
+    enum CodingKeys: String, CodingKey {
+        case schemaPrefix = "schema_prefix"
+        case hasPay = "has_pay"
+        case chainId = "chain_id"
+        case tokenContractAddress = "token_contract_address"
+        case recipientAddress = "recipient_address"
+        case valueHex = "value_hex"
+    }
+
+    func paymentRequest() throws -> Eip681Erc20Request {
+        Eip681Erc20Request(
+            schemaPrefix: schemaPrefix,
+            hasPay: hasPay,
+            chainId: try chainId.map(parseEncodedChainId),
+            tokenContractAddress: tokenContractAddress,
+            recipientAddress: recipientAddress,
+            valueHex: valueHex
+        )
+    }
+}
+
+private struct EncodedSolanaTransferRequest: Decodable {
+    let recipient: String
+    let amount: String?
+    let splToken: String?
+    let references: [String]?
+    let label: String?
+    let message: String?
+    let memo: String?
+
+    enum CodingKeys: String, CodingKey {
+        case recipient, amount, references, label, message, memo
+        case splToken = "spl_token"
+    }
+
+    func paymentRequest() -> SolanaPayTransferRequest {
+        SolanaPayTransferRequest(
             recipient: PaymentURIAddress(validated: recipient),
             amount: amount.map(PaymentURIAmount.init(validated:)),
             splToken: splToken.map(PaymentURIAddress.init(validated:)),
@@ -188,6 +233,41 @@ struct EncodedRequest: Decodable {
             memo: memo
         )
     }
+}
+
+private struct EncodedSolanaTransactionRequest: Decodable {
+    let link: String
+
+    func paymentRequest() throws -> PaymentURILink {
+        // The crate's `is_https_url` only checks that the string splits on "://", that the scheme
+        // is https, and that the authority is non-empty and whitespace-free. Everything after the
+        // authority is unchecked, and validation runs on the percent-decoded payload while the
+        // reject-on-query guard tests the raw one. Keep this caller-input rejection distinct from
+        // structural envelope failures handled by the variant-specific decode above.
+        guard let url = URL(string: link), url.isCanonicalHTTPS else {
+            throw PaymentURIParserError.invalidURI
+        }
+        return PaymentURILink(validated: link)
+    }
+}
+
+private func parseEncodedChainId(_ value: String) throws -> UInt64 {
+    guard let chainId = UInt64(value) else { throw PaymentURIParserError.invalidEnvelope }
+    return chainId
+}
+
+/// Copies the current Rust last-error text without consuming it.
+///
+/// A known fixed rejection token is cleared directly. Every other value must remain in the slot
+/// for `lastErrorReport` to consume and redact while logging the raw detail locally in Rust.
+private func peekLastErrorMessage(fallback: String) -> String {
+    let errorLen = zcashlc_last_error_length()
+    guard errorLen > 0 else { return fallback }
+
+    let error = UnsafeMutablePointer<Int8>.allocate(capacity: Int(errorLen))
+    defer { error.deallocate() }
+    zcashlc_error_message_utf8(error, errorLen)
+    return String(validatingUTF8: error) ?? fallback
 }
 
 private extension URL {

@@ -77,6 +77,39 @@ final class PaymentURIParserTests: XCTestCase {
         XCTAssertEqual(request.message, "Coffee")
     }
 
+    func testParsesUppercaseBech32Addresses() throws {
+        let bitcoin = try PaymentURIParser.parse(
+            "bitcoin:BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4?amount=1"
+        )
+        guard case let .bitcoin(bitcoinRequest) = bitcoin else { return XCTFail("Expected Bitcoin") }
+        XCTAssertEqual(bitcoinRequest.address.value, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+        XCTAssertEqual(bitcoinRequest.amount?.value, "1")
+
+        let litecoin = try PaymentURIParser.parse(
+            "litecoin:TLTC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KLFSUQ0?amount=2"
+        )
+        guard case let .litecoin(litecoinRequest) = litecoin else { return XCTFail("Expected Litecoin") }
+        XCTAssertEqual(litecoinRequest.address.value, "tltc1qw508d6qejxtdg4y5r3zarvary0c5xw7klfsuq0")
+        XCTAssertEqual(litecoinRequest.amount?.value, "2")
+    }
+
+    func testLitecoinQueryKeysAreCaseInsensitive() throws {
+        let litecoin = try PaymentURIParser.parse(
+            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?Amount=1.2500&Label=Coffee"
+        )
+        guard case let .litecoin(request) = litecoin else { return XCTFail("Expected Litecoin") }
+        XCTAssertEqual(request.amount?.value, "1.2500")
+        XCTAssertEqual(request.label, "Coffee")
+
+        XCTAssertThrowsError(
+            try PaymentURIParser.parse(
+                "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?REQ-somethingyoudontunderstand=50"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.unsupportedRequiredParameter))
+        }
+    }
+
     func testParsesErc20Request() throws {
         let erc20 = try PaymentURIParser.parse(
             "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/transfer" +
@@ -93,8 +126,7 @@ final class PaymentURIParserTests: XCTestCase {
         let json = """
         {"version":1,"type":"solana_transaction","link":"https://example.com/tx"}
         """
-        let decoded = try JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        guard case let .solanaTransaction(link) = try decoded.paymentRequest else {
+        guard case let .solanaTransaction(link) = try PaymentURIParser.decode(Data(json.utf8)) else {
             return XCTFail("Expected Solana transaction link")
         }
         XCTAssertEqual(link.value, "https://example.com/tx")
@@ -104,9 +136,8 @@ final class PaymentURIParserTests: XCTestCase {
         let json = """
         {"version":1,"type":"solana_transaction"}
         """
-        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
-            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidEnvelope)
         }
     }
 
@@ -114,32 +145,82 @@ final class PaymentURIParserTests: XCTestCase {
         let json = """
         {"version":1,"type":"ethereum_unrecognised"}
         """
-        let decoded = try JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        guard case .ethereum(.unrecognised) = try decoded.paymentRequest else {
+        guard case .ethereum(.unrecognised) = try PaymentURIParser.decode(Data(json.utf8)) else {
             return XCTFail("Expected unrecognised Ethereum request")
         }
     }
 
     func testDecodesEnvelopeVersion() {
-        // `PaymentURIParser.parse` compares this field against its private
-        // `encodedVersion` constant; this only pins that decoding the field
-        // itself keeps working, since the guard isn't reachable from outside
-        // the enum without a real (version-mismatched) FFI response.
         let json = """
         {"version":2,"type":"bitcoin","address":"1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo","network":"mainnet"}
         """
-        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        XCTAssertEqual(decoded?.version, 2)
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .unsupportedEnvelope(version: 2))
+        }
     }
 
     func testRejectsMissingRequiredField() {
         let json = """
         {"version":1,"type":"bitcoin","network":"mainnet"}
         """
-        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
-            XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidEnvelope)
         }
+    }
+
+    func testRejectsRetypedEnvelopeFieldAsInvalidEnvelope() {
+        let json = """
+        {
+          "version":1,
+          "type":"ethereum_native",
+          "schema_prefix":"ethereum",
+          "has_pay":"false",
+          "recipient_address":"0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"
+        }
+        """
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidEnvelope)
+        }
+    }
+
+    func testRejectsUnknownEnvelopeTypeAsInvalidEnvelope() {
+        let json = """
+        {"version":1,"type":"future_payment_protocol"}
+        """
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .invalidEnvelope)
+        }
+    }
+
+    func testParserFailureRedactsRawRustError() {
+        let raw = "panic while parsing secret-recipient.example"
+        let redacted = RedactedRustError(
+            kind: .unclassified,
+            message: "an unclassified error occurred"
+        )
+        let error = PaymentURIParser.classifyFailure(
+            reported: raw,
+            clearRecognizedError: { XCTFail("A panic is not a rejection token") },
+            redactedReport: { redacted }
+        )
+
+        XCTAssertEqual(error, .parserFailure(redacted))
+        XCTAssertFalse(String(describing: error).contains(raw))
+    }
+
+    func testRecognizedRejectionDoesNotRequestARedactedReport() {
+        var didClear = false
+        let error = PaymentURIParser.classifyFailure(
+            reported: "payment URI rejected: invalid_address",
+            clearRecognizedError: { didClear = true },
+            redactedReport: {
+                XCTFail("A recognized rejection should not consume a redacted report")
+                return RedactedRustError(kind: .unclassified, message: "unused")
+            }
+        )
+
+        XCTAssertEqual(error, .rejected(.invalidAddress))
+        XCTAssertTrue(didClear)
     }
 
     // MARK: - Coverage gaps closed after review
@@ -222,8 +303,7 @@ final class PaymentURIParserTests: XCTestCase {
         let json = """
         {"version":1,"type":"solana_transaction","link":"https://trusted.example.com@evil.test/pay"}
         """
-        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
             XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
         }
     }
@@ -232,8 +312,7 @@ final class PaymentURIParserTests: XCTestCase {
         let json = """
         {"version":1,"type":"solana_transaction","link":"http://example.com/tx"}
         """
-        let decoded = try? JSONDecoder().decode(EncodedRequest.self, from: Data(json.utf8))
-        XCTAssertThrowsError(try decoded?.paymentRequest) { error in
+        XCTAssertThrowsError(try PaymentURIParser.decode(Data(json.utf8))) { error in
             XCTAssertEqual(error as? PaymentURIParserError, .invalidURI)
         }
     }

@@ -13,8 +13,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request URIs, including Solana Pay interactive transaction-request links.
 - `PaymentURIParserError` distinguishes a bad URI (`invalidURI`, `rejected(_:)`) from an
   SDK/Rust-core mismatch (`unsupportedEnvelope(version:)`, `invalidEnvelope`) and from a parser
-  crash (`parserFailure(_:)`). `PaymentURIRejection` reports which check the Rust parser failed,
-  without carrying any fragment of the caller's input across the FFI.
+  crash (`parserFailure(_:)`, carrying a redacted `RedactedRustError`). `PaymentURIRejection`
+  reports which check the Rust parser failed, without carrying any fragment of the caller's input
+  across the FFI.
 - The payment-URI result types expose public initialisers, so consumers can build canned values
   for tests and dependency doubles.
 
@@ -75,6 +76,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `PaymentURIParser` accepts all-uppercase Bitcoin and Litecoin bech32 addresses used by QR
+  encoders, and treats Litecoin query keys (including `Amount` and `REQ-...`) case-insensitively.
+  Amount text and parameter values are preserved exactly.
+- `PaymentURIParserError.parserFailure(_:)` no longer exposes a raw Rust panic string. Its
+  `RedactedRustError` payload is safe to include in support reports; raw detail remains only in
+  device-local Rust diagnostics.
+- `PaymentURIParser` reports missing, retyped, or unknown fields in the Rust result envelope as
+  `invalidEnvelope` instead of `invalidURI`. Callers can distinguish an SDK/core mismatch from a
+  bad scanned URI without asking the user to rescan.
 - The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
   endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
   stream previously recorded a near-zero time and won the ranking outright.
