@@ -175,7 +175,7 @@ lto = true
 # The patch can be dropped once a published version containing the OHTTP transport exists
 # (0.3.1 or later). The rev must be repinned to the slipstream-internal `main` commit once
 # slipstream PR #16 merges (a squash merge can make a feature-branch rev unreachable).
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "c43226e9cb25ceb03ff385a2ce9dd4741fdb66c7" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "73d9a2a01cc980bb7740da9c6d7589239ea61c1f" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a
