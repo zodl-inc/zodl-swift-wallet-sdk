@@ -140,7 +140,7 @@ hex = "0.4"
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
 # fails loudly, a branch would follow a force-push.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "5bc630f9a3dc0e3e485bc030d34a7fd91ad7ba27", default-features = false }
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "f0d88a5d960578b0e34c01881912baca0198de3a", default-features = false }
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
@@ -175,7 +175,7 @@ lto = true
 # The patch can be dropped once a published version containing the OHTTP transport exists
 # (0.3.1 or later). The rev must be repinned to the slipstream-internal `main` commit once
 # slipstream PR #16 merges (a squash merge can make a feature-branch rev unreachable).
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "be6e93b160d4414e3dfcd863d6b25e444a9e4500" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "c43226e9cb25ceb03ff385a2ce9dd4741fdb66c7" }
 
 # The slipstream engine has no crates.io release, so it rides a pinned rev of its canonical
 # repo — a COMMIT HASH rather than a branch: a branch pin silently follows a force-push, so a

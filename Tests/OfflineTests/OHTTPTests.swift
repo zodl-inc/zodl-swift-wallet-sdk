@@ -22,7 +22,7 @@ final class OHTTPTests: XCTestCase {
     func testOHTTPEndpointsRelayMapping() throws {
         // Relay URLs come from zodl-ohttp-client (native lib) and can be overridden at build time
         // via ZODL_OHTTP_RELAY_URL_MAINNET / ZODL_OHTTP_RELAY_URL_TESTNET. These assertions verify
-        // the default URLs (Fastly temporary hostnames until COR-1830 repoints to final hostnames).
+        // the default URLs (Fastly production hostnames).
         let relay1 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
         XCTAssertEqual(relay1, "https://testnet-relay.example.invalid/relay")
 
