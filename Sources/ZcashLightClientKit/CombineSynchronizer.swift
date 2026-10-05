@@ -183,11 +183,35 @@ public protocol CombineSynchronizer {
 
     func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error>
 
+    /// Combine counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
+    func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never>
+
+    /// Combine counterpart of `Synchronizer.restartSync(at:)`.
+    func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error>
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>
 
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) -> SinglePublisher<VotingRoundSession, Error>
+
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
+
+    /// Combine adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
+    /// It preserves the async method's timeout budget and owned-cleanup behavior after work begins.
+    /// The inherited Combine gateway does not propagate subscriber cancellation to the underlying async
+    /// task, so cancelling the subscription is not guaranteed to cancel or stop the request.
+    func httpGetOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 
     var broadcaster: Broadcaster { get }
 

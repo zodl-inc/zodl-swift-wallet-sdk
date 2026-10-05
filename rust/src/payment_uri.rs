@@ -131,6 +131,47 @@ fn lowercase_query_keys(query: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
+/// Returns whether an Ethereum payment URI contains a hexadecimal address whose payload is not
+/// exactly 20 bytes.
+///
+/// The pinned `eip681` revision parses `0x` followed by *at least* 40 hex digits, and its ERC-55
+/// adapter accidentally treats the distinct `IncorrectEthAddressLen` error as success. Checking
+/// the URI before delegation also prevents a future adapter-only fix from turning the malformed
+/// request into `TransactionRequest::Unrecognised`, because that enum deliberately swallows typed
+/// conversion errors. This remains deliberately narrow: ENS names and non-address ABI parameters
+/// still go through the upstream parser unchanged.
+fn has_invalid_ethereum_address_length(input: &str) -> bool {
+    let Some((scheme, payload)) = input.split_once(':') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("ethereum") {
+        return false;
+    }
+
+    let payload = payload.strip_prefix("pay-").unwrap_or(payload);
+    let target_end = payload
+        .find(|character| matches!(character, '@' | '/' | '?'))
+        .unwrap_or(payload.len());
+    if has_invalid_hex_address_length(&payload[..target_end]) {
+        return true;
+    }
+
+    payload.split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|parameter| {
+            parameter.split_once('=').is_some_and(|(key, value)| {
+                key == "address" && has_invalid_hex_address_length(value)
+            })
+        })
+    })
+}
+
+fn has_invalid_hex_address_length(candidate: &str) -> bool {
+    let Some(hex_digits) = candidate.strip_prefix("0x") else {
+        return false;
+    };
+    hex_digits.bytes().all(|byte| byte.is_ascii_hexdigit()) && hex_digits.len() != 40
+}
+
 /// Parses a supported payment URI and returns an internal JSON envelope.
 ///
 /// On failure the last-error slot holds a classification token from [`classify`], or the
@@ -146,6 +187,9 @@ fn lowercase_query_keys(query: &str) -> Cow<'_, str> {
 pub unsafe extern "C" fn zcashlc_payment_uri_parse(input: *const c_char) -> *mut c_char {
     let result = catch_panic(|| {
         let input = unsafe { CStr::from_ptr(input) }.to_str()?;
+        if has_invalid_ethereum_address_length(input) {
+            anyhow::bail!("payment URI rejected: invalid_address");
+        }
         let normalized = normalize_utxo_compatibility(input);
         let json = parse_to_json(normalized.as_ref())
             .map_err(|e| anyhow::anyhow!("payment URI rejected: {}", classify(&e)))?;
@@ -156,7 +200,7 @@ pub unsafe extern "C" fn zcashlc_payment_uri_parse(input: *const c_char) -> *mut
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_utxo_compatibility;
+    use super::{has_invalid_ethereum_address_length, normalize_utxo_compatibility};
 
     #[test]
     fn normalizes_uppercase_bech32_addresses_for_upstream_validation() {
@@ -197,5 +241,43 @@ mod tests {
 
         let mixed_case = "bitcoin:bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
         assert_eq!(normalize_utxo_compatibility(mixed_case), mixed_case);
+    }
+
+    #[test]
+    fn rejects_overlength_ethereum_targets_and_address_parameters() {
+        let overlength = format!("0x{}", "a".repeat(41));
+        let valid = format!("0x{}", "b".repeat(40));
+
+        assert!(has_invalid_ethereum_address_length(&format!(
+            "ethereum:{overlength}"
+        )));
+        assert!(has_invalid_ethereum_address_length(&format!(
+            "ethereum:{overlength}/transfer?address={valid}&uint256=1"
+        )));
+        assert!(has_invalid_ethereum_address_length(&format!(
+            "ethereum:{valid}/transfer?address={overlength}&uint256=1"
+        )));
+        assert!(has_invalid_ethereum_address_length(&format!(
+            "ethereum:{overlength}/approve?address={valid}&uint256=1"
+        )));
+    }
+
+    #[test]
+    fn permits_exact_ethereum_addresses_ens_names_and_non_address_values() {
+        let valid = format!("0x{}", "a".repeat(40));
+        let long_uint256 = format!("0x{}", "f".repeat(64));
+
+        assert!(!has_invalid_ethereum_address_length(&format!(
+            "ethereum:pay-{valid}@1?value=1"
+        )));
+        assert!(!has_invalid_ethereum_address_length(
+            "ethereum:alice.eth/transfer?address=bob.eth&uint256=1"
+        ));
+        assert!(!has_invalid_ethereum_address_length(&format!(
+            "ethereum:{valid}/custom?bytes32={long_uint256}"
+        )));
+        assert!(!has_invalid_ethereum_address_length(&format!(
+            "bitcoin:{long_uint256}"
+        )));
     }
 }

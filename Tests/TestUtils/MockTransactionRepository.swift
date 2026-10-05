@@ -85,6 +85,10 @@ extension MockTransactionRepository: TransactionRepository {
         []
     }
 
+    func getTransactionOutputs(for rawIDs: [Data]) async throws -> [Data: [ZcashLightClientKit.ZcashTransaction.Output]] {
+        [:]
+    }
+
     func findPendingTransactions(latestHeight: ZcashLightClientKit.BlockHeight, offset: Int, limit: Int) async throws -> [ZcashTransaction.Overview] {
         []
     }

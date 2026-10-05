@@ -1,5 +1,7 @@
 //! Tor support
 
+pub(crate) mod http;
+
 use std::path::Path;
 
 use anyhow::anyhow;

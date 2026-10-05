@@ -120,6 +120,23 @@ final class PaymentURIParserTests: XCTestCase {
         XCTAssertEqual(request.recipientAddress, "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359")
     }
 
+    func testRejectsOverlengthEthereumAddresses() {
+        let overlength = "0x" + String(repeating: "a", count: 41)
+        let valid = "0x" + String(repeating: "b", count: 40)
+        let malformedRequests = [
+            "ethereum:\(overlength)",
+            "ethereum:\(overlength)/transfer?address=\(valid)&uint256=1",
+            "ethereum:\(valid)/transfer?address=\(overlength)&uint256=1",
+            "ethereum:\(overlength)/approve?address=\(valid)&uint256=1"
+        ]
+
+        for request in malformedRequests {
+            XCTAssertThrowsError(try PaymentURIParser.parse(request)) { error in
+                XCTAssertEqual(error as? PaymentURIParserError, .rejected(.invalidAddress))
+            }
+        }
+    }
+
     func testDecodesSolanaTransactionLink() throws {
         // The link is re-validated in Swift (see PaymentURIParser.swift): the crate's own check
         // leaves everything after the authority unverified and runs on the decoded payload.
