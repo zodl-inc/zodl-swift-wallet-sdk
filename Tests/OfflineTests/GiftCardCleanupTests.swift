@@ -196,7 +196,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
             returned.fulfill()
         }
         await fulfillment(of: [returned], timeout: 5)
-        weak let old = fixture?.redeemer
+        weak var old = fixture?.redeemer
         fixture = nil
         XCTAssertNil(old, "The coordinator must own teardown without retaining the redeemer")
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
@@ -255,7 +255,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
             XCTFail("Cancellation must detach the unused redeemer's waiter")
         } catch is CancellationError {
         }
-        weak let old = fixture?.redeemer
+        weak var old = fixture?.redeemer
         fixture = nil
         XCTAssertNil(old)
         assertAlreadyActive(card: card)
@@ -396,7 +396,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let marker = root.appendingPathComponent("replacement-marker")
         try Data([1]).write(to: marker)
         try await fixture?.redeemer.cleanup()
-        weak let old = fixture?.redeemer
+        weak var old = fixture?.redeemer
         fixture = nil
         XCTAssertNil(old)
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
@@ -417,7 +417,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         _ = try await fixture?.redeemer.check()
         let engine = try XCTUnwrap(fixture).engine
         engine.stopQuiescent = false
-        weak let old = fixture?.redeemer
+        weak var old = fixture?.redeemer
         fixture = nil
         XCTAssertNil(old)
         await fulfillment(of: [clock.expectSleep(at: 1_000_000_000)], timeout: 5)
