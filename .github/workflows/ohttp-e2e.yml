@@ -59,7 +59,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Authorize cargo against the private slipstream repository
@@ -79,20 +79,20 @@ jobs:
 
       - name: Cache XCFramework
         id: cache-ffi
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: BuildSupport/products/libzcashlc.xcframework
           key: ohttp-e2e-xcframework-macos-arm64-${{ steps.ffi-hash.outputs.hash }}
 
       - name: Setup Rust
         if: steps.cache-ffi.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: aarch64-apple-darwin
 
       - name: Cache Cargo
         if: steps.cache-ffi.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             target
@@ -114,7 +114,7 @@ jobs:
         run: make verify-ffi
 
       - name: Upload XCFramework
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libzcashlc-xcframework-macos
           path: BuildSupport/products/libzcashlc.xcframework
@@ -131,7 +131,7 @@ jobs:
       matrix:
         mode: [ohttp, tor]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -139,7 +139,7 @@ jobs:
         run: sudo xcode-select -s "$XCODE"
 
       - name: Download XCFramework
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libzcashlc-xcframework-macos
           path: BuildSupport/products/libzcashlc.xcframework
@@ -148,7 +148,7 @@ jobs:
         run: make configure-local-ffi
 
       - name: Cache SwiftPM
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
           key: ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
@@ -253,7 +253,7 @@ jobs:
 
       - name: Upload logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ohttp-e2e-logs-${{ matrix.mode }}
           path: |
