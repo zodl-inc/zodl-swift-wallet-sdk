@@ -19,8 +19,19 @@ actor CompactBlockProcessor {
     // more closures here.
     private var eventClosures: [String: EventClosure] = [:]
 
-    private var syncTask: Task<Void, Error>?
+    private(set) var syncTask: Task<Void, Error>?
     private var mempoolDetectionTask: Task<Void, Error>?
+    private var pollTask: Task<Void, Never>?
+    private(set) var rewindTask: Task<Void, Never>?
+    private var drainTask: Task<Void, Never>?
+    private var wipeTask: Task<Void, Never>?
+    private var wipeContexts: [AfterSyncHooksManager.WipeContext] = []
+    private var wipeHasDrained = false
+    private var admissionGeneration: UInt64 = 0
+    private var syncGeneration: UInt64?
+    private var mempoolGeneration: UInt64?
+    private var syncIsRewinding = false
+    private var queuedRewindStart: (generation: UInt64, retry: Bool)?
 
     private let actions: [CBPState: Action]
     var context: ActionContext
@@ -41,7 +52,7 @@ actor CompactBlockProcessor {
 
     private var retryAttempts: Int = 0
     private var serviceFailureRetryAttempts: Int = 0
-    private var backoffTimer: Timer?
+    private(set) var backoffTimer: Timer?
     private var consecutiveChainValidationErrors: Int = 0
 
     private var compactBlockProgress: CompactBlockProgress = .zero
@@ -204,6 +215,7 @@ actor CompactBlockProcessor {
         syncTask = nil
         mempoolDetectionTask?.cancel()
         mempoolDetectionTask = nil
+        pollTask?.cancel()
     }
 
     // swiftlint:disable:next cyclomatic_complexity
@@ -260,6 +272,18 @@ actor CompactBlockProcessor {
 
 extension CompactBlockProcessor {
     func start(retry: Bool = false) async {
+        guard drainTask == nil, wipeTask == nil, !Task.isCancelled else { return }
+        if rewindTask != nil || syncIsRewinding {
+            let priorRetry = queuedRewindStart?.generation == admissionGeneration && queuedRewindStart?.retry == true
+            queuedRewindStart = (generation: admissionGeneration, retry: retry || priorRetry)
+            return
+        }
+        await startWhenUnowned(retry: retry)
+    }
+
+    private func startWhenUnowned(retry: Bool, fromRewindOwner: Bool = false) async {
+        guard drainTask == nil, wipeTask == nil, rewindTask == nil else { return }
+        let admission = admissionGeneration
         if retry {
             self.retryAttempts = 0
             self.serviceFailureRetryAttempts = 0
@@ -267,7 +291,10 @@ extension CompactBlockProcessor {
             self.backoffTimer = nil
         }
 
-        guard await canStartSync() else {
+        let canStart = await canStartSync()
+        guard admission == admissionGeneration, drainTask == nil, wipeTask == nil,
+              rewindTask == nil, fromRewindOwner || !Task.isCancelled else { return }
+        guard canStart else {
             if await isIdle() {
                 logger.warn("max retry attempts reached on \(await context.state) state")
                 await send(event: .failed(ZcashError.compactBlockProcessorMaxAttemptsReached(config.retries)))
@@ -278,23 +305,91 @@ extension CompactBlockProcessor {
             return
         }
 
+        // canStartSync suspends. A completed teardown must also invalidate starts
+        // that were waiting before it reserved admission.
+        guard admission == admissionGeneration, drainTask == nil, wipeTask == nil,
+              rewindTask == nil, syncTask == nil else { return }
+        syncGeneration = admission
         syncTask = Task(priority: .userInitiated) {
-            await run()
+            await run(generation: admission)
         }
 
-        mempoolDetectionTask = Task {
-            await watchMempool()
+        if mempoolDetectionTask == nil {
+            mempoolGeneration = admission
+            mempoolDetectionTask = Task {
+                await watchMempool()
+                if mempoolGeneration == admission {
+                    mempoolDetectionTask = nil
+                    mempoolGeneration = nil
+                }
+            }
         }
     }
 
+    /// Request-only stop for processor-owned callbacks. It must never join its own run.
     func stop() async {
+        admissionGeneration &+= 1
+        queuedRewindStart = nil
         syncTask?.cancel()
         mempoolDetectionTask?.cancel()
+        pollTask?.cancel()
         self.backoffTimer?.invalidate()
         self.backoffTimer = nil
         await stopAllActions()
         retryAttempts = 0
         serviceFailureRetryAttempts = 0
+    }
+
+    /// Owns the exact admitted writers independently of cancellation of this caller.
+    func stopAndWait() async {
+        if let wipeTask {
+            await wipeTask.value
+        } else {
+            await reserveDrain().value
+        }
+    }
+
+    /// Reserve before any suspension, capturing every admitted processor owner while admission is closed.
+    private func reserveDrain() -> Task<Void, Never> {
+        if let drainTask { return drainTask }
+        admissionGeneration &+= 1
+        queuedRewindStart = nil
+        let sync = syncTask
+        let mempool = mempoolDetectionTask
+        let poll = pollTask
+        let rewind = rewindTask
+        sync?.cancel()
+        mempool?.cancel()
+        poll?.cancel()
+        backoffTimer?.invalidate()
+        backoffTimer = nil
+        let task = Task {
+            await stopAllActions()
+            _ = await sync?.result
+            _ = await mempool?.result
+            await poll?.value
+            await rewind?.value
+            // A suspended action can admit a downloader after the initial stop pass.
+            // Captured owners can no longer admit work once joined, so drain their
+            // final action-owned writers before reporting quiescence or wiping.
+            await stopAllActions()
+            backoffTimer?.invalidate()
+            backoffTimer = nil
+            retryAttempts = 0
+            serviceFailureRetryAttempts = 0
+            if wipeTask == nil {
+                // Explicit awaited stop supersedes queued automatic restarts.
+                // Complete every rewind, including ones queued by earlier callbacks.
+                while !afterSyncHooksManager.isEmpty {
+                    let hooks = afterSyncHooksManager
+                    afterSyncHooksManager = AfterSyncHooksManager()
+                    for rewind in hooks.rewindContexts() { try? await doRewind(context: rewind) }
+                }
+                drainTask = nil
+            }
+        }
+        drainTask = task
+        return task
     }
 
     func latestHeight(mode: ServiceMode) async throws -> BlockHeight {
@@ -315,17 +410,54 @@ extension CompactBlockProcessor {
     /// - Note: If this is called while sync is in progress then the sync process is stopped first and then rewind is executed.
     func rewind(context: AfterSyncHooksManager.RewindContext) async throws {
         logger.debug("Starting rewind")
-        if await isIdle() {
-            logger.debug("Sync doesn't run. Executing rewind.")
-            try await doRewind(context: context)
-        } else {
-            logger.debug("Stopping sync because of rewind")
-            afterSyncHooksManager.insert(hook: .rewind(context))
+        // Admission is actor-local and reserved before the first suspension.
+        // In particular, checking idle must not open a stale post-wipe admission.
+        if wipeTask != nil {
+            await context.completion(.failure(ZcashError.synchronizerNotPrepared))
+            return
+        }
+        afterSyncHooksManager.insert(hook: .rewind(context))
+        if drainTask != nil || rewindTask != nil { return }
+        if syncTask != nil {
+            // A run callback cannot await a task that would join that same run.
             await stop()
+        } else {
+            await reserveIdleRewinds().value
         }
     }
 
-    private func doRewind(context: AfterSyncHooksManager.RewindContext) async throws {
+    private func reserveIdleRewinds() -> Task<Void, Never> {
+        if let rewindTask { return rewindTask }
+        let retryTimerAllowed = backoffTimer?.isValid == true
+        admissionGeneration &+= 1
+        let generation = admissionGeneration
+        backoffTimer?.invalidate()
+        backoffTimer = nil
+        let task = Task {
+            while drainTask == nil, wipeTask == nil, !afterSyncHooksManager.isEmpty {
+                let hooks = afterSyncHooksManager
+                afterSyncHooksManager = AfterSyncHooksManager()
+                for rewind in hooks.rewindContexts() {
+                    try? await doRewind(context: rewind, retryTimerAllowed: retryTimerAllowed, expectedGeneration: generation)
+                }
+            }
+            // Any pending contexts after teardown admission belong to its owner.
+            // Retain this task through timer restoration and all terminal callbacks.
+            if retryTimerAllowed, generation == admissionGeneration, drainTask == nil, wipeTask == nil, hasRetryAttempt() {
+                await setTimer()
+            }
+            rewindTask = nil
+            await startQueuedAfterRewind()
+        }
+        rewindTask = task
+        return task
+    }
+
+    private func doRewind(
+        context: AfterSyncHooksManager.RewindContext,
+        retryTimerAllowed: Bool = true,
+        expectedGeneration: UInt64? = nil
+    ) async throws {
         logger.debug("Executing rewind.")
         let lastDownloaded = await latestBlocksDataProvider.maxScannedHeight
         var rewindHeight = BlockHeight(Int32(context.height ?? lastDownloaded) - 10)
@@ -345,7 +477,7 @@ extension CompactBlockProcessor {
             }
             try await rewindDownloadBlockAction(to: rewindHeight)
         } catch {
-            await failure(error)
+            await failure(error, retryTimerAllowed: retryTimerAllowed, expectedGeneration: expectedGeneration)
             return await context.completion(.failure(error))
         }
 
@@ -430,40 +562,50 @@ extension CompactBlockProcessor {
 
 extension CompactBlockProcessor {
     func wipe(context: AfterSyncHooksManager.WipeContext) async throws {
-        logger.debug("Starting wipe")
-        if await isIdle() {
-            logger.debug("Sync doesn't run. Executing wipe.")
-            self.backoffTimer?.invalidate()
-            self.backoffTimer = nil
-            try await doWipe(context: context)
-        } else {
-            logger.debug("Stopping sync because of wipe")
-            afterSyncHooksManager.insert(hook: .wipe(context))
-            await stop()
+        wipeContexts.append(context)
+        if wipeTask != nil {
+            // The existing wipe has passed the writer boundary. A late caller's
+            // prewipe can safely close its own database connections now.
+            if wipeHasDrained { context.prewipe() }
+            return
+        }
+        let drain = reserveDrain()
+        wipeTask = Task {
+            await drain.value
+            wipeHasDrained = true
+            for context in wipeContexts { context.prewipe() }
+            let error = await doWipe()
+            // Wipe supersedes queued restart requests; rewind callers receive a
+            // terminal result rather than being discarded with the old hooks.
+            let hooks = afterSyncHooksManager
+            afterSyncHooksManager = AfterSyncHooksManager()
+            for rewind in hooks.rewindContexts() {
+                await rewind.completion(.failure(ZcashError.synchronizerNotPrepared))
+            }
+            while !wipeContexts.isEmpty {
+                let context = wipeContexts.removeFirst()
+                await context.completion(error)
+            }
+            wipeHasDrained = false
+            drainTask = nil
+            wipeTask = nil
         }
     }
 
-    private func doWipe(context: AfterSyncHooksManager.WipeContext) async throws {
+    private func doWipe() async -> Error? {
         logger.debug("Executing wipe.")
-        context.prewipe()
-
         do {
             try await self.storage.clear()
-
             wipeLegacyCacheDbIfNeeded()
-
             let fileManager = FileManager.default
             if fileManager.fileExists(atPath: config.dataDb.path) {
                 try fileManager.removeItem(at: config.dataDb)
             }
-
             try await rewindDownloadBlockAction(to: nil)
-
             await latestBlocksDataProvider.reset()
-
-            await context.completion(nil)
+            return nil
         } catch {
-            await context.completion(error)
+            return error
         }
     }
 
@@ -592,17 +734,23 @@ extension CompactBlockProcessor {
     // tree in the code update this documentation. Image is generated by plantuml tool.
     //
     // swiftlint:disable:next cyclomatic_complexity
-    private func run() async {
+    private func run(generation: UInt64) async {
         logger.debug("Starting run")
         self.serviceFailureRetryAttempts = 0
         metrics.cbpStart()
         await resetContext()
+        var restartAfterCancellation = false
 
         while true {
+            if Task.isCancelled {
+                restartAfterCancellation = (try? await syncTaskWasCancelled()) ?? false
+                break
+            }
             // Sync is starting when the state is `idle`.
             if await context.state == .idle {
                 // Side effect of calling stop is to delete last used download stream. To be sure that it doesn't keep any data in memory.
                 await stopAllActions()
+                if Task.isCancelled { continue }
                 // Update state to the first state in state machine that can be handled by action.
                 await context.update(state: .migrateLegacyCacheDB)
                 await syncStarted()
@@ -619,7 +767,16 @@ extension CompactBlockProcessor {
             guard let action = actions[state] else {
                 // Side effect of calling stop is to delete last used download stream. To be sure that it doesn't keep any data in memory.
                 await stopAllActions()
-                if await syncFinished() {
+                if Task.isCancelled {
+                    restartAfterCancellation = (try? await syncTaskWasCancelled()) ?? false
+                    break
+                }
+                let restart = await syncFinished()
+                if Task.isCancelled {
+                    restartAfterCancellation = (try? await syncTaskWasCancelled()) ?? false
+                    break
+                }
+                if restart {
                     await resetContext()
                     continue
                 } else {
@@ -666,7 +823,16 @@ extension CompactBlockProcessor {
                     serviceError = !(error is ZcashError)
                 }
 
-                if serviceError && self.serviceFailureRetryAttempts < ZcashSDK.serviceFailureRetries {
+                if Task.isCancelled {
+                    logger.info("Processing cancelled.")
+                    do {
+                        restartAfterCancellation = try await syncTaskWasCancelled()
+                        break
+                    } catch {
+                        await failure(error)
+                        break
+                    }
+                } else if serviceError && self.serviceFailureRetryAttempts < ZcashSDK.serviceFailureRetries {
                     // This may be false positive communication error that is usually resolved by retry.
                     // We will try to reset the sync and continue but this will we done at most `ZcashSDK.serviceFailureRetries` times.
                     logger.error("ServiceError: \(error), retry is available, starting the sync all over again.")
@@ -678,35 +844,59 @@ extension CompactBlockProcessor {
 
                     // Start sync all over again
                     await resetContext()
-                } else if Task.isCancelled {
-                    logger.info("Processing cancelled.")
-                    do {
-                        if try await syncTaskWasCancelled() {
-                            // Start sync all over again
-                            await resetContext()
-                        } else {
-                            // end the sync loop
-                            break
-                        }
-                    } catch {
-                        await failure(error)
-                        break
-                    }
                 } else {
                     await handleSyncFailure(action: action, error: error)
+                    // A failed-event callback can queue rewind and request stop.
+                    // Settle that cancellation before releasing the run owner.
+                    if Task.isCancelled {
+                        restartAfterCancellation = (try? await syncTaskWasCancelled()) ?? false
+                    }
                     break
                 }
             }
         }
 
+        // Every terminal callback may admit another rewind. Retain this run
+        // until those contexts settle, or leave them for the external drain
+        // that already captured and is joining this exact run.
+        if drainTask == nil, wipeTask == nil, !afterSyncHooksManager.isEmpty {
+            restartAfterCancellation = (try? await handleAfterSyncHooks()) ?? false
+        }
         logger.debug("Run ended")
-        syncTask = nil
+        if syncGeneration == generation {
+            syncTask = nil
+            syncGeneration = nil
+            syncIsRewinding = false
+        }
+        if queuedRewindStart != nil {
+            await startQueuedAfterRewind()
+        } else if restartAfterCancellation, drainTask == nil, wipeTask == nil {
+            let generation = admissionGeneration
+            // A fresh task can run the queued sync without inheriting this run's
+            // cancellation. Teardown invalidates its admission if it is delayed.
+            Task { await restartAfterRequestStop(generation: generation) }
+        }
+    }
+
+    private func startQueuedAfterRewind() async {
+        guard let request = queuedRewindStart else { return }
+        queuedRewindStart = nil
+        guard request.generation == admissionGeneration, drainTask == nil, wipeTask == nil else { return }
+        // The cancelled run still owns its terminal callbacks. Only after those
+        // return may it admit a fresh, uncancelled task for the explicit caller.
+        await startWhenUnowned(retry: request.retry, fromRewindOwner: true)
+    }
+
+    private func restartAfterRequestStop(generation: UInt64) async {
+        guard generation == admissionGeneration, drainTask == nil, wipeTask == nil else { return }
+        await startWhenUnowned(retry: false)
     }
 
     private func syncTaskWasCancelled() async throws -> Bool {
         logger.info("Sync cancelled.")
         await context.update(state: .stopped)
         await send(event: .stopped)
+        guard drainTask == nil, wipeTask == nil else { return false }
         return try await handleAfterSyncHooks()
     }
 
@@ -791,7 +981,9 @@ extension CompactBlockProcessor {
         let lastScannedHeight = await latestBlocksDataProvider.maxScannedHeight
         // Some actions may not run. For example there are no transactions to enhance and therefore there is no enhance progress. And in
         // cases like this computation of final progress won't work properly. So let's fake 100% progress at the end of the sync process.
+        guard !Task.isCancelled else { return false }
         await send(event: .progressUpdated(1, false))
+        guard !Task.isCancelled else { return false }
         await send(event: .finished(lastScannedHeight))
         await context.update(state: .finished)
 
@@ -807,7 +999,7 @@ extension CompactBlockProcessor {
         }
     }
 
-    private func failure(_ error: Error) async {
+    private func failure(_ error: Error, retryTimerAllowed: Bool = true, expectedGeneration: UInt64? = nil) async {
         await context.update(state: .failed)
 
         logger.error("Fail with error: \(error)")
@@ -816,27 +1008,26 @@ extension CompactBlockProcessor {
         await send(event: .failed(error))
 
         // don't set a new timer if there are no more attempts.
-        if hasRetryAttempt() {
+        if retryTimerAllowed, expectedGeneration == nil || expectedGeneration == admissionGeneration, hasRetryAttempt() {
             await self.setTimer()
         }
     }
 
     private func handleAfterSyncHooks() async throws -> Bool {
-        let afterSyncHooksManager = self.afterSyncHooksManager
-        self.afterSyncHooksManager = AfterSyncHooksManager()
-
-        if let wipeContext = afterSyncHooksManager.shouldExecuteWipeHook() {
-            try await doWipe(context: wipeContext)
-            return false
-        } else if let rewindContext = afterSyncHooksManager.shouldExecuteRewindHook() {
-            try await doRewind(context: rewindContext)
-            return false
-        } else if afterSyncHooksManager.shouldExecuteAnotherSyncHook() {
-            logger.debug("Starting new sync.")
-            return true
-        } else {
-            return false
+        var anotherSync = false
+        var rewound = false
+        while drainTask == nil, wipeTask == nil, !afterSyncHooksManager.isEmpty {
+            let hooks = afterSyncHooksManager
+            afterSyncHooksManager = AfterSyncHooksManager()
+            let rewinds = hooks.rewindContexts()
+            rewound = rewound || !rewinds.isEmpty
+            syncIsRewinding = syncIsRewinding || !rewinds.isEmpty
+            anotherSync = anotherSync || hooks.shouldExecuteAnotherSyncHook()
+            for rewind in rewinds { try await doRewind(context: rewind) }
         }
+        // An external stop supersedes automatic starts, including ones queued
+        // while a rewind's completion callback was suspended.
+        return anotherSync && !rewound && drainTask == nil && wipeTask == nil
     }
 }
 
@@ -844,35 +1035,33 @@ extension CompactBlockProcessor {
 
 extension CompactBlockProcessor {
     private func setTimer() async {
+        guard drainTask == nil, wipeTask == nil, !Task.isCancelled else { return }
         let interval = config.blockPollInterval
         self.backoffTimer?.invalidate()
-        let timer = Timer(
-            timeInterval: interval,
-            repeats: true,
-            block: { [weak self] _ in
-                Task { [weak self] in
-                    guard let self else { return }
-                    if await self.isIdle() {
-                        if await self.canStartSync() {
-                            await self.logger.debug(
-                                """
-                                Timer triggered: Starting compact Block processor!.
-                                Processor State: \(await self.context.state)
-                                attempts: \(await self.retryAttempts)
-                                """
-                            )
-                            await self.start()
-                        } else if await self.hasRetryAttempt() {
-                            await self.failure(ZcashError.compactBlockProcessorMaxAttemptsReached(self.config.retries))
-                        }
-                    } else {
-                        await self.latestBlocksDataProvider.updateBlockData()
-                    }
-                }
+        let generation = admissionGeneration
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { [weak self] in
+                await self?.admitTimerPoll(generation: generation)
             }
-        )
+        }
         RunLoop.main.add(timer, forMode: .default)
         self.backoffTimer = timer
+    }
+
+    private func admitTimerPoll(generation: UInt64) {
+        guard generation == admissionGeneration, drainTask == nil, wipeTask == nil, pollTask == nil else { return }
+        pollTask = Task {
+            if await isIdle() {
+                if await canStartSync() {
+                    await startWhenUnowned(retry: false)
+                } else if !Task.isCancelled, drainTask == nil, wipeTask == nil, hasRetryAttempt() {
+                    await failure(ZcashError.compactBlockProcessorMaxAttemptsReached(config.retries))
+                }
+            } else if !Task.isCancelled {
+                await latestBlocksDataProvider.updateBlockData()
+            }
+            pollTask = nil
+        }
     }
 
     private func isIdle() async -> Bool {

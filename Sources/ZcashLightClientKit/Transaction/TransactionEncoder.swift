@@ -86,16 +86,25 @@ protocol TransactionEncoder {
     ///
     /// - Parameter proposal: the proposal for which to create transactions.
     /// - Parameter spendingKey: the `UnifiedSpendingKey` associated with the account for which the proposal was created.
+    /// - Parameter ovkPolicy: the outgoing viewing key the transactions' outputs are encrypted to.
     /// - Throws:
-    ///     - `walletTransEncoderCreateTransactionMissingSaplingParams` if the sapling parameters aren't downloaded.
+    ///     - `walletTransEncoderCreateTransactionMissingSaplingParams` if the proposal needs the sapling parameters
+    ///       (see `requiresSaplingParameters(for:)`) and they aren't downloaded.
     ///     - Some `ZcashError.rust*` if the creation of transaction(s) fails.
     ///
     /// If `prepare()` hasn't already been called since creation of the synchronizer instance or since the last wipe then this method throws
     /// `SynchronizerErrors.notPrepared`.
     func createProposedTransactions(
         proposal: Proposal,
-        spendingKey: UnifiedSpendingKey
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction]
+
+    /// Whether creating the transactions of `proposal` needs the Sapling proving parameters on disk.
+    ///
+    /// It does only when the proposal has a Sapling input, payment, change or dummy output.
+    /// - Throws: `rustProposalRequiresSaplingParams` if the proposal does not decode.
+    func requiresSaplingParameters(for proposal: Proposal) throws -> Bool
 
     /// Returns broadcast-ready data for transactions stored by the wallet, independently of
     /// whether they are currently represented by the transaction-history view.
@@ -134,4 +143,20 @@ protocol TransactionEncoder {
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview]
 
     func closeDBConnection()
+}
+
+extension TransactionEncoder {
+    /// Creates the transactions in the given proposal with the default `OvkPolicy.sender`.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey
+    ) async throws -> [CreatedTransaction] {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: .sender)
+    }
+
+    /// Conservative default for encoders that cannot inspect a proposal: assume the Sapling
+    /// parameters are needed, which is what every encoder assumed before the check existed.
+    func requiresSaplingParameters(for proposal: Proposal) throws -> Bool {
+        true
+    }
 }

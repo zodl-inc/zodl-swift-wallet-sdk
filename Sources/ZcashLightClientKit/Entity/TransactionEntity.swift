@@ -13,8 +13,9 @@ public enum ZcashTransaction {
         /// Represents the transaction state based on current height of the chain,
         /// mined height and expiry height of a transaction.
         public enum State {
-            /// transaction has a `minedHeight` that's greater or equal than
-            /// `ZcashSDK.defaultStaleTolerance` confirmations.
+            /// transaction has a `minedHeight` at least as many blocks below the current height as
+            /// its required confirmations: the trusted count of ``ConfirmationsPolicy`` (ZIP 315)
+            /// for a trusted receive, `ZcashSDK.defaultStaleTolerance` for anything else.
             case confirmed
             /// transaction has no `minedHeight` but current known height is less than `expiryHeight`.
             case pending
@@ -25,16 +26,17 @@ public enum ZcashTransaction {
                 currentHeight: BlockHeight,
                 minedHeight: BlockHeight?,
                 expiredUnmined: Bool?,
-                expiryHeight: BlockHeight? = nil
+                expiryHeight: BlockHeight? = nil,
+                requiredConfirmations: Int = ZcashSDK.defaultStaleTolerance
             ) {
                 guard let expiredUnmined, !expiredUnmined else {
                     self = .expired
                     return
                 }
 
-                if let minedHeight, (currentHeight - minedHeight) >= ZcashSDK.defaultStaleTolerance {
+                if let minedHeight, (currentHeight - minedHeight) >= requiredConfirmations {
                     self = .confirmed
-                } else if let minedHeight, (currentHeight - minedHeight) < ZcashSDK.defaultStaleTolerance {
+                } else if let minedHeight, (currentHeight - minedHeight) < requiredConfirmations {
                     self = .pending
                 } else if minedHeight == nil {
                     // Fallback for when `expired_unmined` lags: a tx whose expiry has passed
@@ -330,17 +332,36 @@ extension ZcashTransaction.Overview {
 
 /// extension to handle pending states
 public extension ZcashTransaction.Overview {
+    /// The state of this transaction at `currentHeight`.
+    ///
+    /// A mined transaction is ``State/confirmed`` once it is `requiredConfirmations` blocks deep:
+    /// a trusted receive (``isTrusted``, ZIP 315) uses the trusted count of the transfer
+    /// ``ConfirmationsPolicy``, the one at which its funds become spendable; every other
+    /// transaction, sent and shielding ones included, uses `ZcashSDK.defaultStaleTolerance`.
     func getState(for currentHeight: BlockHeight) -> State {
         State(
             currentHeight: currentHeight,
             minedHeight: minedHeight,
             expiredUnmined: self.isExpiredUmined,
-            expiryHeight: self.expiryHeight
+            expiryHeight: self.expiryHeight,
+            requiredConfirmations: requiredConfirmations
         )
     }
 
     func isPending(currentHeight: BlockHeight) -> Bool {
         getState(for: currentHeight) == .pending
+    }
+}
+
+extension ZcashTransaction.Overview {
+    /// How many blocks deep this transaction must be for ``getState(for:)`` to report it
+    /// confirmed. Only a trusted receive is relaxed: trust (ZIP 315) is a property of funds the
+    /// wallet received, so sent, self-send and shielding transactions keep the stale tolerance.
+    var requiredConfirmations: Int {
+        guard isTrusted, !isSentTransaction, !isShielding else {
+            return ZcashSDK.defaultStaleTolerance
+        }
+        return Int(ConfirmationsPolicy.defaultTransferPolicy().trusted)
     }
 }
 

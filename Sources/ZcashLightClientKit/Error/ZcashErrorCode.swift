@@ -295,6 +295,10 @@ public enum ZcashErrorCode: String {
     case rustSlipstreamUnsupported = "ZRUST0097"
     /// The engine could not prove its previous pass and wallet writer had stopped before a wallet mutation; the mutation was refused.
     case slipstreamEngineNotQuiescent = "ZRUST0155"
+    /// The rust layer could not tell whether a proposal needs the Sapling proving parameters,
+    case rustProposalRequiresSaplingParams = "ZRUST0157"
+    /// Error from rust layer when calling ZcashRustBackend.setTransactionTrust
+    case rustSetTransactionTrust = "ZRUST0158"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
     case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
@@ -563,6 +567,40 @@ public enum ZcashErrorCode: String {
     case synchronizerSpendingKeyDoesNotBelongToTheWallet = "ZSYNCO0008"
     /// The attempt to rescan to height that is bellow sapling activation.
     case rescanFromHeightBellowSaplingActivation = "ZSYNCO0009"
+    /// The raw transaction has a different id than `txId`; it was stored but not marked as trusted.
+    case synchronizerTrustedTransactionIdMismatch = "ZSYNCO0010"
+    /// The gift card is for a different network than the one the redeemer was created for.
+    case giftCardNetworkMismatch = "ZGIFT0001"
+    /// Another `GiftCardRedeemer` for the same card is still active in this process. Call
+    case giftCardRedeemerAlreadyActive = "ZGIFT0002"
+    /// `redeem(to:)` was called before `check()` prepared the card wallet, or after `cleanup()`.
+    case giftCardRedeemerNotReady = "ZGIFT0003"
+    /// The card has no spendable funds to redeem: it was already redeemed, was never funded, or
+    case giftCardNothingToRedeem = "ZGIFT0004"
+    /// The redeemer was cleaned up and can no longer be used. Create a new one.
+    case giftCardRedeemerCleanedUp = "ZGIFT0005"
+    /// The text is not a gift card link: it is not an `https` URL with a gift card in its
+    case giftCardLinkNotAGiftCard = "ZGIFT0006"
+    /// The text is a gift card link of a version this SDK does not read. A newer SDK may read
+    case giftCardLinkUnsupportedVersion = "ZGIFT0007"
+    /// The gift card is for a network this SDK cannot redeem on (regtest, or an unknown one).
+    case giftCardLinkUnsupportedNetwork = "ZGIFT0008"
+    /// The gift card link's birthday height is malformed, or below the network's NU5 activation
+    case giftCardLinkInvalidBirthday = "ZGIFT0009"
+    /// The gift card link is malformed: a field is missing, repeated or invalid, the key is not
+    case giftCardLinkInvalid = "ZGIFT0010"
+    /// The gift card recipient must be a unified address with an Orchard receiver.
+    case giftCardRecipientRequiresOrchard = "ZGIFT0013"
+    /// Cleanup is still continuing and the gift card remains in use. Wait for cleanup to finish before creating another redeemer.
+    case giftCardCleanupTimedOut = "ZGIFT0011"
+    /// The gift claim completed without any submission result. No successful redemption was reported.
+    case giftCardRedemptionIncomplete = "ZGIFT0012"
+    /// The gift-card check did not finish in time. Cleanup still owns unfinished wallet work.
+    case giftCardCheckTimedOut = "ZGIFT0014"
+    /// The gift-card check could not reconnect in time. The card balance is still unknown.
+    case giftCardCheckDisconnected = "ZGIFT0015"
+    /// The gift-card wallet stopped making progress. The card balance is still unknown.
+    case giftCardCheckSyncStalled = "ZGIFT0016"
     /// Attempt to init TxId with input that is not 32 bytes.
     case txIdNot32Bytes = "ZMODEL0001"
     /// Attempt to init TxId with invalid hex encoding.

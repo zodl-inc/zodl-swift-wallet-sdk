@@ -39,7 +39,15 @@ final class SDKBroadcaster: Broadcaster {
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
     ) async throws -> [CreatedTransaction] {
-        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, recordingPlans: true)
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: .sender, recordingPlans: true)
+    }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
+    ) async throws -> [CreatedTransaction] {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, recordingPlans: true)
     }
 
     func createTransactionFromPCZT(
@@ -145,6 +153,7 @@ final class SDKBroadcaster: Broadcaster {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy = .sender,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
@@ -154,11 +163,16 @@ final class SDKBroadcaster: Broadcaster {
         // stale instead of reopening — and thereby recreating — the database `wipe()` just deleted.
         let lifecycle = await submitPlanStore.currentLifecycle()
 
-        try await downloadSaplingParamsIfNeeded()
+        // A proposal without a Sapling bundle is proven without the Sapling parameters, so a wallet
+        // that only spends Orchard or Ironwood funds never downloads them.
+        if try transactionEncoder.requiresSaplingParameters(for: proposal) {
+            try await downloadSaplingParamsIfNeeded()
+        }
 
         let createdTransactions = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
-            spendingKey: spendingKey
+            spendingKey: spendingKey,
+            ovkPolicy: ovkPolicy
         )
         let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 

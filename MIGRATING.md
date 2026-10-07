@@ -1,5 +1,40 @@
 # Migrating from previous versions to _Unreleased_
 
+## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters
+
+`ZcashError` and `ZcashErrorCode` have nineteen new cases: the gift-card errors `ZGIFT0001` to
+`ZGIFT0016`, which only `GiftCard(link:)` and `GiftCardRedeemer` throw;
+`rustProposalRequiresSaplingParams` (`ZRUST0157`), which `createProposedTransactions` throws for a
+proposal it cannot inspect; and `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`) and
+`rustSetTransactionTrust` (`ZRUST0158`), which `GiftCardRedeemer` only logs. An exhaustive
+`switch` over either type stops compiling until they are handled. The gift-card cases carry no
+payload.
+
+```swift
+case .giftCardCheckTimedOut, .giftCardCheckDisconnected, .giftCardCheckSyncStalled:
+    // The card's balance is unknown, not zero: offer another check.
+    break
+case .giftCardCleanupTimedOut:
+    // Cleanup continues and keeps the card: wait for it before creating another redeemer.
+    break
+```
+
+## `TxId` validates its length — `init(_: [UInt8])` throws
+
+`TxId.init(_ id: [UInt8])` now throws `ZcashError.txIdNot32Bytes` for anything but 32 bytes,
+and `TxId.id` is a `let`.
+
+```swift
+// Before
+let txId = TxId(bytes)
+var copy = txId
+copy.id = otherBytes
+
+// After
+let txId = try TxId(bytes)
+let copy = try TxId(otherBytes)
+```
+
 ## Bounded Tor GET requests
 
 After successful Tor enablement, use

@@ -23,8 +23,7 @@ use pczt::{
     roles::{combiner::Combiner, prover::Prover},
 };
 use prost::Message;
-use rand::rngs::OsRng;
-use secrecy::Secret;
+use secrecy::{ExposeSecret, Secret};
 use tor_rtcompat::ToplevelBlockOn as _;
 use tracing::{debug, metadata::LevelFilter};
 use tracing_subscriber::prelude::*;
@@ -100,6 +99,16 @@ mod eip681;
 mod error_report;
 mod ext_schema;
 mod ffi;
+// `liberated_payment.rs` is shared verbatim with the payment-minting tooling, so items this
+// crate does not use (minting, link writing) are allowed rather than edited out, and rustfmt
+// leaves it alone so the copies stay byte-identical. cbindgen must not parse it: its `Error` enum
+// would shadow the generic `Error` paths cbindgen resolves elsewhere. `gift_ffi` carries its C
+// surface, which presents a liberated payment to the SDK as a gift card.
+/// cbindgen:ignore
+#[allow(dead_code)]
+#[rustfmt::skip]
+mod liberated_payment;
+mod gift_ffi;
 mod interactive_qos;
 mod migration;
 mod migration_engine;
@@ -109,6 +118,7 @@ mod migration_plan_cache;
 mod migration_turnstile;
 mod ohttp;
 mod retained_marks;
+mod sapling_prover;
 mod tor;
 mod voting;
 
@@ -170,6 +180,18 @@ pub(crate) fn anchor_retention_interval(network: NetworkParams) -> AnchorRetenti
 /// on, so the timeout never engages.
 pub(crate) const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The system RNG's type, in the form the NU7 crates' APIs accept. The wallet type aliases name
+/// it; everything else is generic over its RNG.
+pub(crate) type SystemRng = rand::rand_core::UnwrapErr<rand::rngs::SysRng>;
+
+/// The system RNG.
+///
+/// Functions below the FFI layer take their RNG as an argument, so the entry points are where
+/// it comes into being and where a caller can see that randomness is involved.
+pub(crate) fn system_rng() -> SystemRng {
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng)
+}
+
 /// Helper method for construcing a WalletDb value from path data provided over the FFI.
 ///
 /// The returned handle retains its durable anchor checkpoints on the interval
@@ -185,11 +207,12 @@ pub(crate) const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Durati
 /// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
 /// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
-unsafe fn wallet_db(
+unsafe fn wallet_db<R: rand::CryptoRng>(
+    rng: R,
     db_data: *const u8,
     db_data_len: usize,
     network: NetworkParams,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>> {
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, R>> {
     let db_data = Path::new(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
@@ -201,7 +224,7 @@ unsafe fn wallet_db(
         .map_err(|e| anyhow!("Error setting wallet database busy_timeout: {}", e))?;
     rusqlite::vtab::array::load_module(&conn)
         .map_err(|e| anyhow!("Error loading wallet database array module: {}", e))?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng)
+    Ok(WalletDb::from_connection(conn, network, SystemClock, rng)
         .with_anchor_retention_interval(anchor_retention_interval(network)))
 }
 
@@ -404,7 +427,7 @@ pub unsafe extern "C" fn zcashlc_init_data_database(
 ) -> i32 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let seed = if seed.is_null() {
             None
@@ -464,7 +487,7 @@ pub unsafe extern "C" fn zcashlc_list_accounts(
 ) -> *mut ffi::Accounts {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         Ok(ffi::Accounts::ptr_from_vec(
             db_data
@@ -503,15 +526,15 @@ pub unsafe extern "C" fn zcashlc_get_account(
 ) -> *mut ffi::Account {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         Ok(Box::into_raw(Box::new(
             db_data
                 .get_account(account_uuid)?
-                .map_or(ffi::Account::NOT_FOUND, |account| {
+                .map_or(Ok(ffi::Account::NOT_FOUND), |account| {
                     ffi::Account::from_account(&account, &network)
-                }),
+                })?,
         )))
     });
     unwrap_exc_or_null(res)
@@ -571,7 +594,7 @@ pub unsafe extern "C" fn zcashlc_create_account(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let seed = Secret::new((unsafe { slice::from_raw_parts(seed, seed_len) }).to_vec());
         let treestate =
             TreeState::decode(unsafe { slice::from_raw_parts(treestate, treestate_len) })
@@ -604,7 +627,7 @@ pub unsafe extern "C" fn zcashlc_create_account(
         let encoded = usk.to_bytes(Era::Orchard);
         Ok(Box::into_raw(Box::new(ffi::BinaryKey::new(
             account_uuid,
-            encoded,
+            encoded.expose_secret().to_vec(),
         ))))
     });
     unwrap_exc_or_null(res)
@@ -658,7 +681,7 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let ufvk_str = unsafe { CStr::from_ptr(ufvk).to_str()? };
         let ufvk = UnifiedFullViewingKey::decode(&network, ufvk_str).map_err(|e| {
             anyhow!(
@@ -757,7 +780,7 @@ pub unsafe extern "C" fn zcashlc_is_seed_relevant_to_any_derived_account(
 ) -> i8 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let seed = Secret::new((unsafe { slice::from_raw_parts(seed, seed_len) }).to_vec());
 
         // Replicate the logic from `initWalletDb`. `NoDerivedAccounts` (the
@@ -815,7 +838,7 @@ pub unsafe extern "C" fn zcashlc_delete_account(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         db_data.delete_account(account_uuid)?;
@@ -883,7 +906,7 @@ pub unsafe extern "C" fn zcashlc_get_current_address(
 ) -> *mut c_char {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         match db_data.get_last_generated_address_matching(
@@ -891,7 +914,7 @@ pub unsafe extern "C" fn zcashlc_get_current_address(
             UnifiedAddressRequest::AllAvailableKeys,
         ) {
             Ok(Some(ua)) => {
-                let address_str = ua.encode(&network);
+                let address_str = ua.encode_receiver_preserving(&network);
                 Ok(CString::new(address_str).unwrap().into_raw())
             }
             Ok(None) => Err(anyhow!(
@@ -930,7 +953,7 @@ pub unsafe extern "C" fn zcashlc_get_single_use_taddr(
 ) -> *mut ffi::SingleUseTaddr {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         match db_data.reserve_next_n_ephemeral_addresses(account_uuid, 1) {
@@ -1042,7 +1065,7 @@ pub unsafe extern "C" fn zcashlc_get_next_available_address(
 ) -> *mut c_char {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let receiver_flags = ReceiverFlags::from_bits(receiver_flags)
             .ok_or_else(|| anyhow!("Invalid unified address receiver flags {}", receiver_flags))?;
@@ -1056,7 +1079,7 @@ pub unsafe extern "C" fn zcashlc_get_next_available_address(
 
         match db_data.get_next_available_address(account_uuid, address_request) {
             Ok(Some((ua, _))) => {
-                let address_str = ua.encode(&network);
+                let address_str = ua.encode_receiver_preserving(&network);
                 Ok(CString::new(address_str).unwrap().into_raw())
             }
             Ok(None) => Err(anyhow!(
@@ -1096,7 +1119,7 @@ pub unsafe extern "C" fn zcashlc_list_transparent_receivers(
 ) -> *mut ffi::EncodedKeys {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         // Zashi does not support standalone keys, so we do not request standalone receivers.
@@ -1141,7 +1164,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let addr = unsafe { CStr::from_ptr(address).to_str()? };
         let taddr = TransparentAddress::decode(&network, addr)?;
         let confirmations_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
@@ -1193,7 +1216,7 @@ pub unsafe extern "C" fn zcashlc_get_verified_transparent_balance_for_account(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         let (target, _) = db_data
@@ -1259,7 +1282,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let addr = unsafe { CStr::from_ptr(address).to_str()? };
         let taddr = TransparentAddress::decode(&network, addr)?;
         let (target, _) = db_data
@@ -1308,7 +1331,7 @@ pub unsafe extern "C" fn zcashlc_get_total_transparent_balance_for_account(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         let (target, _) = db_data
@@ -1375,7 +1398,7 @@ pub unsafe extern "C" fn zcashlc_get_memo(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let txid_bytes = unsafe { slice::from_raw_parts(txid_bytes, 32) };
         let txid = TxId::read(txid_bytes)?;
@@ -1468,7 +1491,7 @@ pub unsafe extern "C" fn zcashlc_rewind_to_height(
     }
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let height = BlockHeight::from(height);
         let result_height = db_data.truncate_to_height(height);
@@ -1530,7 +1553,7 @@ pub unsafe extern "C" fn zcashlc_truncate_to_chain_state(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let chain_state =
             TreeState::decode(unsafe { slice::from_raw_parts(chain_state, chain_state_len) })
                 .map_err(|e| anyhow!("Invalid TreeState: {}", e))?
@@ -1570,7 +1593,7 @@ pub unsafe extern "C" fn zcashlc_put_sapling_subtree_roots(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let roots = unsafe { roots.as_ref().unwrap() };
         let roots_slice: &[ffi::SubtreeRoot] =
@@ -1623,7 +1646,7 @@ pub unsafe extern "C" fn zcashlc_put_orchard_subtree_roots(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let roots = unsafe { roots.as_ref().unwrap() };
         let roots_slice: &[ffi::SubtreeRoot] =
@@ -1679,7 +1702,7 @@ pub unsafe extern "C" fn zcashlc_put_ironwood_subtree_roots(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let roots = unsafe { roots.as_ref().unwrap() };
         let roots_slice: &[ffi::SubtreeRoot] =
@@ -1732,7 +1755,7 @@ pub unsafe extern "C" fn zcashlc_update_chain_tip(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let height = BlockHeight::try_from(height)?;
 
         db_data
@@ -1766,7 +1789,7 @@ pub unsafe extern "C" fn zcashlc_fully_scanned_height(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         match db_data.block_fully_scanned() {
             Ok(Some(metadata)) => Ok(i64::from(u32::from(metadata.block_height()))),
@@ -1805,7 +1828,7 @@ pub unsafe extern "C" fn zcashlc_max_scanned_height(
 ) -> i64 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         match db_data.block_max_scanned() {
             Ok(Some(metadata)) => Ok(i64::from(u32::from(metadata.block_height()))),
@@ -1845,7 +1868,7 @@ pub unsafe extern "C" fn zcashlc_get_wallet_summary(
 ) -> *mut ffi::WalletSummary {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let confirmations_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
 
         match db_data
@@ -1885,7 +1908,7 @@ pub unsafe extern "C" fn zcashlc_suggest_scan_ranges(
 ) -> *mut ffi::ScanRanges {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let ranges = db_data
             .suggest_scan_ranges()
@@ -1959,7 +1982,7 @@ pub unsafe extern "C" fn zcashlc_scan_blocks(
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let block_db = block_db(fs_block_cache_root, fs_block_cache_root_len)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let from_height = BlockHeight::try_from(from_height)?;
         let from_state =
             TreeState::decode(unsafe { slice::from_raw_parts(from_state, from_state_len) })
@@ -2016,7 +2039,7 @@ pub unsafe extern "C" fn zcashlc_put_utxo(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let txid_bytes = unsafe { slice::from_raw_parts(txid_bytes, txid_bytes_len) };
         let mut txid = [0u8; 32];
@@ -2244,7 +2267,7 @@ pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
 ) -> i32 {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let tx_bytes = unsafe { slice::from_raw_parts(tx, tx_len) };
 
         // The consensus branch ID passed in here does not matter:
@@ -2340,7 +2363,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
@@ -2460,7 +2483,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let to = unsafe { CStr::from_ptr(to) }.to_str()?;
@@ -2567,7 +2590,7 @@ pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         let proposal =
@@ -2614,7 +2637,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let payment_uri_str = unsafe { CStr::from_ptr(payment_uri) }.to_str()?;
@@ -2736,7 +2759,7 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
@@ -2882,6 +2905,14 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
 /// - `output_params`: A pointer to a buffer containing the operating system path of the Sapling
 ///   output proving parameters, in the operating system's preferred path representation.
 /// - `output_params_len`: the length of the `output_params` buffer.
+/// - `ovk_policy`: how the outgoing viewing key is used to encrypt the transactions' outputs:
+///   `0` (Sender) lets the sending account's OVK recover them, `1` (Discard) makes them
+///   unrecoverable by any OVK, so nobody holding the sender's keys can learn the recipients
+///   or amounts from the chain. Any other value is an error.
+///
+/// The Sapling parameters are only loaded when the proposal has a Sapling input, payment, change
+/// or dummy output (see `zcashlc_proposal_requires_sapling_params`). For any other proposal,
+/// `spend_params` and `output_params` may be null and the files they name need not exist.
 ///
 /// # Safety
 ///
@@ -2905,13 +2936,13 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
 ///   function call.
 /// - The total size `usk_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of `pointer::offset`.
-/// - `spend_params` must be non-null and valid for reads for `spend_params_len` bytes,
+/// - `spend_params` must be null or valid for reads for `spend_params_len` bytes,
 ///   and it must have an alignment of `1`.
 /// - The memory referenced by `spend_params` must not be mutated for the duration of the
 ///   function call.
 /// - The total size `spend_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of `pointer::offset`.
-/// - `output_params` must be non-null and valid for reads for `output_params_len` bytes,
+/// - `output_params` must be null or valid for reads for `output_params_len` bytes,
 ///   and it must have an alignment of `1`.
 /// - The memory referenced by `output_params` must not be mutated for the duration of the
 ///   function call.
@@ -2930,14 +2961,16 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     output_params: *const u8,
     output_params_len: usize,
     network_id: u32,
+    ovk_policy: u32,
 ) -> *mut ffi::TxIds {
     const CONTEXT: &str = "create_proposed_transactions";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
-        let proposal =
+        let ovk_policy = parse_ovk_policy(ovk_policy)?;
+        let proposal_proto =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| {
                     debug!("{CONTEXT}: proposal did not decode: {e}");
@@ -2946,26 +2979,31 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
                         ErrorKind::ProposalInvalid,
                         "the proposal could not be decoded",
                     )
-                })?
-                .try_into_standard_proposal(&network, &db_data)?;
+                })?;
+        // Loads the Sapling parameters only when the proposal has a Sapling bundle to prove, so a
+        // proposal that never touches Sapling builds even when the parameter files are absent.
+        let prover = unsafe {
+            sapling_prover::SaplingProver::for_proposal(
+                &proposal_proto,
+                spend_params,
+                spend_params_len,
+                output_params,
+                output_params_len,
+            )
+        }?;
+        let proposal = proposal_proto.try_into_standard_proposal(&network, &db_data)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
-        let spend_params = Path::new(OsStr::from_bytes(unsafe {
-            slice::from_raw_parts(spend_params, spend_params_len)
-        }));
-        let output_params = Path::new(OsStr::from_bytes(unsafe {
-            slice::from_raw_parts(output_params, output_params_len)
-        }));
-
-        let prover = LocalTxProver::new(spend_params, output_params);
         let expiry_height = None;
 
         let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
             &mut db_data,
             &network,
+            &SystemClock,
+            &mut system_rng(),
             &prover,
             &prover,
             &SpendingKeys::from_unified_spending_key(usk),
-            OvkPolicy::Sender,
+            ovk_policy,
             &proposal,
             expiry_height,
         )
@@ -3007,7 +3045,7 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
 ) -> *mut ffi::TransactionData {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let txid_bytes = unsafe { *(txid_bytes.cast::<[u8; 32]>()) };
         let txid = TxId::from_bytes(txid_bytes);
         let Some(transaction) = db_data
@@ -3079,7 +3117,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
@@ -3094,6 +3132,8 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 &mut db_data,
                 &network,
+                &SystemClock,
+                &mut system_rng(),
                 account_uuid,
                 OvkPolicy::Sender,
                 &proposal,
@@ -3273,6 +3313,7 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
                 })?;
             prover = prover
                 .create_orchard_proof(
+                    system_rng(),
                     zcash_primitives::transaction::builder::cached_orchard_proving_key(
                         circuit_version,
                     ),
@@ -3296,6 +3337,7 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
                 })?;
             prover = prover
                 .create_ironwood_proof(
+                    system_rng(),
                     zcash_primitives::transaction::builder::cached_orchard_proving_key(
                         circuit_version,
                     ),
@@ -3321,7 +3363,7 @@ pub unsafe extern "C" fn zcashlc_add_proofs_to_pczt(
             let local_prover = LocalTxProver::new(spend_params, output_params);
 
             prover = prover
-                .create_sapling_proofs(&local_prover, &local_prover)
+                .create_sapling_proofs(system_rng(), &local_prover, &local_prover)
                 .map_err(|e| anyhow!("Failed to create Sapling proofs for PCZT: {:?}", e))?;
         }
         assert!(!prover.requires_sapling_proofs());
@@ -3408,7 +3450,7 @@ pub unsafe extern "C" fn zcashlc_extract_and_store_from_pczt(
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let pczt_with_proofs_bytes =
             unsafe { slice::from_raw_parts(pczt_with_proofs_ptr, pczt_with_proofs_len) };
@@ -3438,6 +3480,8 @@ pub unsafe extern "C" fn zcashlc_extract_and_store_from_pczt(
 
         let txid = extract_and_store_transaction_from_pczt::<_, ()>(
             &mut db_data,
+            &SystemClock,
+            &mut system_rng(),
             pczt,
             sapling_vk.as_ref().map(|(s, o)| (s, o)),
             None,
@@ -3477,7 +3521,7 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
 ) -> bool {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let txid_bytes = unsafe { slice::from_raw_parts(txid_bytes, txid_bytes_len) };
         let txid = TxId::read(txid_bytes)?;
@@ -3496,6 +3540,87 @@ pub unsafe extern "C" fn zcashlc_set_transaction_status(
     });
 
     unwrap_exc_or(res, false)
+}
+
+/// Marks the given transaction as trusted or untrusted, in the sense of [ZIP 315]: the outputs of
+/// a trusted transaction become spendable after the policy's `trusted` confirmations even though
+/// they were not produced by this wallet.
+///
+/// The transaction must already be stored in `db_data` (for instance through
+/// [`zcashlc_decrypt_and_store_transaction`], which stores nothing for a transaction that does not
+/// involve the wallet). Returns `true` on success and `false` with the last error set otherwise,
+/// including when the transaction is not stored, so `true` always means the status was recorded.
+///
+/// [ZIP 315]: https://zips.z.cash/zip-0315
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must
+///   have an alignment of `1`. Its contents must be a string representing a valid system
+///   path in the operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the
+///   function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `txid_bytes` must be non-null and valid for reads for `txid_bytes_len` bytes, and it must
+///   have an alignment of `1`.
+/// - The memory referenced by `txid_bytes` must not be mutated for the duration of the
+///   function call.
+/// - The total size `txid_bytes_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_set_transaction_trust(
+    db_data: *const u8,
+    db_data_len: usize,
+    txid_bytes: *const u8,
+    txid_bytes_len: usize,
+    trusted: bool,
+    network_id: u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+
+        let txid_bytes = unsafe { slice::from_raw_parts(txid_bytes, txid_bytes_len) };
+        let txid = TxId::read(txid_bytes)?;
+
+        set_trust_of_stored_transaction(&mut db_data, txid, trusted)?;
+
+        Ok(true)
+    });
+
+    unwrap_exc_or(res, false)
+}
+
+/// Sets the trust status of a transaction this wallet has stored, failing when it has not.
+///
+/// `WalletWrite::set_tx_trust` is an update that succeeds without touching a row when the
+/// transaction is unknown, and `decrypt_and_store_transaction` stores nothing for a transaction
+/// that does not involve the wallet. Checking first is what lets a caller tell "trusted" apart from
+/// "there was nothing to trust".
+fn set_trust_of_stored_transaction<W>(
+    db_data: &mut W,
+    txid: TxId,
+    trusted: bool,
+) -> anyhow::Result<()>
+where
+    W: WalletRead + WalletWrite,
+    <W as WalletRead>::Error: std::fmt::Display,
+{
+    let stored = db_data
+        .get_transaction(txid)
+        .map_err(|e| anyhow!("Error looking up txid {}: {}", txid, e))?
+        .is_some();
+    if !stored {
+        return Err(anyhow!(
+            "Transaction {} is not stored in this wallet; its trust status was not set",
+            txid
+        ));
+    }
+
+    db_data
+        .set_tx_trust(txid, trusted)
+        .map_err(|e| anyhow!("Error setting the trust status of txid {}: {}", txid, e))
 }
 
 /// Returns a list of transaction data requests that the network client should satisfy.
@@ -3518,7 +3643,7 @@ pub unsafe extern "C" fn zcashlc_transaction_data_requests(
 ) -> *mut ffi::TransactionDataRequests {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         Ok(ffi::TransactionDataRequests::ptr_from_vec(
             db_data
@@ -3582,7 +3707,7 @@ pub unsafe extern "C" fn zcashlc_fix_witnesses(
 ) {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let corrupt_ranges = db_data.check_witnesses()?;
         if let Some(nel_ranges) = NonEmpty::from_vec(corrupt_ranges) {
@@ -4034,7 +4159,7 @@ pub unsafe extern "C" fn zcashlc_get_exchange_rate_usd(
         let rate = tor_runtime.runtime().block_on(async {
             tor_runtime
                 .client()
-                .get_latest_zec_to_usd_rate(&exchanges)
+                .get_latest_zec_to_usd_rate(&mut system_rng(), &exchanges)
                 .await
         })?;
 
@@ -4166,7 +4291,7 @@ pub unsafe extern "C" fn zcashlc_get_exchange_rate_usd_from(
         let rate = tor_runtime.runtime().block_on(async {
             tor_runtime
                 .client()
-                .get_latest_zec_to_usd_rate(&exchanges)
+                .get_latest_zec_to_usd_rate(&mut system_rng(), &exchanges)
                 .await
         })?;
 
@@ -4460,7 +4585,7 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_update_transparent_address_transac
             .ok_or_else(|| anyhow!("A Tor lightwalletd connection is required"))?;
 
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
         let addr = TransparentAddress::decode(&network, addr_str)?;
@@ -4534,7 +4659,7 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_fetch_utxos_by_address(
             .ok_or_else(|| anyhow!("A Tor lightwalletd connection is required"))?;
 
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
@@ -4604,7 +4729,7 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         let lwd_conn = unsafe { lwd_conn.as_mut() }
@@ -4817,6 +4942,7 @@ pub extern "C" fn zcashlc_set_custom_network(
     nu6_1: i64,
     nu6_2: i64,
     nu6_3: i64,
+    nu7: i64,
 ) -> bool {
     fn height(value: i64) -> Option<BlockHeight> {
         u32::try_from(value).ok().map(BlockHeight::from_u32)
@@ -4837,6 +4963,7 @@ pub extern "C" fn zcashlc_set_custom_network(
         nu6_1: height(nu6_1),
         nu6_2: height(nu6_2),
         nu6_3: height(nu6_3),
+        nu7: height(nu7),
     };
 
     match CUSTOM_PARAMS.write() {
@@ -4846,6 +4973,15 @@ pub extern "C" fn zcashlc_set_custom_network(
             !replaced_different
         }
         Err(_) => false,
+    }
+}
+
+/// Decodes the `ovk_policy` argument of `zcashlc_create_proposed_transactions`.
+fn parse_ovk_policy(value: u32) -> anyhow::Result<OvkPolicy> {
+    match value {
+        0 => Ok(OvkPolicy::Sender),
+        1 => Ok(OvkPolicy::Discard),
+        _ => Err(anyhow!("Invalid OVK policy: {value}")),
     }
 }
 
@@ -4935,6 +5071,17 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 mod tests {
     use super::*;
 
+    /// The C callers select the outgoing viewing key policy by number; only the two documented
+    /// values are accepted, so a caller asking for an unrecoverable send is never silently given
+    /// a recoverable one.
+    #[test]
+    fn ovk_policy_codes() {
+        assert!(matches!(parse_ovk_policy(0).unwrap(), OvkPolicy::Sender));
+        assert!(matches!(parse_ovk_policy(1).unwrap(), OvkPolicy::Discard));
+        assert!(parse_ovk_policy(2).is_err());
+        assert!(parse_ovk_policy(u32::MAX).is_err());
+    }
+
     /// Only the production network gets the ZIP 318 grid, whose anonymity set depends on every
     /// wallet sharing it. Testnet gets the shortened grid, so a migration passes through anchor
     /// boundaries fast enough to be exercised.
@@ -4949,6 +5096,45 @@ mod tests {
             TEST_ANCHOR_RETENTION_INTERVAL,
         );
         assert_eq!(TEST_ANCHOR_RETENTION_INTERVAL.block_count().get(), 12);
+    }
+
+    /// The NU7 height a host passes to `zcashlc_set_custom_network` selects the NU7 branch from
+    /// that height, and a negative height leaves NU7 not activated.
+    #[test]
+    fn the_custom_network_takes_its_nu7_height_from_the_ffi() {
+        let _custom_network = lock_custom_network();
+
+        assert!(zcashlc_set_custom_network(
+            NETWORK_ID_REGTEST,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            100,
+            300,
+        ));
+        let params = parse_network(NETWORK_ID_REGTEST).unwrap();
+        assert_eq!(
+            params.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(300))
+        );
+        assert_eq!(
+            BranchId::for_height(&params, BlockHeight::from_u32(299)),
+            BranchId::Nu6_3
+        );
+        assert_eq!(
+            BranchId::for_height(&params, BlockHeight::from_u32(300)),
+            BranchId::Nu7
+        );
+
+        zcashlc_set_custom_network(NETWORK_ID_REGTEST, 1, 1, 1, 1, 1, 1, 1, 1, 1, 100, -1);
+        let params = parse_network(NETWORK_ID_REGTEST).unwrap();
+        assert_eq!(params.activation_height(NetworkUpgrade::Nu7), None);
     }
 
     /// A custom-parameter network is a test deployment even when it borrows mainnet's address
@@ -4969,6 +5155,7 @@ mod tests {
                 nu6_1: height,
                 nu6_2: height,
                 nu6_3: height,
+                nu7: height,
             },
         };
         assert_eq!(
@@ -5129,6 +5316,31 @@ mod tests {
             !fresh_tip_decision(false, false, 1, 1),
             "a completed range without a refresh this run proves nothing"
         );
+    }
+
+    /// A transaction the wallet never stored, such as one `decrypt_and_store_transaction` skipped
+    /// because it does not involve the wallet, must not report its trust as set: the update
+    /// underneath would succeed on zero rows.
+    #[test]
+    fn trusting_a_transaction_the_wallet_did_not_store_fails() {
+        use zcash_client_sqlite::wallet::init::init_wallet_db;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wallet.sqlite");
+        let mut db = WalletDb::for_path(
+            &path,
+            NetworkParams::Standard(TestNetwork),
+            SystemClock,
+            system_rng(),
+        )
+        .expect("opens a fresh wallet db");
+        init_wallet_db(&mut db, None).expect("initializes the wallet schema");
+
+        let txid = TxId::from_bytes([0x5a; 32]);
+        let error = set_trust_of_stored_transaction(&mut db, txid, true)
+            .expect_err("an unknown transaction cannot be trusted");
+        assert!(error.to_string().contains("not stored in this wallet"));
+        assert!(db.get_transaction(txid).unwrap().is_none());
     }
 }
 
@@ -5404,9 +5616,11 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
         // every open. Non-fatal by design — a wallet that cannot be marked must still open
         // and sync.
         let network_params = NetworkParams::Standard(network);
-        match unsafe { wallet_db(db_data, db_data_len, network_params) }.and_then(|mut wallet| {
-            retained_marks::reconcile_retained_anchor_marks(&mut wallet, &network_params)
-        }) {
+        match unsafe { wallet_db(system_rng(), db_data, db_data_len, network_params) }.and_then(
+            |mut wallet| {
+                retained_marks::reconcile_retained_anchor_marks(&mut wallet, &network_params)
+            },
+        ) {
             Ok(0) => {}
             Ok(n) => {
                 tracing::info!(
@@ -6703,6 +6917,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_wallet_summary(
                 let path_bytes = db_path.as_os_str().as_bytes();
                 let db_data = unsafe {
                     wallet_db(
+                        system_rng(),
                         path_bytes.as_ptr(),
                         path_bytes.len(),
                         NetworkParams::Standard(network),
@@ -6748,6 +6963,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_wallet_summary(
                             let path_bytes = thread_db_path.as_os_str().as_bytes();
                             let db_data = unsafe {
                                 wallet_db(
+                                    system_rng(),
                                     path_bytes.as_ptr(),
                                     path_bytes.len(),
                                     NetworkParams::Standard(network),
@@ -7363,6 +7579,7 @@ mod slipstream_anchor_retention_tests {
             nu6_1: None,
             nu6_2: None,
             nu6_3: None,
+            nu7: None,
         };
         assert_eq!(slipstream_anchor_retention_floor(&no_nu63), None);
     }
@@ -7401,5 +7618,54 @@ mod engine_schema_names_tests {
              resolve_recovery_nets to match. Engine DDL: {}",
             slipstream_core::reconcile::RECOVERY_BALANCE_VIEW_SQL
         );
+    }
+}
+
+/// The bundled wallet from before `zcash_client_sqlite`'s `full_account_ids` migration migrates
+/// end to end through the FFI with the seed the Swift tests use. The wallet stores its UFVK at
+/// ZIP 316 revision 0.
+#[cfg(test)]
+mod legacy_wallet_migration_tests {
+    #[test]
+    fn the_legacy_fixture_migrates_with_its_own_seed() {
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/Tests/TestUtils/Resources/darkside_data.db"
+        );
+        let dst = std::env::temp_dir().join(format!("legacy-ufvk-{}.db", std::process::id()));
+        std::fs::copy(src, &dst).expect("the fixture copies");
+        // `Environment.seedBytes` in `Tests/TestUtils/Tests+Utils.swift`.
+        let seed = base64_seed();
+        let path = dst.to_str().unwrap().as_bytes();
+        let rc = unsafe {
+            crate::zcashlc_init_data_database(
+                path.as_ptr(),
+                path.len(),
+                seed.as_ptr(),
+                seed.len(),
+                crate::NETWORK_ID_MAINNET,
+            )
+        };
+        let conn = rusqlite::Connection::open(&dst).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(accounts)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let _ = std::fs::remove_file(&dst);
+        assert_eq!(rc, 0, "the fixture's own seed must be accepted");
+        assert!(
+            columns.iter().any(|c| c == "id") && columns.iter().any(|c| c == "uuid"),
+            "the accounts table must have been rebuilt by full_account_ids: {columns:?}"
+        );
+    }
+
+    fn base64_seed() -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode("9VDVOZZZOWWHpZtq1Ebridp3Qeux5C+HwiRR0g7Oi7HgnMs8Gfln83+/Q1NnvClcaSwM4ADFL1uZHxypEWlWXg==")
+            .unwrap()
     }
 }

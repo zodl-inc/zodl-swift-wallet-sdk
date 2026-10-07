@@ -43,7 +43,6 @@
 
 use anyhow::anyhow;
 use orchard::keys::FullViewingKey;
-use rand::rngs::OsRng;
 use zcash_client_backend::data_api::{Account, AccountSource, InputSource, WalletRead};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::{
@@ -59,8 +58,12 @@ use zcash_pool_migration::wallet::WalletMigration;
 use crate::NetworkParams;
 
 /// The concrete wallet type every migration entry point operates over.
-pub(crate) type MigrationWallet =
-    zcash_client_sqlite::WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>;
+pub(crate) type MigrationWallet = zcash_client_sqlite::WalletDb<
+    rusqlite::Connection,
+    NetworkParams,
+    SystemClock,
+    crate::SystemRng,
+>;
 
 /// The account-scoped pool-migration store, over the second connection into the wallet database
 /// file that every migration call opens ([`crate::migration`]'s `CallCtx::store_conn`).

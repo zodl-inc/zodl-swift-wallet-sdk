@@ -19,7 +19,8 @@ pub(crate) fn temp_wallet_db(network_id: u32) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
     let network = crate::parse_network(network_id).expect("network");
-    let mut db = WalletDb::for_path(&path, network, SystemClock, rand::rngs::OsRng).expect("open");
+    let mut db =
+        WalletDb::for_path(&path, network, SystemClock, crate::system_rng()).expect("open");
     init_wallet_db(&mut db, None).expect("init");
     (dir, path)
 }
@@ -77,7 +78,7 @@ pub(crate) fn synthetic_keystone_request() -> zcash_voting::delegate::KeystoneSi
 
 /// A fresh randomizer, drawn the way the crate draws one per bundle.
 pub(crate) fn random_alpha() -> pasta_curves::pallas::Scalar {
-    <pasta_curves::pallas::Scalar as ff::Field>::random(rand::rngs::OsRng)
+    <pasta_curves::pallas::Scalar as ff::Field>::random(&mut crate::system_rng())
 }
 
 /// A Keystone request carrying real RedPallas material, with the signature a
@@ -103,7 +104,7 @@ pub(crate) fn keystone_request_signed_under(
     let rk = <[u8; 32]>::from(&orchard::primitives::redpallas::VerificationKey::from(
         &randomized,
     ));
-    let sig = <[u8; 64]>::from(&randomized.sign(rand::rngs::OsRng, &sighash));
+    let sig = <[u8; 64]>::from(&randomized.sign(crate::system_rng(), &sighash));
 
     let mut request = synthetic_keystone_request();
     request.pczt_sighash = sighash.to_vec();
@@ -223,7 +224,8 @@ pub(crate) fn temp_wallet_db_with_account(network_id: u32) -> (tempfile::TempDir
 
     let (dir, path) = temp_wallet_db(network_id);
     let network = crate::parse_network(network_id).expect("network");
-    let mut db = WalletDb::for_path(&path, network, SystemClock, rand::rngs::OsRng).expect("open");
+    let mut db =
+        WalletDb::for_path(&path, network, SystemClock, crate::system_rng()).expect("open");
 
     let usk = crate::voting::helpers::usk_from_seed(network_id, &[7u8; 32], zip32::AccountId::ZERO)
         .expect("unified spending key");

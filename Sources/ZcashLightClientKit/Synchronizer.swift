@@ -338,6 +338,33 @@ public protocol Synchronizer: AnyObject {
         spendingKey: UnifiedSpendingKey
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>
 
+    /// Creates the transactions in the given proposal, encrypting their outputs according to
+    /// `ovkPolicy`, and submits them.
+    ///
+    /// With ``OvkPolicy/discard`` the transactions' recipients, amounts and memos cannot be
+    /// recovered from the chain by anyone holding the spending account's keys — not even by this
+    /// wallet after a restore from seed. Use it when others may hold those keys, such as when
+    /// sweeping a gift card. `createProposedTransactions(proposal:spendingKey:)` is this call with
+    /// ``OvkPolicy/sender``.
+    ///
+    /// The Sapling proving parameters are only downloaded when the proposal has a Sapling input,
+    /// payment, change or dummy output.
+    ///
+    /// A conformer that does not override this throws for ``OvkPolicy/discard`` rather than
+    /// silently creating recoverable outputs.
+    ///
+    /// - Parameter proposal: the proposal for which to create transactions.
+    /// - Parameter spendingKey: the `UnifiedSpendingKey` associated with the account for which the proposal was created.
+    /// - Parameter ovkPolicy: the outgoing viewing key policy for the created transactions.
+    ///
+    /// If `prepare()` hasn't already been called since creation of the synchronizer instance
+    /// or since the last wipe then this method throws `SynchronizerErrors.notPrepared`.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>
+
     /// Attempts to propose fulfilling a [ZIP-321](https://zips.z.cash/zip-0321) payment URI by spending from the ZIP 32 account with the given index.
     ///  - Parameter uri: a valid ZIP-321 payment URI
     ///  - Parameter accountUUID: the account providing spend authority.
@@ -1648,7 +1675,26 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    /// Default implementation so adding `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`
+    /// to the protocol is not a source-breaking change for downstream conformers. The sender
+    /// policy is what `createProposedTransactions(proposal:spendingKey:)` already does; a conformer
+    /// that cannot honor ``OvkPolicy/discard`` refuses it instead of weakening the caller's
+    /// privacy request.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        switch ovkPolicy {
+        case .sender:
+            return try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey)
+        case .discard:
+            throw OvkPolicyUnsupported(member: "Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:)")
+        }
+    }
+
     // swiftlint:disable function_parameter_count
+
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route.
     ///
     /// Only a conformer that owns a Tor client can open a round on Tor, and the refusal is the
@@ -2227,4 +2273,27 @@ extension UUID {
     static var nullID: UUID {
         UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
     }
+}
+
+// MARK: - Immediate incoming transactions
+
+/// A wallet that can store a trusted transaction before its next sync. `SDKSynchronizer` and
+/// `SlipstreamSynchronizer` conform. Gift-card claims use this internal contract to apply the
+/// three-confirmation trusted policy. The card's shared spending key still permits competing
+/// spends during a reorg, even though this device constructed the claim.
+protocol TrustedTransactionRecording: AnyObject {
+    /// Stores `rawTransaction` at once (the receive shows before any sync, unmined) and explicitly
+    /// marks it as trusted, including when recorded again. The default transfer policy requires
+    /// three confirmations before its funds become spendable. This goes straight to the wallet
+    /// database and works while the synchronizer is stopped.
+    ///
+    /// - Parameters:
+    ///   - rawTransaction: the complete serialized transaction, as broadcast.
+    ///   - txId: the transaction's id. It must be the id of `rawTransaction`.
+    /// - Throws: `ZcashError.rustDecryptAndStoreTransaction` if the transaction cannot be stored,
+    ///   `ZcashError.synchronizerTrustedTransactionIdMismatch` if `txId` is not the id of
+    ///   `rawTransaction` (the transaction is stored, but its trust status is unchanged), and
+    ///   `ZcashError.rustSetTransactionTrust` if the trust status cannot be recorded, which
+    ///   includes a transaction that does not involve this wallet and so was not stored.
+    func recordTrustedTransaction(_ rawTransaction: Data, txId: TxId) async throws
 }

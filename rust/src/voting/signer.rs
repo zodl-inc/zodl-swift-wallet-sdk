@@ -24,9 +24,12 @@
 //! derived keys. It deliberately has no `Debug`: there is no redacted rendering
 //! of a seed worth the risk that someone prints one.
 
+use std::sync::Mutex;
+
 use ff::PrimeField;
 use orchard::primitives::redpallas::{Signature, SpendAuth, VerificationKey};
 use pasta_curves::pallas;
+use rand::CryptoRng;
 use zcash_voting::delegate::{
     DelegationSigningRequest, KeystoneSigningRequest, spend_auth_signature,
 };
@@ -45,13 +48,19 @@ use super::helpers::{usk_from_seed, voting_network};
 /// consensus parameters the same way every other `zcashlc_*` entry point does.
 /// `network` is the crate's view of the same chain, and every request the crate
 /// hands over must name it — see [`sign_delegation_request`].
-pub(super) struct SeedSpendAuthSigner {
+///
+/// The signer is handed its RNG when it is built. `SpendAuthSigner::sign` takes
+/// `&self` and carries no RNG of its own, and the pipeline shares the signer
+/// behind an `Arc`, so the RNG sits behind a mutex for the length of each
+/// signature.
+pub(super) struct SeedSpendAuthSigner<R> {
+    rng: Mutex<R>,
     seed: Zeroizing<Vec<u8>>,
     network_id: u32,
     network: Network,
 }
 
-impl SeedSpendAuthSigner {
+impl<R: CryptoRng> SeedSpendAuthSigner<R> {
     /// A signer over `seed`, rejecting anything too short to derive from and
     /// any `network_id` / `network` pair that does not name one chain.
     ///
@@ -65,6 +74,7 @@ impl SeedSpendAuthSigner {
     /// both from one value, so a disagreement is a host bug and not something
     /// a request can provoke.
     pub(super) fn new(
+        rng: R,
         seed: Zeroizing<Vec<u8>>,
         network_id: u32,
         network: Network,
@@ -86,6 +96,7 @@ impl SeedSpendAuthSigner {
             ));
         }
         Ok(Self {
+            rng: Mutex::new(rng),
             seed,
             network_id,
             network,
@@ -93,9 +104,16 @@ impl SeedSpendAuthSigner {
     }
 }
 
-impl SpendAuthSigner for SeedSpendAuthSigner {
+impl<R: CryptoRng + Send> SpendAuthSigner for SeedSpendAuthSigner<R> {
     fn sign(&self, request: DelegationSigningRequest) -> Result<[u8; 64], VotingError> {
-        sign_delegation_request(&self.seed, self.network_id, self.network, request)
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+        sign_delegation_request(
+            &mut *rng,
+            &self.seed,
+            self.network_id,
+            self.network,
+            request,
+        )
     }
 }
 
@@ -121,6 +139,7 @@ impl SpendAuthSigner for SeedSpendAuthSigner {
 /// against. [`SeedSpendAuthSigner::new`] is where that is checked for the
 /// signer path.
 pub(super) fn sign_delegation_request(
+    rng: impl CryptoRng,
     seed: &[u8],
     network_id: u32,
     expected_network: Network,
@@ -159,9 +178,7 @@ pub(super) fn sign_delegation_request(
         .map_err(|e| internal(format!("failed to derive the account spending key: {e}")))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
 
-    let signature = ask
-        .randomize(&alpha)
-        .sign(rand::rngs::OsRng, &request.sighash);
+    let signature = ask.randomize(&alpha).sign(rng, &request.sighash);
     let bytes: [u8; 64] = (&signature).into();
     Ok(bytes)
 }
@@ -290,9 +307,14 @@ mod tests {
         let alpha = pasta_curves::pallas::Scalar::from(5u64);
         let request = request_for(&seed, ff::PrimeField::to_repr(&alpha));
 
-        let sig =
-            sign_delegation_request(&seed, crate::NETWORK_ID_TESTNET, Network::Testnet, request)
-                .unwrap();
+        let sig = sign_delegation_request(
+            crate::system_rng(),
+            &seed,
+            crate::NETWORK_ID_TESTNET,
+            Network::Testnet,
+            request,
+        )
+        .unwrap();
 
         let usk = crate::voting::helpers::usk_from_seed(
             crate::NETWORK_ID_TESTNET,
@@ -313,6 +335,7 @@ mod tests {
         let request = request_for(&[2u8; 32], [0u8; 32]);
 
         let err = sign_delegation_request(
+            crate::system_rng(),
             &[1u8; 32],
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
@@ -329,6 +352,7 @@ mod tests {
         let request = request_for(&[1u8; 32], [0xffu8; 32]);
 
         let err = sign_delegation_request(
+            crate::system_rng(),
             &[1u8; 32],
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
@@ -345,6 +369,7 @@ mod tests {
         let request = request_for(&[1u8; 32], [0u8; 32]);
 
         let err = sign_delegation_request(
+            crate::system_rng(),
             &[1u8; 32],
             crate::NETWORK_ID_TESTNET,
             Network::Mainnet,
@@ -361,6 +386,7 @@ mod tests {
         let request = request_for(&[1u8; 32], [0u8; 32]);
 
         let err = sign_delegation_request(
+            crate::system_rng(),
             &[1u8; 16],
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
@@ -382,9 +408,14 @@ mod tests {
         let mut request = request_for(&seed, [0u8; 32]);
         request.account_index = 1 << 31;
 
-        let err =
-            sign_delegation_request(&seed, crate::NETWORK_ID_TESTNET, Network::Testnet, request)
-                .unwrap_err();
+        let err = sign_delegation_request(
+            crate::system_rng(),
+            &seed,
+            crate::NETWORK_ID_TESTNET,
+            Network::Testnet,
+            request,
+        )
+        .unwrap_err();
 
         assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
         assert!(
@@ -398,6 +429,7 @@ mod tests {
         // The signer holds seed material and so has no `Debug`, which is what
         // keeps the success arm out of `unwrap_err`.
         let err = match SeedSpendAuthSigner::new(
+            crate::system_rng(),
             Zeroizing::new(vec![1u8; 16]),
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
@@ -415,6 +447,7 @@ mod tests {
     #[test]
     fn seed_signer_rejects_a_network_pair_that_disagrees() {
         let err = match SeedSpendAuthSigner::new(
+            crate::system_rng(),
             Zeroizing::new(vec![1u8; 32]),
             crate::NETWORK_ID_MAINNET,
             Network::Testnet,
@@ -434,6 +467,7 @@ mod tests {
         let alpha = pasta_curves::pallas::Scalar::from(9u64);
         let request = request_for(&seed, ff::PrimeField::to_repr(&alpha));
         let signer = SeedSpendAuthSigner::new(
+            crate::system_rng(),
             Zeroizing::new(seed.to_vec()),
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
@@ -461,6 +495,7 @@ mod tests {
         let seed = [1u8; 32];
         let request = request_for(&seed, [0u8; 32]);
         let signer = SeedSpendAuthSigner::new(
+            crate::system_rng(),
             Zeroizing::new(seed.to_vec()),
             crate::NETWORK_ID_MAINNET,
             Network::Mainnet,

@@ -42,6 +42,21 @@ public protocol Broadcaster: AnyObject {
         spendingKey: UnifiedSpendingKey
     ) async throws -> [CreatedTransaction]
 
+    /// Creates the transactions in the given proposal without submitting them, encrypting their
+    /// outputs according to `ovkPolicy`.
+    ///
+    /// ``OvkPolicy/discard`` leaves the recipients and amounts unrecoverable by anyone holding
+    /// the spending account's keys, including the sending wallet when restored from seed.
+    /// `createProposedTransactions(proposal:spendingKey:)` is this call with ``OvkPolicy/sender``.
+    ///
+    /// A conformer that does not override this throws for ``OvkPolicy/discard`` rather than
+    /// silently creating recoverable outputs.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
+    ) async throws -> [CreatedTransaction]
+
     /// Finalizes a PCZT that has been separately proven and signed, stores it
     /// in the wallet, and returns the resulting transactions without submitting.
     ///
@@ -96,6 +111,24 @@ public protocol Broadcaster: AnyObject {
 }
 
 extension Broadcaster {
+    /// Default implementation so adding `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`
+    /// to the protocol is not a source-breaking change for downstream conformers. The sender
+    /// policy is what `createProposedTransactions(proposal:spendingKey:)` already does; a conformer
+    /// that cannot honor ``OvkPolicy/discard`` refuses it instead of weakening the caller's
+    /// privacy request.
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
+    ) async throws -> [CreatedTransaction] {
+        switch ovkPolicy {
+        case .sender:
+            return try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey)
+        case .discard:
+            throw OvkPolicyUnsupported(member: "Broadcaster.createProposedTransactions(proposal:spendingKey:ovkPolicy:)")
+        }
+    }
+
     /// Forwards with `SubmissionTiming.default` (protocol requirements cannot
     /// declare default arguments).
     public func submit(
@@ -235,5 +268,19 @@ public struct TransactionSubmissionReport: Equatable {
     public init(txId: Data, outcome: TransactionSubmissionOutcome) {
         self.txId = txId
         self.outcome = outcome
+    }
+}
+
+/// Error thrown by the default `ovkPolicy:` overloads of `Broadcaster` and `Synchronizer` when a
+/// conformer that does not override them is asked for ``OvkPolicy/discard``.
+struct OvkPolicyUnsupported: LocalizedError {
+    /// The member that has no discarding implementation.
+    let member: String
+
+    var errorDescription: String? {
+        """
+        \(member) has no implementation for OvkPolicy.discard. \
+        Override it in your conformer to support discarding the outgoing viewing key.
+        """
     }
 }

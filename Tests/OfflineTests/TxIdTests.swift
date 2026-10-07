@@ -59,4 +59,17 @@ class TxIdTests: XCTestCase {
         let decoded = try TxId(displayHex)
         XCTAssertEqual(decoded.id, rawBytes, "round-tripping back through TxId.init(_:) must reproduce the original raw bytes")
     }
+
+    func testTxIdFromBytesRequiresExactly32Bytes() throws {
+        let bytes = [UInt8](repeating: 0xAB, count: 32)
+        XCTAssertEqual(try TxId(bytes).id, bytes)
+
+        for count in [0, 1, 31, 33, 64] {
+            XCTAssertThrowsError(try TxId([UInt8](repeating: 0xAB, count: count)), "\(count) bytes") { error in
+                guard case ZcashError.txIdNot32Bytes = error else {
+                    return XCTFail("Unexpected error \(error.localizedDescription)")
+                }
+            }
+        }
+    }
 }

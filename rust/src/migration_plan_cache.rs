@@ -31,8 +31,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
 use zcash_pool_migration::engine::MigrationPlan;
 
 /// Opaque identifier of one cached [`MigrationPlan`]. Drawn fresh (randomly, never zero) for
@@ -88,15 +87,16 @@ fn store() -> &'static Mutex<HashMap<Key, CachedPlan>> {
 /// Records the most recently previewed plan for `(db_path, account)`, replacing any previous one
 /// (each propose call replaces any prior unconsumed proposal), and returns the fresh handle that
 /// now identifies it. Any handle previously issued for the key is thereby invalidated:
-/// committing with it fails with [`PlanLookupError::Superseded`].
+/// committing with it fails with [`PlanLookupError::Superseded`]. The handle is drawn from `rng`.
 pub(crate) fn set(
+    rng: &mut impl Rng,
     db_path: PathBuf,
     account: [u8; 16],
     plan: MigrationPlan,
     immediate: bool,
 ) -> PlanHandle {
     let handle = loop {
-        let candidate = OsRng.next_u64();
+        let candidate = rng.next_u64();
         if candidate != 0 {
             break candidate;
         }

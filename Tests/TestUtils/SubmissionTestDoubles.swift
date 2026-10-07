@@ -265,6 +265,7 @@ final class StubTransactionEncoder: TransactionEncoder {
     private let createdTransactions: [CreatedTransaction]
     private let overviews: [ZcashTransaction.Overview]
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
+    private(set) var receivedOvkPolicy: OvkPolicy?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
@@ -316,9 +317,11 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     func createProposedTransactions(
         proposal: Proposal,
-        spendingKey: UnifiedSpendingKey
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
+        receivedOvkPolicy = ovkPolicy
         return createdTransactions
     }
 

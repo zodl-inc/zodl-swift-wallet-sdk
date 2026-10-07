@@ -604,7 +604,7 @@ pub unsafe extern "C" fn zcashlc_voting_session_run(
         // SAFETY: the host's callback and context, under this function's
         // contract; the sink is used only until this call returns.
         let sink = unsafe { EventSink::new(callback, context) };
-        json_to_boxed_slice(&session.run(overrides, signer, policy, sink)?)
+        json_to_boxed_slice(&session.run(crate::system_rng(), overrides, signer, policy, sink)?)
     });
     unwrap_exc_or_null(res)
 }

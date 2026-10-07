@@ -568,6 +568,30 @@ class BroadcasterMock: Broadcaster {
         }
     }
 
+    // MARK: - createProposedTransactions
+
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyThrowableError: Error?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount = 0
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyCalled: Bool {
+        return createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount > 0
+    }
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyReceivedArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy)?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyReturnValue: [CreatedTransaction]!
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyClosure: ((Proposal, UnifiedSpendingKey, OvkPolicy) async throws -> [CreatedTransaction])?
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy) async throws -> [CreatedTransaction] {
+        if let error = createProposedTransactionsProposalSpendingKeyOvkPolicyThrowableError {
+            throw error
+        }
+        createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount += 1
+        createProposedTransactionsProposalSpendingKeyOvkPolicyReceivedArguments = (proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy)
+        if let closure = createProposedTransactionsProposalSpendingKeyOvkPolicyClosure {
+            return try await closure(proposal, spendingKey, ovkPolicy)
+        } else {
+            return createProposedTransactionsProposalSpendingKeyOvkPolicyReturnValue
+        }
+    }
+
     // MARK: - createTransactionFromPCZT
 
     var createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError: Error?
@@ -1870,6 +1894,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(proposal, spendingKey)
         } else {
             return createProposedTransactionsProposalSpendingKeyReturnValue
+        }
+    }
+
+    // MARK: - createProposedTransactions
+
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyThrowableError: Error?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount = 0
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyCalled: Bool {
+        return createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount > 0
+    }
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyReceivedArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy)?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyReturnValue: AsyncThrowingStream<TransactionSubmitResult, Error>!
+    var createProposedTransactionsProposalSpendingKeyOvkPolicyClosure: ((Proposal, UnifiedSpendingKey, OvkPolicy) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>)?
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        if let error = createProposedTransactionsProposalSpendingKeyOvkPolicyThrowableError {
+            throw error
+        }
+        createProposedTransactionsProposalSpendingKeyOvkPolicyCallsCount += 1
+        createProposedTransactionsProposalSpendingKeyOvkPolicyReceivedArguments = (proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy)
+        if let closure = createProposedTransactionsProposalSpendingKeyOvkPolicyClosure {
+            return try await closure(proposal, spendingKey, ovkPolicy)
+        } else {
+            return createProposedTransactionsProposalSpendingKeyOvkPolicyReturnValue
         }
     }
 
@@ -4194,6 +4242,33 @@ class TransactionRepositoryMock: TransactionRepository {
     }
 
 }
+class TrustedTransactionRecordingMock: TrustedTransactionRecording {
+
+
+    init(
+    ) {
+    }
+
+    // MARK: - recordTrustedTransaction
+
+    var recordTrustedTransactionTxIdThrowableError: Error?
+    var recordTrustedTransactionTxIdCallsCount = 0
+    var recordTrustedTransactionTxIdCalled: Bool {
+        return recordTrustedTransactionTxIdCallsCount > 0
+    }
+    var recordTrustedTransactionTxIdReceivedArguments: (rawTransaction: Data, txId: TxId)?
+    var recordTrustedTransactionTxIdClosure: ((Data, TxId) async throws -> Void)?
+
+    func recordTrustedTransaction(_ rawTransaction: Data, txId: TxId) async throws {
+        if let error = recordTrustedTransactionTxIdThrowableError {
+            throw error
+        }
+        recordTrustedTransactionTxIdCallsCount += 1
+        recordTrustedTransactionTxIdReceivedArguments = (rawTransaction: rawTransaction, txId: txId)
+        try await recordTrustedTransactionTxIdClosure!(rawTransaction, txId)
+    }
+
+}
 class UTXOFetcherMock: UTXOFetcher {
 
 
@@ -4977,25 +5052,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - createProposedTransactions
 
-    var createProposedTransactionsProposalUskThrowableError: Error?
-    var createProposedTransactionsProposalUskCallsCount = 0
-    var createProposedTransactionsProposalUskCalled: Bool {
-        return createProposedTransactionsProposalUskCallsCount > 0
+    var createProposedTransactionsProposalUskOvkPolicyThrowableError: Error?
+    var createProposedTransactionsProposalUskOvkPolicyCallsCount = 0
+    var createProposedTransactionsProposalUskOvkPolicyCalled: Bool {
+        return createProposedTransactionsProposalUskOvkPolicyCallsCount > 0
     }
-    var createProposedTransactionsProposalUskReceivedArguments: (proposal: FfiProposal, usk: UnifiedSpendingKey)?
-    var createProposedTransactionsProposalUskReturnValue: [Data]!
-    var createProposedTransactionsProposalUskClosure: ((FfiProposal, UnifiedSpendingKey) async throws -> [Data])?
+    var createProposedTransactionsProposalUskOvkPolicyReceivedArguments: (proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy)?
+    var createProposedTransactionsProposalUskOvkPolicyReturnValue: [Data]!
+    var createProposedTransactionsProposalUskOvkPolicyClosure: ((FfiProposal, UnifiedSpendingKey, OvkPolicy) async throws -> [Data])?
 
-    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey) async throws -> [Data] {
-        if let error = createProposedTransactionsProposalUskThrowableError {
+    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy) async throws -> [Data] {
+        if let error = createProposedTransactionsProposalUskOvkPolicyThrowableError {
             throw error
         }
-        createProposedTransactionsProposalUskCallsCount += 1
-        createProposedTransactionsProposalUskReceivedArguments = (proposal: proposal, usk: usk)
-        if let closure = createProposedTransactionsProposalUskClosure {
-            return try await closure(proposal, usk)
+        createProposedTransactionsProposalUskOvkPolicyCallsCount += 1
+        createProposedTransactionsProposalUskOvkPolicyReceivedArguments = (proposal: proposal, usk: usk, ovkPolicy: ovkPolicy)
+        if let closure = createProposedTransactionsProposalUskOvkPolicyClosure {
+            return try await closure(proposal, usk, ovkPolicy)
         } else {
-            return createProposedTransactionsProposalUskReturnValue
+            return createProposedTransactionsProposalUskOvkPolicyReturnValue
         }
     }
 
@@ -5260,6 +5335,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         setTransactionStatusTxIdStatusCallsCount += 1
         setTransactionStatusTxIdStatusReceivedArguments = (txId: txId, status: status)
         try await setTransactionStatusTxIdStatusClosure!(txId, status)
+    }
+
+    // MARK: - setTransactionTrust
+
+    var setTransactionTrustTxIdTrustedThrowableError: Error?
+    var setTransactionTrustTxIdTrustedCallsCount = 0
+    var setTransactionTrustTxIdTrustedCalled: Bool {
+        return setTransactionTrustTxIdTrustedCallsCount > 0
+    }
+    var setTransactionTrustTxIdTrustedReceivedArguments: (txId: Data, trusted: Bool)?
+    var setTransactionTrustTxIdTrustedClosure: ((Data, Bool) async throws -> Void)?
+
+    func setTransactionTrust(txId: Data, trusted: Bool) async throws {
+        if let error = setTransactionTrustTxIdTrustedThrowableError {
+            throw error
+        }
+        setTransactionTrustTxIdTrustedCallsCount += 1
+        setTransactionTrustTxIdTrustedReceivedArguments = (txId: txId, trusted: trusted)
+        try await setTransactionTrustTxIdTrustedClosure!(txId, trusted)
     }
 
     // MARK: - fixWitnesses

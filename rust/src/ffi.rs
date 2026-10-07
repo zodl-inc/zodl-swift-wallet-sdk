@@ -42,12 +42,30 @@ impl Account {
         uivk: ptr::null_mut(),
     };
 
+    /// Builds the FFI view of `account`. Fails if a viewing key of the account has no ZIP 316
+    /// encoding.
     pub(crate) fn from_account(
         account: &impl zcash_client_backend::data_api::Account<AccountId = AccountUuid>,
         params: &impl zcash_protocol::consensus::Parameters,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let derivation = account.source().key_derivation();
-        Account {
+        let (ufvk, uivk) = match account.ufvk() {
+            Some(ufvk) => {
+                let ufvk_str = ufvk
+                    .encode(params)
+                    .map_err(|e| anyhow!("Error encoding unified full viewing key: {e}"))?;
+                let uivk_str = ufvk
+                    .to_unified_incoming_viewing_key()
+                    .encode(params)
+                    .map_err(|e| anyhow!("Error encoding unified incoming viewing key: {e}"))?;
+                (
+                    CString::new(ufvk_str).unwrap().into_raw(),
+                    CString::new(uivk_str).unwrap().into_raw(),
+                )
+            }
+            None => (ptr::null_mut(), ptr::null_mut()),
+        };
+        Ok(Account {
             uuid_bytes: account.id().expose_uuid().into_bytes(),
             account_name: account.name().map_or(ptr::null_mut(), |name| {
                 CString::new(name).unwrap().into_raw()
@@ -58,14 +76,9 @@ impl Account {
                 .map_or(ptr::null_mut(), |s| CString::new(s).unwrap().into_raw()),
             seed_fingerprint: derivation.map_or([0u8; 32], |d| d.seed_fingerprint().to_bytes()),
             hd_account_index: derivation.map_or(u32::MAX, |d| d.account_index().into()),
-            ufvk: account.ufvk().map_or(ptr::null_mut(), |ufvk| {
-                CString::new(ufvk.encode(params)).unwrap().into_raw()
-            }),
-            uivk: account.ufvk().map_or(ptr::null_mut(), |ufvk| {
-                let uivk = ufvk.to_unified_incoming_viewing_key();
-                CString::new(uivk.encode(params)).unwrap().into_raw()
-            }),
-        }
+            ufvk,
+            uivk,
+        })
     }
 }
 
@@ -1154,7 +1167,7 @@ impl Address {
         address: UnifiedAddress,
         diversifier_index: DiversifierIndex,
     ) -> Self {
-        let address_str = address.encode(network);
+        let address_str = address.encode_receiver_preserving(network);
         Self {
             address: CString::new(address_str).unwrap().into_raw(),
             diversifier_index_bytes: *diversifier_index.as_bytes(),

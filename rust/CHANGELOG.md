@@ -30,6 +30,34 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
     with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
     key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
+- `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose
+  fragment carries a `v=1` card (`#v=1&key=…&height=…`) or the legacy JSON payment-link encoding at
+  `/payment-links/open#vN=` — without touching a database or the network, and returns an
+  `FfiGiftCardLink`: its `origin` (`FfiGiftCardOrigin`: `V1`, `LegacyV1`, `LegacyV2`, `LegacyV3`),
+  `network_id` (`0` testnet, `1` mainnet; regtest cards are refused), `birthday_height` (never
+  below the network's NU5 activation height), the informational amount (`has_amount`/`amount`, in
+  zatoshis), a nullable `description` (sanitized: control whitespace becomes a space, other
+  control and invisible formatting characters such as bidi overrides are removed), the card
+  wallet's Orchard-only `funding_address`, and the 64-byte BIP 39 `seed` of the card wallet (ZIP 32
+  account 0). Free it with `zcashlc_free_gift_card`, which zeroes the seed. On failure it returns
+  null, writes the reason to `error_out` when that is non-null, and sets the last error; neither
+  contains any part of the link, which carries a spending secret. The reason is a stable
+  `FfiGiftCardLinkError`: `NotAGiftLink`, `UnsupportedVersion`, `WrongNetwork` (regtest or an
+  unknown network), `InvalidBirthday` (malformed, or below NU5 activation) or `InvalidLink`
+  (anything else).
+- `zcashlc_set_transaction_trust(db_data, db_data_len, txid_bytes, txid_bytes_len, trusted,
+  network_id)` marks a stored transaction as trusted or untrusted in the sense of ZIP 315
+  (`WalletWrite::set_tx_trust`): the outputs of a trusted transaction become spendable after the
+  confirmations policy's `trusted` count even though this wallet did not produce them. The
+  transaction must already be stored (for instance through `zcashlc_decrypt_and_store_transaction`,
+  which stores nothing for a transaction that does not involve the wallet). Returns `true` on
+  success, `false` with the last error set otherwise, including for a txid the wallet has not
+  stored, so `true` always means the status was recorded.
+- `zcashlc_proposal_requires_sapling_params(proposal_ptr, proposal_len)` reports, without a
+  database, whether creating a proposal's transactions needs the Sapling proving parameters: `1`
+  when any step has a Sapling input, payment, change or dummy output (or leaves a pool
+  unspecified), `0` otherwise, and `-1` with the last error set when the proposal does not decode.
+
 - `zcashlc_tor_http_get_with_timeout` adds an HTTP GET entry point whose trailing positive
   `timeout_ms` bounds the complete Tor operation, including connection setup, retries, and response
   body collection. It otherwise accepts the same arguments and returns the same response as
@@ -347,6 +375,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (every chain and PIR endpoint must be one of the gateway's exact hosts, otherwise the open fails
   with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
   when it is true. PIR queries share the session's route.
+  heights, a negative value means "not activated on this network".
+- `zcashlc_create_proposed_transactions` takes a trailing `ovk_policy: u32`: `0` encrypts the
+  outputs to the sending account's outgoing viewing key, as every call did before, and `1` discards
+  it, so nobody holding the account's keys can recover the recipients, amounts or memos from the
+  chain. Any other value fails. Existing callers must pass `0` to keep their behavior.
+- `zcashlc_create_proposed_transactions` reads the Sapling parameter files only for a proposal that
+  `zcashlc_proposal_requires_sapling_params` reports as needing them. For any other proposal
+  `spend_params` and `output_params` may be null and the files need not exist; a proposal that
+  needs them with null paths fails instead of panicking.
 - `zcashlc_slipstream_snapshot` reports `tip_fresh = 1` only once the run that refreshed the
   chain tip has also completed a ChainTip-priority scan range (`spendable_hint = 1`) or reached
   Done, so a host that lifts a spendable-balance mask on `tip_fresh` never uncovers the transient
@@ -570,6 +607,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
+- The crate now builds against the NU7 pre-release generation of the `librustzcash` crates and
+  the `zodl-slipstream` 0.4.0-pre.1 engine.
+- Every unified address, UFVK and UIVK string a `zcashlc_*` function returns is ZIP 316
+  revision 0, with every receiver or item the value carries, as before the NU7 move. Revision 2
+  is used only for a value revision 0 cannot represent (one with expiry metadata, a P2SH
+  viewing-key item, or only transparent items). Decoding accepts both revisions, unchanged.
+- `zcash_voting` moves from 5.1.0 to 5.1.1-rc.3 as it stands at the head of
+  valargroup/zcash_voting#373, which moves the crate's `lrz` backend to the NU7 pre-release
+  crates. No release carries that change yet, so `[patch.crates-io]` takes the crate from
+  `zodl-inc/zcash_voting@9bb3762`, and the crates under it that the change also needs from the
+  heads of their own pull requests: `voting-circuits`, `voting-crypto-deps` and `imt-tree`
+  (valargroup/voting-circuits#135), `pir-types` and `pir-client`
+  (valargroup/vote-nullifier-pir#173), and `zakura-wallet-lib`
+  (zakura-core/wallet-libraries#83). Each entry is replaced by the release that contains its
+  pull request. The `zcashlc_voting_*` C surface is unchanged.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the

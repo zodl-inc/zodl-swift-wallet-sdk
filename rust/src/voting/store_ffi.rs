@@ -672,7 +672,7 @@ mod tests {
         // Modified-mainnet: base identity mainnet, custom activation heights.
         assert!(crate::zcashlc_set_custom_network(
             1, 347_500, 419_200, 653_600, 903_000, 1_046_400, 1_687_104, 2_726_400, 3_146_400,
-            3_364_600, 3_428_143,
+            3_364_600, 3_428_143, -1,
         ));
 
         let db = unsafe {

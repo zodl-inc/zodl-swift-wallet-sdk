@@ -9,6 +9,15 @@ import XCTest
 @testable import ZcashLightClientKit
 
 class ZcashErrorLocalizedTests: XCTestCase {
+    func testGiftCardRecipientRequiresOrchardRendersSafeActionableError() {
+        let error = ZcashError.giftCardRecipientRequiresOrchard
+        XCTAssertEqual(error.code, ZcashErrorCode.giftCardRecipientRequiresOrchard)
+        XCTAssertEqual(error.code.rawValue, "ZGIFT0013")
+        XCTAssertEqual(error.localizedDescription, "ZGIFT0013: The gift card recipient must be a unified address with an Orchard receiver.")
+        XCTAssertNil(error.detail)
+        XCTAssertTrue(Mirror(reflecting: error).children.isEmpty)
+    }
+
     // MARK: - LocalizedError conformance
 
     func testLocalizedDescriptionContainsErrorCode() {

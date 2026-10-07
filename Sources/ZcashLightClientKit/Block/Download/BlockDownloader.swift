@@ -45,7 +45,7 @@ protocol BlockDownloader {
     ///   - maxBlockBufferSize: Number of blocks that is held in memory before blocks are written to disk.
     func startDownload(maxBlockBufferSize: Int) async
 
-    /// Stop download. This method cancels Task used for downloading. And then it is waiting until internal `isDownloading` flag is set to `false`
+    /// Cancels the download and waits for its storage writer to finish, even when the caller is cancelled.
     func stopDownload() async
 
     /// Waits until blocks from `range` are downloaded. This method does just the waiting. If `startDownload(maxBlockBufferSize:syncRange:)` isn't
@@ -80,7 +80,8 @@ actor BlockDownloaderImpl {
     private var batchSize: Int?
 
     private var downloadToHeight: BlockHeight = 0
-    private var isDownloading = false
+    private var isDraining = false
+    private var downloadID: UUID?
     private var task: Task<Void, Error>?
     private var lastError: Error?
 
@@ -98,76 +99,74 @@ actor BlockDownloaderImpl {
         self.logger = logger
     }
 
-    private func doDownload(maxBlockBufferSize: Int) async {
+    private func doDownload(maxBlockBufferSize: Int, downloadID: UUID) async {
+        defer {
+            if self.downloadID == downloadID, !isDraining {
+                task = nil
+                self.downloadID = nil
+            }
+        }
         lastError = nil
         do {
-            guard let batchSize = self.batchSize, let syncRange = self.syncRange else {
-                logger.error("Dont have downloadStream. Trying to download blocks before sync range is not set.")
-                throw ZcashError.blockDownloadSyncRangeNotSet
-            }
+            while true {
+                guard let batchSize = self.batchSize, let syncRange = self.syncRange else {
+                    logger.error("Dont have downloadStream. Trying to download blocks before sync range is not set.")
+                    throw ZcashError.blockDownloadSyncRangeNotSet
+                }
 
-            let downloadFrom = max(syncRange.lowerBound, latestDownloadedBlockHeight + 1)
-            let downloadTo = min(downloadToHeight, syncRange.upperBound)
+                let downloadFrom = max(syncRange.lowerBound, latestDownloadedBlockHeight + 1)
+                let downloadTo = min(downloadToHeight, syncRange.upperBound)
 
-            if downloadFrom > downloadTo {
+                if downloadFrom > downloadTo {
+                    logger.debug("""
+                    Download from \(downloadFrom) is higher or same as dowload to \(downloadTo). All blocks are probably downloaded. Exiting.
+                    """)
+                    return
+                }
+
+                let range = downloadFrom...downloadTo
+                let maxAmountBlocksDownloadedByStream = Constants.rebuildStreamAfterBatchesCount * batchSize
+                let createNewStream =
+                    self.downloadStream == nil ||
+                    range.lowerBound - downloadStreamCreatedAtRange.lowerBound >= maxAmountBlocksDownloadedByStream ||
+                    downloadTo >= downloadStreamCreatedAtRange.upperBound
+
+                let downloadStream: BlockDownloaderStream
+                if let stream = self.downloadStream, !createNewStream {
+                    downloadStream = stream
+                } else {
+                    // In case that limit is larger than Constants.rebuildStreamAfterBatchesCount * batchSize we need to set upper bound of the range like
+                    // this. This is not normal operational mode but something can request to download whole sync range at one go for example.
+                    let streamRange = range.lowerBound...max(downloadToHeight, range.lowerBound + maxAmountBlocksDownloadedByStream)
+                    logger.debug("Creating new stream for range \(streamRange.lowerBound)...\(streamRange.upperBound)")
+
+                    downloadStreamCreatedAtRange = streamRange
+                    // ServiceMode to resolve
+                    let stream = try service.blockStream(startHeight: streamRange.lowerBound, endHeight: streamRange.upperBound, mode: .direct)
+                    downloadStream = BlockDownloaderStream(stream: stream)
+                    self.downloadStream = downloadStream
+                }
+
                 logger.debug("""
-                Download from \(downloadFrom) is higher or same as dowload to \(downloadTo). All blocks are probably downloaded. Exiting.
+                Starting downloading blocks.
+                syncRange:                   \(syncRange.lowerBound)...\(syncRange.upperBound)
+                downloadToHeight:            \(downloadToHeight)
+                latestDownloadedBlockHeight: \(latestDownloadedBlockHeight)
+                range:                       \(range.lowerBound)...\(range.upperBound)
                 """)
-                isDownloading = false
-                task = nil
-                return
-            }
 
-            let range = downloadFrom...downloadTo
-            let maxAmountBlocksDownloadedByStream = Constants.rebuildStreamAfterBatchesCount * batchSize
-            let createNewStream =
-                self.downloadStream == nil ||
-                range.lowerBound - downloadStreamCreatedAtRange.lowerBound >= maxAmountBlocksDownloadedByStream ||
-                downloadTo >= downloadStreamCreatedAtRange.upperBound
+                try await downloadAndStoreBlocks(
+                    using: downloadStream,
+                    at: range,
+                    maxBlockBufferSize: maxBlockBufferSize,
+                    totalProgressRange: syncRange
+                )
 
-            let downloadStream: BlockDownloaderStream
-            if let stream = self.downloadStream, !createNewStream {
-                downloadStream = stream
-            } else {
-                // In case that limit is larger than Constants.rebuildStreamAfterBatchesCount * batchSize we need to set upper bound of the range like
-                // this. This is not normal operational mode but something can request to download whole sync range at one go for example.
-                let streamRange = range.lowerBound...max(downloadToHeight, range.lowerBound + maxAmountBlocksDownloadedByStream)
-                logger.debug("Creating new stream for range \(streamRange.lowerBound)...\(streamRange.upperBound)")
-
-                downloadStreamCreatedAtRange = streamRange
-                // ServiceMode to resolve
-                let stream = try service.blockStream(startHeight: streamRange.lowerBound, endHeight: streamRange.upperBound, mode: .direct)
-                downloadStream = BlockDownloaderStream(stream: stream)
-                self.downloadStream = downloadStream
-            }
-
-            logger.debug("""
-            Starting downloading blocks.
-            syncRange:                   \(syncRange.lowerBound)...\(syncRange.upperBound)
-            downloadToHeight:            \(downloadToHeight)
-            latestDownloadedBlockHeight: \(latestDownloadedBlockHeight)
-            range:                       \(range.lowerBound)...\(range.upperBound)
-            """)
-
-            try await downloadAndStoreBlocks(
-                using: downloadStream,
-                at: range,
-                maxBlockBufferSize: maxBlockBufferSize,
-                totalProgressRange: syncRange
-            )
-
-            task = nil
-            if downloadToHeight > range.upperBound {
-                logger.debug("""
-                Finished downloading with range: \(range.lowerBound)...\(range.upperBound). Going to start new download.
-                range upper bound:      \(range.upperBound)
-                new downloadToHeight:   \(downloadToHeight)
-                """)
-                await startDownload(maxBlockBufferSize: maxBlockBufferSize)
-                logger.debug("finishing after start download")
-            } else {
-                logger.debug("Finished downloading with range: \(range.lowerBound)...\(range.upperBound)")
-                isDownloading = false
+                try Task.checkCancellation()
+                if downloadToHeight <= range.upperBound {
+                    logger.debug("Finished downloading with range: \(range.lowerBound)...\(range.upperBound)")
+                    return
+                }
             }
         } catch {
             if Task.isCancelled {
@@ -176,8 +175,6 @@ actor BlockDownloaderImpl {
                 lastError = error
                 logger.error("Blocks downloading failed: \(error)")
             }
-            isDownloading = false
-            task = nil
         }
     }
 
@@ -246,27 +243,30 @@ extension BlockDownloaderImpl: BlockDownloader {
     }
 
     func startDownload(maxBlockBufferSize: Int) async {
-        guard task == nil else {
+        guard task == nil, !isDraining else {
             logger.debug("Download already in progress.")
             return
         }
-        isDownloading = true
-        task = Task.detached() { [weak self] in
-            // Solve when self is nil, task should be niled.
-            await self?.doDownload(maxBlockBufferSize: maxBlockBufferSize)
+        let downloadID = UUID()
+        self.downloadID = downloadID
+        task = Task.detached { [weak self] in
+            await self?.doDownload(maxBlockBufferSize: maxBlockBufferSize, downloadID: downloadID)
         }
     }
 
     func stopDownload() async {
-        task?.cancel()
-        task = nil
-        while isDownloading {
-            do {
-                try await Task.sleep(milliseconds: 10)
-            } catch {
-                break
-            }
+        guard let task, let downloadID else {
+            downloadStream = nil
+            return
         }
+        isDraining = true
+        task.cancel()
+        // Task completion joins the writer without inheriting the stop caller's cancellation.
+        _ = await task.result
+        guard self.downloadID == downloadID else { return }
+        self.task = nil
+        self.downloadID = nil
+        isDraining = false
         downloadStream = nil
     }
 

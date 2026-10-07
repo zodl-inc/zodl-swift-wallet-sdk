@@ -326,13 +326,18 @@ protocol ZcashRustBackendWelding {
     ) async throws -> FfiProposal?
 
     /// Creates a transaction from the given proposal.
+    ///
+    /// The Sapling proving parameters are only read when the proposal has a Sapling input,
+    /// payment, change or dummy output; see `ZcashRustBackend.proposalRequiresSaplingParams(_:)`.
     /// - Parameter proposal: the transaction proposal.
     /// - Parameter usk: `UnifiedSpendingKey` for the account that controls the funds to be spent.
+    /// - Parameter ovkPolicy: the outgoing viewing key the transactions' outputs are encrypted to.
     /// - Returns: The ids of the created transactions.
     /// - Throws: `rustCreateToAddress`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
     func createProposedTransactions(
         proposal: FfiProposal,
-        usk: UnifiedSpendingKey
+        usk: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
     ) async throws -> [Data]
 
     /// Returns the wallet-store data available for the given transaction, or `nil` if the
@@ -428,6 +433,22 @@ protocol ZcashRustBackendWelding {
     /// scanning; as a consequence, the wallet must actively query to determine whether such
     /// transactions have been mined.
     func setTransactionStatus(txId: Data, status: TransactionStatus) async throws
+
+    /// Marks a stored transaction as trusted or untrusted in the sense of
+    /// [ZIP 315](https://zips.z.cash/zip-0315): the outputs of a trusted transaction become
+    /// spendable after `ConfirmationsPolicy.trusted` confirmations (3 by default) even though this
+    /// wallet did not produce them, instead of the `untrusted` count (10) that applies to every
+    /// other external receive.
+    ///
+    /// The transaction must already be stored, for instance through
+    /// `decryptAndStoreTransaction(txBytes:minedHeight:)`, which stores nothing for a transaction
+    /// that does not involve this wallet. An unknown transaction throws rather than succeeding
+    /// with nothing recorded.
+    /// - Parameters:
+    ///   - txId: the 32-byte transaction id.
+    ///   - trusted: `true` to trust the transaction, `false` to treat it as an ordinary external one.
+    /// - Throws: `rustSetTransactionTrust`, including when the transaction is not stored.
+    func setTransactionTrust(txId: Data, trusted: Bool) async throws
 
     /// Fix witnesses - addressing note commitment tree bug.
     /// This function is supposed to be called occasionaly. It's handled by the SDK Synchronizer and called only once per version.

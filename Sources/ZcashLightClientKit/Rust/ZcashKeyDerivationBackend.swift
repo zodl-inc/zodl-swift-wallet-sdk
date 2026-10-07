@@ -37,6 +37,58 @@ struct ZcashKeyDerivationBackend: ZcashKeyDerivationBackendWelding {
         return AddressMetadata(network: network, addrType: addrType)
     }
 
+    // MARK: Gift cards
+
+    /// Reads a gift card link through the rust layer.
+    ///
+    /// Stateless: it reads no database and makes no network request. The card's seed is read
+    /// from the rust struct in place into a ``GiftCard/Seed``, which wipes it when released; the
+    /// rust copy is zeroed when the struct is freed.
+    /// - Throws: `giftCardLinkNotAGiftCard`, `giftCardLinkUnsupportedVersion`,
+    ///   `giftCardLinkUnsupportedNetwork`, `giftCardLinkInvalidBirthday` or `giftCardLinkInvalid`,
+    ///   from the stable code the rust layer reports. None carries any part of the link.
+    static func parseGiftCardLink(_ link: String) throws -> GiftCard {
+        guard !link.containsCStringNullBytesBeforeStringEnding() else {
+            throw ZcashError.giftCardLinkInvalid
+        }
+
+        var errorCode = FfiGiftCardLinkError_InvalidLink
+        let parsed = link.withCString { zcashlc_parse_gift_card_link($0, &errorCode) }
+        guard let cardPtr = parsed else {
+            // The message is for humans; the code says what went wrong.
+            zcashlc_clear_last_error()
+            throw ZcashError(giftCardLinkError: errorCode)
+        }
+        defer { zcashlc_free_gift_card(cardPtr) }
+
+        // Fields are read one at a time rather than through a copy of the whole struct, which
+        // would put a second copy of the seed on the stack.
+        guard let network = NetworkType.forNetworkId(cardPtr.pointee.network_id) else {
+            throw ZcashError.giftCardLinkUnsupportedNetwork
+        }
+
+        let origin: GiftCard.Origin
+        switch cardPtr.pointee.origin {
+        case FfiGiftCardOrigin_V1: origin = .zodl
+        case FfiGiftCardOrigin_LegacyV1: origin = .legacyV1
+        case FfiGiftCardOrigin_LegacyV2: origin = .legacyV2
+        case FfiGiftCardOrigin_LegacyV3: origin = .legacyV3
+        default: throw ZcashError.giftCardLinkUnsupportedVersion
+        }
+
+        let seed = withUnsafeBytes(of: &cardPtr.pointee.seed) { GiftCard.Seed(copying: $0) }
+
+        return GiftCard(
+            origin: origin,
+            network: network,
+            birthdayHeight: BlockHeight(cardPtr.pointee.birthday_height),
+            statedAmount: cardPtr.pointee.has_amount ? Zatoshi(Int64(cardPtr.pointee.amount)) : nil,
+            description: cardPtr.pointee.description.map { String(cString: $0) },
+            fundingAddress: try UnifiedAddress(encoding: String(cString: cardPtr.pointee.funding_address), network: network),
+            seed: seed
+        )
+    }
+
     func receiverTypecodesOnUnifiedAddress(_ address: String) throws -> [UInt32] {
         guard !address.containsCStringNullBytesBeforeStringEnding() else {
             throw ZcashError.rustReceiverTypecodesOnUnifiedAddressContainsNullBytes(address)
@@ -276,6 +328,19 @@ struct ZcashKeyDerivationBackend: ZcashKeyDerivationBackendWelding {
             }
         } else {
             return fallback
+        }
+    }
+}
+
+extension ZcashError {
+    /// Maps the stable code `zcashlc_parse_gift_card_link` reports to its error.
+    init(giftCardLinkError code: FfiGiftCardLinkError) {
+        switch code {
+        case FfiGiftCardLinkError_NotAGiftLink: self = .giftCardLinkNotAGiftCard
+        case FfiGiftCardLinkError_UnsupportedVersion: self = .giftCardLinkUnsupportedVersion
+        case FfiGiftCardLinkError_WrongNetwork: self = .giftCardLinkUnsupportedNetwork
+        case FfiGiftCardLinkError_InvalidBirthday: self = .giftCardLinkInvalidBirthday
+        default: self = .giftCardLinkInvalid
         }
     }
 }

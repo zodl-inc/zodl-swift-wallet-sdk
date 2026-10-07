@@ -634,7 +634,7 @@ public class Initializer {
         checkpointSource: CheckpointSource,
         isRestore: Bool
     ) async -> (chainTip: UInt32?, treeState: TreeState?) {
-        let latestCheckpointHeight = checkpointSource.birthday(for: BlockHeight.max).height
+        let latestCheckpointHeight = checkpointSource.latestKnownCheckpoint().height
         if isRestore {
             guard let anchor = await anchorSource(true, walletBirthday, latestCheckpointHeight) else {
                 return (nil, nil)

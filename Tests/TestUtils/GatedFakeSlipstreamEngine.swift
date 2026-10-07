@@ -103,6 +103,9 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
 
     /// What `snapshot()` returns while the handle is open.
     var nextSnapshot: SlipstreamSnapshot?
+    private var snapshotOnStart: SlipstreamSnapshot?
+
+    func setSnapshotOnStart(_ snapshot: SlipstreamSnapshot) { snapshotOnStart = snapshot }
     /// [MOB-1852] What `walletSummary(confirmationsPolicy:)` returns while the handle is open. `nil`
     /// by default — "no balance data yet" — which every consumer already falls back from; a test
     /// that needs real balances (e.g. to exercise the [#1591] mask) scripts one via
@@ -242,10 +245,13 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         // whether a start that appears in the log ever RETURNED — which is exactly what
         // `firstTeardownWhileAStartIsInFlight` needs to answer — and a start that failed still
         // returned (by throwing), so its trace must close the same way a successful one's does.
-        defer { record("start:done") }
+        defer {
+            record("start:done")
+        }
         if let startError {
             throw startError
         }
+        if let snapshotOnStart { nextSnapshot = snapshotOnStart }
     }
 
     func stop() async -> Bool {

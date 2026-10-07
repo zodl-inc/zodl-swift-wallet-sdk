@@ -242,6 +242,7 @@ mod tests {
         NetworkUpgrade::Nu6_1,
         NetworkUpgrade::Nu6_2,
         NetworkUpgrade::Nu6_3,
+        NetworkUpgrade::Nu7,
     ];
 
     /// The schedule a wallet runs on `base` by default, as the SDK's own
@@ -249,9 +250,10 @@ mod tests {
     ///
     /// Regtest has no standard `Network` variant to stand on: a regtest chain
     /// only ever reaches the SDK through the custom slot, and the default a
-    /// wallet registers for it is every upgrade active from genesis — the
-    /// schedule `NetworkActivationHeights.allActiveFromGenesis` describes on
-    /// the Swift side.
+    /// wallet registers for it is every upgrade through NU6.3 active from
+    /// genesis, with NU7 not activated — the schedule
+    /// `NetworkActivationHeights.allActiveFromGenesis` describes on the Swift
+    /// side, and the one `zcash_voting`'s regtest schedule agrees with.
     fn standard(base: NetworkType) -> crate::NetworkParams {
         match base {
             NetworkType::Main => crate::NetworkParams::Standard(Network::MainNetwork),
@@ -271,6 +273,7 @@ mod tests {
                         nu6_1: genesis,
                         nu6_2: genesis,
                         nu6_3: genesis,
+                        nu7: None,
                     },
                 }
             }
@@ -297,6 +300,7 @@ mod tests {
                 nu6_1: at(NetworkUpgrade::Nu6_1),
                 nu6_2: at(NetworkUpgrade::Nu6_2),
                 nu6_3: Some(BlockHeight::from_u32(nu6_3)),
+                nu7: at(NetworkUpgrade::Nu7),
             },
         }
     }
@@ -321,7 +325,7 @@ mod tests {
     }
 
     /// A standard network is its own schedule, so the check must never refuse
-    /// one: mainnet and testnet, on both sides of every upgrade.
+    /// one: mainnet and testnet, on both sides of every upgrade each activates.
     #[test]
     fn a_standard_network_always_agrees_with_itself() {
         for base in [NetworkType::Main, NetworkType::Test] {
@@ -329,10 +333,10 @@ mod tests {
             let network = voting_identity(base);
             let mut heights = vec![0u64, 1, u64::from(u32::MAX)];
             for nu in UPGRADES {
-                let activation = u64::from(u32::from(
-                    params.activation_height(*nu).expect("standard activation"),
-                ));
-                heights.extend([activation - 1, activation, activation + 1]);
+                if let Some(activation) = params.activation_height(*nu) {
+                    let activation = u64::from(u32::from(activation));
+                    heights.extend([activation - 1, activation, activation + 1]);
+                }
             }
             for height in heights {
                 require_branch_agreement(&params, network, height)

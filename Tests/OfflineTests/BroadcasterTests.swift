@@ -157,7 +157,7 @@ final class BroadcasterTests: ZcashTestCase {
             expiryHeight: 123_456
         )
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = transactionData
         let encoder = WalletTransactionEncoder(
             rustBackend: rustBackend,
@@ -185,7 +185,7 @@ final class BroadcasterTests: ZcashTestCase {
         let firstTxId = Data(repeating: 0xBC, count: 32)
         let missingTxId = Data(repeating: 0xBD, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskReturnValue = [firstTxId, missingTxId]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [firstTxId, missingTxId]
         rustBackend.getTransactionTxIdClosure = { txId in
             guard txId == firstTxId else { return nil }
             return TransactionData(txId: firstTxId, raw: Data([0x01]), expiryHeight: 123_456)
@@ -256,6 +256,199 @@ final class BroadcasterTests: ZcashTestCase {
         )
 
         XCTAssertEqual(transactions, [CreatedTransaction(txId: rawID, raw: rawTransaction, expiryHeight: 123_456)])
+    }
+
+    // MARK: - Outgoing viewing key policy
+
+    func testCreateProposedTransactionsDefaultsToTheSenderOvkPolicy() async throws {
+        let rawID = Data(repeating: 0xA1, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        _ = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+
+        XCTAssertEqual(transactionEncoder.receivedOvkPolicy, .sender)
+    }
+
+    func testBroadcasterPassesTheDiscardOvkPolicyToTheEncoder() async throws {
+        let rawID = Data(repeating: 0xA2, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey,
+            ovkPolicy: .discard
+        )
+
+        XCTAssertEqual(transactions.map(\.txId), [rawID])
+        XCTAssertEqual(transactionEncoder.receivedOvkPolicy, .discard)
+    }
+
+    func testSynchronizerPassesTheDiscardOvkPolicyToTheEncoder() async throws {
+        let rawID = Data(repeating: 0xA3, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey,
+            ovkPolicy: .discard
+        )
+        var results: [TransactionSubmitResult] = []
+        for try await result in stream {
+            results.append(result)
+        }
+
+        XCTAssertEqual(results, [.success(txId: rawID)])
+        XCTAssertEqual(transactionEncoder.receivedOvkPolicy, .discard)
+    }
+
+    func testWalletTransactionEncoderPassesTheOvkPolicyToTheRustBackend() async throws {
+        let rawID = Data(repeating: 0xA4, count: 32)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
+        let encoder = makeWalletTransactionEncoder(rustBackend: rustBackend)
+
+        for policy in [OvkPolicy.sender, .discard] {
+            _ = try await encoder.createProposedTransactions(
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                spendingKey: TestsData(networkType: .testnet).spendingKey,
+                ovkPolicy: policy
+            )
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyReceivedArguments?.ovkPolicy, policy)
+        }
+    }
+
+    func testOvkPolicyFFIValues() {
+        XCTAssertEqual(OvkPolicy.sender.ffiValue, 0)
+        XCTAssertEqual(OvkPolicy.discard.ffiValue, 1)
+    }
+
+    func testDefaultBroadcasterOverloadRefusesToDiscardTheOvk() async throws {
+        let broadcaster = SenderOnlyBroadcaster()
+        let spendingKey = TestsData(networkType: .testnet).spendingKey
+
+        _ = try await broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: spendingKey,
+            ovkPolicy: .sender
+        )
+        XCTAssertEqual(broadcaster.createCallsCount, 1)
+
+        do {
+            _ = try await broadcaster.createProposedTransactions(
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                spendingKey: spendingKey,
+                ovkPolicy: .discard
+            )
+            XCTFail("A conformer without a discarding implementation must refuse OvkPolicy.discard")
+        } catch is OvkPolicyUnsupported {
+            XCTAssertEqual(broadcaster.createCallsCount, 1)
+        }
+    }
+
+    // MARK: - Sapling parameters
+
+    func testProposalSaplingRequirementIsDecidedByTheRustLayer() throws {
+        XCTAssertFalse(try ZcashRustBackend.proposalRequiresSaplingParams(Self.proposal(inputPool: .orchard, paymentPool: .orchard)))
+        XCTAssertFalse(try ZcashRustBackend.proposalRequiresSaplingParams(Self.proposal(inputPool: .ironwood, paymentPool: .ironwood)))
+        XCTAssertFalse(
+            try ZcashRustBackend.proposalRequiresSaplingParams(
+                Self.proposal(inputPool: .orchard, paymentPool: .ironwood, changePool: .ironwood)
+            )
+        )
+        XCTAssertTrue(try ZcashRustBackend.proposalRequiresSaplingParams(Self.proposal(inputPool: .sapling, paymentPool: .orchard)))
+        XCTAssertTrue(try ZcashRustBackend.proposalRequiresSaplingParams(Self.proposal(inputPool: .orchard, paymentPool: .sapling)))
+        XCTAssertTrue(
+            try ZcashRustBackend.proposalRequiresSaplingParams(
+                Self.proposal(inputPool: .orchard, paymentPool: .orchard, changePool: .sapling)
+            )
+        )
+        XCTAssertTrue(
+            try ZcashRustBackend.proposalRequiresSaplingParams(
+                Self.proposal(inputPool: .orchard, paymentPool: .orchard, saplingDummies: 1)
+            )
+        )
+    }
+
+    func testWalletTransactionEncoderCreatesNonSaplingProposalsWithoutParameters() async throws {
+        let rawID = Data(repeating: 0xA5, count: 32)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
+        let missing = testTempDirectory.appendingPathComponent("missing", isDirectory: true)
+        let encoder = makeWalletTransactionEncoder(
+            rustBackend: rustBackend,
+            spendParams: missing.appendingPathComponent("sapling-spend.params"),
+            outputParams: missing.appendingPathComponent("sapling-output.params")
+        )
+        let spendingKey = TestsData(networkType: .testnet).spendingKey
+
+        let transactions = try await encoder.createProposedTransactions(
+            proposal: Proposal(inner: Self.proposal(inputPool: .ironwood, paymentPool: .ironwood)),
+            spendingKey: spendingKey,
+            ovkPolicy: .discard
+        )
+        XCTAssertEqual(transactions.map(\.txId), [rawID])
+
+        do {
+            _ = try await encoder.createProposedTransactions(
+                proposal: Proposal(inner: Self.proposal(inputPool: .sapling, paymentPool: .orchard)),
+                spendingKey: spendingKey,
+                ovkPolicy: .sender
+            )
+            XCTFail("A Sapling proposal needs the parameters")
+        } catch ZcashError.walletTransEncoderCreateTransactionMissingSaplingParams {
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+        }
+    }
+
+    func testBroadcasterSkipsTheSaplingParameterDownloadForNonSaplingProposals() async throws {
+        let rawID = Data(repeating: 0xA6, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.requiresSaplingParameters = false
+        // Parameters that are neither on disk nor downloadable: any download attempt fails.
+        let missing = testTempDirectory.appendingPathComponent("missing", isDirectory: true)
+        let unreachable = SaplingParamsSourceURL(
+            spendParamFileURL: missing.appendingPathComponent("source-spend.params"),
+            outputParamFileURL: missing.appendingPathComponent("source-output.params")
+        )
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: transactionEncoder,
+            spendParamsURL: missing.appendingPathComponent("sapling-spend.params"),
+            outputParamsURL: missing.appendingPathComponent("sapling-output.params"),
+            saplingParamsSourceURL: unreachable
+        )
+        await synchronizer.updateStatus(.stopped)
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey,
+            ovkPolicy: .discard
+        )
+        XCTAssertEqual(transactions.map(\.txId), [rawID])
+        XCTAssertEqual(transactionEncoder.requiresSaplingParametersCallsCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.appendingPathComponent("sapling-spend.params").path))
+
+        // The same setup fails for a proposal that needs the parameters, because the download is attempted.
+        transactionEncoder.requiresSaplingParameters = true
+        do {
+            _ = try await synchronizer.broadcaster.createProposedTransactions(
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                spendingKey: TestsData(networkType: .testnet).spendingKey
+            )
+            XCTFail("The parameter download should have been attempted and failed")
+        } catch {
+            XCTAssertEqual(transactionEncoder.requiresSaplingParametersCallsCount, 2)
+        }
     }
 
     func testBroadcasterThrowsWhenNotPrepared() async throws {
@@ -721,7 +914,10 @@ final class BroadcasterTests: ZcashTestCase {
     private func makeSynchronizer(
         transactionEncoder: TransactionEncoder,
         rustBackend: ZcashRustBackendWelding? = nil,
-        endpointSubmitter: EndpointSubmitter? = nil
+        endpointSubmitter: EndpointSubmitter? = nil,
+        spendParamsURL: URL? = nil,
+        outputParamsURL: URL? = nil,
+        saplingParamsSourceURL: SaplingParamsSourceURL = .tests
     ) throws -> SDKSynchronizer {
         let serviceMock = LightWalletServiceMock()
         let transactionRepository = TransactionRepositoryMock()
@@ -745,9 +941,9 @@ final class BroadcasterTests: ZcashTestCase {
             torDirURL: try __torDirURL(),
             endpoint: LightWalletEndpointBuilder.default,
             network: ZcashNetworkBuilder.network(for: .testnet),
-            spendParamsURL: try __spendParamsURL(),
-            outputParamsURL: try __outputParamsURL(),
-            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            spendParamsURL: try spendParamsURL ?? __spendParamsURL(),
+            outputParamsURL: try outputParamsURL ?? __outputParamsURL(),
+            saplingParamsSourceURL: saplingParamsSourceURL,
             isTorEnabled: false,
             isExchangeRateEnabled: false
         )
@@ -765,6 +961,65 @@ final class BroadcasterTests: ZcashTestCase {
             blockProcessor: blockProcessor,
             syncSessionTicker: .live
         )
+    }
+
+    private func makeWalletTransactionEncoder(
+        rustBackend: ZcashRustBackendWelding,
+        spendParams: URL? = nil,
+        outputParams: URL? = nil
+    ) -> WalletTransactionEncoder {
+        WalletTransactionEncoder(
+            rustBackend: rustBackend,
+            dataDb: (try? __dataDbURL()) ?? testTempDirectory.appendingPathComponent("data.db"),
+            fsBlockDbRoot: testTempDirectory,
+            service: LightWalletServiceMock(),
+            repository: TransactionRepositoryMock(),
+            outputParams: outputParams ?? ((try? __outputParamsURL()) ?? testTempDirectory),
+            spendParams: spendParams ?? ((try? __spendParamsURL()) ?? testTempDirectory),
+            networkType: .testnet,
+            logger: submissionLifecycleLogger(),
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        )
+    }
+
+    /// A one-step proposal spending one note of `inputPool` to one payment in `paymentPool`.
+    private static func proposal(
+        inputPool: FfiValuePool,
+        paymentPool: FfiValuePool,
+        changePool: FfiValuePool? = nil,
+        saplingDummies: UInt32 = 0
+    ) -> FfiProposal {
+        var receivedOutput = FfiReceivedOutput()
+        receivedOutput.txid = Data(repeating: 0, count: TxId.byteLength)
+        receivedOutput.valuePool = inputPool
+        receivedOutput.value = 1_010_000
+        var input = FfiProposedInput()
+        input.value = .receivedOutput(receivedOutput)
+
+        var payment = FfiPaymentOutputPool()
+        payment.paymentIndex = 0
+        payment.valuePool = paymentPool
+
+        var balance = FfiTransactionBalance()
+        balance.feeRequired = 10_000
+        if let changePool {
+            var change = FfiChangeValue()
+            change.value = 1_000
+            change.valuePool = changePool
+            balance.proposedChange = [change]
+        }
+        var dummies = FfiDummyOutputs()
+        dummies.sapling = saplingDummies
+        balance.dummyOutputs = dummies
+
+        var step = FfiProposalStep()
+        step.inputs = [input]
+        step.paymentOutputPools = [payment]
+        step.balance = balance
+
+        var proposal = FfiProposal()
+        proposal.steps = [step]
+        return proposal
     }
 
     private func makeTransaction(raw: Data?, rawID: Data) -> ZcashTransaction.Overview {
@@ -802,6 +1057,10 @@ private final class StubTransactionEncoder: TransactionEncoder {
     private let fetchError: Error?
     private let missingHistoryTxIds: Set<Data>
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
+    private(set) var receivedOvkPolicy: OvkPolicy?
+    private(set) var requiresSaplingParametersCallsCount = 0
+    /// What `requiresSaplingParameters(for:)` answers; the SDK downloads the parameters only when it is true.
+    var requiresSaplingParameters = true
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
     /// Runs at the start of `createProposedTransactions`, standing in for the (potentially slow)
@@ -858,13 +1117,20 @@ private final class StubTransactionEncoder: TransactionEncoder {
 
     func createProposedTransactions(
         proposal: Proposal,
-        spendingKey: UnifiedSpendingKey
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
+        receivedOvkPolicy = ovkPolicy
         if let onCreateProposedTransactions {
             await onCreateProposedTransactions()
         }
         return createdTransactions
+    }
+
+    func requiresSaplingParameters(for proposal: Proposal) throws -> Bool {
+        requiresSaplingParametersCallsCount += 1
+        return requiresSaplingParameters
     }
 
     func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] {
@@ -902,4 +1168,35 @@ private final class StubTransactionEncoder: TransactionEncoder {
     }
 
     func closeDBConnection() { }
+}
+
+/// A `Broadcaster` that implements only the sender-policy requirements, so the protocol's default
+/// `ovkPolicy:` overload is the one under test.
+private final class SenderOnlyBroadcaster: Broadcaster {
+    private(set) var createCallsCount = 0
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey) async throws -> [CreatedTransaction] {
+        createCallsCount += 1
+        return []
+    }
+
+    func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> [CreatedTransaction] {
+        []
+    }
+
+    func submit(
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> TransactionSubmissionOutcome {
+        .unreachable
+    }
+
+    func submit(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport] {
+        []
+    }
 }

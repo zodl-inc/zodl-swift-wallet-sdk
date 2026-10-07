@@ -96,4 +96,37 @@ final class RegtestActivationHeightsTests: XCTestCase {
         XCTAssertEqual(try backend.consensusBranchIdFor(height: 200), nu6BranchId)
         XCTAssertEqual(try backend.consensusBranchIdFor(height: 5000), nu6BranchId)
     }
+
+    func testRegtestConsensusBranchIdReflectsCustomNu7Height() throws {
+        // Configure a regtest network with NU6.3 at 100 and NU7 at 300.
+        ZcashRustBackend.setCustomNetwork(
+            base: .regtest,
+            NetworkActivationHeights(
+                overwinter: 1,
+                sapling: 1,
+                blossom: 1,
+                heartwood: 1,
+                canopy: 1,
+                nu5: 1,
+                nu6: 1,
+                nu6_1: 1,
+                nu6_2: 1,
+                nu6_3: 100,
+                nu7: 300
+            )
+        )
+
+        let backend = ZcashRustBackend.makeForTests(
+            fsBlockDbRoot: Environment.uniqueTestTempDirectory,
+            networkType: .regtest
+        )
+
+        let nu7BranchId = Int32(bitPattern: 0x7719_0ad9)
+
+        // Below the configured NU7 height the branch id is not NU7's...
+        XCTAssertNotEqual(try backend.consensusBranchIdFor(height: 299), nu7BranchId)
+        // ...and at/after it, it is.
+        XCTAssertEqual(try backend.consensusBranchIdFor(height: 300), nu7BranchId)
+        XCTAssertEqual(try backend.consensusBranchIdFor(height: 5000), nu7BranchId)
+    }
 }

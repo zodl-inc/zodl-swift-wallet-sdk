@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::CryptoRng;
 use zcash_voting::delegate::KeystoneSigningRequest;
 use zcash_voting::storage::KeystoneSignatureInput;
 use zeroize::Zeroizing;
@@ -772,6 +773,7 @@ impl VotingSession {
     /// a report the wire projection refuses.
     pub(super) fn run(
         self: &Arc<Self>,
+        rng: impl CryptoRng + Send + 'static,
         overrides: HostOverridesDto,
         signer: Signer,
         policy: DrivePolicyDto,
@@ -793,7 +795,7 @@ impl VotingSession {
                 // network check it delegates already returns one, so wrapping
                 // unconditionally would nest that envelope's JSON inside a
                 // second one's message.
-                SeedSpendAuthSigner::new(seed, self.network_id, self.network)
+                SeedSpendAuthSigner::new(rng, seed, self.network_id, self.network)
                     .map_err(envelope_or_invalid_input)?,
             ))),
             Signer::KeystoneStored => Some(zcash_voting::DelegationSigner::Keystone(
@@ -1327,7 +1329,7 @@ mod tests {
         // synthetic snapshot, so the two schedules disagree there.
         assert!(crate::zcashlc_set_custom_network(
             1, 347_500, 419_200, 653_600, 903_000, 1_046_400, 1_687_104, 2_726_400, 3_146_400,
-            3_364_600, 10_000_000,
+            3_364_600, 10_000_000, -1,
         ));
 
         let store = open_memory_store(crate::NETWORK_ID_REGTEST, "w");
@@ -1569,6 +1571,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let report = session
             .run(
+                crate::system_rng(),
                 HostOverridesDto::default(),
                 Signer::None,
                 DrivePolicyDto::default(),
@@ -1598,6 +1601,7 @@ mod tests {
         let session = Arc::new(session);
         let err = session
             .run(
+                crate::system_rng(),
                 HostOverridesDto::default(),
                 Signer::Software(Zeroizing::new(vec![0u8; 8])),
                 DrivePolicyDto::default(),
@@ -1628,6 +1632,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let report = session
             .run(
+                crate::system_rng(),
                 HostOverridesDto::default(),
                 Signer::None,
                 DrivePolicyDto::default(),
@@ -1683,6 +1688,7 @@ mod tests {
         let session = Arc::new(session);
         let report = session
             .run(
+                crate::system_rng(),
                 HostOverridesDto::default(),
                 Signer::None,
                 DrivePolicyDto::default(),
@@ -1904,6 +1910,7 @@ mod tests {
         session.cancel();
         session
             .run(
+                crate::system_rng(),
                 HostOverridesDto {
                     helper_urls: Some(vec!["https://run-helper.example/".to_string()]),
                     ..Default::default()

@@ -86,7 +86,7 @@ class RustBackendMockHelper {
             ZcashError.rustProposeTransfer(RedactedRustError(kind: .unclassified, message: "mocked error"))
         let error = ZcashError.rustShieldFunds("mocked error")
         rustBackendMock.proposeShieldingAccountUUIDMemoShieldingThresholdTransparentReceiverThrowableError = error
-        rustBackendMock.createProposedTransactionsProposalUskThrowableError =
+        rustBackendMock.createProposedTransactionsProposalUskOvkPolicyThrowableError =
             ZcashError.rustCreateToAddress(RedactedRustError(kind: .unclassified, message: "mocked error"))
         rustBackendMock.decryptAndStoreTransactionTxBytesMinedHeightThrowableError = ZcashError.rustDecryptAndStoreTransaction("mock fail")
 

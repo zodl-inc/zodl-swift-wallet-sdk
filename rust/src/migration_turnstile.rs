@@ -12,7 +12,6 @@
 //! exposes generally, with the pool set, recipient and spend mode fixed.
 
 use anyhow::anyhow;
-use rand::rngs::OsRng;
 use zcash_address::{ToAddress, ZcashAddress, unified, unified::Encoding as _};
 use zcash_client_backend::{
     data_api::{
@@ -35,7 +34,7 @@ use crate::NetworkParams;
 
 // This line carries custom (regtest-style) networks, so the wallet handle is parameterized by
 // `NetworkParams` rather than `zcash_protocol`'s fixed `Network`.
-type Db = WalletDb<rusqlite::Connection, NetworkParams, SystemClock, OsRng>;
+type Db = WalletDb<rusqlite::Connection, NetworkParams, SystemClock, crate::SystemRng>;
 
 type MigrationProposal = Proposal<StandardFeeRule, <Db as InputSource>::NoteRef>;
 
@@ -79,9 +78,12 @@ pub(crate) fn propose_orchard_to_ironwood(
     let receiver = orchard_fvk.address_at(0u32, orchard::keys::Scope::Internal);
     let recipient = ZcashAddress::from_unified(
         network.network_type(),
-        unified::Address::try_from_items(vec![unified::Receiver::Orchard(
-            receiver.to_raw_address_bytes(),
-        )])
+        unified::Address::try_from_items(
+            unified::Revision::R0,
+            vec![unified::Uitem::Data(unified::Receiver::Orchard(
+                receiver.to_raw_address_bytes(),
+            ))],
+        )
         .map_err(|e| anyhow!("Unable to construct the migration recipient: {}", e))?,
     );
 

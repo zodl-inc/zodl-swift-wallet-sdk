@@ -12,7 +12,6 @@
 //! connection without the SQLite array module the wallet's queries bind list parameters
 //! through.
 
-use rand::rngs::OsRng;
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_voting::{VotingError, WalletDbOpener};
 
@@ -45,7 +44,9 @@ impl WalletDbOpener for SdkWalletDbOpener {
     type Conn = rusqlite::Connection;
     type Params = crate::NetworkParams;
     type Clock = SystemClock;
-    type Rng = OsRng;
+    // `WalletDbOpener` is zcash_voting's trait: it names the RNG type here and its
+    // `open_for_read` takes none, so this is one place the system RNG is not passed in.
+    type Rng = crate::SystemRng;
 
     fn open_for_read(
         &self,
@@ -83,8 +84,10 @@ impl WalletDbOpener for SdkWalletDbOpener {
         rusqlite::vtab::array::load_module(&conn)
             .map_err(|e| storage(format!("failed to load wallet database array module: {e}")))?;
 
-        Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng)
-            .with_anchor_retention_interval(crate::anchor_retention_interval(network)))
+        Ok(
+            WalletDb::from_connection(conn, network, SystemClock, crate::system_rng())
+                .with_anchor_retention_interval(crate::anchor_retention_interval(network)),
+        )
     }
 }
 

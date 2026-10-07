@@ -179,7 +179,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             height(heights.nu6),
             height(heights.nu6_1),
             height(heights.nu6_2),
-            height(heights.nu6_3)
+            height(heights.nu6_3),
+            height(heights.nu7)
         )
     }
 
@@ -1359,10 +1360,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     @DBActor
     func createProposedTransactions(
         proposal: FfiProposal,
-        usk: UnifiedSpendingKey
+        usk: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy
     ) async throws -> [Data] {
         let proposalBytes = try proposal.serializedData(partial: false).bytes
 
+        // Admission may have waited on another wallet's write. Native creation is synchronous
+        // and cannot be rolled back, so cancellation must be checked here, before it starts.
+        try Task.checkCancellation()
+        try GiftCardTransactionCreationContext.admission?.beginNativeCreation()
         let txIdsPtr = proposalBytes.withUnsafeBufferPointer { proposalPtr in
             usk.bytes.withUnsafeBufferPointer { uskPtr in
                 zcashlc_create_proposed_transactions(
@@ -1376,7 +1382,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                     spendParamsPath.1,
                     outputParamsPath.0,
                     outputParamsPath.1,
-                    networkType.networkId
+                    networkType.networkId,
+                    ovkPolicy.ffiValue
                 )
             }
         }
@@ -1547,6 +1554,24 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         guard success else {
             throw ZcashError.rustSetTransactionStatus(
                 lastErrorMessage(fallback: "`setTransactionStatus` failed with unknown error")
+            )
+        }
+    }
+
+    @DBActor
+    func setTransactionTrust(txId: Data, trusted: Bool) async throws {
+        let success = zcashlc_set_transaction_trust(
+            dbData.0,
+            dbData.1,
+            txId.bytes,
+            UInt(txId.bytes.count),
+            trusted,
+            networkType.networkId
+        )
+
+        guard success else {
+            throw ZcashError.rustSetTransactionTrust(
+                lastErrorMessage(fallback: "`setTransactionTrust` failed with unknown error")
             )
         }
     }
@@ -2757,6 +2782,32 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
 
         return BlockHeight(height)
+    }
+
+    /// Reports whether creating the transactions of `proposal` needs the Sapling proving
+    /// parameters.
+    ///
+    /// It does when the proposal has any Sapling input, payment, change or dummy output; a
+    /// proposal that only touches the transparent, Orchard and Ironwood pools does not, so its
+    /// transactions can be created without the parameter files on disk. Stateless: it reads no
+    /// database.
+    /// - Throws: `rustProposalRequiresSaplingParams` if the proposal does not decode.
+    static func proposalRequiresSaplingParams(_ proposal: FfiProposal) throws -> Bool {
+        let proposalBytes = try proposal.serializedData(partial: false).bytes
+        let result = proposalBytes.withUnsafeBufferPointer { proposalPtr in
+            zcashlc_proposal_requires_sapling_params(proposalPtr.baseAddress, UInt(proposalBytes.count))
+        }
+
+        switch result {
+        case 0:
+            return false
+        case 1:
+            return true
+        default:
+            throw ZcashError.rustProposalRequiresSaplingParams(
+                lastErrorMessage(fallback: "`proposalRequiresSaplingParams` failed with unknown error")
+            )
+        }
     }
 }
 

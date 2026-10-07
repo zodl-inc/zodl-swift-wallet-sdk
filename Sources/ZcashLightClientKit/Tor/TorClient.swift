@@ -322,7 +322,7 @@ public actor TorClient {
             throw ZcashError.rustTorConnectToLightwalletd("endpoint string contains null bytes")
         }
 
-        let lwdConnPtr = zcashlc_tor_connect_to_lightwalletd(
+        let lwdConnPtr = httpGetNative.connectLightwalletd(
             runtime, [CChar](endpoint.utf8CString)
         )
 
@@ -332,20 +332,22 @@ public actor TorClient {
             )
         }
 
-        return TorLwdConn(connPtr: lwdConnPtr)
+        return TorLwdConn(connPtr: lwdConnPtr, free: httpGetNative.freeLightwalletd)
     }
 }
 
 public class TorLwdConn {
     private let conn: OpaquePointer
+    private let free: @Sendable (OpaquePointer?) -> Void
 
     // swiftlint:disable:next strict_fileprivate
-    fileprivate init(connPtr: OpaquePointer) {
+    fileprivate init(connPtr: OpaquePointer, free: @escaping @Sendable (OpaquePointer?) -> Void) {
         conn = connPtr
+        self.free = free
     }
 
     deinit {
-        zcashlc_free_tor_lwd_conn(conn)
+        free(conn)
     }
 
     /// Submits a raw transaction over lightwalletd.

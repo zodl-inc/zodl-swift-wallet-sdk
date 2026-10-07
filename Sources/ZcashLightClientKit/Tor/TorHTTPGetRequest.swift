@@ -9,6 +9,10 @@ struct TorHTTPGetNative: Sendable {
     var freeResponse: @Sendable (UnsafeMutablePointer<FfiHttpResponseBytes>?) -> Void = { zcashlc_free_http_response_bytes($0) }
     var isolateRuntime: @Sendable (OpaquePointer?) -> OpaquePointer? = { zcashlc_tor_isolated_client($0) }
     var freeRuntime: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_runtime($0) }
+    var connectLightwalletd: @Sendable (OpaquePointer?, UnsafePointer<CChar>?) -> OpaquePointer? = {
+        zcashlc_tor_connect_to_lightwalletd($0, $1)
+    }
+    var freeLightwalletd: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_lwd_conn($0) }
     var createRuntime: @Sendable (String, UInt) -> OpaquePointer? = { zcashlc_create_tor_runtime($0, $1) }
 }
 

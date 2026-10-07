@@ -107,7 +107,7 @@ mod tests {
         let account = AccountId::try_from(0).expect("account 0");
         let usk = UnifiedSpendingKey::from_seed(&network, &seed, account).expect("from_seed");
         let ufvk = usk.to_unified_full_viewing_key();
-        let ufvk_str = ufvk.encode(&network);
+        let ufvk_str = ufvk.encode(&network).unwrap();
         let orchard_bytes = ufvk.orchard().expect("orchard present").to_bytes();
         (ufvk_str, orchard_bytes)
     }
