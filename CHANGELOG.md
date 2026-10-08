@@ -12,6 +12,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Transaction submission through `Broadcaster` now treats a server rejection as accepted when that same server confirms it already knows the transaction. No caller changes are required.
 - [MOB-1963] Concurrent voting work now waits for a competing database writer when storing a
   vote, avoiding an immediate database-locked failure during ballot submission. No call-site
   changes are required.

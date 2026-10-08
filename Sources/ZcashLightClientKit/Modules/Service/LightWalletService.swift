@@ -250,3 +250,14 @@ protocol LightWalletService: AnyObject {
         mode: ServiceMode
     ) async throws -> TransparentAddressCheckResult
 }
+
+extension LightWalletService {
+    func isTransactionKnownToServer(txId: Data, mode: ServiceMode) async -> Bool {
+        do {
+            let response = try await fetchTransaction(txId: txId, mode: mode)
+            return response.status != .txidNotRecognized
+        } catch {
+            return false
+        }
+    }
+}
