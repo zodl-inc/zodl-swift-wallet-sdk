@@ -29,10 +29,11 @@ use std::ptr;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
-    BhttpRequest, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseOpener,
-    ClientProfile, Completed, EncodeOptions, KEY_BYTES, KeyConfig, Network, Response,
-    collect_response, encapsulate_chunked_request, encode_bhttp_request, pack_fields,
-    signed_config_url, unpack_fields, verify_signed_config,
+    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
+    ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network, OuterOutcome,
+    OuterPolicy, OuterResponse, ResponseEvent, classify_outer_response,
+    encapsulate_chunked_request, encode_bhttp_request, pack_fields, signed_config_url,
+    unpack_fields, verify_signed_config,
 };
 
 use crate::{free_ptr_from_vec, ptr_from_vec, unwrap_exc_or_null, zcashlc_string_free};
@@ -360,116 +361,123 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
             )
         };
 
-        // Chunked OHTTP: classify the outer response, then decode if it's a sealed response.
+        // Classify the outer response using the iOS policy
         let sealed = unsafe { bytes(body, body_len)? };
+        let outer_response = OuterResponse {
+            status: outer_status,
+            content_type,
+            body: sealed,
+        };
+        let outer_outcome = classify_outer_response(&OuterPolicy::IOS, &outer_response, attempt);
 
-        let completed = if outer_status == 200 {
-            // Check content type
-            match content_type {
-                Some(ct) if ct == CONTENT_TYPE_CHUNKED_RES => {
-                    // Decode the chunked response
-                    let mut decoder = inner.decoder();
-                    let mut events = decoder.push(sealed)?;
-                    events.extend(decoder.finish()?);
+        // Process based on classification
+        let outcome = match outer_outcome {
+            OuterOutcome::Sealed => {
+                // Decode the chunked response
+                let mut decoder = inner.decoder();
+                let mut events = decoder.push(sealed)?;
+                events.extend(decoder.finish()?);
 
-                    // Manually collect events into BhttpResponse (keeping headers and trailers separate)
-                    use zodl_ohttp_client::{BhttpResponse, ResponseEvent};
-                    let mut status = None;
-                    let mut headers = Vec::new();
-                    let mut body = Vec::new();
-                    let mut trailers = Vec::new();
-                    for event in events {
-                        match event {
-                            ResponseEvent::Head {
-                                status: s,
-                                headers: h,
-                            } => {
-                                status = Some(s);
-                                // Convert to byte vectors
-                                headers = h
-                                    .into_iter()
-                                    .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
-                                    .collect();
-                            }
-                            ResponseEvent::Data(d) => body.extend_from_slice(&d),
-                            ResponseEvent::Trailers(t) => {
-                                trailers = t
-                                    .into_iter()
-                                    .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
-                                    .collect();
-                            }
-                            ResponseEvent::End => {}
+                // Collect events into BhttpResponse
+                let mut status = None;
+                let mut headers = Vec::new();
+                let mut body = Vec::new();
+                let mut trailers = Vec::new();
+                for event in events {
+                    match event {
+                        ResponseEvent::Head {
+                            status: s,
+                            headers: h,
+                        } => {
+                            status = Some(s);
+                            headers = h
+                                .into_iter()
+                                .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                                .collect();
                         }
+                        ResponseEvent::Data(d) => body.extend_from_slice(&d),
+                        ResponseEvent::Trailers(t) => {
+                            trailers = t
+                                .into_iter()
+                                .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                                .collect();
+                        }
+                        ResponseEvent::End => {}
                     }
-                    let bhttp_response = BhttpResponse {
-                        informational: vec![], // Chunked decoder skips interim 1xx responses
-                        status: status.ok_or_else(|| anyhow!("no status in response"))?,
-                        headers,
-                        trailers,
-                        body,
-                    };
-                    Completed::Response(bhttp_response)
                 }
-                Some(ct) => Completed::WrongMediaType {
-                    content_type: ct.to_string(),
-                },
-                None => Completed::WrongMediaType {
-                    content_type: "missing".to_string(),
-                },
+                let bhttp_response = BhttpResponse {
+                    informational: vec![],
+                    status: status.ok_or_else(|| anyhow!("no status in response"))?,
+                    headers,
+                    trailers,
+                    body,
+                };
+                outcome_from_response(bhttp_response)?
             }
-        } else if (outer_status == 400 || outer_status == 422) && attempt == 0 {
-            // Retry with fresh key on first attempt
-            Completed::RefetchKeyConfig
-        } else {
-            // Refused: relay or gateway error
-            let detail = if sealed.len() > 200 {
-                String::from_utf8_lossy(&sealed[..200]).to_string()
-            } else {
-                String::from_utf8_lossy(sealed).to_string()
-            };
-            Completed::Refused {
-                status: outer_status,
-                detail,
+            OuterOutcome::RefetchKeyConfig => {
+                let mut outcome = OhttpOutcome {
+                    kind: OUTCOME_REFETCH_KEY,
+                    status: 0,
+                    headers: ptr::null_mut(),
+                    headers_len: 0,
+                    trailers: ptr::null_mut(),
+                    trailers_len: 0,
+                    body: ptr::null_mut(),
+                    body_len: 0,
+                    detail: ptr::null_mut(),
+                };
+                outcome
+            }
+            OuterOutcome::Refused { status, detail } => {
+                let mut outcome = OhttpOutcome {
+                    kind: OUTCOME_REFUSED,
+                    status,
+                    headers: ptr::null_mut(),
+                    headers_len: 0,
+                    trailers: ptr::null_mut(),
+                    trailers_len: 0,
+                    body: ptr::null_mut(),
+                    body_len: 0,
+                    detail: c_string(&detail),
+                };
+                outcome
+            }
+            OuterOutcome::WrongMediaType { content_type } => {
+                let mut outcome = OhttpOutcome {
+                    kind: OUTCOME_WRONG_MEDIA_TYPE,
+                    status: 0,
+                    headers: ptr::null_mut(),
+                    headers_len: 0,
+                    trailers: ptr::null_mut(),
+                    trailers_len: 0,
+                    body: ptr::null_mut(),
+                    body_len: 0,
+                    detail: c_string(&content_type),
+                };
+                outcome
             }
         };
 
-        Ok(Box::into_raw(Box::new(outcome_from(completed)?)))
+        Ok(Box::into_raw(Box::new(outcome)))
     });
     unwrap_exc_or_null(res)
 }
 
-fn outcome_from(completed: Completed) -> anyhow::Result<OhttpOutcome> {
-    let mut outcome = OhttpOutcome {
+fn outcome_from_response(response: BhttpResponse) -> anyhow::Result<OhttpOutcome> {
+    let (headers, headers_len) = ptr_from_vec(pack_fields(&response.headers)?);
+    let (trailers, trailers_len) = ptr_from_vec(pack_fields(&response.trailers)?);
+    let (body, body_len) = ptr_from_vec(response.body);
+    Ok(OhttpOutcome {
         kind: OUTCOME_RESPONSE,
-        status: 0,
-        headers: ptr::null_mut(),
-        headers_len: 0,
-        trailers: ptr::null_mut(),
-        trailers_len: 0,
-        body: ptr::null_mut(),
-        body_len: 0,
+        status: response.status,
+        headers,
+        headers_len,
+        trailers,
+        trailers_len,
+        body,
+        body_len,
         detail: ptr::null_mut(),
-    };
-    match completed {
-        Completed::Response(response) => {
-            (outcome.headers, outcome.headers_len) = ptr_from_vec(pack_fields(&response.headers)?);
-            (outcome.trailers, outcome.trailers_len) =
-                ptr_from_vec(pack_fields(&response.trailers)?);
-            (outcome.body, outcome.body_len) = ptr_from_vec(response.body);
-            outcome.status = response.status;
-        }
-        Completed::RefetchKeyConfig => outcome.kind = OUTCOME_REFETCH_KEY,
-        Completed::Refused { status, detail } => {
-            outcome.kind = OUTCOME_REFUSED;
-            outcome.status = status;
-            outcome.detail = c_string(&detail);
-        }
-        Completed::WrongMediaType { content_type } => {
-            outcome.kind = OUTCOME_WRONG_MEDIA_TYPE;
-            outcome.detail = c_string(&content_type);
-        }
-    }
-    Ok(outcome)
+    })
 }
 
 /// Frees an [`OhttpOutcome`] and everything it owns.
