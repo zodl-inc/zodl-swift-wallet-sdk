@@ -25,6 +25,7 @@ use std::os::raw::c_char;
 
 use tracing::debug;
 use zcash_client_backend::data_api::error::Error as WalletError;
+use zcash_client_backend::proposal::ProposalError;
 use zcash_protocol::value::Zatoshis;
 
 /// Stable discriminants for the conditions a wallet is expected to render itself rather than
@@ -79,6 +80,12 @@ pub enum ErrorKind {
     BalanceOverflow = 19,
     /// A note being spent belongs to neither the internal nor the external viewing key.
     NoteMismatch = 20,
+    /// The transaction would exceed the maximum size of a block, because it spends too many
+    /// notes. Raised when a proposal is made and again when its transactions are built.
+    TransactionTooLarge = 21,
+    /// A memo was given for a recipient that cannot receive one, such as a transparent or
+    /// ZIP 320 (TEX) address.
+    TransparentMemo = 22,
 }
 
 /// The two amounts describing an [`ErrorKind::InsufficientFunds`] condition.
@@ -131,6 +138,45 @@ impl ClassifiedError {
             message,
             context,
             amounts: None,
+        }
+    }
+
+    /// An [`ErrorKind::InsufficientFunds`] classification, carrying its amounts out of band.
+    pub fn insufficient_funds(
+        context: &'static str,
+        available: Zatoshis,
+        required: Zatoshis,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::InsufficientFunds,
+            message: "the spendable balance does not cover this payment and its fee",
+            context,
+            amounts: Some(Shortfall {
+                available,
+                required,
+            }),
+        }
+    }
+
+    /// Classifies a failure of the proposal itself, whether `zcash_client_backend` found it
+    /// while proposing, while building, or when [`Proposal::check_transaction_size`] was called
+    /// on a proposal directly.
+    ///
+    /// [`Proposal::check_transaction_size`]: zcash_client_backend::proposal::Proposal::check_transaction_size
+    pub fn classify_proposal(context: &'static str, e: &ProposalError) -> Self {
+        match e {
+            // The input counts it carries describe the user's own wallet, but nothing in the
+            // FFI contract reports them yet, and they stay out of the message regardless.
+            ProposalError::TransactionTooLarge { .. } => Self::new(
+                context,
+                ErrorKind::TransactionTooLarge,
+                "the transaction would spend too many notes to fit in a block",
+            ),
+            _ => Self::new(
+                context,
+                ErrorKind::ProposalInvalid,
+                "the transaction proposal was rejected as invalid",
+            ),
         }
     }
 
@@ -191,10 +237,7 @@ impl ClassifiedError {
                 ErrorKind::ChangeSelectionFailed,
                 "change selection failed, possibly for lack of spendable funds",
             ),
-            WalletError::Proposal(_) => (
-                ErrorKind::ProposalInvalid,
-                "the transaction proposal was rejected as invalid",
-            ),
+            WalletError::Proposal(e) => return Self::classify_proposal(context, e),
             WalletError::ProposalNotSupported => (
                 ErrorKind::ProposalNotSupported,
                 "the proposal requires a feature this build does not support",
@@ -218,17 +261,7 @@ impl ClassifiedError {
             WalletError::InsufficientFunds {
                 available,
                 required,
-            } => {
-                return Self {
-                    kind: ErrorKind::InsufficientFunds,
-                    message: "the spendable balance does not cover this payment and its fee",
-                    context,
-                    amounts: Some(Shortfall {
-                        available: *available,
-                        required: *required,
-                    }),
-                };
-            }
+            } => return Self::insufficient_funds(context, *available, *required),
             WalletError::ScanRequired => (
                 ErrorKind::ScanRequired,
                 "the wallet must finish scanning before this payment can be prepared",
@@ -439,6 +472,47 @@ mod tests {
         assert!(!rendered.contains("1.2"));
     }
 
+    /// The oversized-transaction rejection `zcash_client_backend` reports, with arbitrary counts.
+    fn too_large() -> ProposalError {
+        ProposalError::TransactionTooLarge {
+            estimated_size: 2_000_001,
+            limit: 2_000_000,
+            sapling_input_count: 0,
+            orchard_input_count: 700,
+            ironwood_input_count: 0,
+        }
+    }
+
+    /// A transaction too large for a block is its own kind on every path that reports it: as a
+    /// wallet error from proposing or building, and as the bare proposal error a size check
+    /// returns.
+    #[test]
+    fn an_oversized_transaction_is_classified_as_too_large() {
+        let from_wallet = ClassifiedError::classify(
+            "create_proposed_transactions",
+            &TestError::Proposal(too_large()),
+        );
+        let from_check =
+            ClassifiedError::classify_proposal("propose_send_max_transfer", &too_large());
+
+        for e in [from_wallet, from_check] {
+            assert_eq!(e.kind(), ErrorKind::TransactionTooLarge);
+            assert_eq!(e.amounts(), None);
+            assert!(!e.to_string().contains("2000001"));
+            assert!(!e.to_string().contains("700"));
+        }
+    }
+
+    #[test]
+    fn any_other_proposal_error_is_still_an_invalid_proposal() {
+        let e = ClassifiedError::classify(
+            "create_proposed_transactions",
+            &TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
+        );
+
+        assert_eq!(e.kind(), ErrorKind::ProposalInvalid);
+    }
+
     fn take_report() -> Option<(u32, String, i64, i64)> {
         let ptr = zcashlc_take_last_error_report();
         if ptr.is_null() {
@@ -522,6 +596,7 @@ mod tests {
             TestError::ExpiryHeightConflictsWithCanonicalCrossing {
                 requested: 1_000_000.into(),
             },
+            TestError::Proposal(too_large()),
         ];
 
         for case in &cases {

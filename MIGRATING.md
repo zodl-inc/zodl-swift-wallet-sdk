@@ -1,14 +1,34 @@
 # Migrating from previous versions to _Unreleased_
 
-## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters
+## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters, send-max
 
-`ZcashError` and `ZcashErrorCode` have nineteen new cases: the gift-card errors `ZGIFT0001` to
+`ZcashError` and `ZcashErrorCode` have twenty-two new cases: the gift-card errors `ZGIFT0001` to
 `ZGIFT0016`, which only `GiftCard(link:)` and `GiftCardRedeemer` throw;
 `rustProposalRequiresSaplingParams` (`ZRUST0157`), which `createProposedTransactions` throws for a
-proposal it cannot inspect; and `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`) and
-`rustSetTransactionTrust` (`ZRUST0158`), which `GiftCardRedeemer` only logs. An exhaustive
-`switch` over either type stops compiling until they are handled. The gift-card cases carry no
-payload.
+proposal it cannot inspect; `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`) and
+`rustSetTransactionTrust` (`ZRUST0158`), which `GiftCardRedeemer` only logs; and
+`rustProposalTransactionTooLarge` (`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and
+`rustProposalUnsupportedAddress` (`ZRUST0161`), which `proposeSendMax` throws (the first also from
+transaction and PCZT creation). An exhaustive `switch` over either type stops compiling until they
+are handled. The gift-card and send-max cases carry no payload. `RustErrorKind` likewise gains
+`transactionTooLarge` and `transparentMemo`.
+
+A wallet that treated every `rustProposeSendMaxTransfer` as one condition should handle the
+send-max cases it now sees instead:
+
+```swift
+do {
+    let proposal = try await synchronizer.proposeSendMax(accountUUID: account, recipient: recipient, memo: memo, mode: .maxSpendable)
+} catch ZcashError.rustProposalTransactionTooLarge {
+    // Too many notes for one transaction: offer to send a smaller amount.
+} catch ZcashError.rustProposalTransparentMemo {
+    // Drop the memo for this recipient.
+} catch ZcashError.rustProposalUnsupportedAddress {
+    // The address cannot be paid by this wallet.
+} catch ZcashError.rustProposeSendMaxTransfer(let failure) {
+    // Anything else; `failure.kind` names the condition.
+}
+```
 
 ```swift
 case .giftCardCheckTimedOut, .giftCardCheckDisconnected, .giftCardCheckSyncStalled:

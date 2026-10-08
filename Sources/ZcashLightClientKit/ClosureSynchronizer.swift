@@ -66,11 +66,15 @@ public protocol ClosureSynchronizer {
     /// selected and must be shielded first — see `proposeShielding`.
     ///
     /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
-    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`) where the rust layer
-    /// reports that condition, carrying both amounts; a wallet still catching up throws
-    /// `ZcashError.rustProposalScanRequired` (`ZRUST0153`). Anything else the rust layer returns surfaces as
-    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload names the
-    /// condition without carrying an amount or an address.
+    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), carrying both amounts;
+    /// a wallet still catching up throws `ZcashError.rustProposalScanRequired` (`ZRUST0153`). A balance spread
+    /// over more notes than one transaction can spend within the block size limit throws
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`) here rather than when the transaction is
+    /// created; a memo for a transparent or TEX recipient throws `ZcashError.rustProposalTransparentMemo`
+    /// (`ZRUST0160`); and a recipient with no receiver this wallet can pay throws
+    /// `ZcashError.rustProposalUnsupportedAddress` (`ZRUST0161`). Anything else the rust layer returns
+    /// surfaces as `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload
+    /// names the condition without carrying an amount or an address.
     ///
     /// - Parameter accountUUID: the account from which to spend funds.
     /// - Parameter recipient: the recipient's address.

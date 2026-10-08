@@ -275,7 +275,8 @@ protocol ZcashRustBackendWelding {
     /// - Parameter to: recipient address.
     /// - Parameter memo: the `MemoBytes` for this transaction. pass `nil` when sending to transparent receivers
     /// - Parameter mode: how much of the account's balance the proposal should target spending. See `MaxSpendMode`.
-    /// - Throws: `rustProposeSendMaxTransfer`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
+    /// - Throws: `rustProposalScanRequired`, `rustProposalInsufficientFunds`, `rustProposalTransactionTooLarge`,
+    ///   `rustProposalTransparentMemo`, `rustProposalUnsupportedAddress`, or otherwise `rustProposeSendMaxTransfer`.
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         to address: String,
@@ -648,7 +649,8 @@ protocol ZcashRustBackendWelding {
     /// - Parameter orchardOnly: when `true`, restricts spendable notes to the Orchard pool alone (the
     ///   immediate migration sweep, which must not draw on Sapling funds); when `false`, spends from
     ///   both Sapling and Orchard (pre-existing behavior).
-    /// - Throws: `rustProposeSendMaxTransfer`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
+    /// - Throws: `rustProposalScanRequired`, `rustProposalInsufficientFunds`, `rustProposalTransactionTooLarge`,
+    ///   `rustProposalTransparentMemo`, `rustProposalUnsupportedAddress`, or otherwise `rustProposeSendMaxTransfer`.
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         recipient: String,

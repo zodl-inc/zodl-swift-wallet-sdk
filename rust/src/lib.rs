@@ -49,7 +49,7 @@ use zcash_client_backend::{
             create_proposed_transactions, decrypt_and_store_transaction,
             extract_and_store_transaction_from_pczt,
             input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
-            propose_send_max_transfer, propose_shielding, propose_transfer, redact_pczt_for_signer,
+            propose_shielding, propose_transfer, redact_pczt_for_signer,
         },
     },
     encoding::AddressCodec,
@@ -118,6 +118,7 @@ mod migration_plan_cache;
 mod migration_turnstile;
 mod retained_marks;
 mod sapling_prover;
+mod send_max;
 mod tor;
 mod voting;
 
@@ -2512,45 +2513,22 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             ffi::MaxSpendMode::Everything => MaxSpendMode::Everything,
         };
 
-        let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
-        let locked_input_policy = LockedInputPolicy::Exclude;
-        let lock_inputs = None;
-
-        // Send-max draws the entire spendable balance across every shielded pool,
-        // so Ironwood is included alongside Sapling and Orchard; omitting it would
-        // silently leave a post-NU6.3 wallet's Ironwood funds behind. Including it
-        // is a no-op when the account holds no Ironwood notes.
-        //
-        // `orchard_only` narrows that to Orchard alone: the immediate migration lane
+        // `orchard_only` narrows the sweep to Orchard alone: the immediate migration lane
         // sweeps what the turnstile is for, and must not drag Sapling value (or value
         // already sitting in Ironwood) along with it.
-        let spend_pools: &[ShieldedPool] = if orchard_only {
-            &[ShieldedPool::Orchard]
-        } else {
-            &[
-                ShieldedPool::Sapling,
-                ShieldedPool::Orchard,
-                ShieldedPool::Ironwood,
-            ]
+        let request = send_max::SendMaxRequest {
+            pools: if orchard_only {
+                &send_max::ORCHARD_ONLY
+            } else {
+                &send_max::SEND_MAX_POOLS
+            },
+            mode,
+            recipient: to,
+            memo,
+            confirmations_policy: wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
         };
 
-        let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
-            &mut db_data,
-            &network,
-            account_uuid,
-            spend_pools,
-            &StandardFeeRule::Zip317,
-            to,
-            memo,
-            mode,
-            confirmation_policy,
-            &locked_input_policy,
-            lock_inputs,
-        )
-        .map_err(|e| {
-            debug!("{CONTEXT} failed: {e}");
-            ClassifiedError::classify(CONTEXT, &e)
-        })?;
+        let proposal = send_max::propose(&mut db_data, &network, account_uuid, request, CONTEXT)?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -3114,6 +3092,8 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
     proposal_len: usize,
     account_uuid_bytes: *const u8,
 ) -> *mut ffi::BoxedSlice {
+    const CONTEXT: &str = "create_pczt_from_proposal";
+
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
@@ -3139,7 +3119,10 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 target_expiry_height,
                 orchard_pool_padding,
             )
-            .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
+            .map_err(|e| {
+                debug!("{CONTEXT} failed: {e}");
+                ClassifiedError::classify(CONTEXT, &e)
+            })?;
 
             Ok(ffi::BoxedSlice::some(pczt.serialize().map_err(|e| {
                 anyhow!("Failed to serialize PCZT: {:?}", e)

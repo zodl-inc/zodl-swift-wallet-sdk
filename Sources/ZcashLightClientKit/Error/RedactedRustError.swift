@@ -32,6 +32,8 @@ public enum RustErrorKind: UInt32, Equatable {
     case expiryHeightInvalid = 18
     case balanceOverflow = 19
     case noteMismatch = 20
+    case transactionTooLarge = 21
+    case transparentMemo = 22
 
     init(ffiValue: UInt32) {
         self = RustErrorKind(rawValue: ffiValue) ?? .unclassified

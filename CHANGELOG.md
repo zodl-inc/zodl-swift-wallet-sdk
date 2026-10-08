@@ -140,13 +140,35 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ZRUST0157`).
 - `NetworkActivationHeights.nu7` sets the NU7 activation height of a custom or regtest network.
   A `nil` height means "not activated".
+- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
+  more notes than one transaction can spend within the block size limit is now refused when the
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`);
+  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0160`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0161`). A
+  balance that does not exceed the fee throws `rustProposalInsufficientFunds` with both amounts.
+  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
+  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
+  None of the new cases carries the recipient, the memo or an amount.
+- `createProposedTransactions(proposal:spendingKey:)` and `createPCZTFromProposal(accountUUID:proposal:)`
+  throw `rustProposalTransactionTooLarge` (`ZRUST0159`) for a proposal whose transaction would not
+  fit in a block, instead of `rustCreateToAddress` or `rustCreatePCZTFromProposal`.
 
 ## Changed
 
 - `ZcashError` and `ZcashErrorCode` gain the sixteen gift-card cases named above (`ZGIFT0001` to
   `ZGIFT0016`), `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`),
-  `rustProposalRequiresSaplingParams` (`ZRUST0157`) and `rustSetTransactionTrust` (`ZRUST0158`).
-  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
+  `rustProposalRequiresSaplingParams` (`ZRUST0157`), `rustSetTransactionTrust` (`ZRUST0158`),
+  `rustProposalTransactionTooLarge` (`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and
+  `rustProposalUnsupportedAddress` (`ZRUST0161`). An exhaustive `switch` over either stops
+  compiling until they are handled; see `MIGRATING.md`.
+- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
+  stops compiling until they are handled.
+- `createPCZTFromProposal(accountUUID:proposal:)` throws `rustProposalScanRequired` and
+  `rustProposalInsufficientFunds` for those conditions, as `createProposedTransactions` does, and
+  the `String` that `rustCreatePCZTFromProposal` carries is now the redacted, classified message
+  rather than the rust layer's raw error text. No call site needs editing.
 - `TxId.init(_ id: [UInt8])` now throws `ZcashError.txIdNot32Bytes` (`ZMODEL0001`) unless `id` is
   exactly 32 bytes, so call sites need `try`. `TxId.id` is now a `let`: assigning to it no longer
   compiles; create a new `TxId` instead.
