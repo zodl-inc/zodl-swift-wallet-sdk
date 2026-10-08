@@ -42,6 +42,10 @@ on:
         description: 'Client trace ID prefix for debugging (empty = disabled)'
         type: string
         default: ''
+      relay_url:
+        description: 'Testnet relay URL override (empty = Fastly default, e.g., https://testnet-simulator-relay.example.invalid/relay)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
