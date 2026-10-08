@@ -147,6 +147,14 @@ test-all: ## Run the whole test suite, including networked tests
 test-rust: ## Run the Rust unit tests
 	cargo test
 
+.PHONY: format-rust
+format-rust: ## Format the Rust sources with rustfmt
+	$(CARGO) fmt --all
+
+.PHONY: check-format-rust
+check-format-rust: ## Check that the Rust sources are rustfmt-clean
+	$(CARGO) fmt --all -- --check
+
 .PHONY: lint
 lint: ## Lint the Swift sources with SwiftLint
 	@command -v swiftlint >/dev/null 2>&1 || { \

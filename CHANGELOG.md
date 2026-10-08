@@ -14,8 +14,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
   no longer used. See PR #4 in zodl-inc/ohttp.
 
-
-# Unreleased
+# 5.1.0 - 2026-10-07
 
 ## Added
 
@@ -217,7 +216,7 @@ Mainnet
 ````
 Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3485000.json
 ...
-Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3505000.json
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3507500.json
 ````
 
 Testnet
@@ -225,7 +224,7 @@ Testnet
 ````
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4360000.json
 ...
-Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4460000.json
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4470000.json
 ````
 
 # 5.0.0 - 2026-09-23

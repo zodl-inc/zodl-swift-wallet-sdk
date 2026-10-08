@@ -14,6 +14,31 @@ on:
       - 'docs/**'
 
 jobs:
+  # Checks that the Rust sources are rustfmt-clean. `--check` only reports; it never
+  # rewrites. Run `make format-rust` (or `cargo fmt --all`) to fix a failure.
+  rustfmt:
+    name: rustfmt
+    permissions:
+      contents: read
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+      timeout-minutes: 1
+
+    # The runner image already ships rustup, so no toolchain action is needed.
+    - name: Setup Rust
+      run: |
+        rustup toolchain install stable --profile minimal --component rustfmt
+        rustup override set stable
+
+    - name: Rustfmt
+      timeout-minutes: 5
+      run: make check-format-rust
+
   build:
     permissions:
       contents: read
