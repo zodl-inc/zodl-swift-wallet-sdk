@@ -189,6 +189,7 @@ jobs:
           OHTTP_E2E_MIN_BALANCE_ZAT: ${{ vars.OHTTP_E2E_MIN_BALANCE_ZAT || '9000000000' }}
           OHTTP_E2E_TIMEOUT_SECONDS: '3600'
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
           TEST: ${{ matrix.mode == 'tor' && 'testRestoreAndSyncOverTorAndOHTTP' || 'testRestoreAndSyncOverOHTTP' }}
         run: |
           set -o pipefail
@@ -208,6 +209,7 @@ jobs:
           OHTTP_E2E_GATEWAY_STATE: ${{ inputs.scenario == 'fallback-down' && 'down' || 'up' }}
           OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testFallbackPrimitives" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
@@ -219,6 +221,7 @@ jobs:
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
           OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testMainnetFallbackTierBenchmark" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
@@ -230,21 +233,22 @@ jobs:
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
         run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
       - name: Mainnet SEND E2E (0.0005 ZEC, Wallet 2 → Wallet 1, both legs)
         if: ${{ !cancelled() && inputs.scenario == 'send-mainnet' && matrix.mode == 'tor' }}
-        timeout-minutes: 90
         env:
           OHTTP_E2E_NETWORK: mainnet
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_MAINNET_SEED2_HEX }}
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
           OHTTP_E2E_SEND_BIRTHDAY: 3427084
           OHTTP_E2E_SEND_ZATOSHI: 50000
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.mainnet_recipient }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
-        run: |
+          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
