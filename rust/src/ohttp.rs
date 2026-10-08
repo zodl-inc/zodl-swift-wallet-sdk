@@ -30,10 +30,9 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network, OuterOutcome,
-    OuterPolicy, OuterResponse, ResponseEvent, classify_outer_response,
-    encapsulate_chunked_request, encode_bhttp_request, pack_fields, signed_config_url,
-    unpack_fields, verify_signed_config,
+    ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network, OuterOutcome, OuterPolicy,
+    OuterResponse, ResponseEvent, classify_outer_response, encapsulate_chunked_request,
+    encode_bhttp_request, pack_fields, signed_config_url, unpack_fields, verify_signed_config,
 };
 
 use crate::{free_ptr_from_vec, ptr_from_vec, unwrap_exc_or_null, zcashlc_string_free};
