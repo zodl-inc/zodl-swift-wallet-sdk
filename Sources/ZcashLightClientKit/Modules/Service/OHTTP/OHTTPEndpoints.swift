@@ -28,10 +28,6 @@ public enum OHTTPEndpoints {
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     public static var clientTraceIdPrefix: String?
 
-    /// Test-only relay URL override. Maps gateway host to relay URL, bypassing the native
-    /// (compile-time) relay map. DEBUG/TEST ONLY. Never set in release builds.
-    public static var testRelayURLOverride: [String: String]?
-
     /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
@@ -98,11 +94,7 @@ public enum OHTTPEndpoints {
 
     public static func relayURL(for gatewayHost: String) throws -> String {
         let lowerHost = gatewayHost.lowercased()
-        // Check test override first
-        if let override = testRelayURLOverride?[lowerHost] {
-            return override
-        }
-        // Try native relay map
+        // Try native relay map first
         if let relay = OHTTPNative.relayURL(for: lowerHost) {
             return relay
         }

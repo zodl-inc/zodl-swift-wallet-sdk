@@ -40,14 +40,10 @@ final class OHTTPE2ETests: ZcashTestCase {
         if let prefix = Env.clientTracePrefix {
             OHTTPEndpoints.clientTraceIdPrefix = prefix
         }
-        if let relayURL = Env.relayURL {
-            OHTTPEndpoints.testRelayURLOverride = [Env.gatewayHost.lowercased(): relayURL]
-        }
     }
 
     override func tearDown() {
         OHTTPEndpoints.clientTraceIdPrefix = nil
-        OHTTPEndpoints.testRelayURLOverride = nil
         super.tearDown()
     }
 
