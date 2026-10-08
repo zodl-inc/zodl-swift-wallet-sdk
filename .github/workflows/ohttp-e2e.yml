@@ -248,7 +248,7 @@ jobs:
           OHTTP_E2E_SEND_ZATOSHI: 50000
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.mainnet_recipient }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
-          OHTTP_E2E_RELAY_URL: ${{ inputs.relay_url }}
+        run: |
           set -o pipefail
           swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
 
