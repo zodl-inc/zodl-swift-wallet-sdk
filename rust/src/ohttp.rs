@@ -29,9 +29,9 @@ use std::ptr;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
-    BhttpRequest, ChunkedResponseOpener, ClientProfile, Completed, EncodeOptions, KEY_BYTES,
-    KeyConfig, Network, Response, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    collect_response, encode_bhttp_request, encapsulate_chunked_request, pack_fields,
+    BhttpRequest, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseOpener,
+    ClientProfile, Completed, EncodeOptions, KEY_BYTES, KeyConfig, Network, Response,
+    collect_response, encapsulate_chunked_request, encode_bhttp_request, pack_fields,
     signed_config_url, unpack_fields, verify_signed_config,
 };
 
@@ -660,7 +660,10 @@ mod tests {
             assert_eq!(
                 post,
                 vec![
-                    ("Content-Type".to_string(), CONTENT_TYPE_CHUNKED_REQ.to_string()),
+                    (
+                        "Content-Type".to_string(),
+                        CONTENT_TYPE_CHUNKED_REQ.to_string()
+                    ),
                     ("Accept".to_string(), CONTENT_TYPE_CHUNKED_RES.to_string()),
                     ("Accept-Encoding".to_string(), "identity".to_string()),
                 ]
