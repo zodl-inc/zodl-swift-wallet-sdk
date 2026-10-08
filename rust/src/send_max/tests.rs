@@ -11,12 +11,9 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use transparent::address::TransparentAddress;
-use zcash_client_backend::{
-    data_api::{
-        Account as _,
-        testing::{AddressType, FakeCompactOutput, TestBuilder, TestState},
-    },
-    fees::ChangeError,
+use zcash_client_backend::data_api::{
+    Account as _,
+    testing::{AddressType, FakeCompactOutput, TestBuilder, TestState},
 };
 use zcash_client_sqlite::{
     ReceivedNoteId,
@@ -239,8 +236,8 @@ fn a_wallet_with_nothing_spendable_is_insufficient_funds() {
     assert_eq!(e.amounts().map(|s| s.available), Some(Zatoshis::ZERO));
 }
 
-/// The shortfall a send-max most often reports comes from change selection, which upstream
-/// does not lift into `Error::InsufficientFunds`; it must still carry its amounts.
+/// A balance the fee would consume entirely is refused by input selection with
+/// `InsufficientFunds`, carrying the balance and the fee plus one zatoshi.
 #[test]
 fn a_balance_that_does_not_exceed_the_fee_is_insufficient_funds() {
     const BELOW_FEE: u64 = 9_000;
@@ -335,35 +332,13 @@ fn a_send_max_of_too_many_notes_is_too_large() {
     assert_redacted(&e, &["700"]);
 }
 
-// Error classification, of constructed `zcash_client_backend` errors
+// Error classification, of constructed `zcash_client_backend` errors. The categories
+// `send_max::classify` shares with every other path are tested with the shared classifier in
+// `error_report::tests`; an oversized proposal is covered end to end above.
 
 /// A `zcash_client_backend` send-max failure with display-only type parameters.
 type BackendError =
     DataApiError<String, Infallible, GreedyInputSelectorError, String, String, String>;
-
-fn too_large() -> ProposalError {
-    ProposalError::TransactionTooLarge {
-        estimated_size: 2_000_001,
-        limit: 2_000_000,
-        sapling_input_count: 0,
-        orchard_input_count: 3_000,
-        ironwood_input_count: 0,
-    }
-}
-
-#[test]
-fn an_oversized_transaction_is_classified_as_too_large() {
-    let error: BackendError = DataApiError::Proposal(too_large());
-
-    assert_eq!(
-        classify(CONTEXT, &error).kind(),
-        ErrorKind::TransactionTooLarge
-    );
-    assert_eq!(
-        classify_proposal_error(CONTEXT, &too_large()).kind(),
-        ErrorKind::TransactionTooLarge
-    );
-}
 
 #[test]
 fn an_unpayable_recipient_is_classified_as_unsupported() {
@@ -385,50 +360,6 @@ fn an_unpayable_recipient_is_classified_as_unsupported() {
         let e = classify(CONTEXT, error);
         assert_eq!(e.kind(), ErrorKind::NoSupportedReceivers, "{error:?}");
         assert_redacted(&e, &[&external_recipient(&st).encode()]);
-    }
-}
-
-#[test]
-fn every_form_of_a_transparent_memo_is_classified_alike() {
-    let errors: [BackendError; 2] = [
-        DataApiError::Payment(PaymentError::TransparentMemo),
-        DataApiError::Proposal(ProposalError::Zip321(Zip321Error::TransparentMemo(0))),
-    ];
-
-    for error in &errors {
-        assert_eq!(
-            classify(CONTEXT, error).kind(),
-            ErrorKind::TransparentMemo,
-            "{error:?}"
-        );
-    }
-}
-
-#[test]
-fn every_form_of_insufficient_funds_is_classified_alike() {
-    let available = Zatoshis::const_from_u64(1);
-    let required = Zatoshis::const_from_u64(2);
-    let errors: [BackendError; 2] = [
-        DataApiError::InsufficientFunds {
-            available,
-            required,
-        },
-        DataApiError::Change(ChangeError::InsufficientFunds {
-            available,
-            required,
-        }),
-    ];
-
-    for error in &errors {
-        let e = classify(CONTEXT, error);
-        assert_eq!(e.kind(), ErrorKind::InsufficientFunds, "{error:?}");
-        assert_eq!(
-            e.amounts(),
-            Some(Shortfall {
-                available,
-                required
-            })
-        );
     }
 }
 

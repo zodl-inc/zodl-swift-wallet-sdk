@@ -146,8 +146,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`);
   before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
   or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0160`), and a recipient with
-  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0161`). A
-  balance that does not exceed the fee throws `rustProposalInsufficientFunds` with both amounts.
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0161`).
   Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
   carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
   None of the new cases carries the recipient, the memo or an amount.
@@ -163,6 +162,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustProposalTransactionTooLarge` (`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and
   `rustProposalUnsupportedAddress` (`ZRUST0161`). An exhaustive `switch` over either stops
   compiling until they are handled; see `MIGRATING.md`.
+- `Synchronizer.proposeImmediateMigration(accountUUID:)` builds a send-max, so it now throws
+  `rustProposalTransactionTooLarge` (`ZRUST0159`) for an Orchard balance spread over more notes
+  than one transaction can spend, and `rustProposalUnsupportedAddress` (`ZRUST0161`), where it
+  previously threw `rustProposeSendMaxTransfer` (`ZRUST0129`) for both; a `catch` keyed on
+  `rustProposeSendMaxTransfer` no longer sees them. An oversized balance is refused when the
+  proposal is made rather than when its transaction is created.
+- `proposeOrchardToIronwoodMigration(accountUUID:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) refuses an Orchard balance spread over more notes than one transaction
+  can spend when the proposal is made, throwing `rustProposeOrchardToIronwoodMigration`
+  (`ZRUST0152`), instead of returning a proposal whose transaction creation then fails. Such a
+  balance could never be migrated in one transaction; the staged migration moves it.
+- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
+  amounts from every proposal and transaction-creation call, where it previously surfaced as the
+  call site's own case with `RustErrorKind.changeSelectionFailed`.
 - `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
   stops compiling until they are handled.
 - `createPCZTFromProposal(accountUUID:proposal:)` throws `rustProposalScanRequired` and

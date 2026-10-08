@@ -381,8 +381,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oversized proposal as `21` rather than `17`. `zcashlc_propose_send_max_transfer` now refuses a
   send-max whose transaction would not fit in a block, reporting `21`, instead of returning a
   proposal whose transaction creation then fails; it reports a memo for a transparent or TEX
-  recipient as `22` and a recipient with no payable receiver as `10`, and a balance that does not
-  exceed the fee as `2` with both amounts, where these were previously `6`, `14` and `15`.
+  recipient as `22` and a recipient with no payable receiver as `10`, where these were previously
+  `6` and `14`. On every classifying call site, a memo for a recipient that cannot receive one is
+  `22` (previously `6` or `17`), and a shortfall found during change selection is `2` with both
+  amounts (previously `15`).
   `zcashlc_propose_orchard_to_ironwood_migration` applies the same size limit when proposing.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
