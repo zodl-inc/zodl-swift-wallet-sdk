@@ -402,6 +402,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                         }
                     }
                     let bhttp_response = BhttpResponse {
+                        informational: vec![], // Chunked decoder skips interim 1xx responses
                         status: status.ok_or_else(|| anyhow!("no status in response"))?,
                         headers,
                         trailers,
