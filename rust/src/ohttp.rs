@@ -11,7 +11,7 @@
 //! fetch.
 //!
 //! The response secret never crosses the boundary. [`zcashlc_ohttp_encapsulate`] boxes the
-//! core's single-use `ResponseOpener` and returns an opaque [`OhttpOpener`] handle;
+//! chunked `ChunkedResponseOpener` and returns an opaque [`OhttpOpener`] handle;
 //! [`zcashlc_ohttp_complete`] takes that handle by value, consumes it whatever the outcome, and
 //! so the single-use rule of the core holds across the boundary. A handle whose post failed
 //! before `complete` is called is released with [`zcashlc_ohttp_opener_free`]. Every attempt
@@ -29,9 +29,10 @@ use std::ptr;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
-    BhttpRequest, ClientProfile, Completed, KEY_BYTES, KeyConfig, Network, ResponseOpener,
-    complete_exchange_in_place, encapsulate_request, pack_fields, signed_config_url, unpack_fields,
-    verify_signed_config,
+    BhttpRequest, ChunkedResponseOpener, ClientProfile, Completed, EncodeOptions, KEY_BYTES,
+    KeyConfig, Network, Response, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
+    collect_response, encode_bhttp_request, encapsulate_chunked_request, pack_fields,
+    signed_config_url, unpack_fields, verify_signed_config,
 };
 
 use crate::{free_ptr_from_vec, ptr_from_vec, unwrap_exc_or_null, zcashlc_string_free};
@@ -42,7 +43,7 @@ const OUTCOME_RESPONSE: u32 = 0;
 const OUTCOME_REFETCH_KEY: u32 = 1;
 /// The `kind` of an [`OhttpOutcome`]: the relay or the gateway refused the request.
 const OUTCOME_REFUSED: u32 = 2;
-/// The `kind` of an [`OhttpOutcome`]: a success status not labelled `message/ohttp-res`.
+/// The `kind` of an [`OhttpOutcome`]: a success status not labelled `message/ohttp-chunked-res`.
 const OUTCOME_WRONG_MEDIA_TYPE: u32 = 3;
 
 /// Opens the response to one sealed request, and no other.
@@ -51,7 +52,7 @@ const OUTCOME_WRONG_MEDIA_TYPE: u32 = 3;
 /// it, and [`zcashlc_ohttp_opener_free`] releases one that was never completed. The secret it
 /// holds is zeroized when it is dropped.
 pub struct OhttpOpener {
-    inner: ResponseOpener,
+    inner: ChunkedResponseOpener,
 }
 
 /// The gateway's key, checked and selected out of a signed envelope.
@@ -74,7 +75,7 @@ pub struct OhttpKey {
 /// the opener too. A caller that takes the opener out sets the field to null first.
 #[repr(C)]
 pub struct OhttpSealed {
-    /// The body to post to the relay as `message/ohttp-req`.
+    /// The body to post to the relay as `message/ohttp-chunked-req`.
     body: *mut u8,
     body_len: usize,
     /// Opens the answer; never null on return.
@@ -88,7 +89,7 @@ pub struct OhttpSealed {
 /// `kind` is `0` for an opened response (`status`, `headers`, `trailers` and `body` are the
 /// backend's), `1` when the key configuration must be fetched again and the request sealed
 /// afresh, `2` when the relay or the gateway refused (`status` is the outer status, `detail`
-/// the start of its body) and `3` for a success status not labelled `message/ohttp-res`
+/// the start of its body) and `3` for a success status not labelled `message/ohttp-chunked-res`
 /// (`detail` is the `Content-Type` received). Fields a kind does not use are null and zero.
 #[repr(C)]
 pub struct OhttpOutcome {
@@ -270,10 +271,14 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
             body: unsafe { bytes(body, body_len)? }.to_vec(),
         };
 
-        let sealed = encapsulate_request(&key, &request, &profile.encode, &profile.limits)?;
-        let (body, body_len) = ptr_from_vec(sealed.body);
+        // Encode the request as Binary HTTP
+        let encoded_request = encode_bhttp_request(&request, &EncodeOptions::default())?;
+
+        // Encapsulate as chunked OHTTP
+        let (sealed_body, response_opener) = encapsulate_chunked_request(&key, &encoded_request)?;
+        let (body, body_len) = ptr_from_vec(sealed_body);
         let opener = Box::into_raw(Box::new(OhttpOpener {
-            inner: sealed.opener,
+            inner: response_opener,
         }));
 
         Ok(Box::into_raw(Box::new(OhttpSealed {
@@ -355,16 +360,42 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
             )
         };
 
-        // One copy into memory the core may decrypt in place.
-        let mut sealed = unsafe { bytes(body, body_len)? }.to_vec();
-        let completed = complete_exchange_in_place(
-            &profile,
-            inner,
-            outer_status,
-            content_type,
-            &mut sealed,
-            attempt,
-        )?;
+        // Chunked OHTTP: classify the outer response, then decode if it's a sealed response.
+        let sealed = unsafe { bytes(body, body_len)? };
+
+        let completed = if outer_status == 200 {
+            // Check content type
+            match content_type {
+                Some(ct) if ct == CONTENT_TYPE_CHUNKED_RES => {
+                    // Decode the chunked response
+                    let mut decoder = inner.decoder();
+                    let mut events = decoder.push(sealed)?;
+                    events.extend(decoder.finish()?);
+                    let response = collect_response(events)?;
+                    Completed::Response(response)
+                }
+                Some(ct) => Completed::WrongMediaType {
+                    content_type: ct.to_string(),
+                },
+                None => Completed::WrongMediaType {
+                    content_type: "missing".to_string(),
+                },
+            }
+        } else if (outer_status == 400 || outer_status == 422) && attempt == 0 {
+            // Retry with fresh key on first attempt
+            Completed::RefetchKeyConfig
+        } else {
+            // Refused: relay or gateway error
+            let detail = if sealed.len() > 200 {
+                String::from_utf8_lossy(&sealed[..200]).to_string()
+            } else {
+                String::from_utf8_lossy(sealed).to_string()
+            };
+            Completed::Refused {
+                status: outer_status,
+                detail,
+            }
+        };
 
         Ok(Box::into_raw(Box::new(outcome_from(completed)?)))
     });
@@ -629,8 +660,8 @@ mod tests {
             assert_eq!(
                 post,
                 vec![
-                    ("Content-Type".to_string(), "message/ohttp-req".to_string()),
-                    ("Accept".to_string(), "message/ohttp-res".to_string()),
+                    ("Content-Type".to_string(), CONTENT_TYPE_CHUNKED_REQ.to_string()),
+                    ("Accept".to_string(), CONTENT_TYPE_CHUNKED_RES.to_string()),
                     ("Accept-Encoding".to_string(), "identity".to_string()),
                 ]
             );

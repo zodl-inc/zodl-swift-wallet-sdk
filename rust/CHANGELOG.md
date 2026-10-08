@@ -6,6 +6,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- OHTTP FFI updated to use Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08). `zcashlc_ohttp_encapsulate`
+  now uses `encapsulate_chunked_request` internally. `zcashlc_ohttp_complete` decodes responses with
+  `ChunkedResponseDecoder`. Content-Type constants updated to `message/ohttp-chunked-req` and
+  `message/ohttp-chunked-res`. See zodl-inc/ohttp PR #4.
+
+
 ### Added
 
 - The Oblivious HTTP (RFC 9458) exchange of the iOS client, on the shared `zodl-ohttp-client` core

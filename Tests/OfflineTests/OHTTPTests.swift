@@ -286,8 +286,8 @@ final class OHTTPTests: XCTestCase {
         _ = try? await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
 
         XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept"), "application/ohttp-keys")
-        XCTAssertEqual(post?.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-req")
-        XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept"), "message/ohttp-res")
+        XCTAssertEqual(post?.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-chunked-req")
+        XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept"), "message/ohttp-chunked-res")
         XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
         XCTAssertEqual(post?.httpMethod, "POST")
         XCTAssertGreaterThan(post?.httpBody?.count ?? 0, 0)

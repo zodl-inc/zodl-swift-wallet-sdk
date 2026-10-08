@@ -6,6 +6,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+### Changed
+
+- OHTTP transport upgraded to Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08). The Swift SDK now
+  uses `encapsulate_chunked_request` and `ChunkedResponseDecoder` from `zodl-ohttp-client` to seal
+  requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
+  responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
+  no longer used. See PR #4 in zodl-inc/ohttp.
+
+
 # Unreleased
 
 ## Added

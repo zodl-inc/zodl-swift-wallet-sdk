@@ -54,7 +54,7 @@ enum OHTTPCompleted {
     case refetchKeyConfig
     /// The relay or the gateway refused the request.
     case refused(status: Int, detail: String)
-    /// A success status not labelled `message/ohttp-res`.
+    /// A success status not labelled `message/ohttp-chunked-res`.
     case wrongMediaType(contentType: String)
 }
 

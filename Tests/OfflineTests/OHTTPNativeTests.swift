@@ -151,8 +151,8 @@ final class OHTTPNativeTests: XCTestCase {
         let info = try OHTTPNative.profileInfo()
 
         XCTAssertEqual(info.postHeaders.map { "\($0.name): \($0.value)" }, [
-            "Content-Type: message/ohttp-req",
-            "Accept: message/ohttp-res",
+            "Content-Type: message/ohttp-chunked-req",
+            "Accept: message/ohttp-chunked-res",
             "Accept-Encoding: identity"
         ])
         XCTAssertEqual(info.keyFetchHeaders.map { "\($0.name): \($0.value)" }, ["Accept: application/ohttp-keys"])
@@ -225,7 +225,7 @@ final class OHTTPNativeTests: XCTestCase {
         XCTAssertThrowsError(
             try sealed.pending.complete(
                 status: 200,
-                contentType: "message/ohttp-res",
+                contentType: "message/ohttp-chunked-res",
                 body: OHTTPTestSupport.unopenableSealedResponse(),
                 attempt: 0
             )
