@@ -272,7 +272,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
         };
 
         // Encode the request as Binary HTTP
-        let encoded_request = encode_bhttp_request(&request, &EncodeOptions::default())?;
+        let encoded_request = encode_bhttp_request(&request, &profile.encode)?;
 
         // Encapsulate as chunked OHTTP
         let (sealed_body, response_opener) = encapsulate_chunked_request(&key, &encoded_request)?;
@@ -371,8 +371,38 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                     let mut decoder = inner.decoder();
                     let mut events = decoder.push(sealed)?;
                     events.extend(decoder.finish()?);
-                    let response = collect_response(events)?;
-                    Completed::Response(response)
+
+                    // Manually collect events into BhttpResponse (keeping headers and trailers separate)
+                    use zodl_ohttp_client::{BhttpResponse, ResponseEvent};
+                    let mut status = None;
+                    let mut headers = Vec::new();
+                    let mut body = Vec::new();
+                    let mut trailers = Vec::new();
+                    for event in events {
+                        match event {
+                            ResponseEvent::Head { status: s, headers: h } => {
+                                status = Some(s);
+                                // Convert to byte vectors
+                                headers = h.into_iter()
+                                    .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                                    .collect();
+                            }
+                            ResponseEvent::Data(d) => body.extend_from_slice(&d),
+                            ResponseEvent::Trailers(t) => {
+                                trailers = t.into_iter()
+                                    .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                                    .collect();
+                            }
+                            ResponseEvent::End => {}
+                        }
+                    }
+                    let bhttp_response = BhttpResponse {
+                        status: status.ok_or_else(|| anyhow!("no status in response"))?,
+                        headers,
+                        trailers,
+                        body,
+                    };
+                    Completed::Response(bhttp_response)
                 }
                 Some(ct) => Completed::WrongMediaType {
                     content_type: ct.to_string(),
