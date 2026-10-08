@@ -380,16 +380,21 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                     let mut trailers = Vec::new();
                     for event in events {
                         match event {
-                            ResponseEvent::Head { status: s, headers: h } => {
+                            ResponseEvent::Head {
+                                status: s,
+                                headers: h,
+                            } => {
                                 status = Some(s);
                                 // Convert to byte vectors
-                                headers = h.into_iter()
+                                headers = h
+                                    .into_iter()
                                     .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
                                     .collect();
                             }
                             ResponseEvent::Data(d) => body.extend_from_slice(&d),
                             ResponseEvent::Trailers(t) => {
-                                trailers = t.into_iter()
+                                trailers = t
+                                    .into_iter()
                                     .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
                                     .collect();
                             }
