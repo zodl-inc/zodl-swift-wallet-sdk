@@ -2783,6 +2783,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         return BlockHeight(height)
     }
 
+    /// The ZIP 317 marginal fee, as librustzcash defines it. Stateless (no db access).
+    static func zip317MarginalFee() -> Zatoshi {
+        Zatoshi(Int64(zcashlc_zip317_marginal_fee()))
+    }
+
     /// Reports whether creating the transactions of `proposal` needs the Sapling proving
     /// parameters.
     ///

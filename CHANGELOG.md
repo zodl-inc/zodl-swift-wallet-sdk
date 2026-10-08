@@ -140,6 +140,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ZRUST0157`).
 - `NetworkActivationHeights.nu7` sets the NU7 activation height of a custom or regtest network.
   A `nil` height means "not activated".
+- `Zip317.marginalFee` is the ZIP 317 marginal fee (5,000 zatoshis), the fee per logical action
+  and the value at or below which a note costs more to spend than it carries. It is read from the
+  Rust core, so a wallet need not hardcode it, and needs no `Synchronizer`.
 - `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
   `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
   more notes than one transaction can spend within the block size limit is now refused when the

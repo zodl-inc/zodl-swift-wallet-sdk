@@ -121,6 +121,7 @@ mod sapling_prover;
 mod send_max;
 mod tor;
 mod voting;
+mod zip317;
 
 #[cfg(target_vendor = "apple")]
 mod os_log;
