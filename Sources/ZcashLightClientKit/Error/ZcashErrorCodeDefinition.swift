@@ -424,6 +424,8 @@ enum ZcashErrorDefinition {
     /// confirmations, so `available` may be below the balance the wallet is displaying.
     // sourcery: code="ZRUST0154"
     case rustProposalInsufficientFunds(_ available: Zatoshi, _ required: Zatoshi)
+    // ZRUST0156 retired: it was allocated during gift card development and removed before any
+    // release shipped it. Do not reuse the code.
     /// The transaction would spend too many notes to fit in a block.
     /// Raised while building a send-max proposal, and while creating the transactions or the PCZT of
     /// any proposal. Sending a smaller amount, which spends fewer notes, can succeed.

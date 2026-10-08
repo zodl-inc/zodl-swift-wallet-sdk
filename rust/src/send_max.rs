@@ -25,9 +25,8 @@ use zcash_client_backend::{
             propose_send_max_transfer,
         },
     },
-    fees::{ChangeError, StandardFeeRule},
-    proposal::{Proposal, ProposalError},
-    zip321::{PaymentError, Zip321Error},
+    fees::StandardFeeRule,
+    proposal::Proposal,
 };
 use zcash_protocol::{ShieldedPool, consensus::Parameters, memo::MemoBytes};
 
@@ -115,7 +114,7 @@ where
     // (upstream fix in progress for zcash/librustzcash#2952).
     proposal.check_transaction_size().map_err(|e| {
         debug!("{context} failed: {e}");
-        classify_proposal_error(context, &e)
+        ClassifiedError::classify_proposal(context, &e)
     })?;
 
     Ok(proposal)
@@ -125,30 +124,21 @@ where
 ///
 /// The categories a wallet acts on, and the [`ErrorKind`] each crosses the FFI as:
 ///
-/// - insufficient funds, [`ErrorKind::InsufficientFunds`], with its amounts, whether input
-///   selection or change selection found the shortfall;
+/// - insufficient funds, [`ErrorKind::InsufficientFunds`], with its amounts;
 /// - a transaction too large for a block, [`ErrorKind::TransactionTooLarge`];
 /// - a memo for a recipient that cannot receive one, [`ErrorKind::TransparentMemo`];
 /// - a recipient with no receiver this wallet can pay, [`ErrorKind::NoSupportedReceivers`];
 /// - a wallet that must scan before it can propose, [`ErrorKind::ScanRequired`].
 ///
-/// Anything else is classified as [`ClassifiedError::classify`] classifies any wallet error.
-/// None of the messages carries the recipient, the memo or an amount.
+/// Only the unpayable recipient needs the concrete input selector's error to recognise, so it
+/// is the one arm here; every other category, and anything else, is classified by
+/// [`ClassifiedError::classify`], as it is on every other path. None of the messages carries
+/// the recipient, the memo or an amount.
 pub(crate) fn classify<DE, TE, FE, CE, N>(
     context: &'static str,
     error: &DataApiError<DE, TE, GreedyInputSelectorError, FE, CE, N>,
 ) -> ClassifiedError {
     match error {
-        // `zcash_client_backend` lifts the input selector's shortfall into
-        // `Error::InsufficientFunds`, which `ClassifiedError::classify` handles, but not change
-        // selection's. A send-max whose balance does not exceed its fee fails in change
-        // selection, so this is the shortfall a send-max most often reports.
-        DataApiError::Change(ChangeError::InsufficientFunds {
-            available,
-            required,
-        }) => ClassifiedError::insufficient_funds(context, *available, *required),
-        DataApiError::Proposal(e) => classify_proposal_error(context, e),
-        DataApiError::Payment(PaymentError::TransparentMemo) => transparent_memo(context),
         DataApiError::NoteSelection(
             GreedyInputSelectorError::UnsupportedAddress(_)
             | GreedyInputSelectorError::UnsupportedTexAddress,
@@ -159,23 +149,4 @@ pub(crate) fn classify<DE, TE, FE, CE, N>(
         ),
         other => ClassifiedError::classify(context, other),
     }
-}
-
-/// Sorts a failure of the send-max proposal itself into the condition it describes.
-pub(crate) fn classify_proposal_error(
-    context: &'static str,
-    error: &ProposalError,
-) -> ClassifiedError {
-    match error {
-        ProposalError::Zip321(Zip321Error::TransparentMemo(_)) => transparent_memo(context),
-        other => ClassifiedError::classify_proposal(context, other),
-    }
-}
-
-fn transparent_memo(context: &'static str) -> ClassifiedError {
-    ClassifiedError::new(
-        context,
-        ErrorKind::TransparentMemo,
-        "the recipient cannot receive a memo",
-    )
 }
