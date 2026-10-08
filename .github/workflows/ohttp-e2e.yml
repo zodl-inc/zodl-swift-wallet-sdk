@@ -112,6 +112,8 @@ jobs:
       - name: Build FFI for macOS
         if: steps.cache-ffi.outputs.cache-hit != 'true'
         timeout-minutes: 75
+        env:
+          ZODL_OHTTP_RELAY_URL_TESTNET: ${{ inputs.relay_url }}
         run: make ffi-macos MACOS_ARCHS=aarch64-apple-darwin
 
       - name: Verify XCFramework
