@@ -9,7 +9,7 @@ import Combine
 import Foundation
 @testable import TestUtils
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class CombineSynchronizerOfflineTests: XCTestCase {
     var data: TestsData!

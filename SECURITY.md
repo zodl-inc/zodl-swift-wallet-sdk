@@ -92,7 +92,7 @@ nuttycom.01
 For all other vulnerabilities, please use the GitHub "Report a Vulnerability"
 feature for this repository, available at:
 
-* https://github.com/zodl-inc/zcash-swift-wallet-sdk/security/advisories
+* https://github.com/zodl-inc/zodl-swift-wallet-sdk/security/advisories
 
 Report severity according to the rubric above. Overstating the severity of a
 reported vulnerability MAY MAKE THE REPORTER INELIGIBLE FOR COMPENSATION UNDER

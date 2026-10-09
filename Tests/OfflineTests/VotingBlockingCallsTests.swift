@@ -1,10 +1,10 @@
 //
 //  VotingBlockingCallsTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// The threads every blocking voting FFI call runs on.
 ///

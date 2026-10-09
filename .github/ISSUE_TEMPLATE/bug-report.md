@@ -17,7 +17,7 @@ Do not report security vulnerabilities here. SECURITY.md carries the disclosure
 policy and the reporting routes: a Signal group with the named maintainers for
 critical vulnerabilities, and GitHub's "Report a Vulnerability" feature for
 everything else:
-    https://github.com/zodl-inc/zcash-swift-wallet-sdk/security/advisories
+    https://github.com/zodl-inc/zodl-swift-wallet-sdk/security/advisories
 -->
 
 ### Describe the issue

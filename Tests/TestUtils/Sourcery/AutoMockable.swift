@@ -10,7 +10,7 @@
 
 // sourcery:begin: AutoMockable
 
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 extension ActionContext { }
 extension BlockDownloader { }

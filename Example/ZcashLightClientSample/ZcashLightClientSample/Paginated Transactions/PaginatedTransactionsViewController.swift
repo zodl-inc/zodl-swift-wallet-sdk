@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 import PaginatedTableView
 class PaginatedTransactionsViewController: UIViewController {
     static let cellIdentifier = "TransactionCell"

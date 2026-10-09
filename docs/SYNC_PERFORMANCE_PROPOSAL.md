@@ -204,8 +204,8 @@ Coordinate P0/P2 with ECC/upstream early — `sync::run`, the `ffi_database_hand
 
 ## 8. Evidence index
 
-- Serial state machine: `Sources/ZcashLightClientKit/Block/CompactBlockProcessor.swift:593-699`
-- 100-block batch constants: `Sources/ZcashLightClientKit/Constants/ZcashSDK.swift:91,94`; `CompactBlockProcessor.swift:71`
+- Serial state machine: `Sources/ZODLSwiftWalletSDK/Block/CompactBlockProcessor.swift:593-699`
+- 100-block batch constants: `Sources/ZODLSwiftWalletSDK/Constants/ZcashSDK.swift:91,94`; `CompactBlockProcessor.swift:71`
 - 200-block download leash + disk wait: `Block/Actions/DownloadAction.swift:49-59`; 10 ms poll: `Block/Download/BlockDownloader.swift:273-284`; stream rebuild every 300 blocks: `BlockDownloader.swift:67,122-141`
 - Per-batch treestate RTT: `Block/Scan/BlockScanner.swift:61-63`
 - Progress-cost admission + TODO #1353: `Block/Actions/ScanAction.swift:71-74`

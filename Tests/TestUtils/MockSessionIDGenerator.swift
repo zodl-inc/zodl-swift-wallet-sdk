@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// This generator will consume the list of UUID passed and fail if empty.
 class MockSyncSessionIDGenerator: SyncSessionIDGenerator {

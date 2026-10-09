@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import TestUtils
 
 final class UnifiedTypecodesTests: XCTestCase {

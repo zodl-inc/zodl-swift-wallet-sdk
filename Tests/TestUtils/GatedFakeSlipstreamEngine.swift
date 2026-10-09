@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A latch a test opens to release calls suspended on it.
 ///

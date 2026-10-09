@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 final class RecipientTests: XCTestCase {
     let uaString = """
     u1l9f0l4348negsncgr9pxd9d3qaxagmqv3lnexcplmufpq7muffvfaue6ksevfvd7wrz7xrvn95rc5zjtn7ugkmgh5rnxswmcj30y0pw52pn0zjvy38rn2esfgve64rj5pcmazxgpyuj

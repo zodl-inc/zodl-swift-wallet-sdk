@@ -6,7 +6,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Test vectors for unified addresses
 /// Original file can be found here https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/test-vectors/json/unified_address.json

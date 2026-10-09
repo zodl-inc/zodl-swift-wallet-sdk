@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 import MnemonicSwift
 
 // swiftlint:disable force_try line_length

@@ -1,11 +1,11 @@
 //
 //  SubmitPlanStoreWipeRaceTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A server acceptance for a submission that started before `wipe()` must not recreate the
 /// deleted submit-plan store. `wipe()` retires the store's current lifecycle token before it

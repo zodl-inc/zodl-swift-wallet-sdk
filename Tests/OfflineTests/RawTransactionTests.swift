@@ -1,13 +1,13 @@
 //
 //  SubmitTransactionTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 12/10/19.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 @testable import SwiftProtobuf
 
 class RawTransactionTests: XCTestCase {

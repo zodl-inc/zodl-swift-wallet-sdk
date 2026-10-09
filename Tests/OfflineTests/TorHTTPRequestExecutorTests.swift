@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class TorHTTPRequestExecutorTests: XCTestCase {
     func testOnlyTwoWorkersEnterAndReleasingOneAdmitsOneWaiter() async throws {

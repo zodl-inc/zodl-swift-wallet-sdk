@@ -1,10 +1,10 @@
 //
 //  InteractiveProvingQoSTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class InteractiveProvingQoSTests: XCTestCase {
     func testBoostSessionsAreRefcountedAndSaturateAtZero() {

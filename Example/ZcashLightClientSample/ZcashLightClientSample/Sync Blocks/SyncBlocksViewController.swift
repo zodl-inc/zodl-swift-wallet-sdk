@@ -8,7 +8,7 @@
 
 import Combine
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 /// Sync blocks view controller leverages Compact Block Processor directly. This provides more detail on block processing if needed.
 /// We advise to use the SDKSynchronizer first since it provides a lot of functionality out of the box.

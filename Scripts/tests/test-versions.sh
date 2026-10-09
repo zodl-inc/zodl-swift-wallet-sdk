@@ -80,26 +80,26 @@ test_release_noun_names_a_release() {
 }
 
 test_repo_slug_from_ssh_url() {
-    assert_eq "zcash/zcash-swift-wallet-sdk" \
-        "$(repo_slug_from_url 'git@github.com:zcash/zcash-swift-wallet-sdk.git')" \
+    assert_eq "zodl-inc/zodl-swift-wallet-sdk" \
+        "$(repo_slug_from_url 'git@github.com:zodl-inc/zodl-swift-wallet-sdk.git')" \
         "repo_slug_from_url scp-style ssh"
 }
 
 test_repo_slug_from_https_url() {
-    assert_eq "zcash/zcash-swift-wallet-sdk" \
-        "$(repo_slug_from_url 'https://github.com/zcash/zcash-swift-wallet-sdk.git')" \
+    assert_eq "zodl-inc/zodl-swift-wallet-sdk" \
+        "$(repo_slug_from_url 'https://github.com/zodl-inc/zodl-swift-wallet-sdk.git')" \
         "repo_slug_from_url https with .git"
 }
 
 test_repo_slug_from_https_url_without_suffix() {
-    assert_eq "zcash/zcash-swift-wallet-sdk" \
-        "$(repo_slug_from_url 'https://github.com/zcash/zcash-swift-wallet-sdk')" \
+    assert_eq "zodl-inc/zodl-swift-wallet-sdk" \
+        "$(repo_slug_from_url 'https://github.com/zodl-inc/zodl-swift-wallet-sdk')" \
         "repo_slug_from_url https without .git"
 }
 
 test_repo_slug_from_ssh_protocol_url() {
-    assert_eq "zcash/zcash-swift-wallet-sdk" \
-        "$(repo_slug_from_url 'ssh://git@github.com/zcash/zcash-swift-wallet-sdk.git')" \
+    assert_eq "zodl-inc/zodl-swift-wallet-sdk" \
+        "$(repo_slug_from_url 'ssh://git@github.com/zodl-inc/zodl-swift-wallet-sdk.git')" \
         "repo_slug_from_url ssh:// scheme"
 }
 

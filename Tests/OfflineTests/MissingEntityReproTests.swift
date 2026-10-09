@@ -1,6 +1,6 @@
 //
 //  MissingEntityReproTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Reproduces the `-3000 [ZTREE0001] transactionRepositoryEntityNotFound` reported from the
 //  field after shielding and cross-pay sends.
@@ -22,7 +22,7 @@
 import SQLite
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class MissingEntityReproTests: XCTestCase {
     /// Distinct from anything in the fixture, so a hit can only be the row inserted here.

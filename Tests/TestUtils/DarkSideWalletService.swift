@@ -1,12 +1,12 @@
 //
 //  DarkSideWalletService.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 3/23/20.
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import GRPC
 
 enum DarksideDataset: String {
@@ -38,11 +38,11 @@ enum DarksideDataset: String {
 }
 
 class DarksideWalletService: LightWalletService {
-    func getTaddressTransactions(_ request: ZcashLightClientKit.TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashLightClientKit.RawTransaction, any Error> {
+    func getTaddressTransactions(_ request: ZODLSwiftWalletSDK.TransparentAddressBlockFilter, mode: ServiceMode) throws -> AsyncThrowingStream<ZODLSwiftWalletSDK.RawTransaction, any Error> {
         try service.getTaddressTransactions(request, mode: mode)
     }
 
-    var connectionStateChange: ((ZcashLightClientKit.ConnectionState, ZcashLightClientKit.ConnectionState) -> Void)? {
+    var connectionStateChange: ((ZODLSwiftWalletSDK.ConnectionState, ZODLSwiftWalletSDK.ConnectionState) -> Void)? {
         get { service.connectionStateChange }
         set { service.connectionStateChange = newValue }
     }
@@ -70,7 +70,7 @@ class DarksideWalletService: LightWalletService {
         try service.blockStream(startHeight: startHeight, endHeight: endHeight, mode: mode)
     }
 
-    func latestBlock(mode: ServiceMode) async throws -> ZcashLightClientKit.BlockID {
+    func latestBlock(mode: ServiceMode) async throws -> ZODLSwiftWalletSDK.BlockID {
         throw "Not mocked"
     }
 
@@ -191,7 +191,7 @@ class DarksideWalletService: LightWalletService {
         try await service.fetchTransaction(txId: txId, mode: mode)
     }
 
-    func getSubtreeRoots(_ request: ZcashLightClientKit.GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashLightClientKit.SubtreeRoot, Error> {
+    func getSubtreeRoots(_ request: ZODLSwiftWalletSDK.GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<ZODLSwiftWalletSDK.SubtreeRoot, Error> {
         try service.getSubtreeRoots(request, mode: mode)
     }
 

@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 class LatestHeightViewController: UIViewController {
     @IBOutlet weak var blockHeightLabel: UILabel!

@@ -16,7 +16,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class MigrationRunEstimateTests: XCTestCase {
     /// `transactions` is the run's preparation transactions plus one crossing transfer per

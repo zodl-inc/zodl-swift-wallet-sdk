@@ -7,7 +7,7 @@ import Foundation
 import GRPC
 import NIO
 import NIOTransportServices
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     var interceptors: CompactTxStreamerServerInterceptorFactoryProtocol? { nil }
@@ -99,7 +99,7 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedStreaming(on: context.eventLoop)
     }
 
-    func getMempoolStream(request: ZcashLightClientKit.Empty, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
+    func getMempoolStream(request: ZODLSwiftWalletSDK.Empty, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
         unimplementedStreaming(on: context.eventLoop)
     }
 
@@ -107,7 +107,7 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func getLatestTreeState(request: ZcashLightClientKit.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<TreeState> {
+    func getLatestTreeState(request: ZODLSwiftWalletSDK.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<TreeState> {
         unimplementedUnary(on: context.eventLoop)
     }
 
@@ -123,11 +123,11 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedStreaming(on: context.eventLoop)
     }
 
-    func getLightdInfo(request: ZcashLightClientKit.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<LightdInfo> {
+    func getLightdInfo(request: ZODLSwiftWalletSDK.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<LightdInfo> {
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func ping(request: ZcashLightClientKit.Duration, context: StatusOnlyCallContext) -> EventLoopFuture<PingResponse> {
+    func ping(request: ZODLSwiftWalletSDK.Duration, context: StatusOnlyCallContext) -> EventLoopFuture<PingResponse> {
         unimplementedUnary(on: context.eventLoop)
     }
 

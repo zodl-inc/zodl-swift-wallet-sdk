@@ -19,7 +19,7 @@ severity under the rubric in `SECURITY.md`:
 * **Critical** — create a Signal group with the users `dairaemma.31` and
   `nuttycom.01`. Do not reuse a previous group for a new issue.
 * **All other severities** — use the GitHub "Report a Vulnerability" feature at
-  https://github.com/zodl-inc/zcash-swift-wallet-sdk/security/advisories
+  https://github.com/zodl-inc/zodl-swift-wallet-sdk/security/advisories
 
 `SECURITY.md` carries the full policy: the severity rubric, what is explicitly
 not considered a vulnerability, and the reporting routes above.

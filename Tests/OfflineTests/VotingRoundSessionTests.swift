@@ -1,10 +1,10 @@
 //
 //  VotingRoundSessionTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 private let sessionWalletId = "voting-session-tests"
 

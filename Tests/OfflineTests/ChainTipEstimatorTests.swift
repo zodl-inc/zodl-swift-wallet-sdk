@@ -15,7 +15,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ChainTipEstimatorTests: XCTestCase {
     private let referenceDate = Date(timeIntervalSince1970: 1_700_000_000)

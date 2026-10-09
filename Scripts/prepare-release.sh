@@ -330,7 +330,7 @@ cmd_start() {
     elif ! start_pr_body "$version" "$prev_tag" "$issue" |
         gh pr create --repo "$GH_REPO" --draft \
             --base "$release_branch" --head "$candidate_branch" \
-            --title "Release zcash-swift-wallet-sdk ${version}" \
+            --title "Release zodl-swift-wallet-sdk ${version}" \
             --body-file -; then
         # gh pr create is the last of five steps; both branches are already on
         # the remote by this point. Detect the failure explicitly (rather than
@@ -344,7 +344,7 @@ cmd_start() {
             "" \
             "  gh pr create --repo ${GH_REPO} --draft \\" \
             "      --base ${release_branch} --head ${candidate_branch} \\" \
-            "      --title \"Release zcash-swift-wallet-sdk ${version}\" \\" \
+            "      --title \"Release zodl-swift-wallet-sdk ${version}\" \\" \
             "      --body-file ${pr_body_file}" \
             "" \
             "(the PR body is already written out at ${pr_body_file})"

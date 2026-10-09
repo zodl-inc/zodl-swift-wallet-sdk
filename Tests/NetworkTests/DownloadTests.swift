@@ -1,6 +1,6 @@
 //
 //  DownloadTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 10/16/19.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
@@ -9,7 +9,7 @@
 import XCTest
 import SQLite
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class DownloadTests: ZcashTestCase {
     let testFileManager = FileManager()

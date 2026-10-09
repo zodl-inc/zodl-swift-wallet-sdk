@@ -21,7 +21,7 @@ Standard handling:
 
 ## Project overview
 
-`ZcashLightClientKit` is an iOS/macOS Swift Package that implements a Zcash lightwallet client. The Swift layer wraps a Rust core (in `rust/`) via an `libzcashlc` XCFramework. Most day-to-day SDK work happens in Swift only — SPM auto-downloads a pre-built XCFramework from GitHub Releases.
+`zodl-swift-wallet-sdk` (library product and module `ZODLSwiftWalletSDK`) is an iOS/macOS Swift Package that implements a Zcash lightwallet client. The Swift layer wraps a Rust core (in `rust/`) via an `libzcashlc` XCFramework. Most day-to-day SDK work happens in Swift only — SPM auto-downloads a pre-built XCFramework from GitHub Releases.
 
 ## Build and test
 
@@ -29,7 +29,7 @@ Open the package or workspace in Xcode and build against an iOS or macOS target:
 
 - `swift build` — build the package (macOS target).
 - `swift test --filter OfflineTests` — run the offline unit tests. This is what CI runs (see `.github/workflows/swift.yml`).
-- `xcodebuild ... -testPlan ZcashLightClientKit.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
+- `xcodebuild ... -testPlan ZODLSwiftWalletSDK.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
 
 Test targets are grouped by external dependencies:
 
@@ -80,9 +80,9 @@ built from live in `Scripts/lib/release-lib.sh` and are covered by
 ### Two-layer wallet
 
 1. **Rust core** (`rust/src/`) — key derivation, note scanning, transaction construction, block database migrations.
-2. **Swift SDK** (`Sources/ZcashLightClientKit/`) — orchestration, networking, persistence, public API.
+2. **Swift SDK** (`Sources/ZODLSwiftWalletSDK/`) — orchestration, networking, persistence, public API.
 
-The Swift↔Rust bridge lives in `Sources/ZcashLightClientKit/Rust/`:
+The Swift↔Rust bridge lives in `Sources/ZODLSwiftWalletSDK/Rust/`:
 - `ZcashRustBackend` conforms to `ZcashRustBackendWelding` — the DB-bound surface.
 - `ZcashKeyDerivationBackend` conforms to `ZcashKeyDerivationBackendWelding` — the stateless key-derivation surface.
 
@@ -180,7 +180,7 @@ next reader sees a sanctioned exception rather than a violation.
 
 ### Where direct access lives
 
-All of it is under `Sources/ZcashLightClientKit/DAO/`. Adding a query anywhere
+All of it is under `Sources/ZODLSwiftWalletSDK/DAO/`. Adding a query anywhere
 else is a mistake; adding one that names a table is a mistake wherever it is.
 
 | File | Reads | Status |

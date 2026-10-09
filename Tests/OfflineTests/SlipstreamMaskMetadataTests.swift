@@ -1,12 +1,12 @@
 //
 //  SlipstreamMaskMetadataTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// [MOB-1852] `SynchronizerState.isSpendableMasked` must always describe the balances
 /// carried in the SAME emission — never a flag some other, unrelated call last happened to compute.

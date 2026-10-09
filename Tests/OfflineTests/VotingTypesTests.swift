@@ -1,10 +1,10 @@
 //
 //  VotingTypesTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// The Swift wire types must mirror the JSON the voting FFI exchanges: the
 /// request DTOs of `rust/src/voting/wire.rs` and the `zcash_voting::wire`

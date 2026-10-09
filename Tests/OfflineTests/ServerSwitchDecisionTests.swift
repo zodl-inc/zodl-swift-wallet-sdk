@@ -1,10 +1,10 @@
 //
 //  ServerSwitchDecisionTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ServerSwitchDecisionTests: XCTestCase {
     private func endpoint(_ host: String, port: Int = 443, secure: Bool = true) -> LightWalletEndpoint {

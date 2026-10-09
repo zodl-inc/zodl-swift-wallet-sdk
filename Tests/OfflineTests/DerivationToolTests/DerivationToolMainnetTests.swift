@@ -1,13 +1,13 @@
 //
 //  DerivationToolTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 10/9/20.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class DerivationToolMainnetTests: XCTestCase {
     var seedPhrase = Environment.seedPhrase

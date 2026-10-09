@@ -1,13 +1,13 @@
 //
 //  BlockStreamingTest.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 5/25/21.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class BlockStreamingTest: ZcashTestCase {
     let testFileManager = FileManager()
