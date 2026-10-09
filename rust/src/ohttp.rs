@@ -275,7 +275,10 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
         let encoded_request = encode_bhttp_request(&request, &profile.encode)?;
 
         // The gateway and the relay answer 413 above the cap: refuse here, before the HPKE work.
-        check_size(encoded_request.len(), profile.limits.max_sealed_request_bytes)?;
+        check_size(
+            encoded_request.len(),
+            profile.limits.max_sealed_request_bytes,
+        )?;
 
         // Encapsulate as chunked OHTTP
         let (sealed_body, response_opener) = encapsulate_chunked_request(&key, &encoded_request)?;
@@ -926,10 +929,7 @@ mod tests {
         };
         assert!(sealed.is_null());
         assert!(zcashlc_last_error_length() > 0);
-        assert_eq!(
-            Limits::IOS.max_sealed_request_bytes,
-            Some(10 * 1024 * 1024)
-        );
+        assert_eq!(Limits::IOS.max_sealed_request_bytes, Some(10 * 1024 * 1024));
         zcashlc_clear_last_error();
     }
 
