@@ -31,7 +31,7 @@ use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
     ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network, OuterOutcome, OuterPolicy,
-    OuterResponse, ResponseEvent, classify_outer_response, encapsulate_chunked_request,
+    OuterResponse, ResponseEvent, check_size, classify_outer_response, encapsulate_chunked_request,
     encode_bhttp_request, pack_fields, signed_config_url, unpack_fields, verify_signed_config,
 };
 
@@ -273,6 +273,9 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
 
         // Encode the request as Binary HTTP
         let encoded_request = encode_bhttp_request(&request, &profile.encode)?;
+
+        // The gateway and the relay answer 413 above the cap: refuse here, before the HPKE work.
+        check_size(encoded_request.len(), profile.limits.max_sealed_request_bytes)?;
 
         // Encapsulate as chunked OHTTP
         let (sealed_body, response_opener) = encapsulate_chunked_request(&key, &encoded_request)?;
@@ -892,6 +895,41 @@ mod tests {
             assert!(outcome.is_null());
             assert!(zcashlc_last_error_length() > 0);
         }
+        zcashlc_clear_last_error();
+    }
+
+    #[test]
+    fn a_request_over_the_cap_is_too_large_before_it_is_sealed() {
+        use zodl_ohttp_client::Limits;
+
+        zcashlc_clear_last_error();
+        let key = gateway_key();
+        let body = vec![0u8; 10 * 1024 * 1024];
+        let headers = pack_fields(&[(b"x-test".to_vec(), b"1".to_vec())]).unwrap();
+        let sealed = unsafe {
+            zcashlc_ohttp_encapsulate(
+                IOS,
+                key.as_ptr(),
+                b"POST".as_ptr(),
+                4,
+                b"https".as_ptr(),
+                5,
+                b"gateway.example".as_ptr(),
+                15,
+                b"/large".as_ptr(),
+                6,
+                headers.as_ptr(),
+                headers.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        assert!(sealed.is_null());
+        assert!(zcashlc_last_error_length() > 0);
+        assert_eq!(
+            Limits::IOS.max_sealed_request_bytes,
+            Some(10 * 1024 * 1024)
+        );
         zcashlc_clear_last_error();
     }
 
