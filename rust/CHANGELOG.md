@@ -33,7 +33,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     relay's answer and opens a sealed one. It takes the opener by value and consumes it in every case, errors
     included. An `OhttpOutcome` says whether the response opened (`kind` 0), the key configuration must be
     fetched again (1), the request was refused (2, with the outer status and the start of its body in `detail`)
-    or the success status was not labelled `message/ohttp-res` (3). Free it with `zcashlc_free_ohttp_outcome`.
+    or the success status was not labelled `message/ohttp-chunked-res` (3). Free it with `zcashlc_free_ohttp_outcome`.
   - `zcashlc_ohttp_opener_free` releases an opener whose post failed before `zcashlc_ohttp_complete`.
   - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
     with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
