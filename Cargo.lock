@@ -523,7 +523,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease 0.2.37",
  "proc-macro2",
@@ -1425,7 +1425,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d308ebe4b10924331bd079044b418da7b227d724d3e2408567a47ad7c3da2a0"
 dependencies = [
  "derive-deftly-macros",
- "heck 0.5.0",
+ "heck 0.4.1",
 ]
 
 [[package]]
@@ -1434,9 +1434,9 @@ version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd5f2b7218a51c827a11d22d1439b598121fac94bf9b99452e4afffe512d78c9"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "indexmap 2.14.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -3228,7 +3228,7 @@ dependencies = [
  "zcash_voting",
  "zeroize",
  "zip32",
- "zodl-ohttp-client",
+ "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=98a66a093cb10db625e462a2269a0efc21f3b495)",
  "zodl-slipstream",
 ]
 
@@ -4445,8 +4445,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -4478,7 +4478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5486,7 +5486,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8832,9 +8832,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zodl-ohttp-client"
+version = "0.1.0"
+source = "git+https://github.com/zodl-inc/ohttp.git?rev=cf4f305ebc2ea2d3fb8df4c7dc34475bf2cefe4a#cf4f305ebc2ea2d3fb8df4c7dc34475bf2cefe4a"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "hpke",
+ "rand_core 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
 name = "zodl-slipstream"
 version = "0.4.0-pre.1"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=eb94471930797c1970c8bf6da3bc08ca7843dad2#eb94471930797c1970c8bf6da3bc08ca7843dad2"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3aed447d6b22ed8786f391bdddfc3d040bdc56ca#3aed447d6b22ed8786f391bdddfc3d040bdc56ca"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8881,14 +8900,14 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zip32",
- "zodl-ohttp-client",
+ "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=cf4f305ebc2ea2d3fb8df4c7dc34475bf2cefe4a)",
  "zodl-slipstream-gpuhash",
 ]
 
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=eb94471930797c1970c8bf6da3bc08ca7843dad2#eb94471930797c1970c8bf6da3bc08ca7843dad2"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3aed447d6b22ed8786f391bdddfc3d040bdc56ca#3aed447d6b22ed8786f391bdddfc3d040bdc56ca"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",
