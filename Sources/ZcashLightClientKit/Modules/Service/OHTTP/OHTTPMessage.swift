@@ -34,6 +34,15 @@ struct OHTTPResponse {
         }
         return nil
     }
+
+    /// Whether this is the gateway's freshness refusal: status 400 with `ohttp-freshness: rejected` in the
+    /// header section.
+    var isFreshnessRefusal: Bool {
+        status == 400 && headers.contains { name, value in
+            name.lowercased() == "ohttp-freshness"
+                && value.trimmingCharacters(in: .whitespaces).lowercased() == "rejected"
+        }
+    }
 }
 
 /// A request as the bytes the Rust core encodes: the control data and the packed header list.

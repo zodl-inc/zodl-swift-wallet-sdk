@@ -78,6 +78,39 @@ final class OHTTPBehavioralTests: XCTestCase {
         XCTAssertEqual(counters.keyFetches, 1, "409 should not refetch the key configuration")
     }
 
+    // MARK: - Freshness refusal (inner 400, one retry)
+
+    private func inner(_ status: Int, _ headers: [(String, String)]) -> OHTTPResponse {
+        OHTTPResponse(status: status, headers: headers, body: Data(), trailers: [])
+    }
+
+    private var freshnessRefusal: OHTTPResponse {
+        inner(400, [("content-type", "text/plain"), ("Ohttp-Freshness", "rejected"), ("ohttp-server-time", "1800000000")])
+    }
+
+    func testTheFreshnessRefusalIsRecognised() {
+        XCTAssertTrue(freshnessRefusal.isFreshnessRefusal)
+        XCTAssertFalse(inner(400, [("content-type", "text/plain")]).isFreshnessRefusal)
+        XCTAssertFalse(inner(200, [("ohttp-freshness", "rejected")]).isFreshnessRefusal)
+    }
+
+    func testAFreshnessRefusalIsSentOnceMoreAndOnlyOnce() async throws {
+        let ok = inner(200, [("content-type", "application/grpc")])
+        for (answers, expectedCalls, expectRefusal) in [
+            ([ok], 1, false),
+            ([freshnessRefusal, ok], 2, false),
+            ([freshnessRefusal, freshnessRefusal, ok], 2, true)
+        ] {
+            var calls = 0
+            let response = try await OHTTPTransport.withFreshnessRetry {
+                defer { calls += 1 }
+                return answers[calls]
+            }
+            XCTAssertEqual(calls, expectedCalls)
+            XCTAssertEqual(response.isFreshnessRefusal, expectRefusal)
+        }
+    }
+
     // MARK: - 400 / 422 (Config Refetch + Single Retry)
 
     /// Tests that HTTP 422 triggers config refetch once and retries exactly once with the new config.

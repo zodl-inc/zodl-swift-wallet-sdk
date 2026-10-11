@@ -148,9 +148,31 @@ actor OHTTPTransport {
         return verified
     }
 
+    /// Performs one OHTTP call: `roundTripOnce`, and once more (sealed afresh) when the gateway refused the
+    /// request as stale, an inner 400 with `ohttp-freshness: rejected` ("Request freshness" in the ZIP).
+    /// That response carried the gateway clock, which the native core has already learned, so the second
+    /// attempt is stamped right even on a device whose clock is off. Never more than one such retry.
+    func roundTrip(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+        try await Self.withFreshnessRetry {
+            try await self.roundTripOnce(request: request, timeoutMS: timeoutMS)
+        }
+    }
+
+    /// Runs `attempt`, and once more when its answer is the gateway's freshness refusal. A second refusal
+    /// is returned as it is.
+    static func withFreshnessRetry(
+        _ attempt: () async throws -> OHTTPResponse
+    ) async throws -> OHTTPResponse {
+        let first = try await attempt()
+        guard first.isFreshnessRefusal else {
+            return first
+        }
+        return try await attempt()
+    }
+
     /// Performs one OHTTP round trip. When the relay or gateway answers 400 or 422 the key configuration is
     /// fetched again and the request is sealed afresh and sent once more; a second 400 or 422 is final.
-    func roundTrip(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+    private func roundTripOnce(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
         var key = try await self.keyConfig()
         var attempt: UInt32 = 0
 
