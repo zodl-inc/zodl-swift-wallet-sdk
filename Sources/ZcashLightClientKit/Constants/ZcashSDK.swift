@@ -30,7 +30,7 @@ public extension ZcashNetwork {
     var customNetworkBase: NetworkType? { nil }
 }
 
-public enum NetworkType: Equatable, Codable, Hashable {
+public enum NetworkType: Equatable, Codable, Hashable, Sendable {
     case mainnet
     case testnet
     /// A custom-parameter (regtest) network with configurable NU activation heights. Select it via

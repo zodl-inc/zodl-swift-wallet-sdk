@@ -38,9 +38,9 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     address::Address,
     data_api::{
-        Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
-        SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
-        WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
+        Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
+        MaxSpendMode, SeedRelevance, TransactionDataRequest, TransactionStatus,
+        TransparentKeyOrigin, WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
         anchor_retention::AnchorRetentionInterval,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
@@ -110,6 +110,7 @@ mod ffi;
 mod liberated_payment;
 mod gift_ffi;
 mod interactive_qos;
+mod ledger;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
@@ -255,6 +256,33 @@ pub(crate) fn account_uuid_from_bytes(
     )))
 }
 
+// Per-target filter instead of a bare global level:
+// upstream `zcash_client_backend` #[instrument]s every block and batch
+// (~600k spans per fresh restore) at INFO, and through the os_log +
+// signpost layers each span costs syscalls on the scan producer thread
+// — measured as production pass1 3.4 s vs 0.5 s in the filtered
+// CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
+// host-chosen level still governs everything else (engine logs
+// unchanged). Mirrors the filter the CLI and bench probe ship since
+// v0.6 P6.
+fn log_targets(host: LevelFilter) -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(host)
+        .with_target("zcash_client_backend", LevelFilter::WARN.min(host))
+        // The network stack under the sync engine: h2 logs every frame it receives at DEBUG, tens
+        // of thousands of events per resync, each through the os_log and signpost layers on the
+        // connection threads themselves. At most WARN, and never above the host's level: each
+        // target below is capped at `LevelFilter::WARN.min(host)` rather than a bare WARN
+        // default, because a global WARN default would also silence the engine's own INFO
+        // report lines whenever the host asks for INFO or more.
+        .with_target("h2", LevelFilter::WARN.min(host))
+        .with_target("hyper", LevelFilter::WARN.min(host))
+        .with_target("hyper_util", LevelFilter::WARN.min(host))
+        .with_target("rustls", LevelFilter::WARN.min(host))
+        .with_target("tonic", LevelFilter::WARN.min(host))
+        .with_target("tower", LevelFilter::WARN.min(host))
+}
+
 /// Initializes global Rust state, such as the logging infrastructure and threadpools.
 ///
 /// `log_level` defines how the Rust layer logs its events. These values are supported,
@@ -300,18 +328,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
             })
     };
 
-    // Per-target filter instead of a bare global level:
-    // upstream `zcash_client_backend` #[instrument]s every block and batch
-    // (~600k spans per fresh restore) at INFO, and through the os_log +
-    // signpost layers each span costs syscalls on the scan producer thread
-    // — measured as production pass1 3.4 s vs 0.5 s in the filtered
-    // CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
-    // host-chosen level still governs everything else (engine logs
-    // unchanged). Mirrors the filter the CLI and bench probe ship since
-    // v0.6 P6.
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_default(log_filter)
-        .with_target("zcash_client_backend", LevelFilter::WARN);
+    let log_filter = log_targets(log_filter);
 
     // Set up the tracing layers for the Apple OS logging framework.
     #[cfg(target_vendor = "apple")]
@@ -328,8 +345,8 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
-        "tracing initialized (zcash_client_backend capped at WARN)"
+        zcashlc_build = "2026-09-30.v0.15-network-log-cap",
+        "tracing initialized (zcash_client_backend and the network stack capped at min(host, WARN))"
     );
 
     // Log panics instead of writing them to stderr.
@@ -2306,8 +2323,40 @@ pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
     unwrap_exc_or(res, -1)
 }
 
+/// The `key_source` tag the platform layers stamp on a Ledger import, compared case-
+/// insensitively. It is the only account-level signal this SDK has that a proposal must be
+/// signable by the Ledger Zcash app rather than an in-app or Keystone signer. Mirrored in Swift
+/// as `Account.ledgerKeySource`.
+pub(crate) const LEDGER_KEY_SOURCE: &str = "ledger";
+
+/// The change-output split policy to build a proposal's change strategy with, for an account
+/// whose stored source is `source` (`None` when the account was not found).
+///
+/// The Ledger Zcash app signs exactly one change output per transaction, and the Ledger engine
+/// refuses to build a second one before the first command goes out. A Ledger-tagged account (see
+/// [`LEDGER_KEY_SOURCE`]) therefore proposes with [`SplitPolicy::single_output`]. Every other
+/// account — no tag, any other tag, or an account this call could not find — keeps the policy
+/// [`zip317_helper`] always used before this account-level distinction existed: split change into
+/// up to four outputs of at least 0.1 ZEC each, mirroring
+/// [`crate::migration_engine::run_sizing`]'s Keystone match exactly up to ASCII case (nothing is
+/// trimmed, prefixed, or substring-matched).
+pub(crate) fn change_split_policy(source: Option<&AccountSource>) -> SplitPolicy {
+    let is_ledger = source
+        .and_then(|source| source.key_source())
+        .is_some_and(|tag| tag.eq_ignore_ascii_case(LEDGER_KEY_SOURCE));
+    if is_ledger {
+        SplitPolicy::single_output()
+    } else {
+        SplitPolicy::with_min_output_value(
+            NonZeroUsize::new(4).unwrap(),
+            Zatoshis::const_from_u64(1000_0000),
+        )
+    }
+}
+
 fn zip317_helper<DbT>(
     change_memo: Option<MemoBytes>,
+    split_policy: SplitPolicy,
 ) -> (
     MultiOutputChangeStrategy<StandardFeeRule, DbT>,
     GreedyInputSelector<DbT>,
@@ -2318,10 +2367,7 @@ fn zip317_helper<DbT>(
             change_memo,
             ShieldedPool::Orchard,
             DustOutputPolicy::default(),
-            SplitPolicy::with_min_output_value(
-                NonZeroUsize::new(4).unwrap(),
-                Zatoshis::const_from_u64(1000_0000),
-            ),
+            split_policy,
         ),
         GreedyInputSelector::new(),
     )
@@ -2395,7 +2441,11 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
                 })
         }?;
 
-        let (change_strategy, input_selector) = zip317_helper(None);
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            None,
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
 
         let req = TransactionRequest::new(vec![
             Payment::new(to, Some(value), memo, None, None, vec![]).map_err(|e| {
@@ -2642,7 +2692,11 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let payment_uri_str = unsafe { CStr::from_ptr(payment_uri) }.to_str()?;
 
-        let (change_strategy, input_selector) = zip317_helper(None);
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            None,
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
 
         let req = TransactionRequest::from_uri(payment_uri_str).map_err(|e| {
             debug!("{CONTEXT}: payment URI did not parse: {e:?}");
@@ -2866,7 +2920,11 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             return Ok(ffi::BoxedSlice::none());
         };
 
-        let (change_strategy, input_selector) = zip317_helper(Some(memo_bytes));
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            Some(memo_bytes),
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
         let lock_inputs = None;
         let proposal = propose_shielding::<_, _, _, _, Infallible>(
             &mut db_data,
@@ -5070,6 +5128,7 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Level;
 
     /// The C callers select the outgoing viewing key policy by number; only the two documented
     /// values are accepted, so a caller asking for an unrecoverable send is never silently given
@@ -5341,6 +5400,133 @@ mod tests {
             .expect_err("an unknown transaction cannot be trusted");
         assert!(error.to_string().contains("not stored in this wallet"));
         assert!(db.get_transaction(txid).unwrap().is_none());
+    }
+
+    /// The tag is matched case-insensitively: a wallet that capitalizes it differently is still a
+    /// Ledger account, exactly like [`crate::migration_engine::run_sizing`]'s Keystone match.
+    #[test]
+    fn a_ledger_tag_selects_a_single_change_output() {
+        for tag in ["ledger", "Ledger", "LEDGER"] {
+            let source = AccountSource::Imported {
+                purpose: AccountPurpose::ViewOnly,
+                key_source: Some(tag.to_string()),
+            };
+            let policy = change_split_policy(Some(&source));
+            assert_eq!(
+                policy.target_output_count(),
+                NonZeroUsize::new(1).unwrap(),
+                "a `{tag}` account must propose a single change output"
+            );
+            assert_eq!(
+                policy.min_split_output_value(),
+                None,
+                "a `{tag}` account's single-output policy carries no minimum split value"
+            );
+        }
+    }
+
+    /// Everything not exactly `ledger` (case-insensitively) — a missing account, no tag, another
+    /// wallet's tag, or a near-miss (leading space, suffix, product name) — keeps the crate's
+    /// default note-splitting policy. The match is exact up to ASCII case: nothing is trimmed,
+    /// prefixed, or substring-matched.
+    #[test]
+    fn every_other_account_keeps_the_note_splitting_policy() {
+        let tagged = |key_source: Option<&str>| AccountSource::Imported {
+            purpose: AccountPurpose::ViewOnly,
+            key_source: key_source.map(str::to_string),
+        };
+        let sources = [
+            None,
+            Some(tagged(None)),
+            Some(tagged(Some("zashi"))),
+            Some(tagged(Some("keystone"))),
+            Some(tagged(Some(" ledger"))),
+            Some(tagged(Some("ledger2"))),
+            Some(tagged(Some("ledger nano"))),
+        ];
+        for source in &sources {
+            let policy = change_split_policy(source.as_ref());
+            assert_eq!(
+                policy.target_output_count(),
+                NonZeroUsize::new(4).unwrap(),
+                "{source:?} must keep the default note-splitting target of 4"
+            );
+            assert_eq!(
+                policy.min_split_output_value(),
+                Some(Zatoshis::const_from_u64(1000_0000)),
+                "{source:?} must keep the default 0.1 ZEC minimum split value"
+            );
+        }
+    }
+
+    /// A silenced host (`.noLogging` on the Swift side) must silence the network stack and
+    /// `zcash_client_backend` too — a `Targets` entry sets a crate's level, it doesn't cap it,
+    /// so a naive `.with_target(crate, LevelFilter::WARN)` would keep emitting WARN events from
+    /// these crates even when the host asked for nothing at all.
+    #[test]
+    fn log_targets_host_off_disables_network_and_backend_targets() {
+        let targets = log_targets(LevelFilter::OFF);
+        assert!(
+            !targets.would_enable("h2", &Level::ERROR),
+            "h2 must not log ERROR when the host asked for no logging at all"
+        );
+        assert!(
+            !targets.would_enable("h2", &Level::WARN),
+            "h2 must not log WARN when the host asked for no logging at all"
+        );
+        assert!(
+            !targets.would_enable("zcash_client_backend", &Level::WARN),
+            "zcash_client_backend must not log WARN when the host asked for no logging at all"
+        );
+    }
+
+    /// `.default(.error)` on the Swift side must still let the capped crates report their own
+    /// ERROR events; only their WARN level (or below) should give way to the stricter host level.
+    #[test]
+    fn log_targets_host_error_caps_network_crate_at_error() {
+        let targets = log_targets(LevelFilter::ERROR);
+        assert!(
+            targets.would_enable("rustls", &Level::ERROR),
+            "rustls must still log ERROR when the host asked for ERROR"
+        );
+        assert!(
+            !targets.would_enable("rustls", &Level::WARN),
+            "rustls must not log WARN when the host asked for ERROR only"
+        );
+    }
+
+    /// A permissive host (DEBUG or more) must not pull the capped crates up past WARN, but must
+    /// leave engine targets (outside the capped seven) following the host level directly.
+    #[test]
+    fn log_targets_host_debug_leaves_capped_crate_at_warn_and_engine_at_host_level() {
+        let targets = log_targets(LevelFilter::DEBUG);
+        assert!(
+            targets.would_enable("hyper", &Level::WARN),
+            "hyper must still log WARN when the host asked for DEBUG"
+        );
+        assert!(
+            !targets.would_enable("hyper", &Level::INFO),
+            "hyper must stay capped at WARN even when the host asked for DEBUG"
+        );
+        assert!(
+            targets.would_enable("zodl_slipstream", &Level::DEBUG),
+            "an uncapped engine target must follow the host's DEBUG level"
+        );
+    }
+
+    /// Same shape one rung down: INFO host still caps the network stack at WARN, while an
+    /// engine target (not one of the seven) follows the host level directly.
+    #[test]
+    fn log_targets_host_info_leaves_capped_crate_at_warn_and_engine_at_host_level() {
+        let targets = log_targets(LevelFilter::INFO);
+        assert!(
+            targets.would_enable("tower", &Level::WARN),
+            "tower must still log WARN when the host asked for INFO"
+        );
+        assert!(
+            targets.would_enable("zodl_slipstream", &Level::INFO),
+            "an uncapped engine target must follow the host's INFO level"
+        );
     }
 }
 

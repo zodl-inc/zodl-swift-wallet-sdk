@@ -1200,4 +1200,102 @@ enum ZcashErrorDefinition {
     /// Attempt to init TxId with invalid hex encoding.
     // sourcery: code="ZMODEL0002"
     case txIdInvalidHexEncoding
+
+    // MARK: - Ledger
+
+    /// The user declined on the Ledger device.
+    /// A fresh attempt may succeed if the user approves it.
+    // sourcery: code="ZLEDG0001"
+    case ledgerUserRejected
+    /// The Ledger device is not running the Zcash app.
+    /// - `statusWord` is the status word the device answered with.
+    // sourcery: code="ZLEDG0002"
+    case ledgerWrongApp(_ statusWord: UInt16)
+    /// The Zcash app on the Ledger device is too old for this operation.
+    /// - `reason` names the app version and the version the operation needs; it carries no transaction data.
+    // sourcery: code="ZLEDG0003"
+    case ledgerAppTooOld(_ reason: String)
+    /// The connected Ledger device does not match the account.
+    /// - During signing: the device is not the one the account was paired with. Nothing of the transaction was sent to it.
+    ///   Connect the paired device, or pair this one.
+    /// - During `LedgerDevice.pairAccount` for ZIP 32 account 0: the exported viewing key does not derive the device identity.
+    ///   Do not import the key. For other accounts, pairing does not do this check.
+    /// - During `LedgerDevice.displayUnifiedAddress`: the device shows an address that the account's viewing key does not derive.
+    ///   Do not use the key to receive funds for this account.
+    // sourcery: code="ZLEDG0004"
+    case ledgerDeviceMismatch
+    /// The connected Ledger device runs a different Zcash app version than the one the signing session was built for.
+    /// - `reason` names both versions; it carries no transaction data.
+    // sourcery: code="ZLEDG0005"
+    case ledgerCapsMismatch(_ reason: String)
+    /// The Zcash app on the Ledger device has used up its key derivations for this run; close and reopen the app on the device.
+    // sourcery: code="ZLEDG0006"
+    case ledgerDerivationBudgetExhausted
+    /// The Ledger device refused the command.
+    /// - `statusWord` is the status word the device answered with.
+    /// - `isTransient` is true when the refusal describes a device condition that can clear, such as a locked device.
+    // sourcery: code="ZLEDG0007"
+    case ledgerDeviceRefused(_ statusWord: UInt16, _ isTransient: Bool)
+    /// The transaction cannot be signed by a Ledger device.
+    /// - `reason` says which device rule or limit the transaction breaks; it carries no key, address, amount or signature.
+    // sourcery: code="ZLEDG0008"
+    case ledgerTransactionNotSignable(_ reason: String)
+    /// The reply from the Ledger device was malformed, or a signature it returned did not verify.
+    /// - `reason` describes the shape of the failure; it carries none of the reply's bytes.
+    // sourcery: code="ZLEDG0009"
+    case ledgerMalformedReply(_ reason: String)
+    /// A value passed to the Ledger integration is invalid.
+    /// - `reason` names the value's kind, never the value itself.
+    // sourcery: code="ZLEDG0010"
+    case ledgerInvalidInput(_ reason: String)
+    /// An internal error occurred in the Ledger integration.
+    /// - `reason` carries no key, address, amount, device identity or transaction data.
+    // sourcery: code="ZLEDG0011"
+    case ledgerInternal(_ reason: String)
+    /// Bluetooth LE is not supported on this device.
+    // sourcery: code="ZLEDG0012"
+    case ledgerBluetoothUnsupported
+    /// The app is not authorized to use Bluetooth.
+    // sourcery: code="ZLEDG0013"
+    case ledgerBluetoothUnauthorized
+    /// Bluetooth is turned off.
+    // sourcery: code="ZLEDG0014"
+    case ledgerBluetoothPoweredOff
+    /// The Ledger device was not found.
+    // sourcery: code="ZLEDG0015"
+    case ledgerDeviceNotFound
+    /// Connecting to the Ledger device over Bluetooth failed.
+    /// - `error` is the underlying CoreBluetooth error, if any.
+    // sourcery: code="ZLEDG0016"
+    case ledgerBluetoothConnectionFailed(_ error: Error?)
+    /// The Ledger device disconnected.
+    // sourcery: code="ZLEDG0017"
+    case ledgerBluetoothDisconnected
+    /// Bluetooth pairing with the Ledger device was refused, or the device no longer holds the pairing.
+    /// Remove the device from the system Bluetooth settings and pair it again.
+    // sourcery: code="ZLEDG0018"
+    case ledgerBluetoothPairingRefused
+    /// The Ledger device did not reply in time. The connection is closed.
+    // sourcery: code="ZLEDG0019"
+    case ledgerTimeout
+    /// The connection to the Ledger device is closed or no longer usable. Open a new connection.
+    // sourcery: code="ZLEDG0020"
+    case ledgerTransportClosed
+    /// The Ledger transport failed.
+    /// - `error` is the error the transport threw. The transport has been closed.
+    // sourcery: code="ZLEDG0021"
+    case ledgerTransportFailed(_ error: Error)
+    /// The Zcash app is not installed on the Ledger.
+    /// The user has to install it on the device, with Ledger Live, first.
+    // sourcery: code="ZLEDG0022"
+    case ledgerAppNotInstalled
+    /// The user declined opening the Zcash app.
+    /// A fresh attempt may succeed if the user approves it.
+    // sourcery: code="ZLEDG0023"
+    case ledgerAppOpenRejected
+    /// A later connection to the same Ledger device replaced this one before it was done being used.
+    /// Not restartable: open a fresh connection instead of reconnecting on this error, since
+    /// reconnecting would only displace whichever connection replaced this one in turn.
+    // sourcery: code="ZLEDG0024"
+    case ledgerTransportReplaced
 }

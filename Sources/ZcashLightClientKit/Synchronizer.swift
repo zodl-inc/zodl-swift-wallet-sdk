@@ -424,6 +424,42 @@ public protocol Synchronizer: AnyObject {
     /// - Throws  PcztException.ExtractAndStoreTxFromPcztException as a common indicator of the operation failure
     func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>
 
+    /// Signs a PCZT with the Ledger device the account was paired with.
+    ///
+    /// Pass the PCZT ``createPCZTFromProposal(accountUUID:proposal:)`` returned, unredacted: this method
+    /// prepares its own copy for the device. The signing and the proving are independent, so
+    /// ``addProofsToPCZT(pczt:)`` can run on the same PCZT at the same time; hand both results to
+    /// ``createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)``.
+    ///
+    /// The ceremony first confirms that the connected device runs a Zcash app that can sign and is the
+    /// device in `binding`, and checks the transaction against every rule the device enforces. Nothing
+    /// of the transaction is sent until both pass. The device then shows the transaction for the user
+    /// to review; no timeout applies while it waits.
+    ///
+    /// When an exchange fails on the transport, or the task is cancelled once the ceremony's first
+    /// command has reached the device, the transport is closed: open a new connection before trying
+    /// again. A task cancelled while it waits for its turn on the transport closes nothing. Every
+    /// other failure leaves it open.
+    ///
+    /// - Parameters:
+    ///   - pczt: The PCZT to sign.
+    ///   - accountUUID: The Ledger account the PCZT spends from.
+    ///   - binding: The binding stored when the account was paired.
+    ///   - transport: The connection to the device, such as a ``LedgerBluetoothTransport``.
+    ///   - progress: Called as the ceremony advances, on an arbitrary thread.
+    /// - Returns: The PCZT carrying the device's signatures. It differs from the input by more than the
+    ///   signatures (key paths and change markings for the device); the combine step in
+    ///   ``createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)`` accepts it with the proven PCZT.
+    /// - Throws: A ``ZcashError`` from the `ledger` family, whose ``ZcashError/ledgerIsRestartable`` says
+    ///   whether a fresh attempt could succeed, or `CancellationError`.
+    func signPCZTWithLedger(
+        pczt: Pczt,
+        accountUUID: AccountUUID,
+        binding: LedgerAccountBinding,
+        transport: LedgerAPDUTransport,
+        progress: (@Sendable (LedgerSigningProgress) -> Void)?
+    ) async throws -> Pczt
+
     /// all the transactions that are on the blockchain
     var transactions: [ZcashTransaction.Overview] { get async }
 
@@ -1599,6 +1635,16 @@ private struct RestartSyncUnimplemented: LocalizedError {
     }
 }
 
+/// Error thrown by the default `Synchronizer.signPCZTWithLedger` implementation.
+private struct LedgerSigningUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        """
+        Synchronizer.signPCZTWithLedger has no default implementation. \
+        Override this member in your Synchronizer conformer to provide Ledger signing.
+        """
+    }
+}
+
 /// Error thrown by the default `Synchronizer.broadcaster` implementation.
 private struct BroadcasterUnimplemented: LocalizedError {
     var errorDescription: String? {
@@ -1727,6 +1773,19 @@ public extension Synchronizer {
     /// source-compatible and report that the capability is unavailable.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
         nil
+    }
+
+    /// Default implementation so adding `signPCZTWithLedger` to the protocol is not a
+    /// source-breaking change for downstream conformers. Both shipped synchronizers override it; the
+    /// rest report the capability as unavailable.
+    func signPCZTWithLedger(
+        pczt: Pczt,
+        accountUUID: AccountUUID,
+        binding: LedgerAccountBinding,
+        transport: LedgerAPDUTransport,
+        progress: (@Sendable (LedgerSigningProgress) -> Void)?
+    ) async throws -> Pczt {
+        throw LedgerSigningUnimplemented()
     }
 
     /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is

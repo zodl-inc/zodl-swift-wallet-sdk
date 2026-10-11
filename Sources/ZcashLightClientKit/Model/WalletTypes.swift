@@ -25,6 +25,12 @@ extension Account {
     /// case-insensitively. It sizes that account's Orchard→Ironwood migration runs to one 96-action
     /// QR signing round; any other value, or `nil`, keeps the default 50-note-per-run sizing.
     public static let keystoneKeySource = "keystone"
+
+    /// The `keySource` marking an account a Ledger hardware wallet signs, compared
+    /// case-insensitively. A Ledger-tagged account's proposals carry at most one change output,
+    /// because the Ledger Zcash app signs only one; its migration runs keep the default sizing,
+    /// since no batch signing round bounds them.
+    public static let ledgerKeySource = "ledger"
 }
 
 public struct UnifiedSpendingKey: Equatable, Undescribable {
@@ -59,7 +65,7 @@ public struct TransparentAccountPrivKey: Equatable, Undescribable {
 }
 
 /// A ZIP 316 Unified Full Viewing Key.
-public struct UnifiedFullViewingKey: Equatable, StringEncoded, Undescribable, Hashable, Codable {
+public struct UnifiedFullViewingKey: Equatable, StringEncoded, Undescribable, Hashable, Codable, Sendable {
     let encoding: String
 
     public var stringEncoded: String { encoding }
@@ -224,7 +230,7 @@ public struct SaplingAddress: Equatable, StringEncoded {
     }
 }
 
-public struct UnifiedAddress: Equatable, StringEncoded, Codable, Hashable {
+public struct UnifiedAddress: Equatable, StringEncoded, Codable, Hashable, Sendable {
     let networkType: NetworkType
 
     public enum ReceiverTypecodes: Hashable {

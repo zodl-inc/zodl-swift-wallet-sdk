@@ -2061,6 +2061,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - signPCZTWithLedger
+
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressThrowableError: Error?
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressCallsCount = 0
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressCalled: Bool {
+        return signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressCallsCount > 0
+    }
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressReceivedArguments: (pczt: Pczt, accountUUID: AccountUUID, binding: LedgerAccountBinding, transport: LedgerAPDUTransport, progress: (@Sendable (LedgerSigningProgress) -> Void)?)?
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressReturnValue: Pczt!
+    var signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressClosure: ((Pczt, AccountUUID, LedgerAccountBinding, LedgerAPDUTransport, (@Sendable (LedgerSigningProgress) -> Void)?) async throws -> Pczt)?
+
+    func signPCZTWithLedger(pczt: Pczt, accountUUID: AccountUUID, binding: LedgerAccountBinding, transport: LedgerAPDUTransport, progress: (@Sendable (LedgerSigningProgress) -> Void)?) async throws -> Pczt {
+        if let error = signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressThrowableError {
+            throw error
+        }
+        signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressCallsCount += 1
+        signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressReceivedArguments = (pczt: pczt, accountUUID: accountUUID, binding: binding, transport: transport, progress: progress)
+        if let closure = signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressClosure {
+            return try await closure(pczt, accountUUID, binding, transport, progress)
+        } else {
+            return signPCZTWithLedgerPcztAccountUUIDBindingTransportProgressReturnValue
+        }
+    }
+
     // MARK: - paginatedTransactions
 
     var paginatedTransactionsOfCallsCount = 0
@@ -5211,6 +5235,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return try await closure(pcztWithProofs, pcztWithSigs)
         } else {
             return extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue
+        }
+    }
+
+    // MARK: - createLedgerSignSession
+
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyThrowableError: Error?
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyCallsCount = 0
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyCalled: Bool {
+        return createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyCallsCount > 0
+    }
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyReceivedArguments: (accountUUID: AccountUUID, pczt: Pczt, binding: LedgerAccountBinding, firmwareReply: Data)?
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyReturnValue: LedgerSigningSession!
+    var createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyClosure: ((AccountUUID, Pczt, LedgerAccountBinding, Data) async throws -> LedgerSigningSession)?
+
+    func createLedgerSignSession(accountUUID: AccountUUID, pczt: Pczt, binding: LedgerAccountBinding, firmwareReply: Data) async throws -> LedgerSigningSession {
+        if let error = createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyThrowableError {
+            throw error
+        }
+        createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyCallsCount += 1
+        createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyReceivedArguments = (accountUUID: accountUUID, pczt: pczt, binding: binding, firmwareReply: firmwareReply)
+        if let closure = createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyClosure {
+            return try await closure(accountUUID, pczt, binding, firmwareReply)
+        } else {
+            return createLedgerSignSessionAccountUUIDPcztBindingFirmwareReplyReturnValue
         }
     }
 

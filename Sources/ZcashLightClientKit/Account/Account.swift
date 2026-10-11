@@ -9,7 +9,7 @@
 ///
 /// This index must be paired with a seed, or other context that determines a seed,
 /// in order to identify a ZIP 32 *account*.
-public struct Zip32AccountIndex: Equatable, Codable, Hashable {
+public struct Zip32AccountIndex: Equatable, Codable, Hashable, Sendable {
     public let index: UInt32
 
     /// - Parameter index: the ZIP 32 account index, which must be less than ``1<<31``.

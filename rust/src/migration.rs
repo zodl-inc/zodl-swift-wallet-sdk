@@ -7348,6 +7348,273 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ----- Ledger change-output split policy (a Ledger-tagged account signs one change output) -----
+    //
+    // [`funded_fixture`] (below, alongside the run-estimate fixtures) is the shared harness for
+    // both tests in this section: one account, tagged `key_source`, funded with a single Orchard
+    // note and brought to chain tip 3,600,000. `crate::change_split_policy`'s own unit coverage
+    // (constructing `AccountSource` values directly, no FFI) lives in `lib.rs`'s `mod tests`; the
+    // two tests here exercise it end to end, over the real `zcashlc_propose_transfer` FFI entry
+    // point.
+
+    /// A real unified address for a throwaway fixture account in its own wallet at `prefix` — used
+    /// only as [`proposed_change_output_count`]'s recipient, never a real user's address.
+    fn fixture_recipient_address(prefix: &str) -> String {
+        let path = init_fixture_db(prefix);
+        let (account_bytes, _usk) = create_fixture_account_with_usk_and_key_source(&path, None);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let addr_ptr = unsafe {
+            crate::zcashlc_get_current_address(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        };
+        assert!(
+            !addr_ptr.is_null(),
+            "the recipient fixture account must have a generated address"
+        );
+        let address = unsafe { CStr::from_ptr(addr_ptr) }
+            .to_str()
+            .expect("the fixture address is valid UTF-8")
+            .to_owned();
+        unsafe { zcashlc_string_free(addr_ptr) };
+        let _ = std::fs::remove_file(&path);
+        address
+    }
+
+    /// A fixture wallet at `prefix` with one account tagged `key_source`, funded with a single
+    /// `value_zat` Orchard note whose witness is STABILIZED — spendable through the generic
+    /// `zcash_client_backend::data_api::wallet::propose_transfer` path
+    /// ([`crate::zcashlc_propose_transfer`] and its siblings), not merely visible to the migration
+    /// engine's own adapter the way [`funded_fixture`] (below) leaves it.
+    ///
+    /// `funded_fixture` scans only its one funding block, and registers a chain tip millions of
+    /// blocks beyond it — irrelevant to the migration entry points it serves, which read sizing and
+    /// the stored viewing key through [`crate::migration_engine`], never an anchor derived from the
+    /// registered tip. The generic propose path needs a REAL spendable note, which
+    /// `zcash_client_sqlite`'s own `mark_stabilized_notes` only ever grants once the max scanned
+    /// height has advanced at least `PRUNING_DEPTH` (100) blocks past the note's shard: "a note
+    /// within the chain-tip shard can not be marked as witness_stabilized, because the tip shard is
+    /// by definition not complete or confirmed to the PRUNING_DEPTH" (that function's own doc
+    /// comment). This mirrors `zcash_client_sqlite`'s own test pattern for the same requirement
+    /// (`testing::pool::truncate_to_chain_state_commitment_tree_error`, `extra_blocks =
+    /// PRUNING_DEPTH + 10`): fund at height 1, then scan `PRUNING_DEPTH + 10` further EMPTY blocks
+    /// in the SAME `scan_cached_blocks` call so the funding note's shard closes and prunes. No
+    /// `zcashlc_update_chain_tip` call is made or needed: `scan_cached_blocks` is the only writer of
+    /// `scan_queue` here, so the registered tip lands exactly at the last scanned block.
+    fn stably_funded_fixture(
+        prefix: &str,
+        key_source: Option<&str>,
+        value_zat: u64,
+    ) -> (PathBuf, [u8; 16], Vec<u8>) {
+        use orchard::tree::MerkleHashOrchard;
+        use zcash_client_backend::data_api::WalletCommitmentTrees;
+        use zcash_client_backend::data_api::chain::{CommitmentTreeRoot, scan_cached_blocks};
+        use zcash_client_backend::proto::compact_formats::{
+            ChainMetadata, CompactBlock, CompactTx,
+        };
+        use zcash_client_backend::proto::service::TreeState;
+        use zcash_client_sqlite::WalletDb;
+        use zcash_client_sqlite::util::SystemClock;
+        use zcash_primitives::merkle_tree::HashSer;
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        // `zcash_client_backend::data_api::ll::wallet::PRUNING_DEPTH` is crate-private; mirrored
+        // here exactly as `zcash_client_sqlite::testing::pool` mirrors it for the same reason.
+        const PRUNING_DEPTH: u64 = 100;
+        const LAST_HEIGHT: u64 = 1 + PRUNING_DEPTH + 10;
+
+        let path = init_fixture_db(prefix);
+        let (account_bytes, usk_bytes) =
+            create_fixture_account_with_usk_and_key_source(&path, key_source);
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+
+        let block_hash = |height: u64| -> Vec<u8> { vec![(0x10 + height) as u8; 32] };
+        let funding_action = fixture_orchard_compact_action(&usk, value_zat, 0);
+        let mut blocks = vec![CompactBlock {
+            height: 1,
+            hash: block_hash(1),
+            prev_hash: vec![0x00u8; 32],
+            vtx: vec![CompactTx {
+                index: 1,
+                txid: vec![0xACu8; 32],
+                actions: vec![funding_action],
+                ..Default::default()
+            }],
+            chain_metadata: Some(ChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 1,
+                ironwood_commitment_tree_size: 0,
+            }),
+            ..Default::default()
+        }];
+        for height in 2..=LAST_HEIGHT {
+            blocks.push(CompactBlock {
+                height,
+                hash: block_hash(height),
+                prev_hash: block_hash(height - 1),
+                vtx: vec![],
+                // No new leaves: the tree size stays exactly what block 1 left it at.
+                chain_metadata: Some(ChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 1,
+                    ironwood_commitment_tree_size: 0,
+                }),
+                ..Default::default()
+            });
+        }
+
+        // Height 0, empty frontier: the exact chain state
+        // `create_fixture_account_with_usk_and_key_source`'s all-default birthday treestate already
+        // commits the account to (mirrors `fund_fixture_account_with_orchard_notes`).
+        let from_state = TreeState {
+            hash: "00".repeat(32),
+            ..TreeState::default()
+        }
+        .to_chain_state()
+        .expect("the empty birthday treestate converts to a chain state");
+
+        let mut wallet = WalletDb::for_path(&path, MAIN_NETWORK, SystemClock, system_rng())
+            .expect("the fixture wallet database must reopen");
+
+        // A real wallet fetches subtree roots for already-closed shards from its lightwalletd
+        // connection before it ever scans a block, so a birthday within shard 0 (position 0,
+        // where this fixture's one note lives) still finds `subtree_end_height` non-NULL once
+        // scanning catches up — `mark_stabilized_notes` (zcash_client_sqlite) never sets that
+        // column itself; only this ingestion path does (see this function's own doc comment).
+        // This fixture never talks to a lightwalletd, so it fabricates the one root it needs:
+        // the hash is never verified against a real root, only stored, and `put_shard`'s own
+        // insert-or-update leaves an already-scanned shard's real leaf data untouched, updating
+        // only `subtree_end_height`/`root_hash` (see `put_shard` in `commitment_tree.rs`).
+        let fabricated_root: MerkleHashOrchard = HashSer::read(&[0u8; 32][..])
+            .expect("an all-zero value is a valid Orchard Merkle tree node");
+        wallet
+            .put_orchard_subtree_roots(0, &[CommitmentTreeRoot::from_parts(h(1), fabricated_root)])
+            .expect("the fabricated subtree root must store");
+
+        let block_source = FixtureBlockSource(blocks);
+        let summary = scan_cached_blocks(
+            &MAIN_NETWORK,
+            &block_source,
+            &mut wallet,
+            h(1),
+            &from_state,
+            LAST_HEIGHT as usize,
+        )
+        .expect("scanning the funding block and its stabilizing follow-on blocks must succeed");
+        assert_eq!(
+            summary.received_orchard_note_count(),
+            1,
+            "the funding action must be detected as belonging to this wallet"
+        );
+
+        (path, account_bytes, usk_bytes)
+    }
+
+    /// Proposes a transfer of `value_zat` from `account_bytes` at `path` to `to_address` via
+    /// [`crate::zcashlc_propose_transfer`], decodes the returned protobuf proposal, and returns the
+    /// number of proposed change outputs on its first step's balance — copying the boxed slice out
+    /// and freeing it via [`crate::ffi::zcashlc_free_boxed_slice`], the way
+    /// `ledger::tests::boxed` does for every other `ffi::BoxedSlice`-returning call.
+    ///
+    /// Callers must fund `path` through [`stably_funded_fixture`], never `funded_fixture`; see its
+    /// doc comment. A 1-confirmation policy (rather than
+    /// [`crate::ffi::ConfirmationsPolicy::default`]'s ZIP 315 default of 3 trusted / 10 untrusted)
+    /// is the minimum valid, non-default request; the funding note's confirmation depth is
+    /// established by [`stably_funded_fixture`]'s witness-stabilization scan, not by this value.
+    fn proposed_change_output_count(
+        path: &std::path::Path,
+        account_bytes: &[u8; 16],
+        to_address: &str,
+        value_zat: i64,
+    ) -> usize {
+        use prost::Message;
+        use zcash_client_backend::proto::proposal::Proposal;
+
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let to = CString::new(to_address).expect("the fixture address has no interior NUL");
+        let ptr = unsafe {
+            crate::zcashlc_propose_transfer(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account_bytes.as_ptr(),
+                to.as_ptr(),
+                value_zat,
+                ptr::null(),
+                NETWORK_ID_MAINNET,
+                crate::ffi::ConfirmationsPolicy {
+                    trusted: 1,
+                    untrusted: 1,
+                    allow_zero_conf_shielding: true,
+                },
+            )
+        };
+        if ptr.is_null() {
+            // Surface the classified failure (and its shortfall amounts, for `InsufficientFunds`)
+            // rather than just failing the null check, the way the classified-error tests
+            // elsewhere in this crate read `zcashlc_take_last_error_report` on failure.
+            let last_error = ffi_helpers::error_handling::take_last_error();
+            let detail = last_error.as_ref().map_or_else(
+                || "<no last-error recorded>".to_string(),
+                |e| match e.downcast_ref::<crate::error_report::ClassifiedError>() {
+                    Some(classified) => format!("{e} amounts={:?}", classified.amounts()),
+                    None => e.to_string(),
+                },
+            );
+            panic!("the transfer must propose: {detail}");
+        }
+        let bytes = unsafe { (*ptr).as_slice() }.to_vec();
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(ptr) };
+        let proposal = Proposal::decode(bytes.as_slice()).expect("the proposal decodes");
+        proposal
+            .steps
+            .first()
+            .expect("a proposal always has at least one step")
+            .balance
+            .as_ref()
+            .expect("a proposal step always carries a balance")
+            .proposed_change
+            .len()
+    }
+
+    /// The Ledger Zcash app signs exactly one change output per transaction: a `"ledger"`-tagged
+    /// account's proposal must carry exactly one, however many notes the default policy would
+    /// otherwise split it into (see `an_untagged_account_still_splits_its_change`, its control).
+    #[test]
+    fn a_ledger_tagged_account_proposes_a_single_change_output() {
+        let (path, account_bytes, _usk) = stably_funded_fixture(
+            "zcashlc_propose_ledger_single_change",
+            Some("ledger"),
+            100_000_000,
+        );
+        let to = fixture_recipient_address("zcashlc_propose_ledger_single_change_recipient");
+        let change_outputs = proposed_change_output_count(&path, &account_bytes, &to, 10_000_000);
+        assert_eq!(
+            change_outputs, 1,
+            "a Ledger-tagged account's proposal must carry exactly one change output"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every account without the exact `ledger` tag keeps today's note-splitting change policy —
+    /// the untagged control for [`a_ledger_tagged_account_proposes_a_single_change_output`].
+    #[test]
+    fn an_untagged_account_still_splits_its_change() {
+        let (path, account_bytes, _usk) =
+            stably_funded_fixture("zcashlc_propose_untagged_splits_change", None, 100_000_000);
+        let to = fixture_recipient_address("zcashlc_propose_untagged_splits_change_recipient");
+        let change_outputs = proposed_change_output_count(&path, &account_bytes, &to, 10_000_000);
+        assert!(
+            change_outputs > 1,
+            "an untagged account's proposal must still split change into multiple notes; got \
+             {change_outputs}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Two identically funded wallets, differing only in the tag: the Keystone-tagged one fits
     /// EVERY run in one round, the in-process one takes fewer, larger runs and needs more than one
     /// round in some of them.

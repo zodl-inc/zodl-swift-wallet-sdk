@@ -1090,6 +1090,101 @@ public enum ZcashError: Equatable, Error {
     /// Attempt to init TxId with invalid hex encoding.
     /// ZMODEL0002
     case txIdInvalidHexEncoding
+    /// The user declined on the Ledger device.
+    /// A fresh attempt may succeed if the user approves it.
+    /// ZLEDG0001
+    case ledgerUserRejected
+    /// The Ledger device is not running the Zcash app.
+    /// - `statusWord` is the status word the device answered with.
+    /// ZLEDG0002
+    case ledgerWrongApp(_ statusWord: UInt16)
+    /// The Zcash app on the Ledger device is too old for this operation.
+    /// - `reason` names the app version and the version the operation needs; it carries no transaction data.
+    /// ZLEDG0003
+    case ledgerAppTooOld(_ reason: String)
+    /// The connected Ledger device does not match the account.
+    /// - During signing: the device is not the one the account was paired with. Nothing of the transaction was sent to it.
+    ///   Connect the paired device, or pair this one.
+    /// - During `LedgerDevice.pairAccount` for ZIP 32 account 0: the exported viewing key does not derive the device identity.
+    ///   Do not import the key. For other accounts, pairing does not do this check.
+    /// - During `LedgerDevice.displayUnifiedAddress`: the device shows an address that the account's viewing key does not derive.
+    ///   Do not use the key to receive funds for this account.
+    /// ZLEDG0004
+    case ledgerDeviceMismatch
+    /// The connected Ledger device runs a different Zcash app version than the one the signing session was built for.
+    /// - `reason` names both versions; it carries no transaction data.
+    /// ZLEDG0005
+    case ledgerCapsMismatch(_ reason: String)
+    /// The Zcash app on the Ledger device has used up its key derivations for this run; close and reopen the app on the device.
+    /// ZLEDG0006
+    case ledgerDerivationBudgetExhausted
+    /// The Ledger device refused the command.
+    /// - `statusWord` is the status word the device answered with.
+    /// - `isTransient` is true when the refusal describes a device condition that can clear, such as a locked device.
+    /// ZLEDG0007
+    case ledgerDeviceRefused(_ statusWord: UInt16, _ isTransient: Bool)
+    /// The transaction cannot be signed by a Ledger device.
+    /// - `reason` says which device rule or limit the transaction breaks; it carries no key, address, amount or signature.
+    /// ZLEDG0008
+    case ledgerTransactionNotSignable(_ reason: String)
+    /// The reply from the Ledger device was malformed, or a signature it returned did not verify.
+    /// - `reason` describes the shape of the failure; it carries none of the reply's bytes.
+    /// ZLEDG0009
+    case ledgerMalformedReply(_ reason: String)
+    /// A value passed to the Ledger integration is invalid.
+    /// - `reason` names the value's kind, never the value itself.
+    /// ZLEDG0010
+    case ledgerInvalidInput(_ reason: String)
+    /// An internal error occurred in the Ledger integration.
+    /// - `reason` carries no key, address, amount, device identity or transaction data.
+    /// ZLEDG0011
+    case ledgerInternal(_ reason: String)
+    /// Bluetooth LE is not supported on this device.
+    /// ZLEDG0012
+    case ledgerBluetoothUnsupported
+    /// The app is not authorized to use Bluetooth.
+    /// ZLEDG0013
+    case ledgerBluetoothUnauthorized
+    /// Bluetooth is turned off.
+    /// ZLEDG0014
+    case ledgerBluetoothPoweredOff
+    /// The Ledger device was not found.
+    /// ZLEDG0015
+    case ledgerDeviceNotFound
+    /// Connecting to the Ledger device over Bluetooth failed.
+    /// - `error` is the underlying CoreBluetooth error, if any.
+    /// ZLEDG0016
+    case ledgerBluetoothConnectionFailed(_ error: Error?)
+    /// The Ledger device disconnected.
+    /// ZLEDG0017
+    case ledgerBluetoothDisconnected
+    /// Bluetooth pairing with the Ledger device was refused, or the device no longer holds the pairing.
+    /// Remove the device from the system Bluetooth settings and pair it again.
+    /// ZLEDG0018
+    case ledgerBluetoothPairingRefused
+    /// The Ledger device did not reply in time. The connection is closed.
+    /// ZLEDG0019
+    case ledgerTimeout
+    /// The connection to the Ledger device is closed or no longer usable. Open a new connection.
+    /// ZLEDG0020
+    case ledgerTransportClosed
+    /// The Ledger transport failed.
+    /// - `error` is the error the transport threw. The transport has been closed.
+    /// ZLEDG0021
+    case ledgerTransportFailed(_ error: Error)
+    /// The Zcash app is not installed on the Ledger.
+    /// The user has to install it on the device, with Ledger Live, first.
+    /// ZLEDG0022
+    case ledgerAppNotInstalled
+    /// The user declined opening the Zcash app.
+    /// A fresh attempt may succeed if the user approves it.
+    /// ZLEDG0023
+    case ledgerAppOpenRejected
+    /// A later connection to the same Ledger device replaced this one before it was done being used.
+    /// Not restartable: open a fresh connection instead of reconnecting on this error, since
+    /// reconnecting would only displace whichever connection replaced this one in turn.
+    /// ZLEDG0024
+    case ledgerTransportReplaced
 
     public var message: String {
         switch self {
@@ -1391,6 +1486,30 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckSyncStalled: return "The gift-card wallet stopped making progress. The card balance is still unknown."
         case .txIdNot32Bytes: return "Attempt to init TxId with input that is not 32 bytes."
         case .txIdInvalidHexEncoding: return "Attempt to init TxId with invalid hex encoding."
+        case .ledgerUserRejected: return "The user declined on the Ledger device."
+        case .ledgerWrongApp: return "The Ledger device is not running the Zcash app."
+        case .ledgerAppTooOld: return "The Zcash app on the Ledger device is too old for this operation."
+        case .ledgerDeviceMismatch: return "The connected Ledger device does not match the account."
+        case .ledgerCapsMismatch: return "The connected Ledger device runs a different Zcash app version than the one the signing session was built for."
+        case .ledgerDerivationBudgetExhausted: return "The Zcash app on the Ledger device has used up its key derivations for this run; close and reopen the app on the device."
+        case .ledgerDeviceRefused: return "The Ledger device refused the command."
+        case .ledgerTransactionNotSignable: return "The transaction cannot be signed by a Ledger device."
+        case .ledgerMalformedReply: return "The reply from the Ledger device was malformed, or a signature it returned did not verify."
+        case .ledgerInvalidInput: return "A value passed to the Ledger integration is invalid."
+        case .ledgerInternal: return "An internal error occurred in the Ledger integration."
+        case .ledgerBluetoothUnsupported: return "Bluetooth LE is not supported on this device."
+        case .ledgerBluetoothUnauthorized: return "The app is not authorized to use Bluetooth."
+        case .ledgerBluetoothPoweredOff: return "Bluetooth is turned off."
+        case .ledgerDeviceNotFound: return "The Ledger device was not found."
+        case .ledgerBluetoothConnectionFailed: return "Connecting to the Ledger device over Bluetooth failed."
+        case .ledgerBluetoothDisconnected: return "The Ledger device disconnected."
+        case .ledgerBluetoothPairingRefused: return "Bluetooth pairing with the Ledger device was refused, or the device no longer holds the pairing."
+        case .ledgerTimeout: return "The Ledger device did not reply in time. The connection is closed."
+        case .ledgerTransportClosed: return "The connection to the Ledger device is closed or no longer usable. Open a new connection."
+        case .ledgerTransportFailed: return "The Ledger transport failed."
+        case .ledgerAppNotInstalled: return "The Zcash app is not installed on the Ledger."
+        case .ledgerAppOpenRejected: return "The user declined opening the Zcash app."
+        case .ledgerTransportReplaced: return "A later connection to the same Ledger device replaced this one before it was done being used."
         }
     }
 
@@ -1711,6 +1830,30 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckSyncStalled: return .giftCardCheckSyncStalled
         case .txIdNot32Bytes: return .txIdNot32Bytes
         case .txIdInvalidHexEncoding: return .txIdInvalidHexEncoding
+        case .ledgerUserRejected: return .ledgerUserRejected
+        case .ledgerWrongApp: return .ledgerWrongApp
+        case .ledgerAppTooOld: return .ledgerAppTooOld
+        case .ledgerDeviceMismatch: return .ledgerDeviceMismatch
+        case .ledgerCapsMismatch: return .ledgerCapsMismatch
+        case .ledgerDerivationBudgetExhausted: return .ledgerDerivationBudgetExhausted
+        case .ledgerDeviceRefused: return .ledgerDeviceRefused
+        case .ledgerTransactionNotSignable: return .ledgerTransactionNotSignable
+        case .ledgerMalformedReply: return .ledgerMalformedReply
+        case .ledgerInvalidInput: return .ledgerInvalidInput
+        case .ledgerInternal: return .ledgerInternal
+        case .ledgerBluetoothUnsupported: return .ledgerBluetoothUnsupported
+        case .ledgerBluetoothUnauthorized: return .ledgerBluetoothUnauthorized
+        case .ledgerBluetoothPoweredOff: return .ledgerBluetoothPoweredOff
+        case .ledgerDeviceNotFound: return .ledgerDeviceNotFound
+        case .ledgerBluetoothConnectionFailed: return .ledgerBluetoothConnectionFailed
+        case .ledgerBluetoothDisconnected: return .ledgerBluetoothDisconnected
+        case .ledgerBluetoothPairingRefused: return .ledgerBluetoothPairingRefused
+        case .ledgerTimeout: return .ledgerTimeout
+        case .ledgerTransportClosed: return .ledgerTransportClosed
+        case .ledgerTransportFailed: return .ledgerTransportFailed
+        case .ledgerAppNotInstalled: return .ledgerAppNotInstalled
+        case .ledgerAppOpenRejected: return .ledgerAppOpenRejected
+        case .ledgerTransportReplaced: return .ledgerTransportReplaced
         }
     }
 

@@ -635,6 +635,22 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         return submitTransactions(transactions)
     }
 
+    public func signPCZTWithLedger(
+        pczt: Pczt,
+        accountUUID: AccountUUID,
+        binding: LedgerAccountBinding,
+        transport: LedgerAPDUTransport,
+        progress: (@Sendable (LedgerSigningProgress) -> Void)?
+    ) async throws -> Pczt {
+        try await LedgerSigner(rustBackend: initializer.rustBackend, logger: logger).sign(
+            pczt: pczt,
+            accountUUID: accountUUID,
+            binding: binding,
+            transport: transport,
+            progress: progress
+        )
+    }
+
     public func fetchTxidsWithMemoContaining(searchTerm: String) async throws -> [Data] {
         try await transactionRepository.fetchTxidsWithMemoContaining(searchTerm: searchTerm)
     }

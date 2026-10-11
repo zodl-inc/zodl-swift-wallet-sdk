@@ -652,6 +652,41 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         )
     }
 
+    // DB-READ (audited 2026-09-16): zcashlc_ledger_sign_session_new — WalletRead::get_account and
+    // WalletRead::get_transparent_address_metadata, both SELECT-only in zcash_client_sqlite
+    // 0.23.0-pre.0 (wallet::get_account; wallet::transparent::get_transparent_address_metadata and
+    // its find_gap_start). The PCZT is stamped and redacted in memory; nothing is written.
+    func createLedgerSignSession(
+        accountUUID: AccountUUID,
+        pczt: Pczt,
+        binding: LedgerAccountBinding,
+        firmwareReply: Data
+    ) async throws -> LedgerSigningSession {
+        let deviceIdentity = [CChar](binding.deviceIdentity.stringEncoded.utf8CString)
+        let sessionPtr: OpaquePointer? = pczt.withLedgerBytes { pcztBytes, pcztCount in
+            firmwareReply.withLedgerBytes { replyBytes, replyCount in
+                zcashlc_ledger_sign_session_new(
+                    dbData.0,
+                    dbData.1,
+                    networkType.networkId,
+                    accountUUID.id,
+                    pcztBytes,
+                    pcztCount,
+                    deviceIdentity,
+                    binding.zip32AccountIndex.index,
+                    replyBytes,
+                    replyCount
+                )
+            }
+        }
+
+        guard let sessionPtr else {
+            throw LedgerFFIError.takeLast(fallback: "`createLedgerSignSession` failed with unknown error")
+        }
+
+        return LedgerFFISignSession(sessionPtr: sessionPtr)
+    }
+
     @DBActor
     func decryptAndStoreTransaction(txBytes: [UInt8], minedHeight: UInt32?) async throws -> Data {
         var contiguousTxidBytes = ContiguousArray<UInt8>(Data(count: TxId.byteLength))

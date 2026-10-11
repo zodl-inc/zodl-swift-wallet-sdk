@@ -1,5 +1,29 @@
 # Migrating from previous versions to _Unreleased_
 
+## `ZcashError` gained cases — Ledger hardware wallets
+
+`ZcashError` and `ZcashErrorCode` have twenty-four new cases, `ZLEDG0001` to `ZLEDG0024`, which
+only the Ledger API throws: `LedgerBluetoothScanner`, `LedgerBluetoothTransport`, `LedgerDevice`,
+`LedgerZcashApp`, `LedgerDeviceIdentity` and `Synchronizer.signPCZTWithLedger`. An exhaustive
+`switch` over either type stops compiling until they are handled. Ten of them carry a payload: a
+status word (`ledgerWrongApp`, and `ledgerDeviceRefused`, which also says whether the refusal is
+transient), a reason (`ledgerAppTooOld`, `ledgerCapsMismatch`, `ledgerTransactionNotSignable`,
+`ledgerMalformedReply`, `ledgerInvalidInput`, `ledgerInternal`) or the underlying error
+(`ledgerBluetoothConnectionFailed`, `ledgerTransportFailed`). `ZcashError.ledgerIsRestartable`
+says which of them a fresh attempt could get past.
+
+```swift
+case .ledgerUserRejected, .ledgerAppOpenRejected:
+    // The user declined on the device: offer another attempt.
+    break
+case .ledgerTransportReplaced:
+    // Another connection to the same device displaced this one: do not reconnect from here.
+    break
+case .ledgerBluetoothDisconnected, .ledgerTimeout, .ledgerTransportClosed, .ledgerTransportFailed:
+    // The transport is closed: open a new connection before trying again.
+    break
+```
+
 ## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters
 
 `ZcashError` and `ZcashErrorCode` have nineteen new cases: the gift-card errors `ZGIFT0001` to

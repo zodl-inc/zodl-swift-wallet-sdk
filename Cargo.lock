@@ -3190,6 +3190,7 @@ dependencies = [
  "orchard",
  "pasta_curves",
  "pczt",
+ "pczt_ledger",
  "percent-encoding",
  "prost 0.14.4",
  "rand 0.10.3",
@@ -3199,6 +3200,7 @@ dependencies = [
  "sapling-crypto",
  "schemerz",
  "schemerz-rusqlite",
+ "secp256k1",
  "secrecy",
  "serde",
  "serde_json",
@@ -3895,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "pasta_curves"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec2f82051d06ea52d7ec6a47546c592fc52392b6040e503e05a764dd10dd1de"
+checksum = "a0ed53ba43531a06e1f82020907cf192fc3c25d7c0baf5c49c547b74e7103b62"
 dependencies = [
  "blake2b_simd",
  "ff 0.14.0",
@@ -3960,6 +3962,26 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zeroize",
+]
+
+[[package]]
+name = "pczt_ledger"
+version = "0.1.0-pre.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5adc409f38b5c0d20cf0e16d8b573ecc42c49323149fc7c9840c102109d0a23a"
+dependencies = [
+ "blake2b_simd",
+ "ff 0.14.0",
+ "orchard",
+ "pczt",
+ "secp256k1",
+ "subtle",
+ "zcash_address",
+ "zcash_encoding",
+ "zcash_protocol",
+ "zcash_transparent",
+ "zeroize",
+ "zip32",
 ]
 
 [[package]]
@@ -5711,7 +5733,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

@@ -394,6 +394,23 @@ protocol ZcashRustBackendWelding {
     /// - Throws  PcztException.ExtractAndStoreTxFromPcztException as a common indicator of the operation failure
     func extractAndStoreTxFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> Data
 
+    /// Builds a Ledger signing session for a PCZT: loads the account's viewing key, prepares the PCZT
+    /// for the device and runs every pre-flight check the device would otherwise fail mid-ceremony.
+    ///
+    /// - Parameter accountUUID: The account the PCZT spends from.
+    /// - Parameter pczt: The PCZT `createPCZTFromProposal` returned, unredacted.
+    /// - Parameter binding: The device and account index the account was paired with.
+    /// - Parameter firmwareReply: The connected device's `GET_FIRMWARE_VERSION` reply.
+    ///
+    /// - Throws: `LedgerFFIError` when the account cannot be used or the device cannot sign the
+    ///   transaction; nothing has been sent to the device.
+    func createLedgerSignSession(
+        accountUUID: AccountUUID,
+        pczt: Pczt,
+        binding: LedgerAccountBinding,
+        firmwareReply: Data
+    ) async throws -> LedgerSigningSession
+
     /// Gets the consensus branch id for the given height
     /// - Parameter height: the height you what to know the branch id for
     /// - Throws: `rustNoConsensusBranchId` if rust layer returns error.

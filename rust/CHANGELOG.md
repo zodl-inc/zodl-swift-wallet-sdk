@@ -71,6 +71,73 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body collection. It otherwise accepts the same arguments and returns the same response as
   `zcashlc_tor_http_get`; expiry or an invalid zero timeout returns null with the thread-local error
   set. Existing GET and POST call sites require no changes.
+- Ledger hardware-wallet signing over Bluetooth LE, through `zcashlc_ledger_*` entry points over the
+  `pczt_ledger` engine. The engine performs no I/O: every function here builds a command or parses a
+  reply, and the caller moves the bytes. A reply passed in is always the raw transport payload, data
+  followed by the two-byte status word.
+  - Errors: every `zcashlc_ledger_*` failure (null / `false` / `-1`) is read with
+    `zcashlc_ledger_take_last_error`, which returns `FfiLedgerError` (free with
+    `zcashlc_ledger_free_error`) and clears the last error exactly as `zcashlc_clear_last_error`
+    does. `kind` is a stable `u32`: `0` internal, `1` user rejected, `2` wrong app, `3` app too old,
+    `4` device mismatch, `5` caps mismatch, `6` derivation budget exhausted, `7` device refused,
+    `8` transaction not signable, `9` malformed reply, `10` invalid input, `11` command not
+    accepted (`0x6901`, resend the identical command after a 50 ms backoff). `status_word` is valid
+    when `has_status_word` is set; `is_transient` and `is_restartable` say whether the device
+    condition can clear and whether a fresh ceremony could succeed. `reason` never carries APDU or
+    reply bytes, a PCZT, a viewing key, an address, a device identity or a signature.
+  - Transport policy, taken from the engine so a platform runner applies the same one:
+    `zcashlc_ledger_max_cmd_not_accepted_retries` (resends allowed after consecutive `0x6901`
+    refusals of one command), `zcashlc_ledger_cmd_not_accepted_backoff_ms` (the pause before each
+    resend) and `zcashlc_ledger_default_timeout_ms` (the timeout for a reply that does not wait on
+    the user).
+  - App version: `zcashlc_ledger_firmware_version_apdu`, and `zcashlc_ledger_parse_app_version`
+    returning `FfiLedgerAppVersion` (`major`, `minor`, `patch`, `supports_pczt`; free with
+    `zcashlc_ledger_free_app_version`).
+  - Device identity: `zcashlc_ledger_device_identity_apdu(network_id)`,
+    `zcashlc_ledger_parse_device_identity` returning the `tpk0-…` string (free with
+    `zcashlc_string_free`), and `zcashlc_ledger_validate_device_identity`.
+    `zcashlc_ledger_check_account_zero_identity(network_id, ufvk, identity)` returns `true` when
+    the transparent item of `ufvk`, the exported key of ZIP 32 account 0, derives the public key
+    that `identity` hashes. It returns `false` with kind `4` (device mismatch) when it does not,
+    kind `9` (malformed reply) when `ufvk` has no transparent item, and kind `10` (invalid input)
+    when an input does not parse. The key of any other account never derives the identity, so the
+    check applies to account 0 only.
+  - Viewing key export: `zcashlc_ledger_ufvk_export_new(network_id, account_index)` returns an
+    opaque `FfiLedgerUfvkExport` driven by `_next_apdu`, `_waits_for_user` and `_process_response`,
+    which returns `FfiLedgerUfvkExportStep` (`status` is one of the
+    `ZCASHLC_LEDGER_UFVK_EXPORT_*` constants; `ufvk` is set on completion; free with
+    `zcashlc_ledger_free_ufvk_export_step`, which wipes the key). The export is terminal on any
+    error but `0x6901`, so a declined export cannot be re-issued. Free the handle with
+    `zcashlc_ledger_free_ufvk_export`.
+  - Address display: `zcashlc_ledger_unified_address_apdu(network_id, account_index,
+    transparent_address_index, display)` and `zcashlc_ledger_parse_unified_address`, which returns
+    the encoded unified address holding only the account's Orchard receiver at diversifier index 0.
+    `zcashlc_ledger_device_unified_address(network_id, ufvk)` returns the address the device
+    displays for the account whose viewing key is `ufvk` (free with `zcashlc_string_free`): the
+    external Orchard receiver at diversifier index 0, alone, encoded exactly as
+    `zcashlc_ledger_parse_unified_address` encodes the device's reply, so the two strings are equal
+    when the device shows the address of that key. It returns null with kind `10` (invalid input)
+    when `ufvk` does not parse, is for another network, or has no Orchard item.
+  - BLE framing: `zcashlc_ledger_ble_mtu_request`, `zcashlc_ledger_parse_ble_mtu_response`
+    (the frame size, or `-1`), `zcashlc_ledger_ble_frames` returning `FfiLedgerFrames` of
+    `FfiLedgerFrame` (free with `zcashlc_ledger_free_frames`, which wipes them), and an opaque
+    `FfiLedgerBleDeframer` (`zcashlc_ledger_ble_deframer_new`, `_push`, `_reset`,
+    `zcashlc_ledger_free_ble_deframer`). `_push` returns a boxed slice with a null pointer while
+    more frames are expected and the complete reply on the last one.
+  - Signing: `zcashlc_ledger_sign_session_new(db_data, db_data_len, network_id,
+    account_uuid_bytes, pczt, pczt_len, device_identity, zip32_account_index, firmware_reply,
+    firmware_reply_len)` returns an opaque `FfiLedgerSignSession`. It loads the account's viewing
+    key from the wallet database, stamps BIP 44 derivations on transparent inputs that pay the
+    account's derived addresses and carry none, redacts the PCZT to the full signer view, marks a
+    single transparent output paying the account's internal (change) address as change, and runs
+    every pre-flight check before any command exists. `_next_step` returns `FfiLedgerSignStep`
+    (free with `zcashlc_ledger_free_sign_step`, which wipes the command): `kind` is a
+    `ZCASHLC_LEDGER_SIGN_STEP_*` constant, `apdu` the command to send, `waits_for_user` whether its
+    reply may wait on the user, `starts_review` whether it opens the on-device review (reported
+    once), `stage` a `ZCASHLC_LEDGER_STAGE_*` constant, and `stream_acknowledged` / `stream_total`
+    the streaming progress. `_process_response` returns a `ZCASHLC_LEDGER_SIGN_STATUS_*` constant
+    or `-1`; `_finish` returns the signed PCZT once, for `zcashlc_extract_and_store_from_pczt`
+    alongside the proven PCZT. Free the handle with `zcashlc_ledger_free_sign_session`.
 - The coinholder-voting C surface for driving a round. Requests and reports cross as UTF-8 JSON in
   an `FfiBoxedSlice` (freed with `zcashlc_free_boxed_slice`), and every failure records a
   `VotingErrorView` JSON object as the thread's last error, so a caller branches on its `kind`

@@ -605,4 +605,52 @@ public enum ZcashErrorCode: String {
     case txIdNot32Bytes = "ZMODEL0001"
     /// Attempt to init TxId with invalid hex encoding.
     case txIdInvalidHexEncoding = "ZMODEL0002"
+    /// The user declined on the Ledger device.
+    case ledgerUserRejected = "ZLEDG0001"
+    /// The Ledger device is not running the Zcash app.
+    case ledgerWrongApp = "ZLEDG0002"
+    /// The Zcash app on the Ledger device is too old for this operation.
+    case ledgerAppTooOld = "ZLEDG0003"
+    /// The connected Ledger device does not match the account.
+    case ledgerDeviceMismatch = "ZLEDG0004"
+    /// The connected Ledger device runs a different Zcash app version than the one the signing session was built for.
+    case ledgerCapsMismatch = "ZLEDG0005"
+    /// The Zcash app on the Ledger device has used up its key derivations for this run; close and reopen the app on the device.
+    case ledgerDerivationBudgetExhausted = "ZLEDG0006"
+    /// The Ledger device refused the command.
+    case ledgerDeviceRefused = "ZLEDG0007"
+    /// The transaction cannot be signed by a Ledger device.
+    case ledgerTransactionNotSignable = "ZLEDG0008"
+    /// The reply from the Ledger device was malformed, or a signature it returned did not verify.
+    case ledgerMalformedReply = "ZLEDG0009"
+    /// A value passed to the Ledger integration is invalid.
+    case ledgerInvalidInput = "ZLEDG0010"
+    /// An internal error occurred in the Ledger integration.
+    case ledgerInternal = "ZLEDG0011"
+    /// Bluetooth LE is not supported on this device.
+    case ledgerBluetoothUnsupported = "ZLEDG0012"
+    /// The app is not authorized to use Bluetooth.
+    case ledgerBluetoothUnauthorized = "ZLEDG0013"
+    /// Bluetooth is turned off.
+    case ledgerBluetoothPoweredOff = "ZLEDG0014"
+    /// The Ledger device was not found.
+    case ledgerDeviceNotFound = "ZLEDG0015"
+    /// Connecting to the Ledger device over Bluetooth failed.
+    case ledgerBluetoothConnectionFailed = "ZLEDG0016"
+    /// The Ledger device disconnected.
+    case ledgerBluetoothDisconnected = "ZLEDG0017"
+    /// Bluetooth pairing with the Ledger device was refused, or the device no longer holds the pairing.
+    case ledgerBluetoothPairingRefused = "ZLEDG0018"
+    /// The Ledger device did not reply in time. The connection is closed.
+    case ledgerTimeout = "ZLEDG0019"
+    /// The connection to the Ledger device is closed or no longer usable. Open a new connection.
+    case ledgerTransportClosed = "ZLEDG0020"
+    /// The Ledger transport failed.
+    case ledgerTransportFailed = "ZLEDG0021"
+    /// The Zcash app is not installed on the Ledger.
+    case ledgerAppNotInstalled = "ZLEDG0022"
+    /// The user declined opening the Zcash app.
+    case ledgerAppOpenRejected = "ZLEDG0023"
+    /// A later connection to the same Ledger device replaced this one before it was done being used.
+    case ledgerTransportReplaced = "ZLEDG0024"
 }
