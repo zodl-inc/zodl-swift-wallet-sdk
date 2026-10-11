@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 5.2.0 - 2026-10-09
+
 ## Added
 
 ### Ledger hardware wallets over Bluetooth
@@ -167,6 +169,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for. A host at `off`, `error` or `warn` sees no change; a host at `info` or more verbose no longer
   sees those six crates' `info`, `debug` and `trace` lines. The SDK's own targets, and
   `zcash_client_backend` (already capped the same way), are unchanged. No call site needs editing.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3510000.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4480000.json
+````
 
 # 5.1.0 - 2026-10-07
 
