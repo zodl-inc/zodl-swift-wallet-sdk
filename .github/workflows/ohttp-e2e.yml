@@ -86,8 +86,9 @@ jobs:
 
       - name: Setup Rust
         if: steps.cache-ffi.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
 
       - name: Cache Cargo
