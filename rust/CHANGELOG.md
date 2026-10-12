@@ -650,9 +650,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contracts whose hexadecimal address is not exactly 40 digits, instead of trusting the pinned
   EIP-681 parser's over-length address result.
 - `zcashlc_payment_uri_parse` folds all-uppercase Bitcoin and Litecoin bech32 addresses before
-  upstream validation and folds Litecoin query keys without changing their values. Valid
-  uppercase QR addresses now parse, `Amount` is no longer silently ignored, and an unknown
-  uppercase `REQ-` extension rejects the request.
+  upstream validation without changing Litecoin's case-sensitive BIP-21 query-key semantics.
+- `zcashlc_payment_uri_parse` rejects overflowing explicit ERC-20 chain IDs and conflicting native
+  Ethereum payment parameters before the pinned parser can erase them from its typed result.
+- `zcashlc_payment_uri_parse` rejects SPL-token amounts that cannot fit the `u64` used by any SPL
+  transfer instruction.
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously
   omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood

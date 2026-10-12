@@ -4,6 +4,7 @@ use std::{
     os::raw::c_char,
 };
 
+use eip681::parse::RawTransactionRequest;
 use ffi_helpers::panic::catch_panic;
 use payment_uri::{Error, parse_to_json};
 
@@ -37,11 +38,12 @@ fn classify(error: &Error) -> &'static str {
 /// `payment_uri` revision otherwise mis-parses.
 ///
 /// The normalized value still goes through the single upstream parser below; this function does
-/// not validate an address, amount, or extension itself. It only restores the case-insensitive
-/// spellings required by the advertised Bitcoin and Litecoin URI contracts:
+/// not validate an address, amount, or extension itself. It only restores all-uppercase bech32
+/// addresses, which are valid encodings used to keep QR codes in alphanumeric mode.
 ///
-/// - an all-uppercase bech32 address is folded to lowercase before upstream address validation;
-/// - Litecoin query keys are folded to lowercase while their values remain byte-for-byte intact.
+/// Query keys are deliberately left alone. Litecoin follows BIP-21's case-sensitive key rules,
+/// so changing `req-Amount` to `req-amount` would change an unknown required parameter into a
+/// recognised one.
 fn normalize_utxo_compatibility(input: &str) -> Cow<'_, str> {
     let Some((scheme, payload)) = input.split_once(':') else {
         return Cow::Borrowed(input);
@@ -56,17 +58,7 @@ fn normalize_utxo_compatibility(input: &str) -> Cow<'_, str> {
         .split_once('?')
         .map_or((payload, None), |(address, query)| (address, Some(query)));
     let normalized_address = normalize_uppercase_bech32(address, is_bitcoin);
-    let normalized_query = query.map(|query| {
-        if is_litecoin {
-            lowercase_query_keys(query)
-        } else {
-            Cow::Borrowed(query)
-        }
-    });
-
-    let changed = matches!(&normalized_address, Cow::Owned(_))
-        || matches!(&normalized_query, Some(Cow::Owned(_)));
-    if !changed {
+    if matches!(&normalized_address, Cow::Borrowed(_)) {
         return Cow::Borrowed(input);
     }
 
@@ -74,9 +66,9 @@ fn normalize_utxo_compatibility(input: &str) -> Cow<'_, str> {
     normalized.push_str(scheme);
     normalized.push(':');
     normalized.push_str(normalized_address.as_ref());
-    if let Some(query) = normalized_query {
+    if let Some(query) = query {
         normalized.push('?');
-        normalized.push_str(query.as_ref());
+        normalized.push_str(query);
     }
     Cow::Owned(normalized)
 }
@@ -101,34 +93,6 @@ fn normalize_uppercase_bech32(address: &str, is_bitcoin: bool) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(address)
     }
-}
-
-fn lowercase_query_keys(query: &str) -> Cow<'_, str> {
-    if !query.split('&').any(|parameter| {
-        parameter
-            .split_once('=')
-            .map_or(parameter, |(key, _)| key)
-            .bytes()
-            .any(|byte| byte.is_ascii_uppercase())
-    }) {
-        return Cow::Borrowed(query);
-    }
-
-    let mut normalized = String::with_capacity(query.len());
-    for (index, parameter) in query.split('&').enumerate() {
-        if index > 0 {
-            normalized.push('&');
-        }
-        let (key, value) = parameter
-            .split_once('=')
-            .map_or((parameter, None), |(key, value)| (key, Some(value)));
-        normalized.push_str(&key.to_ascii_lowercase());
-        if let Some(value) = value {
-            normalized.push('=');
-            normalized.push_str(value);
-        }
-    }
-    Cow::Owned(normalized)
 }
 
 /// Returns whether an Ethereum payment URI contains a hexadecimal address whose payload is not
@@ -172,6 +136,108 @@ fn has_invalid_hex_address_length(candidate: &str) -> bool {
     hex_digits.bytes().all(|byte| byte.is_ascii_hexdigit()) && hex_digits.len() != 40
 }
 
+/// Returns whether the pinned EIP-681 parser would lose a validation error while projecting its
+/// typed result into the JSON envelope.
+///
+/// `Erc20Request::chain_id()` turns an overflowing explicit id into `None`, and the native request
+/// getters turn conflicting `value`, `gas`/`gasLimit`, or `gasPrice` parameters into `None`.
+/// Running the low-level parser's checked accessors first preserves the difference between an
+/// omitted field and an invalid one. Equal duplicate values remain accepted by those accessors.
+fn has_invalid_ethereum_semantics(input: &str) -> bool {
+    let Some((scheme, payload)) = input.split_once(':') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("ethereum") {
+        return false;
+    }
+
+    let canonical = format!("ethereum:{payload}");
+    let Ok((remaining, request)) = RawTransactionRequest::parse(&canonical) else {
+        return false;
+    };
+    if !remaining.is_empty() {
+        return false;
+    }
+
+    if request
+        .chain_id
+        .as_ref()
+        .is_some_and(|chain_id| chain_id.as_u64().is_err())
+    {
+        return true;
+    }
+
+    request.parameters.as_ref().is_some_and(|parameters| {
+        parameters.value().is_err()
+            || parameters.gas_limit().is_err()
+            || parameters.gas_price().is_err()
+    })
+}
+
+/// Returns whether an SPL-token amount is too large to fit the `u64` carried by every SPL transfer
+/// instruction, even at the smallest precision capable of expressing the supplied decimal.
+fn has_unrepresentable_spl_amount(input: &str) -> bool {
+    let Some((scheme, payload)) = input.split_once(':') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("solana") {
+        return false;
+    }
+    let Some((_, query)) = payload.split_once('?') else {
+        return false;
+    };
+
+    let mut amount = None;
+    let mut amount_count = 0;
+    let mut spl_token_count = 0;
+    for parameter in query.split('&') {
+        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+        match key {
+            "amount" => {
+                amount_count += 1;
+                amount = Some(value);
+            }
+            "spl-token" => spl_token_count += 1,
+            _ => {}
+        }
+    }
+
+    // Let the upstream parser classify duplicates and malformed decimal text itself.
+    if amount_count != 1 || spl_token_count != 1 {
+        return false;
+    }
+    amount
+        .and_then(minimal_atomic_value_fits_u64)
+        .is_some_and(|fits| !fits)
+}
+
+/// Checks the integer obtained by expressing a decimal at its minimal exact precision.
+///
+/// Trailing fractional zeros do not require precision. Comparing the remaining digits directly
+/// avoids computing `10^scale`, which would overflow for a tiny value such as 1e-20 even though
+/// its exact atomic numerator is just one.
+fn minimal_atomic_value_fits_u64(value: &str) -> Option<bool> {
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|digits| {
+            digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+
+    let fraction = fraction.unwrap_or("").trim_end_matches('0');
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(true);
+    }
+    Some(significant.parse::<u64>().is_ok())
+}
+
 /// Parses a supported payment URI and returns an internal JSON envelope.
 ///
 /// On failure the last-error slot holds a classification token from [`classify`], or the
@@ -190,6 +256,12 @@ pub unsafe extern "C" fn zcashlc_payment_uri_parse(input: *const c_char) -> *mut
         if has_invalid_ethereum_address_length(input) {
             anyhow::bail!("payment URI rejected: invalid_address");
         }
+        if has_invalid_ethereum_semantics(input) {
+            anyhow::bail!("payment URI rejected: ethereum");
+        }
+        if has_unrepresentable_spl_amount(input) {
+            anyhow::bail!("payment URI rejected: invalid_amount");
+        }
         let normalized = normalize_utxo_compatibility(input);
         let json = parse_to_json(normalized.as_ref())
             .map_err(|e| anyhow::anyhow!("payment URI rejected: {}", classify(&e)))?;
@@ -200,7 +272,11 @@ pub unsafe extern "C" fn zcashlc_payment_uri_parse(input: *const c_char) -> *mut
 
 #[cfg(test)]
 mod tests {
-    use super::{has_invalid_ethereum_address_length, normalize_utxo_compatibility};
+    use super::{
+        has_invalid_ethereum_address_length, has_invalid_ethereum_semantics,
+        has_unrepresentable_spl_amount, minimal_atomic_value_fits_u64,
+        normalize_utxo_compatibility,
+    };
 
     #[test]
     fn normalizes_uppercase_bech32_addresses_for_upstream_validation() {
@@ -219,18 +295,18 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_litecoin_query_keys_without_touching_values() {
+    fn preserves_litecoin_query_key_case() {
         assert_eq!(
             normalize_utxo_compatibility(
                 "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?Amount=1.2500&Label=CaseSensitive"
             ),
-            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?amount=1.2500&label=CaseSensitive"
+            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?Amount=1.2500&Label=CaseSensitive"
         );
         assert_eq!(
             normalize_utxo_compatibility(
                 "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?REQ-Unknown=KeepThis"
             ),
-            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?req-unknown=KeepThis"
+            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?REQ-Unknown=KeepThis"
         );
     }
 
@@ -279,5 +355,65 @@ mod tests {
         assert!(!has_invalid_ethereum_address_length(&format!(
             "bitcoin:{long_uint256}"
         )));
+    }
+
+    #[test]
+    fn rejects_ethereum_semantics_that_typed_getters_would_erase() {
+        let address = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359";
+        let token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+
+        assert!(has_invalid_ethereum_semantics(&format!(
+            "ethereum:{token}@18446744073709551616/transfer?address={address}&uint256=1"
+        )));
+        assert!(has_invalid_ethereum_semantics(&format!(
+            "ethereum:{address}?value=1&value=2"
+        )));
+        assert!(has_invalid_ethereum_semantics(&format!(
+            "ethereum:{address}?gas=21000&gasLimit=22000"
+        )));
+
+        assert!(!has_invalid_ethereum_semantics(&format!(
+            "ethereum:{address}?value=1&value=1"
+        )));
+        assert!(!has_invalid_ethereum_semantics(&format!(
+            "ethereum:{address}?gas=21000&gasLimit=21000"
+        )));
+    }
+
+    #[test]
+    fn rejects_only_universally_unrepresentable_spl_amounts() {
+        let recipient = "mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN";
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+        assert!(has_unrepresentable_spl_amount(&format!(
+            "solana:{recipient}?amount=99999999999999999999999999999&spl-token={mint}"
+        )));
+        assert!(has_unrepresentable_spl_amount(&format!(
+            "solana:{recipient}?amount=18446744073709551615.1&spl-token={mint}"
+        )));
+        assert!(!has_unrepresentable_spl_amount(&format!(
+            "solana:{recipient}?amount=18446744073709551615.0&spl-token={mint}"
+        )));
+        assert!(!has_unrepresentable_spl_amount(&format!(
+            "solana:{recipient}?amount=0.00000000000000000001&spl-token={mint}"
+        )));
+        assert!(!has_unrepresentable_spl_amount(&format!(
+            "solana:{recipient}?amount=99999999999999999999999999999"
+        )));
+
+        assert_eq!(minimal_atomic_value_fits_u64("1.2300"), Some(true));
+        assert_eq!(
+            minimal_atomic_value_fits_u64("0.00000000000000000001"),
+            Some(true)
+        );
+        assert_eq!(
+            minimal_atomic_value_fits_u64("18446744073709551615"),
+            Some(true)
+        );
+        assert_eq!(
+            minimal_atomic_value_fits_u64("18446744073709551616"),
+            Some(false)
+        );
+        assert_eq!(minimal_atomic_value_fits_u64("1."), None);
     }
 }

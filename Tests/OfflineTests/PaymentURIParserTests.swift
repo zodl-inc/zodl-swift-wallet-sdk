@@ -93,21 +93,27 @@ final class PaymentURIParserTests: XCTestCase {
         XCTAssertEqual(litecoinRequest.amount?.value, "2")
     }
 
-    func testLitecoinQueryKeysAreCaseInsensitive() throws {
+    func testLitecoinQueryKeysRemainCaseSensitive() throws {
         let litecoin = try PaymentURIParser.parse(
             "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?Amount=1.2500&Label=Coffee"
         )
         guard case let .litecoin(request) = litecoin else { return XCTFail("Expected Litecoin") }
-        XCTAssertEqual(request.amount?.value, "1.2500")
-        XCTAssertEqual(request.label, "Coffee")
+        XCTAssertNil(request.amount)
+        XCTAssertNil(request.label)
 
         XCTAssertThrowsError(
             try PaymentURIParser.parse(
-                "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?REQ-somethingyoudontunderstand=50"
+                "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?req-Amount=1"
             )
         ) { error in
             XCTAssertEqual(error as? PaymentURIParserError, .rejected(.unsupportedRequiredParameter))
         }
+
+        let distinctKeys = try PaymentURIParser.parse(
+            "litecoin:LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA?amount=1&Amount=2"
+        )
+        guard case let .litecoin(distinctRequest) = distinctKeys else { return XCTFail("Expected Litecoin") }
+        XCTAssertEqual(distinctRequest.amount?.value, "1")
     }
 
     func testParsesErc20Request() throws {
@@ -118,6 +124,54 @@ final class PaymentURIParserTests: XCTestCase {
         guard case let .ethereum(.erc20(request)) = erc20 else { return XCTFail("Expected ERC-20 Ethereum") }
         XCTAssertEqual(request.tokenContractAddress, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
         XCTAssertEqual(request.recipientAddress, "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359")
+    }
+
+    func testRejectsOverflowingExplicitErc20ChainId() {
+        XCTAssertThrowsError(
+            try PaymentURIParser.parse(
+                "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48@18446744073709551616/transfer" +
+                "?address=0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359&uint256=1"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.ethereum))
+        }
+    }
+
+    func testRejectsConflictingEthereumPaymentParameters() {
+        let recipient = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"
+        let requests = [
+            "ethereum:\(recipient)?value=1&value=2",
+            "ethereum:\(recipient)?gas=21000&gasLimit=22000",
+            "ethereum:\(recipient)?gasPrice=50&gasPrice=51"
+        ]
+
+        for request in requests {
+            XCTAssertThrowsError(try PaymentURIParser.parse(request)) { error in
+                XCTAssertEqual(error as? PaymentURIParserError, .rejected(.ethereum))
+            }
+        }
+    }
+
+    func testAcceptsSemanticallyEqualEthereumPaymentParameters() throws {
+        let recipient = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"
+        let request = try PaymentURIParser.parse(
+            "ethereum:\(recipient)?value=1&value=1&gas=21000&gasLimit=21000"
+        )
+        guard case let .ethereum(.native(native)) = request else { return XCTFail("Expected native Ethereum") }
+        XCTAssertEqual(native.valueHex, "0x1")
+        XCTAssertEqual(native.gasLimitHex, "0x5208")
+    }
+
+    func testRejectsUniversallyUnrepresentableSplTokenAmount() {
+        XCTAssertThrowsError(
+            try PaymentURIParser.parse(
+                "solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN" +
+                "?amount=99999999999999999999999999999" +
+                "&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            )
+        ) { error in
+            XCTAssertEqual(error as? PaymentURIParserError, .rejected(.invalidAmount))
+        }
     }
 
     func testRejectsOverlengthEthereumAddresses() {

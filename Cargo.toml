@@ -60,6 +60,7 @@ ur-registry = { git = "https://github.com/KeystoneHQ/keystone-sdk-rust", rev = "
 # one. Pinned to the zcash/librustzcash#2989 merge commit specifically (not main's moving tip),
 # so this doesn't pick up unrelated later changes; that merge commit is a permanent part of
 # main's history now, so it stays reachable even as main moves on. Same rev as the Android SDK.
+eip681 = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9" }
 payment_uri = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9", features = ["json"] }
 
 # Infrastructure
