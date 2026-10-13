@@ -4100,12 +4100,14 @@ where
             let data_len = data.remaining();
             let new_total = collected.len() + data_len;
             if new_total > MAX_HTTP_RESPONSE_BYTES {
-                return Err(HttpError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "HTTP response too large: {} bytes exceeds limit of {} bytes",
-                        new_total,
-                        MAX_HTTP_RESPONSE_BYTES
+                return Err(zcash_client_backend::tor::Error::Http(HttpError::from(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "HTTP response too large: {} bytes exceeds limit of {} bytes",
+                            new_total,
+                            MAX_HTTP_RESPONSE_BYTES
+                        ),
                     ),
                 )));
             }
