@@ -184,4 +184,42 @@ final class OHTTPBoundedResponseTests: XCTestCase {
             }
         }
     }
+
+    // MARK: iOS 13/14 path (delegate callbacks instead of `bytes(for:)`), run on every OS
+
+    func testDelegatePathUnderAndAtLimitSucceeds() async throws {
+        let request = URLRequest(url: URL(string: "https://example.com/test")!)
+        for size in [1024, 2048] {
+            MockResponseURLProtocol.responseSize = size
+            let (data, response) = try await OHTTPTransport.boundedDataViaDelegate(
+                for: request,
+                maxBytes: 2048,
+                configuration: testSession.configuration
+            )
+            XCTAssertEqual(data.count, size, "Should receive all data up to the limit")
+            XCTAssertNotNil(response as? HTTPURLResponse, "Response should be HTTPURLResponse")
+        }
+    }
+
+    func testDelegatePathStreamingLargeResponseAbortsEarly() async throws {
+        MockResponseURLProtocol.responseSize = 10 * 1024 * 1024 // 10 MiB
+        MockResponseURLProtocol.shouldSimulateStreaming = true
+        let request = URLRequest(url: URL(string: "https://example.com/test")!)
+
+        do {
+            _ = try await OHTTPTransport.boundedDataViaDelegate(
+                for: request,
+                maxBytes: 1024 * 1024,
+                configuration: testSession.configuration
+            )
+            XCTFail("Should have thrown responseTooLarge error")
+        } catch let error as OHTTPError {
+            switch error {
+            case .responseTooLarge(let message):
+                XCTAssertTrue(message.contains("exceeded limit"), "Error message should mention exceeded limit: \(message)")
+            default:
+                XCTFail("Expected responseTooLarge error, got \(error)")
+            }
+        }
+    }
 }
