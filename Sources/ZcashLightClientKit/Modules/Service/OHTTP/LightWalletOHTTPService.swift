@@ -151,8 +151,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
+            // with bounded response reading per ZIP MUST requirement
             httpSender = { request in
-                let (data, response) = try await OHTTPTransport.session.data(for: request)
+                let (data, response) = try await OHTTPTransport.boundedData(
+                    for: request,
+                    maxBytes: OHTTPTransport.maxRelayResponseBytes
+                )
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")
                 }

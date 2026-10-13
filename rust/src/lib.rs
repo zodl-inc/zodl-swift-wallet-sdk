@@ -4074,6 +4074,11 @@ unsafe fn tor_http_get_impl(
     unwrap_exc_or_null(res)
 }
 
+/// Maximum size of an HTTP response body over Tor (256 MiB + 1 MiB framing overhead).
+/// Matches the OHTTP relay response limit in Swift. ZIP MUST: clients must bound response size
+/// while reading and abort as soon as the limit is exceeded.
+const MAX_HTTP_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
+
 async fn collect_http_response_body<B>(
     body: B,
 ) -> Result<bytes::Bytes, zcash_client_backend::tor::Error>
@@ -4083,7 +4088,31 @@ where
 {
     #[cfg(test)]
     crate::tor::http::network_tests::observe_body();
-    Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
+
+    // ZIP MUST: bound response size while reading. Accumulate frames up to MAX_HTTP_RESPONSE_BYTES,
+    // aborting as soon as exceeded (don't buffer the entire response before checking).
+    let mut collected = bytes::BytesMut::new();
+    let mut body = std::pin::pin!(body);
+
+    while let Some(frame) = body.frame().await.transpose().map_err(HttpError::from)? {
+        if let Ok(data) = frame.into_data() {
+            let new_total = collected.len() + data.len();
+            if new_total > MAX_HTTP_RESPONSE_BYTES {
+                // Create a custom HttpError with a descriptive message
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "HTTP response too large: {} bytes exceeds limit of {} bytes",
+                        new_total, MAX_HTTP_RESPONSE_BYTES
+                    ),
+                );
+                return Err(HttpError::from(err).into());
+            }
+            collected.extend_from_slice(&data);
+        }
+    }
+
+    Ok(collected.freeze())
 }
 
 /// Makes an HTTP POST request over Tor.

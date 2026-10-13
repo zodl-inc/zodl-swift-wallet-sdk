@@ -58,6 +58,55 @@ actor OHTTPTransport {
         session.configuration
     }
 
+    /// Maximum size of a signed key-configuration response (64 KiB). ZIP MUST: clients bound the
+    /// key-config response while reading.
+    internal static let maxKeyConfigBytes = 64 * 1024
+
+    /// Maximum size of an OHTTP relay response (256 MiB sealed response + 1 MiB framing overhead).
+    /// ZIP MUST: "A Client MUST bound the total size of the Chunked OHTTP response it reads ... MUST
+    /// enforce the limit while reading, counting the sealed octets ... and MUST abort the read and fail
+    /// the call as soon as it is exceeded."
+    internal static let maxRelayResponseBytes = (256 * 1024 * 1024) + (1024 * 1024)
+
+    /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
+    /// for OHTTP relay responses: abort as soon as the limit is exceeded. Uses `session.bytes(for:)`
+    /// to stream and count, rejecting early if `expectedContentLength > maxBytes`.
+    ///
+    /// - Parameters:
+    ///   - request: The URL request to execute
+    ///   - maxBytes: Maximum allowed response size in bytes
+    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    /// - Returns: The response data and URLResponse
+    /// - Throws: `OHTTPError.responseTooLarge` if the response exceeds maxBytes, or transport errors
+    static func boundedData(
+        for request: URLRequest,
+        maxBytes: Int,
+        session: URLSession = OHTTPTransport.session
+    ) async throws -> (Data, URLResponse) {
+        let (bytes, response) = try await session.bytes(for: request)
+
+        // Reject early if Content-Length header exceeds the limit
+        if let expectedLength = response.expectedContentLength, expectedLength > 0, expectedLength > maxBytes {
+            throw OHTTPError.responseTooLarge(
+                "Response Content-Length (\(expectedLength) bytes) exceeds limit (\(maxBytes) bytes)"
+            )
+        }
+
+        var accumulated = Data()
+        accumulated.reserveCapacity(min(Int(response.expectedContentLength > 0 ? response.expectedContentLength : 0), maxBytes))
+
+        for try await byte in bytes {
+            accumulated.append(byte)
+            if accumulated.count > maxBytes {
+                throw OHTTPError.responseTooLarge(
+                    "Response size (\(accumulated.count) bytes) exceeded limit (\(maxBytes) bytes)"
+                )
+            }
+        }
+
+        return (accumulated, response)
+    }
+
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
     /// signed key configuration is checked against.
     private let gatewayHost: String
@@ -92,7 +141,10 @@ actor OHTTPTransport {
         testNow: Date? = nil,
         testKeyVerifier: KeyVerifier? = nil,
         httpSender: @escaping HTTPSender = { request in
-            let (data, response) = try await OHTTPTransport.session.data(for: request)
+            let (data, response) = try await OHTTPTransport.boundedData(
+                for: request,
+                maxBytes: OHTTPTransport.maxRelayResponseBytes
+            )
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw OHTTPError.transportError("Invalid response type")
             }

@@ -14,6 +14,7 @@ enum OHTTPError: Error {
     case transportError(String)
     case httpStatusError(statusCode: Int, message: String)
     case keyConfigError(String)
+    case responseTooLarge(String)
 }
 
 extension OHTTPError {

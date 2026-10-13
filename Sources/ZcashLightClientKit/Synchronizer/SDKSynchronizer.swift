@@ -1428,7 +1428,10 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             }
         } else {
             httpSender = { request in
-                let (data, response) = try await OHTTPTransport.session.data(for: request)
+                let (data, response) = try await OHTTPTransport.boundedData(
+                    for: request,
+                    maxBytes: OHTTPTransport.maxRelayResponseBytes
+                )
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")
                 }
