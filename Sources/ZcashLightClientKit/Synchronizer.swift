@@ -719,7 +719,7 @@ public protocol Synchronizer: AnyObject {
     /// - Parameters:
     ///    - for: URLRequest
     ///    - retryLimit: How many times the request will be retried in case of failure
-    func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
+    func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
 
     /// Makes an isolated GET under one positive timeout budget that starts before synchronizer actor
     /// admission and includes later Tor actor admission, executor waiting, native retries, and response-body

@@ -3012,6 +3012,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
     // swiftlint:enable function_parameter_count
 
+    /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
+    public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+    }
+
     public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled

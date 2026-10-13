@@ -716,8 +716,9 @@ mod tests {
     #[test]
     fn ohttp_route_host_validation_is_before_dispatch() {
         // Host validation happens before any network call, so it's always before-dispatch.
-        let error =
-            OhttpRoute::new("https://unknown.example").expect_err("host not in OHTTP_VOTE_HOSTS");
+        let error = OhttpRoute::new("https://unknown.example")
+            .err()
+            .expect("host not in OHTTP_VOTE_HOSTS");
         assert_eq!(
             error.phase,
             RoutePhase::BeforeDispatch,

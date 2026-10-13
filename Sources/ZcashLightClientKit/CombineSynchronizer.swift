@@ -204,7 +204,7 @@ public protocol CombineSynchronizer {
     ) -> SinglePublisher<VotingRoundSession, Error>
     // swiftlint:enable function_parameter_count
 
-    func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
+    func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 
     /// Combine adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
     /// It preserves the async method's timeout budget and owned-cleanup behavior after work begins.
