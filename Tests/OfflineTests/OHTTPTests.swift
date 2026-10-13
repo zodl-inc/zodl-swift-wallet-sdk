@@ -307,7 +307,7 @@ final class OHTTPTests: XCTestCase {
     func testTraceIdAlsoRidesTheKeyConfigurationFetch() async throws {
         // The iOS profile sends the trace id on the key fetch as well as on the post.
         var fetch: URLRequest?
-        let transport = OHTTPTestSupport.makeTransport(clientTraceIdPrefix: "trace") { request in
+        let transport = OHTTPTestSupport.makeTransport(clientTraceIdPrefix: "trace") { request, _ in
             if request.httpMethod == "GET" {
                 fetch = request
                 return (
@@ -326,7 +326,7 @@ final class OHTTPTests: XCTestCase {
     func testRequestsCarryTheProfileHeaders() async throws {
         var fetch: URLRequest?
         var post: URLRequest?
-        let transport = OHTTPTestSupport.makeTransport { request in
+        let transport = OHTTPTestSupport.makeTransport { request, _ in
             if request.httpMethod == "GET" {
                 fetch = request
                 return (
@@ -354,7 +354,7 @@ final class OHTTPTests: XCTestCase {
         var keyConfigRequestCaptured = false
         var relayRequestCaptured = false
 
-        let torSender: OHTTPTransport.HTTPSender = { request in
+        let torSender: OHTTPTransport.HTTPSender = { request, _ in
             if request.httpMethod == "GET" {
                 keyConfigRequestCaptured = true
                 return (
@@ -453,7 +453,7 @@ final class OHTTPTests: XCTestCase {
 
     func testNonHTTPSRelayURLFails() async throws {
         // Verify that a non-https relay URL throws at request time (not init).
-        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request in
+        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request, _ in
             (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
         }
 
@@ -473,7 +473,7 @@ final class OHTTPTests: XCTestCase {
 
     func testNonHTTPSKeyConfigURLFails() async throws {
         var senderCalls = 0
-        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request in
+        let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request, _ in
             senderCalls += 1
             return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
         }
@@ -499,7 +499,7 @@ final class OHTTPTests: XCTestCase {
             gatewayHost: "ohttp-gateway-testnet.example",
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs"
-        ) { request in
+        ) { request, _ in
             if request.httpMethod == "GET" {
                 return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
             }

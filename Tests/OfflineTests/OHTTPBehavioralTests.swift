@@ -29,7 +29,7 @@ final class OHTTPBehavioralTests: XCTestCase {
         counters: Counters,
         answer: @escaping (_ attempt: Int, _ request: URLRequest) throws -> (Data, Int)
     ) -> OHTTPTransport {
-        OHTTPTestSupport.makeTransport { request in
+        OHTTPTestSupport.makeTransport { request, _ in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 counters.keyFetches += 1

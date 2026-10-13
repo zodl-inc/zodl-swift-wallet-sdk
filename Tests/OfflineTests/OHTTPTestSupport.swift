@@ -69,7 +69,7 @@ enum OHTTPTestSupport {
     /// returns the POST the sender saw.
     static func capturePost(clientTraceIdPrefix: String?) async -> URLRequest? {
         var captured: URLRequest?
-        let transport = makeTransport(clientTraceIdPrefix: clientTraceIdPrefix) { request in
+        let transport = makeTransport(clientTraceIdPrefix: clientTraceIdPrefix) { request, _ in
             if request.httpMethod == "GET" {
                 return (stubEnvelope, response(for: request.url, status: 200, headers: ["Content-Type": "application/json"]))
             }

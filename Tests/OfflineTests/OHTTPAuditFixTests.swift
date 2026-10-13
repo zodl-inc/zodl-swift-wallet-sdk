@@ -20,7 +20,7 @@ final class OHTTPAuditFixTests: XCTestCase {
         var roundTripAttempts = 0
 
         // Mock HTTP sender that returns HTTP 500 with "HTTP 400" in body (attack scenario)
-        let transport = OHTTPTestSupport.makeTransport { request in
+        let transport = OHTTPTestSupport.makeTransport { request, _ in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
@@ -65,7 +65,7 @@ final class OHTTPAuditFixTests: XCTestCase {
         var roundTripAttempts = 0
 
         // Mock HTTP sender that returns HTTP 400 on first attempt, then 200
-        let transport = OHTTPTestSupport.makeTransport { request in
+        let transport = OHTTPTestSupport.makeTransport { request, _ in
             let url = request.url?.absoluteString ?? ""
             if url.hasSuffix("/ohttp-configs/signed") {
                 keyConfigFetchCount += 1
