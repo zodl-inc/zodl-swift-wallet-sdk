@@ -564,7 +564,10 @@ async fn complete_body_copies_exact_bytes() {
 
     assert!(outcome.client_eof, "the client must close its local socket");
     let result = guarded_result.expect("body copy exceeded the test guard");
-    assert_eq!(result.expect("complete body must succeed"), b"test"[..]);
+    assert_eq!(
+        result.expect("complete body must succeed"),
+        Some(bytes::Bytes::from_static(b"test"))
+    );
 }
 
 #[tokio::test]

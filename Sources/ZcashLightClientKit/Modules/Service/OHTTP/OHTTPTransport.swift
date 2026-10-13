@@ -86,18 +86,24 @@ actor OHTTPTransport {
         let (bytes, response) = try await session.bytes(for: request)
 
         // Reject early if Content-Length header exceeds the limit
-        if let expectedLength = response.expectedContentLength, expectedLength > 0, expectedLength > maxBytes {
+        // `expectedContentLength` is -1 when the length is unknown.
+        let expectedLength = response.expectedContentLength
+        if expectedLength > Int64(maxBytes) {
+            bytes.task.cancel()
             throw OHTTPError.responseTooLarge(
                 "Response Content-Length (\(expectedLength) bytes) exceeds limit (\(maxBytes) bytes)"
             )
         }
 
         var accumulated = Data()
-        accumulated.reserveCapacity(min(Int(response.expectedContentLength > 0 ? response.expectedContentLength : 0), maxBytes))
+        if expectedLength > 0 {
+            accumulated.reserveCapacity(Int(expectedLength))
+        }
 
         for try await byte in bytes {
             accumulated.append(byte)
             if accumulated.count > maxBytes {
+                bytes.task.cancel()
                 throw OHTTPError.responseTooLarge(
                     "Response size (\(accumulated.count) bytes) exceeded limit (\(maxBytes) bytes)"
                 )
