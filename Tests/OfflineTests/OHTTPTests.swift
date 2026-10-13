@@ -441,7 +441,7 @@ final class OHTTPTests: XCTestCase {
             task: task,
             willPerformHTTPRedirection: redirectResponse,
             newRequest: newRequest
-        ) { request, _ in
+        ) { request in
             capturedNewRequest = request
             expectation.fulfill()
         }
