@@ -2899,7 +2899,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // unchanged and relayURL(for:) routes them to the mainnet relay. Only checking isGateway
         // rejected them with ohttpUnsupportedHost before any request was sent.
         guard let host = request.url?.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host) else {
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
             throw ZcashError.ohttpUnsupportedHost
         }
         let relayURL = try OHTTPEndpoints.relayURL(for: host)

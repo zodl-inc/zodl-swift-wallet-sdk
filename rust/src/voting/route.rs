@@ -444,6 +444,28 @@ impl OhttpRoute {
     }
 }
 
+/// Wraps `on_dispatch` so that `dispatched` records whether it fired.
+fn dispatch_tracking<'a>(
+    dispatched: &'a AtomicBool,
+    on_dispatch: &'a (dyn Fn() + Send + Sync),
+) -> impl Fn() + Send + Sync + 'a {
+    move || {
+        dispatched.store(true, Ordering::SeqCst);
+        on_dispatch();
+    }
+}
+
+/// A transport failure or timeout is ambiguous only once the sealed request may have left the
+/// device: before `on_dispatch` (key-config fetch, encapsulation, relay connect) it is provably
+/// unsent, so it keeps the before-dispatch phase and its safe retry.
+fn dispatch_phase_error(dispatched: &AtomicBool, message: String) -> RouteError {
+    if dispatched.load(Ordering::SeqCst) {
+        RouteError::after_dispatch(message)
+    } else {
+        RouteError::before_dispatch(format!("{message} (before dispatch)"))
+    }
+}
+
 impl RouteHttp for OhttpRoute {
     fn execute<'a>(
         &'a self,
@@ -465,13 +487,9 @@ impl RouteHttp for OhttpRoute {
             let max_response_bytes = request.max_response_bytes.min(MAX_OHTTP_RESPONSE_BYTES);
 
             // Track whether on_dispatch fired. Failures before the callback are definitely unsent
-            // (before-dispatch phase); failures after it are ambiguous (after-dispatch).
-            let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let dispatched_inner = dispatched.clone();
-            let wrapped_on_dispatch = move || {
-                dispatched_inner.store(true, std::sync::atomic::Ordering::SeqCst);
-                on_dispatch();
-            };
+            // (before-dispatch phase, safe to retry); failures after it are ambiguous.
+            let dispatched = AtomicBool::new(false);
+            let wrapped_on_dispatch = dispatch_tracking(&dispatched, on_dispatch);
 
             // The relay leg uses the device's own connection (`Dialer::Direct`).
             // The callback fires right before the sealed request is sent, so failures
@@ -488,20 +506,10 @@ impl RouteHttp for OhttpRoute {
             let (status, headers, body) = tokio::time::timeout(request.timeout, call)
                 .await
                 .map_err(|_| {
-                    if dispatched.load(std::sync::atomic::Ordering::SeqCst) {
-                        RouteError::after_dispatch("OHTTP request timed out")
-                    } else {
-                        RouteError::before_dispatch("OHTTP request timed out before dispatch")
-                    }
+                    dispatch_phase_error(&dispatched, "OHTTP request timed out".to_string())
                 })?
                 .map_err(|error| {
-                    if dispatched.load(std::sync::atomic::Ordering::SeqCst) {
-                        RouteError::after_dispatch(format!("OHTTP transport: {error}"))
-                    } else {
-                        RouteError::before_dispatch(format!(
-                            "OHTTP transport (before dispatch): {error}"
-                        ))
-                    }
+                    dispatch_phase_error(&dispatched, format!("OHTTP transport: {error}"))
                 })?;
 
             if body.len() > max_response_bytes {
@@ -682,30 +690,27 @@ mod tests {
         assert_eq!(error.phase, RoutePhase::ResponseRead);
     }
 
-    /// Helper to classify errors by dispatch state: tests the logic without network I/O.
-    fn classify_ohttp_error(dispatched: bool, _error: String) -> RoutePhase {
-        if dispatched {
-            RoutePhase::AfterDispatch
-        } else {
-            RoutePhase::BeforeDispatch
-        }
-    }
-
     #[test]
-    fn ohttp_route_classifies_errors_by_dispatch_state() {
-        // Before dispatch: BeforeDispatch
-        assert_eq!(
-            classify_ohttp_error(false, "key-config fetch failed".to_string()),
-            RoutePhase::BeforeDispatch,
-            "Errors before on_dispatch callback should be BeforeDispatch"
-        );
+    fn dispatch_phase_follows_the_callback() {
+        let dispatched = AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let on_dispatch = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        };
+        let wrapped = dispatch_tracking(&dispatched, &on_dispatch);
 
-        // After dispatch: AfterDispatch
+        // Key-config fetch failed: the callback never ran.
+        let error = dispatch_phase_error(&dispatched, "config HTTP 503".to_string());
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+
+        wrapped();
         assert_eq!(
-            classify_ohttp_error(true, "relay timeout".to_string()),
-            RoutePhase::AfterDispatch,
-            "Errors after on_dispatch callback should be AfterDispatch"
+            calls.load(Ordering::SeqCst),
+            1,
+            "the caller's callback still runs"
         );
+        let error = dispatch_phase_error(&dispatched, "relay reset".to_string());
+        assert_eq!(error.phase, RoutePhase::AfterDispatch);
     }
 
     #[test]

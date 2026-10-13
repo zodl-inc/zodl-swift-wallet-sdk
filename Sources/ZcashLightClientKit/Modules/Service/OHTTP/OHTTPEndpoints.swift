@@ -89,11 +89,7 @@ public enum OHTTPEndpoints {
             return true
         }
         // Check proxy-only gateways
-        if proxyOnlyGateways.contains(lowerHost) {
-            return true
-        }
-        // Check third-party proxy hosts (path-restricted)
-        return isThirdPartyProxyHost(host: lowerHost)
+        return proxyOnlyGateways.contains(lowerHost)
     }
 
     public static func relayURL(for gatewayHost: String) throws -> String {
@@ -179,8 +175,16 @@ public enum OHTTPEndpoints {
 
     /// Returns true if the host is a third-party host that routes through OHTTP with path restrictions.
     /// Currently only raw.githubusercontent.com with the valargroup voting config path prefix.
-    private static func isThirdPartyProxyHost(host: String) -> Bool {
+    /// Not a gateway: `isGateway` stays false so it can never become a lightwalletd endpoint.
+    static func isThirdPartyProxyHost(host: String) -> Bool {
         return host.lowercased() == "raw.githubusercontent.com"
+    }
+
+    /// True for a URL on a path-restricted third-party host whose path the gateway serves
+    /// (the bundled voting-config mirror). Other paths on that host are not routable.
+    public static func isPathRestrictedProxyURL(_ url: URL) -> Bool {
+        guard let host = url.host, isThirdPartyProxyHost(host: host) else { return false }
+        return proxyHost(for: url) != nil
     }
 
     /// Returns true if the host is an alias that carries gateway-injected secrets (CMC, NEAR, voting).
