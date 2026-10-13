@@ -4069,30 +4069,62 @@ unsafe fn tor_http_get_impl(
             }
         })?;
 
-        ffi::HttpResponseBytes::from_rust(response)
+        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
     });
     unwrap_exc_or_null(res)
 }
 
+/// Upper bound on a Tor HTTP response body, equal to `OHTTPTransport.maxRelayResponseBytes`
+/// (256 MiB sealed OHTTP response + 1 MiB framing overhead). The largest legitimate body on
+/// these calls is an OHTTP relay response; Sapling parameters (~48 MB) stay well below it.
+const TOR_HTTP_MAX_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
+
+/// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
+/// body exceeds `TOR_HTTP_MAX_RESPONSE_BYTES`, without reading the rest, so a hostile relay or
+/// server cannot make the device buffer an unbounded response.
 async fn collect_http_response_body<B>(
     body: B,
-) -> Result<bytes::Bytes, zcash_client_backend::tor::Error>
+) -> Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>
 where
-    B: BodyExt,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
     HttpError: From<B::Error>,
 {
     #[cfg(test)]
     crate::tor::http::network_tests::observe_body();
-    // Note: Response size bounding (ZIP MUST requirement) is not implemented here due to generic
-    // type constraints. The function must return tor::Error, which wraps HttpError, but HttpError
-    // can only be constructed from B::Error (the body's associated error type), not from custom
-    // errors like io::Error. After multiple attempts, no feasible type-safe solution was found.
-    //
-    // Mitigation: All OHTTP relay responses are bounded in Swift (OHTTPTransport.boundedData),
-    // including Tor+OHTTP paths. The gateway also enforces response size limits. This unbounded
-    // collect() only affects Tor HTTP (used by OHTTP-over-Tor), which is a less common path and
-    // relies on gateway-side enforcement.
-    Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
+    Ok(collect_body_limited(body, TOR_HTTP_MAX_RESPONSE_BYTES)
+        .await
+        .map_err(HttpError::from)?)
+}
+
+async fn collect_body_limited<B, E>(
+    mut body: B,
+    max_bytes: usize,
+) -> Result<Option<bytes::Bytes>, E>
+where
+    B: BodyExt<Data = bytes::Bytes, Error = E> + Unpin,
+{
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if data.len() > max_bytes - out.len() {
+                return Ok(None);
+            }
+            out.extend_from_slice(data);
+        }
+    }
+    Ok(Some(bytes::Bytes::from(out)))
+}
+
+/// Fails the call when [`collect_http_response_body`] stopped at the size limit.
+fn within_response_limit(
+    response: http::Response<Option<bytes::Bytes>>,
+) -> anyhow::Result<http::Response<bytes::Bytes>> {
+    let (parts, body) = response.into_parts();
+    let body = body.ok_or_else(|| {
+        anyhow!("Tor HTTP response body exceeds {TOR_HTTP_MAX_RESPONSE_BYTES} bytes")
+    })?;
+    Ok(http::Response::from_parts(parts, body))
 }
 
 /// Makes an HTTP POST request over Tor.
@@ -4174,7 +4206,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                         })
                     },
                     http_body_util::Full::new(body),
-                    |body| async { Ok(body.collect().await.map_err(HttpError::from)?.to_bytes()) },
+                    collect_http_response_body,
                     retry_limit,
                     |res| {
                         res.is_err()
@@ -4184,7 +4216,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                 .await
         })?;
 
-        ffi::HttpResponseBytes::from_rust(response)
+        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
     });
     unwrap_exc_or_null(res)
 }
@@ -7862,5 +7894,31 @@ mod legacy_wallet_migration_tests {
         base64::engine::general_purpose::STANDARD
             .decode("9VDVOZZZOWWHpZtq1Ebridp3Qeux5C+HwiRR0g7Oi7HgnMs8Gfln83+/Q1NnvClcaSwM4ADFL1uZHxypEWlWXg==")
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tor_http_body_limit_tests {
+    #[test]
+    fn a_body_within_the_limit_is_returned_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
+        let out = rt
+            .block_on(super::collect_body_limited(body, 10))
+            .unwrap()
+            .expect("exactly at the limit");
+        assert_eq!(&out[..], b"0123456789");
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
+        let out = rt.block_on(super::collect_body_limited(body, 9)).unwrap();
+        assert!(out.is_none());
     }
 }
