@@ -498,7 +498,9 @@ impl RouteHttp for OhttpRoute {
                     if dispatched.load(std::sync::atomic::Ordering::SeqCst) {
                         RouteError::after_dispatch(format!("OHTTP transport: {error}"))
                     } else {
-                        RouteError::before_dispatch(format!("OHTTP transport (before dispatch): {error}"))
+                        RouteError::before_dispatch(format!(
+                            "OHTTP transport (before dispatch): {error}"
+                        ))
                     }
                 })?;
 
@@ -684,8 +686,8 @@ mod tests {
     fn ohttp_route_tracks_dispatch_for_errors() {
         // Test that errors before on_dispatch are marked as before-dispatch.
         // OhttpRoute::new validates the host before any network call.
-        let error = OhttpRoute::new("https://unknown.example")
-            .expect_err("host not in OHTTP_VOTE_HOSTS");
+        let error =
+            OhttpRoute::new("https://unknown.example").expect_err("host not in OHTTP_VOTE_HOSTS");
         assert_eq!(
             error.phase,
             RoutePhase::BeforeDispatch,

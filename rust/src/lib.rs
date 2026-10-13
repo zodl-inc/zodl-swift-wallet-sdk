@@ -3943,7 +3943,17 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
     headers_len: usize,
     retry_limit: u8,
 ) -> *mut ffi::HttpResponseBytes {
-    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None, None) }
+    unsafe {
+        tor_http_get_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            retry_limit,
+            None,
+            None,
+        )
+    }
 }
 
 /// Makes an HTTP GET request over Tor with a whole-operation timeout.
@@ -4016,7 +4026,17 @@ pub unsafe extern "C" fn zcashlc_tor_http_get_bounded(
     retry_limit: u8,
     max_bytes: usize,
 ) -> *mut ffi::HttpResponseBytes {
-    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None, Some(max_bytes)) }
+    unsafe {
+        tor_http_get_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            retry_limit,
+            None,
+            Some(max_bytes),
+        )
+    }
 }
 
 /// Makes an HTTP POST request over Tor with a bounded response size.
@@ -4131,7 +4151,8 @@ unsafe fn tor_http_get_impl(
             })
         };
         let max_response_bytes = max_bytes.unwrap_or(TOR_HTTP_MAX_RESPONSE_BYTES);
-        let collect_response_body = |body| collect_http_response_body_limited(body, max_response_bytes);
+        let collect_response_body =
+            |body| collect_http_response_body_limited(body, max_response_bytes);
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
             #[cfg(test)]
             crate::tor::http::network_tests::observe_retry(
