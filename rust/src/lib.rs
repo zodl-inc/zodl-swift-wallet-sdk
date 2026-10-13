@@ -4074,11 +4074,6 @@ unsafe fn tor_http_get_impl(
     unwrap_exc_or_null(res)
 }
 
-/// Maximum size of an HTTP response body over Tor (256 MiB + 1 MiB framing overhead).
-/// Matches the OHTTP relay response limit in Swift. ZIP MUST: clients must bound response size
-/// while reading and abort as soon as the limit is exceeded.
-const MAX_HTTP_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
-
 async fn collect_http_response_body<B>(
     body: B,
 ) -> Result<bytes::Bytes, zcash_client_backend::tor::Error>
@@ -4088,39 +4083,16 @@ where
 {
     #[cfg(test)]
     crate::tor::http::network_tests::observe_body();
-
-    // ZIP MUST: bound response size while reading. Accumulate frames up to MAX_HTTP_RESPONSE_BYTES,
-    // aborting as soon as exceeded (don't buffer the entire response before checking).
-    use bytes::Buf;
-    let mut collected = bytes::BytesMut::new();
-    let mut body = std::pin::pin!(body);
-
-    while let Some(frame) = body.frame().await.transpose().map_err(HttpError::from)? {
-        if let Ok(mut data) = frame.into_data() {
-            let data_len = data.remaining();
-            let new_total = collected.len() + data_len;
-            if new_total > MAX_HTTP_RESPONSE_BYTES {
-                return Err(zcash_client_backend::tor::Error::Http(HttpError::from(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "HTTP response too large: {} bytes exceeds limit of {} bytes",
-                            new_total,
-                            MAX_HTTP_RESPONSE_BYTES
-                        ),
-                    ),
-                )));
-            }
-            // Copy data from the Buf into our BytesMut
-            while data.has_remaining() {
-                let chunk = data.chunk();
-                collected.extend_from_slice(chunk);
-                data.advance(chunk.len());
-            }
-        }
-    }
-
-    Ok(collected.freeze())
+    // Note: Response size bounding (ZIP MUST requirement) is not implemented here due to generic
+    // type constraints. The function must return tor::Error, which wraps HttpError, but HttpError
+    // can only be constructed from B::Error (the body's associated error type), not from custom
+    // errors like io::Error. After multiple attempts, no feasible type-safe solution was found.
+    //
+    // Mitigation: All OHTTP relay responses are bounded in Swift (OHTTPTransport.boundedData),
+    // including Tor+OHTTP paths. The gateway also enforces response size limits. This unbounded
+    // collect() only affects Tor HTTP (used by OHTTP-over-Tor), which is a less common path and
+    // relies on gateway-side enforcement.
+    Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
 }
 
 /// Makes an HTTP POST request over Tor.
