@@ -77,9 +77,12 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(relay, "https://mainnet-relay.example.invalid/relay",
                        "raw.githubusercontent.com should use mainnet relay")
 
-        // Verify isGateway recognizes it
-        XCTAssertTrue(OHTTPEndpoints.isGateway("raw.githubusercontent.com"),
-                      "raw.githubusercontent.com should be recognized as a gateway host")
+        // A routable third-party URL, never a gateway (cannot become a lightwalletd endpoint)
+        XCTAssertFalse(OHTTPEndpoints.isGateway("raw.githubusercontent.com"),
+                       "raw.githubusercontent.com must not be a gateway host")
+        XCTAssertTrue(OHTTPEndpoints.isPathRestrictedProxyURL(allowedURL))
+        XCTAssertFalse(OHTTPEndpoints.isPathRestrictedProxyURL(
+            URL(string: "https://raw.githubusercontent.com/zodl-inc/other/main/x.json")!))
 
         // Verify proxyURL returns unchanged URL (passthrough)
         let proxyURL = OHTTPEndpoints.proxyURL(for: allowedURL)
