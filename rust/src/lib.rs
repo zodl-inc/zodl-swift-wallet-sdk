@@ -4091,12 +4091,14 @@ where
 
     // ZIP MUST: bound response size while reading. Accumulate frames up to MAX_HTTP_RESPONSE_BYTES,
     // aborting as soon as exceeded (don't buffer the entire response before checking).
+    use bytes::Buf;
     let mut collected = bytes::BytesMut::new();
     let mut body = std::pin::pin!(body);
 
     while let Some(frame) = body.frame().await.transpose().map_err(HttpError::from)? {
-        if let Ok(data) = frame.into_data() {
-            let new_total = collected.len() + data.len();
+        if let Ok(mut data) = frame.into_data() {
+            let data_len = data.remaining();
+            let new_total = collected.len() + data_len;
             if new_total > MAX_HTTP_RESPONSE_BYTES {
                 // Create a custom HttpError with a descriptive message
                 let err = std::io::Error::new(
@@ -4108,7 +4110,12 @@ where
                 );
                 return Err(HttpError::from(err).into());
             }
-            collected.extend_from_slice(&data);
+            // Copy data from the Buf into our BytesMut
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                collected.extend_from_slice(chunk);
+                data.advance(chunk.len());
+            }
         }
     }
 
