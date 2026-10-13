@@ -4107,8 +4107,7 @@ where
                         new_total,
                         MAX_HTTP_RESPONSE_BYTES
                     ),
-                ))
-                .into());
+                )));
             }
             // Copy data from the Buf into our BytesMut
             while data.has_remaining() {
