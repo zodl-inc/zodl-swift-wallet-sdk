@@ -4100,15 +4100,10 @@ where
             let data_len = data.remaining();
             let new_total = collected.len() + data_len;
             if new_total > MAX_HTTP_RESPONSE_BYTES {
-                // Create a custom HttpError with a descriptive message
-                let err = std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "HTTP response too large: {} bytes exceeds limit of {} bytes",
-                        new_total, MAX_HTTP_RESPONSE_BYTES
-                    ),
+                anyhow::bail!(
+                    "HTTP response too large: {} bytes exceeds limit of {} bytes",
+                    new_total, MAX_HTTP_RESPONSE_BYTES
                 );
-                return Err(HttpError::from(err).into());
             }
             // Copy data from the Buf into our BytesMut
             while data.has_remaining() {
