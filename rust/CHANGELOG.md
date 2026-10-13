@@ -38,8 +38,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
     with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
     key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
+=======
+- `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
+>>>>>>> origin/main
 - `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose
-  fragment carries a `v=1` card (`#v=1&key=…&height=…`) or the legacy JSON payment-link encoding at
   `/payment-links/open#vN=` — without touching a database or the network, and returns an
   `FfiGiftCardLink`: its `origin` (`FfiGiftCardOrigin`: `V1`, `LegacyV1`, `LegacyV2`, `LegacyV3`),
   `network_id` (`0` testnet, `1` mainnet; regtest cards are refused), `birthday_height` (never
@@ -799,6 +801,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+- `zcashlc_payment_uri_parse` rejects Ethereum native recipients, ERC-20 recipients, and token
+  contracts whose hexadecimal address is not exactly 40 digits, instead of trusting the pinned
+  EIP-681 parser's over-length address result.
+- `zcashlc_payment_uri_parse` folds all-uppercase Bitcoin and Litecoin bech32 addresses before
+  upstream validation without changing Litecoin's case-sensitive BIP-21 query-key semantics.
+- `zcashlc_payment_uri_parse` rejects overflowing explicit ERC-20 chain IDs and conflicting native
+  Ethereum payment parameters before the pinned parser can erase them from its typed result.
+- `zcashlc_payment_uri_parse` rejects SPL-token amounts that cannot fit the `u64` used by any SPL
+  transfer instruction.
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously
   omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood

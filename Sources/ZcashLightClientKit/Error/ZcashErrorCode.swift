@@ -281,8 +281,6 @@ public enum ZcashErrorCode: String {
     case rustDeleteAccount = "ZRUST0090"
     /// Error from rust layer when calling ZcashRustBackend.truncateToChainState
     case rustTruncateToChainState = "ZRUST0091"
-    /// Error from rust layer when calling ZcashEip681Backend.parseTransactionRequest
-    case rustEip681Parse = "ZRUST0092"
     /// Failed to open the Slipstream engine handle via zcashlc_slipstream_open.
     case rustSlipstreamOpen = "ZRUST0093"
     /// Slipstream engine handle is nil (open was not called or failed).

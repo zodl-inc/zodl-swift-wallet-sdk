@@ -6,9 +6,46 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `PaymentURIParser` and the typed `PaymentURIRequest` results provide Rust-backed parsing and
+  validation for Bitcoin, Ethereum (EIP-681, native and ERC-20), Litecoin, and Solana payment
+  request URIs, including Solana Pay interactive transaction-request links.
+- `PaymentURIParserError` distinguishes a bad URI (`invalidURI`, `rejected(_:)`) from an
+  SDK/Rust-core mismatch (`unsupportedEnvelope(version:)`, `invalidEnvelope`) and from a parser
+  crash (`parserFailure(_:)`, carrying a redacted `RedactedRustError`). `PaymentURIRejection`
+  reports which check the Rust parser failed, without carrying any fragment of the caller's input
+  across the FFI.
+- The payment-URI result types expose public initialisers, so consumers can build canned values
+  for tests and dependency doubles.
+- `PaymentURIParser` rejects Ethereum native recipients, ERC-20 recipients, and token contracts
+  whose hexadecimal address is not exactly 40 digits. The pinned EIP-681 parser previously
+  accepted over-length addresses as validated requests.
+- `PaymentURIParser` accepts all-uppercase Bitcoin and Litecoin bech32 addresses used by QR
+  encoders without changing Litecoin's case-sensitive BIP-21 query-key semantics.
+- `PaymentURIParser` rejects overflowing explicit ERC-20 chain IDs and conflicting native
+  Ethereum `value`, `gas`/`gasLimit`, or `gasPrice` parameters instead of reporting those fields
+  as omitted.
+- `PaymentURIParser` rejects SPL-token amounts that cannot fit the `u64` used by any SPL transfer,
+  while leaving mint-specific decimal validation to the consumer that resolves the mint.
+- `PaymentURIParserError.parserFailure(_:)` never exposes a raw Rust panic string. Its
+  `RedactedRustError` payload is safe to include in support reports; raw detail remains only in
+  device-local Rust diagnostics.
+- `PaymentURIParser` reports missing, retyped, or unknown fields in the Rust result envelope as
+  `invalidEnvelope` rather than `invalidURI`. Callers can distinguish an SDK/core mismatch from a
+  bad scanned URI without asking the user to rescan.
+
 ## Changed
 
 - Sapling parameter files are now verified with SHA-256 instead of SHA-1.
+
+## Removed
+
+- `ZcashEip681Backend` and the `zcashlc_eip681_*` FFI are gone. `PaymentURIParser` now handles
+  every `ethereum:` URI, so the two parse paths no longer disagree about a request's
+  `schemaPrefix`. This matches the Android SDK, which retired its EIP-681 path in the same way.
+  One behaviour is lost with it: non-`ethereum:` EIP-681 scheme prefixes such as `celo:` are no
+  longer accepted, and a URI's own scheme text is normalised to `"ethereum"`.
 
 # 5.2.0 - 2026-10-09
 

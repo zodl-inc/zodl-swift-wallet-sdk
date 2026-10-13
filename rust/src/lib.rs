@@ -95,7 +95,6 @@ use zip32::fingerprint::SeedFingerprint;
 #[cfg(target_vendor = "apple")]
 mod darwin_qos;
 mod derivation;
-mod eip681;
 mod error_report;
 mod ext_schema;
 mod ffi;
@@ -118,6 +117,7 @@ mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
 mod ohttp;
+mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
 mod tor;
