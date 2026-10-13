@@ -1335,7 +1335,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
     // swiftlint:enable function_parameter_count
 
-    public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1354,7 +1354,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             throw ZcashError.torClientUnavailable
         }
 
-        return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+        return try await httpTor.isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
     }
 
     public func httpGetOverTor(
@@ -1419,18 +1419,18 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
-            httpSender = { [weak self] request in
+            httpSender = { [weak self] request, maxBytes in
                 guard let self else { throw ZcashError.ohttpTransportError }
                 // C-08 fix: OHTTP ciphertext must not be retried (gateway replay cache returns 409).
                 // The OHTTP layer already retries on key rotation (HTTP 400/422), sealing afresh. Tor transport retries
                 // would resend the same sealed ciphertext, violating the nonce-once invariant.
-                return try await self.httpRequestOverTor(for: request, retryLimit: 0)
+                return try await self.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: 0)
             }
         } else {
-            httpSender = { request in
+            httpSender = { request, maxBytes in
                 let (data, response) = try await OHTTPTransport.boundedData(
                     for: request,
-                    maxBytes: OHTTPTransport.maxRelayResponseBytes
+                    maxBytes: maxBytes
                 )
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")

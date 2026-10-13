@@ -38,6 +38,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Changed
 
 - Sapling parameter files are now verified with SHA-256 instead of SHA-1.
+- OHTTP key-configuration response size limit (64 KiB) is now enforced incrementally while reading
+  the body, not post-read. The per-request limit is carried through every HTTPSender implementation
+  (clearnet URLSession and Tor) so that key-config GETs use the 64 KiB limit and relay POSTs use
+  the 257 MiB limit. Addresses ZIP MUST requirement.
+- OHTTP voting route now tracks whether the `on_dispatch` callback fired. Failures before dispatch
+  (e.g., key-config fetch, relay connect) are classified as Transport (safely retriable); failures
+  after dispatch are Ambiguous (no retry). Previously all failures were marked after-dispatch.
+- Sapling parameter Tor downloader now creates the destination directory before writing its temporary
+  file, fixing ENOENT when the SDK caller supplies a new parameters directory.
+- OHTTP now routes `GET https://raw.githubusercontent.com/valargroup/token-holder-voting-config/*`
+  through the mainnet gateway for the iOS app's bundled voting-config mirror walk. Other paths on
+  raw.githubusercontent.com remain rejected as unsupportedPrivateDestination.
 
 ## Removed
 

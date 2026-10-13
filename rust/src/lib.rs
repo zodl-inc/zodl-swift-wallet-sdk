@@ -3943,7 +3943,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
     headers_len: usize,
     retry_limit: u8,
 ) -> *mut ffi::HttpResponseBytes {
-    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None) }
+    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None, None) }
 }
 
 /// Makes an HTTP GET request over Tor with a whole-operation timeout.
@@ -3993,8 +3993,99 @@ pub unsafe extern "C" fn zcashlc_tor_http_get_with_timeout(
             headers_len,
             retry_limit,
             Some(timeout_ms),
+            None,
         )
     }
+}
+
+/// Makes an HTTP GET request over Tor with a bounded response size.
+///
+/// `max_bytes` is the maximum allowed response body size in bytes. The body is counted
+/// incrementally as frames arrive, and the request is aborted as soon as the limit is exceeded.
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_get`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_get_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    retry_limit: u8,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None, Some(max_bytes)) }
+}
+
+/// Makes an HTTP POST request over Tor with a bounded response size.
+///
+/// `max_bytes` is the maximum allowed response body size in bytes. The body is counted
+/// incrementally as frames arrive, and the request is aborted as soon as the limit is exceeded.
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    retry_limit: u8,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+
+    let res = catch_panic(|| {
+        let tor_runtime =
+            unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+
+        let url = unsafe { CStr::from_ptr(url).to_str()? }
+            .try_into()
+            .map_err(|e| anyhow!("Invalid URL: {e}"))?;
+
+        let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
+            .iter()
+            .map(|header| {
+                anyhow::Ok((
+                    unsafe { CStr::from_ptr(header.name) }.to_str()?,
+                    unsafe { CStr::from_ptr(header.value) }.to_str()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let collect_response_body = |body| collect_http_response_body_limited(body, max_bytes);
+
+        let response = tor_runtime.runtime().block_on(async {
+            tor_runtime
+                .client()
+                .http_post(
+                    url,
+                    |builder| {
+                        headers.iter().fold(builder, |builder, (key, value)| {
+                            builder.header(*key, *value)
+                        })
+                    },
+                    http_body_util::Full::new(body_data),
+                    collect_response_body,
+                    retry_limit,
+                    |res| {
+                        res.is_err()
+                            .then_some(zcash_client_backend::tor::http::Retry::Same)
+                    },
+                )
+                .await
+        })?;
+
+        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
+    });
+    unwrap_exc_or_null(res)
 }
 
 unsafe fn tor_http_get_impl(
@@ -4004,6 +4095,7 @@ unsafe fn tor_http_get_impl(
     headers_len: usize,
     retry_limit: u8,
     timeout_ms: Option<u64>,
+    max_bytes: Option<usize>,
 ) -> *mut ffi::HttpResponseBytes {
     // SAFETY: Callers would have to do the following for unwind safety (#194):
     // - using `*mut TorRuntime` and respecting mutability rules on the Swift side, to
@@ -4038,7 +4130,8 @@ unsafe fn tor_http_get_impl(
                 builder.header(*key, *value)
             })
         };
-        let collect_response_body = |body| collect_http_response_body(body);
+        let max_response_bytes = max_bytes.unwrap_or(TOR_HTTP_MAX_RESPONSE_BYTES);
+        let collect_response_body = |body| collect_http_response_body_limited(body, max_response_bytes);
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
             #[cfg(test)]
             crate::tor::http::network_tests::observe_retry(
@@ -4080,6 +4173,24 @@ unsafe fn tor_http_get_impl(
 const TOR_HTTP_MAX_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
 
 /// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
+/// body exceeds `max_bytes`, without reading the rest, so a hostile relay or server cannot
+/// make the device buffer an unbounded response.
+async fn collect_http_response_body_limited<B>(
+    body: B,
+    max_bytes: usize,
+) -> Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>
+where
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
+{
+    #[cfg(test)]
+    crate::tor::http::network_tests::observe_body();
+    Ok(collect_body_limited(body, max_bytes)
+        .await
+        .map_err(HttpError::from)?)
+}
+
+/// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
 /// body exceeds `TOR_HTTP_MAX_RESPONSE_BYTES`, without reading the rest, so a hostile relay or
 /// server cannot make the device buffer an unbounded response.
 async fn collect_http_response_body<B>(
@@ -4089,11 +4200,7 @@ where
     B: BodyExt<Data = bytes::Bytes> + Unpin,
     HttpError: From<B::Error>,
 {
-    #[cfg(test)]
-    crate::tor::http::network_tests::observe_body();
-    Ok(collect_body_limited(body, TOR_HTTP_MAX_RESPONSE_BYTES)
-        .await
-        .map_err(HttpError::from)?)
+    collect_http_response_body_limited(body, TOR_HTTP_MAX_RESPONSE_BYTES).await
 }
 
 async fn collect_body_limited<B, E>(

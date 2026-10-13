@@ -130,7 +130,8 @@ private final class BoundedTaskHandle: @unchecked Sendable {
 actor OHTTPTransport {
     /// Pluggable HTTP sender for the relay POST (and the key-config GET).
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
-    typealias HTTPSender = (URLRequest) async throws -> (Data, HTTPURLResponse)
+    /// The Int parameter is the per-request maximum response size in bytes.
+    typealias HTTPSender = (URLRequest, Int) async throws -> (Data, HTTPURLResponse)
 
     /// Test-only replacement for the native verification of the signed key configuration: the pinned
     /// signing keys have no private half to sign a test envelope with.
@@ -286,10 +287,10 @@ actor OHTTPTransport {
         clientTraceIdPrefix: String? = nil,
         testNow: Date? = nil,
         testKeyVerifier: KeyVerifier? = nil,
-        httpSender: @escaping HTTPSender = { request in
+        httpSender: @escaping HTTPSender = { request, maxBytes in
             let (data, response) = try await OHTTPTransport.boundedData(
                 for: request,
-                maxBytes: OHTTPTransport.maxRelayResponseBytes
+                maxBytes: maxBytes
             )
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw OHTTPError.transportError("Invalid response type")
@@ -445,7 +446,7 @@ actor OHTTPTransport {
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
-        let (data, httpResponse) = try await httpSender(request)
+        let (data, httpResponse) = try await httpSender(request, Self.maxKeyConfigBytes)
 
         guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
             throw OHTTPError.transportError("Key config fetch failed: HTTP \(httpResponse.statusCode)")
@@ -477,7 +478,7 @@ actor OHTTPTransport {
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
-        return try await httpSender(request)
+        return try await httpSender(request, Self.maxRelayResponseBytes)
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to

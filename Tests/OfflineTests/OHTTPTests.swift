@@ -55,6 +55,42 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(voteURL, "https://mainnet-relay.example.invalid/ohttp-configs")
     }
 
+    // MARK: Finding D - GitHub voting config path routing
+
+    func testGitHubVotingConfigPathRouting() {
+        // Allowed path: /valargroup/token-holder-voting-config/*
+        let allowedURL = URL(string: "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/main/pins/prod/abc123/v2-static-voting-config.json")!
+        let proxyHost = OHTTPEndpoints.proxyHost(for: allowedURL)
+        XCTAssertEqual(proxyHost, "ohttp-gateway.example",
+                       "Allowed valargroup voting config path should route through mainnet gateway")
+
+        // Allowed path with checksum parameter
+        let allowedWithChecksum = URL(string: "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/main/pins/prod/def456/v2-static-voting-config.json?checksum=sha256:abc")!
+        let proxyHostWithChecksum = OHTTPEndpoints.proxyHost(for: allowedWithChecksum)
+        XCTAssertEqual(proxyHostWithChecksum, "ohttp-gateway.example",
+                       "Allowed path with query should route through gateway")
+    }
+
+    func testGitHubOtherPathsRejected() {
+        // Other paths on raw.githubusercontent.com are rejected
+        let otherPath = URL(string: "https://raw.githubusercontent.com/other-org/other-repo/main/file.json")!
+        let proxyHost = OHTTPEndpoints.proxyHost(for: otherPath)
+        XCTAssertNil(proxyHost,
+                     "Non-valargroup paths on raw.githubusercontent.com should be rejected (nil = unsupportedPrivateDestination)")
+
+        // Even valargroup but different repo
+        let wrongRepo = URL(string: "https://raw.githubusercontent.com/valargroup/other-repo/main/file.json")!
+        let wrongRepoProxy = OHTTPEndpoints.proxyHost(for: wrongRepo)
+        XCTAssertNil(wrongRepoProxy,
+                     "valargroup repos other than token-holder-voting-config should be rejected")
+
+        // valargroup but no /token-holder-voting-config/ prefix
+        let noPrefix = URL(string: "https://raw.githubusercontent.com/valargroup/config.json")!
+        let noPrefixProxy = OHTTPEndpoints.proxyHost(for: noPrefix)
+        XCTAssertNil(noPrefixProxy,
+                     "valargroup URLs without the voting-config path prefix should be rejected")
+    }
+
 
     // MARK: - gRPC Frame Parsing Tests
 

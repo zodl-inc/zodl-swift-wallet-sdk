@@ -325,9 +325,9 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
     }
     // swiftlint:enable function_parameter_count
 
-    public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
-            try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)
+            try await self.synchronizer.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
         }
     }
 

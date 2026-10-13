@@ -222,4 +222,64 @@ final class OHTTPBoundedResponseTests: XCTestCase {
             }
         }
     }
+
+    // MARK: Finding A - Key config limit enforcement
+
+    /// Test that a 64 KiB key-config response succeeds through the production sender.
+    func testKeyConfigAtLimitSucceedsViaSender() async throws {
+        MockResponseURLProtocol.responseSize = 64 * 1024 // 64 KiB
+        let request = URLRequest(url: URL(string: "https://example.com/ohttp-configs")!)
+
+        // Production sender with key-config limit
+        let sender: OHTTPTransport.HTTPSender = { request, maxBytes in
+            let (data, response) = try await OHTTPTransport.boundedData(
+                for: request,
+                maxBytes: maxBytes,
+                session: self.testSession
+            )
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw OHTTPError.transportError("Invalid response type")
+            }
+            return (data, httpResponse)
+        }
+
+        let (data, response) = try await sender(request, OHTTPTransport.maxKeyConfigBytes)
+        XCTAssertEqual(data.count, 64 * 1024, "Should receive all data at limit")
+        XCTAssertEqual(response.statusCode, 200, "Should get 200 response")
+    }
+
+    /// Test that a 65 KiB key-config response fails with responseTooLarge through the production sender.
+    func testKeyConfigOverLimitFailsViaSender() async throws {
+        MockResponseURLProtocol.responseSize = 65 * 1024 // 65 KiB
+        MockResponseURLProtocol.shouldSimulateStreaming = true
+        let request = URLRequest(url: URL(string: "https://example.com/ohttp-configs")!)
+
+        // Production sender with key-config limit
+        let sender: OHTTPTransport.HTTPSender = { request, maxBytes in
+            let (data, response) = try await OHTTPTransport.boundedData(
+                for: request,
+                maxBytes: maxBytes,
+                session: self.testSession
+            )
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw OHTTPError.transportError("Invalid response type")
+            }
+            return (data, httpResponse)
+        }
+
+        do {
+            _ = try await sender(request, OHTTPTransport.maxKeyConfigBytes)
+            XCTFail("Should have thrown responseTooLarge error")
+        } catch let error as OHTTPError {
+            switch error {
+            case .responseTooLarge(let message):
+                XCTAssertTrue(
+                    message.contains("exceeded limit"),
+                    "Error message should mention exceeded limit: \(message)"
+                )
+            default:
+                XCTFail("Expected responseTooLarge error, got \(error)")
+            }
+        }
+    }
 }

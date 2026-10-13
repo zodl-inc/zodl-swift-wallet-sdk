@@ -148,6 +148,17 @@ public enum OHTTPEndpoints {
             return mapped
         }
 
+        // Path-based routing for raw.githubusercontent.com: only /valargroup/token-holder-voting-config/* is allowed
+        if host.lowercased() == "raw.githubusercontent.com" {
+            let path = url.path
+            if path.hasPrefix("/valargroup/token-holder-voting-config/") {
+                // Return the mainnet gateway host for this third-party route
+                return "ohttp-gateway.example"
+            }
+            // Other paths on raw.githubusercontent.com are rejected (nil return = unsupportedPrivateDestination)
+            return nil
+        }
+
         // Allowlisted hosts pass through unchanged (vote servers learned at run time)
         if isProxyAllowlisted(host: host) {
             return host

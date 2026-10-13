@@ -216,7 +216,7 @@ public protocol ClosureSynchronizer {
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     )
 
-    func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
+    func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
 
     /// Closure adapter for Synchronizer.httpGetOverTor(for:retryLimit:timeoutMilliseconds:).
     /// It preserves that method's original timeout budget, late-admission prevention, and owned cleanup.

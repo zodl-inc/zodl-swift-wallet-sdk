@@ -158,9 +158,10 @@ public actor TorClient {
 
     /// Makes an HTTP request over Tor.
     ///
+    /// - Parameter maxBytes: Maximum allowed response size in bytes
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
-    public func httpRequest(for request: URLRequest, retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequest(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
         let runtime = try resolveRuntime()
 
         let url = request.url
@@ -189,23 +190,25 @@ public actor TorClient {
         try cHeaders.withUnsafeBufferPointer { headersPtr in
             switch request.httpMethod?.lowercased() {
             case "get":
-                responsePtr = zcashlc_tor_http_get(
+                responsePtr = zcashlc_tor_http_get_bounded(
                     runtime,
                     [CChar](url.absoluteString.utf8CString),
                     headersPtr.baseAddress,
                     UInt(headersPtr.count),
-                    retryLimit
+                    retryLimit,
+                    UInt(maxBytes)
                 )
             case "post":
                 let data = request.httpBody ?? Data()
-                responsePtr = zcashlc_tor_http_post(
+                responsePtr = zcashlc_tor_http_post_bounded(
                     runtime,
                     [CChar](url.absoluteString.utf8CString),
                     headersPtr.baseAddress,
                     UInt(headersPtr.count),
                     data.bytes,
                     UInt(data.count),
-                    retryLimit
+                    retryLimit,
+                    UInt(maxBytes)
                 )
             default:
                 throw ZcashError.rustTorHttpRequest("Only GET and POST requests are supported")

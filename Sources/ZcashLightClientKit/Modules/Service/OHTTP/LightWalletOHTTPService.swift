@@ -146,16 +146,16 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
             // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
             // it re-encapsulates (new nonce, new ciphertext).
-            httpSender = { request in
-                return try await torClient.httpRequest(for: request, retryLimit: 0)
+            httpSender = { request, maxBytes in
+                return try await torClient.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
             // with bounded response reading per ZIP MUST requirement
-            httpSender = { request in
+            httpSender = { request, maxBytes in
                 let (data, response) = try await OHTTPTransport.boundedData(
                     for: request,
-                    maxBytes: OHTTPTransport.maxRelayResponseBytes
+                    maxBytes: maxBytes
                 )
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")

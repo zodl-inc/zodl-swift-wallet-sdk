@@ -329,9 +329,9 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
-    public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
-            try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)
+            try await self.synchronizer.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
         }
     }
 

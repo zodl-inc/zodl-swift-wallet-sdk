@@ -223,7 +223,8 @@ private extension SaplingParameterDownloader {
         logger.debug("Downloading sapling file from \(sourceURL) via Tor")
 
         let request = URLRequest(url: sourceURL)
-        let (data, response) = try await torClient.httpRequest(for: request, retryLimit: 2)
+        // Sapling parameters are ~48 MB, well under the 256 MiB Tor HTTP limit
+        let (data, response) = try await torClient.httpRequest(for: request, maxBytes: (256 * 1024 * 1024) + (1024 * 1024), retryLimit: 2)
 
         guard response.statusCode == 200 else {
             throw ZcashError.saplingParamsDownload(
@@ -237,6 +238,8 @@ private extension SaplingParameterDownloader {
         let tempFile = parentDir.appendingPathComponent(UUID().uuidString)
 
         do {
+            // Ensure parent directory exists before writing temp file
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
             try data.write(to: tempFile, options: .atomic)
             // Validate BEFORE moving to destination (atomic: download → validate → move)
             try validator(tempFile)
