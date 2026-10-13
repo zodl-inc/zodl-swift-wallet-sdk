@@ -61,14 +61,30 @@ final class OHTTPTests: XCTestCase {
         // Allowed path: /valargroup/token-holder-voting-config/*
         let allowedURL = URL(string: "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/main/pins/prod/abc123/v2-static-voting-config.json")!
         let proxyHost = OHTTPEndpoints.proxyHost(for: allowedURL)
-        XCTAssertEqual(proxyHost, "ohttp-gateway.example",
-                       "Allowed valargroup voting config path should route through mainnet gateway")
+        XCTAssertEqual(proxyHost, "raw.githubusercontent.com",
+                       "Allowed valargroup voting config path returns raw.githubusercontent.com (passthrough by :authority)")
 
         // Allowed path with checksum parameter
         let allowedWithChecksum = URL(string: "https://raw.githubusercontent.com/valargroup/token-holder-voting-config/main/pins/prod/def456/v2-static-voting-config.json?checksum=sha256:abc")!
         let proxyHostWithChecksum = OHTTPEndpoints.proxyHost(for: allowedWithChecksum)
-        XCTAssertEqual(proxyHostWithChecksum, "ohttp-gateway.example",
-                       "Allowed path with query should route through gateway")
+        XCTAssertEqual(proxyHostWithChecksum, "raw.githubusercontent.com",
+                       "Allowed path with query returns raw.githubusercontent.com")
+
+        // Verify relayURL works for raw.githubusercontent.com
+        XCTAssertNoThrow(try OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com"),
+                         "relayURL should accept raw.githubusercontent.com")
+        let relay = try? OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com")
+        XCTAssertEqual(relay, "https://mainnet-relay.example.invalid/relay",
+                       "raw.githubusercontent.com should use mainnet relay")
+
+        // Verify isGateway recognizes it
+        XCTAssertTrue(OHTTPEndpoints.isGateway("raw.githubusercontent.com"),
+                      "raw.githubusercontent.com should be recognized as a gateway host")
+
+        // Verify proxyURL returns unchanged URL (passthrough)
+        let proxyURL = OHTTPEndpoints.proxyURL(for: allowedURL)
+        XCTAssertEqual(proxyURL, allowedURL,
+                       "proxyURL should return the URL unchanged for passthrough hosts")
     }
 
     func testGitHubOtherPathsRejected() {

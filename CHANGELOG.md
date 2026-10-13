@@ -48,8 +48,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sapling parameter Tor downloader now creates the destination directory before writing its temporary
   file, fixing ENOENT when the SDK caller supplies a new parameters directory.
 - OHTTP now routes `GET https://raw.githubusercontent.com/valargroup/token-holder-voting-config/*`
-  through the mainnet gateway for the iOS app's bundled voting-config mirror walk. Other paths on
+  through the mainnet gateway. The host is returned unchanged (passthrough by :authority header),
+  so the inner request authority is `raw.githubusercontent.com` itself. Other paths on
   raw.githubusercontent.com remain rejected as unsupportedPrivateDestination.
+- `TorClient.httpRequest(for:maxBytes:retryLimit:)` now has a default value for `maxBytes`
+  (257 MiB), preserving compatibility with existing callers that do not specify it.
 
 ## Removed
 

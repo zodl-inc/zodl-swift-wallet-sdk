@@ -158,10 +158,10 @@ public actor TorClient {
 
     /// Makes an HTTP request over Tor.
     ///
-    /// - Parameter maxBytes: Maximum allowed response size in bytes
+    /// - Parameter maxBytes: Maximum allowed response size in bytes (defaults to 257 MiB)
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
-    public func httpRequest(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
+    public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
         let runtime = try resolveRuntime()
 
         let url = request.url

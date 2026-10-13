@@ -89,7 +89,11 @@ public enum OHTTPEndpoints {
             return true
         }
         // Check proxy-only gateways
-        return proxyOnlyGateways.contains(lowerHost)
+        if proxyOnlyGateways.contains(lowerHost) {
+            return true
+        }
+        // Check third-party proxy hosts (path-restricted)
+        return isThirdPartyProxyHost(host: lowerHost)
     }
 
     public static func relayURL(for gatewayHost: String) throws -> String {
@@ -100,6 +104,13 @@ public enum OHTTPEndpoints {
         }
         // Check proxy-only gateways
         if proxyOnlyGateways.contains(lowerHost) {
+            guard let relay = mainnetRelayURL else {
+                throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
+            }
+            return relay
+        }
+        // Third-party proxy hosts (path-restricted) use mainnet relay
+        if isThirdPartyProxyHost(host: gatewayHost) {
             guard let relay = mainnetRelayURL else {
                 throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
             }
@@ -149,11 +160,11 @@ public enum OHTTPEndpoints {
         }
 
         // Path-based routing for raw.githubusercontent.com: only /valargroup/token-holder-voting-config/* is allowed
+        // Return the host itself (passthrough by :authority) for allowed paths; nil for others.
         if host.lowercased() == "raw.githubusercontent.com" {
             let path = url.path
             if path.hasPrefix("/valargroup/token-holder-voting-config/") {
-                // Return the mainnet gateway host for this third-party route
-                return "ohttp-gateway.example"
+                return "raw.githubusercontent.com"
             }
             // Other paths on raw.githubusercontent.com are rejected (nil return = unsupportedPrivateDestination)
             return nil
@@ -164,6 +175,12 @@ public enum OHTTPEndpoints {
             return host
         }
         return nil
+    }
+
+    /// Returns true if the host is a third-party host that routes through OHTTP with path restrictions.
+    /// Currently only raw.githubusercontent.com with the valargroup voting config path prefix.
+    private static func isThirdPartyProxyHost(host: String) -> Bool {
+        return host.lowercased() == "raw.githubusercontent.com"
     }
 
     /// Returns true if the host is an alias that carries gateway-injected secrets (CMC, NEAR, voting).
