@@ -35,7 +35,7 @@ public enum SaplingParameterDownloader {
             logger: logger,
             at: at,
             torClient: torClient,
-            validator: isSpendParamsSHA1Valid
+            validator: isSpendParamsSHA256Valid
         )
     }
 
@@ -54,7 +54,7 @@ public enum SaplingParameterDownloader {
             logger: logger,
             at: at,
             torClient: torClient,
-            validator: isOutputParamsSHA1Valid
+            validator: isOutputParamsSHA256Valid
         )
     }
 
@@ -105,7 +105,7 @@ public enum SaplingParameterDownloader {
 
     static func ensureSpendParameter(at url: URL, sourceURL: URL, logger: Logger, torClientProvider: (@Sendable () async -> TorClient?)? = nil) async throws -> URL {
         if isFilePresent(url: url) {
-            try isSpendParamsSHA1Valid(url: url)
+            try isSpendParamsSHA256Valid(url: url)
             return url
         } else {
             var torClient: TorClient?
@@ -118,7 +118,7 @@ public enum SaplingParameterDownloader {
 
     static func ensureOutputParameter(at url: URL, sourceURL: URL, logger: Logger, torClientProvider: (@Sendable () async -> TorClient?)? = nil) async throws -> URL {
         if isFilePresent(url: url) {
-            try isOutputParamsSHA1Valid(url: url)
+            try isOutputParamsSHA256Valid(url: url)
             return url
         } else {
             var torClient: TorClient?
@@ -133,15 +133,15 @@ public enum SaplingParameterDownloader {
         (try? FileManager.default.attributesOfItem(atPath: url.path)) != nil
     }
 
-    static func isSpendParamsSHA1Valid(url: URL) throws {
-        if Insecure.SHA1.hash(data: try Data(contentsOf: url)).hexString != Constants.spendParamFileSHA1 {
+    static func isSpendParamsSHA256Valid(url: URL) throws {
+        if SHA256.hash(data: try Data(contentsOf: url)).hexString != Constants.spendParamFileSHA256 {
             try? FileManager.default.removeItem(at: url)
             throw ZcashError.saplingParamsInvalidSpendParams
         }
     }
 
-    static func isOutputParamsSHA1Valid(url: URL) throws {
-        if Insecure.SHA1.hash(data: try Data(contentsOf: url)).hexString != Constants.outputParamFileSHA1 {
+    static func isOutputParamsSHA256Valid(url: URL) throws {
+        if SHA256.hash(data: try Data(contentsOf: url)).hexString != Constants.outputParamFileSHA256 {
             try? FileManager.default.removeItem(at: url)
             throw ZcashError.saplingParamsInvalidOutputParams
         }
@@ -150,8 +150,8 @@ public enum SaplingParameterDownloader {
 
 private extension SaplingParameterDownloader {
     enum Constants {
-        public static let spendParamFileSHA1 = "a15ab54c2888880e53c823a3063820c728444126"
-        public static let outputParamFileSHA1 = "0ebc5a1ef3653948e1c46cf7a16071eac4b7e352"
+        public static let spendParamFileSHA256 = "8e48ffd23abb3a5fd9c5589204f32d9c31285a04b78096ba40a79b75677efc13"
+        public static let outputParamFileSHA256 = "2f0ebbcbb9bb0bcffe95a397e7eba89c29eb4dde6191c339db88570e3f3fb0e4"
     }
 
     static func downloadFileWithRequestWithContinuation(
