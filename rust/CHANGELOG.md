@@ -38,10 +38,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
     with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
     key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
-=======
 - `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
->>>>>>> origin/main
+  internal JSON envelope for SDK bindings.
 - `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose
+  fragment carries a `v=1` card (`#v=1&key=…&height=…`) or the legacy JSON payment-link encoding at
   `/payment-links/open#vN=` — without touching a database or the network, and returns an
   `FfiGiftCardLink`: its `origin` (`FfiGiftCardOrigin`: `V1`, `LegacyV1`, `LegacyV2`, `LegacyV3`),
   `network_id` (`0` testnet, `1` mainnet; regtest cards are refused), `birthday_height` (never
@@ -452,6 +452,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (every chain and PIR endpoint must be one of the gateway's exact hosts, otherwise the open fails
   with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
   when it is true. PIR queries share the session's route.
+  heights, a negative value means "not activated on this network".
+- `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other
   heights, a negative value means "not activated on this network".
 - `zcashlc_create_proposed_transactions` takes a trailing `ovk_policy: u32`: `0` encrypts the
   outputs to the sending account's outgoing viewing key, as every call did before, and `1` discards
