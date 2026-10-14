@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 // swiftlint:disable force_try
 class SaplingParametersViewController: UIViewController {

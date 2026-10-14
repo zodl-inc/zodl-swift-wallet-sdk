@@ -21,7 +21,7 @@
 import XCTest
 import libzcashlc
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class DBActorIsolationTests: XCTestCase {
     var dbData: URL!

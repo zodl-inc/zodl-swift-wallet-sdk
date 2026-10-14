@@ -38,9 +38,9 @@ use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     address::Address,
     data_api::{
-        Account, AccountBirthday, AccountPurpose, CoinbaseFilter, InputSource, MaxSpendMode,
-        SeedRelevance, TransactionDataRequest, TransactionStatus, TransparentKeyOrigin,
-        WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
+        Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
+        MaxSpendMode, SeedRelevance, TransactionDataRequest, TransactionStatus,
+        TransparentKeyOrigin, WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
         anchor_retention::AnchorRetentionInterval,
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
@@ -95,7 +95,6 @@ use zip32::fingerprint::SeedFingerprint;
 #[cfg(target_vendor = "apple")]
 mod darwin_qos;
 mod derivation;
-mod eip681;
 mod error_report;
 mod ext_schema;
 mod ffi;
@@ -110,12 +109,14 @@ mod ffi;
 mod liberated_payment;
 mod gift_ffi;
 mod interactive_qos;
+mod ledger;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
+mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
 mod send_max;
@@ -173,11 +174,10 @@ pub(crate) fn anchor_retention_interval(network: NetworkParams) -> AnchorRetenti
 
 /// The busy_timeout every connection onto the wallet database file must use while the slipstream
 /// engine is a potential concurrent writer. Upstream sets none; a host write (or a migration-store
-/// call, see `migration::open_store_conn`) landing while the engine's writer holds the lock
-/// (`deleteAccount`/`importAccount` mid-pass, or a write-behind commit) would otherwise die with an
-/// instant SQLITE_BUSY instead of waiting. 15 s matches the engine's main-connection posture
-/// (wallet_session.rs). Behavior-neutral for the legacy engine: it has no concurrent writer to wait
-/// on, so the timeout never engages.
+/// call) landing while the engine's writer holds the lock (`deleteAccount`/`importAccount`
+/// mid-pass, or a write-behind commit) would otherwise die with an instant SQLITE_BUSY instead of
+/// waiting. 15 s matches the engine's main-connection posture (wallet_session.rs). Behavior-neutral
+/// for the legacy engine: it has no concurrent writer to wait on, so the timeout never engages.
 pub(crate) const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The system RNG's type, in the form the NU7 crates' APIs accept. The wallet type aliases name
@@ -192,12 +192,84 @@ pub(crate) fn system_rng() -> SystemRng {
     rand::rand_core::UnwrapErr(rand::rngs::SysRng)
 }
 
+/// How [`wallet_db_connection`] may touch the wallet database file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalletDbAccess {
+    /// Reads and writes, through SQLite's default open, which creates the file when it is missing.
+    /// Only `zcashlc_init_data_database` may rely on that. A caller that must not create a wallet
+    /// first asks SQLite whether the database exists, through a [`WalletDbAccess::ReadOnly`] open,
+    /// which cannot create it. A filesystem check would not do, because the path may be a `file:`
+    /// URI, which only SQLite resolves.
+    ReadWrite,
+    /// Reads only. The connection can neither write to the file nor create it, so a pure read path
+    /// that strays into a write fails with `SQLITE_READONLY` instead of changing the wallet.
+    ReadOnly,
+}
+
+/// Opens a connection onto the wallet database at `path` with the setup a wallet handle needs:
+/// [`WALLET_DB_BUSY_TIMEOUT`], and the array module that [`WalletDb::from_connection`] requires to
+/// be loaded already. The handles [`wallet_db`] and [`wallet_db_read_only`] build, the migration
+/// store's connection, and the connection the block-rate read opens all come from here, so none of
+/// them can drift from the others' lock wait.
+///
+/// `path` may be a SQLite `file:` URI, which is what the Swift SDK passes, and both accesses open
+/// with the URI flag (the read-write one through rusqlite's default flags), so resolving one does
+/// not depend on how SQLite was compiled.
+pub(crate) fn wallet_db_connection(
+    path: &Path,
+    access: WalletDbAccess,
+) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = match access {
+        WalletDbAccess::ReadWrite => rusqlite::Connection::open(path)?,
+        WalletDbAccess::ReadOnly => rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?,
+    };
+    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)?;
+    rusqlite::vtab::array::load_module(&conn)?;
+    Ok(conn)
+}
+
+/// Builds a WalletDb value from path data provided over the FFI, over a connection that
+/// [`wallet_db_connection`] opens with `access`. [`wallet_db`] and [`wallet_db_read_only`] differ
+/// only in the access they pass, so a handle is put together the same way for both.
+///
+/// A failed open is labelled by `access`. The read-write label is the one [`wallet_db`]'s callers
+/// have always seen, so its error text does not change.
+///
+/// # Safety
+///
+/// Same contract as [`wallet_db`].
+unsafe fn wallet_db_with_access<R: rand::CryptoRng>(
+    rng: R,
+    db_data: *const u8,
+    db_data_len: usize,
+    network: NetworkParams,
+    access: WalletDbAccess,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, R>> {
+    let db_data = Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }));
+    let conn = wallet_db_connection(db_data, access).map_err(|e| match access {
+        WalletDbAccess::ReadWrite => anyhow!("Error opening wallet database connection: {}", e),
+        WalletDbAccess::ReadOnly => {
+            anyhow!("Error opening read-only wallet database connection: {}", e)
+        }
+    })?;
+    Ok(WalletDb::from_connection(conn, network, SystemClock, rng)
+        .with_anchor_retention_interval(anchor_retention_interval(network)))
+}
+
 /// Helper method for construcing a WalletDb value from path data provided over the FFI.
 ///
 /// The returned handle retains its durable anchor checkpoints on the interval
 /// [`anchor_retention_interval`] selects for `network`, which is also the grid the next pool
-/// migration planned over this wallet will anchor to. Every wallet handle the FFI hands out is
-/// built here, so the two cannot be configured inconsistently.
+/// migration planned over this wallet will anchor to. [`wallet_db_with_access`] builds the handles
+/// of both this function and [`wallet_db_read_only`], so that interval and that grid cannot be
+/// configured inconsistently.
 ///
 /// # Safety
 ///
@@ -213,19 +285,31 @@ unsafe fn wallet_db<R: rand::CryptoRng>(
     db_data_len: usize,
     network: NetworkParams,
 ) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, R>> {
-    let db_data = Path::new(OsStr::from_bytes(unsafe {
-        slice::from_raw_parts(db_data, db_data_len)
-    }));
-    // Mirror `WalletDb::for_path` (open + array vtab + wrap) but give the connection
-    // a busy_timeout first — see `WALLET_DB_BUSY_TIMEOUT` above for the rationale.
-    let conn = rusqlite::Connection::open(db_data)
-        .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))?;
-    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)
-        .map_err(|e| anyhow!("Error setting wallet database busy_timeout: {}", e))?;
-    rusqlite::vtab::array::load_module(&conn)
-        .map_err(|e| anyhow!("Error loading wallet database array module: {}", e))?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, rng)
-        .with_anchor_retention_interval(anchor_retention_interval(network)))
+    unsafe {
+        wallet_db_with_access(
+            rng,
+            db_data,
+            db_data_len,
+            network,
+            WalletDbAccess::ReadWrite,
+        )
+    }
+}
+
+/// Read-only twin of [`wallet_db`]: the same handle over a [`WalletDbAccess::ReadOnly`]
+/// connection, so neither the handle nor anything built on it can write to the wallet database,
+/// or create it.
+///
+/// # Safety
+///
+/// Same contract as [`wallet_db`].
+unsafe fn wallet_db_read_only<R: rand::CryptoRng>(
+    rng: R,
+    db_data: *const u8,
+    db_data_len: usize,
+    network: NetworkParams,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, NetworkParams, SystemClock, R>> {
+    unsafe { wallet_db_with_access(rng, db_data, db_data_len, network, WalletDbAccess::ReadOnly) }
 }
 
 /// Helper method for construcing a FsBlockDb value from path data provided over the FFI.
@@ -253,6 +337,33 @@ pub(crate) fn account_uuid_from_bytes(
     Ok(AccountUuid::from_uuid(Uuid::from_bytes(
         <[u8; 16]>::try_from(uuid_bytes)?,
     )))
+}
+
+// Per-target filter instead of a bare global level:
+// upstream `zcash_client_backend` #[instrument]s every block and batch
+// (~600k spans per fresh restore) at INFO, and through the os_log +
+// signpost layers each span costs syscalls on the scan producer thread
+// — measured as production pass1 3.4 s vs 0.5 s in the filtered
+// CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
+// host-chosen level still governs everything else (engine logs
+// unchanged). Mirrors the filter the CLI and bench probe ship since
+// v0.6 P6.
+fn log_targets(host: LevelFilter) -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(host)
+        .with_target("zcash_client_backend", LevelFilter::WARN.min(host))
+        // The network stack under the sync engine: h2 logs every frame it receives at DEBUG, tens
+        // of thousands of events per resync, each through the os_log and signpost layers on the
+        // connection threads themselves. At most WARN, and never above the host's level: each
+        // target below is capped at `LevelFilter::WARN.min(host)` rather than a bare WARN
+        // default, because a global WARN default would also silence the engine's own INFO
+        // report lines whenever the host asks for INFO or more.
+        .with_target("h2", LevelFilter::WARN.min(host))
+        .with_target("hyper", LevelFilter::WARN.min(host))
+        .with_target("hyper_util", LevelFilter::WARN.min(host))
+        .with_target("rustls", LevelFilter::WARN.min(host))
+        .with_target("tonic", LevelFilter::WARN.min(host))
+        .with_target("tower", LevelFilter::WARN.min(host))
 }
 
 /// Initializes global Rust state, such as the logging infrastructure and threadpools.
@@ -300,18 +411,7 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
             })
     };
 
-    // Per-target filter instead of a bare global level:
-    // upstream `zcash_client_backend` #[instrument]s every block and batch
-    // (~600k spans per fresh restore) at INFO, and through the os_log +
-    // signpost layers each span costs syscalls on the scan producer thread
-    // — measured as production pass1 3.4 s vs 0.5 s in the filtered
-    // CLI/probe (2026-07-08 A18 seal log). Cap that crate at WARN; the
-    // host-chosen level still governs everything else (engine logs
-    // unchanged). Mirrors the filter the CLI and bench probe ship since
-    // v0.6 P6.
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_default(log_filter)
-        .with_target("zcash_client_backend", LevelFilter::WARN);
+    let log_filter = log_targets(log_filter);
 
     // Set up the tracing layers for the Apple OS logging framework.
     #[cfg(target_vendor = "apple")]
@@ -328,8 +428,8 @@ pub unsafe extern "C" fn zcashlc_init_on_load(log_level: *const c_char) {
     // the subscriber): greppable in device logs AND via `strings` on the
     // built slice.
     tracing::info!(
-        zcashlc_build = "2026-08-26.v0.14-interactive-proving-qos",
-        "tracing initialized (zcash_client_backend capped at WARN)"
+        zcashlc_build = "2026-09-30.v0.15-network-log-cap",
+        "tracing initialized (zcash_client_backend and the network stack capped at min(host, WARN))"
     );
 
     // Log panics instead of writing them to stderr.
@@ -2306,8 +2406,40 @@ pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
     unwrap_exc_or(res, -1)
 }
 
+/// The `key_source` tag the platform layers stamp on a Ledger import, compared case-
+/// insensitively. It is the only account-level signal this SDK has that a proposal must be
+/// signable by the Ledger Zcash app rather than an in-app or Keystone signer. Mirrored in Swift
+/// as `Account.ledgerKeySource`.
+pub(crate) const LEDGER_KEY_SOURCE: &str = "ledger";
+
+/// The change-output split policy to build a proposal's change strategy with, for an account
+/// whose stored source is `source` (`None` when the account was not found).
+///
+/// The Ledger Zcash app signs exactly one change output per transaction, and the Ledger engine
+/// refuses to build a second one before the first command goes out. A Ledger-tagged account (see
+/// [`LEDGER_KEY_SOURCE`]) therefore proposes with [`SplitPolicy::single_output`]. Every other
+/// account — no tag, any other tag, or an account this call could not find — keeps the policy
+/// [`zip317_helper`] always used before this account-level distinction existed: split change into
+/// up to four outputs of at least 0.1 ZEC each, mirroring
+/// [`crate::migration_engine::run_sizing`]'s Keystone match exactly up to ASCII case (nothing is
+/// trimmed, prefixed, or substring-matched).
+pub(crate) fn change_split_policy(source: Option<&AccountSource>) -> SplitPolicy {
+    let is_ledger = source
+        .and_then(|source| source.key_source())
+        .is_some_and(|tag| tag.eq_ignore_ascii_case(LEDGER_KEY_SOURCE));
+    if is_ledger {
+        SplitPolicy::single_output()
+    } else {
+        SplitPolicy::with_min_output_value(
+            NonZeroUsize::new(4).unwrap(),
+            Zatoshis::const_from_u64(1000_0000),
+        )
+    }
+}
+
 fn zip317_helper<DbT>(
     change_memo: Option<MemoBytes>,
+    split_policy: SplitPolicy,
 ) -> (
     MultiOutputChangeStrategy<StandardFeeRule, DbT>,
     GreedyInputSelector<DbT>,
@@ -2318,10 +2450,7 @@ fn zip317_helper<DbT>(
             change_memo,
             ShieldedPool::Orchard,
             DustOutputPolicy::default(),
-            SplitPolicy::with_min_output_value(
-                NonZeroUsize::new(4).unwrap(),
-                Zatoshis::const_from_u64(1000_0000),
-            ),
+            split_policy,
         ),
         GreedyInputSelector::new(),
     )
@@ -2395,7 +2524,11 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
                 })
         }?;
 
-        let (change_strategy, input_selector) = zip317_helper(None);
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            None,
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
 
         let req = TransactionRequest::new(vec![
             Payment::new(to, Some(value), memo, None, None, vec![]).map_err(|e| {
@@ -2619,7 +2752,11 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
         let payment_uri_str = unsafe { CStr::from_ptr(payment_uri) }.to_str()?;
 
-        let (change_strategy, input_selector) = zip317_helper(None);
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            None,
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
 
         let req = TransactionRequest::from_uri(payment_uri_str).map_err(|e| {
             debug!("{CONTEXT}: payment URI did not parse: {e:?}");
@@ -2843,7 +2980,11 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
             return Ok(ffi::BoxedSlice::none());
         };
 
-        let (change_strategy, input_selector) = zip317_helper(Some(memo_bytes));
+        let account = db_data.get_account(account_uuid)?;
+        let (change_strategy, input_selector) = zip317_helper(
+            Some(memo_bytes),
+            change_split_policy(account.as_ref().map(|a| a.source())),
+        );
         let lock_inputs = None;
         let proposal = propose_shielding::<_, _, _, _, Infallible>(
             &mut db_data,
@@ -5052,6 +5193,7 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Level;
 
     /// The C callers select the outgoing viewing key policy by number; only the two documented
     /// values are accepted, so a caller asking for an unrecoverable send is never silently given
@@ -5323,6 +5465,133 @@ mod tests {
             .expect_err("an unknown transaction cannot be trusted");
         assert!(error.to_string().contains("not stored in this wallet"));
         assert!(db.get_transaction(txid).unwrap().is_none());
+    }
+
+    /// The tag is matched case-insensitively: a wallet that capitalizes it differently is still a
+    /// Ledger account, exactly like [`crate::migration_engine::run_sizing`]'s Keystone match.
+    #[test]
+    fn a_ledger_tag_selects_a_single_change_output() {
+        for tag in ["ledger", "Ledger", "LEDGER"] {
+            let source = AccountSource::Imported {
+                purpose: AccountPurpose::ViewOnly,
+                key_source: Some(tag.to_string()),
+            };
+            let policy = change_split_policy(Some(&source));
+            assert_eq!(
+                policy.target_output_count(),
+                NonZeroUsize::new(1).unwrap(),
+                "a `{tag}` account must propose a single change output"
+            );
+            assert_eq!(
+                policy.min_split_output_value(),
+                None,
+                "a `{tag}` account's single-output policy carries no minimum split value"
+            );
+        }
+    }
+
+    /// Everything not exactly `ledger` (case-insensitively) — a missing account, no tag, another
+    /// wallet's tag, or a near-miss (leading space, suffix, product name) — keeps the crate's
+    /// default note-splitting policy. The match is exact up to ASCII case: nothing is trimmed,
+    /// prefixed, or substring-matched.
+    #[test]
+    fn every_other_account_keeps_the_note_splitting_policy() {
+        let tagged = |key_source: Option<&str>| AccountSource::Imported {
+            purpose: AccountPurpose::ViewOnly,
+            key_source: key_source.map(str::to_string),
+        };
+        let sources = [
+            None,
+            Some(tagged(None)),
+            Some(tagged(Some("zashi"))),
+            Some(tagged(Some("keystone"))),
+            Some(tagged(Some(" ledger"))),
+            Some(tagged(Some("ledger2"))),
+            Some(tagged(Some("ledger nano"))),
+        ];
+        for source in &sources {
+            let policy = change_split_policy(source.as_ref());
+            assert_eq!(
+                policy.target_output_count(),
+                NonZeroUsize::new(4).unwrap(),
+                "{source:?} must keep the default note-splitting target of 4"
+            );
+            assert_eq!(
+                policy.min_split_output_value(),
+                Some(Zatoshis::const_from_u64(1000_0000)),
+                "{source:?} must keep the default 0.1 ZEC minimum split value"
+            );
+        }
+    }
+
+    /// A silenced host (`.noLogging` on the Swift side) must silence the network stack and
+    /// `zcash_client_backend` too — a `Targets` entry sets a crate's level, it doesn't cap it,
+    /// so a naive `.with_target(crate, LevelFilter::WARN)` would keep emitting WARN events from
+    /// these crates even when the host asked for nothing at all.
+    #[test]
+    fn log_targets_host_off_disables_network_and_backend_targets() {
+        let targets = log_targets(LevelFilter::OFF);
+        assert!(
+            !targets.would_enable("h2", &Level::ERROR),
+            "h2 must not log ERROR when the host asked for no logging at all"
+        );
+        assert!(
+            !targets.would_enable("h2", &Level::WARN),
+            "h2 must not log WARN when the host asked for no logging at all"
+        );
+        assert!(
+            !targets.would_enable("zcash_client_backend", &Level::WARN),
+            "zcash_client_backend must not log WARN when the host asked for no logging at all"
+        );
+    }
+
+    /// `.default(.error)` on the Swift side must still let the capped crates report their own
+    /// ERROR events; only their WARN level (or below) should give way to the stricter host level.
+    #[test]
+    fn log_targets_host_error_caps_network_crate_at_error() {
+        let targets = log_targets(LevelFilter::ERROR);
+        assert!(
+            targets.would_enable("rustls", &Level::ERROR),
+            "rustls must still log ERROR when the host asked for ERROR"
+        );
+        assert!(
+            !targets.would_enable("rustls", &Level::WARN),
+            "rustls must not log WARN when the host asked for ERROR only"
+        );
+    }
+
+    /// A permissive host (DEBUG or more) must not pull the capped crates up past WARN, but must
+    /// leave engine targets (outside the capped seven) following the host level directly.
+    #[test]
+    fn log_targets_host_debug_leaves_capped_crate_at_warn_and_engine_at_host_level() {
+        let targets = log_targets(LevelFilter::DEBUG);
+        assert!(
+            targets.would_enable("hyper", &Level::WARN),
+            "hyper must still log WARN when the host asked for DEBUG"
+        );
+        assert!(
+            !targets.would_enable("hyper", &Level::INFO),
+            "hyper must stay capped at WARN even when the host asked for DEBUG"
+        );
+        assert!(
+            targets.would_enable("zodl_slipstream", &Level::DEBUG),
+            "an uncapped engine target must follow the host's DEBUG level"
+        );
+    }
+
+    /// Same shape one rung down: INFO host still caps the network stack at WARN, while an
+    /// engine target (not one of the seven) follows the host level directly.
+    #[test]
+    fn log_targets_host_info_leaves_capped_crate_at_warn_and_engine_at_host_level() {
+        let targets = log_targets(LevelFilter::INFO);
+        assert!(
+            targets.would_enable("tower", &Level::WARN),
+            "tower must still log WARN when the host asked for INFO"
+        );
+        assert!(
+            targets.would_enable("zodl_slipstream", &Level::INFO),
+            "an uncapped engine target must follow the host's INFO level"
+        );
     }
 }
 
@@ -7585,7 +7854,7 @@ mod engine_schema_names_tests {
             slipstream_core::reconcile::RECONCILE_VIEW_NAME,
             "ext_slipstream_v_tx_reconciled",
             "the engine renamed the reconciliation view; update the query in \
-             Sources/ZcashLightClientKit/DAO/TransactionDao.swift to match"
+             Sources/ZODLSwiftWalletSDK/DAO/TransactionDao.swift to match"
         );
     }
 

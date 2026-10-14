@@ -1,13 +1,13 @@
 //
 //  RegtestActivationHeightsTests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Offline coverage for configurable NU activation heights (regtest / custom network).
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class RegtestActivationHeightsTests: XCTestCase {
     // MARK: - Network model

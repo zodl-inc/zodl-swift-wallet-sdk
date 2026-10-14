@@ -1,6 +1,6 @@
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardRecipientTests: ZcashTestCase {
     // Published mainnet vectors are validated by Rust rather than relabelled as testnet.

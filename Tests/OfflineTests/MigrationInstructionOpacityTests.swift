@@ -4,7 +4,7 @@
 //
 //  The COMPILATION-SHAPE half of the instruction-executor capability discipline (task 4.4).
 //
-//  This file imports `ZcashLightClientKit` WITHOUT `@testable` — deliberately, and it is the whole
+//  This file imports `ZODLSwiftWalletSDK` WITHOUT `@testable` — deliberately, and it is the whole
 //  point: it sees exactly what an app sees. Every other migration test file reaches the internal
 //  initializers of `MigrationBroadcastInstruction` / `MigrationProveTarget` through `@testable` so
 //  it can drive the executors; this one proves that an app cannot.
@@ -51,7 +51,7 @@
 //
 //  ONE deliberate escape hatch exists, and it is not reachable from this file's plain import:
 //  both initializers are `@_spi(Testing) public`, so a TEST target that writes
-//  `@_spi(Testing) import ZcashLightClientKit` may construct instructions (downstream apps'
+//  `@_spi(Testing) import ZODLSwiftWalletSDK` may construct instructions (downstream apps'
 //  suites need genuine instructions to exercise their drivers). The SPI name is the ceremony —
 //  greppable, deliberate, and never present in a production import. This file intentionally
 //  keeps the plain import so the claims above stay verified against the surface an app ships on.
@@ -59,7 +59,7 @@
 
 import Foundation
 import XCTest
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 
 final class MigrationInstructionOpacityTests: XCTestCase {
     /// Nothing this file can build names a transaction for an executor to act on.

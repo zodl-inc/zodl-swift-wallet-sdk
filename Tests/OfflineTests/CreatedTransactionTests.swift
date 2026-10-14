@@ -1,11 +1,11 @@
 //
 //  CreatedTransactionTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class CreatedTransactionTests: ZcashTestCase {
     func testInitFromOverviewMapsFields() throws {

@@ -3,7 +3,7 @@ import XCTest
 import libzcashlc
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Select independently from TorClientTests.testApis, which submits a transaction.
 /// TOR_HTTP_TEST_BASE_URL must provide HTTPBin-compatible /get, /post and /delay/3.

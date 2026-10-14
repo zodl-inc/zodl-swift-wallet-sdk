@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A shared `FfiProposal`/`Proposal` fixture builder for offline tests.
 ///

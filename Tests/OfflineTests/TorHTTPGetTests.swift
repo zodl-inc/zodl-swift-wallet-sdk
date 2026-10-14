@@ -1,7 +1,7 @@
 import Foundation
 import libzcashlc
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class TorHTTPGetTests: XCTestCase {
     func testInvalidRequestsAndZeroTimeoutDoNotCreateRuntime() async throws {

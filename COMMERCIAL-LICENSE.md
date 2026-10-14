@@ -1,14 +1,14 @@
 # Commercial Licensing
 
-ZODL ZcashLightClientKit is dual-licensed.
+ZODL Swift Wallet SDK is dual-licensed.
 
-**Open source.** ZODL ZcashLightClientKit is available to everyone under
+**Open source.** ZODL Swift Wallet SDK is available to everyone under
 the GNU Affero General Public License, version 3 only (AGPL-3.0-only).
-If you incorporate ZODL ZcashLightClientKit into your application, the
+If you incorporate ZODL Swift Wallet SDK into your application, the
 AGPL requires that the complete corresponding source of your application
 be made available under the AGPL to every user to whom it is conveyed or
 who interacts with it over a network. If you are able and willing to
-comply with those conditions, you may use ZODL ZcashLightClientKit free
+comply with those conditions, you may use ZODL Swift Wallet SDK free
 of charge under the terms in the `LICENSE` file.
 
 **Commercial.** If the AGPL's conditions are not compatible with your
@@ -26,9 +26,9 @@ Commercial license inquiries:
 > Email: licensing@zodl.com
 
 Please include a description of your project, how ZODL
-ZcashLightClientKit would be incorporated, and your intended
+Swift Wallet SDK would be incorporated, and your intended
 distribution channels.
 
-Use of ZODL ZcashLightClientKit under the AGPL does not require any
+Use of ZODL Swift Wallet SDK under the AGPL does not require any
 registration, notification, or fee. This document is informational and
 is not itself a license grant.

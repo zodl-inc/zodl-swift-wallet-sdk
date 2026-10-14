@@ -1,6 +1,6 @@
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
     // Returning an empty claim as a successful redemption would hide a missing submission.

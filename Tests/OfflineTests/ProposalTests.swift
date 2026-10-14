@@ -1,13 +1,13 @@
 //
 //  ProposalTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Michal Fousek on 2026-07-29.
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ProposalTests: XCTestCase {
     // MARK: - totalSpendValue()

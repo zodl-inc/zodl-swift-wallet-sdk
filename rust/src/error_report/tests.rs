@@ -126,10 +126,24 @@ fn every_form_of_a_transparent_memo_is_classified_alike() {
 }
 
 #[test]
+fn anchor_not_found_is_classified_and_says_so() {
+    let e = ClassifiedError::classify(
+        "propose_transfer",
+        &TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
+    );
+
+    assert_eq!(e.kind(), ErrorKind::AnchorNotFound);
+    assert_eq!(e.amounts(), None);
+    assert!(e.to_string().contains("anchor"));
+    // the height is a wallet-state detail; it must not reach the report
+    assert!(!e.to_string().contains("1000000"));
+}
+
+#[test]
 fn any_other_proposal_error_is_still_an_invalid_proposal() {
     let e = ClassifiedError::classify(
         "create_proposed_transactions",
-        &TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
+        &TestError::Proposal(ProposalError::RequestTotalInvalid),
     );
 
     assert_eq!(e.kind(), ErrorKind::ProposalInvalid);
@@ -216,6 +230,7 @@ fn every_classification_renders_a_constant_message() {
         TestError::ExpiryHeightConflictsWithCanonicalCrossing {
             requested: 1_000_000.into(),
         },
+        TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
         TestError::Proposal(too_large()),
     ];
 

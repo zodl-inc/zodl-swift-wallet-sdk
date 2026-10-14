@@ -8,6 +8,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
+  internal JSON envelope for SDK bindings.
 - `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose
   fragment carries a `v=1` card (`#v=1&key=…&height=…`) or the legacy JSON payment-link encoding at
   `/payment-links/open#vN=` — without touching a database or the network, and returns an
@@ -41,6 +43,73 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body collection. It otherwise accepts the same arguments and returns the same response as
   `zcashlc_tor_http_get`; expiry or an invalid zero timeout returns null with the thread-local error
   set. Existing GET and POST call sites require no changes.
+- Ledger hardware-wallet signing over Bluetooth LE, through `zcashlc_ledger_*` entry points over the
+  `pczt_ledger` engine. The engine performs no I/O: every function here builds a command or parses a
+  reply, and the caller moves the bytes. A reply passed in is always the raw transport payload, data
+  followed by the two-byte status word.
+  - Errors: every `zcashlc_ledger_*` failure (null / `false` / `-1`) is read with
+    `zcashlc_ledger_take_last_error`, which returns `FfiLedgerError` (free with
+    `zcashlc_ledger_free_error`) and clears the last error exactly as `zcashlc_clear_last_error`
+    does. `kind` is a stable `u32`: `0` internal, `1` user rejected, `2` wrong app, `3` app too old,
+    `4` device mismatch, `5` caps mismatch, `6` derivation budget exhausted, `7` device refused,
+    `8` transaction not signable, `9` malformed reply, `10` invalid input, `11` command not
+    accepted (`0x6901`, resend the identical command after a 50 ms backoff). `status_word` is valid
+    when `has_status_word` is set; `is_transient` and `is_restartable` say whether the device
+    condition can clear and whether a fresh ceremony could succeed. `reason` never carries APDU or
+    reply bytes, a PCZT, a viewing key, an address, a device identity or a signature.
+  - Transport policy, taken from the engine so a platform runner applies the same one:
+    `zcashlc_ledger_max_cmd_not_accepted_retries` (resends allowed after consecutive `0x6901`
+    refusals of one command), `zcashlc_ledger_cmd_not_accepted_backoff_ms` (the pause before each
+    resend) and `zcashlc_ledger_default_timeout_ms` (the timeout for a reply that does not wait on
+    the user).
+  - App version: `zcashlc_ledger_firmware_version_apdu`, and `zcashlc_ledger_parse_app_version`
+    returning `FfiLedgerAppVersion` (`major`, `minor`, `patch`, `supports_pczt`; free with
+    `zcashlc_ledger_free_app_version`).
+  - Device identity: `zcashlc_ledger_device_identity_apdu(network_id)`,
+    `zcashlc_ledger_parse_device_identity` returning the `tpk0-…` string (free with
+    `zcashlc_string_free`), and `zcashlc_ledger_validate_device_identity`.
+    `zcashlc_ledger_check_account_zero_identity(network_id, ufvk, identity)` returns `true` when
+    the transparent item of `ufvk`, the exported key of ZIP 32 account 0, derives the public key
+    that `identity` hashes. It returns `false` with kind `4` (device mismatch) when it does not,
+    kind `9` (malformed reply) when `ufvk` has no transparent item, and kind `10` (invalid input)
+    when an input does not parse. The key of any other account never derives the identity, so the
+    check applies to account 0 only.
+  - Viewing key export: `zcashlc_ledger_ufvk_export_new(network_id, account_index)` returns an
+    opaque `FfiLedgerUfvkExport` driven by `_next_apdu`, `_waits_for_user` and `_process_response`,
+    which returns `FfiLedgerUfvkExportStep` (`status` is one of the
+    `ZCASHLC_LEDGER_UFVK_EXPORT_*` constants; `ufvk` is set on completion; free with
+    `zcashlc_ledger_free_ufvk_export_step`, which wipes the key). The export is terminal on any
+    error but `0x6901`, so a declined export cannot be re-issued. Free the handle with
+    `zcashlc_ledger_free_ufvk_export`.
+  - Address display: `zcashlc_ledger_unified_address_apdu(network_id, account_index,
+    transparent_address_index, display)` and `zcashlc_ledger_parse_unified_address`, which returns
+    the encoded unified address holding only the account's Orchard receiver at diversifier index 0.
+    `zcashlc_ledger_device_unified_address(network_id, ufvk)` returns the address the device
+    displays for the account whose viewing key is `ufvk` (free with `zcashlc_string_free`): the
+    external Orchard receiver at diversifier index 0, alone, encoded exactly as
+    `zcashlc_ledger_parse_unified_address` encodes the device's reply, so the two strings are equal
+    when the device shows the address of that key. It returns null with kind `10` (invalid input)
+    when `ufvk` does not parse, is for another network, or has no Orchard item.
+  - BLE framing: `zcashlc_ledger_ble_mtu_request`, `zcashlc_ledger_parse_ble_mtu_response`
+    (the frame size, or `-1`), `zcashlc_ledger_ble_frames` returning `FfiLedgerFrames` of
+    `FfiLedgerFrame` (free with `zcashlc_ledger_free_frames`, which wipes them), and an opaque
+    `FfiLedgerBleDeframer` (`zcashlc_ledger_ble_deframer_new`, `_push`, `_reset`,
+    `zcashlc_ledger_free_ble_deframer`). `_push` returns a boxed slice with a null pointer while
+    more frames are expected and the complete reply on the last one.
+  - Signing: `zcashlc_ledger_sign_session_new(db_data, db_data_len, network_id,
+    account_uuid_bytes, pczt, pczt_len, device_identity, zip32_account_index, firmware_reply,
+    firmware_reply_len)` returns an opaque `FfiLedgerSignSession`. It loads the account's viewing
+    key from the wallet database, stamps BIP 44 derivations on transparent inputs that pay the
+    account's derived addresses and carry none, redacts the PCZT to the full signer view, marks a
+    single transparent output paying the account's internal (change) address as change, and runs
+    every pre-flight check before any command exists. `_next_step` returns `FfiLedgerSignStep`
+    (free with `zcashlc_ledger_free_sign_step`, which wipes the command): `kind` is a
+    `ZCASHLC_LEDGER_SIGN_STEP_*` constant, `apdu` the command to send, `waits_for_user` whether its
+    reply may wait on the user, `starts_review` whether it opens the on-device review (reported
+    once), `stage` a `ZCASHLC_LEDGER_STAGE_*` constant, and `stream_acknowledged` / `stream_total`
+    the streaming progress. `_process_response` returns a `ZCASHLC_LEDGER_SIGN_STATUS_*` constant
+    or `-1`; `_finish` returns the signed PCZT once, for `zcashlc_extract_and_store_from_pczt`
+    alongside the proven PCZT. Free the handle with `zcashlc_ledger_free_sign_session`.
 - The coinholder-voting C surface for driving a round. Requests and reports cross as UTF-8 JSON in
   an `FfiBoxedSlice` (freed with `zcashlc_free_boxed_slice`), and every failure records a
   `VotingErrorView` JSON object as the thread's last error, so a caller branches on its `kind`
@@ -344,6 +413,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
+- `ErrorKind::AnchorNotFound` (`21`): `zcashlc_take_last_error_report` reports it when creating
+  transactions from a proposal (`zcashlc_create_proposed_transactions`) fails because the wallet
+  has not scanned to a height it can anchor them on. Such failures were reported as
+  `ProposalInvalid` (`17`).
 
 ### Changed
 
@@ -375,15 +448,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unredacted upstream text is logged on the device at `debug!` only. A caller that parsed the old
   text for a cause should take `zcashlc_take_last_error_report` and switch on `kind` instead.
   `zcashlc_propose_shielding` is unchanged and still reports a plain string.
-- `ErrorKind` gains `21` (`TransactionTooLarge`: the transaction would spend too many notes to fit
-  in a block) and `22` (`TransparentMemo`: a memo for a recipient that cannot receive one).
+- `ErrorKind` gains `22` (`TransactionTooLarge`: the transaction would spend too many notes to fit
+  in a block) and `23` (`TransparentMemo`: a memo for a recipient that cannot receive one).
   `zcashlc_create_proposed_transactions` and `zcashlc_create_pczt_from_proposal` report an
-  oversized proposal as `21` rather than `17`. `zcashlc_propose_send_max_transfer` now refuses a
-  send-max whose transaction would not fit in a block, reporting `21`, instead of returning a
+  oversized proposal as `22` rather than `17`. `zcashlc_propose_send_max_transfer` now refuses a
+  send-max whose transaction would not fit in a block, reporting `22`, instead of returning a
   proposal whose transaction creation then fails; it reports a memo for a transparent or TEX
-  recipient as `22` and a recipient with no payable receiver as `10`, where these were previously
+  recipient as `23` and a recipient with no payable receiver as `10`, where these were previously
   `6` and `14`. On every classifying call site, a memo for a recipient that cannot receive one is
-  `22` (previously `6` or `17`), and a shortfall found during change selection is `2` with both
+  `23` (previously `6` or `17`), and a shortfall found during change selection is `2` with both
   amounts (previously `15`).
   `zcashlc_propose_orchard_to_ironwood_migration` applies the same size limit when proposing.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
@@ -549,9 +622,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
   returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
-  migration is no longer registered. On the first migration call, surviving rejection rows are
-  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
-  and the table is dropped.
+  migration is no longer registered.
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
@@ -607,6 +678,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (valargroup/vote-nullifier-pir#173), and `zakura-wallet-lib`
   (zakura-core/wallet-libraries#83). Each entry is replaced by the release that contains its
   pull request. The `zcashlc_voting_*` C surface is unchanged.
+- `zcashlc_init_data_database` now creates the
+  `ext_zcashlc_orchard_ironwood_migration_immediate_runs` extension table, moving into it any
+  records held by the `sdk_immediate_runs` table that read-write `zcashlc_migration_*` calls used
+  to create on demand, and dropping that table. `zcashlc_migration_record_immediate_run` and
+  `zcashlc_migration_progress` read and write only the new table, so `zcashlc_init_data_database`
+  must have run with this version before either is called.
+- `zcashlc_init_data_database` drops the retired
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` table, and read-write
+  `zcashlc_migration_*` calls no longer replay its rows into the migration state first. Rejection
+  marks a wallet never replayed are discarded; the engine re-adjudicates the affected transfers on
+  their next broadcast attempt.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
@@ -709,6 +791,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+- `zcashlc_payment_uri_parse` rejects Ethereum native recipients, ERC-20 recipients, and token
+  contracts whose hexadecimal address is not exactly 40 digits, instead of trusting the pinned
+  EIP-681 parser's over-length address result.
+- `zcashlc_payment_uri_parse` folds all-uppercase Bitcoin and Litecoin bech32 addresses before
+  upstream validation without changing Litecoin's case-sensitive BIP-21 query-key semantics.
+- `zcashlc_payment_uri_parse` rejects overflowing explicit ERC-20 chain IDs and conflicting native
+  Ethereum payment parameters before the pinned parser can erase them from its typed result.
+- `zcashlc_payment_uri_parse` rejects SPL-token amounts that cannot fit the `u64` used by any SPL
+  transfer instruction.
 - `zcashlc_extract_and_store_from_pczt` now records the transaction's Ironwood
   outputs in the stored sent transaction. Every Ironwood output was previously
   omitted, so for a post-NU6.3 PCZT delivering its payment through the Ironwood
@@ -750,6 +841,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
+- `zcashlc_migration_*` read-write entry points no longer create the wallet database, or any table
+  in it, when asked about a wallet that does not exist or was never initialized; they return an
+  error instead (a stray table used to make an empty file look like a wallet).
 
 ## 2.8.0-rc.2 - 2026-07-28
 

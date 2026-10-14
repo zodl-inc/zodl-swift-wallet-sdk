@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class TorHTTPAdmissionTests: ZcashTestCase {
     func testDeadlineCompletesWhileRootActorIsHeld() async throws {
