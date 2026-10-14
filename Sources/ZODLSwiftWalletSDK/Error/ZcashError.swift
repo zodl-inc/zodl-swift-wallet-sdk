@@ -399,8 +399,8 @@ public enum ZcashError: Equatable, Error {
     /// ZRUST0154
     case rustProposalInsufficientFunds(_ available: Zatoshi, _ required: Zatoshi)
     /// The transaction would spend too many notes to fit in a block.
-    /// Raised while building a send-max proposal, and while creating the transactions or the PCZT of
-    /// any proposal. Sending a smaller amount, which spends fewer notes, can succeed.
+    /// Raised while building a send-max proposal or a transfer proposal. Sending a smaller amount,
+    /// which spends fewer notes, can succeed.
     /// ZRUST0159
     case rustProposalTransactionTooLarge
     /// The recipient cannot receive a memo.

@@ -53,15 +53,12 @@ pub(crate) fn too_large() -> ProposalError {
     }
 }
 
-/// A transaction too large for a block is its own kind on every path that reports it: as a
-/// wallet error from proposing or building, and as the bare proposal error a size check
-/// returns.
+/// A transaction too large for a block is its own kind when proposing: as a wallet error from
+/// proposing, and as the bare proposal error a size check returns.
 #[test]
 fn an_oversized_transaction_is_classified_as_too_large() {
-    let from_wallet = ClassifiedError::classify(
-        "create_proposed_transactions",
-        &TestError::Proposal(too_large()),
-    );
+    let from_wallet =
+        ClassifiedError::classify_proposing("propose_transfer", &TestError::Proposal(too_large()));
     let from_check = ClassifiedError::classify_proposal("propose_send_max_transfer", &too_large());
 
     for e in [from_wallet, from_check] {
@@ -73,7 +70,7 @@ fn an_oversized_transaction_is_classified_as_too_large() {
 }
 
 /// Change selection's shortfall is lifted into the same amount-carrying kind as input
-/// selection's, on every path that classifies.
+/// selection's when proposing.
 #[test]
 fn every_form_of_insufficient_funds_is_classified_alike() {
     let available = Zatoshis::const_from_u64(1);
@@ -90,7 +87,7 @@ fn every_form_of_insufficient_funds_is_classified_alike() {
     ];
 
     for error in &errors {
-        let e = ClassifiedError::classify("create_proposed_transactions", error);
+        let e = ClassifiedError::classify_proposing("propose_transfer", error);
         assert_eq!(e.kind(), ErrorKind::InsufficientFunds, "{error:?}");
         assert_eq!(
             e.amounts(),
@@ -102,8 +99,8 @@ fn every_form_of_insufficient_funds_is_classified_alike() {
     }
 }
 
-/// A memo for a recipient that cannot receive one is one kind, whether payment construction or
-/// the proposal reported it.
+/// A memo for a recipient that cannot receive one is one kind when proposing, whether payment
+/// construction or the proposal reported it.
 #[test]
 fn every_form_of_a_transparent_memo_is_classified_alike() {
     let errors: [TestError; 2] = [
@@ -112,7 +109,7 @@ fn every_form_of_a_transparent_memo_is_classified_alike() {
     ];
 
     for error in &errors {
-        let e = ClassifiedError::classify("create_proposed_transactions", error);
+        let e = ClassifiedError::classify_proposing("propose_transfer", error);
         assert_eq!(e.kind(), ErrorKind::TransparentMemo, "{error:?}");
     }
     assert_eq!(
@@ -123,6 +120,44 @@ fn every_form_of_a_transparent_memo_is_classified_alike() {
         .kind(),
         ErrorKind::TransparentMemo
     );
+}
+
+/// Building transactions, and the migration lanes, classify as they always have: none of the
+/// proposing categories is lifted, so each keeps the kind and message it had.
+#[test]
+fn classify_keeps_the_kinds_it_always_had() {
+    let cases: [(TestError, ErrorKind, &str); 4] = [
+        (
+            TestError::Proposal(too_large()),
+            ErrorKind::ProposalInvalid,
+            "the transaction proposal was rejected as invalid",
+        ),
+        (
+            TestError::Proposal(ProposalError::Zip321(Zip321Error::TransparentMemo(0))),
+            ErrorKind::ProposalInvalid,
+            "the transaction proposal was rejected as invalid",
+        ),
+        (
+            TestError::Payment(PaymentError::TransparentMemo),
+            ErrorKind::InvalidPaymentRequest,
+            "the payment could not be constructed from this request",
+        ),
+        (
+            TestError::Change(ChangeError::InsufficientFunds {
+                available: Zatoshis::const_from_u64(1),
+                required: Zatoshis::const_from_u64(2),
+            }),
+            ErrorKind::ChangeSelectionFailed,
+            "change selection failed, possibly for lack of spendable funds",
+        ),
+    ];
+
+    for (error, kind, message) in &cases {
+        let e = ClassifiedError::classify("create_proposed_transactions", error);
+        assert_eq!(e.kind(), *kind, "{error:?}");
+        assert_eq!(e.message(), *message, "{error:?}");
+        assert_eq!(e.amounts(), None, "{error:?}");
+    }
 }
 
 #[test]

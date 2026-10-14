@@ -427,8 +427,8 @@ enum ZcashErrorDefinition {
     // ZRUST0156 retired: it was allocated during gift card development and removed before any
     // release shipped it. Do not reuse the code.
     /// The transaction would spend too many notes to fit in a block.
-    /// Raised while building a send-max proposal, and while creating the transactions or the PCZT of
-    /// any proposal. Sending a smaller amount, which spends fewer notes, can succeed.
+    /// Raised while building a send-max proposal or a transfer proposal. Sending a smaller amount,
+    /// which spends fewer notes, can succeed.
     // sourcery: code="ZRUST0159"
     case rustProposalTransactionTooLarge
     /// The recipient cannot receive a memo.
