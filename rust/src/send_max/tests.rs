@@ -29,6 +29,8 @@ use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork, valu
 use super::*;
 use crate::error_report::Shortfall;
 
+mod migration_lanes;
+
 /// A synthetic wallet with one account, as `zcash_client_backend`'s test harness builds it.
 type TestWallet = TestState<BlockCache, TestDb, LocalNetwork>;
 
