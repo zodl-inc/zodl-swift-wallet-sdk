@@ -1,6 +1,6 @@
 //
 //  Zip317.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 
 import Foundation
