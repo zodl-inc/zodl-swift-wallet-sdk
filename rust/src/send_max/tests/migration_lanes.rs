@@ -12,6 +12,7 @@
 //! report its failures as it always has; the user's Send Max over the same wallet is still
 //! refused as too large.
 
+use zcash_client_backend::proposal::ProposalError;
 use zcash_protocol::consensus::NetworkUpgrade;
 
 use super::*;
@@ -249,4 +250,58 @@ fn the_turnstile_reports_errors_as_before() {
         "{e}"
     );
     assert_unclassified(&e);
+}
+
+// Building
+
+/// Building the transaction of an oversized immediate sweep fails as it always has: upstream's
+/// own size check rejects it, `zcashlc_create_proposed_transactions` classifies that as an
+/// invalid proposal (kind 17, which the Swift SDK reports as `rustCreateToAddress`), and
+/// `zcashlc_create_pczt_from_proposal` reports upstream's text unclassified.
+#[test]
+fn building_an_oversized_immediate_sweep_reports_as_before() {
+    let mut st = wallet_with_too_many_notes();
+    let sweep = propose_immediate(&mut st).expect("the immediate lane proposes the sweep");
+    let usk = st.test_account().unwrap().usk().clone();
+    let account = st.test_account().unwrap().id();
+
+    let build = st
+        .create_proposed_transactions::<Infallible, _, Infallible, _>(
+            &usk,
+            zcash_client_backend::wallet::OvkPolicy::Sender,
+            &sweep,
+        )
+        .expect_err("the sweep is too large to build");
+    assert!(
+        matches!(
+            build,
+            DataApiError::Proposal(ProposalError::TransactionTooLarge { .. })
+        ),
+        "{build}"
+    );
+    // What `zcashlc_create_proposed_transactions` reports.
+    let e = ClassifiedError::classify("create_proposed_transactions", &build);
+    assert_eq!(e.kind(), ErrorKind::ProposalInvalid);
+    assert_eq!(e.kind() as u32, 17);
+    assert_eq!(
+        e.message(),
+        "the transaction proposal was rejected as invalid"
+    );
+    assert_eq!(e.amounts(), None);
+
+    let pczt = st
+        .create_pczt_from_proposal::<Infallible, _, Infallible>(
+            account,
+            zcash_client_backend::wallet::OvkPolicy::Sender,
+            &sweep,
+            None,
+        )
+        .expect_err("the sweep is too large for a PCZT");
+    assert!(
+        matches!(
+            pczt,
+            DataApiError::Proposal(ProposalError::TransactionTooLarge { .. })
+        ),
+        "{pczt}"
+    );
 }

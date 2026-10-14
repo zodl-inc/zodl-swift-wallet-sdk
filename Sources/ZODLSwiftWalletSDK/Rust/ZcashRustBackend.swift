@@ -530,9 +530,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
 
         guard let pcztPtr else {
-            throw proposalError(fallback: "`createPCZTFromProposal` failed with unknown error") {
-                ZcashError.rustCreatePCZTFromProposal($0.message)
-            }
+            throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: "`createPCZTFromProposal` failed with unknown error"))
         }
 
         defer { zcashlc_free_boxed_slice(pcztPtr) }

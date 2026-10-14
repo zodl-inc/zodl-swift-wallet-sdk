@@ -227,6 +227,32 @@ impl ClassifiedError {
         self.amounts
     }
 
+    /// Classifies a failure from proposing a payment (`propose_transfer`, a payment URI, or the
+    /// user's send-max), where the wallet explains the send-max categories to the user.
+    ///
+    /// On top of [`Self::classify`], it reports a transaction too large for a block as
+    /// [`ErrorKind::TransactionTooLarge`], a memo for a recipient that cannot receive one as
+    /// [`ErrorKind::TransparentMemo`], and a shortfall found during change selection as
+    /// [`ErrorKind::InsufficientFunds`] with its amounts. Building a proposal's transactions,
+    /// and the migration lanes, use [`Self::classify`] alone, so they report as they always have.
+    pub fn classify_proposing<DbE, CtE, SelE, FeeE, ChE, NoteRef>(
+        context: &'static str,
+        e: &WalletError<DbE, CtE, SelE, FeeE, ChE, NoteRef>,
+    ) -> Self {
+        match e {
+            // `ChangeError` has its own `InsufficientFunds` variant, which upstream does NOT lift
+            // into `Error::InsufficientFunds`, so a shortfall found during change selection is
+            // lifted here, with its amounts, into the same kind.
+            WalletError::Change(ChangeError::InsufficientFunds {
+                available,
+                required,
+            }) => Self::insufficient_funds(context, *available, *required),
+            WalletError::Proposal(e) => Self::classify_proposal(context, e),
+            WalletError::Payment(PaymentError::TransparentMemo) => Self::transparent_memo(context),
+            other => Self::classify(context, other),
+        }
+    }
+
     /// Classifies a wallet error from proposal construction or transaction creation.
     ///
     /// `context` names the FFI entry point the failure came from, as described on
@@ -255,18 +281,27 @@ impl ClassifiedError {
             WalletError::NoteSelection(_) => {
                 (ErrorKind::NoteSelectionFailed, "input selection failed")
             }
-            // `ChangeError` has its own `InsufficientFunds` variant, which upstream does NOT lift
-            // into `Error::InsufficientFunds`, so a shortfall found during change selection is
-            // lifted here, with its amounts, into the same kind.
-            WalletError::Change(ChangeError::InsufficientFunds {
-                available,
-                required,
-            }) => return Self::insufficient_funds(context, *available, *required),
+            // Reachable as a second insufficient-funds path: `ChangeError` has its own
+            // `InsufficientFunds` variant, which upstream does NOT lift into
+            // `Error::InsufficientFunds`, so a shortfall found during change selection arrives
+            // here rather than as the classified amount-carrying kind. Proposing lifts it; see
+            // [`Self::classify_proposing`].
             WalletError::Change(_) => (
                 ErrorKind::ChangeSelectionFailed,
                 "change selection failed, possibly for lack of spendable funds",
             ),
-            WalletError::Proposal(e) => return Self::classify_proposal(context, e),
+            // The wallet has not scanned to a height it can anchor the proposal on. It is the one
+            // proposal failure the wallet treats as "scan further, then retry" rather than as a bad
+            // request, so it gets its own kind instead of disappearing into `ProposalInvalid` —
+            // the wallet used to recognise it by its upstream text, which redaction removes.
+            WalletError::Proposal(ProposalError::AnchorNotFound(_)) => (
+                ErrorKind::AnchorNotFound,
+                "the wallet has not scanned far enough to anchor this payment; retry once scanning catches up",
+            ),
+            WalletError::Proposal(_) => (
+                ErrorKind::ProposalInvalid,
+                "the transaction proposal was rejected as invalid",
+            ),
             WalletError::ProposalNotSupported => (
                 ErrorKind::ProposalNotSupported,
                 "the proposal requires a feature this build does not support",
@@ -299,9 +334,6 @@ impl ClassifiedError {
                 ErrorKind::BuilderFailed,
                 "the transaction builder returned an error",
             ),
-            WalletError::Payment(PaymentError::TransparentMemo) => {
-                return Self::transparent_memo(context);
-            }
             WalletError::Payment(_) => (
                 ErrorKind::InvalidPaymentRequest,
                 "the payment could not be constructed from this request",

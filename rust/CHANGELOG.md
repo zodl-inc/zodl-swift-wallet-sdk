@@ -441,23 +441,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier stop or start stays on record so a later stop keeps reporting `false` until it has
   actually finished; previously it returned `true` regardless.
 - `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
-  `zcashlc_propose_send_max_transfer`, `zcashlc_create_proposed_transactions`, and
-  `zcashlc_create_pczt_from_proposal` classify their failures instead of flattening them into a
-  string. Their last-error text now reads
+  `zcashlc_propose_send_max_transfer`, and `zcashlc_create_proposed_transactions` classify their
+  failures instead of flattening them into a string. Their last-error text now reads
   `<call site>: <redacted message>`, with the same redaction guarantee as `FfiErrorReport`, and the
   unredacted upstream text is logged on the device at `debug!` only. A caller that parsed the old
   text for a cause should take `zcashlc_take_last_error_report` and switch on `kind` instead.
   `zcashlc_propose_shielding` is unchanged and still reports a plain string.
 - `ErrorKind` gains `22` (`TransactionTooLarge`: the transaction would spend too many notes to fit
   in a block) and `23` (`TransparentMemo`: a memo for a recipient that cannot receive one).
-  `zcashlc_create_proposed_transactions` and `zcashlc_create_pczt_from_proposal` report an
-  oversized proposal as `22` rather than `17`. `zcashlc_propose_send_max_transfer` with
-  `orchard_only` false now refuses a send-max whose transaction would not fit in a block,
-  reporting `22`, instead of returning a proposal whose transaction creation then fails; it
-  reports a memo for a transparent or TEX recipient as `23` and a recipient with no payable
-  receiver as `10`, where these were previously `6` and `14`. On every classifying call site, a
-  memo for a recipient that cannot receive one is `23` (previously `6` or `17`), and a shortfall
-  found during change selection is `2` with both amounts (previously `15`).
+  `zcashlc_propose_transfer` and `zcashlc_propose_transfer_from_uri` report an oversized proposal
+  as `22` rather than `17`. `zcashlc_propose_send_max_transfer` with `orchard_only` false now
+  refuses a send-max whose transaction would not fit in a block, reporting `22`, instead of
+  returning a proposal whose transaction creation then fails; it reports a recipient with no
+  payable receiver as `10` rather than `14`. These proposal calls report a memo for a recipient
+  that cannot receive one as `23` (previously `6` or `17`), and a shortfall found during change
+  selection as `2` with both amounts (previously `15`). Transaction and PCZT creation, and
+  `zcashlc_propose_send_max_transfer` with `orchard_only` true, report as before.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and

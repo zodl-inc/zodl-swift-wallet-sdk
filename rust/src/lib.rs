@@ -2566,7 +2566,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
         )
         .map_err(|e| {
             debug!("{CONTEXT} failed: {e}");
-            ClassifiedError::classify(CONTEXT, &e)
+            ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
@@ -2839,7 +2839,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
         )
         .map_err(|e| {
             debug!("{CONTEXT} failed: {e}");
-            ClassifiedError::classify(CONTEXT, &e)
+            ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
@@ -3288,8 +3288,6 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
     proposal_len: usize,
     account_uuid_bytes: *const u8,
 ) -> *mut ffi::BoxedSlice {
-    const CONTEXT: &str = "create_pczt_from_proposal";
-
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
@@ -3315,10 +3313,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
                 target_expiry_height,
                 orchard_pool_padding,
             )
-            .map_err(|e| {
-                debug!("{CONTEXT} failed: {e}");
-                ClassifiedError::classify(CONTEXT, &e)
-            })?;
+            .map_err(|e| anyhow!("Error creating PCZT from single-step proposal: {}", e))?;
 
             Ok(ffi::BoxedSlice::some(pczt.serialize().map_err(|e| {
                 anyhow!("Failed to serialize PCZT: {:?}", e)

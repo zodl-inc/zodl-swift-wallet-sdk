@@ -56,12 +56,20 @@ final class SendMaxProposalErrorTests: XCTestCase {
 
     // MARK: - Every proposal and creation call
 
-    /// A transaction too large for a block is raised at build time, by transaction and PCZT creation,
-    /// for any proposal.
-    func testTransactionTooLargeIsTypedOnEveryPath() {
-        let error = proposalError(for: report(.transactionTooLarge)) { .rustCreateToAddress($0) }
+    /// A transaction too large for a block is typed when a transfer is proposed, too. Building
+    /// transactions never reports this kind: the rust layer classifies build failures as it always has.
+    func testTransactionTooLargeIsTypedWhenProposingATransfer() {
+        let error = proposalError(for: report(.transactionTooLarge)) { .rustProposeTransfer($0) }
 
         XCTAssertEqual(error, .rustProposalTransactionTooLarge)
+    }
+
+    /// Building transactions reports an oversized proposal as an invalid proposal, so it keeps the
+    /// call site's own case, as it always has.
+    func testAnInvalidProposalAtBuildTimeKeepsItsCase() {
+        let failure = report(.proposalInvalid)
+
+        XCTAssertEqual(proposalError(for: failure) { .rustCreateToAddress($0) }, .rustCreateToAddress(failure))
     }
 
     /// The send-max-only categories stay with their call site's case elsewhere.

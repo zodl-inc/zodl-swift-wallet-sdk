@@ -46,9 +46,10 @@ Changes are relative to `5.2.0`.
   Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
   carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
   None of the new cases carries the recipient, the memo or an amount.
-- `createProposedTransactions(proposal:spendingKey:)` and `createPCZTFromProposal(accountUUID:proposal:)`
-  throw `rustProposalTransactionTooLarge` (`ZRUST0159`) for a proposal whose transaction would not
-  fit in a block, instead of `rustCreateToAddress` or `rustCreatePCZTFromProposal`.
+- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
+  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
+  (`ZRUST0159`) for a payment whose transaction would not fit in a block, instead of
+  `rustProposeTransfer` or `rustProposeTransferFromURI`.
 
 ## Changed
 
@@ -78,14 +79,10 @@ Changes are relative to `5.2.0`.
   `rustProposalTransparentMemo` (`ZRUST0160`) and `rustProposalUnsupportedAddress` (`ZRUST0161`).
   An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
 - A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
-  amounts from every proposal and transaction-creation call, where it previously surfaced as the
-  call site's own case with `RustErrorKind.changeSelectionFailed`.
+  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
+  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
 - `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
   stops compiling until they are handled.
-- `createPCZTFromProposal(accountUUID:proposal:)` throws `rustProposalScanRequired` and
-  `rustProposalInsufficientFunds` for those conditions, as `createProposedTransactions` does, and
-  the `String` that `rustCreatePCZTFromProposal` carries is now the redacted, classified message
-  rather than the rust layer's raw error text. No call site needs editing.
 - `migrationProgress(accountUUID:)` and `recordImmediateMigration(accountUUID:txid:)` use a record
   that `prepare()` now creates, so on a wallet upgraded from an earlier SDK version they throw until
   the synchronizer has been prepared with this version.

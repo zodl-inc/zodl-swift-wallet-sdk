@@ -132,7 +132,7 @@ where
 ///
 /// Only the unpayable recipient needs the concrete input selector's error to recognise, so it
 /// is the one arm here; every other category, and anything else, is classified by
-/// [`ClassifiedError::classify`], as it is on every other path. None of the messages carries
+/// [`ClassifiedError::classify_proposing`], as it is when proposing a transfer. None of the messages carries
 /// the recipient, the memo or an amount.
 pub(crate) fn classify<DE, TE, FE, CE, N>(
     context: &'static str,
@@ -147,6 +147,6 @@ pub(crate) fn classify<DE, TE, FE, CE, N>(
             ErrorKind::NoSupportedReceivers,
             "the recipient address exposes no receiver this wallet can pay",
         ),
-        other => ClassifiedError::classify(context, other),
+        other => ClassifiedError::classify_proposing(context, other),
     }
 }
