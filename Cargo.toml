@@ -58,8 +58,21 @@ ur-registry = { git = "https://github.com/KeystoneHQ/keystone-sdk-rust", rev = "
     "std",
 ] }
 
-# EIP-681
-eip681 = "0.1.0"
+# Ledger hardware-wallet signing over Bluetooth LE (`rust/src/ledger.rs`).
+#
+# The sans-I/O APDU engine for the Ledger Zcash app: pairing commands, BLE framing and the PCZT
+# signing session. Default features only (`std`); the USB HID and speculos transports stay off,
+# since the platform layer moves the bytes. Published from the public zodl-inc/pczt-ledger
+# repository.
+pczt_ledger = "=0.1.0-pre.0"
+
+# Payment URI parsing (Bitcoin/Litecoin, EIP-681, Solana Pay).
+# TODO: temporary git-rev pin -- switch to a published crates.io release once payment_uri ships
+# one. Pinned to the zcash/librustzcash#2989 merge commit specifically (not main's moving tip),
+# so this doesn't pick up unrelated later changes; that merge commit is a permanent part of
+# main's history now, so it stays reachable even as main moves on. Same rev as the Android SDK.
+eip681 = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9" }
+payment_uri = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9", features = ["json"] }
 
 # Gift cards (`rust/src/liberated_payment.rs`): payment secrets are BIP 39 entropy encoded as
 # Bech32m. Descriptions are percent-encoded and legacy payloads are base64url (`base64`, below);
@@ -142,6 +155,9 @@ hex = "0.4"
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Plays the device in the Ledger signing tests (`rust/src/ledger/tests.rs`). Matches the engine's
+# own secp256k1 (via zcash_transparent) so the two stay one dependency instance, not two.
+secp256k1 = "0.33"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 # Test-only: enables `zcash_client_sqlite::testing` and, through it,
@@ -220,3 +236,20 @@ zakura-wallet-lib = { git = "https://github.com/zodl-inc/zakura-wallet-libraries
 #zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
+
+# The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
+# transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes
+# in unoptimized halo2 and curve arithmetic and seconds optimized, so the test profile optimizes
+# those crates; nothing else, and no other profile, changes.
+[profile.test.package.halo2_proofs]
+opt-level = 3
+[profile.test.package.halo2_gadgets]
+opt-level = 3
+[profile.test.package.orchard]
+opt-level = 3
+[profile.test.package.pasta_curves]
+opt-level = 3
+[profile.test.package.ff]
+opt-level = 3
+[profile.test.package.group]
+opt-level = 3

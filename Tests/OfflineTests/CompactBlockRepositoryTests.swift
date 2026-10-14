@@ -1,6 +1,6 @@
 //
 //  CompactBlockStorageTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 10/13/19.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
@@ -8,7 +8,7 @@
 
 import Foundation
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import XCTest
 
 class CompactBlockRepositoryTests: ZcashTestCase {

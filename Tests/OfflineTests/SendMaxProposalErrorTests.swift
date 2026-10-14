@@ -4,7 +4,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// The mapping from a classified rust failure to the `ZcashError` a send-max, or any other
 /// proposal or transaction-creation call, throws.
@@ -90,8 +90,9 @@ final class SendMaxProposalErrorTests: XCTestCase {
     }
 
     func testRustErrorKindDecodesTheNewDiscriminants() {
-        XCTAssertEqual(RustErrorKind(ffiValue: 21), .transactionTooLarge)
-        XCTAssertEqual(RustErrorKind(ffiValue: 22), .transparentMemo)
-        XCTAssertEqual(RustErrorKind(ffiValue: 23), .unclassified)
+        XCTAssertEqual(RustErrorKind(ffiValue: 21), .anchorNotFound)
+        XCTAssertEqual(RustErrorKind(ffiValue: 22), .transactionTooLarge)
+        XCTAssertEqual(RustErrorKind(ffiValue: 23), .transparentMemo)
+        XCTAssertEqual(RustErrorKind(ffiValue: 24), .unclassified)
     }
 }

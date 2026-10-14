@@ -1,7 +1,7 @@
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCheckReadinessTests: ZcashTestCase {
     // Removing the settle window returns an authoritative zero before its timer exists.

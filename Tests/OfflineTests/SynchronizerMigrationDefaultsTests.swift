@@ -16,7 +16,7 @@ import Combine
 import Foundation
 @testable import TestUtils
 import XCTest
-@_spi(Testing) @testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 final class SynchronizerMigrationDefaultsTests: XCTestCase {
     private let accountUUID = AccountUUID(id: [UInt8](repeating: 0x01, count: 16))

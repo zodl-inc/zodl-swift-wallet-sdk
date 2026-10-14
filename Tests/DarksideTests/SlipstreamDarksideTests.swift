@@ -1,6 +1,6 @@
 //
 //  SlipstreamDarksideTests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Created for Slipstream task [#1755] — T4.4.
 //
@@ -28,7 +28,7 @@ import Combine
 import Foundation
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class SlipstreamDarksideTests: ZcashTestCase {
     let birthday: BlockHeight = 663150

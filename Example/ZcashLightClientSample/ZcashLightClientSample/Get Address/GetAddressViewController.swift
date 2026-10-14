@@ -7,7 +7,7 @@
 //
 
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 class GetAddressViewController: UIViewController {
     @IBOutlet weak var unifiedAddressLabel: UILabel! // This is your Unified Address
     @IBOutlet weak var tAddressLabel: UILabel! // this is the transparent receiver of your UA above

@@ -1,6 +1,6 @@
 //
 //  TorClientTests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Created by Jack Grigg on 27/02/2025.
 //
@@ -9,7 +9,7 @@ import GRPC
 import XCTest
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 import libzcashlc
 
 class TorClientTests: ZcashTestCase {

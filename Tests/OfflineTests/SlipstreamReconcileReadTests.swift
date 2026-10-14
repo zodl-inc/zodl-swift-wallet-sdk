@@ -1,6 +1,6 @@
 //
 //  SlipstreamReconcileReadTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  [#1755] Covers the SDK read side of the slipstream reconciliation gate:
 //  `TransactionSQLDAO.unreconciledTxids()` reads the `ext_slipstream_v_tx_reconciled`
@@ -12,7 +12,7 @@
 
 import XCTest
 import SQLite
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class SlipstreamReconcileReadTests: XCTestCase {
     private func tempDBPath() -> String {

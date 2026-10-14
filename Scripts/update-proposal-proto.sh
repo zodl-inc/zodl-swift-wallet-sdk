@@ -36,7 +36,7 @@ readonly UPSTREAM_REPO="zcash/librustzcash"
 readonly UPSTREAM_PATH="zcash_client_backend/proto/proposal.proto"
 readonly CRATE="zcash_client_backend"
 readonly LOCK="Cargo.lock"
-readonly DEST="Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/proto/proposal.proto"
+readonly DEST="Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/proto/proposal.proto"
 readonly SWIFT_PREFIX="Ffi"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"

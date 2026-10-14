@@ -9,7 +9,7 @@
 # The proto definitions live in lightwallet-protocol/ as a git subtree; this
 # script pulls the requested ref with `git subtree pull --squash` (recording
 # the exact command in the merge commit message) and then regenerates
-# Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/*.swift.
+# Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/*.swift.
 #
 # Regeneration requires `protoc` on the PATH (provided by the nix dev shell:
 # `nix develop`). The protoc-gen-swift and protoc-gen-grpc-swift plugins are
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 REPO_URL="https://github.com/zcash/lightwallet-protocol.git"
 PREFIX="lightwallet-protocol"
 PROTO_DIR="$PREFIX/walletrpc"
-OUT_DIR="Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf"
+OUT_DIR="Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf"
 PLUGIN_SCRATCH=".build/protoc-plugins"
 
 if [[ $# -ne 1 ]]; then

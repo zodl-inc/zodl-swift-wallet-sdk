@@ -8,7 +8,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class AccountKeySourceTests: XCTestCase {
     func testKeystoneKeySourceIsTheLiteralTheRustSeamMatches() {

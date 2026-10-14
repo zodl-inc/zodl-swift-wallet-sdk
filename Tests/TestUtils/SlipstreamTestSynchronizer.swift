@@ -5,7 +5,7 @@
 
 import Foundation
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 extension ZcashTestCase {
     /// Builds a `SlipstreamSynchronizer` around an injected engine, wired exactly as the shipped one

@@ -1,12 +1,12 @@
 //
 //  BroadcasterTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class BroadcasterTests: ZcashTestCase {
     private var cancellables: [AnyCancellable] = []

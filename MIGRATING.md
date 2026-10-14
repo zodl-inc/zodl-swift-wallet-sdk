@@ -1,17 +1,94 @@
 # Migrating from previous versions to _Unreleased_
 
-## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters, send-max
+## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
 
-`ZcashError` and `ZcashErrorCode` have twenty-two new cases: the gift-card errors `ZGIFT0001` to
-`ZGIFT0016`, which only `GiftCard(link:)` and `GiftCardRedeemer` throw;
-`rustProposalRequiresSaplingParams` (`ZRUST0157`), which `createProposedTransactions` throws for a
-proposal it cannot inspect; `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`) and
-`rustSetTransactionTrust` (`ZRUST0158`), which `GiftCardRedeemer` only logs; and
-`rustProposalTransactionTooLarge` (`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and
-`rustProposalUnsupportedAddress` (`ZRUST0161`), which `proposeSendMax` throws (the first also from
-transaction and PCZT creation). An exhaustive `switch` over either type stops compiling until they
-are handled. The gift-card and send-max cases carry no payload. `RustErrorKind` likewise gains
-`transactionTooLarge` and `transparentMemo`.
+The package, its library product, and its module are renamed, and the repository has moved to
+`https://github.com/zodl-inc/zodl-swift-wallet-sdk`. There is no compatibility product under the
+old name, so every import site changes. SwiftPM derives the `package:` argument of
+`.product(name:package:)` from the last path component of the URL you declare, so update
+`.package(url:)` and `package:` together. GitHub redirects the old URL; a manifest that keeps it
+must keep `package: "zcash-swift-wallet-sdk"` to match.
+
+Before:
+
+```swift
+// Package.swift
+.package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "4.0.0")
+.product(name: "ZcashLightClientKit", package: "zcash-swift-wallet-sdk")
+```
+
+```swift
+import ZcashLightClientKit
+@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
+
+let height: ZcashLightClientKit.BlockHeight = 1
+```
+
+After:
+
+```swift
+// Package.swift — 6.0.0 is the first release containing the rename (unreleased as of
+// this writing; until it exists, pin a revision of main instead of a version range).
+.package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "6.0.0")
+.product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
+```
+
+```swift
+import ZODLSwiftWalletSDK
+@testable import ZODLSwiftWalletSDK
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
+
+let height: ZODLSwiftWalletSDK.BlockHeight = 1
+```
+
+If your dependency uses the explicit-name form, `.package(name: "ZcashLightClientKit", url: …)`,
+drop the `name:` argument or set it to `"zodl-swift-wallet-sdk"`.
+
+Two strings that were derived from the old module name change at runtime: a `ZcashError`
+bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM resource bundle
+is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
+rather than on either string.
+
+## `RustErrorKind` gained a case — `anchorNotFound`
+
+`RustErrorKind`, the type of `RedactedRustError.kind`, has a new case, `anchorNotFound`: creating
+transactions from a proposal failed because the wallet has not scanned far enough to anchor them.
+Such failures were previously reported as `proposalInvalid`.
+
+An exhaustive `switch` over `RustErrorKind` stops compiling until the new case is handled. Do not
+fold it into `proposalInvalid`, where it used to land: a wallet should treat it as "scan further,
+then retry", not as a bad request.
+
+```swift
+// Before: exhaustive over the cases 5.2.0 had.
+catch ZcashError.rustCreateToAddress(let error) {
+    switch error.kind {
+    case .proposalInvalid:
+        showAsBadRequest(error.message)
+    // ... the rest of RustErrorKind's cases
+    }
+}
+
+// After: the new case is "scan further, then retry", not a bad request.
+catch ZcashError.rustCreateToAddress(let error) {
+    switch error.kind {
+    case .proposalInvalid:
+        showAsBadRequest(error.message)
+    case .anchorNotFound:
+        keepSyncingThenRetry()
+    // ... the rest of RustErrorKind's cases
+    }
+}
+```
+
+## `ZcashError` gained cases — send-max
+
+`ZcashError` and `ZcashErrorCode` have three new cases, `rustProposalTransactionTooLarge`
+(`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and `rustProposalUnsupportedAddress`
+(`ZRUST0161`), which `proposeSendMax` throws (the first also from transaction and PCZT creation).
+An exhaustive `switch` over either type stops compiling until they are handled. They carry no
+payload. `RustErrorKind` likewise gains `transactionTooLarge` and `transparentMemo`.
 
 A wallet that treated every `rustProposeSendMaxTransfer` as one condition should handle the
 send-max cases it now sees instead:
@@ -29,6 +106,40 @@ do {
     // Anything else; `failure.kind` names the condition.
 }
 ```
+
+## `ZcashError` gained cases — Ledger hardware wallets
+
+`ZcashError` and `ZcashErrorCode` have twenty-four new cases, `ZLEDG0001` to `ZLEDG0024`, which
+only the Ledger API throws: `LedgerBluetoothScanner`, `LedgerBluetoothTransport`, `LedgerDevice`,
+`LedgerZcashApp`, `LedgerDeviceIdentity` and `Synchronizer.signPCZTWithLedger`. An exhaustive
+`switch` over either type stops compiling until they are handled. Ten of them carry a payload: a
+status word (`ledgerWrongApp`, and `ledgerDeviceRefused`, which also says whether the refusal is
+transient), a reason (`ledgerAppTooOld`, `ledgerCapsMismatch`, `ledgerTransactionNotSignable`,
+`ledgerMalformedReply`, `ledgerInvalidInput`, `ledgerInternal`) or the underlying error
+(`ledgerBluetoothConnectionFailed`, `ledgerTransportFailed`). `ZcashError.ledgerIsRestartable`
+says which of them a fresh attempt could get past.
+
+```swift
+case .ledgerUserRejected, .ledgerAppOpenRejected:
+    // The user declined on the device: offer another attempt.
+    break
+case .ledgerTransportReplaced:
+    // Another connection to the same device displaced this one: do not reconnect from here.
+    break
+case .ledgerBluetoothDisconnected, .ledgerTimeout, .ledgerTransportClosed, .ledgerTransportFailed:
+    // The transport is closed: open a new connection before trying again.
+    break
+```
+
+## `ZcashError` gained cases — gift cards, claim recording, Sapling parameters
+
+`ZcashError` and `ZcashErrorCode` have nineteen new cases: the gift-card errors `ZGIFT0001` to
+`ZGIFT0016`, which only `GiftCard(link:)` and `GiftCardRedeemer` throw;
+`rustProposalRequiresSaplingParams` (`ZRUST0157`), which `createProposedTransactions` throws for a
+proposal it cannot inspect; and `synchronizerTrustedTransactionIdMismatch` (`ZSYNCO0010`) and
+`rustSetTransactionTrust` (`ZRUST0158`), which `GiftCardRedeemer` only logs. An exhaustive
+`switch` over either type stops compiling until they are handled. The gift-card cases carry no
+payload.
 
 ```swift
 case .giftCardCheckTimedOut, .giftCardCheckDisconnected, .giftCardCheckSyncStalled:

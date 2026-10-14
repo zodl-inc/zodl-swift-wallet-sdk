@@ -1,7 +1,7 @@
 import Foundation
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Keeps the native restore boundary offline while exercising real Slipstream preparation.
 actor GiftCardAnchorCapture {

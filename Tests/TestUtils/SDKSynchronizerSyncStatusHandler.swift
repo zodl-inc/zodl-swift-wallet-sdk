@@ -8,7 +8,7 @@
 import Combine
 import Foundation
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class SDKSynchronizerInternalSyncStatusHandler {
     enum StatusIdentifier: String {

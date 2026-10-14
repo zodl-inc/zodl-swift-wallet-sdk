@@ -1,11 +1,11 @@
 //
 //  EndpointSubmitterTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class EndpointSubmitterTests: ZcashTestCase {
     private func makeSubmitter() throws -> GRPCEndpointSubmitter {
@@ -54,6 +54,22 @@ final class EndpointSubmitterTests: ZcashTestCase {
             XCTAssertEqual(code, -25)
             XCTAssertEqual(message, "rejected")
         }
+    }
+
+    func testSubmitTreatsRejectionAsSuccessWhenSameServerKnowsTransaction() async throws {
+        let transaction = makeTransaction()
+        var fetchedTransaction = RawTransaction()
+        fetchedTransaction.data = transaction.raw
+        let service = try RecordingCompactTxStreamerService(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "already known"),
+            fetchedTransaction: fetchedTransaction
+        )
+        defer { try? service.stop() }
+        let submitter = try makeSubmitter()
+
+        try await submitter.submit(transaction: transaction, to: service.endpoint)
+
+        XCTAssertEqual(service.recordedTransactions(), [transaction.raw])
     }
 
     func testSubmitThrowsTransportErrorForUnreachableEndpoint() async throws {

@@ -1,10 +1,10 @@
 //
 //  VotingRustBackendTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// The store half of the voting FFI: the database-bound reads and maintenance
 /// calls a host makes without a round session, plus the process-wide proving

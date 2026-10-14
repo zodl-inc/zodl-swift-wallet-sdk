@@ -70,9 +70,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "ZcashLightClientKit"
-               BuildableName = "ZcashLightClientKit"
-               BlueprintName = "ZcashLightClientKit"
+               BlueprintIdentifier = "ZODLSwiftWalletSDK"
+               BuildableName = "ZODLSwiftWalletSDK"
+               BlueprintName = "ZODLSwiftWalletSDK"
                ReferencedContainer = "container:../..">
             </BuildableReference>
          </BuildActionEntry>

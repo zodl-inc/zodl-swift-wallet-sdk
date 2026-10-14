@@ -7,7 +7,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 @testable import ZcashLightClientSample
 
 // this test exists only for travis ci to build the demo app

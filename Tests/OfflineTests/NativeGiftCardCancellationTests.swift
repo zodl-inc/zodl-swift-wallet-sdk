@@ -1,5 +1,5 @@
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class NativeGiftCardCancellationTests: XCTestCase {
     func testPendingCancellationWhenCompletionHandlerRegistersClosesNativeAdmission() {

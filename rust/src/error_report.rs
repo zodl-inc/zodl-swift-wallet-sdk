@@ -82,12 +82,15 @@ pub enum ErrorKind {
     BalanceOverflow = 19,
     /// A note being spent belongs to neither the internal nor the external viewing key.
     NoteMismatch = 20,
+    /// The wallet has not scanned to a height it can anchor the transaction on: scan further,
+    /// then retry.
+    AnchorNotFound = 21,
     /// The transaction would exceed the maximum size of a block, because it spends too many
     /// notes. Raised when a proposal is made and again when its transactions are built.
-    TransactionTooLarge = 21,
+    TransactionTooLarge = 22,
     /// A memo was given for a recipient that cannot receive one, such as a transparent or
     /// ZIP 320 (TEX) address.
-    TransparentMemo = 22,
+    TransparentMemo = 23,
 }
 
 /// The two amounts describing an [`ErrorKind::InsufficientFunds`] condition.
@@ -167,6 +170,15 @@ impl ClassifiedError {
     /// [`Proposal::check_transaction_size`]: zcash_client_backend::proposal::Proposal::check_transaction_size
     pub fn classify_proposal(context: &'static str, e: &ProposalError) -> Self {
         match e {
+            // The wallet has not scanned to a height it can anchor the proposal on. It is the one
+            // proposal failure the wallet treats as "scan further, then retry" rather than as a bad
+            // request, so it gets its own kind instead of disappearing into `ProposalInvalid` —
+            // the wallet used to recognise it by its upstream text, which redaction removes.
+            ProposalError::AnchorNotFound(_) => Self::new(
+                context,
+                ErrorKind::AnchorNotFound,
+                "the wallet has not scanned far enough to anchor this payment; retry once scanning catches up",
+            ),
             // The input counts it carries describe the user's own wallet, but nothing in the
             // FFI contract reports them yet, and they stay out of the message regardless.
             ProposalError::TransactionTooLarge { .. } => Self::new(

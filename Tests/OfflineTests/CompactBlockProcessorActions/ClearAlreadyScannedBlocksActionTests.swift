@@ -7,7 +7,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ClearAlreadyScannedBlocksActionTests: ZcashTestCase {
     func testClearAlreadyScannedBlocksAction_NextAction() async throws {

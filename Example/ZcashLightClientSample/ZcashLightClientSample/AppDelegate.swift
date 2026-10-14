@@ -8,7 +8,7 @@
 
 import Combine
 import UIKit
-import ZcashLightClientKit
+import ZODLSwiftWalletSDK
 import NotificationBubbles
 
 var loggerProxy = OSLogger(logLevel: .debug)

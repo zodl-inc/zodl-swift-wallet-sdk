@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A `Logger` that prints to stdout so SDK lifecycle logs are visible in
 /// `swift test` console output.

@@ -7,7 +7,7 @@ import Foundation
 import GRPC
 import NIO
 import NIOTransportServices
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     var interceptors: CompactTxStreamerServerInterceptorFactoryProtocol? { nil }
@@ -15,13 +15,15 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     private(set) var endpoint: LightWalletEndpoint!
 
     private let sendResponse: SendResponse
+    private let fetchedTransaction: RawTransaction?
     private let eventLoopGroup = NIOTSEventLoopGroup(loopCount: 1, defaultQoS: .default)
     private let queue = DispatchQueue(label: "RecordingCompactTxStreamerService.queue")
     private var submittedTransactions: [Data] = []
     private var server: Server?
 
-    init(sendResponse: SendResponse) throws {
+    init(sendResponse: SendResponse, fetchedTransaction: RawTransaction? = nil) throws {
         self.sendResponse = sendResponse
+        self.fetchedTransaction = fetchedTransaction
         self.endpoint = LightWalletEndpoint(address: "127.0.0.1", port: 0, secure: false)
 
         let server = try Server.insecure(group: eventLoopGroup)
@@ -69,7 +71,10 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     }
 
     func getTransaction(request: TxFilter, context: StatusOnlyCallContext) -> EventLoopFuture<RawTransaction> {
-        unimplementedUnary(on: context.eventLoop)
+        guard let fetchedTransaction else {
+            return unimplementedUnary(on: context.eventLoop)
+        }
+        return context.eventLoop.makeSucceededFuture(fetchedTransaction)
     }
 
     func sendTransaction(request: RawTransaction, context: StatusOnlyCallContext) -> EventLoopFuture<SendResponse> {
@@ -99,7 +104,7 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedStreaming(on: context.eventLoop)
     }
 
-    func getMempoolStream(request: ZcashLightClientKit.Empty, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
+    func getMempoolStream(request: ZODLSwiftWalletSDK.Empty, context: StreamingResponseCallContext<RawTransaction>) -> EventLoopFuture<GRPCStatus> {
         unimplementedStreaming(on: context.eventLoop)
     }
 
@@ -107,7 +112,7 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func getLatestTreeState(request: ZcashLightClientKit.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<TreeState> {
+    func getLatestTreeState(request: ZODLSwiftWalletSDK.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<TreeState> {
         unimplementedUnary(on: context.eventLoop)
     }
 
@@ -123,11 +128,11 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
         unimplementedStreaming(on: context.eventLoop)
     }
 
-    func getLightdInfo(request: ZcashLightClientKit.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<LightdInfo> {
+    func getLightdInfo(request: ZODLSwiftWalletSDK.Empty, context: StatusOnlyCallContext) -> EventLoopFuture<LightdInfo> {
         unimplementedUnary(on: context.eventLoop)
     }
 
-    func ping(request: ZcashLightClientKit.Duration, context: StatusOnlyCallContext) -> EventLoopFuture<PingResponse> {
+    func ping(request: ZODLSwiftWalletSDK.Duration, context: StatusOnlyCallContext) -> EventLoopFuture<PingResponse> {
         unimplementedUnary(on: context.eventLoop)
     }
 

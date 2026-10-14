@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 struct SomeStructure: Undescribable {
     var info: String

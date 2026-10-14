@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class TorSynchronizerAdapterTests: XCTestCase {
     func testClosureForwardsBoundedGETAndItsResponse() async throws {

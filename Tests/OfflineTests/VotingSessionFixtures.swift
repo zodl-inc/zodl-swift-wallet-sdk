@@ -1,12 +1,12 @@
 //
 //  VotingSessionFixtures.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 import SwiftProtobuf
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Snapshot height every voting fixture votes at.
 ///

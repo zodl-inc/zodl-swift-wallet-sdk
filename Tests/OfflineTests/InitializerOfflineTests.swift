@@ -8,7 +8,7 @@
 import Foundation
 @testable import TestUtils
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class InitializerOfflineTests: XCTestCase {
     let validFileURL = URL(fileURLWithPath: "/some/valid/path/to.file")
