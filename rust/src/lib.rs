@@ -2649,31 +2649,16 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
 
         let proposal = if orchard_only {
-            // `orchard_only` is the immediate migration lane: it sweeps what the turnstile is
-            // for, and must not drag Sapling value (or value already sitting in Ironwood) along
-            // with it. The lane keeps its original proposal exactly: no size check at proposal
-            // time and no send-max classification, so a migration behaves as it always has.
-            let locked_input_policy = LockedInputPolicy::Exclude;
-            let lock_inputs = None;
-            let spend_pools: &[ShieldedPool] = &[ShieldedPool::Orchard];
-
-            propose_send_max_transfer::<_, _, _, Infallible>(
+            propose_orchard_only_send_max(
                 &mut db_data,
                 &network,
                 account_uuid,
-                spend_pools,
-                &StandardFeeRule::Zip317,
                 to,
                 memo,
                 mode,
                 confirmation_policy,
-                &locked_input_policy,
-                lock_inputs,
-            )
-            .map_err(|e| {
-                debug!("{CONTEXT} failed: {e}");
-                ClassifiedError::classify(CONTEXT, &e)
-            })?
+                CONTEXT,
+            )?
         } else {
             let request = send_max::SendMaxRequest {
                 pools: &send_max::SEND_MAX_POOLS,
@@ -2691,6 +2676,53 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
         Ok(ffi::BoxedSlice::some(encoded))
     });
     unwrap_exc_or_null(res)
+}
+
+/// The immediate migration lane's proposal, behind `zcashlc_propose_send_max_transfer` with
+/// `orchard_only` true.
+///
+/// The lane sweeps what the turnstile is for, and must not drag Sapling value (or value already
+/// sitting in Ironwood) along with it. It keeps its original proposal exactly: no size check at
+/// proposal time and no send-max classification, so a migration behaves as it always has. It is
+/// generic only so the synthetic test wallet can drive it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propose_orchard_only_send_max<DbT, P>(
+    db_data: &mut DbT,
+    network: &P,
+    account_uuid: <DbT as InputSource>::AccountId,
+    to: ZcashAddress,
+    memo: Option<MemoBytes>,
+    mode: MaxSpendMode,
+    confirmation_policy: wallet::ConfirmationsPolicy,
+    context: &'static str,
+) -> Result<send_max::SendMaxProposal<<DbT as InputSource>::NoteRef>, ClassifiedError>
+where
+    DbT: WalletWrite + InputSource<Error = <DbT as WalletRead>::Error>,
+    <DbT as InputSource>::NoteRef: Copy + Eq + Ord + std::fmt::Display,
+    <DbT as WalletRead>::Error: std::fmt::Display,
+    P: Parameters + Clone,
+{
+    let locked_input_policy = LockedInputPolicy::Exclude;
+    let lock_inputs = None;
+    let spend_pools: &[ShieldedPool] = &[ShieldedPool::Orchard];
+
+    propose_send_max_transfer::<_, _, _, Infallible>(
+        db_data,
+        network,
+        account_uuid,
+        spend_pools,
+        &StandardFeeRule::Zip317,
+        to,
+        memo,
+        mode,
+        confirmation_policy,
+        &locked_input_policy,
+        lock_inputs,
+    )
+    .map_err(|e| {
+        debug!("{context} failed: {e}");
+        ClassifiedError::classify(context, &e)
+    })
 }
 
 /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
