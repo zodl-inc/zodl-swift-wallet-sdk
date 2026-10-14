@@ -1,11 +1,15 @@
 //! Sending an account's entire spendable shielded balance to one recipient.
 //!
-//! Every send-max this library proposes goes through [`propose`]:
-//! `zcashlc_propose_send_max_transfer` (the wallet's Send Max, the gift card sweep and the
-//! immediate migration lane) as well as the single-shot Orchard to Ironwood turnstile in
-//! [`crate::migration_turnstile`]. [`propose`] is the only place that pins the fee rule and the
-//! input locking behaviour, applies the transaction size limit, and sorts the failures
-//! `zcash_client_backend` reports into the [`ErrorKind`]s a wallet branches on.
+//! The user's send-max goes through [`propose`]: `zcashlc_propose_send_max_transfer` with
+//! `orchard_only` false (the wallet's Send Max and the gift card sweep). [`propose`] is the
+//! only place that pins the fee rule and the input locking behaviour for it, applies the
+//! transaction size limit, and sorts the failures `zcash_client_backend` reports into the
+//! [`ErrorKind`]s a wallet branches on.
+//!
+//! The migration lanes do not use it: the immediate migration lane (`orchard_only` true) and
+//! the single-shot Orchard to Ironwood turnstile in [`crate::migration_turnstile`] call
+//! upstream's `propose_send_max_transfer` directly, exactly as they always have, with neither
+//! the size limit nor this classification.
 //!
 //! The selection itself is upstream's [`propose_send_max_transfer`]: it selects every spendable
 //! note in the chosen pools and computes the ZIP 317 fee internally, so the payment is exactly
@@ -47,10 +51,6 @@ pub(crate) const SEND_MAX_POOLS: [ShieldedPool; 3] = [
     ShieldedPool::Orchard,
     ShieldedPool::Ironwood,
 ];
-
-/// The pool an Orchard to Ironwood migration spends from. Sapling value, and value already in
-/// Ironwood, is deliberately left where it is: a migration moves one pool, it is not a sweep.
-pub(crate) const ORCHARD_ONLY: [ShieldedPool; 1] = [ShieldedPool::Orchard];
 
 /// What to send the maximum of, and to whom.
 #[derive(Debug, Clone)]

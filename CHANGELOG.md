@@ -77,17 +77,6 @@ Changes are relative to `5.2.0`.
 - `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0159`),
   `rustProposalTransparentMemo` (`ZRUST0160`) and `rustProposalUnsupportedAddress` (`ZRUST0161`).
   An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
-- `Synchronizer.proposeImmediateMigration(accountUUID:)` builds a send-max, so it now throws
-  `rustProposalTransactionTooLarge` (`ZRUST0159`) for an Orchard balance spread over more notes
-  than one transaction can spend, and `rustProposalUnsupportedAddress` (`ZRUST0161`), where it
-  previously threw `rustProposeSendMaxTransfer` (`ZRUST0129`) for both; a `catch` keyed on
-  `rustProposeSendMaxTransfer` no longer sees them. An oversized balance is refused when the
-  proposal is made rather than when its transaction is created.
-- `proposeOrchardToIronwoodMigration(accountUUID:)` (on `Synchronizer`, `ClosureSynchronizer` and
-  `CombineSynchronizer`) refuses an Orchard balance spread over more notes than one transaction
-  can spend when the proposal is made, throwing `rustProposeOrchardToIronwoodMigration`
-  (`ZRUST0152`), instead of returning a proposal whose transaction creation then fails. Such a
-  balance could never be migrated in one transaction; the staged migration moves it.
 - A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
   amounts from every proposal and transaction-creation call, where it previously surfaced as the
   call site's own case with `RustErrorKind.changeSelectionFailed`.

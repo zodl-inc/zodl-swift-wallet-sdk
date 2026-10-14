@@ -1,9 +1,9 @@
 //! The single-shot Orchard→Ironwood turnstile proposal, as released in 2.8.0-rc.1.
 //!
-//! Builds on [`crate::send_max::propose`], which spends the entire spendable
-//! balance of a chosen set of shielded pools to one recipient with the fee
-//! computed so nothing is left over. This module only pins the parameters that
-//! make that call the pool migration.
+//! Builds on the upstream `propose_send_max_transfer`, which spends the entire
+//! spendable balance of a chosen set of shielded pools to one recipient with
+//! the fee computed so nothing is left over. This module only pins the
+//! parameters that make that call the pool migration.
 //!
 //! This is NOT the staged pool-migration engine — that lives in [`crate::migration`], which
 //! splits, schedules and delivers a real Orchard balance over many transactions. This one
@@ -13,20 +13,30 @@
 
 use anyhow::anyhow;
 use zcash_address::{ToAddress, ZcashAddress, unified, unified::Encoding as _};
-use zcash_client_backend::data_api::{
-    Account as _, InputSource, MaxSpendMode, WalletRead, wallet::ConfirmationsPolicy,
+use zcash_client_backend::{
+    data_api::{
+        Account as _, InputSource, MaxSpendMode, WalletRead,
+        wallet::{
+            ConfirmationsPolicy, input_selection::LockedInputPolicy, propose_send_max_transfer,
+        },
+    },
+    fees::StandardFeeRule,
+    proposal::Proposal,
 };
 use zcash_client_sqlite::{AccountUuid, WalletDb, util::SystemClock};
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+use zcash_protocol::{
+    ShieldedPool,
+    consensus::{NetworkUpgrade, Parameters},
+    memo::MemoBytes,
+};
 
 use crate::NetworkParams;
-use crate::send_max::{self, ORCHARD_ONLY, SendMaxProposal, SendMaxRequest};
 
 // This line carries custom (regtest-style) networks, so the wallet handle is parameterized by
 // `NetworkParams` rather than `zcash_protocol`'s fixed `Network`.
 type Db = WalletDb<rusqlite::Connection, NetworkParams, SystemClock, crate::SystemRng>;
 
-type MigrationProposal = SendMaxProposal<<Db as InputSource>::NoteRef>;
+type MigrationProposal = Proposal<StandardFeeRule, <Db as InputSource>::NoteRef>;
 
 /// Proposes migrating the account's entire Orchard balance into the Ironwood
 /// pool, sending the maximum from Orchard to the account's own internal Orchard
@@ -77,23 +87,26 @@ pub(crate) fn propose_orchard_to_ironwood(
         .map_err(|e| anyhow!("Unable to construct the migration recipient: {}", e))?,
     );
 
-    let request = SendMaxRequest {
-        pools: &ORCHARD_ONLY,
-        mode: MaxSpendMode::Everything,
-        recipient,
-        memo: None,
-        confirmations_policy: ConfirmationsPolicy::default(),
-    };
+    let spend_pools = [ShieldedPool::Orchard];
+    let fee_rule = StandardFeeRule::Zip317;
+    let memo: Option<MemoBytes> = None;
+    let mode = MaxSpendMode::Everything;
+    let confirmations_policy = ConfirmationsPolicy::default();
+    let locked_input_policy = LockedInputPolicy::Exclude;
+    let lock_inputs = None;
 
-    // The classification is deliberately not forwarded: this entry point has always reported
-    // its failures unclassified, and `send_max::propose` has already logged the unredacted
-    // cause at `debug!`.
-    send_max::propose(
+    propose_send_max_transfer::<_, _, _, std::convert::Infallible>(
         db_data,
         network,
         account,
-        request,
-        "propose_orchard_to_ironwood_migration",
+        &spend_pools,
+        &fee_rule,
+        recipient,
+        memo,
+        mode,
+        confirmations_policy,
+        &locked_input_policy,
+        lock_inputs,
     )
     .map_err(|e| anyhow!("Error creating the migration proposal: {}", e))
 }

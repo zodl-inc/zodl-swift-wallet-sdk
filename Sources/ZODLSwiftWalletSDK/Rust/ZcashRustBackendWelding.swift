@@ -666,8 +666,9 @@ protocol ZcashRustBackendWelding {
     /// - Parameter orchardOnly: when `true`, restricts spendable notes to the Orchard pool alone (the
     ///   immediate migration sweep, which must not draw on Sapling funds); when `false`, spends from
     ///   both Sapling and Orchard (pre-existing behavior).
-    /// - Throws: `rustProposalScanRequired`, `rustProposalInsufficientFunds`, `rustProposalTransactionTooLarge`,
-    ///   `rustProposalTransparentMemo`, `rustProposalUnsupportedAddress`, or otherwise `rustProposeSendMaxTransfer`.
+    /// - Throws: when `orchardOnly` is `true`, `rustProposeSendMaxTransfer`, `rustProposalScanRequired`, or
+    ///   `rustProposalInsufficientFunds`; when `false`, whatever `proposeSendMaxTransfer(accountUUID:to:memo:mode:)`
+    ///   throws.
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         recipient: String,

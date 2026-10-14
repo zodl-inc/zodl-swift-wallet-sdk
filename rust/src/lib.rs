@@ -49,7 +49,7 @@ use zcash_client_backend::{
             create_proposed_transactions, decrypt_and_store_transaction,
             extract_and_store_transaction_from_pczt,
             input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, SpendPolicy},
-            propose_shielding, propose_transfer, redact_pczt_for_signer,
+            propose_send_max_transfer, propose_shielding, propose_transfer, redact_pczt_for_signer,
         },
     },
     encoding::AddressCodec,
@@ -2646,22 +2646,45 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
             ffi::MaxSpendMode::Everything => MaxSpendMode::Everything,
         };
 
-        // `orchard_only` narrows the sweep to Orchard alone: the immediate migration lane
-        // sweeps what the turnstile is for, and must not drag Sapling value (or value
-        // already sitting in Ironwood) along with it.
-        let request = send_max::SendMaxRequest {
-            pools: if orchard_only {
-                &send_max::ORCHARD_ONLY
-            } else {
-                &send_max::SEND_MAX_POOLS
-            },
-            mode,
-            recipient: to,
-            memo,
-            confirmations_policy: wallet::ConfirmationsPolicy::try_from(confirmations_policy)?,
-        };
+        let confirmation_policy = wallet::ConfirmationsPolicy::try_from(confirmations_policy)?;
 
-        let proposal = send_max::propose(&mut db_data, &network, account_uuid, request, CONTEXT)?;
+        let proposal = if orchard_only {
+            // `orchard_only` is the immediate migration lane: it sweeps what the turnstile is
+            // for, and must not drag Sapling value (or value already sitting in Ironwood) along
+            // with it. The lane keeps its original proposal exactly: no size check at proposal
+            // time and no send-max classification, so a migration behaves as it always has.
+            let locked_input_policy = LockedInputPolicy::Exclude;
+            let lock_inputs = None;
+            let spend_pools: &[ShieldedPool] = &[ShieldedPool::Orchard];
+
+            propose_send_max_transfer::<_, _, _, Infallible>(
+                &mut db_data,
+                &network,
+                account_uuid,
+                spend_pools,
+                &StandardFeeRule::Zip317,
+                to,
+                memo,
+                mode,
+                confirmation_policy,
+                &locked_input_policy,
+                lock_inputs,
+            )
+            .map_err(|e| {
+                debug!("{CONTEXT} failed: {e}");
+                ClassifiedError::classify(CONTEXT, &e)
+            })?
+        } else {
+            let request = send_max::SendMaxRequest {
+                pools: &send_max::SEND_MAX_POOLS,
+                mode,
+                recipient: to,
+                memo,
+                confirmations_policy: confirmation_policy,
+            };
+
+            send_max::propose(&mut db_data, &network, account_uuid, request, CONTEXT)?
+        };
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 

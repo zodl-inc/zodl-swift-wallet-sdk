@@ -414,7 +414,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         )
 
         guard let proposal else {
-            throw sendMaxProposalError(fallback: "`proposeSendMaxTransfer` failed with unknown error")
+            let fallback = "`proposeSendMaxTransfer` failed with unknown error"
+
+            // The immediate migration lane (`orchardOnly`) keeps the mapping it has always had;
+            // only the user's send-max reports the send-max cases.
+            if orchardOnly {
+                throw proposalError(fallback: fallback, wrap: ZcashError.rustProposeSendMaxTransfer)
+            }
+
+            throw sendMaxProposalError(fallback: fallback)
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
