@@ -10,7 +10,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class OHTTPSignedConfigTests: XCTestCase {
     private static let testnetHost = "ohttp-gateway-testnet.example"

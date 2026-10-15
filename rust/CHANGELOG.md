@@ -443,6 +443,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed override starts and releases are logged through `tracing`, and a failed release is
   counted — that worker stays boosted for the process lifetime. Non-Apple targets track the
   session refcount but apply no QoS override.
+- `ErrorKind::AnchorNotFound` (`21`): `zcashlc_take_last_error_report` reports it when creating
+  transactions from a proposal (`zcashlc_create_proposed_transactions`) fails because the wallet
+  has not scanned to a height it can anchor them on. Such failures were reported as
+  `ProposalInvalid` (`17`).
 
 ### Changed
 
@@ -453,6 +457,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
   when it is true. PIR queries share the session's route.
   heights, a negative value means "not activated on this network".
+- `libzcashlc` is built for minimum iOS 16 and macOS 14 on every slice (the iOS simulator included);
+  its C objects previously claimed the building Xcode SDK's version.
 - `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other
   heights, a negative value means "not activated on this network".
 - `zcashlc_create_proposed_transactions` takes a trailing `ovk_policy: u32`: `0` encrypts the
@@ -643,9 +649,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal rejection evidence is reported to the upstream engine, whose satisfiability oracle
   returns `Reevaluate` or `Replan`; the FFI projects those onto its existing `Attend` case. The
   `ext_zcashlc_orchard_ironwood_migration_invalid_marks` extension table is retired: its schema
-  migration is no longer registered. On the first migration call, surviving rejection rows are
-  replayed at the current scanned height, funding-spent rows are left for the oracle to rediscover,
-  and the table is dropped.
+  migration is no longer registered.
 - The estimated-tip due-ness split is owned by the upstream engine (`DuenessTargets`) instead of
   hand-rolled SDK twins of the upstream predicates; behaviour additionally gains upstream's
   doomed-broadcast withhold (above).
@@ -701,6 +705,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (valargroup/vote-nullifier-pir#173), and `zakura-wallet-lib`
   (zakura-core/wallet-libraries#83). Each entry is replaced by the release that contains its
   pull request. The `zcashlc_voting_*` C surface is unchanged.
+- `zcashlc_init_data_database` now creates the
+  `ext_zcashlc_orchard_ironwood_migration_immediate_runs` extension table, moving into it any
+  records held by the `sdk_immediate_runs` table that read-write `zcashlc_migration_*` calls used
+  to create on demand, and dropping that table. `zcashlc_migration_record_immediate_run` and
+  `zcashlc_migration_progress` read and write only the new table, so `zcashlc_init_data_database`
+  must have run with this version before either is called.
+- `zcashlc_init_data_database` drops the retired
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` table, and read-write
+  `zcashlc_migration_*` calls no longer replay its rows into the migration state first. Rejection
+  marks a wallet never replayed are discarded; the engine re-adjudicates the affected transfers on
+  their next broadcast attempt.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
@@ -853,6 +868,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
+- `zcashlc_migration_*` read-write entry points no longer create the wallet database, or any table
+  in it, when asked about a wallet that does not exist or was never initialized; they return an
+  error instead (a stray table used to make an empty file look like a wallet).
 
 ## 2.8.0-rc.2 - 2026-07-28
 

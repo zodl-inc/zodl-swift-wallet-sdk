@@ -1,7 +1,7 @@
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCheckReadinessTests: ZcashTestCase {
     // Removing the settle window returns an authoritative zero before its timer exists.
@@ -496,7 +496,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         await fulfillment(of: [harness.clock.expectSleep(at: 15_000_000_000)], timeout: 5)
         caller.cancel()
         do {
-            _ = try await caller.value
+            _ = try await boundedValue(of: caller)
             XCTFail("Cancelled attempt must throw")
         } catch is CancellationError { }
         await fulfillment(of: [stateCancelled, eventCancelled, harness.clock.expectNoPendingSleeps()], timeout: 5)
@@ -505,8 +505,31 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         harness.events.send(.syncStalled(attempt: 9, gaveUp: true))
         harness.clock.advance(to: 15_000_000_000)
         next.states.send(state(tip: 100, scanned: 100, value: 90_000))
-        let accepted = try await nextCaller.value
+        let accepted = try await boundedValue(of: nextCaller)
         XCTAssertEqual(accepted.shieldedSpendableValue, Zatoshi(90_000))
+    }
+
+    /// Awaits the attempt's value, but never longer than the hang backstop. The waiter runs on
+    /// the test clock, so a healthy attempt completes in milliseconds of wall time; this bound
+    /// exists so a regression fails the test in seconds instead of stalling the CI job until its
+    /// timeout kills the runner (run 38475223787 lost 52 minutes to exactly that).
+    private func boundedValue(of task: Task<AccountBalance, Error>, seconds: UInt64 = 30) async throws -> AccountBalance {
+        // The guard runs inside the group so it is always joined before this function returns:
+        // a backstop failure can never be posted late and attributed to a later test.
+        try await withThrowingTaskGroup(of: AccountBalance?.self) { group in
+            group.addTask { try await task.value }
+            group.addTask {
+                guard (try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)) != nil else { return nil }
+                task.cancel()
+                XCTFail("attempt did not complete within the \(seconds) s hang backstop")
+                return nil
+            }
+            defer { group.cancelAll() }
+            while let result = try await group.next() {
+                if let value = result { return value }
+            }
+            throw CancellationError()
+        }
     }
 
     private func fundedArrival(at instant: UInt64) async throws {

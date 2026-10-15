@@ -13,6 +13,23 @@ on:
       - 'SWIFTLINT.md'
       - 'docs/**'
 
+  # Pushes to main build too, so that main always holds warm caches: a
+  # pull_request run can restore only its own caches and its base branch's, and
+  # without these every pull request's first run compiled the whole Rust graph
+  # from scratch. Keep this list identical to the one above.
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'responsible_disclosure.md'
+      - 'SECURITY.md'
+      - 'SWIFTLINT.md'
+      - 'docs/**'
+
 jobs:
   # Checks that the Rust sources are rustfmt-clean. `--check` only reports; it never
   # rewrites. Run `make format-rust` (or `cargo fmt --all`) to fix a failure.
@@ -43,7 +60,10 @@ jobs:
     permissions:
       contents: read
 
-    runs-on: macos-15
+    # Xcode 27 ships only on this image, which GitHub still marks as a public
+    # preview (https://github.com/actions/runner-images/issues/14404). If it
+    # misbehaves, macos-26 with Xcode 26.6 is the fallback.
+    runs-on: xcode-27
 
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -52,47 +72,52 @@ jobs:
       timeout-minutes: 1
 
     - name: Select Xcode version
-      run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+      run: sudo xcode-select -s '/Applications/Xcode_27.0.app/Contents/Developer'
 
     - name: Run release-script tests
       run: make test-scripts
 
-    # Generate a hash of all Rust source files for cache key
+    # Hash every input of the FFI build for the XCFramework cache key.
     - name: Generate FFI source hash
       id: ffi-hash
       run: |
-        # Hash all Rust source files, Cargo files, and build support files
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
+        # Hash the Rust sources, the Cargo files, the build support files and
+        # the root Makefile, whose ffi-ci target decides how CI builds the FFI.
+        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
         echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
         echo "FFI source hash: $FFI_HASH"
 
-    # Cache the built xcframework (macOS-only for CI tests)
+    # Cache the XCFramework `make ffi-ci` builds: the arm64 macOS slice, without
+    # fat LTO. The key names that build, so a cache of a different one is never
+    # restored in its place.
     - name: Cache FFI XCFramework
       id: cache-ffi
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-only-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
+        key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
-    # Runs whenever anything in this job will invoke cargo: an FFI cache miss (the
-    # FFI build below) or an internal PR (the Rust test step). `~/.cargo/git` is
-    # deliberately left out of the cache — see `Cache Cargo` — so every cargo
-    # invocation needs a fresh authenticated clone of the private slipstream repo.
-    # Fork PRs get no secrets, which is why the Rust test step skips them.
+    # This branch fetches private git dependencies (see Cargo.lock), so every
+    # cargo invocation needs this token: an FFI cache miss (the FFI build below)
+    # and the Rust test step, which runs on every event. `~/.cargo/git` is
+    # deliberately left out of the cache, see `Cache Cargo`. Fork PRs get no
+    # secrets; the action then does nothing and their fetches of the private
+    # repositories fail.
     - name: Authorize cargo against the private slipstream repository
-      if: steps.cache-ffi.outputs.cache-hit != 'true' || github.event.pull_request.head.repo.full_name == github.repository
       uses: ./.github/actions/authorize-slipstream
       with:
         app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
         app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
     # Needed unconditionally: even on an FFI cache hit, the Rust test step below
-    # compiles the crate's test profile and so needs the toolchain.
+    # compiles the crate's test profile and so needs the toolchain. Only the
+    # arm64 macOS target: `make ffi-ci` builds nothing else.
     - name: Setup Rust
+      id: toolchain
       uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
       with:
         toolchain: stable
-        targets: aarch64-apple-darwin, x86_64-apple-darwin
+        targets: aarch64-apple-darwin
 
     # Used by both the FFI build and the Rust tests, so it is not conditional on
     # the FFI cache.
@@ -100,31 +125,37 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
-        # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clone of
-        # the PRIVATE zodl-inc/slipstream repo. This repository is public, and GitHub lets
-        # workflow runs from forked pull requests restore caches created on the base branch — a
-        # cached clone would hand fork PRs the private source without their ever holding the App
-        # credential. Re-cloning one small repo per run is the cost of keeping it out.
+        # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clones of
+        # git dependencies. Every git dependency on main is public today (slipstream, once a
+        # private git dependency, now comes from crates.io), but a private one can return — other
+        # branches already pull some — and the public twin of this repository lets workflow runs
+        # from forked pull requests restore caches created on main. A cached clone would hand those
+        # runs the private source without their ever holding a credential for it, so the clones are
+        # fetched afresh on every run instead.
         #
-        # `registry/` is crates.io content and safe to cache. `target/` still holds
-        # slipstream-core's compiled rlib/rmeta, which is a far smaller disclosure than the source
-        # tree and too expensive to rebuild every run; dropping it too would require solving the
-        # public-repo/private-dependency problem properly instead.
+        # `registry/` is crates.io content and safe to cache. `target/` holds compiled rlib/rmeta
+        # files, never sources: a far smaller disclosure should a private dependency return, and
+        # too expensive to rebuild every run. The key names what built `target/`: v2 is ffi-ci's
+        # arm64-only, LTO-off build, so bump it whenever CI's build settings change, and the
+        # toolchain's cachekey starts a fresh cache with each stable Rust release, whose compiler
+        # cannot reuse the old one's artifacts.
         path: |
           target
           ~/.cargo/bin
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: ${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-v1-
+          ${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-
 
-    # Build FFI for macOS only (sufficient for running tests)
+    # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
+    # the Swift build and the offline tests need. Releases still build every
+    # slice with LTO.
     - name: Build FFI for macOS
       if: steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 60
-      run: make ffi-macos
+      run: make ffi-ci
 
     # Verify xcframework exists (whether from cache or fresh build)
     - name: Verify XCFramework
@@ -132,9 +163,10 @@ jobs:
 
     # The Rust unit tests cover the FFI layer below the Swift package, so no
     # `swift test` filter reaches them. Without this step a failing Rust test
-    # can sit on a branch indefinitely.
+    # can sit on a branch indefinitely. Every run executes them, pushes to main
+    # included, so main's cargo cache holds the test profile every pull request
+    # starts from.
     - name: Run Rust unit tests
-      if: github.event.pull_request.head.repo.full_name == github.repository
       timeout-minutes: 30
       run: make test-rust
 
@@ -143,7 +175,7 @@ jobs:
       run: make configure-local-ffi
 
     # Build the Swift package
-    - name: Build ZcashLightClientKit Swift Package
+    - name: Build ZODLSwiftWalletSDK Swift Package
       timeout-minutes: 15
       run: make build SWIFT_BUILD_FLAGS=-v
 

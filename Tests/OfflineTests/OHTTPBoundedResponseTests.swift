@@ -6,7 +6,7 @@
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Mock URLProtocol that serves responses of a specified size for testing bounded data reading.
 class MockResponseURLProtocol: URLProtocol {

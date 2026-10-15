@@ -1,7 +1,7 @@
 import XCTest
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCheckDeadlineTests: ZcashTestCase {
     // Removing caller detachment would make cancellation wait for native preparation again.

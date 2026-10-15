@@ -7,7 +7,7 @@
 
 import Foundation
 import CryptoKit
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 enum OHTTPTestSupport {
     /// The body a mock serves for the signed key-configuration GET. Only the test verifier reads it.

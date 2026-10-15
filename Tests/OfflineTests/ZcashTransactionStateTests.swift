@@ -7,7 +7,7 @@
 
 import XCTest
 import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ZcashTransactionStateTests: XCTestCase {
     func testExpiredUnminedState() throws {

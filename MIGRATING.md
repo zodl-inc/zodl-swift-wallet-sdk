@@ -1,5 +1,108 @@
 # Migrating from previous versions to _Unreleased_
 
+## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
+
+The package, its library product, and its module are renamed, and the repository has moved to
+`https://github.com/zodl-inc/zodl-swift-wallet-sdk`. There is no compatibility product under the
+old name, so every import site changes. SwiftPM derives the `package:` argument of
+`.product(name:package:)` from the last path component of the URL you declare, so update
+`.package(url:)` and `package:` together. GitHub redirects the old URL; a manifest that keeps it
+must keep `package: "zcash-swift-wallet-sdk"` to match.
+
+Before:
+
+```swift
+// Package.swift
+.package(url: "https://github.com/zodl-inc/zcash-swift-wallet-sdk.git", from: "4.0.0")
+.product(name: "ZcashLightClientKit", package: "zcash-swift-wallet-sdk")
+```
+
+```swift
+import ZcashLightClientKit
+@testable import ZcashLightClientKit
+@_spi(Testing) @testable import ZcashLightClientKit
+
+let height: ZcashLightClientKit.BlockHeight = 1
+```
+
+After:
+
+```swift
+// Package.swift — 6.0.0 is the first release containing the rename (unreleased as of
+// this writing; until it exists, pin a revision of main instead of a version range).
+.package(url: "https://github.com/zodl-inc/zodl-swift-wallet-sdk.git", from: "6.0.0")
+.product(name: "ZODLSwiftWalletSDK", package: "zodl-swift-wallet-sdk")
+```
+
+```swift
+import ZODLSwiftWalletSDK
+@testable import ZODLSwiftWalletSDK
+@_spi(Testing) @testable import ZODLSwiftWalletSDK
+
+let height: ZODLSwiftWalletSDK.BlockHeight = 1
+```
+
+If your dependency uses the explicit-name form, `.package(name: "ZcashLightClientKit", url: …)`,
+drop the `name:` argument or set it to `"zodl-swift-wallet-sdk"`.
+
+Two strings that were derived from the old module name change at runtime: a `ZcashError`
+bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM resource bundle
+is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
+rather than on either string.
+
+## Minimum platforms raised — iOS 16 and macOS 14
+
+`Package.swift` now declares `.iOS(.v16)` and `.macOS(.v14)`, and the `libzcashlc` XCFramework is built
+for the same minimums. SwiftPM refuses a dependency whose platforms are newer than the depending target's,
+so raise yours to at least these:
+
+```swift
+// Before
+platforms: [.iOS(.v13), .macOS(.v12)]
+
+// After
+platforms: [.iOS(.v16), .macOS(.v14)]
+```
+
+`.macOS(.v14)` exists from `PackageDescription` 5.9, and `.iOS(.v16)` from 5.7. If your own manifest
+declares an older `swift-tools-version`, spell the platforms as strings instead:
+`platforms: [.iOS("16.0"), .macOS("14.0")]`.
+
+In an Xcode project, set the iOS Deployment Target to 16.0 and the macOS Deployment Target to 14.0
+(`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`).
+
+## `RustErrorKind` gained a case — `anchorNotFound`
+
+`RustErrorKind`, the type of `RedactedRustError.kind`, has a new case, `anchorNotFound`: creating
+transactions from a proposal failed because the wallet has not scanned far enough to anchor them.
+Such failures were previously reported as `proposalInvalid`.
+
+An exhaustive `switch` over `RustErrorKind` stops compiling until the new case is handled. Do not
+fold it into `proposalInvalid`, where it used to land: a wallet should treat it as "scan further,
+then retry", not as a bad request.
+
+```swift
+// Before: exhaustive over the cases 5.2.0 had.
+catch ZcashError.rustCreateToAddress(let error) {
+    switch error.kind {
+    case .proposalInvalid:
+        showAsBadRequest(error.message)
+    // ... the rest of RustErrorKind's cases
+    }
+}
+
+// After: the new case is "scan further, then retry", not a bad request.
+catch ZcashError.rustCreateToAddress(let error) {
+    switch error.kind {
+    case .proposalInvalid:
+        showAsBadRequest(error.message)
+    case .anchorNotFound:
+        keepSyncingThenRetry()
+    // ... the rest of RustErrorKind's cases
+    }
+}
+```
+
 ## `ZcashError` gained cases — Ledger hardware wallets
 
 `ZcashError` and `ZcashErrorCode` have twenty-four new cases, `ZLEDG0001` to `ZLEDG0024`, which

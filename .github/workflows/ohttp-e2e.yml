@@ -51,12 +51,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  XCODE: /Applications/Xcode_16.0.app/Contents/Developer
+  XCODE: /Applications/Xcode_27.0.app/Contents/Developer
 
 jobs:
   ffi:
     name: Build FFI (macOS arm64)
-    runs-on: macos-15
+    runs-on: xcode-27
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -125,7 +125,7 @@ jobs:
   e2e:
     name: E2E (${{ matrix.mode }})
     needs: ffi
-    runs-on: macos-15
+    runs-on: xcode-27
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -152,10 +152,10 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
-          key: ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
+          key: ohttp-e2e-swiftpm-${{ env.XCODE }}-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
           restore-keys: |
-            ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-
-            ohttp-e2e-swiftpm-
+            ohttp-e2e-swiftpm-${{ env.XCODE }}-${{ hashFiles('Package.resolved') }}-
+            ohttp-e2e-swiftpm-${{ env.XCODE }}-
 
       - name: Build Swift package
         timeout-minutes: 30

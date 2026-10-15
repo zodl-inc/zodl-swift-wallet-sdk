@@ -1,6 +1,6 @@
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCleanupCoordinatorTests: ZcashTestCase {
     // Catches deleting or releasing a wallet whose native wipe refused teardown.

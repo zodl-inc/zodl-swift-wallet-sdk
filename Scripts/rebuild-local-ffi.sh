@@ -15,6 +15,12 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# The minimum OS versions every slice is built for. Keep them equal to
+# Package.swift's platforms and BuildSupport/Makefile (a script test checks);
+# rustc and the cc crate both read them.
+export MACOSX_DEPLOYMENT_TARGET=14.0
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+
 # Ensure cargo/rustup are on PATH (needed when invoked from Xcode)
 if [[ -f "$HOME/.cargo/env" ]]; then
     source "$HOME/.cargo/env"

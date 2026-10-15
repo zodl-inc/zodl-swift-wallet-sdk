@@ -1,4 +1,4 @@
-// swift-tools-version:5.6
+// swift-tools-version:5.9
 import PackageDescription
 import Foundation
 
@@ -39,7 +39,7 @@ if useLocalFFI {
 
 targets.append(contentsOf: [
     .target(
-        name: "ZcashLightClientKit",
+        name: "ZODLSwiftWalletSDK",
         dependencies: sdkDependencies,
         exclude: [
             "Modules/Service/GRPC/ProtoBuf/proto/proposal.proto",
@@ -51,7 +51,7 @@ targets.append(contentsOf: [
     ),
     .target(
         name: "TestUtils",
-        dependencies: ["ZcashLightClientKit"],
+        dependencies: ["ZODLSwiftWalletSDK"],
         path: "Tests/TestUtils",
         exclude: [
             "proto/darkside.proto",
@@ -73,39 +73,39 @@ targets.append(contentsOf: [
     ),
     .testTarget(
         name: "OfflineTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZODLSwiftWalletSDK", "TestUtils"]
     ),
     .testTarget(
         name: "NetworkTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZODLSwiftWalletSDK", "TestUtils"]
     ),
     .testTarget(
         name: "DarksideTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZODLSwiftWalletSDK", "TestUtils"]
     ),
     .testTarget(
         name: "AliasDarksideTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"],
+        dependencies: ["ZODLSwiftWalletSDK", "TestUtils"],
         exclude: [
             "scripts/"
         ]
     ),
     .testTarget(
         name: "PerformanceTests",
-        dependencies: ["ZcashLightClientKit", "TestUtils"]
+        dependencies: ["ZODLSwiftWalletSDK", "TestUtils"]
     )
 ])
 
 let package = Package(
-    name: "ZcashLightClientKit",
+    name: "zodl-swift-wallet-sdk",
     platforms: [
-        .iOS(.v13),
-        .macOS(.v12)
+        .iOS(.v16),
+        .macOS(.v14)
     ],
     products: [
         .library(
-            name: "ZcashLightClientKit",
-            targets: ["ZcashLightClientKit"]
+            name: "ZODLSwiftWalletSDK",
+            targets: ["ZODLSwiftWalletSDK"]
         )
     ],
     dependencies: dependencies,

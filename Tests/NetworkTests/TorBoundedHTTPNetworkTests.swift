@@ -3,7 +3,7 @@ import XCTest
 import libzcashlc
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Select independently from TorClientTests.testApis, which submits a transaction.
 /// TOR_HTTP_TEST_BASE_URL must provide HTTPBin-compatible /get, /post and /delay/3.
@@ -247,7 +247,8 @@ private final class TorNetworkFixture: @unchecked Sendable {
     }
 }
 
-/// NSLock supports the SDK's macOS 12 / iOS 13 deployment floors.
+/// NSLock dates from the SDK's macOS 12 / iOS 13 floor, below OSAllocatedUnfairLock's
+/// macOS 13 / iOS 16.
 /// Only records real native outcomes. In particular, get never calls lastErrorMessage.
 private final class TorNativeObserver: @unchecked Sendable {
     private let lock = NSLock()

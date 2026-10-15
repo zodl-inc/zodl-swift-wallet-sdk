@@ -1,6 +1,6 @@
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCheckStartupTests: ZcashTestCase {
     // Preparation can display syncing from a persisted tip without owning a running pass.

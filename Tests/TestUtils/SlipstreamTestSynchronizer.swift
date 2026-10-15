@@ -5,7 +5,7 @@
 
 import Foundation
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 extension ZcashTestCase {
     /// Builds a `SlipstreamSynchronizer` around an injected engine, wired exactly as the shipped one
@@ -112,7 +112,8 @@ extension XCTestCase {
 /// `latestState` before the assertion runs, and that would be a race the test invented rather than
 /// one it found.
 ///
-/// `NSLock` for the package's iOS 13 / macOS 12 floor.
+/// `NSLock` dates from the package's iOS 13 / macOS 12 floor, below `OSAllocatedUnfairLock`'s
+/// iOS 16 / macOS 13.
 final class RecordedSyncStatuses: @unchecked Sendable {
     private let lock = NSLock()
     private var statuses: [InternalSyncStatus] = []
@@ -147,7 +148,8 @@ struct SyncStalledReport: Equatable {
 /// `RecordedSyncStatuses`, and for the same reason: a Combine sink fires on whatever thread sent the
 /// value, so appending to a captured local `var` from one is a data race the test invented.
 ///
-/// `NSLock` for the package's iOS 13 / macOS 12 floor.
+/// `NSLock` dates from the package's iOS 13 / macOS 12 floor, below `OSAllocatedUnfairLock`'s
+/// iOS 16 / macOS 13.
 final class RecordedEvents: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [SynchronizerEvent] = []

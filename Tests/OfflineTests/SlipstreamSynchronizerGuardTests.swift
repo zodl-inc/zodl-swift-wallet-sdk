@@ -1,11 +1,11 @@
 //
 //  SlipstreamSynchronizerGuardTests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Prepared-state guards on the four `SlipstreamSynchronizer.propose*` methods that, unlike
 /// `proposeSendMax`, did not yet reject calls made before `prepare()`. Sibling coverage to

@@ -1,6 +1,6 @@
 //
 //  OHTTPE2ETests.swift
-//  ZcashLightClientKit
+//  ZODLSwiftWalletSDK
 //
 //  Live end-to-end test of the OHTTP (RFC 9458) transport against the testnet gateway:
 //  restore a wallet from seed, sync to the chain tip through `ohttp-gateway-testnet.example`
@@ -20,7 +20,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class OHTTPE2ETests: ZcashTestCase {
     private enum Env {

@@ -1,6 +1,6 @@
 //
 //  TestDbBuilder.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 10/14/19.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
@@ -8,7 +8,7 @@
 
 import Foundation
 import SQLite
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 struct TestDbHandle {
     var originalDb: URL

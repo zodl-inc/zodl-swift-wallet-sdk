@@ -1,12 +1,12 @@
 //
 //  SlipstreamFakeEngineSmokeTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Proves the engine seam introduced by MOB-1850: `SlipstreamSynchronizer` drives its sync engine
 /// through `SlipstreamEngineControlling`, so a test can hand it a fake and observe the lifecycle
