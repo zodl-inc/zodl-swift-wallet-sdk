@@ -1,5 +1,5 @@
 {
-  description = "Development tools for ZcashLightClientKit";
+  description = "Development tools for ZODL Swift Wallet SDK";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

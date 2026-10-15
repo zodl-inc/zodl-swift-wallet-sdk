@@ -1,6 +1,6 @@
 //
 //  Tests+Utils.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 18/09/2019.
 //  Copyright © 2019 Electric Coin Company. All rights reserved.
@@ -12,7 +12,7 @@ import GRPC
 import XCTest
 import NIO
 import NIOTransportServices
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 enum Environment {
     static let lightwalletdKey = "LIGHTWALLETD_ADDRESS"
@@ -94,11 +94,21 @@ enum MockDbInit {
 /// `TestCoordinator` (`data_db_<ts>.db`, `fs_cache_<ts>`) were never cleaned up —
 /// hundreds of them accumulated in the maintainer's Documents folder. The OS purges
 /// `temporaryDirectory` periodically, so leaked per-run artifacts are self-cleaning.
+///
+/// Each test process gets a directory of its own. `temporaryDirectory` is one folder per
+/// user, shared by every process (on macOS, Foundation ignores `TMPDIR`), and the helpers
+/// below hand out fixed names such as `data.db` and `tor`: two test runs at once, from
+/// another worktree or from Xcode next to `swift test`, deleted and re-created each other's
+/// wallet database mid-test.
 func __documentsDirectory() throws -> URL {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZcashSDKTests", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    try FileManager.default.createDirectory(at: testProcessDirectory, withIntermediateDirectories: true)
+    return testProcessDirectory
 }
+
+/// Chosen once per test process; see `__documentsDirectory()`.
+private let testProcessDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ZcashSDKTests", isDirectory: true)
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
 func __dataDbURL() throws -> URL {
     try __documentsDirectory().appendingPathComponent("data.db", isDirectory: false)

@@ -1,7 +1,7 @@
 import XCTest
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCancellationTests: ZcashTestCase {
     func testGiftCheckStartsSlipstreamEngine() async throws {
@@ -415,7 +415,8 @@ struct GiftCardCancellationFixture {
             },
             cleanupTiming: cleanupTiming,
             checkTiming: checkTiming,
-            checkPolicy: checkPolicy
+            checkPolicy: checkPolicy,
+            saplingParamsSourceURL: .tests
         )
         return GiftCardCancellationFixture(
             card: card,

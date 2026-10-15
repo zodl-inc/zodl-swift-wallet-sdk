@@ -1,6 +1,6 @@
 name: Proto Sync
 
-# Sources/ZcashLightClientKit/Modules/Service/GRPC/ProtoBuf/proto/proposal.proto
+# Sources/ZODLSwiftWalletSDK/Modules/Service/GRPC/ProtoBuf/proto/proposal.proto
 # is vendored from librustzcash. libzcashlc encodes proposals with the schema of
 # the pinned zcash_client_backend, so a stale copy silently drops fields on the
 # Swift side. Re-derive it from the pinned version and fail if the committed

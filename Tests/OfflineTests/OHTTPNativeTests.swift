@@ -10,7 +10,7 @@
 
 import XCTest
 import CryptoKit
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class OHTTPNativeTests: XCTestCase {
     private func makeKey(id: UInt8 = 0x05) -> OHTTPVerifiedKey {

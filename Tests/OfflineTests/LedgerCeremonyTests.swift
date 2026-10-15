@@ -10,7 +10,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// Polls `condition` with a short yield between checks, failing the test after `timeoutSeconds` if
 /// it never becomes true. Not named `waitUntil`: `XCTestCase` has a member of that name (from

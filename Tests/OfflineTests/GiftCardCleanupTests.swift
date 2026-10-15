@@ -2,7 +2,7 @@ import Combine
 import XCTest
 
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardCleanupTests: ZcashTestCase {
     func testCleanupWaitsForGiftSlipstreamStartToFinish() async throws {

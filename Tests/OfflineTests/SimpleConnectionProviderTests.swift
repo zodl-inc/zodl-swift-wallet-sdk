@@ -12,7 +12,7 @@
 
 import XCTest
 import SQLite
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class SimpleConnectionProviderTests: XCTestCase {
     var dbPath: String!

@@ -1,11 +1,11 @@
 //
 //  GiftCardTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class GiftCardTests: ZcashTestCase {
     /// A published, never-funded reference vector of the legacy `v3` encoding: 32 zero bytes of

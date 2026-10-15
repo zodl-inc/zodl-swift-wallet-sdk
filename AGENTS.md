@@ -21,7 +21,7 @@ Standard handling:
 
 ## Project overview
 
-`ZcashLightClientKit` is an iOS/macOS Swift Package that implements a Zcash lightwallet client. The Swift layer wraps a Rust core (in `rust/`) via an `libzcashlc` XCFramework. Most day-to-day SDK work happens in Swift only — SPM auto-downloads a pre-built XCFramework from GitHub Releases.
+`zodl-swift-wallet-sdk` (library product and module `ZODLSwiftWalletSDK`) is an iOS/macOS Swift Package that implements a Zcash lightwallet client. The Swift layer wraps a Rust core (in `rust/`) via an `libzcashlc` XCFramework. Most day-to-day SDK work happens in Swift only — SPM auto-downloads a pre-built XCFramework from GitHub Releases.
 
 ## Build and test
 
@@ -29,7 +29,7 @@ Open the package or workspace in Xcode and build against an iOS or macOS target:
 
 - `swift build` — build the package (macOS target).
 - `swift test --filter OfflineTests` — run the offline unit tests. This is what CI runs (see `.github/workflows/swift.yml`).
-- `xcodebuild ... -testPlan ZcashLightClientKit.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
+- `xcodebuild ... -testPlan ZODLSwiftWalletSDK.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
 
 Test targets are grouped by external dependencies:
 
@@ -55,7 +55,7 @@ Scripts:
 
 For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, run the full `init-local-ffi.sh` before PRing — `rebuild-local-ffi.sh` only covers one arch.
 
-The `Makefile` wraps these (`make ffi-macos`, `make ffi-all`, `make init-ffi`, `make rebuild-ffi`, `make reset-ffi`, `make configure-local-ffi`); CI calls the targets, so prefer them over the scripts directly. `make help` lists everything.
+The `Makefile` wraps these (`make ffi-ci`, `make ffi-macos`, `make ffi-all`, `make init-ffi`, `make rebuild-ffi`, `make reset-ffi`, `make configure-local-ffi`); CI calls the targets, so prefer them over the scripts directly. `make help` lists everything.
 
 See `docs/LOCAL_DEVELOPMENT.md` for the full reference.
 
@@ -80,9 +80,9 @@ built from live in `Scripts/lib/release-lib.sh` and are covered by
 ### Two-layer wallet
 
 1. **Rust core** (`rust/src/`) — key derivation, note scanning, transaction construction, block database migrations.
-2. **Swift SDK** (`Sources/ZcashLightClientKit/`) — orchestration, networking, persistence, public API.
+2. **Swift SDK** (`Sources/ZODLSwiftWalletSDK/`) — orchestration, networking, persistence, public API.
 
-The Swift↔Rust bridge lives in `Sources/ZcashLightClientKit/Rust/`:
+The Swift↔Rust bridge lives in `Sources/ZODLSwiftWalletSDK/Rust/`:
 - `ZcashRustBackend` conforms to `ZcashRustBackendWelding` — the DB-bound surface.
 - `ZcashKeyDerivationBackend` conforms to `ZcashKeyDerivationBackendWelding` — the stateless key-derivation surface.
 
@@ -180,7 +180,7 @@ next reader sees a sanctioned exception rather than a violation.
 
 ### Where direct access lives
 
-All of it is under `Sources/ZcashLightClientKit/DAO/`. Adding a query anywhere
+All of it is under `Sources/ZODLSwiftWalletSDK/DAO/`. Adding a query anywhere
 else is a mistake; adding one that names a table is a mistake wherever it is.
 
 | File | Reads | Status |
@@ -198,7 +198,7 @@ rather than a second table reader.
 ## Pre-push validation
 
 Before opening a PR or pushing to an existing PR branch, run the checks CI runs.
-On a cache miss CI builds the Rust FFI from source (30-minute timeout) before it
+On a cache miss CI builds the Rust FFI from source (60-minute timeout) before it
 compiles a line of Swift, so a mistake that a local build would have caught in a
 minute can cost most of an hour to surface.
 
@@ -208,13 +208,14 @@ hand-written `swift` command:
 
 | Workflow | Trigger | Local equivalent |
 |---|---|---|
-| `swift.yml` | any PR outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
+| `swift.yml` | any PR, and any push to `main`, outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
 | `swiftlint.yml` | any PR touching `**/*.swift` or `.swiftlint.yml` | `make lint` |
 | `proto-sync.yml` | any PR outside its `paths-ignore` list | `./Scripts/update-proposal-proto.sh --check` |
 | `zizmor.yml` | every PR | matters when you change a workflow file |
 
 `codeql.yml` does **not** run per PR — only on merges to `main` and weekly,
-because its Swift matrix entry needs `build-mode: manual` and a full FFI build.
+because its Swift matrix entry needs `build-mode: manual` and an FFI build
+(`make ffi-ci`).
 
 The `paths-ignore` list is specific: `README.md`, `CHANGELOG.md`,
 `CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `SECURITY.md`,
@@ -231,11 +232,13 @@ enforces and cannot pass locally and fail there.
 The package cannot build without an `libzcashlc` XCFramework. On a fresh
 checkout `swift build` downloads the published binary named in `Package.swift`;
 that binary is stale the moment your branch changes anything under `rust/`.
-`make ffi-macos` reproduces the CI "Build FFI for macOS" step exactly, and the
-macOS slice alone is enough to build and test the Swift package:
+`make ffi-ci` reproduces the CI "Build FFI for macOS" step exactly: the arm64
+macOS slice alone, built without the release profile's whole-program LTO. That
+is enough to build and test the Swift package on Apple Silicon; `make ffi-macos`
+builds the universal macOS slice with release settings instead.
 
 ```bash
-make ffi-macos           # once per branch, and after each Rust edit
+make ffi-ci              # once per branch, and after each Rust edit
 make configure-local-ffi # point Package.swift at the local build
 make check               # build, the offline suite, then the Rust tests
 ```
@@ -252,14 +255,14 @@ says nothing about them; `swift.yml` runs both.
 | Any other doc, including this one | `make check` — the build runs regardless |
 | Swift style or rename | `make lint` |
 | Swift logic or refactor | `make check`, then `make lint` |
-| Rust internals | `make ffi-macos`, then `make check` (which runs `make test-rust`) |
+| Rust internals | `make ffi-ci`, then `make check` (which runs `make test-rust`) |
 | Any change to an FFI signature or a new FFI function | `make ffi-all` (all five architectures) before PRing |
 | Bumping the pinned `zcash_client_backend` | `./Scripts/update-proposal-proto.sh --check` |
 
-`make ffi-macos` and `make rebuild-ffi` cover one architecture. A mismatch
-between the generated `zcashlc.h` and the Swift call site compiles cleanly on
-both sides and fails at *runtime*, so a change to the Swift↔Rust boundary needs
-a real build and the offline suite — never a lint pass alone.
+`make ffi-ci`, `make ffi-macos` and `make rebuild-ffi` cover a single platform.
+A mismatch between the generated `zcashlc.h` and the Swift call site compiles
+cleanly on both sides and fails at *runtime*, so a change to the Swift↔Rust
+boundary needs a real build and the offline suite — never a lint pass alone.
 
 ## Worktree layout
 

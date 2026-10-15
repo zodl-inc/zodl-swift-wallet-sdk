@@ -1,10 +1,10 @@
 //
 //  WitnessesFixGateTests.swift
-//  ZcashLightClientKitTests
+//  ZODLSwiftWalletSDK
 //
 
 import XCTest
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class WitnessesFixGateTests: XCTestCase {
     private struct VersionCase {

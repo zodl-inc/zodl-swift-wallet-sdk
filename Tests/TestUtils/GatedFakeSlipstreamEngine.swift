@@ -4,7 +4,7 @@
 //
 
 import Foundation
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 /// A latch a test opens to release calls suspended on it.
 ///
@@ -21,8 +21,8 @@ import Foundation
 /// is the caller's: close a gate only while no call is inside it, and then wait on an OBSERVABLE
 /// (`onCall`, or the recorded call log) rather than on elapsed time before assuming a call arrived.
 ///
-/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor — the same
-/// reason `LifecycleQueue` uses one.
+/// `NSLock`, not `OSAllocatedUnfairLock`, dates from the package's iOS 13 / macOS 12 floor, below
+/// that lock's iOS 16 / macOS 13, like the lock in `LifecycleQueue`.
 final class Gate: @unchecked Sendable {
     private let lock = NSLock()
     private var isOpen = false
@@ -122,8 +122,9 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     ///
     /// `nonisolated` and lock-guarded rather than actor-isolated like `reopenError` and
     /// `startError`, because a stop can arrive from a `nonisolated` teardown at any time and a test
-    /// sets this while the synchronizer is running; the lock is `NSLock` for the package's
-    /// iOS 13 / macOS 12 floor, like `Gate`'s.
+    /// sets this while the synchronizer is running; like `Gate`'s, the lock is `NSLock`. That
+    /// choice dates from the package's iOS 13 / macOS 12 floor, below `OSAllocatedUnfairLock`'s
+    /// iOS 16 / macOS 13.
     nonisolated var stopQuiescent: Bool {
         get {
             stopQuiescentLock.lock()

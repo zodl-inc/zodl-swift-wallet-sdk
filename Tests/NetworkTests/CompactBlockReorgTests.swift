@@ -1,6 +1,6 @@
 //
 //  CompactBlockReorgTests.swift
-//  ZcashLightClientKit-Unit-Tests
+//  ZODLSwiftWalletSDK
 //
 //  Created by Francisco Gindre on 11/13/19.
 //
@@ -9,7 +9,7 @@
 import Combine
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 class CompactBlockReorgTests: ZcashTestCase {
     var processorConfig: CompactBlockProcessor.Configuration!

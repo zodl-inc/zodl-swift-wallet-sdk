@@ -3,7 +3,7 @@
 
 Validates exactly the checkpoint files that are new or modified in the working
 tree — i.e. what is about to be committed — under
-Sources/ZcashLightClientKit/Resources/checkpoints/<network>. Run it after
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/<network>. Run it after
 fetch_checkpoints.py and before committing.
 
 Per changed file it checks:
@@ -38,7 +38,7 @@ NETWORKS = {
     "testnet": {"interval": 10000, "network_value": "test"},
 }
 
-CHECKPOINTS_REL = "Sources/ZcashLightClientKit/Resources/checkpoints"
+CHECKPOINTS_REL = "Sources/ZODLSwiftWalletSDK/Resources/checkpoints"
 HEX_RE = re.compile(r"^[0-9a-f]+$")
 
 

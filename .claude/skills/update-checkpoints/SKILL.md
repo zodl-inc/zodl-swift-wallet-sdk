@@ -2,7 +2,7 @@
 name: update-checkpoints
 description: >-
   Updates the bundled Zcash lightwallet checkpoint files under
-  Sources/ZcashLightClientKit/Resources/checkpoints (mainnet + testnet). Use this
+  Sources/ZODLSwiftWalletSDK/Resources/checkpoints (mainnet + testnet). Use this
   whenever the user asks to update, refresh, regenerate, bump, or add new
   checkpoints, "run checkmate", or prepare checkpoints for a release — even if
   they don't name the exact directory. Downloads new GetTreeState checkpoints from
@@ -13,7 +13,7 @@ description: >-
 # Update Zcash checkpoints
 
 The SDK ships bundled chain checkpoints in
-`Sources/ZcashLightClientKit/Resources/checkpoints/{mainnet,testnet}/<height>.json`.
+`Sources/ZODLSwiftWalletSDK/Resources/checkpoints/{mainnet,testnet}/<height>.json`.
 They seed wallet birthday lookups, so they need refreshing periodically (typically
 before a release) to add checkpoints for blocks mined since the last update.
 
@@ -92,7 +92,7 @@ Also eyeball the working tree to confirm the change is additive and only touches
 checkpoints directories:
 
 ```bash
-git status --short Sources/ZcashLightClientKit/Resources/checkpoints
+git status --short Sources/ZODLSwiftWalletSDK/Resources/checkpoints
 ```
 
 You should see only new (`??`) `.json` files — no modified (` M`) or deleted ones.
@@ -114,17 +114,17 @@ four-backtick fences (matching prior entries):
 Mainnet
 
 ````
-Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/<first_added>.json
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/<first_added>.json
 ...
-Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/<new_max>.json
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/<new_max>.json
 ````
 
 Testnet
 
 ````
-Sources/ZcashLightClientKit/Resources/checkpoints/testnet/<first_added>.json
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/<first_added>.json
 ...
-Sources/ZcashLightClientKit/Resources/checkpoints/testnet/<new_max>.json
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/<new_max>.json
 ````
 ````
 
@@ -136,7 +136,7 @@ summary in the body. If the current branch is `main`, create a topic branch firs
 (e.g. `update-checkpoints`) — `main` must stay clean per repo policy.
 
 ```bash
-git add Sources/ZcashLightClientKit/Resources/checkpoints CHANGELOG.md
+git add Sources/ZODLSwiftWalletSDK/Resources/checkpoints CHANGELOG.md
 git commit -m "Checkpoints updated" -m "Mainnet <first_added> → <new_max> (interval 2500).
 Testnet <first_added> → <new_max> (interval 10000).
 
@@ -164,8 +164,8 @@ failed mid-run. Reset the working tree for that network and re-run its fetch —
 operation is additive and idempotent:
 
 ```bash
-git checkout -- Sources/ZcashLightClientKit/Resources/checkpoints/<network>
-git clean -f Sources/ZcashLightClientKit/Resources/checkpoints/<network>
+git checkout -- Sources/ZODLSwiftWalletSDK/Resources/checkpoints/<network>
+git clean -f Sources/ZODLSwiftWalletSDK/Resources/checkpoints/<network>
 python3 .claude/skills/update-checkpoints/scripts/fetch_checkpoints.py <network>
 ```
 

@@ -7,7 +7,7 @@
 
 import XCTest
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 final class ScanActionTests: ZcashTestCase {
     func testScanAction_NextAction() async throws {

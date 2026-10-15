@@ -1,6 +1,6 @@
 import Foundation
 @testable import TestUtils
-@testable import ZcashLightClientKit
+@testable import ZODLSwiftWalletSDK
 
 struct ClassicProcessorCleanupFixture {
     let rootDirectory: URL

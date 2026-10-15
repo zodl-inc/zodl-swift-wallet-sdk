@@ -16,7 +16,10 @@ build = "rust/build.rs"
 
 # Zcash
 orchard = { version = "0.16" }
-pasta_curves = "0.6"
+# `asm` selects the assembly field arithmetic, where most of 0.6.1's speedup is; without it every
+# target gets the portable arithmetic. pasta_curves picks the backend per target itself and has
+# none for Apple's x86-64 targets, so the x86_64 slices stay portable. 0.6.0 has no such feature.
+pasta_curves = { version = "0.6.1", features = ["asm"] }
 ff = "0.14"
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 # The scalar types in the Sapling prover traits, named by `rust/src/sapling_prover.rs`.
@@ -189,6 +192,18 @@ crate-type = ["staticlib"]
 
 [profile.release]
 lto = true
+
+# Build scripts and proc macros, which run on the build machine, stay unstripped. A release build
+# strips them by default, and on macOS rustc does that with its bundled rust-objcopy, which writes
+# the Mach-O string table straight after the indirect symbol table without padding it to 8 bytes,
+# so the string table is misaligned whenever the indirect symbol table has an odd number of
+# entries. macOS 27's dyld refuses to load such a proc macro, and the build fails with "mis-aligned
+# LINKEDIT string pool" or "can't find crate". BuildSupport/Makefile's MACOSX_DEPLOYMENT_TARGET
+# reaches them too, and linked for macOS 14 every one of them came out misaligned. The linker's own
+# output is aligned. The static libraries the SDK ships were never stripped, so this setting does
+# not apply to them.
+[profile.release.build-override]
+strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.1 lives in slipstream-internal

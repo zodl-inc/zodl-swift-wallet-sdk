@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+Changes are relative to `5.2.1`.
+
 ## Added
 
 - `PaymentURIParser` and the typed `PaymentURIRequest` results provide Rust-backed parsing and
@@ -53,6 +55,34 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw.githubusercontent.com remain rejected as unsupportedPrivateDestination.
 - `TorClient.httpRequest(for:maxBytes:retryLimit:)` now has a default value for `maxBytes`
   (257 MiB), preserving compatibility with existing callers that do not specify it.
+- The Swift package is renamed from `ZcashLightClientKit` to `zodl-swift-wallet-sdk`, and
+  its single library product and module from `ZcashLightClientKit` to `ZODLSwiftWalletSDK`.
+  Every `import ZcashLightClientKit` — including the `@testable` and `@_spi(Testing)` forms —
+  and every module-qualified name such as `ZcashLightClientKit.BlockHeight` stops compiling
+  until it says `ZODLSwiftWalletSDK`. In `Package.swift`, `.product(name: "ZcashLightClientKit", …)`
+  becomes `.product(name: "ZODLSwiftWalletSDK", …)`. The repository is now
+  `https://github.com/zodl-inc/zodl-swift-wallet-sdk`: update `.package(url:)` to it and, because
+  SwiftPM derives the `package:` argument from the URL's last path component, set
+  `package: "zodl-swift-wallet-sdk"` in the same edit (GitHub redirects the old URL, and a
+  manifest that keeps it keeps `package: "zcash-swift-wallet-sdk"`). A dependency declared with
+  the explicit `.package(name: "ZcashLightClientKit", url: …)` form must drop that `name:` or
+  set it to `"zodl-swift-wallet-sdk"`. There is no compatibility product under the old name.
+  Two runtime strings follow the module: a `ZcashError` bridged to `NSError` now reports the
+  domain `ZODLSwiftWalletSDK.ZcashError` instead of `ZcashLightClientKit.ZcashError`, and the
+  SPM resource bundle is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle` instead of
+  `ZcashLightClientKit_ZcashLightClientKit.bundle`; code that matched either literal must be
+  updated. See MIGRATING.md.
+- The package's minimum platforms are now iOS 16 and macOS 14, up from iOS 13 and macOS 12, and the
+  `libzcashlc` XCFramework is built for the same minimums. An app or package whose deployment target is
+  lower no longer builds against the SDK: raise it to at least iOS 16 / macOS 14; see `MIGRATING.md`.
+- `RustErrorKind` has a new case, `anchorNotFound`: creating transactions from a proposal failed
+  because the wallet has not scanned to a height it can anchor them on. Such failures were reported
+  as `proposalInvalid`, and a wallet could only tell them apart by the upstream error text, which
+  redaction now removes; the new case lets it say "scan further and retry". An exhaustive `switch`
+  over `RustErrorKind` stops compiling until the new case is handled.
+- `migrationProgress(accountUUID:)` and `recordImmediateMigration(accountUUID:txid:)` use a record
+  that `prepare()` now creates, so on a wallet upgraded from an earlier SDK version they throw until
+  the synchronizer has been prepared with this version.
 
 ## Removed
 
@@ -61,6 +91,46 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schemaPrefix`. This matches the Android SDK, which retired its EIP-681 path in the same way.
   One behaviour is lost with it: non-`ethereum:` EIP-681 scheme prefixes such as `celo:` are no
   longer accepted, and a URI's own scheme text is normalised to `"ethereum"`.
+
+## Fixed
+
+- Transaction submission through `Broadcaster` now treats a server rejection as accepted when that
+  same server confirms it already knows the transaction. No caller changes are required.
+- The migration APIs no longer create a wallet database, or any table in one, when called for a
+  wallet whose database does not exist or was never initialized; they throw instead. Such a call
+  used to leave behind a database file holding a single table, which a wallet could mistake for
+  an existing one.
+- The `libzcashlc` XCFramework's C objects claimed the Xcode SDK version they were built with as their
+  minimum OS, above the package's platforms, so linking it could warn that objects were "built for
+  newer version". They now claim iOS 16 / macOS 14. No caller changes are required.
+
+# 5.2.1 - 2026-10-14
+
+## Changed
+
+- The Rust core enables `pasta_curves`' `asm` feature, so the Pallas and Vesta field arithmetic
+  behind Orchard sends, sync and coinholder voting runs on assembly on arm64: iOS devices, the
+  arm64 iOS simulator and Apple silicon Macs. The x86_64 iOS simulator and Intel Macs keep the
+  portable arithmetic, because `pasta_curves` has no assembly backend for Apple's x86-64 targets.
+  Every result is the same as before; only the speed changes. No call site needs editing.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3512500.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3515000.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4490000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4500000.json
+````
 
 # 5.2.0 - 2026-10-09
 
