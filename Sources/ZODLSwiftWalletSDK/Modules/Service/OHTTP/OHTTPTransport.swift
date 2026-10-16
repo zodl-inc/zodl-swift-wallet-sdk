@@ -28,105 +28,6 @@ private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, 
     }
 }
 
-/// Body reader of `OHTTPTransport.boundedDataViaDelegate`. The session's serial delegate queue
-/// runs every callback, so the state needs no lock.
-private final class BoundedBodyReader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let maxBytes: Int
-    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
-    private var body = Data()
-    private var response: URLResponse?
-    private var failure: Error?
-
-    init(maxBytes: Int, continuation: CheckedContinuation<(Data, URLResponse), Error>) {
-        self.maxBytes = maxBytes
-        self.continuation = continuation
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        dataTask: URLSessionDataTask,
-        didReceive response: URLResponse,
-        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
-    ) {
-        // `expectedContentLength` is -1 when the length is unknown.
-        let expectedLength = response.expectedContentLength
-        if expectedLength > Int64(maxBytes) {
-            failure = OHTTPError.responseTooLarge(
-                "Response Content-Length (\(expectedLength) bytes) exceeds limit (\(maxBytes) bytes)"
-            )
-            completionHandler(.cancel)
-            return
-        }
-        self.response = response
-        if expectedLength > 0 {
-            body.reserveCapacity(Int(expectedLength))
-        }
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard failure == nil else { return }
-        if body.count + data.count > maxBytes {
-            failure = OHTTPError.responseTooLarge(
-                "Response size (\(body.count + data.count) bytes) exceeded limit (\(maxBytes) bytes)"
-            )
-            dataTask.cancel()
-            return
-        }
-        body.append(data)
-    }
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        completionHandler(nil)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let continuation = continuation else { return }
-        self.continuation = nil
-        if let failure = failure {
-            continuation.resume(throwing: failure)
-        } else if let error = error {
-            continuation.resume(throwing: error)
-        } else if let response = response {
-            continuation.resume(returning: (body, response))
-        } else {
-            continuation.resume(throwing: URLError(.badServerResponse))
-        }
-    }
-}
-
-/// The task of a bounded read, cancellable before it exists (Swift task cancelled first).
-private final class BoundedTaskHandle: @unchecked Sendable {
-    private let lock = NSLock()
-    private var task: URLSessionTask?
-    private var cancelled = false
-
-    func start(_ task: URLSessionTask) {
-        lock.lock()
-        self.task = task
-        let cancelled = self.cancelled
-        lock.unlock()
-        if cancelled {
-            task.cancel()
-        }
-        task.resume()
-    }
-
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        let task = self.task
-        lock.unlock()
-        task?.cancel()
-    }
-}
-
 actor OHTTPTransport {
     /// Pluggable HTTP sender for the relay POST (and the key-config GET).
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
@@ -169,10 +70,8 @@ actor OHTTPTransport {
     internal static let maxRelayResponseBytes = (256 * 1024 * 1024) + (1024 * 1024)
 
     /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
-    /// for OHTTP relay responses: abort as soon as the limit is exceeded. Uses `session.bytes(for:)`
-    /// to stream and count where available (iOS 15+, macOS 12+), rejecting early if
-    /// `expectedContentLength > maxBytes`. Below iOS 15 the body is counted in delegate callbacks
-    /// instead (`boundedDataViaDelegate`): a post-read size check would buffer the whole body first.
+    /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
+    /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
     ///
     /// - Parameters:
     ///   - request: The URL request to execute
@@ -184,18 +83,6 @@ actor OHTTPTransport {
         for request: URLRequest,
         maxBytes: Int,
         session: URLSession = OHTTPTransport.session
-    ) async throws -> (Data, URLResponse) {
-        if #available(iOS 15.0, *) {
-            return try await boundedDataStreaming(for: request, maxBytes: maxBytes, session: session)
-        }
-        return try await boundedDataViaDelegate(for: request, maxBytes: maxBytes, configuration: session.configuration)
-    }
-
-    @available(iOS 15.0, *)
-    private static func boundedDataStreaming(
-        for request: URLRequest,
-        maxBytes: Int,
-        session: URLSession
     ) async throws -> (Data, URLResponse) {
         let (bytes, response) = try await session.bytes(for: request)
 
@@ -225,33 +112,6 @@ actor OHTTPTransport {
         }
 
         return (accumulated, response)
-    }
-
-    /// Bounded read without `bytes(for:)` (iOS 13/14): a one-task session with the same
-    /// configuration, whose delegate counts the body as it arrives and cancels the task as soon as
-    /// the limit is exceeded. It refuses redirects like `OHTTPTransport.session`. No connection
-    /// reuse across calls, which only costs latency on the OS versions the apps do not ship to.
-    /// Internal so the tests can run this path on every OS.
-    static func boundedDataViaDelegate(
-        for request: URLRequest,
-        maxBytes: Int,
-        configuration: URLSessionConfiguration
-    ) async throws -> (Data, URLResponse) {
-        let handle = BoundedTaskHandle()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let reader = BoundedBodyReader(maxBytes: maxBytes, continuation: continuation)
-                let queue = OperationQueue()
-                queue.maxConcurrentOperationCount = 1
-                let session = URLSession(configuration: configuration, delegate: reader, delegateQueue: queue)
-                let task = session.dataTask(with: request)
-                handle.start(task)
-                // Invalidates once the task completes, which releases the delegate.
-                session.finishTasksAndInvalidate()
-            }
-        } onCancel: {
-            handle.cancel()
-        }
     }
 
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
