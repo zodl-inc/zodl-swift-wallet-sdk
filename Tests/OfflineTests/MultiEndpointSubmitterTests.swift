@@ -79,7 +79,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
-    func testOneTransientRefusalKeepsTheTransactionPending() async {
+    func testATransientRefusalBesideAnExplicitOneIsStillRejected() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpoint(2))
@@ -89,10 +89,10 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         guard case .rejected = result.outcome else {
             return XCTFail("Expected rejected, got \(result.outcome)")
         }
-        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+        XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
-    func testATransportFailureKeepsTheTransactionPending() async {
+    func testATransportFailureBesideAnExplicitRejectionIsStillRejected() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
         mock.set(behavior: .failTransport, for: endpoint(2))
@@ -101,7 +101,10 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
 
         XCTAssertEqual(result.outcome, .rejected(code: -26, message: "bad-txns"))
         XCTAssertEqual(result.endpointOutcomes[endpointKey(endpoint(2))], .failed)
-        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+        XCTAssertNotNil(
+            submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil),
+            "a transport failure does not hold back an explicit rejection"
+        )
     }
 
     func testAnAcceptanceIsNeverRejectedByAll() async {

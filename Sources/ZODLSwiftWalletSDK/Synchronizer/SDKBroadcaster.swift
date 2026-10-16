@@ -97,10 +97,13 @@ final class SDKBroadcaster: Broadcaster {
         let outcome = result.outcome
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
 
-        // Every endpoint of the plan refused it for good, and none took it: stop background
+        // A node refused it for good and none took it: report it rejected and stop background
         // resubmission, which could only repeat the refusal until the transaction expires.
-        if case .rejected = outcome {
+        switch outcome {
+        case .rejected, .timedOut, .unreachable:
             await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
+        case .accepted, .notAttempted, .cancelled:
+            break
         }
 
         // Remember which server took it, so the app can tell "handed to a
@@ -113,7 +116,7 @@ final class SDKBroadcaster: Broadcaster {
         return outcome
     }
 
-    /// Records the transaction as rejected when the verdict over its stored plan says so.
+    /// Records the transaction as rejected when the verdict over its endpoints' answers says so.
     private func recordRejectionVerdict(
         txId: Data,
         endpoints: [LightWalletEndpoint],

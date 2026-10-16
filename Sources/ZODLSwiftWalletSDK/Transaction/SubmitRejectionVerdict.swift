@@ -33,29 +33,25 @@ func endpointKey(_ endpoint: LightWalletEndpoint) -> String {
     "\(endpoint.host):\(endpoint.port)"
 }
 
-/// Whether a transaction is rejected for good, given its stored plan and what its endpoints just
-/// answered: the rejection to record, or `nil` when it should stay pending and be resubmitted as
-/// before.
+/// Whether a transaction is rejected, given what its endpoints just answered: the rejection to
+/// record, or `nil` when it stays pending and is resubmitted as before.
 ///
-/// It is rejected only when every endpoint of its plan (`planEndpoints`) refused it terminally and
-/// none of `outcomes` accepted it. An endpoint with no answer here counts as having refused when the
-/// transaction was already rejected (`previous`). The recorded rejection is the first terminal
-/// refusal among `outcomes` in plan order, or `previous`.
+/// A node that explicitly refuses a transaction for good (a ``SubmitRejection``) has rejected it,
+/// and that is reported as an error rather than left pending. So it is rejected when none of
+/// `outcomes` accepted it and at least one is a terminal refusal; an endpoint that did not answer,
+/// timed out, failed at the transport level or refused transiently neither counts as an
+/// acceptance nor prevents the verdict. Without a terminal refusal in `outcomes` an earlier
+/// rejection (`previous`) stands, until an acceptance clears it. The recorded rejection is the
+/// first terminal refusal in `planEndpoints` order, then any other.
 func submitRejectionVerdict(
     planEndpoints: [LightWalletEndpoint],
     outcomes: [String: EndpointSubmission],
     previous: StoredRejection?
 ) -> StoredRejection? {
-    guard !planEndpoints.isEmpty, !outcomes.values.contains(.accepted) else { return nil }
-    let refusedByAll = planEndpoints.allSatisfy { endpoint in
-        guard let outcome = outcomes[endpointKey(endpoint)] else { return previous != nil }
-        return outcome.rejection != nil
-    }
-    guard refusedByAll else { return nil }
-    let first = planEndpoints.lazy
-        .compactMap { outcomes[endpointKey($0)] }
-        .first { $0.rejection != nil }
-    if case let .refused(code, message) = first {
+    guard !outcomes.values.contains(.accepted) else { return nil }
+    let ordered = planEndpoints.compactMap { outcomes[endpointKey($0)] }
+        + outcomes.keys.sorted().filter { key in !planEndpoints.contains { endpointKey($0) == key } }.compactMap { outcomes[$0] }
+    if case let .refused(code, message) = ordered.first(where: { $0.rejection != nil }) {
         return StoredRejection(code: code, reason: message)
     }
     return previous

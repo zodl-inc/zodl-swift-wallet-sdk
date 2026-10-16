@@ -139,7 +139,8 @@ public enum TransactionSubmissionStatus: Equatable {
     case submitted
     /// A server accepted the transaction into its mempool. `host` is `host:port`.
     case accepted(host: String)
-    /// Every server the transaction was submitted to refused it for good, and none accepted it.
+    /// A server explicitly refused the transaction for good (``SubmitRejection``) and none accepted
+    /// it; servers that did not answer or failed transiently do not prevent this.
     /// The SDK no longer resubmits it. Its inputs stay reserved until it expires, when the
     /// transaction's state becomes expired and the funds spendable again.
     case rejected(SubmitRejection)
@@ -947,8 +948,8 @@ public protocol Synchronizer: AnyObject {
     ///   return `nil`.
     func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus?
 
-    /// The raw ids (`ZcashTransaction.Overview.rawID`) of the transactions every server refused
-    /// for good, as ``TransactionSubmissionStatus/rejected(_:)`` reports them one by one.
+    /// The raw ids (`ZcashTransaction.Overview.rawID`) of the transactions a server refused for
+    /// good while none accepted them, as ``TransactionSubmissionStatus/rejected(_:)`` reports them one by one.
     ///
     /// Emits the current set on subscription and again whenever it changes. A transaction leaves
     /// the set when it expires (its record is pruned then) or the wallet is wiped. The SDK no

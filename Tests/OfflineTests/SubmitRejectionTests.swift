@@ -89,41 +89,64 @@ final class SubmitRejectionTests: XCTestCase {
         XCTAssertEqual(verdict, StoredRejection(code: -26, reason: "bad"), "the first refusal in plan order is recorded")
     }
 
-    func testOneEndpointOfTheTwoIsNotUnanimous() {
-        XCTAssertNil(submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: nil))
+    func testOneExplicitRejectionWithAnUnansweredEndpointIsRejected() {
+        XCTAssertEqual(
+            submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: nil),
+            StoredRejection(code: -26, reason: "bad"),
+            "an endpoint that timed out does not hold back an explicit rejection"
+        )
     }
 
-    func testATransientRefusalOrTransportFailureKeepsItPending() {
-        XCTAssertNil(submitRejectionVerdict(
-            planEndpoints: [endpointA, endpointB],
-            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): transient],
-            previous: nil
-        ))
-        XCTAssertNil(submitRejectionVerdict(
-            planEndpoints: [endpointA, endpointB],
-            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .failed],
-            previous: nil
-        ))
+    func testOneExplicitRejectionWithATransientOrTransportFailureIsRejected() {
+        XCTAssertEqual(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): transient, endpointKey(endpointB): terminal],
+                previous: nil
+            ),
+            StoredRejection(code: -26, reason: "bad")
+        )
+        XCTAssertEqual(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .failed],
+                previous: nil
+            ),
+            StoredRejection(code: -26, reason: "bad")
+        )
     }
 
-    func testAnAcceptanceIsNeverRejected() {
+    func testWithoutAnExplicitRejectionItStaysPending() {
         XCTAssertNil(submitRejectionVerdict(
-            planEndpoints: [endpointA],
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): transient, endpointKey(endpointB): .failed],
+            previous: nil
+        ))
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [:], previous: nil))
+    }
+
+    func testARejectionWithAnAcceptanceIsNeverRejected() {
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
             outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .accepted],
             previous: StoredRejection(code: -26, reason: "bad")
         ))
     }
 
-    func testAnUnaskedEndpointCountsAsRefusedOnlyWhenAlreadyRejected() {
+    func testAnEarlierRejectionStandsUntilAnAcceptance() {
         let previous = StoredRejection(code: -25, reason: zakuraTooLarge)
+        XCTAssertEqual(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [endpointKey(endpointA): .failed], previous: previous), previous)
         XCTAssertEqual(
-            submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: previous),
-            StoredRejection(code: -26, reason: "bad")
+            submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [endpointKey(endpointA): terminal], previous: previous),
+            StoredRejection(code: -26, reason: "bad"),
+            "the latest explicit rejection is recorded"
         )
-        XCTAssertEqual(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [:], previous: previous), previous)
     }
 
-    func testNoPlanIsNeverRejected() {
-        XCTAssertNil(submitRejectionVerdict(planEndpoints: [], outcomes: [endpointKey(endpointA): terminal], previous: nil))
+    func testARefusalFromAnEndpointOutsideThePlanStillCounts() {
+        XCTAssertEqual(
+            submitRejectionVerdict(planEndpoints: [], outcomes: [endpointKey(endpointA): terminal], previous: nil),
+            StoredRejection(code: -26, reason: "bad")
+        )
     }
 }

@@ -22,9 +22,8 @@ final class MultiEndpointSubmitter {
     /// The outcome of one submission race, with what each endpoint answered.
     struct RaceResult: Equatable {
         let outcome: TransactionSubmissionOutcome
-        /// Each endpoint's answer, keyed by `endpointKey(_:)`. Complete when `outcome` is
-        /// `.rejected`, which resolves only once every endpoint has answered; an endpoint still in
-        /// flight when the race resolved otherwise has no entry.
+        /// Each endpoint's answer, keyed by `endpointKey(_:)`, as far as the race had them when it
+        /// resolved; an endpoint still in flight then (after a timeout, say) has no entry.
         let endpointOutcomes: [String: EndpointSubmission]
     }
 

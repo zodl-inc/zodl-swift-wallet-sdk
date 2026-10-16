@@ -18,8 +18,8 @@ enum StoredSubmitPlan: Equatable {
     /// does not end retrying: an accepted transaction is still resubmitted
     /// until it is mined, because a mempool is not a commitment.
     case ready([LightWalletEndpoint], acceptedBy: String?)
-    /// Every endpoint the transaction was submitted to refused it for good (see
-    /// `SubmitRejection`) and none accepted it. Resubmission must skip it: the same transaction
+    /// A node the transaction was submitted to refused it for good (see `SubmitRejection`) and
+    /// none accepted it. Resubmission must skip it: the same transaction
     /// cannot succeed, and retrying would only repeat the refusal until it expires. `code` and
     /// `reason` are the first refusal's.
     case rejected(code: Int, reason: String)
@@ -80,7 +80,7 @@ protocol SubmitPlanStoring {
     /// Dropped — logged, not thrown — when `lifecycle` belongs to an epoch the store has since
     /// wiped: see `currentLifecycle()`.
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async
-    /// Records that every endpoint of the transaction's plan refused it for good (see
+    /// Records that a node refused the transaction for good and none accepted it (see
     /// `submitRejectionVerdict`), with the recorded refusal's `code` and `reason`. Creates the row when the transaction has no plan yet, as
     /// `markAccepted` does. Ignored for a transaction a server has accepted, and dropped — logged,
     /// not thrown — when `lifecycle` belongs to an epoch the store has since wiped.

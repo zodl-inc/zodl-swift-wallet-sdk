@@ -108,7 +108,7 @@ private extension TxResubmitter {
                 )
                 return
             }
-            // Every endpoint of the plan refused it for good: stop retrying until it expires.
+            // A node refused it for good and none took it: stop retrying until it expires.
             if case .ready(_, acceptedBy: nil) = plan,
                let verdict = submitRejectionVerdict(planEndpoints: endpoints, outcomes: attempt.answers, previous: nil) {
                 await submitPlanStore.markRejected(
@@ -126,7 +126,7 @@ private extension TxResubmitter {
             // Every endpoint refused it for good. Retrying cannot succeed; the plan is pruned
             // once the transaction expires, like any other.
             logger.info(
-                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): every endpoint rejected it."
+                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): a node rejected it."
             )
 
         case .storeUnavailable:

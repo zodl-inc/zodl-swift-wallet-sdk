@@ -165,7 +165,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertEqual(endpointSubmitter.recordedSubmissions().count, 2, "resubmitted again on the next pass")
     }
 
-    func testBackgroundRetryWithOneTransientRefusalStaysReady() async throws {
+    func testBackgroundRetryWithAnExplicitRejectionBesideATransportFailureIsRejected() async throws {
         let rawID = Data(repeating: 0x10, count: 32)
         let candidate = makeOverview(rawID: rawID)
         let action = setupAction(candidates: [candidate])
@@ -178,7 +178,21 @@ final class TxResubmissionActionTests: ZcashTestCase {
         _ = try await action.run(with: makeContext()) { _ in }
 
         let plan = await submitPlanStore.plan(for: rawID)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns"))
+    }
+
+    func testBackgroundRetryWithOnlyTransientFailuresStaysReady() async throws {
+        let rawID = Data(repeating: 0x12, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpointA)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testReadyTransactionIsResubmittedThroughPlanEndpoints() async throws {

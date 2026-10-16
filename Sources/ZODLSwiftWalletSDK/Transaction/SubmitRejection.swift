@@ -81,7 +81,7 @@ public extension TransactionSubmitResult {
 public extension TransactionSubmissionOutcome {
     /// The terminal refusal this outcome reports, or `nil` for any other outcome or a refusal that
     /// may be transient. `.rejected` carries the first refusal observed; the transaction is
-    /// recorded as rejected only when every endpoint refused it terminally.
+    /// recorded as rejected when any endpoint refused it terminally and none accepted it.
     var rejection: SubmitRejection? {
         guard case let .rejected(code, message) = self else { return nil }
         return SubmitRejection(code: code, message: message)

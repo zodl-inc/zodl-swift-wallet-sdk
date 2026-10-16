@@ -93,7 +93,7 @@ Changes are relative to `5.2.0`.
   reports one submitted round with nothing remaining.
 - `Synchronizer.rejectedTransactionIdsStream` (also on `ClosureSynchronizer` and
   `CombineSynchronizer`) publishes the raw ids
-  (`ZcashTransaction.Overview.rawID`) of the transactions every server refused terminally,
+  (`ZcashTransaction.Overview.rawID`) of the transactions a server refused terminally while none accepted them,
   emitting the current set on subscription and on every change. A transaction leaves it when it
   expires or the wallet is wiped. The protocol provides a default (always empty), so existing
   conformers compile unchanged.
@@ -106,14 +106,14 @@ Changes are relative to `5.2.0`.
 
 ## Changed
 
-- `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`: every endpoint a
-  transaction was submitted to refused it terminally and none accepted it. The SDK then stops
+- `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`: a node the
+  transaction was submitted to explicitly refused it terminally and none accepted it. The SDK then stops
   resubmitting it in the background, where it previously retried until expiry; its inputs stay
-  reserved until it expires. A transaction is recorded as rejected only when every endpoint of its
-  retry plan (the endpoints given to `Broadcaster.submit` or `releaseForResubmission`) refused it
-  terminally and none accepted it, whether on submission or on a background retry; a mix with
-  transport failures or transient refusals keeps it pending, as before, and a later acceptance
-  clears the rejection. Transactions submitted by `createProposedTransactions` or
+  reserved until it expires. A transaction with a retry plan (the endpoints given to
+  `Broadcaster.submit` or `releaseForResubmission`) is recorded as rejected as soon as one endpoint
+  explicitly refuses it terminally and none accepts it, whether on submission or on a background
+  retry; endpoints that did not answer, timed out, failed at the transport level or refused
+  transiently neither prevent nor count towards it. A later acceptance clears the rejection. Transactions submitted by `createProposedTransactions` or
   `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected, and
   neither are migration preparations handed out by `takeMigrationPreparation(accountUUID:byTxid:)`,
   which are resubmitted until they expire, as before. An

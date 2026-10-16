@@ -800,7 +800,7 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(rejected.last, [transaction.txId])
     }
 
-    func testSubmitRejectedTransientlyIsNotRecordedAsRejected() async throws {
+    func testOneExplicitRejectionBesideATransientRefusalIsRecordedAsRejected() async throws {
         let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
         defer { try? terminal.stop() }
         let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
@@ -808,13 +808,63 @@ final class BroadcasterTests: ZcashTestCase {
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
 
-        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
 
-        guard case .rejected = outcome else {
-            return XCTFail("Expected rejected, got \(outcome)")
-        }
         let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
-        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "Another server may still take it")
+        XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.invalid))
+    }
+
+    func testOneExplicitRejectionBesideATimeoutIsRecordedAsRejected() async throws {
+        let endpointSubmitter = EndpointSubmitterMock()
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let silent = LightWalletEndpoint(address: "silent.example.com", port: 443, secure: true)
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: rejecting)
+        endpointSubmitter.set(behavior: .hang, for: silent)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(
+            transaction: transaction,
+            to: [rejecting, silent],
+            timing: SubmissionTiming(responseTimeout: 0.5, postAcceptanceGraceDelay: 0.1)
+        )
+
+        XCTAssertEqual(outcome, .timedOut)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.tooLarge), "a silent endpoint does not hold back the rejection")
+    }
+
+    func testOnlyTransientRefusalsStaySubmitted() async throws {
+        let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [transient.endpoint])
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted)
+    }
+
+    func testARejectionBesideAnAcceptanceIsNotRejected() async throws {
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? rejecting.stop() }
+        let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? accepting.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(
+            transaction: transaction,
+            to: [rejecting.endpoint, accepting.endpoint],
+            timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.2)
+        )
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
     }
 
     func testLegacySubmitWithoutAPlanRecordsNoRejection() async throws {
