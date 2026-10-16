@@ -461,9 +461,20 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         }
     }
 
+    private(set) var migrationPreparations: Set<Data> = []
+
+    func markMigrationPreparation(txId: Data) async {
+        migrationPreparations.insert(txId)
+    }
+
+    func isMigrationPreparation(txId: Data) async -> Bool {
+        migrationPreparations.contains(txId)
+    }
+
     func markRejected(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) async {
-        // Mirrors the real store: stale epochs are dropped, and an accepted plan stays accepted.
-        guard lifecycle.generation == lifecycleGeneration else { return }
+        // Mirrors the real store: stale epochs are dropped, an accepted plan stays accepted, and a
+        // migration preparation is never rejected.
+        guard lifecycle.generation == lifecycleGeneration, !migrationPreparations.contains(txId) else { return }
         storeFileExists = true
         if case .ready(_, .some) = plans[txId] { return }
         plans[txId] = StoredSubmitPlan.rejected(code: code, reason: reason)

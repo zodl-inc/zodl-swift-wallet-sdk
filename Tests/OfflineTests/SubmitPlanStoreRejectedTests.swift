@@ -88,6 +88,25 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
         XCTAssertNil(code)
     }
 
+    func testAMigrationPreparationIsNeverRecordedAsRejected() async {
+        let txId = Data(repeating: 0x4A, count: 32)
+        let store = makeStore()
+        await store.markMigrationPreparation(txId: txId)
+        await store.recordPlan(txId: txId, endpoints: [endpointA])
+
+        await store.markRejected(txId: txId, code: -26, reason: "bad", lifecycle: await store.currentLifecycle())
+
+        let plan = await store.plan(for: txId)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: nil))
+        // The mark is on the plan's row, so a reopened store (after a restart) still honours it.
+        let reopened = makeStore()
+        let marked = await reopened.isMigrationPreparation(txId: txId)
+        XCTAssertTrue(marked)
+        await reopened.markRejected(txId: txId, code: -26, reason: "bad", lifecycle: await reopened.currentLifecycle())
+        let reread = await reopened.plan(for: txId)
+        XCTAssertEqual(reread, .ready([endpointA], acceptedBy: nil))
+    }
+
     func testARejectionFromAWipedLifecycleIsDropped() async {
         let txId = Data(repeating: 0x44, count: 32)
         let store = makeStore()

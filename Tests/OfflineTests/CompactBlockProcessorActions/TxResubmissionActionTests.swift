@@ -145,6 +145,26 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns"))
     }
 
+    /// Characterization: as on main, a migration preparation is resubmitted on every pass until it
+    /// expires, even when every endpoint of its plan rejects it terminally.
+    func testAUnanimouslyRejectedMigrationPreparationIsStillResubmitted() async throws {
+        let rawID = Data(repeating: 0x11, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.markMigrationPreparation(txId: rawID)
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpointA)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+        let afterFirst = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(afterFirst, StoredSubmitPlan.ready([endpointA], acceptedBy: nil), "never recorded as rejected")
+
+        action.latestResolvedTime = 0
+        _ = try await action.run(with: makeContext()) { _ in }
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().count, 2, "resubmitted again on the next pass")
+    }
+
     func testBackgroundRetryWithOneTransientRefusalStaysReady() async throws {
         let rawID = Data(repeating: 0x10, count: 32)
         let candidate = makeOverview(rawID: rawID)

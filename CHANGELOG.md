@@ -114,7 +114,9 @@ Changes are relative to `5.2.0`.
   terminally and none accepted it, whether on submission or on a background retry; a mix with
   transport failures or transient refusals keeps it pending, as before, and a later acceptance
   clears the rejection. Transactions submitted by `createProposedTransactions` or
-  `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected. An
+  `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected, and
+  neither are migration preparations handed out by `takeMigrationPreparation(accountUUID:byTxid:)`,
+  which are resubmitted until they expire, as before. An
   exhaustive `switch` over `TransactionSubmissionStatus` stops compiling until the new case is
   handled. See MIGRATING.md.
 - `ZcashError` and `ZcashErrorCode` have new cases, starting with `giftCardTooManyNotes` (`ZGIFT0017`):

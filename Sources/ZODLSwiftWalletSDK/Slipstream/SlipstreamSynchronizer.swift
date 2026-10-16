@@ -2386,7 +2386,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        let prepared = try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        // Its submission keeps main's resubmission until expiry, even if every server rejects it.
+        await submitPlanStore.markMigrationPreparation(txId: prepared.txid)
+        return prepared
     }
 
     public func recordMigrationPreparationBroadcast(

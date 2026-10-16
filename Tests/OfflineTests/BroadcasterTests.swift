@@ -908,6 +908,20 @@ final class BroadcasterTests: ZcashTestCase {
         }
     }
 
+    func testAMigrationPreparationRejectedByEveryEndpointStaysSubmitted() async throws {
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? rejecting.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+        await mockContainer.resolve(SubmitPlanStoring.self).markMigrationPreparation(txId: transaction.txId)
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
+
+        XCTAssertEqual(outcome.rejection, .invalid, "the result is still classified")
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it, as on main")
+    }
+
     func testALaterAcceptanceClearsARejection() async throws {
         let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
         defer { try? rejecting.stop() }
