@@ -211,7 +211,7 @@ strip = false
 # PR #16 (head 8b6f55de, not merged yet: chunked connector, grpc-status fix, request freshness, one
 # retry after a freshness refusal; on 0.4.0-pre.1). Git dependency pinned by commit; the rev moves to the
 # slipstream-internal main commit once #16 merges.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "8b6f55de4d1e4b066ccac06c70d7388cee975fe4" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "3046f44324ec0164caa0a25d7b194f4c2a8f6ed9" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
