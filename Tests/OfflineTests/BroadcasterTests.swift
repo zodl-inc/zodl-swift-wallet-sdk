@@ -876,6 +876,38 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(transactionEncoder.receivedSizeBound, .consensus, "The unbounded overload stays consensus only")
     }
 
+    /// The wallet app's send path: create through the broadcaster (an awaiting plan), then submit
+    /// each transaction to the chosen endpoints. A unanimous terminal refusal is recorded.
+    func testCreateThenSubmitThroughTheBroadcasterRecordsAUnanimousRejection() async throws {
+        let rawID = Data(repeating: 0xE4, count: 32)
+        let rawTransaction = Data([0x01, 0x02])
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: rawTransaction, rawID: rawID)])
+        )
+        await synchronizer.updateStatus(.stopped)
+        let first = try RecordingCompactTxStreamerService(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "exceeding the next block's ZIP 218 limit")
+        )
+        defer { try? first.stop() }
+        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? second.stop() }
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        let awaiting = await synchronizer.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(awaiting, TransactionSubmissionStatus.awaiting)
+
+        let reports = await synchronizer.broadcaster.submit(transactions: transactions, to: [first.endpoint, second.endpoint])
+
+        XCTAssertNotNil(reports.first?.outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: rawID)
+        guard case .rejected = status else {
+            return XCTFail("Expected a rejected status, got \(String(describing: status))")
+        }
+    }
+
     func testALaterAcceptanceClearsARejection() async throws {
         let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
         defer { try? rejecting.stop() }

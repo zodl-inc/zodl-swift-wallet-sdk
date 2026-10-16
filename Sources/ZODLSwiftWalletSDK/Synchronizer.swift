@@ -2247,7 +2247,9 @@ public extension ClosureSynchronizer {
         sizeBound: TransactionSizeBound,
         completion: @escaping (Result<Proposal, Error>) -> Void
     ) {
-        // `ClosureSynchronizer` has no unbounded counterpart to forward to.
+        // `ClosureSynchronizer` had no payment-URI proposal before this member, so no existing call
+        // site reaches this default; a conformer that does not implement it refuses rather than
+        // proposing anything. `ClosureSDKSynchronizer` implements it for every bound.
         completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.proposefulfillingPaymentURI(...sizeBound:completion:)")))
     }
 
