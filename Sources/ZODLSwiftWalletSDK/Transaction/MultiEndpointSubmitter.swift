@@ -19,14 +19,31 @@ final class MultiEndpointSubmitter {
         self.logger = logger
     }
 
+    /// The outcome of one submission race, and whether it ended in a terminal rejection.
+    struct RaceResult: Equatable {
+        let outcome: TransactionSubmissionOutcome
+        /// `true` only when every endpoint responded with a terminal refusal (`SubmitRejection`)
+        /// and none accepted. A mix of refusals and transport failures, or any refusal that may be
+        /// transient, leaves it `false`: some server may still take the transaction.
+        let rejectedByAll: Bool
+    }
+
     func submit(
         transaction: CreatedTransaction,
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> TransactionSubmissionOutcome {
+        await submitClassifyingRejection(transaction: transaction, to: endpoints, timing: timing).outcome
+    }
+
+    func submitClassifyingRejection(
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> RaceResult {
         guard !endpoints.isEmpty else {
             logger.warn("Multi-endpoint submission requested with an empty endpoint list.")
-            return .unreachable
+            return RaceResult(outcome: .unreachable, rejectedByAll: false)
         }
 
         let race = SubmissionRace(
@@ -43,7 +60,7 @@ final class MultiEndpointSubmitter {
             await race.run()
         }
 
-        return await withTaskCancellationHandler {
+        let outcome = await withTaskCancellationHandler {
             await race.outcome()
         } onCancel: {
             worker.cancel()
@@ -56,6 +73,11 @@ final class MultiEndpointSubmitter {
                 await race.callerCancelled()
             }
         }
+        // `.rejected` resolves only once every endpoint has completed, so the tally is final.
+        guard case .rejected = outcome else {
+            return RaceResult(outcome: outcome, rejectedByAll: false)
+        }
+        return RaceResult(outcome: outcome, rejectedByAll: await race.rejectedTerminallyByAll())
     }
 }
 
@@ -75,6 +97,7 @@ actor SubmissionRace {
     private var winner: LightWalletEndpoint?
     private var firstRejection: (code: Int, message: String)?
     private var completedCount = 0
+    private var terminalRejectionCount = 0
     private var graceTask: Task<Void, Never>?
 
     init(
@@ -126,6 +149,12 @@ actor SubmissionRace {
     /// failure cannot win over the cancellation.
     func callerCancelled() {
         resolve(.cancelled)
+    }
+
+    /// Whether every endpoint refused the transaction terminally. Meaningful once the race has
+    /// resolved `.rejected`, which happens only after every endpoint completed.
+    func rejectedTerminallyByAll() -> Bool {
+        winner == nil && terminalRejectionCount == endpoints.count
     }
 
     /// The caller-facing promise. Resumes exactly once.
@@ -187,6 +216,9 @@ actor SubmissionRace {
         completedCount += 1
         if firstRejection == nil {
             firstRejection = (code: code, message: message)
+        }
+        if SubmitRejection(code: code, message: message) != nil {
+            terminalRejectionCount += 1
         }
         logger.warn("Transaction \(transaction.txId.toHexStringTxId()) rejected by \(endpoint.host):\(endpoint.port): \(code) \(message)")
         resolveIfAllFailed()

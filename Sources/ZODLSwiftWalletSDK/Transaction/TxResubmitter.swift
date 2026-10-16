@@ -108,6 +108,13 @@ private extension TxResubmitter {
                 )
             }
 
+        case .rejected:
+            // Every endpoint refused it for good. Retrying cannot succeed; the plan is pruned
+            // once the transaction expires, like any other.
+            logger.info(
+                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): every endpoint rejected it."
+            )
+
         case .storeUnavailable:
             // Whether the app ever submitted this transaction is unknown.
             // Skip rather than risk broadcasting something the user never

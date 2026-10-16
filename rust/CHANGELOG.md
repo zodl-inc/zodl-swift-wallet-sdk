@@ -422,6 +422,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
+  `zcashlc_propose_send_max_transfer`, `zcashlc_create_proposed_transactions` and
+  `zcashlc_create_pczt_from_proposal` take a trailing `size_bound: FfiTransactionSizeBound`, the
+  caps the proposal is held to below consensus: `max_bytes` (the proposal's estimated serialized
+  size), `max_shielded_actions`, `max_sapling_actions`, `max_orchard_actions`,
+  `max_ironwood_actions`, `max_transparent_inputs`, `max_transparent_outputs` and
+  `max_shielded_payment_outputs`, each `-1` for no cap (`0` forbids that dimension; any other
+  negative value fails). Actions are those `zcash_client_backend`'s builder produces, padding
+  included. A proposal exceeding the bound fails with `ErrorKind::TransactionTooLarge`
+  (`22`); `zcashlc_create_pczt_from_proposal` reports it through the last error message. A send-max
+  is refused, never reduced to what fits. `zcashlc_propose_send_max_transfer` ignores the bound when
+  `orchard_only` is `true`. Existing callers must pass every field `-1` to keep their behavior.
 - `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other
   heights, a negative value means "not activated on this network".
 - `zcashlc_create_proposed_transactions` takes a trailing `ovk_policy: u32`: `0` encrypts the

@@ -1194,6 +1194,11 @@ enum ZcashErrorDefinition {
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     // sourcery: code="ZGIFT0016"
     case giftCardCheckSyncStalled
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    /// block). Nothing was created or broadcast, and the card's funds are untouched. Redeeming such
+    /// a card takes several transactions, which this SDK version does not yet create.
+    // sourcery: code="ZGIFT0017"
+    case giftCardTooManyNotes
 
     // MARK: - Models
 

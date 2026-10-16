@@ -138,14 +138,14 @@ final class ClassicProcessorCleanupEncoder: TransactionEncoder {
     private(set) var createdTransactions: [CreatedTransaction] = []
     private(set) var submittedTransactions: [EncodedTransaction] = []
 
-    func proposeSendMax(accountUUID: AccountUUID, recipient: String, memoBytes: MemoBytes?, mode: MaxSpendMode) async throws -> Proposal {
+    func proposeSendMax(accountUUID: AccountUUID, recipient: String, memoBytes: MemoBytes?, mode: MaxSpendMode, sizeBound: TransactionSizeBound) async throws -> Proposal {
         if let propose { return try await propose() }
         return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)])
     }
 
     func requiresSaplingParameters(for proposal: Proposal) throws -> Bool { false }
 
-    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy) async throws -> [CreatedTransaction] {
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound) async throws -> [CreatedTransaction] {
         let transaction = CreatedTransaction(txId: Data(repeating: 0xA1, count: 32), raw: Data([1]), expiryHeight: 3_000_100)
         createdTransactions.append(transaction)
         return [transaction]
@@ -159,7 +159,7 @@ final class ClassicProcessorCleanupEncoder: TransactionEncoder {
     func closeDBConnection() { }
     func isTransactionKnownToServer(txId: Data) async -> Bool { false }
     func createdTransactions(forTxIds txIds: [Data]) async throws -> [CreatedTransaction] { createdTransactions }
-    func proposeTransfer(accountUUID: AccountUUID, recipient: String, amount: Zatoshi, memoBytes: MemoBytes?) async throws -> Proposal {
+    func proposeTransfer(accountUUID: AccountUUID, recipient: String, amount: Zatoshi, memoBytes: MemoBytes?, sizeBound: TransactionSizeBound) async throws -> Proposal {
         throw ZcashError.giftCardNothingToRedeem
     }
     func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
@@ -168,7 +168,7 @@ final class ClassicProcessorCleanupEncoder: TransactionEncoder {
     func proposeShielding(accountUUID: AccountUUID, shieldingThreshold: Zatoshi, memoBytes: MemoBytes?, transparentReceiver: String?) async throws -> Proposal? {
         throw ZcashError.giftCardNothingToRedeem
     }
-    func proposeFulfillingPaymentFromURI(_ uri: String, accountUUID: AccountUUID) async throws -> Proposal {
+    func proposeFulfillingPaymentFromURI(_ uri: String, accountUUID: AccountUUID, sizeBound: TransactionSizeBound) async throws -> Proposal {
         throw ZcashError.giftCardNothingToRedeem
     }
 }

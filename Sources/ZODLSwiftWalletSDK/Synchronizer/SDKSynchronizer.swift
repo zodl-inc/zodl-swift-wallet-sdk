@@ -467,6 +467,16 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func proposeTransfer(accountUUID: AccountUUID, recipient: Recipient, amount: Zatoshi, memo: Memo?) async throws -> Proposal {
+        try await proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, sizeBound: .consensus)
+    }
+
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
 
         try recipient.ensureMemoIsAllowed(memo)
@@ -475,13 +485,24 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             amount: amount,
-            memoBytes: memo?.asMemoBytes()
+            memoBytes: memo?.asMemoBytes(),
+            sizeBound: sizeBound
         )
 
         return proposal
     }
 
     public func proposeSendMax(accountUUID: AccountUUID, recipient: Recipient, memo: Memo?, mode: MaxSpendMode) async throws -> Proposal {
+        try await proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, sizeBound: .consensus)
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
 
         try recipient.ensureMemoIsAllowed(memo)
@@ -490,7 +511,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             memoBytes: memo?.asMemoBytes(),
-            mode: mode
+            mode: mode,
+            sizeBound: sizeBound
         )
 
         return proposal
@@ -522,10 +544,19 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
+        try await proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: .consensus)
+    }
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
         return try await transactionEncoder.proposeFulfillingPaymentFromURI(
             uri,
-            accountUUID: accountUUID
+            accountUUID: accountUUID,
+            sizeBound: sizeBound
         )
     }
 
@@ -541,10 +572,20 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: .consensus)
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
         let transactions = try await sdkBroadcaster.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
             ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound,
             recordingPlans: false
         )
 
@@ -561,6 +602,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                // Captured before the network round trip, so a refusal for a submission a `wipe()`
+                // overtook cannot recreate the store the wipe deleted.
+                let lifecycle = await self.submitPlanStore.currentLifecycle()
                 do {
                     try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
                     return TransactionSubmitResult.success(txId: transaction.txId)
@@ -576,6 +620,13 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    // A terminal refusal stops background resubmission of this transaction.
+                    await self.submitPlanStore.recordSingleEndpointRefusal(
+                        txId: transaction.txId,
+                        code: code,
+                        reason: message,
+                        lifecycle: lifecycle
+                    )
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 }
             }
@@ -584,9 +635,14 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt {
+        try await createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: .consensus)
+    }
+
+    public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
         try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
-            proposal: proposal.inner
+            proposal: proposal.inner,
+            sizeBound: sizeBound
         )
     }
 
@@ -734,6 +790,10 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
     public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
         await submitPlanStore.plan(for: rawID)?.submissionStatus
+    }
+
+    public var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        submitPlanStore.rejectedTransactionIds
     }
 
     /// Fetches the latest ZEC-USD exchange rate.

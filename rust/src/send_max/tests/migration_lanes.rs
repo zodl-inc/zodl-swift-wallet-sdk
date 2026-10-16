@@ -75,22 +75,18 @@ fn ironwood_wallet_with_orchard_notes(values: &[u64]) -> TestWallet {
     st
 }
 
-/// An Ironwood-era wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes, as
-/// [`wallet_with_too_many_notes`] builds them.
-fn ironwood_wallet_with_too_many_notes() -> TestWallet {
+/// An Ironwood-era wallet holding `count` spendable Orchard notes, as
+/// [`wallet_with_note_count`] builds them.
+fn ironwood_wallet_with_note_count(count: usize) -> TestWallet {
     let mut st = unscanned_ironwood_wallet();
-    let output = FakeCompactOutput::new(
-        orchard_fvk(&st),
-        AddressType::DefaultExternal,
-        Zatoshis::const_from_u64(MINIMUM_FEE),
-    );
-    let block = vec![output; NOTES_PER_BLOCK];
-    let first = (0..TOO_MANY_NOTES / NOTES_PER_BLOCK)
-        .map(|_| st.generate_next_block_multi(&block).0)
-        .min()
-        .unwrap();
+    let first = receive_many_orchard_notes(&mut st, count);
     scan_past_nu6_3(&mut st, first);
     st
+}
+
+/// An Ironwood-era wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes.
+fn ironwood_wallet_with_too_many_notes() -> TestWallet {
+    ironwood_wallet_with_note_count(TOO_MANY_NOTES)
 }
 
 /// Receives one more Orchard note of [`NOTE_VALUE`] in a new block and scans it, so the wallet
@@ -177,6 +173,57 @@ fn the_turnstile_is_not_size_gated() {
         sweep.check_transaction_size().is_err(),
         "the sweep is oversized"
     );
+}
+
+// No size bound
+
+/// More notes than the phone bound of 75 shielded actions admits, but few enough to fit a
+/// block: the case a size bound changes for the user's Send Max and must not change for a
+/// migration.
+const OVER_PHONE_BOUND: usize = 80;
+
+/// A bound of the kind a phone holds its own sends to.
+fn phone_bound() -> TransactionSizeBound {
+    TransactionSizeBound::CONSENSUS
+        .with_max_bytes(250_000)
+        .with_max_shielded_actions(75)
+}
+
+/// The migration lanes take no size bound: a sweep of more notes than a phone bound admits
+/// proposes exactly as before, though the same bound refuses the user's Send Max over the same
+/// wallet.
+#[test]
+fn neither_lane_is_size_bounded_but_send_max_is() {
+    let mut st = wallet_with_note_count(OVER_PHONE_BOUND);
+
+    let sweep = propose_immediate(&mut st).expect("the immediate lane proposes the sweep");
+    assert_eq!(spent_note_count(&sweep), OVER_PHONE_BOUND);
+    assert!(
+        sweep.check_transaction_size().is_ok(),
+        "the sweep fits a block"
+    );
+    assert!(
+        phone_bound().check(&sweep, st.network()).is_err(),
+        "a bounded sweep of the same notes would be refused"
+    );
+
+    let recipient = external_recipient(&st);
+    let unbounded = propose_max(&mut st, user_send_max(recipient.clone(), None))
+        .expect("an unbounded Send Max of the same notes proposes");
+    assert_eq!(spent_note_count(&unbounded), OVER_PHONE_BOUND);
+    let e = refusal(
+        &mut st,
+        SendMaxRequest {
+            size_bound: phone_bound(),
+            ..user_send_max(recipient, None)
+        },
+    );
+    assert_eq!(e.kind(), ErrorKind::TransactionTooLarge);
+
+    let mut ironwood = ironwood_wallet_with_note_count(OVER_PHONE_BOUND);
+    let migration = propose_turnstile(&mut ironwood).expect("the turnstile proposes the sweep");
+    assert_eq!(spent_note_count(&migration), OVER_PHONE_BOUND);
+    assert!(phone_bound().check(&migration, ironwood.network()).is_err());
 }
 
 // Modes and gates

@@ -430,7 +430,9 @@ public actor GiftCardRedeemer {
     ///   would take everything (``GiftCardStatus/State/dust``),
     ///   ``ZcashError/giftCardNetworkMismatch`` for an address on another network,
     ///   ``ZcashError/giftCardRecipientRequiresOrchard`` for a unified address without an Orchard
-    ///   receiver, and the proposal and creation errors of `Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:)`
+    ///   receiver, ``ZcashError/giftCardTooManyNotes`` when the card holds more notes than one claim
+    ///   transaction can spend within a block, with nothing created or broadcast, and the proposal
+    ///   and creation errors of `Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:)`
     ///   and `Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:)`. The
     ///   destination's errors are never thrown. Empty completion throws
     ///   ``ZcashError/giftCardRedemptionIncomplete``.
@@ -440,8 +442,26 @@ public actor GiftCardRedeemer {
     /// completion, even when the caller cancels. Cleanup joins that work before deleting the wallet.
     /// A later stream error is rethrown after accepted receipts are attempted in the destination.
     public func redeem(to recipient: UnifiedAddress, memo: Memo?, recordIn destination: Synchronizer?) async throws -> Redemption {
+        try await redeem(to: recipient, memo: memo, recordIn: destination, sizeBound: .consensus)
+    }
+
+    /// Sends the card's entire spendable balance, minus the fee, to `recipient`, as
+    /// ``redeem(to:memo:recordIn:)`` does, with the claim held to `sizeBound`.
+    ///
+    /// Pass the bound the device can prove and relays accept, for instance
+    /// ``TransactionSizeBound/forProvingMemory(availableBytes:)``: card notes are spent with the
+    /// card's key on this device. A card holding more notes than one claim may spend within the
+    /// bound throws ``ZcashError/giftCardTooManyNotes`` before anything is created or broadcast, and
+    /// its funds stay on the card. ``Redemption`` sums the fee and amount of every claim
+    /// transaction and lists all of their results.
+    public func redeem(
+        to recipient: UnifiedAddress,
+        memo: Memo?,
+        recordIn destination: Synchronizer?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Redemption {
         try await serialized { redeemer, admission in
-            try await redeemer.performRedeem(to: recipient, memo: memo, recordIn: destination, admission: admission)
+            try await redeemer.performRedeem(to: recipient, memo: memo, recordIn: destination, sizeBound: sizeBound, admission: admission)
         }
     }
 
@@ -527,6 +547,7 @@ public actor GiftCardRedeemer {
         to recipient: UnifiedAddress,
         memo: Memo?,
         recordIn destination: Synchronizer?,
+        sizeBound: TransactionSizeBound,
         admission: GiftCardOperationAdmission
     ) async throws -> Redemption {
         guard !isCleanedUp else {
@@ -547,22 +568,14 @@ public actor GiftCardRedeemer {
             throw ZcashError.giftCardNothingToRedeem
         }
 
-        let proposal: Proposal
-        do {
-            proposal = try await synchronizer.proposeSendMax(
-                accountUUID: accountUUID,
-                recipient: .unified(recipient),
-                memo: memo,
-                mode: .maxSpendable
-            )
-        } catch ZcashError.rustProposalInsufficientFunds {
-            // The fee would take everything: a dust card.
-            throw ZcashError.giftCardNothingToRedeem
-        }
-        let tool = DerivationTool(networkType: card.network)
-        let spendingKey = try card.seed.withBytes { seed in
-            try tool.deriveUnifiedSpendingKey(seed: seed, accountIndex: Zip32AccountIndex(0))
-        }
+        let rounds = try redemptionRounds(
+            accountUUID: accountUUID,
+            recipient: recipient,
+            memo: memo,
+            sizeBound: sizeBound,
+            recordIn: destination
+        )
+        let first = try await rounds.proposeFirst()
 
         // Preparatory awaits may ignore cancellation. Check before creation can store a claim.
         try Task.checkCancellation()
@@ -572,7 +585,7 @@ public actor GiftCardRedeemer {
         return try await withTaskCancellationHandler {
             let completion = Task {
                 try await GiftCardTransactionCreationContext.$admission.withValue(creationAdmission) {
-                    try await self.completeRedemption(proposal: proposal, spendingKey: spendingKey, recordIn: destination)
+                    try Redemption(rounds: try await rounds.run(startingWith: first))
                 }
             }
             // This task owns creation, submission and recording. Caller cancellation only closes
@@ -586,12 +599,14 @@ public actor GiftCardRedeemer {
     private func completeRedemption(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound,
         recordIn destination: Synchronizer?
-    ) async throws -> Redemption {
+    ) async throws -> GiftCardRedeemRounds<Proposal>.Outcome {
         let stream = try await synchronizer.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
-            ovkPolicy: .discard
+            ovkPolicy: .discard,
+            sizeBound: sizeBound
         )
 
         var results: [TransactionSubmitResult] = []
@@ -624,7 +639,7 @@ public actor GiftCardRedeemer {
         if let streamError { throw streamError }
         guard !results.isEmpty else { throw ZcashError.giftCardRedemptionIncomplete }
         let sweep = GiftCardStatus.Sweep(proposal: proposal)
-        return Redemption(results: results, recordedInDestination: recorded, fee: sweep.fee, amount: sweep.amount)
+        return .init(results: results, recordedInDestination: recorded, fee: sweep.fee, amount: sweep.amount)
     }
 
     /// Prepares the card wallet from the card's seed and birthday on first use, and returns the
@@ -672,6 +687,51 @@ public actor GiftCardRedeemer {
         accountUUID = account.id
         try Task.checkCancellation()
         return account.id
+    }
+}
+
+private extension GiftCardRedeemer {
+    /// The rounds of one redemption of the card from `accountUUID` to `recipient`, each claim
+    /// proposed and created under `sizeBound` and signed with the card's key.
+    func redemptionRounds(
+        accountUUID: AccountUUID,
+        recipient: UnifiedAddress,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound,
+        recordIn destination: Synchronizer?
+    ) throws -> GiftCardRedeemRounds<Proposal> {
+        let tool = DerivationTool(networkType: card.network)
+        let spendingKey = try card.seed.withBytes { seed in
+            try tool.deriveUnifiedSpendingKey(seed: seed, accountIndex: Zip32AccountIndex(0))
+        }
+        let synchronizer = self.synchronizer
+        return GiftCardRedeemRounds<Proposal>(
+            sendWhatFits: Self.sendWhatFits,
+            maxRounds: Self.maxRounds,
+            propose: { _ in
+                // Until librustzcash can propose the part of a send-max that fits a bound, every
+                // round proposes the whole card, so it leaves nothing behind.
+                do {
+                    let proposal = try await synchronizer.proposeSendMax(
+                        accountUUID: accountUUID,
+                        recipient: .unified(recipient),
+                        memo: memo,
+                        mode: .maxSpendable,
+                        sizeBound: sizeBound
+                    )
+                    return .init(proposal: proposal, remainingNotes: 0)
+                } catch ZcashError.rustProposalInsufficientFunds {
+                    // The fee would take everything: a dust card.
+                    throw ZcashError.giftCardNothingToRedeem
+                }
+            },
+            complete: { proposal in
+                try await self.completeRedemption(proposal: proposal, spendingKey: spendingKey, sizeBound: sizeBound, recordIn: destination)
+            },
+            awaitMined: { txIds in
+                try await Self.awaitMined(txIds, events: synchronizer.eventStream)
+            }
+        )
     }
 }
 

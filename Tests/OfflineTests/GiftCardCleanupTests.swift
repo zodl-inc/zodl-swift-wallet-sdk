@@ -283,7 +283,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let proposalEntered = XCTestExpectation(description: "predecessor entered proposal")
         let gate = GiftCardCleanupTestGate()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             proposalEntered.fulfill()
             await gate.wait()
             return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
@@ -329,7 +329,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let entered = XCTestExpectation(description: "predecessor installed cancellation callback")
         let cancelled = XCTestExpectation(description: "cancellation callback consumed twenty seconds")
         let gate = GiftCardCleanupTestGate()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             await withTaskCancellationHandler {
                 entered.fulfill()
                 await gate.wait()

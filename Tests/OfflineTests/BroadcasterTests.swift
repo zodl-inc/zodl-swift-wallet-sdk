@@ -157,7 +157,7 @@ final class BroadcasterTests: ZcashTestCase {
             expiryHeight: 123_456
         )
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = transactionData
         let encoder = WalletTransactionEncoder(
             rustBackend: rustBackend,
@@ -185,7 +185,7 @@ final class BroadcasterTests: ZcashTestCase {
         let firstTxId = Data(repeating: 0xBC, count: 32)
         let missingTxId = Data(repeating: 0xBD, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [firstTxId, missingTxId]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [firstTxId, missingTxId]
         rustBackend.getTransactionTxIdClosure = { txId in
             guard txId == firstTxId else { return nil }
             return TransactionData(txId: firstTxId, raw: Data([0x01]), expiryHeight: 123_456)
@@ -283,7 +283,8 @@ final class BroadcasterTests: ZcashTestCase {
         let transactions = try await synchronizer.broadcaster.createProposedTransactions(
             proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
             spendingKey: TestsData(networkType: .testnet).spendingKey,
-            ovkPolicy: .discard
+            ovkPolicy: .discard,
+            sizeBound: .consensus
         )
 
         XCTAssertEqual(transactions.map(\.txId), [rawID])
@@ -313,7 +314,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testWalletTransactionEncoderPassesTheOvkPolicyToTheRustBackend() async throws {
         let rawID = Data(repeating: 0xA4, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
         let encoder = makeWalletTransactionEncoder(rustBackend: rustBackend)
 
@@ -321,9 +322,10 @@ final class BroadcasterTests: ZcashTestCase {
             _ = try await encoder.createProposedTransactions(
                 proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
                 spendingKey: TestsData(networkType: .testnet).spendingKey,
-                ovkPolicy: policy
+                ovkPolicy: policy,
+                sizeBound: .consensus
             )
-            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyReceivedArguments?.ovkPolicy, policy)
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments?.ovkPolicy, policy)
         }
     }
 
@@ -382,7 +384,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testWalletTransactionEncoderCreatesNonSaplingProposalsWithoutParameters() async throws {
         let rawID = Data(repeating: 0xA5, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
         let missing = testTempDirectory.appendingPathComponent("missing", isDirectory: true)
         let encoder = makeWalletTransactionEncoder(
@@ -395,7 +397,8 @@ final class BroadcasterTests: ZcashTestCase {
         let transactions = try await encoder.createProposedTransactions(
             proposal: Proposal(inner: Self.proposal(inputPool: .ironwood, paymentPool: .ironwood)),
             spendingKey: spendingKey,
-            ovkPolicy: .discard
+            ovkPolicy: .discard,
+            sizeBound: .consensus
         )
         XCTAssertEqual(transactions.map(\.txId), [rawID])
 
@@ -403,11 +406,12 @@ final class BroadcasterTests: ZcashTestCase {
             _ = try await encoder.createProposedTransactions(
                 proposal: Proposal(inner: Self.proposal(inputPool: .sapling, paymentPool: .orchard)),
                 spendingKey: spendingKey,
-                ovkPolicy: .sender
+                ovkPolicy: .sender,
+                sizeBound: .consensus
             )
             XCTFail("A Sapling proposal needs the parameters")
         } catch ZcashError.walletTransEncoderCreateTransactionMissingSaplingParams {
-            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         }
     }
 
@@ -772,6 +776,106 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(outcome, TransactionSubmissionOutcome.rejected(code: -25, message: "rejected"))
     }
 
+    func testSubmitRejectedTerminallyByEveryEndpointIsRecordedAsRejected() async throws {
+        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? first.stop() }
+        let second = try RecordingCompactTxStreamerService(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "tx size exceeding the configured mempool maximum")
+        )
+        defer { try? second.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+        var rejected: [Set<Data>] = []
+        synchronizer.rejectedTransactionIdsStream
+            .sink { rejected.append($0) }
+            .store(in: &cancellables)
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [first.endpoint, second.endpoint])
+
+        XCTAssertNotNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        guard case .rejected = status else {
+            return XCTFail("Expected a rejected status, got \(String(describing: status))")
+        }
+        XCTAssertEqual(rejected.last, [transaction.txId])
+    }
+
+    func testSubmitRejectedTransientlyIsNotRecordedAsRejected() async throws {
+        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? terminal.stop() }
+        let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
+
+        guard case .rejected = outcome else {
+            return XCTFail("Expected rejected, got \(outcome)")
+        }
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "Another server may still take it")
+    }
+
+    func testLegacySubmitRecordsATerminalRefusal() async throws {
+        let rawID = Data(repeating: 0xE1, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns")
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        var results: [TransactionSubmitResult] = []
+        for try await result in stream { results.append(result) }
+
+        XCTAssertEqual(results.map(\.rejection), [.invalid])
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns"))
+    }
+
+    func testLegacySubmitRecordsNothingForATransientRefusal() async throws {
+        let rawID = Data(repeating: 0xE2, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -25, message: "Missing inputs")
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        for try await _ in stream {}
+
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
+        XCTAssertNil(plan, "A refusal that may be transient leaves the transaction to resubmission")
+    }
+
+    func testCreateProposedTransactionsPassesTheSizeBoundToTheEncoder() async throws {
+        let rawID = Data(repeating: 0xE3, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+        let bound = TransactionSizeBound(maxShieldedActions: 75)
+
+        _ = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey,
+            ovkPolicy: .sender,
+            sizeBound: bound
+        )
+        XCTAssertEqual(transactionEncoder.receivedSizeBound, bound)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        for try await _ in stream {}
+        XCTAssertEqual(transactionEncoder.receivedSizeBound, .consensus, "The unbounded overload stays consensus only")
+    }
+
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {
         let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
@@ -1058,6 +1162,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
     private let missingHistoryTxIds: Set<Data>
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedOvkPolicy: OvkPolicy?
+    private(set) var receivedSizeBound: TransactionSizeBound?
+    /// When set, `submit(transaction:)` records the transaction and then throws this error.
+    var submitError: Error?
     private(set) var requiresSaplingParametersCallsCount = 0
     /// What `requiresSaplingParameters(for:)` answers; the SDK downloads the parameters only when it is true.
     var requiresSaplingParameters = true
@@ -1088,7 +1195,8 @@ private final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         amount: Zatoshi,
-        memoBytes: MemoBytes?
+        memoBytes: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -1097,7 +1205,8 @@ private final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         memoBytes: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -1118,10 +1227,12 @@ private final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         receivedOvkPolicy = ovkPolicy
+        receivedSizeBound = sizeBound
         if let onCreateProposedTransactions {
             await onCreateProposedTransactions()
         }
@@ -1141,13 +1252,17 @@ private final class StubTransactionEncoder: TransactionEncoder {
 
     func proposeFulfillingPaymentFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
 
     func submit(transaction: EncodedTransaction) async throws {
         submittedTransactions.append(transaction)
+        if let submitError {
+            throw submitError
+        }
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {

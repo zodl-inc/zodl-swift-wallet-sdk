@@ -7,7 +7,7 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
     func testEmptyCompletionReportsIncompleteRedemption() async throws {
         let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)
         _ = try await fixture.redeemer.check()
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = []
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = []
         do {
             _ = try await fixture.redeemer.redeem(to: fixture.card.fundingAddress, memo: nil, recordIn: nil)
             XCTFail("Empty completion must not report a successful redemption")
@@ -25,7 +25,7 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let first = Data(repeating: 0xA1, count: 32)
         let second = Data(repeating: 0xB2, count: 32)
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [first, second]
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [first, second]
         fixture.backend.getTransactionTxIdClosure = { id in
             TransactionData(txId: id, raw: Data([id[0]]), expiryHeight: 3_000_100)
         }
@@ -58,7 +58,7 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let first = Data(repeating: 0xA1, count: 32)
         let second = Data(repeating: 0xB2, count: 32)
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [first, second]
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [first, second]
         fixture.backend.getTransactionTxIdClosure = { id in
             TransactionData(txId: id, raw: Data([id[0]]), expiryHeight: 3_000_100)
         }
@@ -77,7 +77,7 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
         XCTAssertEqual(receipts, [Data([0xA1]), Data([0xB2])])
         XCTAssertEqual(destination.backend.setTransactionTrustTxIdTrustedReceivedArguments?.txId, second)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 2)
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         try await fixture.redeemer.cleanup()
     }
 
@@ -122,7 +122,7 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
         XCTAssertTrue(result.recordedInDestination)
         XCTAssertEqual(result.fee, Zatoshi(10_000))
         XCTAssertEqual(result.amount, Zatoshi(40_000))
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyReceivedArguments?.ovkPolicy, .discard)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments?.ovkPolicy, .discard)
         let calls = await order.ids
         XCTAssertEqual(calls, [Data([1]), Data([2])])
         try await fixture.redeemer.cleanup()

@@ -69,7 +69,7 @@ final class GiftCardStallRetryTests: ZcashTestCase {
     // Each explicit retry owns its own terminal event rather than replaying the prior one.
     func testSecondTerminalStallFailsTheRetry() async throws {
         let fixture = try await stalledFixture()
-        let proposals = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount
+        let proposals = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount
         let restarted = XCTestExpectation(description: "retry published its fresh syncing pass")
         let subscription = fixture.synchronizer.stateStream
             .dropFirst()
@@ -95,7 +95,7 @@ final class GiftCardStallRetryTests: ZcashTestCase {
             _ = try await caller.value
             XCTFail("A second exhausted pass must fail its own check")
         } catch ZcashError.giftCardCheckSyncStalled { }
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, proposals)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, proposals)
         try await fixture.redeemer.cleanup()
     }
 
@@ -115,7 +115,7 @@ final class GiftCardStallRetryTests: ZcashTestCase {
         let clock = GiftCardCleanupTestClock()
         defer { clock.dispose() }
         let fixture = try await stalledFixture(clock: clock)
-        let proposals = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount
+        let proposals = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount
         let root = testTempDirectory.appendingPathComponent(fixture.card.synchronizerAlias.description)
         let marker = root.appendingPathComponent("held-retry-marker")
         try Data([1]).write(to: marker)
@@ -162,7 +162,7 @@ final class GiftCardStallRetryTests: ZcashTestCase {
         fixture.engine.startGate.open()
         try await fixture.redeemer.cleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, proposals)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, proposals)
     }
 
     private func stalledFixture(clock: GiftCardCleanupTestClock? = nil) async throws -> GiftCardCancellationFixture {

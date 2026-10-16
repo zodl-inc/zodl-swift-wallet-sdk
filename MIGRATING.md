@@ -50,6 +50,50 @@ bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM
 is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
 rather than on either string.
 
+## `TransactionSubmissionStatus` gained a case — `rejected`
+
+`TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`, for a transaction every
+server refused for good. The SDK no longer resubmits such a transaction, and its inputs stay
+reserved until it expires, so show it as rejected (until its state becomes expired) rather than as
+still sending. `Synchronizer.rejectedTransactionIdsStream` reports the same transactions as a set.
+
+```swift
+// Before: exhaustive over the three cases.
+switch await synchronizer.transactionSubmissionStatus(for: transaction.rawID) {
+case .awaiting, .submitted: showSending()
+case .accepted: showSent()
+case nil: break
+}
+
+// After
+switch await synchronizer.transactionSubmissionStatus(for: transaction.rawID) {
+case .awaiting, .submitted: showSending()
+case .accepted: showSent()
+case .rejected(.tooLarge): showTooManyNotesUntilExpiry()
+case .rejected: showRejectedUntilExpiry()
+case nil: break
+}
+```
+
+## `ZcashError` gained a case — `giftCardTooManyNotes`
+
+`ZcashError` and `ZcashErrorCode` have a new case, `giftCardTooManyNotes` (`ZGIFT0017`), which
+`GiftCardRedeemer.redeem` throws, before creating or broadcasting anything, for a card with more
+notes than one claim may spend. It replaces `rustProposalTransactionTooLarge` from that call. An
+exhaustive `switch` over either type stops compiling until it is handled.
+
+```swift
+// Before
+} catch ZcashError.rustProposalTransactionTooLarge {
+    showCardTooFragmented()
+}
+
+// After
+} catch ZcashError.giftCardTooManyNotes {
+    showCardTooFragmented()
+}
+```
+
 ## `RustErrorKind` gained a case — `anchorNotFound`
 
 `RustErrorKind`, the type of `RedactedRustError.kind`, has a new case, `anchorNotFound`: creating

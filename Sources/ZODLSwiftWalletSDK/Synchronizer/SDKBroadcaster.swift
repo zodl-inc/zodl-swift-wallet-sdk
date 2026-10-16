@@ -50,6 +50,21 @@ final class SDKBroadcaster: Broadcaster {
         try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, recordingPlans: true)
     }
 
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction] {
+        try await createProposedTransactions(
+            proposal: proposal,
+            spendingKey: spendingKey,
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound,
+            recordingPlans: true
+        )
+    }
+
     func createTransactionFromPCZT(
         pcztWithProofs: Pczt,
         pcztWithSigs: Pczt
@@ -78,8 +93,15 @@ final class SDKBroadcaster: Broadcaster {
         // is in flight leaves the eventual `markAccepted` call provably stale.
         let lifecycle = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
 
-        let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
+        let result = await multiEndpointSubmitter.submitClassifyingRejection(transaction: transaction, to: endpoints, timing: timing)
+        let outcome = result.outcome
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
+
+        // Every endpoint refused it for good, and none took it: stop background resubmission,
+        // which could only repeat the refusal until the transaction expires.
+        if result.rejectedByAll, case let .rejected(code, message) = outcome {
+            await submitPlanStore.markRejected(txId: transaction.txId, code: code, reason: message, lifecycle: lifecycle)
+        }
 
         // Remember which server took it, so the app can tell "handed to a
         // server" apart from "still trying" while the transaction waits to be
@@ -154,6 +176,7 @@ final class SDKBroadcaster: Broadcaster {
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy = .sender,
+        sizeBound: TransactionSizeBound = .consensus,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
@@ -172,7 +195,8 @@ final class SDKBroadcaster: Broadcaster {
         let createdTransactions = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
-            ovkPolicy: ovkPolicy
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound
         )
         let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 

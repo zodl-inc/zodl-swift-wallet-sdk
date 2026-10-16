@@ -1458,6 +1458,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         await submitPlanStore.plan(for: rawID)?.submissionStatus
     }
 
+    public nonisolated var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        submitPlanStore.rejectedTransactionIds
+    }
+
     public func listAccounts() async throws -> [Account] {
         try await initializer.rustBackend.listAccounts()
     }
@@ -1706,6 +1710,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         amount: Zatoshi,
         memo: Memo?
     ) async throws -> Proposal {
+        try await proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, sizeBound: .consensus)
+    }
+
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeTransfer`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
@@ -1718,7 +1732,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             amount: amount,
-            memoBytes: memo?.asMemoBytes()
+            memoBytes: memo?.asMemoBytes(),
+            sizeBound: sizeBound
         )
     }
 
@@ -1727,6 +1742,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         recipient: Recipient,
         memo: Memo?,
         mode: MaxSpendMode
+    ) async throws -> Proposal {
+        try await proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, sizeBound: .consensus)
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeSendMax`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
@@ -1740,7 +1765,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             memoBytes: memo?.asMemoBytes(),
-            mode: mode
+            mode: mode,
+            sizeBound: sizeBound
         )
     }
 
@@ -1780,6 +1806,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
+        try await proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: .consensus)
+    }
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposefulfillingPaymentURI`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
@@ -1790,7 +1824,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         return try await transactionEncoder.proposeFulfillingPaymentFromURI(
             uri,
-            accountUUID: accountUUID
+            accountUUID: accountUUID,
+            sizeBound: sizeBound
         )
     }
 
@@ -1806,10 +1841,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: .consensus)
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
         let transactions = try await broadcaster.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
-            ovkPolicy: ovkPolicy
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound
         )
         return submitTransactions(transactions)
     }
@@ -1817,9 +1862,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // ── PCZT ──────────────────────────────────────────────────────────────────
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt {
+        try await createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: .consensus)
+    }
+
+    public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
         try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
-            proposal: proposal.inner
+            proposal: proposal.inner,
+            sizeBound: sizeBound
         )
     }
 
@@ -3031,6 +3081,9 @@ private extension SlipstreamSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                // Captured before the network round trip, so a refusal for a submission a `wipe()`
+                // overtook cannot recreate the store the wipe deleted.
+                let lifecycle = await self.submitPlanStore.currentLifecycle()
                 do {
                     try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
                     // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
@@ -3049,6 +3102,13 @@ private extension SlipstreamSynchronizer {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    // A terminal refusal stops background resubmission of this transaction.
+                    await self.submitPlanStore.recordSingleEndpointRefusal(
+                        txId: transaction.txId,
+                        code: code,
+                        reason: message,
+                        lifecycle: lifecycle
+                    )
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 }
             }

@@ -139,6 +139,10 @@ public enum TransactionSubmissionStatus: Equatable {
     case submitted
     /// A server accepted the transaction into its mempool. `host` is `host:port`.
     case accepted(host: String)
+    /// Every server the transaction was submitted to refused it for good, and none accepted it.
+    /// The SDK no longer resubmits it. Its inputs stay reserved until it expires, when the
+    /// transaction's state becomes expired and the funds spendable again.
+    case rejected(SubmitRejection)
 }
 
 /// Primary interface for interacting with the SDK. Defines the contract that specific
@@ -259,6 +263,21 @@ public protocol Synchronizer: AnyObject {
         memo: Memo?
     ) async throws -> Proposal
 
+    /// Creates a proposal for transferring funds to the given recipient, held to `sizeBound`.
+    ///
+    /// `proposeTransfer(accountUUID:recipient:amount:memo:)` is this call with
+    /// ``TransactionSizeBound/consensus``. A proposal that exceeds `sizeBound` throws
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`), as one too large for a block does.
+    /// A conformer that does not override this throws for any bound other than
+    /// ``TransactionSizeBound/consensus`` rather than ignore it.
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal
+
     /// Creates a proposal that spends the maximum amount available in the given account to a single recipient.
     ///
     /// Unlike `proposeTransfer`, no `amount` is passed: the proposal is constructed to spend as much of the
@@ -291,6 +310,22 @@ public protocol Synchronizer: AnyObject {
         recipient: Recipient,
         memo: Memo?,
         mode: MaxSpendMode
+    ) async throws -> Proposal
+
+    /// Creates a proposal that spends the maximum amount available in the given account to a single
+    /// recipient, held to `sizeBound`.
+    ///
+    /// `proposeSendMax(accountUUID:recipient:memo:mode:)` is this call with
+    /// ``TransactionSizeBound/consensus``. The proposal is never cut down to what fits: a send-max
+    /// whose transaction exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
+    /// (`ZRUST0159`), as one too large for a block does. A conformer that does not override this
+    /// throws for any bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal
 
     /// Creates a proposal that migrates the account's entire Orchard balance into the Ironwood pool.
@@ -369,6 +404,22 @@ public protocol Synchronizer: AnyObject {
         ovkPolicy: OvkPolicy
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>
 
+    /// Creates and submits the transactions in the given proposal, as
+    /// `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` does, after checking the
+    /// proposal against `sizeBound`.
+    ///
+    /// A proposal that exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
+    /// (`ZRUST0159`) before anything is proven, stored or broadcast. Pass the bound the proposal was
+    /// made under, so that a proposal held across a change of bound is checked again. A conformer
+    /// that does not override this throws for any bound other than
+    /// ``TransactionSizeBound/consensus`` rather than ignore it.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>
+
     /// Attempts to propose fulfilling a [ZIP-321](https://zips.z.cash/zip-0321) payment URI by spending from the ZIP 32 account with the given index.
     ///  - Parameter uri: a valid ZIP-321 payment URI
     ///  - Parameter accountUUID: the account providing spend authority.
@@ -378,6 +429,19 @@ public protocol Synchronizer: AnyObject {
     func proposefulfillingPaymentURI(
         _ uri: String,
         accountUUID: AccountUUID
+    ) async throws -> Proposal
+
+    /// Attempts to propose fulfilling a [ZIP-321](https://zips.z.cash/zip-0321) payment URI, held to
+    /// `sizeBound`.
+    ///
+    /// `proposefulfillingPaymentURI(_:accountUUID:)` is this call with
+    /// ``TransactionSizeBound/consensus``. A proposal that exceeds `sizeBound` throws
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`). A conformer that does not override
+    /// this throws for any bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal
 
     /// Creates a partially-created (unsigned without proofs) transaction from the given proposal.
@@ -391,6 +455,19 @@ public protocol Synchronizer: AnyObject {
     ///
     /// - Throws rustCreatePCZTFromProposal as a common indicator of the operation failure
     func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt
+
+    /// Creates a partially-created (unsigned without proofs) transaction from the given proposal,
+    /// as `createPCZTFromProposal(accountUUID:proposal:)` does, after checking the proposal
+    /// against `sizeBound`.
+    ///
+    /// A proposal that exceeds `sizeBound` throws `ZcashError.rustCreatePCZTFromProposal` before
+    /// the PCZT is created. A conformer that does not override this throws for any bound other than
+    /// ``TransactionSizeBound/consensus`` rather than ignore it.
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Pczt
 
     /// Redacts information from the given PCZT that is unnecessary for the Signer role.
     ///
@@ -869,6 +946,17 @@ public protocol Synchronizer: AnyObject {
     ///   when its record cannot be read. Conformers without submission bookkeeping always
     ///   return `nil`.
     func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus?
+
+    /// The raw ids (`ZcashTransaction.Overview.rawID`) of the transactions every server refused
+    /// for good, as ``TransactionSubmissionStatus/rejected(_:)`` reports them one by one.
+    ///
+    /// Emits the current set on subscription and again whenever it changes. A transaction leaves
+    /// the set when it expires (its record is pruned then) or the wallet is wiped. The SDK no
+    /// longer resubmits these transactions; their inputs stay reserved until they expire, so a
+    /// wallet can show them as rejected, expiring at their expiry height, until their state
+    /// becomes expired. Values are delivered on an arbitrary thread. Conformers without submission
+    /// bookkeeping emit only an empty set.
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { get }
 
     // MARK: - Migration (Orchard -> Ironwood)
     //
@@ -1721,6 +1809,70 @@ public extension Synchronizer {
         }
     }
 
+    // Defaults so adding the `sizeBound:` members to the protocol is not a source-breaking change
+    // for downstream conformers. A consensus bound is what the unbounded members already do; any
+    // other bound is refused rather than silently ignored.
+
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Synchronizer.proposeTransfer(accountUUID:recipient:amount:memo:sizeBound:)")
+        }
+        return try await proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo)
+    }
+
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:sizeBound:)")
+        }
+        return try await proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode)
+    }
+
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Synchronizer.proposefulfillingPaymentURI(_:accountUUID:sizeBound:)")
+        }
+        return try await proposefulfillingPaymentURI(uri, accountUUID: accountUUID)
+    }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)")
+        }
+        return try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy)
+    }
+
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Pczt {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Synchronizer.createPCZTFromProposal(accountUUID:proposal:sizeBound:)")
+        }
+        return try await createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal)
+    }
+
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route.
     ///
     /// Only a conformer that owns a Tor client can open a round on Tor, and the refusal is the
@@ -1766,6 +1918,13 @@ public extension Synchronizer {
     /// report that they know nothing about the transaction.
     func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
         nil
+    }
+
+    /// Default implementation so adding `rejectedTransactionIdsStream` to the protocol is not a
+    /// source-breaking change for downstream conformers: without submission bookkeeping there is
+    /// nothing to report.
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        Just([]).eraseToAnyPublisher()
     }
 
     /// Default implementation so adding `getTransactionOutputs(for transactions:)` to the

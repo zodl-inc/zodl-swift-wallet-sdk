@@ -120,6 +120,7 @@ mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
 mod send_max;
+mod size_bound;
 mod tor;
 mod voting;
 mod zip317;
@@ -2476,9 +2477,13 @@ fn zip317_helper<DbT>(
 /// - `to` must be non-null and must point to a null-terminated UTF-8 string.
 /// - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
 ///   512-byte array.
+/// - `size_bound`: the caps the proposal is held to below consensus, as
+///   [`ffi::FfiTransactionSizeBound`] describes; all `-1` for consensus only. A proposal exceeding
+///   it fails as `TransactionTooLarge`.
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_propose_transfer(
     db_data: *const u8,
     db_data_len: usize,
@@ -2488,11 +2493,13 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
     memo: *const u8,
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_transfer";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
@@ -2569,6 +2576,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             debug!("{CONTEXT} failed: {e}");
             ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2599,9 +2607,12 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 /// - `orchard_only`: when `true`, restricts the spendable pools to Orchard alone (the Orchard→
 ///   Ironwood immediate migration lane's sweep, which must not draw on Sapling funds); when
 ///   `false`, spends from both Sapling and Orchard (pre-existing behavior).
+/// - `size_bound`: as for [`zcashlc_propose_transfer`], for the user's send-max only. It is
+///   ignored when `orchard_only` is `true`: the migration lane is never bounded.
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     db_data: *const u8,
     db_data_len: usize,
@@ -2612,6 +2623,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     mode: ffi::MaxSpendMode,
     confirmations_policy: ffi::ConfirmationsPolicy,
     orchard_only: bool,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_send_max_transfer";
 
@@ -2667,6 +2679,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
                 recipient: to,
                 memo,
                 confirmations_policy: confirmation_policy,
+                size_bound: size_bound::TransactionSizeBound::try_from(size_bound)?,
             };
 
             send_max::propose(&mut db_data, &network, account_uuid, request, CONTEXT)?
@@ -2788,6 +2801,7 @@ pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
 /// - `network_id` a u32. 0 for Testnet and 1 for Mainnet
 /// - `confirmations_policy` number of trusted/untrusted confirmations of the funds to spend
 /// - `use_zip317_fees` `true` to use ZIP-317 fees.
+/// - `size_bound`: as for [`zcashlc_propose_transfer`].
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
@@ -2798,11 +2812,13 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
     payment_uri: *const c_char,
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_transfer_from_uri";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
@@ -2842,6 +2858,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             debug!("{CONTEXT} failed: {e}");
             ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -3122,7 +3139,11 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
 ///   function call.
 /// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
+///
+/// `size_bound` is checked before anything is built, as for [`zcashlc_propose_transfer`]; all
+/// `-1` checks consensus only, which the builder does regardless.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     db_data: *const u8,
     db_data_len: usize,
@@ -3136,11 +3157,13 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     output_params_len: usize,
     network_id: u32,
     ovk_policy: u32,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::TxIds {
     const CONTEXT: &str = "create_proposed_transactions";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let ovk_policy = parse_ovk_policy(ovk_policy)?;
@@ -3166,6 +3189,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             )
         }?;
         let proposal = proposal_proto.try_into_standard_proposal(&network, &db_data)?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
         let expiry_height = None;
 
@@ -3260,6 +3284,8 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
 /// - `proposal_ptr`: A pointer to a buffer containing an encoded `Proposal` protobuf.
 /// - `proposal_len`: The length of the `proposal_ptr` buffer.
 /// - `account_uuid_bytes`: A pointer to the 16-byte representaion of the account UUID.
+/// - `size_bound`: checked before the PCZT is created, as for [`zcashlc_propose_transfer`]; all
+///   `-1` checks consensus only. A proposal exceeding it fails as `TransactionTooLarge`.
 ///
 /// # Safety
 ///
@@ -3288,15 +3314,23 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
     proposal_ptr: *const u8,
     proposal_len: usize,
     account_uuid_bytes: *const u8,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
                 .try_into_standard_proposal(&network, &db_data)?;
+        size_bound::enforce(
+            &proposal,
+            &network,
+            &size_bound,
+            "create_pczt_from_proposal",
+        )?;
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 

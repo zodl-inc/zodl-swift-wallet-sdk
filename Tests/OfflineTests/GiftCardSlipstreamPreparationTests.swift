@@ -129,7 +129,7 @@ final class GiftCardSlipstreamPreparationTests: ZcashTestCase {
                 )
             )
             if expected.state == .dust {
-                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeThrowableError = ZcashError.rustProposalInsufficientFunds(
+                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundThrowableError = ZcashError.rustProposalInsufficientFunds(
                     Zatoshi(10_000),
                     Zatoshi(10_000)
                 )

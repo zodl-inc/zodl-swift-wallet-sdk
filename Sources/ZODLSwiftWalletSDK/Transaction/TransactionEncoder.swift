@@ -32,7 +32,8 @@ protocol TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         amount: Zatoshi,
-        memoBytes: MemoBytes?
+        memoBytes: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal
 
     /// Creates a proposal that spends the maximum amount available in the given account to a single recipient.
@@ -54,7 +55,8 @@ protocol TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         memoBytes: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal
 
     /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
@@ -97,7 +99,8 @@ protocol TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [CreatedTransaction]
 
     /// Whether creating the transactions of `proposal` needs the Sapling proving parameters on disk.
@@ -127,7 +130,8 @@ protocol TransactionEncoder {
     ///     - Some `ZcashError.rust*` if the creation of transaction fails.
     func proposeFulfillingPaymentFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal
 
     /// submits a transaction to the Zcash peer-to-peer network.
@@ -151,7 +155,7 @@ extension TransactionEncoder {
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey
     ) async throws -> [CreatedTransaction] {
-        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: .sender)
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: .sender, sizeBound: .consensus)
     }
 
     /// Conservative default for encoders that cannot inspect a proposal: assume the Sapling

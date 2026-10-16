@@ -71,7 +71,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         try await fixture.redeemer.cleanup()
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         XCTAssertEqual(fixture.backend.createAccountSeedTreeStateRecoverUntilNameKeySourceCallsCount, 1)
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 0)
     }
 
     func testDroppingTimedOutCallerAndRedeemerKeepsNativePreparationOwnedUntilDrain() async throws {
@@ -136,7 +136,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let entered = XCTestExpectation(description: "native claim admitted")
         let gate = GiftCardOperationGate()
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyClosure = { _, _, _ in
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundClosure = { _, _, _, _ in
             try GiftCardTransactionCreationContext.admission?.beginNativeCreation()
             entered.fulfill()
             await gate.wait()
@@ -157,7 +157,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         let result = try await claim.value
         XCTAssertEqual(result.results, [.success(txId: Data(repeating: 0xA1, count: 32))])
         try await cleanup.value
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 2)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 2)
     }
 
     func testQueuedCheckDoesNotStartAfterDeadlineWithTimerDeliveryWithheld() async throws {
@@ -174,7 +174,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         await gate.open()
         await assertTimeout(first)
         await assertTimeout(second)
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 0)
         let calls = await fixture.engine.calls
         XCTAssertFalse(calls.contains("start"))
         try await fixture.redeemer.cleanup()

@@ -599,6 +599,8 @@ public enum ZcashErrorCode: String {
     case giftCardCheckDisconnected = "ZGIFT0015"
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     case giftCardCheckSyncStalled = "ZGIFT0016"
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    case giftCardTooManyNotes = "ZGIFT0017"
     /// Attempt to init TxId with input that is not 32 bytes.
     case txIdNot32Bytes = "ZMODEL0001"
     /// Attempt to init TxId with invalid hex encoding.

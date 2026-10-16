@@ -256,12 +256,15 @@ protocol ZcashRustBackendWelding {
     /// - Parameter to: recipient address
     /// - Parameter value: transaction amount in Zatoshi
     /// - Parameter memo: the `MemoBytes` for this transaction. pass `nil` when sending to transparent receivers
-    /// - Throws: `rustProposeTransfer`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
+    /// - Parameter sizeBound: the caps the proposal is held to below consensus.
+    /// - Throws: `rustProposeTransfer`, `rustProposalScanRequired`, `rustProposalInsufficientFunds`, or
+    ///   `rustProposalTransactionTooLarge` when the proposal exceeds `sizeBound` or a block.
     func proposeTransfer(
         accountUUID: AccountUUID,
         to address: String,
         value: Int64,
-        memo: MemoBytes?
+        memo: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal
 
     /// Select transaction inputs, compute fees, and construct a "spend max" proposal that spends
@@ -275,13 +278,16 @@ protocol ZcashRustBackendWelding {
     /// - Parameter to: recipient address.
     /// - Parameter memo: the `MemoBytes` for this transaction. pass `nil` when sending to transparent receivers
     /// - Parameter mode: how much of the account's balance the proposal should target spending. See `MaxSpendMode`.
+    /// - Parameter sizeBound: the caps the proposal is held to below consensus; exceeding them throws
+    ///   `rustProposalTransactionTooLarge`.
     /// - Throws: `rustProposalScanRequired`, `rustProposalInsufficientFunds`, `rustProposalTransactionTooLarge`,
     ///   `rustProposalTransparentMemo`, `rustProposalUnsupportedAddress`, or otherwise `rustProposeSendMaxTransfer`.
     func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         to address: String,
         memo: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal
 
     /// Proposes migrating the account's entire Orchard balance into the Ironwood pool.
@@ -299,10 +305,13 @@ protocol ZcashRustBackendWelding {
     ///
     /// - parameter uri: the URI String that the proposal will be made from.
     /// - parameter account: index of the given account
-    /// - Throws: `rustProposeTransferFromURI`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
+    /// - Parameter sizeBound: the caps the proposal is held to below consensus.
+    /// - Throws: `rustProposeTransferFromURI`, `rustProposalScanRequired`, `rustProposalInsufficientFunds`, or
+    ///   `rustProposalTransactionTooLarge` when the proposal exceeds `sizeBound` or a block.
     func proposeTransferFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal
 
     /// Constructs a transaction proposal to shield all found UTXOs in data db for the given account,
@@ -333,12 +342,15 @@ protocol ZcashRustBackendWelding {
     /// - Parameter proposal: the transaction proposal.
     /// - Parameter usk: `UnifiedSpendingKey` for the account that controls the funds to be spent.
     /// - Parameter ovkPolicy: the outgoing viewing key the transactions' outputs are encrypted to.
+    /// - Parameter sizeBound: checked before anything is built; exceeding it throws `rustProposalTransactionTooLarge`.
     /// - Returns: The ids of the created transactions.
-    /// - Throws: `rustCreateToAddress`, `rustProposalScanRequired`, or `rustProposalInsufficientFunds`.
+    /// - Throws: `rustCreateToAddress`, `rustProposalScanRequired`, `rustProposalInsufficientFunds`, or
+    ///   `rustProposalTransactionTooLarge`.
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [Data]
 
     /// Returns the wallet-store data available for the given transaction, or `nil` if the
@@ -354,10 +366,12 @@ protocol ZcashRustBackendWelding {
     ///
     /// - Parameter accountUUID: The account for which the proposal was created.
     /// - Parameter proposal: The proposal for which to create the transaction.
+    /// - Parameter sizeBound: checked before the PCZT is created.
     /// - Returns The partially created transaction in [Pczt] format.
     ///
-    /// - Throws rustCreatePCZTFromProposal as a common indicator of the operation failure
-    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: FfiProposal) async throws -> Pczt
+    /// - Throws rustCreatePCZTFromProposal as a common indicator of the operation failure, including a
+    ///   proposal that exceeds `sizeBound`.
+    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: FfiProposal, sizeBound: TransactionSizeBound) async throws -> Pczt
 
     /// Redacts information from the given PCZT that is unnecessary for the Signer role.
     ///

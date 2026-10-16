@@ -104,6 +104,31 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting, "Awaiting plan must survive")
     }
 
+    func testRejectedTransactionIsNotResubmitted() async throws {
+        let rawID = Data(repeating: 0x0E, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        await submitPlanStore.markRejected(
+            txId: rawID,
+            code: -25,
+            reason: "transaction size exceeding the configured mempool maximum",
+            lifecycle: await submitPlanStore.currentLifecycle()
+        )
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty, "A rejected transaction must not be retried")
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "nor sent to the default endpoint")
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.rejected(code: -25, reason: "transaction size exceeding the configured mempool maximum"),
+            "The rejection stays recorded until the transaction expires"
+        )
+    }
+
     func testReadyTransactionIsResubmittedThroughPlanEndpoints() async throws {
         let rawID = Data(repeating: 0x02, count: 32)
         let candidate = makeOverview(rawID: rawID)

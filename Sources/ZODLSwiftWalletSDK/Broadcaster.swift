@@ -57,6 +57,20 @@ public protocol Broadcaster: AnyObject {
         ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction]
 
+    /// Creates the transactions in the given proposal without submitting them, as
+    /// `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` does, after checking the
+    /// proposal against `sizeBound`.
+    ///
+    /// A proposal that exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
+    /// before anything is proven or stored. A conformer that does not override this throws for any
+    /// bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction]
+
     /// Finalizes a PCZT that has been separately proven and signed, stores it
     /// in the wallet, and returns the resulting transactions without submitting.
     ///
@@ -127,6 +141,21 @@ extension Broadcaster {
         case .discard:
             throw OvkPolicyUnsupported(member: "Broadcaster.createProposedTransactions(proposal:spendingKey:ovkPolicy:)")
         }
+    }
+
+    /// Default implementation so adding the `sizeBound:` overload to the protocol is not a
+    /// source-breaking change for downstream conformers: a consensus bound is what the unbounded
+    /// overload already does, and any other bound is refused rather than silently ignored.
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction] {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Broadcaster.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)")
+        }
+        return try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy)
     }
 
     /// Forwards with `SubmissionTiming.default` (protocol requirements cannot

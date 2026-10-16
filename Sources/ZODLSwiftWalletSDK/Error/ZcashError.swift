@@ -1085,6 +1085,11 @@ public enum ZcashError: Equatable, Error {
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     /// ZGIFT0016
     case giftCardCheckSyncStalled
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    /// block). Nothing was created or broadcast, and the card's funds are untouched. Redeeming such
+    /// a card takes several transactions, which this SDK version does not yet create.
+    /// ZGIFT0017
+    case giftCardTooManyNotes
     /// Attempt to init TxId with input that is not 32 bytes.
     /// ZMODEL0001
     case txIdNot32Bytes
@@ -1484,6 +1489,7 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckTimedOut: return "The gift-card check did not finish in time. Cleanup still owns unfinished wallet work."
         case .giftCardCheckDisconnected: return "The gift-card check could not reconnect in time. The card balance is still unknown."
         case .giftCardCheckSyncStalled: return "The gift-card wallet stopped making progress. The card balance is still unknown."
+        case .giftCardTooManyNotes: return "The card holds more notes than one claim transaction may spend within its size bound (or a"
         case .txIdNot32Bytes: return "Attempt to init TxId with input that is not 32 bytes."
         case .txIdInvalidHexEncoding: return "Attempt to init TxId with invalid hex encoding."
         case .ledgerUserRejected: return "The user declined on the Ledger device."
@@ -1827,6 +1833,7 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckTimedOut: return .giftCardCheckTimedOut
         case .giftCardCheckDisconnected: return .giftCardCheckDisconnected
         case .giftCardCheckSyncStalled: return .giftCardCheckSyncStalled
+        case .giftCardTooManyNotes: return .giftCardTooManyNotes
         case .txIdNot32Bytes: return .txIdNot32Bytes
         case .txIdInvalidHexEncoding: return .txIdInvalidHexEncoding
         case .ledgerUserRejected: return .ledgerUserRejected
