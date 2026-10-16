@@ -160,7 +160,8 @@ hex = "0.4"
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. 98a66a09 = chunked-only (old single-shot APIs removed from crate root).
+# fails loudly, a branch would follow a force-push. 607d8507 = ohttp#16 (every client profile stamps
+# ohttp-freshness), on the chunked-only API (old single-shot APIs removed from crate root since 98a66a09).
 zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "607d8507feaffe128b359088e0cf2e10d6d69ae0", default-features = false }
 
 [dev-dependencies]
