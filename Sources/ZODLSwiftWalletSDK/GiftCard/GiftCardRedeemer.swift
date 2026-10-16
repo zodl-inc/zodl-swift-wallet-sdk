@@ -195,6 +195,7 @@ public actor GiftCardRedeemer {
     private var hasUsedWallet = false
     private var operations: [UUID: GiftCardOperationAdmission] = [:]
     private var tail: Task<Void, Never>?
+    nonisolated let progressBroadcaster = GiftCardProgressBroadcaster()
 
     /// Creates a redeemer for `card`. Nothing touches the disk or the network until ``check()``.
     ///
@@ -479,6 +480,7 @@ public actor GiftCardRedeemer {
         let admittedAt = cleanupTiming.now()
         isCleanedUp = true
         accountUUID = nil
+        progressBroadcaster.finish()
         // Close admission and transfer ownership even for an already-cancelled caller.
         for admission in operations.values { admission.requestCancellation() }
         _ = GiftCardRedeemerRegistry.retainCleanup(alias: alias, owner: owner, coordinator: cleanupCoordinator)
@@ -690,6 +692,16 @@ public actor GiftCardRedeemer {
     }
 }
 
+extension GiftCardRedeemer {
+    /// The progress of this redeemer's redemptions: one value when a round's transactions are
+    /// submitted and another when they are mined, with what the card still holds. A card redeemed
+    /// in one transaction reports a single submitted round with nothing remaining. Each call
+    /// returns a new stream; it ends when the redeemer is cleaned up or the caller stops iterating.
+    public nonisolated func redeemProgress() -> AsyncStream<RedeemProgress> {
+        progressBroadcaster.stream()
+    }
+}
+
 private extension GiftCardRedeemer {
     /// The rounds of one redemption of the card from `accountUUID` to `recipient`, each claim
     /// proposed and created under `sizeBound` and signed with the card's key.
@@ -708,6 +720,7 @@ private extension GiftCardRedeemer {
         return GiftCardRedeemRounds<Proposal>(
             sendWhatFits: Self.sendWhatFits,
             maxRounds: Self.maxRounds,
+            timing: .live,
             propose: { _ in
                 // Until librustzcash can propose the part of a send-max that fits a bound, every
                 // round proposes the whole card, so it leaves nothing behind.
@@ -728,9 +741,10 @@ private extension GiftCardRedeemer {
             complete: { proposal in
                 try await self.completeRedemption(proposal: proposal, spendingKey: spendingKey, sizeBound: sizeBound, recordIn: destination)
             },
-            awaitMined: { txIds in
-                try await Self.awaitMined(txIds, events: synchronizer.eventStream)
-            }
+            roundState: { txIds in
+                Self.roundState(of: txIds, in: try await synchronizer.allTransactions())
+            },
+            progress: { [progressBroadcaster] in progressBroadcaster.send($0) }
         )
     }
 }

@@ -279,6 +279,79 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { synchronizer.rejectedTransactionIdsStream }
+
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.proposeTransfer(
+                accountUUID: accountUUID,
+                recipient: recipient,
+                amount: amount,
+                memo: memo,
+                sizeBound: sizeBound
+            )
+        }
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.proposeSendMax(
+                accountUUID: accountUUID,
+                recipient: recipient,
+                memo: memo,
+                mode: mode,
+                sizeBound: sizeBound
+            )
+        }
+    }
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: sizeBound)
+        }
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.createProposedTransactions(
+                proposal: proposal,
+                spendingKey: spendingKey,
+                ovkPolicy: .sender,
+                sizeBound: sizeBound
+            )
+        }
+    }
+
+    public func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Pczt, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: sizeBound)
+        }
+    }
+
     public func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
         AsyncToCombineGateway.executeAction() {
             await self.synchronizer.transactionSubmissionStatus(for: rawID)

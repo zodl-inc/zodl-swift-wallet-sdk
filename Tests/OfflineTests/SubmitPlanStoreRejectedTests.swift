@@ -69,6 +69,25 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
         XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "a.example.com:443"))
     }
 
+    func testALaterAcceptanceClearsARejection() async throws {
+        let txId = Data(repeating: 0x49, count: 32)
+        let store = makeStore()
+        await store.recordPlan(txId: txId, endpoints: [endpointA])
+        await store.markRejected(txId: txId, code: -26, reason: "bad", lifecycle: await store.currentLifecycle())
+        var latest: Set<Data>?
+        store.rejectedTransactionIds.sink { latest = $0 }.store(in: &cancellables)
+
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
+
+        let plan = await store.plan(for: txId)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "a.example.com:443"))
+        XCTAssertEqual(latest, [])
+        // The rejection is gone from the row, not merely shadowed by the acceptance.
+        let connection = try Connection(databaseURL.path)
+        let code = try connection.scalar("SELECT rejected_code FROM tx_submit_plans") as? Int64
+        XCTAssertNil(code)
+    }
+
     func testARejectionFromAWipedLifecycleIsDropped() async {
         let txId = Data(repeating: 0x44, count: 32)
         let store = makeStore()

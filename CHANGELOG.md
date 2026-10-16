@@ -56,15 +56,23 @@ Changes are relative to `5.2.0`.
   `maxIronwoodActions`, where `0` forbids the pool), on transparent inputs and outputs, and on
   shielded payment outputs. `.consensus` caps nothing; `intersect(_:)` combines bounds, taking the
   tighter cap in every dimension; `forProvingMemory(availableBytes:)` caps shielded actions at what
-  proving can afford in the given memory (550 MiB plus 20 MiB per action, at most 75).
-  Actions are those librustzcash's transaction builder produces, padding included; the byte size is
-  its conservative estimate of the serialized transactions.
+  proving can afford in the given memory (550 MiB plus 20 MiB per action, at least
+  `minProvingActions` = 16 and at most `maxProvingActions` = 75). Actions are those librustzcash's
+  transaction builder produces, padding included: a Send Max of `n` Orchard notes to one Orchard
+  recipient counts `n` actions. A later SDK that delegates the check to librustzcash will count
+  as its size estimator does, two actions more per bundle, so treat an action cap as admitting
+  about `cap - 2` notes. The byte size is librustzcash's conservative estimate, held against each
+  transaction of the proposal on its own (a payment to a TEX address takes two), and `maxBytes`
+  above a block counts as a block.
 - `Synchronizer` takes a `sizeBound:` in new overloads of `proposeTransfer`, `proposeSendMax`,
   `proposefulfillingPaymentURI`, `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` and
-  `createPCZTFromProposal`, and `Broadcaster` in a new overload of
-  `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`. A proposal exceeding the bound
-  throws `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`), the error a transaction too
-  large for a block throws; `createPCZTFromProposal` throws `rustCreatePCZTFromProposal`. The
+  `createPCZTFromProposal`, as do `ClosureSynchronizer` and `CombineSynchronizer` (their
+  `createProposedTransactions` overload uses `OvkPolicy.sender`), and `Broadcaster` in a new
+  overload of `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`. A proposal exceeding
+  the bound throws `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`), the error a
+  transaction too large for a block throws, from every one of them; any other failure of a bounded
+  `createPCZTFromProposal` throws `rustCreatePCZTFromProposal` with a redacted message, while the
+  overload without `sizeBound:` reports its failures exactly as before. The
   creation overloads check before anything is proven, stored or broadcast. A send-max is refused,
   never reduced to what fits. The overloads without `sizeBound:` behave as before (consensus only).
   The Orchard to Ironwood migration and shielding take no bound. The protocols provide defaults, so
@@ -73,10 +81,18 @@ Changes are relative to `5.2.0`.
 - `SubmitRejection` (`.tooLarge`, `.expired`, `.invalid`) names a server's refusal of a submitted
   transaction that retrying cannot get past, and `TransactionSubmitResult.rejection` and
   `TransactionSubmissionOutcome.rejection` report it (`nil` for anything else). `.tooLarge` is error
-  code `-25` with a message naming the configured mempool maximum; `.expired` is any refusal citing
-  expiry; `.invalid` is code `-26`. Every other failure, such as a transport error or missing
-  inputs, is still treated as transient.
-- `Synchronizer.rejectedTransactionIdsStream` publishes the raw ids
+  code `-25` with a message naming the configured mempool maximum or the next block's ZIP 218
+  limit; `.expired` is code `-25` or `-26` with a message naming an expiry (`greater than its
+  expiry`, `tx-overwinter-expired`, `tx-expiring-soon`); `.invalid` is any other `-26` except a
+  full mempool or a transaction already known. Every other failure, such as a transport error or
+  missing inputs, is still treated as transient.
+- `GiftCardRedeemer.redeemProgress()` returns an `AsyncStream<RedeemProgress>` reporting each
+  redemption round when its transactions are submitted and when they are mined, with the
+  transactions' ids and the notes and value the card still holds (`remainingNotes`,
+  `remainingValue`). A card redeemed in one transaction, the only kind this version creates,
+  reports one submitted round with nothing remaining.
+- `Synchronizer.rejectedTransactionIdsStream` (also on `ClosureSynchronizer` and
+  `CombineSynchronizer`) publishes the raw ids
   (`ZcashTransaction.Overview.rawID`) of the transactions every server refused terminally,
   emitting the current set on subscription and on every change. A transaction leaves it when it
   expires or the wallet is wiped. The protocol provides a default (always empty), so existing
@@ -93,17 +109,23 @@ Changes are relative to `5.2.0`.
 - `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`: every endpoint a
   transaction was submitted to refused it terminally and none accepted it. The SDK then stops
   resubmitting it in the background, where it previously retried until expiry; its inputs stay
-  reserved until it expires. A transaction submitted through `Broadcaster.submit` is recorded as
-  rejected only when every endpoint of the call refused it terminally (a mix with transport
-  failures or transient refusals keeps it pending, as before); one submitted through
-  `createProposedTransactions` or `createTransactionFromPCZT`, which use the single configured
-  endpoint, when that endpoint did. An exhaustive `switch` over `TransactionSubmissionStatus` stops
-  compiling until the new case is handled. See MIGRATING.md.
-- `ZcashError` and `ZcashErrorCode` have a new case, `giftCardTooManyNotes` (`ZGIFT0017`):
+  reserved until it expires. A transaction is recorded as rejected only when every endpoint of its
+  retry plan (the endpoints given to `Broadcaster.submit` or `releaseForResubmission`) refused it
+  terminally and none accepted it, whether on submission or on a background retry; a mix with
+  transport failures or transient refusals keeps it pending, as before, and a later acceptance
+  clears the rejection. Transactions submitted by `createProposedTransactions` or
+  `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected. An
+  exhaustive `switch` over `TransactionSubmissionStatus` stops compiling until the new case is
+  handled. See MIGRATING.md.
+- `ZcashError` and `ZcashErrorCode` have new cases, starting with `giftCardTooManyNotes` (`ZGIFT0017`):
   `GiftCardRedeemer.redeem` throws it for a card holding more notes than one claim transaction may
   spend within its size bound or a block, before anything is created or broadcast, where it threw
-  `rustProposalTransactionTooLarge`. An exhaustive `switch` over either type stops compiling until
-  the new case is handled. It carries no payload.
+  `rustProposalTransactionTooLarge`. Two more, `giftCardRoundFailed(_:_:)` (`ZGIFT0018`) and
+  `giftCardRoundExpired(_:_:)` (`ZGIFT0019`), are thrown by a redemption of several rounds when a
+  round after the first is not accepted, or a round is not mined before it expires; each carries
+  the round and the ids of every claim transaction sent so far. This version redeems in one
+  transaction and does not throw them yet. An exhaustive `switch` over either type stops compiling
+  until the new cases are handled.
 - The Swift package is renamed from `ZcashLightClientKit` to `zodl-swift-wallet-sdk`, and
   its single library product and module from `ZcashLightClientKit` to `ZODLSwiftWalletSDK`.
   Every `import ZcashLightClientKit` — including the `@testable` and `@_spi(Testing)` forms —

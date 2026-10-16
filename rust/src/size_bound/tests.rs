@@ -48,6 +48,24 @@ fn each_builder_sets_only_its_own_cap() {
 }
 
 #[test]
+fn a_byte_cap_is_never_looser_than_a_block() {
+    let loose = TransactionSizeBound::CONSENSUS.with_max_bytes(usize::MAX);
+    assert_eq!(
+        loose.max_bytes,
+        Some(zcash_protocol::constants::MAX_BLOCK_BYTES)
+    );
+
+    let ffi = FfiTransactionSizeBound {
+        max_bytes: i64::MAX,
+        ..FfiTransactionSizeBound::CONSENSUS
+    };
+    assert_eq!(
+        TransactionSizeBound::try_from(ffi).unwrap().max_bytes,
+        Some(zcash_protocol::constants::MAX_BLOCK_BYTES)
+    );
+}
+
+#[test]
 fn intersect_takes_the_tighter_cap_in_every_dimension() {
     let phone = TransactionSizeBound::CONSENSUS
         .with_max_bytes(250_000)

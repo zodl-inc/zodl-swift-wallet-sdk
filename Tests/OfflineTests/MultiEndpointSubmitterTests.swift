@@ -68,7 +68,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertTrue([-25, -26].contains(code))
     }
 
-    func testEveryEndpointRefusingTerminallyIsRejectedByAll() async {
+    func testEveryEndpointRefusingTerminallyIsRejected() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpoint(2))
@@ -76,7 +76,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
 
         XCTAssertNotNil(result.outcome.rejection)
-        XCTAssertTrue(result.rejectedByAll)
+        XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
     func testOneTransientRefusalKeepsTheTransactionPending() async {
@@ -89,7 +89,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         guard case .rejected = result.outcome else {
             return XCTFail("Expected rejected, got \(result.outcome)")
         }
-        XCTAssertFalse(result.rejectedByAll)
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
     func testATransportFailureKeepsTheTransactionPending() async {
@@ -100,7 +100,8 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
 
         XCTAssertEqual(result.outcome, .rejected(code: -26, message: "bad-txns"))
-        XCTAssertFalse(result.rejectedByAll)
+        XCTAssertEqual(result.endpointOutcomes[endpointKey(endpoint(2))], .failed)
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
     func testAnAcceptanceIsNeverRejectedByAll() async {
@@ -111,7 +112,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
 
         XCTAssertEqual(result.outcome, .accepted(by: endpoint(2)))
-        XCTAssertFalse(result.rejectedByAll)
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
     func testAllTransportFailuresAreUnreachable() async {

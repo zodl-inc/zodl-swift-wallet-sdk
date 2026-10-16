@@ -31,6 +31,7 @@ use zcash_primitives::transaction::{
 use zcash_protocol::{
     PoolType, ShieldedPool,
     consensus::{BlockHeight, BranchId, Parameters},
+    constants::MAX_BLOCK_BYTES,
 };
 
 use crate::error_report::{ClassifiedError, ErrorKind};
@@ -69,10 +70,11 @@ impl TransactionSizeBound {
         max_shielded_payment_outputs: None,
     };
 
-    /// Caps the estimated serialized size of the proposal's transactions together.
+    /// Caps the estimated serialized size of the proposal's transactions together. A cap above a
+    /// block is a block: a bound is never looser than consensus.
     pub(crate) fn with_max_bytes(self, n: usize) -> Self {
         Self {
-            max_bytes: Some(n),
+            max_bytes: Some(n.min(MAX_BLOCK_BYTES)),
             ..self
         }
     }
@@ -171,10 +173,9 @@ impl TransactionSizeBound {
     /// Checks `proposal` against this bound, returning the first cap it exceeds. `params` decide
     /// the consensus rules the proposal's transactions are built under, and so their actions.
     ///
-    /// The byte cap applies to the proposal's transactions together, which is exact for the
-    /// single-transaction proposals a bound is meant for and conservative otherwise. Every other
-    /// cap applies to each transaction on its own.
-    pub(crate) fn check<P: Parameters, FeeRuleT, NoteRef>(
+    /// Every cap, the byte cap included, applies to each transaction of the proposal on its own,
+    /// as consensus' own size check does.
+    pub(crate) fn check<P: Parameters, FeeRuleT: Clone, NoteRef: Clone>(
         &self,
         proposal: &Proposal<FeeRuleT, NoteRef>,
         params: &P,
@@ -183,8 +184,10 @@ impl TransactionSizeBound {
             return Ok(());
         }
         if let Some(limit) = self.max_bytes {
-            let estimated = proposal.estimated_serialized_size();
-            if estimated > limit {
+            if let Some(estimated) = step_serialized_sizes(proposal)
+                .into_iter()
+                .find(|size| *size > limit)
+            {
                 return Err(SizeBoundViolation::Bytes { estimated, limit });
             }
         }
@@ -260,7 +263,7 @@ impl TryFrom<FfiTransactionSizeBound> for TransactionSizeBound {
             }
         }
         Ok(Self {
-            max_bytes: cap(ffi.max_bytes, "max_bytes")?,
+            max_bytes: cap(ffi.max_bytes, "max_bytes")?.map(|n| n.min(MAX_BLOCK_BYTES)),
             max_shielded_actions: cap(ffi.max_shielded_actions, "max_shielded_actions")?,
             max_sapling_actions: cap(ffi.max_sapling_actions, "max_sapling_actions")?,
             max_orchard_actions: cap(ffi.max_orchard_actions, "max_orchard_actions")?,
@@ -278,7 +281,7 @@ impl TryFrom<FfiTransactionSizeBound> for TransactionSizeBound {
 /// The cap a proposal exceeded, and by how much.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SizeBoundViolation {
-    /// The proposal's estimated serialized size exceeds the byte cap.
+    /// A transaction's estimated serialized size exceeds the byte cap.
     Bytes { estimated: usize, limit: usize },
     /// A transaction's shielded actions, all pools together, exceed their cap.
     ShieldedActions {
@@ -545,6 +548,43 @@ fn orchard_style_actions<NoteRef>(
     counted.unwrap_or(spends + outputs)
 }
 
+/// The estimated serialized size of each transaction of `proposal`, in step order.
+///
+/// `zcash_client_backend` estimates each step (`Step::estimated_serialized_size`) but exposes only
+/// their sum (`Proposal::estimated_serialized_size`) in this release. A step's own estimate is
+/// therefore read as the difference between the sums of the proposals made of the steps up to it
+/// and up to the one before: every step's estimate depends only on itself and on the earlier
+/// steps whose outputs it spends, so each difference is exactly that step's estimate.
+pub(crate) fn step_serialized_sizes<FeeRuleT: Clone, NoteRef: Clone>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> Vec<usize> {
+    let steps = proposal.steps();
+    if steps.len() == 1 {
+        return vec![proposal.estimated_serialized_size()];
+    }
+    let mut sizes = Vec::with_capacity(steps.len());
+    let mut total_before = 0;
+    for end in 1..=steps.len() {
+        let prefix = NonEmpty::from_vec(steps.iter().take(end).cloned().collect())
+            .expect("a prefix of a non-empty proposal has a step");
+        let total = Proposal::multi_step(
+            proposal.fee_rule().clone(),
+            proposal.min_target_height(),
+            proposal.confirmations_policy(),
+            prefix,
+        )
+        // A prefix of a valid proposal is valid: dropping later steps removes no reference an
+        // earlier step depends on. Fall back to the whole proposal's sum, which never under-counts.
+        .map_or_else(
+            |_| proposal.estimated_serialized_size(),
+            |p| p.estimated_serialized_size(),
+        );
+        sizes.push(total.saturating_sub(total_before));
+        total_before = total;
+    }
+    sizes
+}
+
 /// The pool of the earlier step's output that `prior` refers to.
 fn prior_output_pool<NoteRef>(steps: &NonEmpty<Step<NoteRef>>, prior: &StepOutput) -> PoolType {
     let step = &steps[prior.step_index()];
@@ -562,7 +602,7 @@ fn prior_output_pool<NoteRef>(steps: &NonEmpty<Step<NoteRef>>, prior: &StepOutpu
 ///
 /// `context` names the FFI entry point, as [`ClassifiedError::new`] describes. Which cap was
 /// exceeded, and by how much, is logged at `debug!`, where it stays on the device.
-pub(crate) fn enforce<P: Parameters, FeeRuleT, NoteRef>(
+pub(crate) fn enforce<P: Parameters, FeeRuleT: Clone, NoteRef: Clone>(
     proposal: &Proposal<FeeRuleT, NoteRef>,
     params: &P,
     bound: &TransactionSizeBound,

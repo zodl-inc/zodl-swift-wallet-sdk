@@ -24,7 +24,7 @@ import libzcashlc
 /// included (the ZIP 218 measure), and the byte size is its conservative estimate of the
 /// serialized transactions.
 public struct TransactionSizeBound: Equatable, Hashable {
-    /// The estimated serialized size of the proposal's transactions together, in bytes.
+    /// The estimated serialized size of each transaction, in bytes. A cap above a block is a block.
     public var maxBytes: Int?
     /// Sapling, Orchard and Ironwood actions together, in each transaction.
     public var maxShieldedActions: Int?
@@ -96,10 +96,14 @@ extension TransactionSizeBound {
     /// The most shielded actions ``forProvingMemory(availableBytes:)`` admits however much memory
     /// is available: about what a relay's 250 kB transaction limit admits.
     public static let maxProvingActions = 75
+    /// The fewest shielded actions ``forProvingMemory(availableBytes:)`` admits, however little
+    /// memory is reported, so that an ordinary small payment is never refused on memory grounds.
+    /// An app that wants a lower cap intersects the result with its own bound.
+    public static let minProvingActions = 16
 
     /// The bound on shielded actions under which proving a transaction fits in `availableBytes` of
     /// memory: `(availableBytes - provingBaselineBytes) / provingBytesPerAction`, rounded down, at
-    /// most ``maxProvingActions`` and at least `0`.
+    /// most ``maxProvingActions`` and at least ``minProvingActions``.
     ///
     /// This is the only sizing policy in the SDK. Which memory figure to pass (for instance what
     /// `os_proc_available_memory()` reports when the payment is proposed, or a per-device profile),
@@ -107,7 +111,7 @@ extension TransactionSizeBound {
     /// the result with any other bound that applies.
     public static func forProvingMemory(availableBytes: UInt64) -> TransactionSizeBound {
         let spare = availableBytes > provingBaselineBytes ? availableBytes - provingBaselineBytes : 0
-        let actions = min(Int(clamping: spare / provingBytesPerAction), maxProvingActions)
+        let actions = min(max(Int(clamping: spare / provingBytesPerAction), minProvingActions), maxProvingActions)
         return TransactionSizeBound(maxShieldedActions: actions)
     }
 

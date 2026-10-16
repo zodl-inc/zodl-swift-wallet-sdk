@@ -2204,6 +2204,76 @@ public extension ClosureSynchronizer {
     /// source-breaking change for downstream conformers. Conformers backed by a real engine override
     /// this; the rest report the capability as unavailable, matching `Synchronizer`'s own default.
     func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void) { completion(RestartSyncUnimplemented()) }
+
+    // Defaults so adding the size-bound members is not a source-breaking change for downstream
+    // conformers: nothing is rejected without bookkeeping, and a bound other than `.consensus` is
+    // refused rather than ignored.
+
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { Just([]).eraseToAnyPublisher() }
+
+    // swiftlint:disable function_parameter_count
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        guard sizeBound == .consensus else {
+            return completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.proposeTransfer(...sizeBound:completion:)")))
+        }
+        proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, completion: completion)
+    }
+
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        guard sizeBound == .consensus else {
+            return completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.proposeSendMax(...sizeBound:completion:)")))
+        }
+        proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, completion: completion)
+    }
+    // swiftlint:enable function_parameter_count
+
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        // `ClosureSynchronizer` has no unbounded counterpart to forward to.
+        completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.proposefulfillingPaymentURI(...sizeBound:completion:)")))
+    }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>) -> Void
+    ) {
+        guard sizeBound == .consensus else {
+            return completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.createProposedTransactions(...sizeBound:completion:)")))
+        }
+        createProposedTransactions(proposal: proposal, spendingKey: spendingKey, completion: completion)
+    }
+
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Pczt, Error>) -> Void
+    ) {
+        guard sizeBound == .consensus else {
+            return completion(.failure(SizeBoundUnsupported(member: "ClosureSynchronizer.createPCZTFromProposal(...sizeBound:completion:)")))
+        }
+        createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, completion: completion)
+    }
 }
 
 public extension CombineSynchronizer {
@@ -2243,6 +2313,71 @@ public extension CombineSynchronizer {
     /// change for downstream conformers. Conformers backed by a real engine override this; the rest
     /// report the capability as unavailable, matching `Synchronizer`'s own default.
     func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error> { Fail(error: RestartSyncUnimplemented()).eraseToAnyPublisher() }
+
+    // Defaults so adding the size-bound members is not a source-breaking change for downstream
+    // conformers: nothing is rejected without bookkeeping, and a bound other than `.consensus` is
+    // refused rather than ignored.
+
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { Just([]).eraseToAnyPublisher() }
+
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        guard sizeBound == .consensus else {
+            return Fail(error: SizeBoundUnsupported(member: "CombineSynchronizer.proposeTransfer(...sizeBound:)")).eraseToAnyPublisher()
+        }
+        return proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo)
+    }
+
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        guard sizeBound == .consensus else {
+            return Fail(error: SizeBoundUnsupported(member: "CombineSynchronizer.proposeSendMax(...sizeBound:)")).eraseToAnyPublisher()
+        }
+        return proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode)
+    }
+
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error> {
+        guard sizeBound == .consensus else {
+            return Fail(error: SizeBoundUnsupported(member: "CombineSynchronizer.proposefulfillingPaymentURI(...sizeBound:)")).eraseToAnyPublisher()
+        }
+        return proposefulfillingPaymentURI(uri, accountUUID: accountUUID)
+    }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error> {
+        guard sizeBound == .consensus else {
+            return Fail(error: SizeBoundUnsupported(member: "CombineSynchronizer.createProposedTransactions(...sizeBound:)")).eraseToAnyPublisher()
+        }
+        return createProposedTransactions(proposal: proposal, spendingKey: spendingKey)
+    }
+
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Pczt, Error> {
+        guard sizeBound == .consensus else {
+            return Fail(error: SizeBoundUnsupported(member: "CombineSynchronizer.createPCZTFromProposal(...sizeBound:)")).eraseToAnyPublisher()
+        }
+        return createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal)
+    }
 }
 
 public enum SyncStatus: Equatable {

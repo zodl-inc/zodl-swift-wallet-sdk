@@ -73,14 +73,15 @@ protocol SubmitPlanStoring {
     /// release that landed after a wipe.
     @discardableResult
     func recordPlanForAwaitingTransaction(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle?
-    /// Records that `host` (`host:port`) took the transaction into its mempool.
+    /// Records that `host` (`host:port`) took the transaction into its mempool, clearing any
+    /// rejection recorded for it.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
     /// Dropped — logged, not thrown — when `lifecycle` belongs to an epoch the store has since
     /// wiped: see `currentLifecycle()`.
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async
-    /// Records that every endpoint refused the transaction for good, with the first refusal's
-    /// `code` and `reason`. Creates the row when the transaction has no plan yet, as
+    /// Records that every endpoint of the transaction's plan refused it for good (see
+    /// `submitRejectionVerdict`), with the recorded refusal's `code` and `reason`. Creates the row when the transaction has no plan yet, as
     /// `markAccepted` does. Ignored for a transaction a server has accepted, and dropped — logged,
     /// not thrown — when `lifecycle` belongs to an epoch the store has since wiped.
     func markRejected(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) async
@@ -102,18 +103,6 @@ protocol SubmitPlanStoring {
     /// onto the token from when it recorded the plan) fetches a fresh one here immediately before
     /// the work whose result will flow into `markAccepted`.
     func currentLifecycle() async -> SubmitPlanLifecycle
-}
-
-extension SubmitPlanStoring {
-    /// Records a refusal from the single endpoint a transaction was submitted to, when the refusal
-    /// is terminal (see `SubmitRejection`); a refusal that may be transient records nothing. With
-    /// one endpoint, its refusal is every endpoint's.
-    ///
-    /// `lifecycle` must be captured before the submission, as for `markRejected`.
-    func recordSingleEndpointRefusal(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) async {
-        guard SubmitRejection(code: code, message: reason) != nil else { return }
-        await markRejected(txId: txId, code: code, reason: reason, lifecycle: lifecycle)
-    }
 }
 
 /// SQLite-backed store for per-transaction submit plans.
@@ -250,10 +239,18 @@ actor SubmitPlanStore: SubmitPlanStoring {
                 endpointsColumn <- "[]"
             )
             try connection.run(insert)
-            try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(acceptedHostColumn <- host))
+            // An acceptance clears any earlier rejection: a server holds the transaction now.
+            try connection.run(
+                table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(
+                    acceptedHostColumn <- host,
+                    rejectedCodeColumn <- nil,
+                    rejectedReasonColumn <- nil
+                )
+            )
         } catch {
             logger.warn("SubmitPlanStore failed to record the accepting server for a submit plan: \(error.localizedDescription)")
         }
+        publishRejectedTransactionIds()
     }
 
     func plan(for txId: Data) -> StoredSubmitPlan? {

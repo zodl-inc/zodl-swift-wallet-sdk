@@ -75,12 +75,14 @@ case nil: break
 }
 ```
 
-## `ZcashError` gained a case — `giftCardTooManyNotes`
+## `ZcashError` gained cases — gift card rounds
 
-`ZcashError` and `ZcashErrorCode` have a new case, `giftCardTooManyNotes` (`ZGIFT0017`), which
-`GiftCardRedeemer.redeem` throws, before creating or broadcasting anything, for a card with more
-notes than one claim may spend. It replaces `rustProposalTransactionTooLarge` from that call. An
-exhaustive `switch` over either type stops compiling until it is handled.
+`ZcashError` and `ZcashErrorCode` have three new cases. `giftCardTooManyNotes` (`ZGIFT0017`) is
+thrown by `GiftCardRedeemer.redeem`, before creating or broadcasting anything, for a card with more
+notes than one claim may spend; it replaces `rustProposalTransactionTooLarge` from that call.
+`giftCardRoundFailed(_:_:)` (`ZGIFT0018`) and `giftCardRoundExpired(_:_:)` (`ZGIFT0019`) carry a
+round number and the ids of every claim transaction sent so far, for redemptions of several rounds.
+An exhaustive `switch` over either type stops compiling until they are handled.
 
 ```swift
 // Before
@@ -91,6 +93,8 @@ exhaustive `switch` over either type stops compiling until it is handled.
 // After
 } catch ZcashError.giftCardTooManyNotes {
     showCardTooFragmented()
+} catch let ZcashError.giftCardRoundFailed(round, txIds), let ZcashError.giftCardRoundExpired(round, txIds) {
+    showRoundStopped(round: round, sent: txIds)
 }
 ```
 

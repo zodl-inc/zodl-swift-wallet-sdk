@@ -19,13 +19,13 @@ final class MultiEndpointSubmitter {
         self.logger = logger
     }
 
-    /// The outcome of one submission race, and whether it ended in a terminal rejection.
+    /// The outcome of one submission race, with what each endpoint answered.
     struct RaceResult: Equatable {
         let outcome: TransactionSubmissionOutcome
-        /// `true` only when every endpoint responded with a terminal refusal (`SubmitRejection`)
-        /// and none accepted. A mix of refusals and transport failures, or any refusal that may be
-        /// transient, leaves it `false`: some server may still take the transaction.
-        let rejectedByAll: Bool
+        /// Each endpoint's answer, keyed by `endpointKey(_:)`. Complete when `outcome` is
+        /// `.rejected`, which resolves only once every endpoint has answered; an endpoint still in
+        /// flight when the race resolved otherwise has no entry.
+        let endpointOutcomes: [String: EndpointSubmission]
     }
 
     func submit(
@@ -43,7 +43,7 @@ final class MultiEndpointSubmitter {
     ) async -> RaceResult {
         guard !endpoints.isEmpty else {
             logger.warn("Multi-endpoint submission requested with an empty endpoint list.")
-            return RaceResult(outcome: .unreachable, rejectedByAll: false)
+            return RaceResult(outcome: .unreachable, endpointOutcomes: [:])
         }
 
         let race = SubmissionRace(
@@ -73,11 +73,7 @@ final class MultiEndpointSubmitter {
                 await race.callerCancelled()
             }
         }
-        // `.rejected` resolves only once every endpoint has completed, so the tally is final.
-        guard case .rejected = outcome else {
-            return RaceResult(outcome: outcome, rejectedByAll: false)
-        }
-        return RaceResult(outcome: outcome, rejectedByAll: await race.rejectedTerminallyByAll())
+        return RaceResult(outcome: outcome, endpointOutcomes: await race.endpointOutcomes())
     }
 }
 
@@ -97,7 +93,7 @@ actor SubmissionRace {
     private var winner: LightWalletEndpoint?
     private var firstRejection: (code: Int, message: String)?
     private var completedCount = 0
-    private var terminalRejectionCount = 0
+    private var answers: [String: EndpointSubmission] = [:]
     private var graceTask: Task<Void, Never>?
 
     init(
@@ -151,10 +147,10 @@ actor SubmissionRace {
         resolve(.cancelled)
     }
 
-    /// Whether every endpoint refused the transaction terminally. Meaningful once the race has
-    /// resolved `.rejected`, which happens only after every endpoint completed.
-    func rejectedTerminallyByAll() -> Bool {
-        winner == nil && terminalRejectionCount == endpoints.count
+    /// What each endpoint has answered so far. Complete once the race has resolved `.rejected`,
+    /// which happens only after every endpoint answered.
+    func endpointOutcomes() -> [String: EndpointSubmission] {
+        answers
     }
 
     /// The caller-facing promise. Resumes exactly once.
@@ -201,6 +197,7 @@ actor SubmissionRace {
 
     private func submissionSucceeded(at endpoint: LightWalletEndpoint) {
         completedCount += 1
+        answers[endpointKey(endpoint)] = .accepted
         if winner == nil {
             winner = endpoint
             logger.info("Transaction \(transaction.txId.toHexStringTxId()) accepted by \(endpoint.host):\(endpoint.port).")
@@ -217,9 +214,7 @@ actor SubmissionRace {
         if firstRejection == nil {
             firstRejection = (code: code, message: message)
         }
-        if SubmitRejection(code: code, message: message) != nil {
-            terminalRejectionCount += 1
-        }
+        answers[endpointKey(endpoint)] = .refused(code: code, message: message)
         logger.warn("Transaction \(transaction.txId.toHexStringTxId()) rejected by \(endpoint.host):\(endpoint.port): \(code) \(message)")
         resolveIfAllFailed()
         finishRaceIfAllCompleted()
@@ -227,6 +222,7 @@ actor SubmissionRace {
 
     private func submissionFailed(at endpoint: LightWalletEndpoint, error: Error) {
         completedCount += 1
+        answers[endpointKey(endpoint)] = .failed
         logger.warn("Transaction \(transaction.txId.toHexStringTxId()) submission to \(endpoint.host):\(endpoint.port) failed: \(error)")
         resolveIfAllFailed()
         finishRaceIfAllCompleted()

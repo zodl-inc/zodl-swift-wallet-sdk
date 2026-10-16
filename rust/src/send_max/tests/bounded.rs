@@ -5,7 +5,7 @@
 use zcash_protocol::{ShieldedPool, consensus::BranchId};
 
 use super::*;
-use crate::size_bound::StepCounts;
+use crate::size_bound::{StepCounts, step_serialized_sizes};
 
 /// The notes [`five_note_wallet`] holds.
 const NOTES: usize = 5;
@@ -138,6 +138,97 @@ fn the_byte_cap_holds_the_estimated_size() {
     let below = TransactionSizeBound::CONSENSUS.with_max_bytes(size - 1);
     let e = refuse_bounded(&mut st, below);
     assert_eq!(e.kind(), ErrorKind::TransactionTooLarge);
+}
+
+/// A send-max to a TEX address takes two transactions; the byte cap holds each of them, as
+/// consensus does, so the proposal passes at its largest transaction's size.
+#[test]
+fn the_byte_cap_holds_each_transaction_of_a_multi_step_proposal() {
+    let mut st = five_note_wallet();
+    let recipient = tex_recipient(&st);
+    let tex = propose_max(&mut st, user_send_max(recipient.clone(), None)).expect("proposes");
+
+    let sizes = step_serialized_sizes(&tex);
+    assert_eq!(
+        sizes.len(),
+        2,
+        "a TEX payment goes through an ephemeral address"
+    );
+    assert_eq!(sizes.iter().sum::<usize>(), tex.estimated_serialized_size());
+    let largest = *sizes.iter().max().unwrap();
+    assert!(largest < tex.estimated_serialized_size());
+
+    let request = |bytes| SendMaxRequest {
+        size_bound: TransactionSizeBound::CONSENSUS.with_max_bytes(bytes),
+        ..user_send_max(recipient.clone(), None)
+    };
+    propose_max(&mut st, request(largest))
+        .expect("a bound its largest transaction meets admits it");
+    let e = refusal(&mut st, request(largest - 1));
+    assert_eq!(e.kind(), ErrorKind::TransactionTooLarge);
+}
+
+/// A wallet holding one spendable Sapling note of [`NOTE_VALUE`].
+fn sapling_funded_wallet() -> TestWallet {
+    let mut st = unscanned_wallet();
+    let fvk = st
+        .test_account()
+        .unwrap()
+        .usk()
+        .sapling()
+        .to_diversifiable_full_viewing_key();
+    let height = st
+        .generate_next_block(
+            &fvk,
+            AddressType::DefaultExternal,
+            Zatoshis::const_from_u64(NOTE_VALUE),
+        )
+        .0;
+    mine_empty_blocks(&mut st, CONFIRMATIONS);
+    scan_from(&mut st, height);
+    st
+}
+
+/// A Sapling address that belongs to nobody in the test wallet.
+fn sapling_recipient(st: &TestWallet) -> ZcashAddress {
+    let (_, address) = sapling::zip32::ExtendedSpendingKey::master(&[9; 32])
+        .expect("a valid seed")
+        .default_address();
+    Address::Sapling(Box::new(address)).to_zcash_address(st.network())
+}
+
+/// The canonical Send Max shapes are counted as the builder builds them: three Orchard notes to
+/// an Orchard recipient take three actions, and one Sapling note to a Sapling recipient takes a
+/// spend and two padded outputs. Upstream's estimator charges two more per bundle
+/// (`spends + outputs + 2`), so once this check collapses to upstream's a cap of `n` actions admits
+/// about `n - 2` notes.
+#[test]
+fn canonical_shapes_are_counted_as_built() {
+    let mut st = wallet_with_orchard_notes(&[NOTE_VALUE; 3]);
+    let recipient = external_recipient(&st);
+    let max = propose_max(&mut st, user_send_max(recipient, None)).expect("proposes");
+    let orchard = counts(&st, &max);
+    assert_eq!(
+        [
+            orchard.pool_actions(ShieldedPool::Sapling),
+            orchard.pool_actions(ShieldedPool::Orchard),
+            orchard.pool_actions(ShieldedPool::Ironwood),
+        ],
+        [0, 3, 0]
+    );
+
+    let mut st = sapling_funded_wallet();
+    let recipient = sapling_recipient(&st);
+    let max = propose_max(&mut st, user_send_max(recipient, None)).expect("proposes");
+    let sapling = counts(&st, &max);
+    assert_eq!(
+        [
+            sapling.pool_actions(ShieldedPool::Sapling),
+            sapling.pool_actions(ShieldedPool::Orchard),
+            sapling.pool_actions(ShieldedPool::Ironwood),
+        ],
+        [3, 0, 0]
+    );
 }
 
 #[test]

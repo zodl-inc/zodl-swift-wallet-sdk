@@ -431,7 +431,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_shielded_payment_outputs`, each `-1` for no cap (`0` forbids that dimension; any other
   negative value fails). Actions are those `zcash_client_backend`'s builder produces, padding
   included. A proposal exceeding the bound fails with `ErrorKind::TransactionTooLarge`
-  (`22`); `zcashlc_create_pczt_from_proposal` reports it through the last error message. A send-max
+  (`22`), through `zcashlc_take_last_error_report` on every one of these entry points. A
+  `max_bytes` above `MAX_BLOCK_BYTES` counts as a block, and is held against each transaction of
+  the proposal on its own. A send-max
   is refused, never reduced to what fits. `zcashlc_propose_send_max_transfer` ignores the bound when
   `orchard_only` is `true`. Existing callers must pass every field `-1` to keep their behavior.
 - `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other

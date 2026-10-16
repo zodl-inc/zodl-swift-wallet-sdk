@@ -3,35 +3,51 @@
 //  ZODLSwiftWalletSDK
 //
 
-import Combine
 import XCTest
 @testable import TestUtils
 @testable import ZODLSwiftWalletSDK
 
 final class SubmitRejectionTests: XCTestCase {
-    private let tooLargeText = "transaction is 260001 bytes, exceeding the configured mempool maximum of 250000"
+    private let zakuraTooLarge = "transaction is 260001 bytes, exceeding the configured mempool maximum of 250000"
+    private let zebraTooLarge = "transaction has 90 actions, exceeding the next block's ZIP 218 limit of 75"
 
-    func testAMempoolSizeRefusalIsTooLarge() {
-        XCTAssertEqual(SubmitRejection(code: -25, message: tooLargeText), .tooLarge)
-        XCTAssertEqual(SubmitRejection(code: -25, message: tooLargeText.uppercased()), .tooLarge)
+    // MARK: - Classifier (the same table as the Android SDK)
+
+    func testAMempoolMaximumOrZip218RefusalOnMinus25IsTooLarge() {
+        XCTAssertEqual(SubmitRejection(code: -25, message: zakuraTooLarge), .tooLarge)
+        XCTAssertEqual(SubmitRejection(code: -25, message: zebraTooLarge), .tooLarge)
+        XCTAssertEqual(SubmitRejection(code: -25, message: zakuraTooLarge.uppercased()), .tooLarge)
     }
 
-    func testTheMempoolTextUnderAnotherCodeIsNotTooLarge() {
-        XCTAssertNil(SubmitRejection(code: -1, message: tooLargeText))
-        XCTAssertEqual(SubmitRejection(code: -26, message: tooLargeText), .invalid)
+    func testTheSizeTextsUnderAnotherCodeAreNotTooLarge() {
+        XCTAssertNil(SubmitRejection(code: -1, message: zakuraTooLarge))
+        XCTAssertNil(SubmitRejection(code: -1, message: zebraTooLarge))
+        XCTAssertEqual(SubmitRejection(code: -26, message: zebraTooLarge), .invalid)
     }
 
-    func testAnExpiryRefusalIsExpired() {
+    func testAnExpiryRefusalOnAVerificationCodeIsExpired() {
         XCTAssertEqual(SubmitRejection(code: -26, message: "tx-overwinter-expired"), .expired)
-        XCTAssertEqual(SubmitRejection(code: -25, message: "transaction is expiring soon"), .expired)
-        XCTAssertEqual(SubmitRejection(code: -1, message: "Transaction Expired"), .expired)
+        XCTAssertEqual(SubmitRejection(code: -25, message: "tx-expiring-soon"), .expired)
+        XCTAssertEqual(SubmitRejection(code: -25, message: "block height 100 is greater than its expiry height 90"), .expired)
     }
 
-    func testAnyOtherVerificationRejectionIsInvalid() {
+    func testAnExpiryTextUnderAnotherCodeIsTransient() {
+        XCTAssertNil(SubmitRejection(code: -1, message: "tx-overwinter-expired"))
+        XCTAssertNil(SubmitRejection(code: 0, message: "greater than its expiry"))
+    }
+
+    func testAnyOtherMinus26RefusalIsInvalid() {
         XCTAssertEqual(SubmitRejection(code: -26, message: "bad-txns-sapling-binding-signature-invalid"), .invalid)
+        XCTAssertEqual(SubmitRejection(code: -26, message: ""), .invalid)
     }
 
-    func testTransientRefusalsAreNotTerminal() {
+    func testTransientMinus26RefusalsAreNotTerminal() {
+        XCTAssertNil(SubmitRejection(code: -26, message: "mempool full"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "txn-already-in-mempool"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "transaction already in chain"))
+    }
+
+    func testOtherRefusalsAreTransient() {
         XCTAssertNil(SubmitRejection(code: -25, message: "Missing inputs"))
         XCTAssertNil(SubmitRejection(code: -1, message: "connection reset"))
         XCTAssertNil(SubmitRejection(code: 0, message: ""))
@@ -39,7 +55,7 @@ final class SubmitRejectionTests: XCTestCase {
 
     func testASubmitResultReportsItsRejection() {
         let txId = Data(repeating: 1, count: 32)
-        XCTAssertEqual(TransactionSubmitResult.submitFailure(txId: txId, code: -25, description: tooLargeText).rejection, .tooLarge)
+        XCTAssertEqual(TransactionSubmitResult.submitFailure(txId: txId, code: -25, description: zebraTooLarge).rejection, .tooLarge)
         XCTAssertNil(TransactionSubmitResult.submitFailure(txId: txId, code: -25, description: "Missing inputs").rejection)
         XCTAssertNil(TransactionSubmitResult.success(txId: txId).rejection)
         XCTAssertNil(TransactionSubmitResult.notAttempted(txId: txId).rejection)
@@ -52,23 +68,62 @@ final class SubmitRejectionTests: XCTestCase {
     }
 
     func testARejectedPlanReportsItsKindAsTheSubmissionStatus() {
-        XCTAssertEqual(StoredSubmitPlan.rejected(code: -25, reason: tooLargeText).submissionStatus, .rejected(.tooLarge))
+        XCTAssertEqual(StoredSubmitPlan.rejected(code: -25, reason: zakuraTooLarge).submissionStatus, .rejected(.tooLarge))
         XCTAssertEqual(StoredSubmitPlan.rejected(code: -26, reason: "bad").submissionStatus, .rejected(.invalid))
         XCTAssertEqual(StoredSubmitPlan.rejected(code: 0, reason: "").submissionStatus, .rejected(.invalid))
     }
 
-    func testASingleEndpointRefusalIsRecordedOnlyWhenTerminal() async {
-        let store = SubmitPlanStoringMock()
-        let terminal = Data(repeating: 2, count: 32)
-        let transient = Data(repeating: 3, count: 32)
-        let lifecycle = await store.currentLifecycle()
+    // MARK: - Verdict against the stored plan
 
-        await store.recordSingleEndpointRefusal(txId: terminal, code: -26, reason: "bad", lifecycle: lifecycle)
-        await store.recordSingleEndpointRefusal(txId: transient, code: -25, reason: "Missing inputs", lifecycle: lifecycle)
+    private let endpointA = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+    private let endpointB = LightWalletEndpoint(address: "b.example.com", port: 9067, secure: true)
+    private var terminal: EndpointSubmission { .refused(code: -26, message: "bad") }
+    private var transient: EndpointSubmission { .refused(code: -25, message: "Missing inputs") }
 
-        let terminalPlan = await store.plan(for: terminal)
-        let transientPlan = await store.plan(for: transient)
-        XCTAssertEqual(terminalPlan, .rejected(code: -26, reason: "bad"))
-        XCTAssertNil(transientPlan)
+    func testEveryPlanEndpointRefusingTerminallyIsRejected() {
+        let verdict = submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .refused(code: -25, message: zakuraTooLarge)],
+            previous: nil
+        )
+        XCTAssertEqual(verdict, StoredRejection(code: -26, reason: "bad"), "the first refusal in plan order is recorded")
+    }
+
+    func testOneEndpointOfTheTwoIsNotUnanimous() {
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: nil))
+    }
+
+    func testATransientRefusalOrTransportFailureKeepsItPending() {
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): transient],
+            previous: nil
+        ))
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .failed],
+            previous: nil
+        ))
+    }
+
+    func testAnAcceptanceIsNeverRejected() {
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .accepted],
+            previous: StoredRejection(code: -26, reason: "bad")
+        ))
+    }
+
+    func testAnUnaskedEndpointCountsAsRefusedOnlyWhenAlreadyRejected() {
+        let previous = StoredRejection(code: -25, reason: zakuraTooLarge)
+        XCTAssertEqual(
+            submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: previous),
+            StoredRejection(code: -26, reason: "bad")
+        )
+        XCTAssertEqual(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [:], previous: previous), previous)
+    }
+
+    func testNoPlanIsNeverRejected() {
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: [], outcomes: [endpointKey(endpointA): terminal], previous: nil))
     }
 }

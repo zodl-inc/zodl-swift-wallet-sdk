@@ -27,6 +27,15 @@ final class SendMaxProposalErrorTests: XCTestCase {
         XCTAssertEqual(error, .rustProposalInsufficientFunds(Zatoshi(9_000), Zatoshi(10_001)))
     }
 
+    func testABoundedPCZTOverItsBoundIsTypedAsTooLarge() {
+        XCTAssertEqual(pcztProposalError(for: report(.transactionTooLarge)), .rustProposalTransactionTooLarge)
+    }
+
+    func testAnyOtherBoundedPCZTFailureKeepsItsCase() {
+        XCTAssertEqual(pcztProposalError(for: report(.unclassified)), .rustCreatePCZTFromProposal("redacted"))
+        XCTAssertEqual(pcztProposalError(for: report(.proposalInvalid)), .rustCreatePCZTFromProposal("redacted"))
+    }
+
     func testSendMaxTransactionTooLarge() {
         XCTAssertEqual(sendMaxProposalError(for: report(.transactionTooLarge)), .rustProposalTransactionTooLarge)
     }

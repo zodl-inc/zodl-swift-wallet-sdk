@@ -557,7 +557,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
 
         guard let pcztPtr else {
-            throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: "`createPCZTFromProposal` failed with unknown error"))
+            let fallback = "`createPCZTFromProposal` failed with unknown error"
+            // Unbounded callers (the migration lanes, hardware signing) keep the error they have
+            // always seen. A bounded caller gets the typed size failure, and otherwise the redacted
+            // report.
+            guard sizeBound != .consensus else {
+                throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: fallback))
+            }
+            throw pcztProposalError(for: lastErrorReport(fallback: fallback))
         }
 
         defer { zcashlc_free_boxed_slice(pcztPtr) }
@@ -2976,6 +2983,13 @@ nonisolated func proposalError(
     default:
         return wrap(report)
     }
+}
+
+/// Maps a failed bounded `createPCZTFromProposal` to the `ZcashError` the wallet should act on:
+/// a proposal over its size bound (or a block) is `rustProposalTransactionTooLarge`, and anything
+/// else `rustCreatePCZTFromProposal` with the redacted message.
+nonisolated func pcztProposalError(for report: RedactedRustError) -> ZcashError {
+    proposalError(for: report) { ZcashError.rustCreatePCZTFromProposal($0.message) }
 }
 
 /// Maps a failed send-max proposal to the `ZcashError` the wallet should act on.

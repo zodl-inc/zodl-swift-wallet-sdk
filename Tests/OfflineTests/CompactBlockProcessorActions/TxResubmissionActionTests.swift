@@ -129,6 +129,38 @@ final class TxResubmissionActionTests: ZcashTestCase {
         )
     }
 
+    func testBackgroundRetryRefusedTerminallyByEveryPlanEndpointIsRejected() async throws {
+        let rawID = Data(repeating: 0x0F, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        let endpointB = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpointA)
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpointB)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns"))
+    }
+
+    func testBackgroundRetryWithOneTransientRefusalStaysReady() async throws {
+        let rawID = Data(repeating: 0x10, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        let endpointB = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpointA)
+        endpointSubmitter.set(behavior: .failTransport, for: endpointB)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
+    }
+
     func testReadyTransactionIsResubmittedThroughPlanEndpoints() async throws {
         let rawID = Data(repeating: 0x02, count: 32)
         let candidate = makeOverview(rawID: rawID)

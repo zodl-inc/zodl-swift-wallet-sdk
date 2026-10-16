@@ -3,8 +3,58 @@
 //  ZODLSwiftWalletSDK
 //
 
-import Combine
 import Foundation
+
+/// The progress of a gift card redemption, one value per round and phase, as
+/// ``GiftCardRedeemer/redeemProgress()`` delivers it.
+public struct RedeemProgress: Equatable {
+    /// Where a round stands.
+    public enum Phase: Equatable {
+        /// The round's transactions were created and submitted.
+        case submitted
+        /// The round's transactions were mined; the next round, if any, starts now.
+        case confirmed
+    }
+
+    /// The round, from 1.
+    public let round: Int
+    /// Where the round stands.
+    public let phase: Phase
+    /// The ids of the round's transactions.
+    public let txIds: [Data]
+    /// The spendable notes the card holds beyond this round; `0` once it is swept.
+    public let remainingNotes: Int
+    /// The value of ``remainingNotes``, before fees.
+    public let remainingValue: Zatoshi
+}
+
+/// Whether a round's transactions are mined, expired, or neither yet.
+enum GiftCardRoundState: Equatable {
+    case pending
+    case mined
+    case expired
+}
+
+/// How a redemption waits for a round to be mined.
+struct GiftCardRoundTiming {
+    /// How long a round may stay unmined before the redemption gives up on it.
+    let roundTimeout: TimeInterval
+    /// How often a pending round's transactions are checked.
+    let pollInterval: TimeInterval
+    /// The current time, in seconds.
+    let now: () -> TimeInterval
+    /// Suspends for the given number of seconds.
+    let sleep: (TimeInterval) async throws -> Void
+
+    /// A round is given 50 minutes, the 40-block expiry delta with a margin, and checked every
+    /// 15 seconds.
+    static let live = GiftCardRoundTiming(
+        roundTimeout: 50 * 60,
+        pollInterval: 15,
+        now: { ProcessInfo.processInfo.systemUptime },
+        sleep: { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    )
+}
 
 /// Redeems a gift card in one or more rounds, each one claim transaction held to a size bound.
 ///
@@ -27,6 +77,14 @@ struct GiftCardRedeemRounds<RoundProposal> {
         let proposal: RoundProposal
         /// The spendable notes the proposal leaves behind; `0` when it sweeps the card.
         let remainingNotes: Int
+        /// The value of those notes, before fees.
+        let remainingValue: Zatoshi
+
+        init(proposal: RoundProposal, remainingNotes: Int, remainingValue: Zatoshi = .zero) {
+            self.proposal = proposal
+            self.remainingNotes = remainingNotes
+            self.remainingValue = remainingValue
+        }
     }
 
     /// What one round created, submitted and recorded.
@@ -49,37 +107,57 @@ struct GiftCardRedeemRounds<RoundProposal> {
     let sendWhatFits: Bool
     /// The most rounds one redemption runs, however many notes remain.
     let maxRounds: Int
+    let timing: GiftCardRoundTiming
     /// Proposes the next round; with `sendWhatFits`, the most of the card that fits the bound.
     let propose: (_ sendWhatFits: Bool) async throws -> Round
     /// Creates, submits and records a round's transactions.
     let complete: (RoundProposal) async throws -> Outcome
-    /// Returns once every transaction in the given ids is mined.
-    let awaitMined: ([Data]) async throws -> Void
+    /// Reads whether the given transactions are mined, expired, or neither yet.
+    let roundState: ([Data]) async throws -> GiftCardRoundState
+    /// Receives each round's progress.
+    let progress: (RedeemProgress) -> Void
 
     /// Proposes the first round. A card that needs more than one transaction, while rounds are
     /// unavailable, fails here with ``ZcashError/giftCardTooManyNotes``.
     func proposeFirst() async throws -> Round {
-        try await proposeRound()
+        do {
+            return try await propose(sendWhatFits)
+        } catch ZcashError.rustProposalTransactionTooLarge {
+            throw ZcashError.giftCardTooManyNotes
+        }
     }
 
     /// Runs the redemption from its first round, `first`, to the last, and returns every round's
     /// outcome in order.
     ///
-    /// The redemption stops after a round any of whose transactions a server did not accept: the
-    /// inputs of that round stay reserved until it expires, and the caller reports the round's
-    /// results. It also stops once the card is swept or `maxRounds` have run.
+    /// A first round that a server did not accept ends the redemption with that round's results,
+    /// as a single-transaction redemption always has. A later round that a server did not accept
+    /// throws ``ZcashError/giftCardRoundFailed(_:_:)``, and a round not mined before it expires or
+    /// times out throws ``ZcashError/giftCardRoundExpired(_:_:)``; both carry the ids of every
+    /// transaction sent so far. The redemption also stops once the card is swept or `maxRounds`
+    /// have run.
     func run(startingWith first: Round) async throws -> [Outcome] {
         var outcomes: [Outcome] = []
+        var sent: [Data] = []
         var round = first
         while true {
+            let number = outcomes.count + 1
             let outcome = try await complete(round.proposal)
+            let txIds = outcome.results.map(\.txId)
+            sent += txIds
             outcomes.append(outcome)
-            guard sendWhatFits, round.remainingNotes > 0, outcome.allAccepted, outcomes.count < maxRounds else {
+            guard outcome.allAccepted else {
+                guard number == 1 else { throw ZcashError.giftCardRoundFailed(number, sent) }
                 return outcomes
             }
-            try await awaitMined(outcome.results.map(\.txId))
+            report(round, number: number, phase: .submitted, txIds: txIds)
+            guard sendWhatFits, round.remainingNotes > 0, outcomes.count < maxRounds else {
+                return outcomes
+            }
+            try await awaitMined(round: number, txIds: txIds, sent: sent)
+            report(round, number: number, phase: .confirmed, txIds: txIds)
             do {
-                round = try await proposeRound()
+                round = try await propose(sendWhatFits)
             } catch ZcashError.giftCardNothingToRedeem {
                 // What remained was dust: the rounds so far are the whole redemption.
                 return outcomes
@@ -87,11 +165,30 @@ struct GiftCardRedeemRounds<RoundProposal> {
         }
     }
 
-    private func proposeRound() async throws -> Round {
-        do {
-            return try await propose(sendWhatFits)
-        } catch ZcashError.rustProposalTransactionTooLarge {
-            throw ZcashError.giftCardTooManyNotes
+    private func report(_ round: Round, number: Int, phase: RedeemProgress.Phase, txIds: [Data]) {
+        progress(RedeemProgress(
+            round: number,
+            phase: phase,
+            txIds: txIds,
+            remainingNotes: round.remainingNotes,
+            remainingValue: round.remainingValue
+        ))
+    }
+
+    /// Polls the round's transactions until they are mined; an expiry or the round timeout throws.
+    private func awaitMined(round: Int, txIds: [Data], sent: [Data]) async throws {
+        let deadline = timing.now() + timing.roundTimeout
+        while true {
+            try Task.checkCancellation()
+            switch try await roundState(txIds) {
+            case .mined:
+                return
+            case .expired:
+                throw ZcashError.giftCardRoundExpired(round, sent)
+            case .pending:
+                guard timing.now() < deadline else { throw ZcashError.giftCardRoundExpired(round, sent) }
+                try await timing.sleep(timing.pollInterval)
+            }
         }
     }
 }
@@ -120,86 +217,52 @@ extension GiftCardRedeemer {
     /// what this many rounds can sweep.
     static let maxRounds = 8
 
-    /// Returns once a `.minedTransaction` event has been seen for every id in `txIds`.
-    static func awaitMined(_ txIds: [Data], events: AnyPublisher<SynchronizerEvent, Never>) async throws {
-        guard !txIds.isEmpty else { return }
-        let waiter = GiftCardMinedWaiter(txIds: Set(txIds))
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                waiter.start(events: events, continuation: continuation)
-            }
-        } onCancel: {
-            waiter.cancel()
+    /// Whether every transaction in `txIds` is mined, any of them expired unmined, or neither yet,
+    /// as the card wallet's `transactions` record them. A transaction the wallet does not list yet
+    /// is pending.
+    static func roundState(of txIds: [Data], in transactions: [ZcashTransaction.Overview]) -> GiftCardRoundState {
+        let byId = Dictionary(transactions.map { ($0.rawID, $0) }, uniquingKeysWith: { first, _ in first })
+        let round = txIds.map { byId[$0] }
+        if round.contains(where: { $0?.minedHeight == nil && $0?.isExpiredUmined == true }) {
+            return .expired
         }
+        return round.allSatisfy { $0?.minedHeight != nil } ? .mined : .pending
     }
 }
 
-/// Waits, without `AsyncSequence` (unavailable before iOS 15), for a set of transactions to be
-/// reported mined, resuming its continuation exactly once.
-private final class GiftCardMinedWaiter: @unchecked Sendable {
+/// Delivers redemption progress to every current ``GiftCardRedeemer/redeemProgress()`` stream.
+final class GiftCardProgressBroadcaster: @unchecked Sendable {
     private let lock = NSLock()
-    private var pending: Set<Data>
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var subscription: AnyCancellable?
-    private var isFinished = false
+    private var continuations: [UUID: AsyncStream<RedeemProgress>.Continuation] = [:]
 
-    init(txIds: Set<Data>) {
-        pending = txIds
+    func stream() -> AsyncStream<RedeemProgress> {
+        AsyncStream { continuation in
+            let id = UUID()
+            lock.lock()
+            continuations[id] = continuation
+            lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.continuations[id] = nil
+                self.lock.unlock()
+            }
+        }
     }
 
-    func start(events: AnyPublisher<SynchronizerEvent, Never>, continuation: CheckedContinuation<Void, Error>) {
+    func send(_ progress: RedeemProgress) {
         lock.lock()
-        guard !isFinished else {
-            lock.unlock()
-            continuation.resume(throwing: CancellationError())
-            return
-        }
-        self.continuation = continuation
+        let current = Array(continuations.values)
         lock.unlock()
-        let subscription = events.sink { [weak self] event in
-            guard case let .minedTransaction(transaction) = event else { return }
-            self?.mined(transaction.rawID)
-        }
-        lock.lock()
-        if isFinished {
-            lock.unlock()
-            subscription.cancel()
-        } else {
-            self.subscription = subscription
-            lock.unlock()
-        }
+        current.forEach { $0.yield(progress) }
     }
 
-    func cancel() {
-        finish(with: CancellationError())
-    }
-
-    private func mined(_ txId: Data) {
+    func finish() {
         lock.lock()
-        pending.remove(txId)
-        let done = pending.isEmpty
+        let current = Array(continuations.values)
+        continuations = [:]
         lock.unlock()
-        if done { finish(with: nil) }
-    }
-
-    private func finish(with error: Error?) {
-        lock.lock()
-        guard !isFinished else {
-            lock.unlock()
-            return
-        }
-        isFinished = true
-        let continuation = self.continuation
-        let subscription = self.subscription
-        self.continuation = nil
-        self.subscription = nil
-        lock.unlock()
-        subscription?.cancel()
-        if let error {
-            continuation?.resume(throwing: error)
-        } else {
-            continuation?.resume()
-        }
+        current.forEach { $0.finish() }
     }
 }
 

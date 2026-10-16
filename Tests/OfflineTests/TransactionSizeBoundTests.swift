@@ -60,10 +60,11 @@ final class TransactionSizeBoundTests: XCTestCase {
         XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: .max).maxShieldedActions, 75)
     }
 
-    func testProvingMemoryBelowTheBaselineAdmitsNoShieldedAction() {
-        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: 0).maxShieldedActions, 0)
-        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: 550 * mebibyte).maxShieldedActions, 0)
-        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: 570 * mebibyte).maxShieldedActions, 1)
+    func testProvingMemoryNeverCapsBelowTheFloor() {
+        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: 0).maxShieldedActions, 16)
+        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: 550 * mebibyte).maxShieldedActions, 16)
+        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: (550 + 16 * 20) * mebibyte).maxShieldedActions, 16)
+        XCTAssertEqual(TransactionSizeBound.forProvingMemory(availableBytes: (550 + 17 * 20) * mebibyte).maxShieldedActions, 17)
     }
 
     func testProvingMemoryCapsOnlyShieldedActions() {

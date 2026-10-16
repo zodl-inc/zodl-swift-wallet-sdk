@@ -97,10 +97,10 @@ final class SDKBroadcaster: Broadcaster {
         let outcome = result.outcome
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
 
-        // Every endpoint refused it for good, and none took it: stop background resubmission,
-        // which could only repeat the refusal until the transaction expires.
-        if result.rejectedByAll, case let .rejected(code, message) = outcome {
-            await submitPlanStore.markRejected(txId: transaction.txId, code: code, reason: message, lifecycle: lifecycle)
+        // Every endpoint of the plan refused it for good, and none took it: stop background
+        // resubmission, which could only repeat the refusal until the transaction expires.
+        if case .rejected = outcome {
+            await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
         }
 
         // Remember which server took it, so the app can tell "handed to a
@@ -111,6 +111,33 @@ final class SDKBroadcaster: Broadcaster {
         }
 
         return outcome
+    }
+
+    /// Records the transaction as rejected when the verdict over its stored plan says so.
+    private func recordRejectionVerdict(
+        txId: Data,
+        endpoints: [LightWalletEndpoint],
+        outcomes: [String: EndpointSubmission],
+        lifecycle: SubmitPlanLifecycle
+    ) async {
+        let planEndpoints: [LightWalletEndpoint]
+        let previous: StoredRejection?
+        switch await submitPlanStore.plan(for: txId) {
+        case let .ready(stored, acceptedBy: nil):
+            planEndpoints = stored
+            previous = nil
+        case let .rejected(code, reason):
+            // The plan just recorded is this call's endpoints; the rejection columns survive it.
+            planEndpoints = endpoints
+            previous = StoredRejection(code: code, reason: reason)
+        default:
+            // Accepted at some point, unreadable, or gone: never rejected.
+            return
+        }
+        guard let verdict = submitRejectionVerdict(planEndpoints: planEndpoints, outcomes: outcomes, previous: previous) else {
+            return
+        }
+        await submitPlanStore.markRejected(txId: txId, code: verdict.code, reason: verdict.reason, lifecycle: lifecycle)
     }
 
     func releaseForResubmission(

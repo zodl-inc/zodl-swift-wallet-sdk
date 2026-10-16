@@ -11,8 +11,9 @@ import Foundation
 /// still arrive, an unrecognized refusal) is treated as transient, and the transaction stays
 /// pending and is retried until it expires, as before.
 public enum SubmitRejection: Equatable, Hashable {
-    /// The transaction is larger than the server's mempool accepts. It spends too many notes; the
-    /// same payment needs fewer inputs, for instance a smaller amount or a tighter
+    /// The transaction is larger than the server accepts: it exceeds the server's configured
+    /// mempool size limit, or the ZIP 218 shielded action budget of the next block. The same
+    /// payment needs fewer inputs, for instance a smaller amount or a tighter
     /// ``TransactionSizeBound``.
     case tooLarge
     /// The transaction has expired, or expires too soon to be mined.
@@ -20,26 +21,47 @@ public enum SubmitRejection: Equatable, Hashable {
     /// The server found the transaction invalid.
     case invalid
 
-    /// The lightwalletd error code for a transaction the node failed to verify.
+    /// The RPC code for a transaction that failed verification (`RPC_VERIFY_ERROR`).
     static let verifyErrorCode = -25
-    /// The lightwalletd error code for a transaction the node rejected.
+    /// The RPC code for a transaction that was rejected (`RPC_VERIFY_REJECTED`).
     static let verifyRejectedCode = -26
-    /// The text a node reports, with ``verifyErrorCode``, for a transaction over its mempool limit.
-    static let mempoolMaximumText = "exceeding the configured mempool maximum"
+
+    // These texts match the servers' own rejection messages; do not change them.
+
+    /// A Zakura relay refusing a transaction above its configured mempool size limit.
+    static let mempoolMaximumMarker = "exceeding the configured mempool maximum"
+    /// Zebra refusing a transaction over the next block's ZIP 218 shielded action budget.
+    static let zip218LimitMarker = "ZIP 218 limit"
+    /// Zebra refusing a transaction past its expiry height.
+    static let zebraExpiredMarker = "greater than its expiry"
+    /// zcashd refusing a transaction past its expiry height.
+    static let zcashdExpiredMarker = "tx-overwinter-expired"
+    /// zcashd refusing a transaction that expires within the next few blocks.
+    static let zcashdExpiringSoonMarker = "tx-expiring-soon"
+    /// Refusals zcashd reports with ``verifyRejectedCode`` that are nonetheless transient.
+    static let transientRejectionMarkers = ["mempool full", "already in", "already-in"]
 
     /// Classifies a server's refusal of a submitted transaction, or returns `nil` when the refusal
-    /// is not one of the terminal kinds.
+    /// may be transient: anything this does not recognize as final.
+    ///
+    /// - `-25` naming the configured mempool maximum or the ZIP 218 limit is ``tooLarge``;
+    /// - `-25` or `-26` naming an expiry is ``expired``;
+    /// - any other `-26`, except a full mempool or a transaction already known, is ``invalid``.
     ///
     /// - Parameters:
     ///   - code: the error code the server returned.
     ///   - message: the error message the server returned.
     public init?(code: Int, message: String) {
-        let text = message.lowercased()
-        if code == Self.verifyErrorCode && text.contains(Self.mempoolMaximumText) {
+        func mentions(_ marker: String) -> Bool {
+            message.range(of: marker, options: .caseInsensitive) != nil
+        }
+        let verificationCode = code == Self.verifyErrorCode || code == Self.verifyRejectedCode
+        if code == Self.verifyErrorCode && (mentions(Self.mempoolMaximumMarker) || mentions(Self.zip218LimitMarker)) {
             self = .tooLarge
-        } else if text.contains("expired") || text.contains("expiring") {
+        } else if verificationCode
+            && [Self.zebraExpiredMarker, Self.zcashdExpiredMarker, Self.zcashdExpiringSoonMarker].contains(where: mentions) {
             self = .expired
-        } else if code == Self.verifyRejectedCode {
+        } else if code == Self.verifyRejectedCode && !Self.transientRejectionMarkers.contains(where: mentions) {
             self = .invalid
         } else {
             return nil

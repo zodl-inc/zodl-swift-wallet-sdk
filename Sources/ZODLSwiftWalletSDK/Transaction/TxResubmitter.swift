@@ -99,13 +99,27 @@ private extension TxResubmitter {
             // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
-            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
-            if let acceptingEndpoint {
+            let attempt = try await submitPlanExecutor.submitRecordingAnswers(transaction: createdTransaction, endpoints: endpoints)
+            if let acceptingEndpoint = attempt.accepted {
                 await submitPlanStore.markAccepted(
                     txId: transaction.rawID,
-                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
+                    host: endpointKey(acceptingEndpoint),
                     lifecycle: lifecycle
                 )
+                return
+            }
+            // Every endpoint of the plan refused it for good: stop retrying until it expires.
+            if case .ready(_, acceptedBy: nil) = plan,
+               let verdict = submitRejectionVerdict(planEndpoints: endpoints, outcomes: attempt.answers, previous: nil) {
+                await submitPlanStore.markRejected(
+                    txId: transaction.rawID,
+                    code: verdict.code,
+                    reason: verdict.reason,
+                    lifecycle: lifecycle
+                )
+            }
+            if let lastError = attempt.lastError {
+                throw lastError
             }
 
         case .rejected:

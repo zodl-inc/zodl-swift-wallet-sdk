@@ -817,7 +817,7 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "Another server may still take it")
     }
 
-    func testLegacySubmitRecordsATerminalRefusal() async throws {
+    func testLegacySubmitWithoutAPlanRecordsNoRejection() async throws {
         let rawID = Data(repeating: 0xE1, count: 32)
         let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
         transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns")
@@ -831,9 +831,9 @@ final class BroadcasterTests: ZcashTestCase {
         var results: [TransactionSubmitResult] = []
         for try await result in stream { results.append(result) }
 
-        XCTAssertEqual(results.map(\.rejection), [.invalid])
+        XCTAssertEqual(results.map(\.rejection), [.invalid], "the refusal is still classified for the caller")
         let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
-        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns"))
+        XCTAssertNil(plan, "one endpoint's refusal without a plan is not a unanimous verdict")
     }
 
     func testLegacySubmitRecordsNothingForATransientRefusal() async throws {
@@ -874,6 +874,23 @@ final class BroadcasterTests: ZcashTestCase {
         )
         for try await _ in stream {}
         XCTAssertEqual(transactionEncoder.receivedSizeBound, .consensus, "The unbounded overload stays consensus only")
+    }
+
+    func testALaterAcceptanceClearsARejection() async throws {
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        defer { try? rejecting.stop() }
+        let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? accepting.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
+        let rejected = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(rejected, TransactionSubmissionStatus.rejected(.invalid))
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [accepting.endpoint])
+        let accepted = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
     }
 
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {

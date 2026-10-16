@@ -3081,9 +3081,6 @@ private extension SlipstreamSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
-                // Captured before the network round trip, so a refusal for a submission a `wipe()`
-                // overtook cannot recreate the store the wipe deleted.
-                let lifecycle = await self.submitPlanStore.currentLifecycle()
                 do {
                     try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
                     // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
@@ -3102,13 +3099,6 @@ private extension SlipstreamSynchronizer {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
-                    // A terminal refusal stops background resubmission of this transaction.
-                    await self.submitPlanStore.recordSingleEndpointRefusal(
-                        txId: transaction.txId,
-                        code: code,
-                        reason: message,
-                        lifecycle: lifecycle
-                    )
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 }
             }
