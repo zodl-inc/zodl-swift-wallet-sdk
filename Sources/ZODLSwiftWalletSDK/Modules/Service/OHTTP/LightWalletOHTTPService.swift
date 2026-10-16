@@ -168,7 +168,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             gatewayHost: host,
             relayURL: relayURL,
             keyConfigURL: keyConfigURL,
-            clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             httpSender: httpSender
         )
 

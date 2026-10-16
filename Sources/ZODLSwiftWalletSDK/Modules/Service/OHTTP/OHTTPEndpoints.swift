@@ -28,6 +28,16 @@ public enum OHTTPEndpoints {
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     public static var clientTraceIdPrefix: String?
 
+    /// The prefix the transports actually use: ``clientTraceIdPrefix`` in DEBUG builds, always nil
+    /// in release builds, so a release build never sends `X-Client-Trace-Id`.
+    static var effectiveClientTraceIdPrefix: String? {
+        #if DEBUG
+        return clientTraceIdPrefix
+        #else
+        return nil
+        #endif
+    }
+
     /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.

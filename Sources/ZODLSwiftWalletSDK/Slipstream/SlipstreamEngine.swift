@@ -144,7 +144,7 @@ public actor SlipstreamEngine {
 
         // Set the OHTTP client trace prefix for the Rust engine path (both Tor OFF and ON).
         // This is process-wide and should be called BEFORE the first engine start.
-        setDefaultOhttpClientTracePrefix(OHTTPEndpoints.clientTraceIdPrefix)
+        setDefaultOhttpClientTracePrefix(OHTTPEndpoints.effectiveClientTraceIdPrefix)
 
         // Empty Tor-dir bytes → null pointer / length 0 → the engine syncs directly (Tor off).
         let torBytes: [UInt8] = torDir.map { Array($0.utf8) } ?? []

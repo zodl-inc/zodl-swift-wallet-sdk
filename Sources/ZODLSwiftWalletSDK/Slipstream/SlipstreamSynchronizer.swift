@@ -2933,7 +2933,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
         }
 
-        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.clientTraceIdPrefix, httpSender: httpSender)
+        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix, httpSender: httpSender)
         let scheme = request.url?.scheme ?? "https"
         // Use percent-encoded path to preserve special characters
         let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
