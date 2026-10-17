@@ -162,7 +162,7 @@ hex = "0.4"
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
 # fails loudly, a branch would follow a force-push. 607d8507 = ohttp#16 (every client profile stamps
 # ohttp-freshness), on the chunked-only API (old single-shot APIs removed from crate root since 98a66a09).
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "607d8507feaffe128b359088e0cf2e10d6d69ae0", default-features = false }
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "e0a87714b4ec577e049a9b37b76fb24c82b8602b", default-features = false }
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
@@ -211,7 +211,7 @@ strip = false
 # PR #16 (head 8b6f55de, not merged yet: chunked connector, grpc-status fix, request freshness, one
 # retry after a freshness refusal; on 0.4.0-pre.1). Git dependency pinned by commit; the rev moves to the
 # slipstream-internal main commit once #16 merges.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "3046f44324ec0164caa0a25d7b194f4c2a8f6ed9" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "632faab41c7d84cac8dde7209c27eb24c4bc2499" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
