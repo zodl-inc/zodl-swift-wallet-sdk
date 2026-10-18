@@ -247,6 +247,17 @@ public enum OHTTPEndpoints {
         return (gateway, relay, keyConfigURL(for: gateway))
     }
 
+    /// Refuses a gateway `host` of the other network than the wallet's `network`, before any request is
+    /// made to it: a testnet wallet never calls the mainnet gateway, nor the other way round. Any other
+    /// host passes; its network is checked against the server's chain name when it is validated.
+    public static func checkGatewayNetwork(host: String, network: NetworkType) throws {
+        guard OHTTPNative.relayURL(for: host.lowercased()) != nil else { return }
+        let gatewayNetwork = self.network(for: host)
+        guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
+            throw ZcashError.compactBlockProcessorChainName(gatewayNetwork)
+        }
+    }
+
     /// The relay hosts run by a party independent of the gateway operator: the production relays. Any
     /// other relay (a build pointed at the relay simulator) is run by the gateway operator, which then
     /// sees both the device address and the request, so it is not private.

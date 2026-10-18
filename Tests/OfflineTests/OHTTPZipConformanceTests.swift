@@ -249,6 +249,29 @@ final class OHTTPZipConformanceTests: XCTestCase {
         )
     }
 
+    func testAGatewayOfTheOtherNetworkIsRefusedBeforeAnyRequest() async throws {
+        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway.example", network: .mainnet))
+        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway-testnet.example", network: .testnet))
+        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "lwd.example.com", network: .testnet))
+        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway.example", network: .testnet))
+        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway-testnet.example", network: .mainnet))
+
+        let endpoint = LightWalletEndpoint(address: "ohttp-gateway.example", port: 443, secure: true)
+        let service = LightWalletOHTTPService(
+            endpoint: endpoint,
+            singleCallTimeout: 1000,
+            streamingCallTimeout: 1000,
+            tor: TorClient(torDir: FileManager.default.temporaryDirectory),
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        )
+        service.walletNetwork = .testnet
+        do {
+            _ = try await service.latestBlock(mode: .direct)
+            XCTFail("a testnet wallet must not call the mainnet gateway")
+        } catch ZcashError.compactBlockProcessorChainName {
+        }
+    }
+
     func testTheBuiltInRelaysAreIndependent() {
         XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway.example"))
         XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway-testnet.example"))

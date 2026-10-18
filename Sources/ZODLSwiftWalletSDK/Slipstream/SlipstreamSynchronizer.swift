@@ -481,6 +481,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // policy and Tor privacy live ENGINE-side, one implementation for every host. The
         // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
         let anchorServer = currentEndpoint
+        try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
         let anchorNetwork = initializer.network
         let anchorTorDir = await slipstreamTorDirPath()
         let resolveAnchor = restoreAnchor
@@ -2569,6 +2570,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// The queued body of `switchTo(endpoint:)`.
     private func switchToOnLifecycleQueue(endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
         // host, port and TLS flag must all match (`isSameServer`). [MOB-1850] Checked BEFORE the
         // generation bump: a switch that turns out to be a no-op changes nothing about who owns the

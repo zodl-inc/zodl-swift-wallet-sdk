@@ -88,13 +88,15 @@ enum Dependencies {
             // OHTTP gateways get the RFC 9458 transport (`isGateway` only matches hosts with a
             // configured relay); everything else keeps the grpc-swift / Tor service.
             if OHTTPEndpoints.isGateway(endpoint.host) {
-                return LightWalletOHTTPService(
+                let service = LightWalletOHTTPService(
                     endpoint: endpoint,
                     singleCallTimeout: endpoint.singleCallTimeoutInMillis,
                     streamingCallTimeout: endpoint.streamingCallTimeoutInMillis,
                     tor: torClient,
                     sdkFlags: sdkFlags
                 )
+                service.walletNetwork = networkType
+                return service
             }
             let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
             service.sdkFlags = sdkFlags

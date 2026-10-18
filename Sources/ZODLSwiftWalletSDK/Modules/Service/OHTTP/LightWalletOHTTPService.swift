@@ -22,6 +22,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private let gatewayKeyConfigURL: String?
     private let singleCallTimeoutMS: Int64
     private let streamingCallTimeoutMS: Int64
+    /// The wallet's network. When set, a gateway of the other network is refused before any request.
+    var walletNetwork: NetworkType?
 
     // `init(endpoint:tor:)` is inherited from the superclass: this class overrides its only
     // designated initializer, so the superclass convenience initializers come along.
@@ -107,6 +109,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
               let relayURL = gatewayRelayURL,
               let keyConfigURL = gatewayKeyConfigURL else {
             return nil
+        }
+        if let walletNetwork {
+            try OHTTPEndpoints.checkGatewayNetwork(host: host, network: walletNetwork)
         }
 
         let isTorEnabled = await sdkFlags?.torEnabled ?? false

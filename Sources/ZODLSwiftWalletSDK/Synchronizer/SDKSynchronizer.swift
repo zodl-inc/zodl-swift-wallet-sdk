@@ -183,6 +183,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
         guard await status == .unprepared else { return .success }
+        try OHTTPEndpoints.checkGatewayNetwork(host: initializer.endpoint.host, network: initializer.network.networkType)
 
         if let error = checkIfCanContinueInitialisation() {
             throw error
@@ -1823,6 +1824,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     // MARK: Server switch
 
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+
         // Stop synchronization
         let status = await self.status
         if status != .stopped && status != .disconnected {
