@@ -232,8 +232,9 @@ public actor TorClient {
         return response
     }
 
-    /// Posts `request` over Tor once, never retried, and returns as soon as the response head has arrived;
-    /// the body follows as it arrives, at most `maxBytes` of it. Iterating the body no longer closes the
+    /// Posts `request` over Tor and returns as soon as the response head has arrived. The request is never
+    /// resent; only a failure to reach the server, before any of it was sent, is tried again on a new circuit.
+    /// The body follows as it arrives, at most `maxBytes` of it. Iterating the body no longer closes the
     /// stream. The body is read on a queue of its own, so a long stream holds no thread of the Swift
     /// concurrency pool.
     func httpPostStream(for request: URLRequest, maxBytes: Int) throws -> OHTTPOuterStream {

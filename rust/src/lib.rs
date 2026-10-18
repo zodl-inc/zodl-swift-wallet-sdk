@@ -4445,6 +4445,24 @@ pub struct TorHttpStream {
     max_bytes: usize,
 }
 
+/// How often [`zcashlc_tor_http_post_stream`] tries again to reach the server.
+const TOR_HTTP_STREAM_CONNECT_RETRIES: u8 = 2;
+
+/// Whether `error` came before any of the request was sent: opening the Tor stream (the only
+/// arti call of a request) or the TLS session to the server. Trying again then cannot replay it.
+fn failed_before_sending(error: &zcash_client_backend::tor::Error) -> bool {
+    use zcash_client_backend::tor::{
+        Error,
+        http::{HttpError, TimeoutPhase},
+    };
+    matches!(
+        error,
+        Error::Tor(_)
+            | Error::Http(HttpError::Timeout(TimeoutPhase::Connect))
+            | Error::Http(HttpError::Tls(_))
+    )
+}
+
 /// [`zcashlc_tor_http_stream_next`] returned body bytes.
 const TOR_HTTP_STREAM_DATA: u8 = 0;
 /// [`zcashlc_tor_http_stream_next`] waited and no body bytes came.
@@ -4455,7 +4473,9 @@ const TOR_HTTP_STREAM_END: u8 = 2;
 /// Makes an HTTP POST request over Tor and returns as soon as the response head has arrived,
 /// with the body still to be read by [`zcashlc_tor_http_stream_next`].
 ///
-/// The request is sent once: never retried, since a resent body may be a replay. The client's
+/// The request is sent once: never resent, since a resent body may be a replay. Only a failure
+/// to open the Tor stream or the TLS session to the server, before any of the request has left
+/// the device, is tried again, twice at most, each time on a new isolated circuit. The client's
 /// connect and request timeouts bound the wait for the head; the body has no overall deadline,
 /// the caller decides how long it reads. The body may be at most `max_bytes` long: a read
 /// beyond it fails.
@@ -4514,8 +4534,13 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
                     },
                     http_body_util::Full::new(body_data),
                     |body| async move { Ok(body.map_err(HttpError::from).boxed_unsync()) },
-                    0,
-                    |_| None,
+                    TOR_HTTP_STREAM_CONNECT_RETRIES,
+                    |res| match res {
+                        Err(e) if failed_before_sending(e) => {
+                            Some(zcash_client_backend::tor::http::Retry::Isolated)
+                        }
+                        _ => None,
+                    },
                 )
                 .await
         })?;
@@ -8368,5 +8393,32 @@ mod tor_http_body_limit_tests {
         let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
         let out = rt.block_on(super::collect_body_limited(body, 9)).unwrap();
         assert!(out.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tor_http_stream_tests {
+    use zcash_client_backend::tor::{
+        Error,
+        http::{HttpError, TimeoutPhase},
+    };
+
+    use super::failed_before_sending;
+
+    #[test]
+    fn only_a_failure_to_reach_the_server_is_tried_again() {
+        assert!(failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::Connect
+        ))));
+        assert!(failed_before_sending(&Error::Http(HttpError::Tls(
+            std::io::Error::other("handshake")
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::Request
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::ResponseBody
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::NonHttpUrl)));
     }
 }
