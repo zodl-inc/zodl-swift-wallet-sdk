@@ -2980,6 +2980,25 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         return (response.body, httpResp)
     }
 
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                // A sealed request is never resent as it is: no Tor-level retry.
+                return try await self.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: 0)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
+    }
+
     // swiftlint:disable function_parameter_count
     /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
@@ -3030,14 +3049,19 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from. Throws unless Tor or the
+    /// exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
         guard torEnabled || exchangeRateEnabled else {
             throw ZcashError.torNotEnabled
         }
-        let torClient = initializer.container.resolve(TorClient.self)
-        return try await torClient.isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+        return initializer.container.resolve(TorClient.self)
     }
 
     public nonisolated func httpGetOverTor(

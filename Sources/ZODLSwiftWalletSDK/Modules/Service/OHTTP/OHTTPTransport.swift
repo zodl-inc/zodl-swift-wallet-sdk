@@ -232,7 +232,7 @@ actor OHTTPTransport {
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
     /// signed key configuration is checked against.
     private let gatewayHost: String
-    private let relayURL: String
+    let relayURL: String
     private let keyConfigURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
@@ -242,6 +242,10 @@ actor OHTTPTransport {
     /// The back-off entry of this relay and sender kind in ``keyCache``.
     private let backoffKey: String
     private let httpSender: HTTPSender
+    /// Sender of the relay POST whose answer is read as it arrives (``stream(request:timeoutMS:)``).
+    let streamSender: StreamSender
+    /// Makes the decoder of a sealed answer read as it arrives. Tests replace the native one.
+    let streamDecoderFactory: StreamDecoderFactory
     /// Optional client trace ID prefix. When set, every outer OHTTP POST to the relay carries
     /// `X-Client-Trace-Id: <prefix>-<uuid>` so a tester can tag and follow requests end-to-end in
     /// Grafana (relay → gateway → downstream). The prefix is sanitised to `[A-Za-z0-9._:-]` and
@@ -277,7 +281,11 @@ actor OHTTPTransport {
                 throw OHTTPError.transportError("Invalid response type")
             }
             return (data, httpResponse)
-        }
+        },
+        streamSender: @escaping StreamSender = { request, maxBytes in
+            try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+        },
+        streamDecoderFactory: @escaping StreamDecoderFactory = { try $0.streamDecoder() }
     ) {
         // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
         self.gatewayHost = gatewayHost
@@ -292,6 +300,8 @@ actor OHTTPTransport {
         self.cacheKey = "\(relayURL)|\(gatewayHost.lowercased())|\(viaTor ? "tor" : "direct")"
         self.backoffKey = "\(relayURL)|\(viaTor ? "tor" : "direct")"
         self.httpSender = httpSender
+        self.streamSender = streamSender
+        self.streamDecoderFactory = streamDecoderFactory
     }
 
     /// Fetches (or returns the cached) gateway key using the signed envelope.
@@ -373,12 +383,7 @@ actor OHTTPTransport {
                 guard attempt == 0 else {
                     throw OHTTPError.transportError("OHTTP key configuration was refused twice")
                 }
-                // Discard the refused key before fetching the one that replaces it, so that a failed fetch
-                // leaves none to be used next.
-                if try OHTTPNative.profileInfo().dropBeforeRefetch {
-                    await keyCache.store(nil, for: cacheKey)
-                }
-                key = try await self.keyConfig(forceRefresh: true)
+                key = try await refetchKeyConfig()
                 attempt = 1
 
             case .refused(let status, let detail):
@@ -389,6 +394,15 @@ actor OHTTPTransport {
                 throw OHTTPError.transportError("Relay/gateway answered \(contentType), not a sealed response")
             }
         }
+    }
+
+    /// The key configuration fetched again after the gateway refused the cached one. The refused key is
+    /// discarded first, so that a failed fetch leaves none to be used next.
+    func refetchKeyConfig() async throws -> OHTTPVerifiedKey {
+        if try OHTTPNative.profileInfo().dropBeforeRefetch {
+            await keyCache.store(nil, for: cacheKey)
+        }
+        return try await keyConfig(forceRefresh: true)
     }
 
     /// One attempt: seals the request afresh, posts it and lets the core classify and open the answer.
@@ -447,6 +461,16 @@ actor OHTTPTransport {
     }
 
     private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> (Data, HTTPURLResponse) {
+        let request = try relayPost(url: url, body: body, timeoutMS: timeoutMS)
+        try await waitForRelayBackoff()
+        let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
+        await noteRelayAnswer(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
+        return (data, response)
+    }
+
+    /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
+    /// debug build with a prefix set, a trace id.
+    func relayPost(url: String, body: Data, timeoutMS: Int) throws -> URLRequest {
         // Validate https at request time to prevent downgrade attacks without crashing the app
         guard url.lowercased().hasPrefix("https://") else {
             throw OHTTPError.transportError("OHTTP endpoints must use https: \(url)")
@@ -473,18 +497,19 @@ actor OHTTPTransport {
             let traceId = generateClientTraceId(prefix: prefix)
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
+        return request
+    }
 
-        try await waitForRelayBackoff()
-        let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
-        if response.statusCode == 429, let delay = Self.retryAfter(response.value(forHTTPHeaderField: "Retry-After")) {
+    /// Records the `Retry-After` of a 429 through this relay, which every later post waits out.
+    func noteRelayAnswer(status: Int, retryAfter: String?) async {
+        if status == 429, let delay = Self.retryAfter(retryAfter) {
             await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: backoffKey)
         }
-        return (data, response)
     }
 
     /// Waits out the `Retry-After` of an earlier 429 through this relay before the next post, including a
     /// later one that extended it while this post was waiting.
-    private func waitForRelayBackoff() async throws {
+    func waitForRelayBackoff() async throws {
         while let deadline = await keyCache.backoffDeadline(for: backoffKey) {
             let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
             guard remaining > 0 else { return }

@@ -10,6 +10,17 @@ Changes are relative to `5.2.1`.
 
 ## Added
 
+- `Synchronizer.httpStreamOverOHTTP(for:viaTor:)` sends an HTTP request through the OHTTP relay and
+  gateway like `httpRequestOverOHTTP` and returns once the response head is in, with the body read
+  as the gateway sends it (`OHTTPStreamedResponse`): a server-sent event stream arrives event by
+  event, and a body that breaks off before the gateway's final chunk throws. In Tor mode the relay
+  leg, read as it arrives too, rides Tor.
+- `OHTTPURLProtocol` sends every request of the sessions it is registered in through
+  `httpStreamOverOHTTP`, mapped to the host's gateway alias; a host with no alias fails and never
+  goes out directly. `OHTTPURLProtocol.session(configuration:headers:delegate:delegateQueue:)` also
+  passes header fields the session would set (`Last-Event-ID`), which a `URLProtocol` is not given.
+- `api.flexa.co` maps to the mainnet gateway alias `flexa.zodl.com`, whose `Authorization` is the
+  client's own and goes through (the gateway replaces only the placeholder publishable key).
 - `PaymentURIParser` and the typed `PaymentURIRequest` results provide Rust-backed parsing and
   validation for Bitcoin, Ethereum (EIP-681, native and ERC-20), Litecoin, and Solana payment
   request URIs, including Solana Pay interactive transaction-request links.

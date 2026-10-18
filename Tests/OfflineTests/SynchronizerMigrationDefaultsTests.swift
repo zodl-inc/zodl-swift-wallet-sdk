@@ -466,6 +466,7 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func exchangeRateOverTor(enabled: Bool) async throws { Self.unused() }
     func isTorSuccessfullyInitialized() async -> Bool? { Self.unused() }
     func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse { Self.unused() }
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
 
     func httpGetOverTor(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }

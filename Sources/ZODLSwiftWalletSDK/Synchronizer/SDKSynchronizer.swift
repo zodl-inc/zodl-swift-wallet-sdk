@@ -1343,6 +1343,12 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from, bootstrapped on first use. Throws
+    /// unless Tor or the exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1360,8 +1366,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         guard let httpTor else {
             throw ZcashError.torClientUnavailable
         }
-
-        return try await httpTor.isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+        return httpTor
     }
 
     public func httpGetOverTor(
@@ -1496,6 +1501,25 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             throw ZcashError.ohttpResponseError
         }
         return (bhttpResponse.body, httpResponse)
+    }
+
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await sdkFlags.torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                // A sealed request is never resent as it is: no Tor-level retry.
+                return try await self.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: 0)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
     }
 
     public func debugDatabase(sql: String) -> String {

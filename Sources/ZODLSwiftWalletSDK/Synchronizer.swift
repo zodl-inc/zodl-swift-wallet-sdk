@@ -746,6 +746,13 @@ public protocol Synchronizer: AnyObject {
     ///              uses clearnet to reach the relay (device → relay → gateway). Default false.
     func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
 
+    /// Makes an HTTP request through the OHTTP relay→gateway as ``httpRequestOverOHTTP(for:viaTor:)`` does,
+    /// returning as soon as the response head is in, with the body read as the gateway sends it (a
+    /// server-sent event stream comes out event by event). The body throws if the gateway's answer breaks
+    /// off before its end. In Tor mode the relay leg rides Tor whatever `viaTor` says.
+    /// `request.timeoutInterval` bounds each wait for the relay, not the whole answer.
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
+
     // swiftlint:disable function_parameter_count
     /// Open a voting round session on the explicitly selected route.
     ///

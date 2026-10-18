@@ -232,6 +232,61 @@ public actor TorClient {
         return response
     }
 
+    /// Posts `request` over Tor once, never retried, and returns as soon as the response head has arrived;
+    /// the body follows as it arrives, at most `maxBytes` of it. Iterating the body no longer closes the
+    /// stream. The body is read on a queue of its own, so a long stream holds no thread of the Swift
+    /// concurrency pool.
+    func httpPostStream(for request: URLRequest, maxBytes: Int) throws -> OHTTPOuterStream {
+        let runtime = try resolveRuntime()
+
+        guard let url = request.url else {
+            throw ZcashError.rustTorHttpRequest("`TorClient.httpPostStream` requires a URL")
+        }
+
+        let headers = request.allHTTPHeaderFields ?? [:]
+        let cHeadersMut = headers.map { key, value in
+            (strdup(key), strdup(value))
+        }
+        let cHeaders = cHeadersMut.map { key, value in
+            FfiHttpRequestHeader(name: key, value: value)
+        }
+        defer {
+            for (namePtr, valuePtr) in cHeadersMut {
+                free(namePtr)
+                free(valuePtr)
+            }
+        }
+
+        let body = request.httpBody ?? Data()
+        let streamPtr = cHeaders.withUnsafeBufferPointer { headersPtr in
+            body.withUnsafeBytes { bodyPtr in
+                zcashlc_tor_http_post_stream(
+                    runtime,
+                    [CChar](url.absoluteString.utf8CString),
+                    headersPtr.baseAddress,
+                    UInt(headersPtr.count),
+                    bodyPtr.bindMemory(to: UInt8.self).baseAddress,
+                    UInt(bodyPtr.count),
+                    UInt(maxBytes)
+                )
+            }
+        }
+
+        guard let streamPtr else {
+            throw ZcashError.rustTorHttpRequest(
+                lastErrorMessage(fallback: "`TorClient.httpPostStream` failed with unknown error")
+            )
+        }
+
+        let reader = TorHTTPStreamReader(stream: streamPtr, owner: self)
+        return OHTTPOuterStream(
+            status: Int(zcashlc_tor_http_stream_status(streamPtr)),
+            contentType: reader.header("Content-Type"),
+            retryAfter: reader.header("Retry-After"),
+            body: reader.body()
+        )
+    }
+
     /// Makes an isolated GET under one timeout budget that starts before actor admission and includes
     /// executor waiting, native retries, and response-body collection. Cancellation or expiry before
     /// runtime ownership can complete while this actor remains busy; later admission starts no native work.

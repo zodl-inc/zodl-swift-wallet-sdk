@@ -154,6 +154,27 @@ enum OHTTPNative {
         return (copyBytes(sealed.pointee.body, sealed.pointee.body_len), pending)
     }
 
+    /// Whether the relay's answer with `status` and `contentType` is a sealed response, as the core's iOS
+    /// rule has it: a reader of the answer as it arrives must know before it has the body. An answer that
+    /// is not goes whole to ``OHTTPPendingResponse/complete(status:contentType:body:attempt:)``.
+    static func answerIsSealed(status: Int, contentType: String?, attempt: UInt32) throws -> Bool {
+        guard let status16 = UInt16(exactly: status) else {
+            throw OHTTPError.transportError("OHTTP outer status out of range")
+        }
+        let result: Int32 = withOptionalCString(contentType) {
+            zcashlc_ohttp_answer_is_sealed(profile, status16, $0, attempt)
+        }
+        guard result >= 0 else {
+            throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP answer could not be classified"))
+        }
+        return result == 1
+    }
+
+    static func withOptionalCString<R>(_ string: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+        guard let string else { return body(nil) }
+        return string.withCString { body($0) }
+    }
+
     /// The URL of the signed key configuration of the relay at `relayURL`.
     static func signedConfigURL(relayURL: String) throws -> String {
         let bytes = Array(relayURL.utf8)
@@ -215,7 +236,7 @@ enum OHTTPNative {
         return String(cString: result)
     }
 
-    fileprivate static func copyBytes(_ pointer: UnsafeMutablePointer<UInt8>?, _ count: UInt) -> Data {
+    static func copyBytes(_ pointer: UnsafeMutablePointer<UInt8>?, _ count: UInt) -> Data {
         guard let pointer, count > 0 else { return Data() }
         return Data(bytes: pointer, count: Int(count))
     }
@@ -297,7 +318,20 @@ final class OHTTPPendingResponse: @unchecked Sendable {
         }
     }
 
-    private static func fields(_ pointer: UnsafeMutablePointer<UInt8>?, _ count: UInt) throws -> [(String, String)] {
+    /// A decoder of the sealed answer as it arrives, for an answer ``OHTTPNative/answerIsSealed(status:contentType:attempt:)``
+    /// says is sealed. Consumes this handle whatever the outcome, as `complete` does.
+    func streamDecoder() throws -> OHTTPNativeStreamDecoder {
+        guard let taken = opener else {
+            throw OHTTPError.transportError("OHTTP response context was already used")
+        }
+        opener = nil
+        guard let decoder = zcashlc_ohttp_stream_decoder(taken) else {
+            throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
+        }
+        return OHTTPNativeStreamDecoder(decoder)
+    }
+
+    static func fields(_ pointer: UnsafeMutablePointer<UInt8>?, _ count: UInt) throws -> [(String, String)] {
         try OHTTPFieldList.unpack(OHTTPNative.copyBytes(pointer, count)).map {
             (OHTTPFieldList.latin1($0.0), OHTTPFieldList.latin1($0.1))
         }
@@ -309,7 +343,6 @@ final class OHTTPPendingResponse: @unchecked Sendable {
     }
 
     private static func withOptionalCString<R>(_ string: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
-        guard let string else { return body(nil) }
-        return string.withCString { body($0) }
+        OHTTPNative.withOptionalCString(string, body)
     }
 }

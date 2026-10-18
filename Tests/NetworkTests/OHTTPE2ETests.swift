@@ -497,6 +497,61 @@ final class OHTTPE2ETests: ZcashTestCase {
             log("SKIP external=near no proxy configured (OHTTPEndpoints.proxyURL returned nil)")
         }
 
+        // Test 2b: the same CMC call with the answer read as it arrives (httpStreamOverOHTTP): the core's
+        // stream decoder against the real gateway, and on the tor leg the Tor POST read as it arrives.
+        if let cmcProxyURL = OHTTPEndpoints.proxyURL(for: cmcURL) {
+            var request = URLRequest(url: cmcProxyURL)
+            request.setValue("zodl-ohttp-e2e/1.0", forHTTPHeaderField: "User-Agent")
+            let streamed: OHTTPStreamedResponse
+            if tor {
+                guard let sync = synchronizer else { throw XCTSkip("tor leg without a synchronizer") }
+                streamed = try await sync.httpStreamOverOHTTP(for: request, viaTor: true)
+            } else {
+                streamed = try await OHTTPExternalHTTP.stream(
+                    request,
+                    network: .mainnet,
+                    viaTor: false,
+                    torSender: { _, _ in throw ZcashError.torNotEnabled },
+                    torStreamSender: { _, _ in throw ZcashError.torNotEnabled }
+                )
+            }
+            var body = Data()
+            var chunks = 0
+            for try await chunk in streamed.body {
+                body.append(chunk)
+                chunks += 1
+            }
+            XCTAssertEqual(streamed.response.statusCode, 200, "CMC streamed via \(mode) must return 200")
+            XCTAssertNotNil(try? JSONSerialization.jsonObject(with: body), "the streamed CMC body must be the whole JSON answer")
+            log("RESULT external=cmc-streamed via=\(mode) status=\(streamed.response.statusCode) bytes=\(body.count) chunks=\(chunks)")
+        }
+
+        // Test 2c: Flexa REST through its flexa.zodl.com alias (mainnet gateway only, so not on the testnet tor
+        // leg), with the placeholder publishable key the app sends. Any HTTP status proves the route; 200 once
+        // the gateway puts the real key in.
+        if !tor {
+            let flexaURL = URL(string: "https://api.flexa.co/assets?limit=1")!
+            let proxyURL = try XCTUnwrap(OHTTPEndpoints.proxyURL(for: flexaURL))
+            XCTAssertEqual(proxyURL.host, "flexa.zodl.com")
+            var request = URLRequest(url: proxyURL)
+            let placeholder = Data(":publishable_live_zodl_gateway_placeholder".utf8).base64EncodedString()
+            request.setValue("Basic \(placeholder)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/vnd.flexa+json", forHTTPHeaderField: "Accept")
+            let streamed = try await OHTTPExternalHTTP.stream(
+                request,
+                network: .mainnet,
+                viaTor: false,
+                torSender: { _, _ in throw ZcashError.torNotEnabled },
+                torStreamSender: { _, _ in throw ZcashError.torNotEnabled }
+            )
+            var body = Data()
+            for try await chunk in streamed.body {
+                body.append(chunk)
+            }
+            XCTAssertTrue((200...599).contains(streamed.response.statusCode))
+            log("RESULT external=flexa via=\(mode) status=\(streamed.response.statusCode) bytes=\(body.count)")
+        }
+
         // Test 3: valargroup.org voting chain — allowlisted host (no hostname rewrite).
         // Real authority is passed to gateway, which proxies by :authority header.
         let votechainURL = URL(string: "https://prod.vote-chain-primary.valargroup.org/shielded-vote/v1/rounds")!

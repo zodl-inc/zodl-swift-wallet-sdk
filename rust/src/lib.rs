@@ -4432,6 +4432,233 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
     unwrap_exc_or_null(res)
 }
 
+/// A response to an HTTP POST over Tor, read as it arrives.
+///
+/// Obtained from [`zcashlc_tor_http_post_stream`] and freed with
+/// [`zcashlc_free_tor_http_stream`], which closes the stream.
+pub struct TorHttpStream {
+    runtime: tor_rtcompat::PreferredRuntime,
+    status: u16,
+    headers: http::HeaderMap,
+    body: http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, HttpError>,
+    read: usize,
+    max_bytes: usize,
+}
+
+/// [`zcashlc_tor_http_stream_next`] returned body bytes.
+const TOR_HTTP_STREAM_DATA: u8 = 0;
+/// [`zcashlc_tor_http_stream_next`] waited and no body bytes came.
+const TOR_HTTP_STREAM_PENDING: u8 = 1;
+/// [`zcashlc_tor_http_stream_next`]: the body has ended.
+const TOR_HTTP_STREAM_END: u8 = 2;
+
+/// Makes an HTTP POST request over Tor and returns as soon as the response head has arrived,
+/// with the body still to be read by [`zcashlc_tor_http_stream_next`].
+///
+/// The request is sent once: never retried, since a resent body may be a replay. The client's
+/// connect and request timeouts bound the wait for the head; the body has no overall deadline,
+/// the caller decides how long it reads. The body may be at most `max_bytes` long: a read
+/// beyond it fails.
+///
+/// Returns null on failure; the result is freed with [`zcashlc_free_tor_http_stream`].
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+) -> *mut TorHttpStream {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+
+    let res = catch_panic(|| {
+        let tor_runtime =
+            unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+
+        let url = unsafe { CStr::from_ptr(url).to_str()? }
+            .try_into()
+            .map_err(|e| anyhow!("Invalid URL: {e}"))?;
+
+        let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
+            .iter()
+            .map(|header| {
+                anyhow::Ok((
+                    unsafe { CStr::from_ptr(header.name) }.to_str()?,
+                    unsafe { CStr::from_ptr(header.value) }.to_str()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let body_data = if body_len == 0 {
+            bytes::Bytes::new()
+        } else {
+            bytes::Bytes::copy_from_slice(unsafe { slice::from_raw_parts(body, body_len) })
+        };
+
+        let response = tor_runtime.runtime().block_on(async {
+            tor_runtime
+                .client()
+                .http_post(
+                    url,
+                    |builder| {
+                        headers.iter().fold(builder, |builder, (key, value)| {
+                            builder.header(*key, *value)
+                        })
+                    },
+                    http_body_util::Full::new(body_data),
+                    |body| async move { Ok(body.map_err(HttpError::from).boxed_unsync()) },
+                    0,
+                    |_| None,
+                )
+                .await
+        })?;
+
+        let (parts, body) = response.into_parts();
+        Ok(Box::into_raw(Box::new(TorHttpStream {
+            runtime: tor_runtime.runtime().clone(),
+            status: parts.status.as_u16(),
+            headers: parts.headers,
+            body,
+            read: 0,
+            max_bytes,
+        })))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// The status of the response `stream` reads.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_status(stream: *const TorHttpStream) -> u16 {
+    unsafe { stream.as_ref() }.map_or(0, |stream| stream.status)
+}
+
+/// The value of the response header `name` (NUL-terminated, case-insensitive) of `stream`, or
+/// null when the response has none or it is not text. The string is freed with
+/// `zcashlc_string_free`.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+/// - `name` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_header(
+    stream: *const TorHttpStream,
+    name: *const c_char,
+) -> *mut c_char {
+    let stream = AssertUnwindSafe(stream);
+
+    let res = catch_panic(|| {
+        let stream =
+            unsafe { stream.as_ref() }.ok_or_else(|| anyhow!("A Tor HTTP stream is required"))?;
+        let name = unsafe { CStr::from_ptr(name) }.to_str()?;
+        match stream
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) => Ok(CString::new(value)?.into_raw()),
+            None => Ok(std::ptr::null_mut()),
+        }
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Waits up to `wait_ms` milliseconds for the next body bytes of `stream`.
+///
+/// Sets `*state` to 0 and returns the bytes when some came, to 1 with an empty slice when none
+/// came in time (the stream is still open), and to 2 with an empty slice when the body has
+/// ended. Returns null on failure (the connection broke or the body went beyond its limit); the
+/// stream must then only be freed. The result is freed with `zcashlc_free_boxed_slice`.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed, and must not be passed to two calls at the same time.
+/// - `state` must be non-null and valid for writes of one byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
+    stream: *mut TorHttpStream,
+    wait_ms: u64,
+    state: *mut u8,
+) -> *mut ffi::BoxedSlice {
+    let stream = AssertUnwindSafe(stream);
+    let state = AssertUnwindSafe(state);
+
+    let res = catch_panic(|| {
+        let stream =
+            unsafe { stream.as_mut() }.ok_or_else(|| anyhow!("A Tor HTTP stream is required"))?;
+        let state =
+            unsafe { state.as_mut() }.ok_or_else(|| anyhow!("A stream state is required"))?;
+
+        let TorHttpStream {
+            runtime,
+            body,
+            read,
+            max_bytes,
+            ..
+        } = stream;
+        let next = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(wait_ms), body.frame()).await
+        });
+        match next {
+            Err(_) => {
+                *state = TOR_HTTP_STREAM_PENDING;
+                Ok(ffi::BoxedSlice::none())
+            }
+            Ok(None) => {
+                *state = TOR_HTTP_STREAM_END;
+                Ok(ffi::BoxedSlice::none())
+            }
+            Ok(Some(frame)) => {
+                let frame = frame?;
+                match frame.into_data() {
+                    Ok(data) if !data.is_empty() => {
+                        if data.len() > *max_bytes - *read {
+                            return Err(anyhow!(
+                                "Tor HTTP response body exceeds {max_bytes} bytes"
+                            ));
+                        }
+                        *read += data.len();
+                        *state = TOR_HTTP_STREAM_DATA;
+                        Ok(ffi::BoxedSlice::some(data.to_vec()))
+                    }
+                    _ => {
+                        *state = TOR_HTTP_STREAM_PENDING;
+                        Ok(ffi::BoxedSlice::none())
+                    }
+                }
+            }
+        }
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Frees a [`TorHttpStream`], closing it if its body has not ended.
+///
+/// # Safety
+///
+/// - `stream` must be null or a pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_tor_http_stream(stream: *mut TorHttpStream) {
+    if !stream.is_null() {
+        drop(unsafe { Box::from_raw(stream) });
+    }
+}
+
 /// Fetches the current ZEC-USD exchange rate over Tor.
 ///
 /// The result is a [`Decimal`] struct containing the fields necessary to construct an

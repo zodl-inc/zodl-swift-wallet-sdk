@@ -17,6 +17,11 @@
 //! before `complete` is called is released with [`zcashlc_ohttp_opener_free`]. Every attempt
 //! must call `zcashlc_ohttp_encapsulate` again: the gateway answers a repeated nonce with 409.
 //!
+//! A response read as it arrives (a server-sent event stream) takes the opener to
+//! [`zcashlc_ohttp_stream_decoder`] instead, once [`zcashlc_ohttp_answer_is_sealed`] has said the
+//! relay's answer is a sealed one; [`zcashlc_ohttp_stream_push`] and
+//! [`zcashlc_ohttp_stream_finish`] then decode it chunk by chunk.
+//!
 //! Errors follow the crate's convention: a failed call returns null and leaves the error in the
 //! thread-local last error. The text is the core's fixed `Display` of the failure, which does not
 //! quote the request or the response body.
@@ -30,12 +35,15 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network, OuterOutcome, OuterPolicy,
-    OuterResponse, ResponseEvent, check_size, classify_outer_response, encapsulate_chunked_request,
-    encode_bhttp_request, pack_fields, signed_config_url, unpack_fields, verify_signed_config,
+    ChunkedResponseDecoder, ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network,
+    OuterOutcome, OuterPolicy, OuterResponse, ResponseEvent, check_size, classify_outer_response,
+    encapsulate_chunked_request, encode_bhttp_request, pack_fields, signed_config_url,
+    unpack_fields, verify_signed_config,
 };
 
-use crate::{free_ptr_from_vec, ptr_from_vec, unwrap_exc_or_null, zcashlc_string_free};
+use crate::{
+    free_ptr_from_vec, ptr_from_vec, unwrap_exc_or, unwrap_exc_or_null, zcashlc_string_free,
+};
 
 /// The `kind` of an [`OhttpOutcome`]: the sealed answer opened.
 const OUTCOME_RESPONSE: u32 = 0;
@@ -514,6 +522,243 @@ pub unsafe extern "C" fn zcashlc_ohttp_opener_free(ptr: *mut OhttpOpener) {
     }
 }
 
+/// Decodes the sealed response to one request as it arrives.
+///
+/// Obtained from [`zcashlc_ohttp_stream_decoder`] and freed with
+/// [`zcashlc_ohttp_stream_decoder_free`]. The secret it holds is zeroized when it is dropped.
+pub struct OhttpStreamDecoder {
+    inner: ChunkedResponseDecoder,
+}
+
+/// What the bytes given to [`zcashlc_ohttp_stream_push`] or [`zcashlc_ohttp_stream_finish`]
+/// decoded to.
+///
+/// Freed with [`zcashlc_free_ohttp_stream_events`].
+///
+/// `status` is non-zero when the response head was decoded in this call, with `headers` its
+/// header fields packed by `pack_fields`. `body` is the body bytes decoded in this call, in
+/// order. `has_trailers` is set when the trailer section was decoded, `trailers` packed like
+/// `headers`. `end` is set by [`zcashlc_ohttp_stream_finish`] once the response is complete and
+/// authenticated.
+#[repr(C)]
+pub struct OhttpStreamEvents {
+    status: u16,
+    headers: *mut u8,
+    headers_len: usize,
+    body: *mut u8,
+    body_len: usize,
+    has_trailers: bool,
+    trailers: *mut u8,
+    trailers_len: usize,
+    end: bool,
+}
+
+fn stream_events(events: Vec<ResponseEvent>) -> anyhow::Result<*mut OhttpStreamEvents> {
+    let mut status = 0;
+    let mut headers = Vec::new();
+    let mut body = Vec::new();
+    let mut trailers = None;
+    let mut end = false;
+    for event in events {
+        match event {
+            ResponseEvent::Head {
+                status: s,
+                headers: h,
+            } => {
+                status = s;
+                headers = h
+                    .into_iter()
+                    .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                    .collect();
+            }
+            ResponseEvent::Data(d) => body.extend_from_slice(&d),
+            ResponseEvent::Trailers(t) => {
+                trailers = Some(
+                    t.into_iter()
+                        .map(|(n, v)| (n.into_bytes(), v.into_bytes()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            ResponseEvent::End => end = true,
+        }
+    }
+    let (headers, headers_len) = if status == 0 {
+        (ptr::null_mut(), 0)
+    } else {
+        ptr_from_vec(pack_fields(&headers)?)
+    };
+    let (body, body_len) = ptr_from_vec(body);
+    let has_trailers = trailers.is_some();
+    let (trailers, trailers_len) = match trailers {
+        Some(t) => ptr_from_vec(pack_fields(&t)?),
+        None => (ptr::null_mut(), 0),
+    };
+    Ok(Box::into_raw(Box::new(OhttpStreamEvents {
+        status,
+        headers,
+        headers_len,
+        body,
+        body_len,
+        has_trailers,
+        trailers,
+        trailers_len,
+        end,
+    })))
+}
+
+/// Whether the relay's answer with `outer_status` and `content_type` (NUL-terminated UTF-8, or
+/// null) is a sealed response under the profile's rule, which a reader of the answer as it
+/// arrives must know before its body: 1 when it is, 0 when it is not (the whole body then goes
+/// to [`zcashlc_ohttp_complete`], which tells a refusal from a key refetch), -1 on failure.
+///
+/// # Safety
+///
+/// - `content_type` must be null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_answer_is_sealed(
+    profile: u32,
+    outer_status: u16,
+    content_type: *const c_char,
+    attempt: u32,
+) -> i32 {
+    let res = catch_panic(|| {
+        let profile = profile_from_id(profile)?;
+        let content_type = if content_type.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(content_type) }
+                    .to_str()
+                    .map_err(|_| anyhow!("the content type is not UTF-8"))?,
+            )
+        };
+        let outer_response = OuterResponse {
+            status: outer_status,
+            content_type,
+            body: &[],
+        };
+        let sealed = matches!(
+            classify_outer_response(&profile.outer, &outer_response, attempt),
+            OuterOutcome::Sealed
+        );
+        Ok(i32::from(sealed))
+    });
+    unwrap_exc_or(res, -1)
+}
+
+/// Turns `opener` into a decoder of the sealed response as it arrives.
+///
+/// **Consumes `opener` in every case**, errors included: it must not be used or freed again.
+///
+/// Returns null on failure; the result is freed with [`zcashlc_ohttp_stream_decoder_free`].
+///
+/// # Safety
+///
+/// - `opener` must be a pointer returned in [`OhttpSealed::opener`] by
+///   [`zcashlc_ohttp_encapsulate`] that has not been completed or freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_stream_decoder(
+    opener: *mut OhttpOpener,
+) -> *mut OhttpStreamDecoder {
+    // SAFETY: as in `zcashlc_ohttp_complete`, the opener is taken out of its box before anything
+    // else can fail.
+    let opener = AssertUnwindSafe(opener);
+
+    let res = catch_panic(|| {
+        let opener = *opener;
+        if opener.is_null() {
+            return Err(anyhow!("missing OHTTP opener"));
+        }
+        let OhttpOpener { inner } = *unsafe { Box::from_raw(opener) };
+        Ok(Box::into_raw(Box::new(OhttpStreamDecoder {
+            inner: inner.decoder(),
+        })))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Feeds the next `bytes_len` bytes of the relay's sealed answer to `decoder` and returns what
+/// they completed.
+///
+/// Returns null on failure (a chunk that does not open, or a malformed message); the decoder
+/// must then only be freed. The result is freed with [`zcashlc_free_ohttp_stream_events`].
+///
+/// # Safety
+///
+/// - `decoder` must be a pointer returned by [`zcashlc_ohttp_stream_decoder`] that has not been
+///   freed, and must not be passed to two calls at the same time.
+/// - `bytes` must be valid for reads for `bytes_len` bytes, with an alignment of `1`, or null
+///   when `bytes_len` is zero, and must not be mutated for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_stream_push(
+    decoder: *mut OhttpStreamDecoder,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+) -> *mut OhttpStreamEvents {
+    let decoder = AssertUnwindSafe(decoder);
+
+    let res = catch_panic(|| {
+        let decoder =
+            unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
+        let input = unsafe { bytes(bytes_ptr, bytes_len)? };
+        stream_events(decoder.inner.push(input)?)
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Tells `decoder` the relay's answer has ended: opens the final chunk and checks that the
+/// message is complete. Fails when the answer ended before its final chunk (the exchange broke
+/// off), when the final chunk does not open and when the message is cut short.
+///
+/// Returns null on failure; the result is freed with [`zcashlc_free_ohttp_stream_events`].
+///
+/// # Safety
+///
+/// - `decoder` must be a pointer returned by [`zcashlc_ohttp_stream_decoder`] that has not been
+///   freed, and must not be passed to two calls at the same time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_stream_finish(
+    decoder: *mut OhttpStreamDecoder,
+) -> *mut OhttpStreamEvents {
+    let decoder = AssertUnwindSafe(decoder);
+
+    let res = catch_panic(|| {
+        let decoder =
+            unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
+        stream_events(decoder.inner.finish()?)
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Frees an [`OhttpStreamEvents`] and everything it owns.
+///
+/// # Safety
+///
+/// - `ptr` must be null or a pointer returned by [`zcashlc_ohttp_stream_push`] or
+///   [`zcashlc_ohttp_stream_finish`] that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_ohttp_stream_events(ptr: *mut OhttpStreamEvents) {
+    if !ptr.is_null() {
+        let events = unsafe { Box::from_raw(ptr) };
+        free_ptr_from_vec(events.headers, events.headers_len);
+        free_ptr_from_vec(events.body, events.body_len);
+        free_ptr_from_vec(events.trailers, events.trailers_len);
+    }
+}
+
+/// Frees an [`OhttpStreamDecoder`], finished or not.
+///
+/// # Safety
+///
+/// - `ptr` must be null or a pointer returned by [`zcashlc_ohttp_stream_decoder`] that has not
+///   been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_stream_decoder_free(ptr: *mut OhttpStreamDecoder) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
+
 /// The URL of the signed key configuration of the relay at `relay_url`, under the profile's rule.
 ///
 /// Returns null on failure; the string is freed with `zcashlc_string_free`.
@@ -929,6 +1174,87 @@ mod tests {
         assert!(zcashlc_last_error_length() > 0);
         assert_eq!(Limits::IOS.max_sealed_request_bytes, Some(10 * 1024 * 1024));
         zcashlc_clear_last_error();
+    }
+
+    #[test]
+    fn only_a_200_is_read_as_a_sealed_stream() {
+        let sealed = |status, attempt| unsafe {
+            zcashlc_ohttp_answer_is_sealed(IOS, status, ptr::null(), attempt)
+        };
+        assert_eq!(sealed(200, 0), 1);
+        assert_eq!(sealed(200, 1), 1);
+        for status in [204, 400, 409, 422, 429, 503] {
+            assert_eq!(sealed(status, 0), 0, "status {status}");
+            assert_eq!(sealed(status, 1), 0, "status {status}");
+        }
+        zcashlc_clear_last_error();
+        assert_eq!(
+            unsafe { zcashlc_ohttp_answer_is_sealed(99, 200, ptr::null(), 0) },
+            -1
+        );
+        zcashlc_clear_last_error();
+    }
+
+    #[test]
+    fn a_stream_decoder_consumes_the_opener_and_waits_for_whole_chunks() {
+        let key = gateway_key();
+        let (opener, _) = take_opener(seal(b"/x", &key));
+        let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+        assert!(!decoder.is_null());
+
+        // Less than the response nonce: nothing to decode yet.
+        let partial = [0u8; 8];
+        let events = unsafe { zcashlc_ohttp_stream_push(decoder, partial.as_ptr(), partial.len()) };
+        assert!(!events.is_null());
+        {
+            let events = unsafe { &*events };
+            assert_eq!(events.status, 0);
+            assert_eq!(events.body_len, 0);
+            assert!(!events.has_trailers);
+            assert!(!events.end);
+        }
+        unsafe { zcashlc_free_ohttp_stream_events(events) };
+
+        // The answer ends before its final chunk: truncated, a transport failure.
+        zcashlc_clear_last_error();
+        assert!(unsafe { zcashlc_ohttp_stream_finish(decoder) }.is_null());
+        assert!(zcashlc_last_error_length() > 0);
+        zcashlc_clear_last_error();
+        unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+    }
+
+    #[test]
+    fn a_chunk_that_does_not_open_fails_the_stream() {
+        let key = gateway_key();
+        let (opener, _) = take_opener(seal(b"/x", &key));
+        let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+        assert!(!decoder.is_null());
+
+        // The 16-byte response nonce, then a 20-byte chunk of zeros, which is no AES-GCM
+        // ciphertext.
+        let mut wire = vec![0u8; 16];
+        wire.push(20);
+        wire.extend_from_slice(&[0u8; 20]);
+        zcashlc_clear_last_error();
+        let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), wire.len()) };
+        assert!(events.is_null());
+        assert!(zcashlc_last_error_length() > 0);
+        zcashlc_clear_last_error();
+        unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+    }
+
+    #[test]
+    fn a_missing_decoder_is_an_error() {
+        zcashlc_clear_last_error();
+        assert!(unsafe { zcashlc_ohttp_stream_decoder(ptr::null_mut()) }.is_null());
+        assert!(unsafe { zcashlc_ohttp_stream_push(ptr::null_mut(), ptr::null(), 0) }.is_null());
+        assert!(unsafe { zcashlc_ohttp_stream_finish(ptr::null_mut()) }.is_null());
+        assert!(zcashlc_last_error_length() > 0);
+        zcashlc_clear_last_error();
+        unsafe {
+            zcashlc_free_ohttp_stream_events(ptr::null_mut());
+            zcashlc_ohttp_stream_decoder_free(ptr::null_mut());
+        }
     }
 
     #[test]

@@ -49,7 +49,15 @@ public enum OHTTPEndpoints {
         "cmc.zodl.com",    // CoinMarketCap price feed
         "near.zodl.com",   // NEAR 1click intents API
         "vote.zodl.com",   // Voting config / vote servers
+        "flexa.zodl.com",  // Flexa REST + SSE API (mainnet gateway only)
     ]
+
+    /// Aliases the mainnet gateway serves and the testnet one does not.
+    static let mainnetOnlyAliases: Set<String> = ["flexa.zodl.com"]
+
+    /// Aliases whose `Authorization` is the client's own and goes through: the gateway replaces only the
+    /// placeholder publishable key the app is given, and passes a user's token as it is.
+    static let clientAuthorizationAliases: Set<String> = ["flexa.zodl.com"]
 
     /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 12 vote
     /// servers and the 3 PIR endpoints, host-bound. Exact match only: the gateway removed suffix
@@ -155,6 +163,7 @@ public enum OHTTPEndpoints {
         "pro-api.coinmarketcap.com": "cmc.zodl.com",
         "1click.chaindefuser.com":   "near.zodl.com",
         "voting.valargroup.dev":     "vote.zodl.com",
+        "api.flexa.co":              "flexa.zodl.com",
     ]
 
     public static func proxyHost(for url: URL) -> String? {
@@ -204,7 +213,7 @@ public enum OHTTPEndpoints {
         let lowerHost = host.lowercased()
         // Check if it's one of the alias hosts (values in proxyHostMapping)
         let aliasHosts = Set(proxyHostMapping.values.map { $0.lowercased() })
-        return aliasHosts.contains(lowerHost)
+        return aliasHosts.contains(lowerHost) && !clientAuthorizationAliases.contains(lowerHost)
     }
 
     /// Rewrites `url` to go through the OHTTP proxy.
@@ -239,6 +248,9 @@ public enum OHTTPEndpoints {
                 throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
             }
             return (host, relay, keyConfigURL(for: host))
+        }
+        if network != .mainnet, mainnetOnlyAliases.contains(host.lowercased()) {
+            throw OHTTPError.transportError("\(host) is served by the mainnet gateway only")
         }
         let gateway = network == .mainnet ? mainnetGatewayHost : testnetGatewayHost
         guard let relay = OHTTPNative.relayURL(for: gateway) else {

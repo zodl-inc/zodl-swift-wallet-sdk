@@ -2711,6 +2711,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - httpStreamOverOHTTP
+
+    var httpStreamOverOHTTPForThrowableError: Error?
+    var httpStreamOverOHTTPForCallsCount = 0
+    var httpStreamOverOHTTPForCalled: Bool {
+        return httpStreamOverOHTTPForCallsCount > 0
+    }
+    var httpStreamOverOHTTPForReceivedArguments: (request: URLRequest, viaTor: Bool)?
+    var httpStreamOverOHTTPForReturnValue: OHTTPStreamedResponse!
+    var httpStreamOverOHTTPForClosure: ((URLRequest, Bool) async throws -> OHTTPStreamedResponse)?
+
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        if let error = httpStreamOverOHTTPForThrowableError {
+            throw error
+        }
+        httpStreamOverOHTTPForCallsCount += 1
+        httpStreamOverOHTTPForReceivedArguments = (request: request, viaTor: viaTor)
+        if let closure = httpStreamOverOHTTPForClosure {
+            return try await closure(request, viaTor)
+        } else {
+            return httpStreamOverOHTTPForReturnValue
+        }
+    }
+
     // MARK: - httpRequestOverTor
 
     var httpRequestOverTorForRetryLimitThrowableError: Error?
