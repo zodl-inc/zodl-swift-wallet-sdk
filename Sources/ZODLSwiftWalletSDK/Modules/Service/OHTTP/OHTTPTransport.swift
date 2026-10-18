@@ -48,20 +48,21 @@ actor OHTTPKeyCache {
     private var fetches: [String: Task<OHTTPVerifiedKey, Error>] = [:]
     private var notBefore: [String: Date] = [:]
 
-    func key(for cacheKey: String) -> OHTTPVerifiedKey? {
-        keys[cacheKey]
-    }
-
     func store(_ key: OHTTPVerifiedKey?, for cacheKey: String) {
         keys[cacheKey] = key
     }
 
-    /// The key `fetch` returns, stored for `cacheKey`. A call while a fetch for the same entry is under
-    /// way waits for that one instead of starting another.
-    func fetch(
+    /// The cached key of `cacheKey` if `accept` takes it, else the key `fetch` returns, stored. Checked and
+    /// started in one step: a call while a fetch for the same entry is under way waits for that one, and
+    /// one that comes after it finds its key.
+    func key(
         for cacheKey: String,
-        _ fetch: @escaping @Sendable () async throws -> OHTTPVerifiedKey
+        accept: @Sendable (OHTTPVerifiedKey) -> Bool,
+        fetch: @escaping @Sendable () async throws -> OHTTPVerifiedKey
     ) async throws -> OHTTPVerifiedKey {
+        if let cached = keys[cacheKey], accept(cached) {
+            return cached
+        }
         if let running = fetches[cacheKey] {
             return try await running.value
         }
@@ -299,13 +300,11 @@ actor OHTTPTransport {
         let profile = try OHTTPNative.profileInfo()
 
         // The cached key is used while the profile says it is fresh.
-        if !forceRefresh, let cached = await keyCache.key(for: cacheKey), profile.isFresh(cached, at: Date()) {
-            return cached
-        }
-
-        return try await keyCache.fetch(for: cacheKey) { [self] in
-            try await self.fetchKeyConfig(profile: profile)
-        }
+        return try await keyCache.key(
+            for: cacheKey,
+            accept: { !forceRefresh && profile.isFresh($0, at: Date()) },
+            fetch: { [self] in try await self.fetchKeyConfig(profile: profile) }
+        )
     }
 
     /// Fetches the signed key configuration through the relay and verifies it.
