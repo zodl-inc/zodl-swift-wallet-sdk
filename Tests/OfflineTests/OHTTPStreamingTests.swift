@@ -75,12 +75,12 @@ final class OHTTPStreamingTests: XCTestCase {
             keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: keyCache,
+            streamSender: streamSender,
+            streamDecoderFactory: { _ in decoders() },
             httpSender: { [self] request, _ in
                 keyFetches()
                 return keyResponse(request)
-            },
-            streamSender: streamSender,
-            streamDecoderFactory: { _ in decoders() }
+            }
         )
     }
 

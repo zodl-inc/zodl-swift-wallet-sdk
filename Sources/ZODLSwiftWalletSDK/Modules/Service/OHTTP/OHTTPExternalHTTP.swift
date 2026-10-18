@@ -115,8 +115,8 @@ enum OHTTPExternalHTTP {
                 keyConfigURL: route.keyConfigURL,
                 clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
                 viaTor: true,
-                httpSender: torSender,
-                streamSender: torStreamSender
+                streamSender: torStreamSender,
+                httpSender: torSender
             )
         } else {
             transport = OHTTPTransport(

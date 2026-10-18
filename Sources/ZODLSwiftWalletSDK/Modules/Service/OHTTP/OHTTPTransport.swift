@@ -272,6 +272,10 @@ actor OHTTPTransport {
         testKeyVerifier: KeyVerifier? = nil,
         viaTor: Bool = false,
         keyCache: OHTTPKeyCache = .shared,
+        streamSender: @escaping StreamSender = { request, maxBytes in
+            try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+        },
+        streamDecoderFactory: @escaping StreamDecoderFactory = { try $0.streamDecoder() },
         httpSender: @escaping HTTPSender = { request, maxBytes in
             let (data, response) = try await OHTTPTransport.boundedData(
                 for: request,
@@ -281,11 +285,7 @@ actor OHTTPTransport {
                 throw OHTTPError.transportError("Invalid response type")
             }
             return (data, httpResponse)
-        },
-        streamSender: @escaping StreamSender = { request, maxBytes in
-            try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
-        },
-        streamDecoderFactory: @escaping StreamDecoderFactory = { try $0.streamDecoder() }
+        }
     ) {
         // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
         self.gatewayHost = gatewayHost
