@@ -243,6 +243,10 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
         let gateway = try OHTTPEndpoints.proxyRoute(for: "ohttp-gateway-testnet.example", network: .testnet)
         XCTAssertEqual(gateway.gatewayHost, "ohttp-gateway-testnet.example")
+        XCTAssertThrowsError(
+            try OHTTPEndpoints.proxyRoute(for: "ohttp-gateway.example", network: .testnet),
+            "a testnet call never goes to the mainnet gateway"
+        )
     }
 
     func testTheBuiltInRelaysAreIndependent() {

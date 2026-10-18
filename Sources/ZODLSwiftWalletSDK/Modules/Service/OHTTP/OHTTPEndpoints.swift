@@ -235,6 +235,9 @@ public enum OHTTPEndpoints {
     /// of the wallet's network, never the other network's.
     static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String, keyConfigURL: String) {
         if let relay = OHTTPNative.relayURL(for: host.lowercased()) {
+            guard self.network(for: host) == (network == .mainnet ? "mainnet" : "testnet") else {
+                throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
+            }
             return (host, relay, keyConfigURL(for: host))
         }
         let gateway = network == .mainnet ? mainnetGatewayHost : testnetGatewayHost

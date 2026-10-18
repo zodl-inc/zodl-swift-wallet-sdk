@@ -49,6 +49,7 @@ actor CompactBlockProcessor {
     let storage: CompactBlockRepository
     private let transactionRepository: TransactionRepository
     private let fileManager: ZcashFileManager
+    private let sdkFlags: SDKFlags
 
     private var retryAttempts: Int = 0
     private var serviceFailureRetryAttempts: Int = 0
@@ -207,6 +208,7 @@ actor CompactBlockProcessor {
         self.config = config
         self.transactionRepository = container.resolve(TransactionRepository.self)
         self.fileManager = container.resolve(ZcashFileManager.self)
+        self.sdkFlags = container.resolve(SDKFlags.self)
         self.configProvider = configProvider
     }
 
@@ -1125,11 +1127,11 @@ extension CompactBlockProcessor {
     func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight) async throws -> RefreshedUTXOs {
         let dataDb = self.config.dataDb
 
-        // ServiceMode to resolve
+        // Wallet-identifying: its own Tor circuit when Tor is on.
         let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: tAddress.stringEncoded,
             startHeight: startHeight,
-            mode: .direct
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
         var utxos: [UnspentTransactionOutputEntity] = []
 
