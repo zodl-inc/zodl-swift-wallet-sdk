@@ -56,6 +56,27 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertEqual(recorder.keyFetches, 1, "a transport made per call must reuse the cached key configuration")
     }
 
+    func testConcurrentColdCallsShareOneKeyFetch() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let transports = (0..<4).map { _ in
+            OHTTPTestSupport.makeTransport(keyCache: cache) { request, _ in
+                recorder.keyFetches += 1
+                try await Task.sleep(nanoseconds: 200_000_000)
+                return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for transport in transports {
+                group.addTask { _ = try await transport.keyConfig() }
+            }
+            try await group.waitForAll()
+        }
+
+        XCTAssertEqual(recorder.keyFetches, 1, "concurrent cold calls must not each fetch the key configuration")
+    }
+
     func testTorAndDirectTransportsKeepSeparateEntries() async throws {
         let recorder = Recorder()
         let cache = OHTTPKeyCache()
@@ -123,6 +144,29 @@ final class OHTTPZipConformanceTests: XCTestCase {
         _ = try? await transport.roundTrip(request: request, timeoutMS: 5000)
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.9, "the next post waits out Retry-After")
         XCTAssertEqual(recorder.keyFetches, 1, "a 429 never refetches the key configuration")
+    }
+
+    func testA429BacksOffEveryGatewayBehindTheSameRelay() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let limited = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
+        _ = try? await limited.roundTrip(request: request, timeoutMS: 5000)
+
+        let other = OHTTPTransport(
+            gatewayHost: "cmc.zodl.com",
+            relayURL: "https://testnet-operator-relay.example.invalid/relay",
+            keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+            keyCache: cache
+        ) { request, _ in
+            if request.httpMethod == "GET" {
+                return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+            return (Data(), OHTTPTestSupport.response(for: request.url, status: 503))
+        }
+        let started = Date()
+        _ = try? await other.roundTrip(request: request, timeoutMS: 5000)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.9, "the back-off belongs to the relay, not to one gateway")
     }
 
     // MARK: - No transparent resend

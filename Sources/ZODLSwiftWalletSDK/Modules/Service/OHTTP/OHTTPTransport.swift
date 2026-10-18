@@ -38,13 +38,14 @@ private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, 
     }
 }
 
-/// Process-wide state of the OHTTP transports, keyed by relay, gateway network and sender kind (Tor or
-/// not): the verified key configuration, fetched once and reused by every transport until it expires, and
-/// the `Retry-After` of the last 429 through that relay.
+/// Process-wide state of the OHTTP transports: the verified key configuration of each relay, gateway
+/// and sender kind (Tor or not), fetched once (concurrent fetches share one) and reused by every transport
+/// until it expires; and the `Retry-After` of the last 429 through each relay and sender kind.
 actor OHTTPKeyCache {
     static let shared = OHTTPKeyCache()
 
     private var keys: [String: OHTTPVerifiedKey] = [:]
+    private var fetches: [String: Task<OHTTPVerifiedKey, Error>] = [:]
     private var notBefore: [String: Date] = [:]
 
     func key(for cacheKey: String) -> OHTTPVerifiedKey? {
@@ -53,6 +54,23 @@ actor OHTTPKeyCache {
 
     func store(_ key: OHTTPVerifiedKey?, for cacheKey: String) {
         keys[cacheKey] = key
+    }
+
+    /// The key `fetch` returns, stored for `cacheKey`. A call while a fetch for the same entry is under
+    /// way waits for that one instead of starting another.
+    func fetch(
+        for cacheKey: String,
+        _ fetch: @escaping @Sendable () async throws -> OHTTPVerifiedKey
+    ) async throws -> OHTTPVerifiedKey {
+        if let running = fetches[cacheKey] {
+            return try await running.value
+        }
+        let task = Task { try await fetch() }
+        fetches[cacheKey] = task
+        defer { fetches[cacheKey] = nil }
+        let key = try await task.value
+        keys[cacheKey] = key
+        return key
     }
 
     func backoffDeadline(for cacheKey: String) -> Date? {
@@ -218,8 +236,10 @@ actor OHTTPTransport {
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
     private let keyCache: OHTTPKeyCache
-    /// The entry of this relay, gateway network and sender kind in ``keyCache``.
+    /// The key-configuration entry of this relay, gateway and sender kind in ``keyCache``.
     private let cacheKey: String
+    /// The back-off entry of this relay and sender kind in ``keyCache``.
+    private let backoffKey: String
     private let httpSender: HTTPSender
     /// Optional client trace ID prefix. When set, every outer OHTTP POST to the relay carries
     /// `X-Client-Trace-Id: <prefix>-<uuid>` so a tester can tag and follow requests end-to-end in
@@ -268,7 +288,8 @@ actor OHTTPTransport {
         self.testNow = testNow
         self.testKeyVerifier = testKeyVerifier
         self.keyCache = keyCache
-        self.cacheKey = "\(relayURL)|\(OHTTPEndpoints.network(for: gatewayHost))|\(viaTor ? "tor" : "direct")"
+        self.cacheKey = "\(relayURL)|\(gatewayHost.lowercased())|\(viaTor ? "tor" : "direct")"
+        self.backoffKey = "\(relayURL)|\(viaTor ? "tor" : "direct")"
         self.httpSender = httpSender
     }
 
@@ -282,6 +303,13 @@ actor OHTTPTransport {
             return cached
         }
 
+        return try await keyCache.fetch(for: cacheKey) { [self] in
+            try await self.fetchKeyConfig(profile: profile)
+        }
+    }
+
+    /// Fetches the signed key configuration through the relay and verifies it.
+    private func fetchKeyConfig(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
         // Derive signed config URL from relayURL (replace path suffix /relay with /ohttp-configs/signed)
         let signedURL = try OHTTPNative.signedConfigURL(relayURL: relayURL)
 
@@ -305,7 +333,6 @@ actor OHTTPTransport {
             verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
         }
 
-        await keyCache.store(verified, for: cacheKey)
         return verified
     }
 
@@ -451,16 +478,17 @@ actor OHTTPTransport {
         try await waitForRelayBackoff()
         let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
         if response.statusCode == 429, let delay = Self.retryAfter(response.value(forHTTPHeaderField: "Retry-After")) {
-            await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: cacheKey)
+            await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: backoffKey)
         }
         return (data, response)
     }
 
-    /// Waits out the `Retry-After` of an earlier 429 through this relay before the next post.
+    /// Waits out the `Retry-After` of an earlier 429 through this relay before the next post, including a
+    /// later one that extended it while this post was waiting.
     private func waitForRelayBackoff() async throws {
-        guard let deadline = await keyCache.backoffDeadline(for: cacheKey) else { return }
-        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
-        if remaining > 0 {
+        while let deadline = await keyCache.backoffDeadline(for: backoffKey) {
+            let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
+            guard remaining > 0 else { return }
             try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
         }
     }
