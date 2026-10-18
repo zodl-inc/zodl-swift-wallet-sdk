@@ -1422,7 +1422,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         }
         let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
         // Tor mode puts every relay leg on Tor, whatever the caller asked for.
-        let viaTor = viaTor ? true : await sdkFlags.torEnabled
+        let torMode = await sdkFlags.torEnabled
+        let viaTor = viaTor || torMode
 
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender

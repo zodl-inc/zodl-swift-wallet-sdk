@@ -326,9 +326,10 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         viaTor: Bool,
         httpSender: @escaping OHTTPTransport.HTTPSender
     ) async throws -> OHTTPGRPCClient {
+        let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
         let transport = OHTTPTransport(
             gatewayHost: endpoint.host,
-            relayURL: try OHTTPEndpoints.relayURL(for: endpoint.host),
+            relayURL: relayURL,
             keyConfigURL: OHTTPEndpoints.keyConfigURL(for: endpoint.host),
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             viaTor: viaTor,

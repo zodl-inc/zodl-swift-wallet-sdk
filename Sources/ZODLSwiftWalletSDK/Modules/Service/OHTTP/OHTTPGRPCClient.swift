@@ -15,7 +15,7 @@ actor OHTTPGRPCClient {
     private let transport: OHTTPTransport
     private let singleCallTimeoutMS: Int
     private let streamingCallTimeoutMS: Int
-    private let logger = Logger(subsystem: "ZODLSwiftWalletSDK", category: "OHTTPGRPCClient")
+    private let logger = os.Logger(subsystem: "ZODLSwiftWalletSDK", category: "OHTTPGRPCClient")
 
     private static let grpcContentType = "application/grpc"
     private static let userAgent = "zodl-ohttp-swift/1.0"

@@ -2906,7 +2906,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
         let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
         // Tor mode puts every relay leg on Tor, whatever the caller asked for.
-        let viaTor = viaTor ? true : await initializer.container.resolve(SDKFlags.self).torEnabled
+        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+        let viaTor = viaTor || torMode
 
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
