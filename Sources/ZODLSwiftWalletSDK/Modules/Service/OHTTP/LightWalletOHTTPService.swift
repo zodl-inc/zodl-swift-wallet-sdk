@@ -15,16 +15,13 @@ import Foundation
 /// intercepted before `compactTxStreamer` is accessed).
 // swiftlint:disable:next type_body_length
 final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
-    private var ohttpClientClearnet: OHTTPGRPCClient?
-    private var ohttpClientTor: OHTTPGRPCClient?
+    private let clients = OHTTPClientPool()
     private let torClient: TorClient
-    private var httpTor: TorClient?
     private let gatewayHost: String?
     private let gatewayRelayURL: String?
     private let gatewayKeyConfigURL: String?
     private let singleCallTimeoutMS: Int64
     private let streamingCallTimeoutMS: Int64
-    private let sdkFlags: SDKFlags?
 
     // `init(endpoint:tor:)` is inherited from the superclass: this class overrides its only
     // designated initializer, so the superclass convenience initializers come along.
@@ -37,7 +34,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         self.torClient = tor
         self.singleCallTimeoutMS = singleCallTimeout
         self.streamingCallTimeoutMS = streamingCallTimeout
-        self.sdkFlags = nil
 
         // Store gateway configuration but defer OHTTPTransport creation until first use
         if OHTTPEndpoints.isGateway(endpoint.host) {
@@ -74,7 +70,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         self.torClient = tor
         self.singleCallTimeoutMS = singleCallTimeout
         self.streamingCallTimeoutMS = streamingCallTimeout
-        self.sdkFlags = sdkFlags
 
         // Store gateway configuration but defer OHTTPTransport creation until first use
         if OHTTPEndpoints.isGateway(endpoint.host) {
@@ -98,47 +93,43 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             streamingCallTimeout: streamingCallTimeout,
             tor: tor
         )
+        self.sdkFlags = sdkFlags
     }
 
-    /// Ensures the OHTTP client is initialized with the appropriate HTTP sender.
-    /// When Tor is globally enabled (via SDKFlags), we use a Tor-backed HTTP sender
-    /// for the OHTTP transport so that both the key-config GET and all relay POSTs
-    /// go through Tor, preventing device IP leakage.
+    /// The OHTTP client for a call in `mode`, or nil when the endpoint is not a gateway.
     ///
-    /// When mode != .direct, returns nil to fall back to parent's TorLwdConn implementation.
+    /// A gateway is only ever reached through its relay, whatever the mode: a Tor mode, or `.direct` while
+    /// Tor is enabled, puts the relay leg on Tor, never on a plain connection to the gateway host. The Tor
+    /// circuit follows the mode: `.direct` and `.defaultTor` (block ranges, tree states, chain tip) share
+    /// one circuit, each `.torInGroup` name has its own, and `.uniqueTor` gets a new one per call.
     private func ensureOHTTPClient(mode: ServiceMode) async throws -> OHTTPGRPCClient? {
-        // Only use OHTTP for .direct mode; other modes use TorLwdConn
-        guard mode == .direct else {
-            return nil
-        }
-
         guard let host = gatewayHost,
               let relayURL = gatewayRelayURL,
               let keyConfigURL = gatewayKeyConfigURL else {
             return nil
         }
 
-        // Check if Tor is globally enabled
-        let isTorEnabled = sdkFlags != nil ? await sdkFlags!.torEnabled : false
-
-        // Return cached client if we have one for the current Tor state
-        if isTorEnabled, let existing = ohttpClientTor {
-            return existing
+        let isTorEnabled = await sdkFlags?.torEnabled ?? false
+        let circuit: String?
+        switch mode {
+        case .direct:
+            circuit = isTorEnabled ? Self.sharedCircuit : nil
+        case .defaultTor:
+            circuit = Self.sharedCircuit
+        case .torInGroup(let group):
+            circuit = "group:\(group)"
+        case .uniqueTor:
+            circuit = nil
         }
-        if !isTorEnabled, let existing = ohttpClientClearnet {
+
+        if mode != .uniqueTor, let existing = await clients.client(for: circuit) {
             return existing
         }
 
         let httpSender: OHTTPTransport.HTTPSender
-        if isTorEnabled {
-            // Tor-backed sender: isolate a Tor client for OHTTP HTTP requests
-            if httpTor == nil {
-                httpTor = try await torClient.isolatedClient()
-            }
-            guard let torClient = httpTor else {
-                throw ZcashError.torClientUnavailable
-            }
-
+        let viaTor = mode == .uniqueTor || circuit != nil
+        if viaTor {
+            let isolated = try await torClient.isolatedClient()
             // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
             // OHTTPTransport seals every attempt afresh, each with its own ephemeral key and nonce.
             // If Tor retried (retryLimit > 0), the SAME ciphertext would be re-sent, violating
@@ -147,7 +138,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
             // it re-encapsulates (new nonce, new ciphertext).
             httpSender = { request, maxBytes in
-                return try await torClient.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
@@ -169,6 +160,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             relayURL: relayURL,
             keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
             httpSender: httpSender
         )
 
@@ -179,14 +171,33 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             streamingCallTimeoutMS: Int(streamingCallTimeoutMS)
         )
 
-        // Cache the client for the current Tor state
-        if isTorEnabled {
-            ohttpClientTor = client
-        } else {
-            ohttpClientClearnet = client
+        if mode != .uniqueTor {
+            await clients.store(client, for: circuit)
         }
-
         return client
+    }
+
+    /// The circuit name of the calls that carry public, non-identifying chain data.
+    private static let sharedCircuit = "shared"
+
+    /// Below this many blocks a `GetBlockRange` refused with INVALID_ARGUMENT is not split any further:
+    /// the gateway's span limit is at least 10 000 blocks, so a smaller range is refused for another reason.
+    private static let minimumSplitSpan = 1000
+
+    /// The blocks `start...end`, split in halves when the gateway refuses the span with INVALID_ARGUMENT
+    /// (its block range limit).
+    private func fetchBlocks(_ client: OHTTPGRPCClient, from start: BlockHeight, to end: BlockHeight) async throws -> [CompactBlock] {
+        do {
+            return try await client.serverStreaming(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+                request: BlockRange(startHeight: start, endHeight: end)
+            )
+        } catch LightWalletServiceError.failed(let code, _) where code == OHTTPGRPCStatus.invalidArgument && end - start >= Self.minimumSplitSpan {
+            let middle = start + (end - start) / 2
+            let lower = try await fetchBlocks(client, from: start, to: middle)
+            let upper = try await fetchBlocks(client, from: middle + 1, to: end)
+            return lower + upper
+        }
     }
 
     // MARK: - LightWalletService Protocol
@@ -245,10 +256,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                         return
                     }
 
-                    let blocks: [CompactBlock] = try await client.serverStreaming(
-                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
-                        request: range.blockRange()
-                    )
+                    let blocks = try await self.fetchBlocks(client, from: range.lowerBound, to: range.upperBound)
 
                     for block in blocks {
                         continuation.yield(ZcashCompactBlock(compactBlock: block))
@@ -395,10 +403,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                         return
                     }
 
-                    let blocks: [CompactBlock] = try await client.serverStreaming(
-                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
-                        request: BlockRange(startHeight: startHeight, endHeight: endHeight)
-                    )
+                    let blocks = try await self.fetchBlocks(client, from: startHeight, to: endHeight)
 
                     for block in blocks {
                         continuation.yield(ZcashCompactBlock(compactBlock: block))
@@ -522,5 +527,19 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     override func closeConnections() async {
         // OHTTP uses URLSession with no persistent connection, so nothing to close
         await super.closeConnections()
+    }
+}
+
+/// The OHTTP clients of one service, by Tor circuit (nil: no Tor). Each keeps its transport, and so its
+/// relay connection; the key configuration itself is shared process-wide (`OHTTPKeyCache`).
+private actor OHTTPClientPool {
+    private var clients: [String: OHTTPGRPCClient] = [:]
+
+    func client(for circuit: String?) -> OHTTPGRPCClient? {
+        clients[circuit ?? ""]
+    }
+
+    func store(_ client: OHTTPGRPCClient, for circuit: String?) {
+        clients[circuit ?? ""] = client
     }
 }

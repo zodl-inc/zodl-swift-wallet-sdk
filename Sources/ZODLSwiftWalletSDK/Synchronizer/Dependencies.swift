@@ -96,7 +96,9 @@ enum Dependencies {
                     sdkFlags: sdkFlags
                 )
             }
-            return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            service.sdkFlags = sdkFlags
+            return service
         }
 
         container.register(type: TransactionRepository.self, isSingleton: true) { _ in
@@ -246,7 +248,8 @@ enum Dependencies {
                 config: utxoFetcherConfig,
                 rustBackend: rustBackend,
                 metrics: metrics,
-                logger: logger
+                logger: logger,
+                sdkFlags: di.resolve(SDKFlags.self)
             )
         }
 

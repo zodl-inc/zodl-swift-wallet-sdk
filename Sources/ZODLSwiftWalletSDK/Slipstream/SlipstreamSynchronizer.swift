@@ -2023,10 +2023,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
         // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: address.stringEncoded,
             startHeight: height,
-            mode: .direct
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
         var utxos: [UnspentTransactionOutputEntity] = []
         for try await utxo in stream {
@@ -2797,7 +2798,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient)
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags)
                     let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
                     guard let probed = await Self.probe(
                         endpoint,
@@ -2903,8 +2904,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
             throw ZcashError.ohttpUnsupportedHost
         }
-        let relayURL = try OHTTPEndpoints.relayURL(for: host)
-        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let viaTor = viaTor ? true : await initializer.container.resolve(SDKFlags.self).torEnabled
 
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
@@ -2933,7 +2935,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
         }
 
-        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix, httpSender: httpSender)
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            keyConfigURL: route.keyConfigURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
         let scheme = request.url?.scheme ?? "https"
         // Use percent-encoded path to preserve special characters
         let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"

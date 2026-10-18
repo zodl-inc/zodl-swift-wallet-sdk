@@ -38,11 +38,8 @@ use super::errors::invalid_input;
 /// uses.
 const OHTTP_GATEWAY_HOST_MAINNET: &str = "ohttp-gateway.example";
 
-/// OHTTP gateway hostname for voting traffic (testnet).
-///
-/// TODO(COR-1830): use when network-aware gateway selection is implemented;
-/// until then every session, testnet included, rides the mainnet gateway.
-#[allow(dead_code)]
+/// OHTTP gateway hostname for voting traffic (testnet). The testnet gateway
+/// carries the same vote and PIR hosts as the mainnet one.
 const OHTTP_GATEWAY_HOST_TESTNET: &str = "ohttp-gateway-testnet.example";
 
 /// Exact vote and PIR hosts in the gateway's BACKENDS (mainnet).
@@ -427,20 +424,31 @@ pub(super) struct OhttpRoute {
 }
 
 impl OhttpRoute {
-    /// The OHTTP route for the server at `url`, or a pre-dispatch failure when
-    /// the gateway does not carry that host.
-    pub(super) fn new(url: &str) -> Result<Self, RouteError> {
+    /// The OHTTP route for the server at `url` through the gateway of the
+    /// wallet's `network`, or a pre-dispatch failure when the gateway does not
+    /// carry that host or there is no gateway for the network (regtest).
+    pub(super) fn new(url: &str, network: zcash_voting::Network) -> Result<Self, RouteError> {
         let host = url_host(url)?;
         if !can_handle_ohttp(&host) {
             return Err(RouteError::before_dispatch(format!(
                 "host {host} not supported by the OHTTP gateway"
             )));
         }
-        // TODO(COR-1830): derive the gateway from the network when testnet
-        // support is added; see `OHTTP_GATEWAY_HOST_TESTNET`.
         Ok(Self {
-            gateway_host: OHTTP_GATEWAY_HOST_MAINNET.to_string(),
+            gateway_host: gateway_host_for(network)?.to_string(),
         })
+    }
+}
+
+/// The OHTTP gateway of `network`. A testnet session never rides the mainnet
+/// gateway, nor the other way round.
+fn gateway_host_for(network: zcash_voting::Network) -> Result<&'static str, RouteError> {
+    match network {
+        zcash_voting::Network::Mainnet => Ok(OHTTP_GATEWAY_HOST_MAINNET),
+        zcash_voting::Network::Testnet => Ok(OHTTP_GATEWAY_HOST_TESTNET),
+        _ => Err(RouteError::before_dispatch(
+            "no OHTTP gateway for this network".to_string(),
+        )),
     }
 }
 
@@ -546,6 +554,7 @@ impl RouteHttp for OhttpRoute {
 pub(super) fn resolve_session_route(
     tor: Option<&crate::tor::TorRuntime>,
     is_custom_server: bool,
+    network: zcash_voting::Network,
     endpoint_urls: &[&str],
 ) -> anyhow::Result<SdkRoute> {
     if let Some(tor) = tor {
@@ -556,7 +565,7 @@ pub(super) fn resolve_session_route(
     }
     // Every endpoint must pass; the route itself carries no per-endpoint state.
     let mut routes = endpoint_urls.iter().map(|url| {
-        OhttpRoute::new(url).map_err(|error| {
+        OhttpRoute::new(url, network).map_err(|error| {
             invalid_input(format!(
                 "cannot reach predefined vote server at {url} with Tor disabled: {error}"
             ))
@@ -716,7 +725,7 @@ mod tests {
     #[test]
     fn ohttp_route_host_validation_is_before_dispatch() {
         // Host validation happens before any network call, so it's always before-dispatch.
-        let error = OhttpRoute::new("https://unknown.example")
+        let error = OhttpRoute::new("https://unknown.example", zcash_voting::Network::Mainnet)
             .err()
             .expect("host not in OHTTP_VOTE_HOSTS");
         assert_eq!(
@@ -724,6 +733,19 @@ mod tests {
             RoutePhase::BeforeDispatch,
             "Host validation failure should be before-dispatch"
         );
+    }
+
+    #[test]
+    fn ohttp_route_uses_the_gateway_of_the_wallet_network() {
+        let url = "https://vote.zodl.com";
+        let mainnet = OhttpRoute::new(url, zcash_voting::Network::Mainnet).expect("mainnet");
+        assert_eq!(mainnet.gateway_host, OHTTP_GATEWAY_HOST_MAINNET);
+        let testnet = OhttpRoute::new(url, zcash_voting::Network::Testnet).expect("testnet");
+        assert_eq!(testnet.gateway_host, OHTTP_GATEWAY_HOST_TESTNET);
+        let error = OhttpRoute::new(url, zcash_voting::Network::Regtest)
+            .err()
+            .expect("no regtest gateway");
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
     }
 
     #[test]
@@ -848,7 +870,9 @@ mod tests {
             "not a url",
             "vote.zodl.com",
         ] {
-            let error = OhttpRoute::new(url).err().expect(url);
+            let error = OhttpRoute::new(url, zcash_voting::Network::Mainnet)
+                .err()
+                .expect(url);
             assert_eq!(error.phase, RoutePhase::BeforeDispatch, "{url}");
         }
     }
@@ -861,7 +885,10 @@ mod tests {
                 format!("https://{host}/"),
                 format!("https://{host}:443/api/v1/round"),
             ] {
-                assert!(OhttpRoute::new(&url).is_ok(), "{url}");
+                assert!(
+                    OhttpRoute::new(&url, zcash_voting::Network::Mainnet).is_ok(),
+                    "{url}"
+                );
             }
         }
     }
@@ -874,7 +901,8 @@ mod tests {
             &["https://vote.zodl.com"][..],
             &[][..],
         ] {
-            let route = resolve_session_route(None, true, urls).expect("custom server");
+            let route = resolve_session_route(None, true, zcash_voting::Network::Mainnet, urls)
+                .expect("custom server");
             assert_eq!(variant(&route), "Direct");
         }
     }
@@ -883,19 +911,22 @@ mod tests {
     fn tor_off_predefined_servers_route_through_ohttp() {
         for host in EXPECTED_VOTE_HOSTS {
             let url = format!("https://{host}");
-            let route = resolve_session_route(None, false, &[&url]).expect(host);
+            let route = resolve_session_route(None, false, zcash_voting::Network::Mainnet, &[&url])
+                .expect(host);
             assert_eq!(variant(&route), "Ohttp", "{host}");
         }
         // The three PIR hosts take the same route as the vote servers.
         for host in EXPECTED_PIR_HOSTS {
             let url = format!("https://{host}/");
-            let route = resolve_session_route(None, false, &[&url]).expect(host);
+            let route = resolve_session_route(None, false, zcash_voting::Network::Mainnet, &[&url])
+                .expect(host);
             assert_eq!(variant(&route), "Ohttp", "{host}");
         }
         // A session's chain and PIR endpoints together.
         let route = resolve_session_route(
             None,
             false,
+            zcash_voting::Network::Mainnet,
             &[
                 "https://vote.zodl.com",
                 "https://zvote.zodl.com/",
@@ -914,7 +945,7 @@ mod tests {
             &["https://vote.zodl.com", "https://pir.example.com/"][..],
             &[][..],
         ] {
-            let error = resolve_session_route(None, false, urls)
+            let error = resolve_session_route(None, false, zcash_voting::Network::Mainnet, urls)
                 .err()
                 .unwrap_or_else(|| panic!("{urls:?} must not resolve a route"));
             // Crosses the FFI as the typed `invalid_input` envelope.
@@ -926,7 +957,8 @@ mod tests {
 
     #[tokio::test]
     async fn ohttp_route_refuses_an_unlisted_host_before_dispatch() {
-        let route = OhttpRoute::new("https://vote.zodl.com").expect("listed host");
+        let route = OhttpRoute::new("https://vote.zodl.com", zcash_voting::Network::Mainnet)
+            .expect("listed host");
         let dispatched = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&dispatched);
         let on_dispatch = move || flag.store(true, Ordering::SeqCst);

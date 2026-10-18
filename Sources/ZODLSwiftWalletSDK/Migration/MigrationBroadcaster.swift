@@ -59,6 +59,9 @@ protocol MigrationBroadcasting {
 /// - **Direct (`useTor == false`)** opens a fresh, ephemeral gRPC service for exactly the resolved
 ///   endpoint, submits once, and closes it.
 ///
+/// An OHTTP gateway endpoint takes no plain gRPC on either transport: the submit is sealed to the gateway
+/// and posted to its relay, over an isolated circuit of the dedicated Tor client when `useTor` is set.
+///
 /// Once the connection is established, a thrown error from the submit RPC is reported as
 /// ``MigrationBroadcastOutcome/transportError`` (a retryable network error), not as a fail-closed
 /// Tor failure.
@@ -227,26 +230,6 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
-        // Gateway endpoints must go through OHTTP, even when Tor is enabled.
-        // The Tor transport is used for the OHTTP relay connection, maintaining IP privacy.
-        if OHTTPEndpoints.isGateway(endpoint.host) {
-            // Fail-closed: any failure to build the runtime is reported as Tor-unavailable.
-            let runtime: TorClient
-            do {
-                runtime = try await dedicatedTorClient()
-            } catch {
-                logger.error("MigrationBroadcaster: dedicated Tor runtime unavailable: \(error)")
-                throw ZcashError.migrationTorUnavailable
-            }
-            return await broadcastViaOHTTP(
-                rawTransaction: rawTransaction,
-                to: endpoint,
-                useTor: true,
-                torClient: runtime,
-                onWillSubmit: onWillSubmit
-            )
-        }
-
         // Fail-closed: any failure to build the runtime or open the isolated connection — i.e. any
         // failure *before* the submit RPC — is reported as Tor-unavailable, and nothing is broadcast.
         let runtime: TorClient
@@ -255,6 +238,22 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         } catch {
             logger.error("MigrationBroadcaster: dedicated Tor runtime unavailable: \(error)")
             throw ZcashError.migrationTorUnavailable
+        }
+
+        // A gateway takes no plain gRPC: the submit goes through its relay, the relay leg on an isolated
+        // circuit of the dedicated runtime.
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            let client: OHTTPGRPCClient
+            do {
+                let isolated = try await runtime.isolatedClient()
+                client = try await preparedOHTTPClient(for: endpoint, viaTor: true) { request, maxBytes in
+                    try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                }
+            } catch {
+                logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host) over Tor: \(error)")
+                throw ZcashError.migrationTorUnavailable
+            }
+            return await submitViaOHTTP(rawTransaction: rawTransaction, client: client, onWillSubmit: onWillSubmit)
         }
 
         let connection: TorLwdConn
@@ -285,15 +284,22 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async -> MigrationBroadcastOutcome {
-        // Gateway endpoints must go through OHTTP, not plain gRPC.
-        // Gateways don't speak gRPC directly; they only accept OHTTP-encapsulated requests.
+        // A gateway takes no plain gRPC: the submit goes through its relay.
         if OHTTPEndpoints.isGateway(endpoint.host) {
-            return await broadcastViaOHTTP(
-                rawTransaction: rawTransaction,
-                to: endpoint,
-                useTor: false,
-                onWillSubmit: onWillSubmit
-            )
+            let client: OHTTPGRPCClient
+            do {
+                client = try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
+                    let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: maxBytes)
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw OHTTPError.transportError("Invalid response type")
+                    }
+                    return (data, httpResponse)
+                }
+            } catch {
+                logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host): \(error)")
+                return MigrationBroadcastOutcome.transportError
+            }
+            return await submitViaOHTTP(rawTransaction: rawTransaction, client: client, onWillSubmit: onWillSubmit)
         }
 
         // A fresh, ephemeral gRPC service for exactly this endpoint, closed after the single attempt.
@@ -313,59 +319,41 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         }
     }
 
-    private func broadcastViaOHTTP(
+    /// The OHTTP client for the gateway `endpoint`, with its key configuration already fetched, so that
+    /// only the submit itself is left after it returns.
+    private func preparedOHTTPClient(
+        for endpoint: LightWalletEndpoint,
+        viaTor: Bool,
+        httpSender: @escaping OHTTPTransport.HTTPSender
+    ) async throws -> OHTTPGRPCClient {
+        let transport = OHTTPTransport(
+            gatewayHost: endpoint.host,
+            relayURL: try OHTTPEndpoints.relayURL(for: endpoint.host),
+            keyConfigURL: OHTTPEndpoints.keyConfigURL(for: endpoint.host),
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
+        _ = try await transport.keyConfig()
+        return OHTTPGRPCClient(
+            authority: endpoint.host,
+            transport: transport,
+            singleCallTimeoutMS: Self.ohttpSubmitTimeoutMS,
+            streamingCallTimeoutMS: Self.ohttpSubmitTimeoutMS
+        )
+    }
+
+    private static let ohttpSubmitTimeoutMS = 30_000
+
+    private func submitViaOHTTP(
         rawTransaction: Data,
-        to endpoint: LightWalletEndpoint,
-        useTor: Bool,
-        torClient: TorClient? = nil,
+        client: OHTTPGRPCClient,
         onWillSubmit: @Sendable () -> Void
     ) async -> MigrationBroadcastOutcome {
+        onWillSubmit()
+        var transaction = RawTransaction()
+        transaction.data = rawTransaction
         do {
-            let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
-            let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
-
-            let httpSender: OHTTPTransport.HTTPSender
-            if useTor {
-                guard let tor = torClient else {
-                    logger.error("MigrationBroadcaster: Tor client required but not provided")
-                    return MigrationBroadcastOutcome.transportError
-                }
-                let isolated = try await tor.isolatedClient()
-                httpSender = { request, maxBytes in
-                    try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
-                }
-            } else {
-                httpSender = { request, maxBytes in
-                    let (data, response) = try await OHTTPTransport.boundedData(
-                        for: request,
-                        maxBytes: maxBytes
-                    )
-                    guard let httpResponse = response as? HTTPURLResponse else {
-                        throw OHTTPError.transportError("Invalid response type")
-                    }
-                    return (data, httpResponse)
-                }
-            }
-
-            let transport = OHTTPTransport(
-                gatewayHost: endpoint.host,
-                relayURL: relayURL,
-                keyConfigURL: keyConfigURL,
-                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
-                httpSender: httpSender
-            )
-
-            let client = OHTTPGRPCClient(
-                authority: endpoint.host,
-                transport: transport,
-                singleCallTimeoutMS: 10000,
-                streamingCallTimeoutMS: 10000
-            )
-
-            onWillSubmit()
-
-            var transaction = RawTransaction()
-            transaction.data = rawTransaction
             let response: SendResponse = try await client.unary(
                 path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
                 request: transaction

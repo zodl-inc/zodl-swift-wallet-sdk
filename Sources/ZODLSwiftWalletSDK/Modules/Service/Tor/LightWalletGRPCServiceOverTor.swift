@@ -71,6 +71,10 @@ actor ServiceConnections {
 class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     var tor: TorClient
     let serviceConnections: ServiceConnections
+    /// The SDK's Tor mode. While it is on, a `.direct` call goes over the default Tor connection instead of
+    /// plain gRPC, and the streaming calls, which have no Tor transport here, are refused: nothing reaches
+    /// the server outside Tor. Nil (no Tor mode known) leaves `.direct` as it is.
+    var sdkFlags: SDKFlags?
 
     convenience init(endpoint: LightWalletEndpoint, tor: TorClient) {
         self.init(
@@ -109,6 +113,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func getInfo(mode: ServiceMode) async throws -> LightWalletdInfo {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.getInfo(mode: mode)
         }
@@ -122,6 +127,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func latestBlockHeight(mode: ServiceMode) async throws -> BlockHeight {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.latestBlockHeight(mode: mode)
         }
@@ -130,6 +136,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func latestBlock(mode: ServiceMode) async throws -> BlockID {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.latestBlock(mode: mode)
         }
@@ -143,6 +150,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func submit(spendTransaction: Data, mode: ServiceMode) async throws -> LightWalletServiceResponse {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.submit(spendTransaction: spendTransaction, mode: mode)
         }
@@ -156,6 +164,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func fetchTransaction(txId: Data, mode: ServiceMode) async throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.fetchTransaction(txId: txId, mode: mode)
         }
@@ -169,6 +178,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
     }
 
     override func getTreeState(_ id: BlockID, mode: ServiceMode) async throws -> TreeState {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.getTreeState(id, mode: mode)
         }
@@ -187,6 +197,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         accountUUID: AccountUUID,
         mode: ServiceMode
     ) async throws -> TransparentAddressCheckResult {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.checkSingleUseTransparentAddresses(dbData: dbData, networkType: networkType, accountUUID: accountUUID, mode: mode)
         }
@@ -211,6 +222,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         networkType: NetworkType,
         mode: ServiceMode
     ) async throws -> TransparentAddressCheckResult {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.updateTransparentAddressTransactions(
                 address: address,
@@ -243,6 +255,7 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         accountUUID: AccountUUID,
         mode: ServiceMode
     ) async throws -> TransparentAddressCheckResult {
+        let mode = await resolvedMode(mode)
         guard mode != .direct else {
             return try await super.fetchUTXOsByAddress(
                 address: address,
@@ -266,8 +279,81 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
         }
     }
 
+    override func blockRange(_ range: CompactBlockRange, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
+        try refusedOverTor { try super.blockRange(range, mode: mode) }
+    }
+
+    override func fetchUTXOs(for tAddress: String, height: BlockHeight, mode: ServiceMode) throws -> AsyncThrowingStream<UnspentTransactionOutputEntity, Error> {
+        try refusedOverTor { try super.fetchUTXOs(for: tAddress, height: height, mode: mode) }
+    }
+
+    override func fetchUTXOs(
+        for tAddresses: [String],
+        height: BlockHeight,
+        mode: ServiceMode
+    ) throws -> AsyncThrowingStream<UnspentTransactionOutputEntity, Error> {
+        try refusedOverTor { try super.fetchUTXOs(for: tAddresses, height: height, mode: mode) }
+    }
+
+    override func blockStream(
+        startHeight: BlockHeight,
+        endHeight: BlockHeight,
+        mode: ServiceMode
+    ) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
+        try refusedOverTor { try super.blockStream(startHeight: startHeight, endHeight: endHeight, mode: mode) }
+    }
+
+    override func getMempoolStream() throws -> AsyncThrowingStream<RawTransaction, Error> {
+        try refusedOverTor { try super.getMempoolStream() }
+    }
+
+    override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {
+        try refusedOverTor { try super.getSubtreeRoots(request, mode: mode) }
+    }
+
+    override func getTaddressTransactions(
+        _ request: TransparentAddressBlockFilter,
+        mode: ServiceMode
+    ) throws -> AsyncThrowingStream<RawTransaction, Error> {
+        try refusedOverTor { try super.getTaddressTransactions(request, mode: mode) }
+    }
+
     override func closeConnections() async {
         await super.closeConnections()
         await serviceConnections.closeConnections()
+    }
+
+    /// `mode`, except that `.direct` becomes `.defaultTor` while Tor mode is on.
+    func resolvedMode(_ mode: ServiceMode) async -> ServiceMode {
+        guard mode == .direct, let sdkFlags, await sdkFlags.torEnabled else {
+            return mode
+        }
+        return .defaultTor
+    }
+
+    /// The stream `make` opens, unless Tor mode is on: the plain gRPC stream would leave Tor, so the call
+    /// fails with ``ZcashError/grpcServiceCalledWithTorMode`` instead.
+    private func refusedOverTor<Element>(
+        _ make: @escaping () throws -> AsyncThrowingStream<Element, Error>
+    ) throws -> AsyncThrowingStream<Element, Error> {
+        guard let sdkFlags else {
+            return try make()
+        }
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    if await sdkFlags.torEnabled {
+                        throw ZcashError.grpcServiceCalledWithTorMode
+                    }
+                    for try await element in try make() {
+                        continuation.yield(element)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }

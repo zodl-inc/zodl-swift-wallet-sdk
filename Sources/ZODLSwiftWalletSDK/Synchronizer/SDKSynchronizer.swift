@@ -933,10 +933,11 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 return LightWalletOHTTPService(endpoint: endpoint, tor: tor)
             }
         }
-        if let singleCallTimeout {
-            return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
-        }
-        return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+        let service = singleCallTimeout.map {
+            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: $0)
+        } ?? LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+        service.sdkFlags = sdkFlags
+        return service
     }
 
     /// Takes the list of endpoints and runs it through a series of checks to evaluate its performance.
@@ -1419,8 +1420,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
             throw ZcashError.ohttpUnsupportedHost
         }
-        let relayURL = try OHTTPEndpoints.relayURL(for: host)
-        let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: host)
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let viaTor = viaTor ? true : await sdkFlags.torEnabled
 
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
@@ -1445,7 +1447,14 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             }
         }
 
-        let transport = OHTTPTransport(gatewayHost: host, relayURL: relayURL, keyConfigURL: keyConfigURL, clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix, httpSender: httpSender)
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            keyConfigURL: route.keyConfigURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
 
         let scheme = request.url?.scheme ?? "https"
         // Use percent-encoded path to preserve special characters

@@ -42,7 +42,7 @@ public enum OHTTPEndpoints {
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
     /// Derived from the native relay map for the mainnet gateway host `ohttp-gateway.example`.
-    private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: "ohttp-gateway.example") }
+    private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: mainnetGatewayHost) }
 
     /// Proxy-only gateway hosts that are not in the native relay map (cmc, near, vote aliases).
     private static let proxyOnlyGateways: Set<String> = [
@@ -224,6 +224,43 @@ public enum OHTTPEndpoints {
         var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         comps.host = proxyHost
         return comps.url
+    }
+
+    static let mainnetGatewayHost = "ohttp-gateway.example"
+    static let testnetGatewayHost = "ohttp-gateway-testnet.example"
+
+    /// The gateway, relay and key-configuration URL a request to `host` goes through for a wallet on
+    /// `network`. A lightwalletd gateway host is its own gateway; every other host the gateways carry
+    /// (the CMC and NEAR aliases, vote and PIR servers, the voting-config mirror) goes through the gateway
+    /// of the wallet's network, never the other network's.
+    static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String, keyConfigURL: String) {
+        if let relay = OHTTPNative.relayURL(for: host.lowercased()) {
+            return (host, relay, keyConfigURL(for: host))
+        }
+        let gateway = network == .mainnet ? mainnetGatewayHost : testnetGatewayHost
+        guard let relay = OHTTPNative.relayURL(for: gateway) else {
+            throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gateway)")
+        }
+        return (gateway, relay, keyConfigURL(for: gateway))
+    }
+
+    /// The relay hosts run by a party independent of the gateway operator: the production relays. Any
+    /// other relay (a build pointed at the relay simulator) is run by the gateway operator, which then
+    /// sees both the device address and the request, so it is not private.
+    static let independentRelayHosts: Set<String> = [
+        "mainnet-relay.example.invalid",
+        "testnet-relay.example.invalid"
+    ]
+
+    /// Whether requests to the gateway `gatewayHost` go through a relay that is not independent of the
+    /// gateway operator (a test relay): such a configuration gives no network privacy and is shown to the
+    /// user as not private. True as well for a host with no relay.
+    public static func usesOperatorRelay(gatewayHost: String) -> Bool {
+        guard let relay = try? relayURL(for: gatewayHost),
+              let relayHost = URL(string: relay)?.host?.lowercased() else {
+            return true
+        }
+        return !independentRelayHosts.contains(relayHost)
     }
 
     /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.

@@ -228,8 +228,12 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
             .chain(inputs.pir_endpoints.iter())
             .map(String::as_str)
             .collect();
-        let route =
-            resolve_session_route(unsafe { (*tor).as_ref() }, is_custom_server, &endpoints)?;
+        let route = resolve_session_route(
+            unsafe { (*tor).as_ref() },
+            is_custom_server,
+            handle.network,
+            &endpoints,
+        )?;
         let session = VotingSession::open(handle, inputs, binding, route, epoch)?;
         Ok(Box::into_raw(Box::new(VotingSessionHandle {
             session: Arc::new(session),

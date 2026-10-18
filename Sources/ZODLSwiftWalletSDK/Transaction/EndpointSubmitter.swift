@@ -46,12 +46,13 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
             "Transaction \(transaction.txId.toHexStringTxId()) submitting to \(endpoint.host):\(endpoint.port) over \(transport)."
         )
 
-        let service: LightWalletService
+        let service: LightWalletGRPCServiceOverTor
         if OHTTPEndpoints.isGateway(endpoint.host) {
             service = LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient)
         } else {
             service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: serviceTorClient)
         }
+        service.sdkFlags = sdkFlags
 
         let response: LightWalletServiceResponse
         do {
