@@ -135,15 +135,10 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         let viaTor = mode == .uniqueTor || circuit != nil
         if viaTor {
             let isolated = try await torClient.isolatedClient()
-            // C-08 fix: OHTTP ciphertext must not be retried at transport layer.
-            // OHTTPTransport seals every attempt afresh, each with its own ephemeral key and nonce.
-            // If Tor retried (retryLimit > 0), the SAME ciphertext would be re-sent, violating
-            // nonce-once. Gateway replay cache detects duplicate nonce and returns 409. Setting retryLimit: 0
-            // means the Tor transport only attempts once; if it fails, the error propagates up to the OHTTP
-            // layer. The OHTTP layer has its own retry for key rotation (HTTP 400/422), which is safe because
-            // it re-encapsulates (new nonce, new ciphertext).
+            // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+            // tried again, on a new circuit, only when it failed before any of it was sent.
             httpSender = { request, maxBytes in
-                try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)

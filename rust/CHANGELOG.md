@@ -68,6 +68,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when any step has a Sapling input, payment, change or dummy output (or leaves a pool
   unspecified), `0` otherwise, and `-1` with the last error set when the proposal does not decode.
 
+- `zcashlc_tor_http_post_once_bounded(tor_runtime, url, headers, headers_len, body, body_len,
+  max_bytes)` posts a body that must never be resent (a sealed OHTTP request) with the retry rule of
+  `zcashlc_tor_http_post_stream`: tried again on a new isolated circuit, twice at most, only when
+  opening the Tor stream or the TLS session failed, before any of the request was sent.
 - `zcashlc_tor_http_get_with_timeout` adds an HTTP GET entry point whose trailing positive
   `timeout_ms` bounds the complete Tor operation, including connection setup, retries, and response
   body collection. It otherwise accepts the same arguments and returns the same response as

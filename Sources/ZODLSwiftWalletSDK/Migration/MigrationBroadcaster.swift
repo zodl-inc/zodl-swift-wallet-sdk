@@ -257,7 +257,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             do {
                 let isolated = try await runtime.isolatedClient()
                 client = try await preparedOHTTPClient(for: endpoint, viaTor: true) { request, maxBytes in
-                    try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
                 }
             } catch {
                 logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host) over Tor: \(error)")

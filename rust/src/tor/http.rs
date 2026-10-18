@@ -40,6 +40,7 @@ mod tests {
     use crate::{
         ffi, zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length,
         zcashlc_tor_http_get, zcashlc_tor_http_get_with_timeout, zcashlc_tor_http_post,
+        zcashlc_tor_http_post_bounded, zcashlc_tor_http_post_once_bounded,
     };
 
     struct Dropped(Arc<AtomicBool>);
@@ -215,6 +216,25 @@ mod tests {
             usize,
             u8,
         ) -> *mut ffi::HttpResponseBytes = zcashlc_tor_http_post;
+        let _bounded_post: unsafe extern "C" fn(
+            *mut TorRuntime,
+            *const std::ffi::c_char,
+            *const ffi::HttpRequestHeader,
+            usize,
+            *const u8,
+            usize,
+            u8,
+            usize,
+        ) -> *mut ffi::HttpResponseBytes = zcashlc_tor_http_post_bounded;
+        let _post_once: unsafe extern "C" fn(
+            *mut TorRuntime,
+            *const std::ffi::c_char,
+            *const ffi::HttpRequestHeader,
+            usize,
+            *const u8,
+            usize,
+            usize,
+        ) -> *mut ffi::HttpResponseBytes = zcashlc_tor_http_post_once_bounded;
     }
 
     #[test]

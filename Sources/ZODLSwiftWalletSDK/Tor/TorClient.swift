@@ -162,6 +162,22 @@ public actor TorClient {
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
     public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
+        try httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit, postOnce: false)
+    }
+
+    /// Makes an HTTP request over Tor whose body must never be resent, such as an OHTTP relay post: a POST
+    /// is tried again, on a new circuit, only when it failed to reach the server before any of it was sent
+    /// (as ``httpPostStream(for:maxBytes:)`` is); a GET is not retried.
+    func httpRequestSentOnce(for request: URLRequest, maxBytes: Int) throws -> (data: Data, response: HTTPURLResponse) {
+        try httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0, postOnce: true)
+    }
+
+    private func httpRequest(
+        for request: URLRequest,
+        maxBytes: Int,
+        retryLimit: UInt8,
+        postOnce: Bool
+    ) throws -> (data: Data, response: HTTPURLResponse) {
         let runtime = try resolveRuntime()
 
         let url = request.url
@@ -196,6 +212,17 @@ public actor TorClient {
                     headersPtr.baseAddress,
                     UInt(headersPtr.count),
                     retryLimit,
+                    UInt(maxBytes)
+                )
+            case "post" where postOnce:
+                let data = request.httpBody ?? Data()
+                responsePtr = zcashlc_tor_http_post_once_bounded(
+                    runtime,
+                    [CChar](url.absoluteString.utf8CString),
+                    headersPtr.baseAddress,
+                    UInt(headersPtr.count),
+                    data.bytes,
+                    UInt(data.count),
                     UInt(maxBytes)
                 )
             case "post":

@@ -1436,10 +1436,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         if viaTor {
             httpSender = { [weak self] request, maxBytes in
                 guard let self else { throw ZcashError.ohttpTransportError }
-                // C-08 fix: OHTTP ciphertext must not be retried (gateway replay cache returns 409).
-                // The OHTTP layer already retries on key rotation (HTTP 400/422), sealing afresh. Tor transport retries
-                // would resend the same sealed ciphertext, violating the nonce-once invariant.
-                return try await self.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: 0)
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
             }
         } else {
             httpSender = { request, maxBytes in
@@ -1512,8 +1511,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             viaTor: viaTor || torMode,
             torSender: { [weak self] request, maxBytes in
                 guard let self else { throw ZcashError.ohttpTransportError }
-                // A sealed request is never resent as it is: no Tor-level retry.
-                return try await self.httpRequestOverTor(for: request, maxBytes: maxBytes, retryLimit: 0)
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
             },
             torStreamSender: { [weak self] request, maxBytes in
                 guard let self else { throw ZcashError.ohttpTransportError }

@@ -4142,7 +4142,75 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_bounded(
     retry_limit: u8,
     max_bytes: usize,
 ) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_post_bounded_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            body,
+            body_len,
+            max_bytes,
+            retry_limit,
+            |res| {
+                res.is_err()
+                    .then_some(zcash_client_backend::tor::http::Retry::Same)
+            },
+        )
+    }
+}
+
+/// Makes an HTTP POST request over Tor with a bounded response size, sent once: the retry rule
+/// of [`zcashlc_tor_http_post_stream`] ([`retry_if_unsent`]), for a body that must never be
+/// resent, such as a sealed OHTTP request.
+///
+/// `max_bytes` is as in [`zcashlc_tor_http_post_bounded`].
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_once_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_post_bounded_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            body,
+            body_len,
+            max_bytes,
+            TOR_HTTP_UNSENT_RETRIES,
+            retry_if_unsent,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn tor_http_post_bounded_impl(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+    retry_limit: u8,
+    retry_filter: impl Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+) -> *mut ffi::HttpResponseBytes {
     let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let retry_filter = AssertUnwindSafe(retry_filter);
 
     let res = catch_panic(|| {
         let tor_runtime =
@@ -4178,10 +4246,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_bounded(
                     http_body_util::Full::new(body_data),
                     collect_response_body,
                     retry_limit,
-                    |res| {
-                        res.is_err()
-                            .then_some(zcash_client_backend::tor::http::Retry::Same)
-                    },
+                    &*retry_filter,
                 )
                 .await
         })?;
@@ -4445,8 +4510,8 @@ pub struct TorHttpStream {
     max_bytes: usize,
 }
 
-/// How often [`zcashlc_tor_http_post_stream`] tries again to reach the server.
-const TOR_HTTP_STREAM_CONNECT_RETRIES: u8 = 2;
+/// How often a request sent once ([`retry_if_unsent`]) tries again to reach the server.
+const TOR_HTTP_UNSENT_RETRIES: u8 = 2;
 
 /// Whether `error` came before any of the request was sent: opening the Tor stream (the only
 /// arti call of a request) or the TLS session to the server. Trying again then cannot replay it.
@@ -4461,6 +4526,19 @@ fn failed_before_sending(error: &zcash_client_backend::tor::Error) -> bool {
             | Error::Http(HttpError::Timeout(TimeoutPhase::Connect))
             | Error::Http(HttpError::Tls(_))
     )
+}
+
+/// The retry rule of a request that must never be resent: a new isolated circuit when it failed
+/// before any of it was sent ([`failed_before_sending`]), no retry otherwise, whatever the answer.
+fn retry_if_unsent(
+    res: Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+) -> Option<zcash_client_backend::tor::http::Retry> {
+    match res {
+        Err(e) if failed_before_sending(e) => {
+            Some(zcash_client_backend::tor::http::Retry::Isolated)
+        }
+        _ => None,
+    }
 }
 
 /// [`zcashlc_tor_http_stream_next`] returned body bytes.
@@ -4534,13 +4612,8 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
                     },
                     http_body_util::Full::new(body_data),
                     |body| async move { Ok(body.map_err(HttpError::from).boxed_unsync()) },
-                    TOR_HTTP_STREAM_CONNECT_RETRIES,
-                    |res| match res {
-                        Err(e) if failed_before_sending(e) => {
-                            Some(zcash_client_backend::tor::http::Retry::Isolated)
-                        }
-                        _ => None,
-                    },
+                    TOR_HTTP_UNSENT_RETRIES,
+                    retry_if_unsent,
                 )
                 .await
         })?;
@@ -8403,7 +8476,7 @@ mod tor_http_stream_tests {
         http::{HttpError, TimeoutPhase},
     };
 
-    use super::failed_before_sending;
+    use super::{failed_before_sending, retry_if_unsent};
 
     #[test]
     fn only_a_failure_to_reach_the_server_is_tried_again() {
@@ -8420,5 +8493,36 @@ mod tor_http_stream_tests {
             TimeoutPhase::ResponseBody
         ))));
         assert!(!failed_before_sending(&Error::Http(HttpError::NonHttpUrl)));
+    }
+
+    #[test]
+    fn a_request_sent_once_is_retried_only_when_unsent() {
+        use zcash_client_backend::tor::http::Retry;
+
+        assert!(matches!(
+            retry_if_unsent(Err(&Error::Http(HttpError::Timeout(TimeoutPhase::Connect)))),
+            Some(Retry::Isolated)
+        ));
+        assert!(matches!(
+            retry_if_unsent(Err(&Error::Http(HttpError::Tls(std::io::Error::other(
+                "handshake"
+            ))))),
+            Some(Retry::Isolated)
+        ));
+        for sent in [
+            Error::Http(HttpError::Timeout(TimeoutPhase::Request)),
+            Error::Http(HttpError::Timeout(TimeoutPhase::ResponseBody)),
+            Error::Io(std::io::Error::other("broken pipe")),
+        ] {
+            assert!(retry_if_unsent(Err(&sent)).is_none());
+        }
+        for status in [
+            http::StatusCode::OK,
+            http::StatusCode::CONFLICT,
+            http::StatusCode::BAD_GATEWAY,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(retry_if_unsent(Ok(status)).is_none());
+        }
     }
 }

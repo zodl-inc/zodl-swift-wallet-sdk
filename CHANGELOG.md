@@ -60,6 +60,10 @@ Changes are relative to `5.2.1`.
   after dispatch are Ambiguous (no retry). Previously all failures were marked after-dispatch.
 - Sapling parameter Tor downloader now creates the destination directory before writing its temporary
   file, fixing ENOENT when the SDK caller supplies a new parameters directory.
+- OHTTP relay posts over Tor (`httpRequestOverOHTTP`, the lightwalletd and migration OHTTP clients)
+  are tried again on a new isolated circuit, twice at most, when they fail to reach the relay
+  before any of the sealed request was sent (Tor stream or TLS); a sealed request is still never
+  resent. They were not retried at all.
 - OHTTP now routes `GET https://raw.githubusercontent.com/valargroup/token-holder-voting-config/*`
   through the mainnet gateway. The host is returned unchanged (passthrough by :authority header),
   so the inner request authority is `raw.githubusercontent.com` itself. Other paths on
