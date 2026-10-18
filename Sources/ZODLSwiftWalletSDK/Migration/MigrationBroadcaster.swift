@@ -227,6 +227,26 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
+        // ZIP 1619: gateway endpoints must go through OHTTP, even when Tor is enabled.
+        // The Tor transport is used for the OHTTP relay connection, maintaining IP privacy.
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            // Fail-closed: any failure to build the runtime is reported as Tor-unavailable.
+            let runtime: TorClient
+            do {
+                runtime = try await dedicatedTorClient()
+            } catch {
+                logger.error("MigrationBroadcaster: dedicated Tor runtime unavailable: \(error)")
+                throw ZcashError.migrationTorUnavailable
+            }
+            return await broadcastViaOHTTP(
+                rawTransaction: rawTransaction,
+                to: endpoint,
+                useTor: true,
+                torClient: runtime,
+                onWillSubmit: onWillSubmit
+            )
+        }
+
         // Fail-closed: any failure to build the runtime or open the isolated connection — i.e. any
         // failure *before* the submit RPC — is reported as Tor-unavailable, and nothing is broadcast.
         let runtime: TorClient
@@ -265,6 +285,17 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async -> MigrationBroadcastOutcome {
+        // ZIP 1619: gateway endpoints must go through OHTTP, not plain gRPC.
+        // Gateways don't speak gRPC directly; they only accept OHTTP-encapsulated requests.
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            return await broadcastViaOHTTP(
+                rawTransaction: rawTransaction,
+                to: endpoint,
+                useTor: false,
+                onWillSubmit: onWillSubmit
+            )
+        }
+
         // A fresh, ephemeral gRPC service for exactly this endpoint, closed after the single attempt.
         let service = LightWalletGRPCService(endpoint: endpoint)
 
@@ -278,6 +309,70 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         } catch {
             await service.closeConnections()
             logger.error("MigrationBroadcaster: direct submit transport failure: \(error)")
+            return MigrationBroadcastOutcome.transportError
+        }
+    }
+
+    private func broadcastViaOHTTP(
+        rawTransaction: Data,
+        to endpoint: LightWalletEndpoint,
+        useTor: Bool,
+        torClient: TorClient? = nil,
+        onWillSubmit: @Sendable () -> Void
+    ) async -> MigrationBroadcastOutcome {
+        do {
+            let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+            let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
+
+            let httpSender: OHTTPTransport.HTTPSender
+            if useTor {
+                guard let tor = torClient else {
+                    logger.error("MigrationBroadcaster: Tor client required but not provided")
+                    return MigrationBroadcastOutcome.transportError
+                }
+                let isolated = try await tor.isolatedClient()
+                httpSender = { request, maxBytes in
+                    try await isolated.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                }
+            } else {
+                httpSender = { request, maxBytes in
+                    let (data, response) = try await OHTTPTransport.boundedData(
+                        for: request,
+                        maxBytes: maxBytes
+                    )
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw OHTTPError.transportError("Invalid response type")
+                    }
+                    return (data, httpResponse)
+                }
+            }
+
+            let transport = OHTTPTransport(
+                gatewayHost: endpoint.host,
+                relayURL: relayURL,
+                keyConfigURL: keyConfigURL,
+                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+                httpSender: httpSender
+            )
+
+            let client = OHTTPGRPCClient(
+                authority: endpoint.host,
+                transport: transport,
+                singleCallTimeoutMS: 10000,
+                streamingCallTimeoutMS: 10000
+            )
+
+            onWillSubmit()
+
+            var transaction = RawTransaction()
+            transaction.data = rawTransaction
+            let response: SendResponse = try await client.unary(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+                request: transaction
+            )
+            return outcome(from: response)
+        } catch {
+            logger.error("MigrationBroadcaster: OHTTP submit failure: \(error)")
             return MigrationBroadcastOutcome.transportError
         }
     }
