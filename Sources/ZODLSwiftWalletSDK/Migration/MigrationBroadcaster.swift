@@ -69,6 +69,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     private let torDirURL: URL
     private let logger: Logger
     private let torClientFactory: @Sendable (URL) async throws -> TorClient
+    /// The SDK's Tor mode: while it is on, every broadcast goes over Tor whatever the caller asked for.
+    private let torMode: @Sendable () async -> Bool
 
     /// The dedicated Tor client's bootstrap, cached as a `Task` on the first `useTor` broadcast so
     /// concurrent broadcasts await the exact SAME bootstrap attempt rather than each racing its own
@@ -91,8 +93,13 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     ///   documents), so sharing the directory is safe. ``torClientTask`` additionally removes the
     ///   duplicate-bootstrap race within a single broadcaster: concurrent `useTor` broadcasts on one
     ///   instance bootstrap the shared directory at most once (see ``dedicatedTorClient()``).
-    init(torDirURL: URL, logger: Logger) {
-        self.init(torDirURL: torDirURL, logger: logger, torClientFactory: MigrationBroadcaster.bootstrapTorClient)
+    init(torDirURL: URL, logger: Logger, torMode: @escaping @Sendable () async -> Bool = { false }) {
+        self.init(
+            torDirURL: torDirURL,
+            logger: logger,
+            torClientFactory: MigrationBroadcaster.bootstrapTorClient,
+            torMode: torMode
+        )
     }
 
     /// Injecting initializer for tests: substitutes the Tor-client factory ``dedicatedTorClient()``
@@ -102,11 +109,13 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     init(
         torDirURL: URL,
         logger: Logger,
-        torClientFactory: @escaping @Sendable (URL) async throws -> TorClient
+        torClientFactory: @escaping @Sendable (URL) async throws -> TorClient,
+        torMode: @escaping @Sendable () async -> Bool = { false }
     ) {
         self.torDirURL = torDirURL
         self.logger = logger
         self.torClientFactory = torClientFactory
+        self.torMode = torMode
     }
 
     /// The zcashd `sendrawtransaction` RPC error code for a transaction the node already knows
@@ -178,7 +187,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         useTor: Bool,
         onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
-        if useTor {
+        let torModeOn = await torMode()
+        if useTor || torModeOn {
             return try await broadcastOverTor(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)
         } else {
             return await broadcastDirect(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)

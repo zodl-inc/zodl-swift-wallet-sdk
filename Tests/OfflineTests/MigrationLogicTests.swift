@@ -753,6 +753,23 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(callCountAfterRetry, 2, "a later broadcast must retry with a fresh bootstrap, not replay the cached failure")
     }
 
+    /// With the SDK's Tor mode on, a broadcast asked for without Tor still takes the fail-closed Tor
+    /// path: a Tor runtime that cannot start fails the broadcast instead of a direct submit going out.
+    func testTorModeForcesTheTorPathWhateverTheCallerAsked() async throws {
+        let broadcaster = MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory,
+            logger: logger,
+            torClientFactory: { _ in throw StubTorBootstrapError() },
+            torMode: { true }
+        )
+        let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
+
+        let attempt = Task {
+            try await broadcaster.broadcast(rawTransaction: Data([0x01]), to: endpoint, useTor: false, onWillSubmit: { })
+        }
+        await assertThrowsMigrationTorUnavailable(attempt)
+    }
+
     private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationBroadcastOutcome, Error>) async {
         do {
             _ = try await task.value
