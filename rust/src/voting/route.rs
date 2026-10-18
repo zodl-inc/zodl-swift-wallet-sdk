@@ -22,7 +22,7 @@ use std::sync::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use slipstream_core::ohttp::{Dialer, http_round_trip, http_round_trip_with_dispatch};
+use slipstream_core::ohttp::{Dialer, NetworkType, http_round_trip, http_round_trip_with_dispatch};
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
@@ -421,6 +421,7 @@ fn url_host(url: &str) -> Result<String, RouteError> {
 /// configs fetched through the relay, 64 MiB response cap).
 pub(super) struct OhttpRoute {
     gateway_host: String,
+    network: NetworkType,
 }
 
 impl OhttpRoute {
@@ -434,18 +435,21 @@ impl OhttpRoute {
                 "host {host} not supported by the OHTTP gateway"
             )));
         }
+        let (gateway_host, network) = gateway_for(network)?;
         Ok(Self {
-            gateway_host: gateway_host_for(network)?.to_string(),
+            gateway_host: gateway_host.to_string(),
+            network,
         })
     }
 }
 
-/// The OHTTP gateway of `network`. A testnet session never rides the mainnet
-/// gateway, nor the other way round.
-fn gateway_host_for(network: zcash_voting::Network) -> Result<&'static str, RouteError> {
+/// The OHTTP gateway of `network`, and the network the engine checks it
+/// against. A testnet session never rides the mainnet gateway, nor the other
+/// way round.
+fn gateway_for(network: zcash_voting::Network) -> Result<(&'static str, NetworkType), RouteError> {
     match network {
-        zcash_voting::Network::Mainnet => Ok(OHTTP_GATEWAY_HOST_MAINNET),
-        zcash_voting::Network::Testnet => Ok(OHTTP_GATEWAY_HOST_TESTNET),
+        zcash_voting::Network::Mainnet => Ok((OHTTP_GATEWAY_HOST_MAINNET, NetworkType::Main)),
+        zcash_voting::Network::Testnet => Ok((OHTTP_GATEWAY_HOST_TESTNET, NetworkType::Test)),
         _ => Err(RouteError::before_dispatch(
             "no OHTTP gateway for this network".to_string(),
         )),
@@ -504,6 +508,7 @@ impl RouteHttp for OhttpRoute {
             // during key-config fetch or relay connect are not classified as dispatched.
             let call = http_round_trip_with_dispatch(
                 &self.gateway_host,
+                self.network,
                 Dialer::Direct,
                 &method,
                 request.url,

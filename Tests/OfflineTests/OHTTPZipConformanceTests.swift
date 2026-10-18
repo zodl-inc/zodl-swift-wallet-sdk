@@ -216,6 +216,9 @@ final class OHTTPZipConformanceTests: XCTestCase {
         guard case .binaryHttpError = OHTTPError.native("the gateway's answer does not open") else {
             return XCTFail("an answer that does not open is a format failure")
         }
+        guard case .transportError = OHTTPError.native("the gateway's answer ended before its final chunk") else {
+            return XCTFail("a response cut off before its final chunk is a transport failure (UNAVAILABLE)")
+        }
         guard case .responseTooLarge = OHTTPError.native("an answer larger than 10 bytes") else {
             return XCTFail("an oversized answer is a size failure")
         }
