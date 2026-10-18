@@ -3230,7 +3230,7 @@ dependencies = [
  "zcash_voting",
  "zeroize",
  "zip32",
- "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=1b6ab2d83a3fea8d4824cecdbf5a98869d3601de)",
+ "zodl-ohttp-client",
  "zodl-slipstream",
 ]
 
@@ -8866,28 +8866,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "zodl-ohttp-client"
-version = "0.1.0"
-source = "git+https://github.com/zodl-inc/ohttp.git?rev=a2986679ec50494755a432e57d97a64c64544d66#a2986679ec50494755a432e57d97a64c64544d66"
-dependencies = [
- "aes-gcm",
- "base64",
- "ed25519-dalek",
- "hex",
- "hkdf",
- "hpke",
- "rand_core 0.9.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.19",
- "zeroize",
-]
-
-[[package]]
 name = "zodl-slipstream"
 version = "0.4.0-pre.1"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=a82c03661a95b8e76a549b08e083a3e0660d439b#a82c03661a95b8e76a549b08e083a3e0660d439b"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3fdc30e900d7d82ec20d2b7c1901eafdfb4ecf39#3fdc30e900d7d82ec20d2b7c1901eafdfb4ecf39"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8934,14 +8915,14 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zip32",
- "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=a2986679ec50494755a432e57d97a64c64544d66)",
+ "zodl-ohttp-client",
  "zodl-slipstream-gpuhash",
 ]
 
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=a82c03661a95b8e76a549b08e083a3e0660d439b#a82c03661a95b8e76a549b08e083a3e0660d439b"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3fdc30e900d7d82ec20d2b7c1901eafdfb4ecf39#3fdc30e900d7d82ec20d2b7c1901eafdfb4ecf39"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",
