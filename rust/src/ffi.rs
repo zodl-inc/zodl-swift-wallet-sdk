@@ -1822,12 +1822,9 @@ mod recovery_hold_tests {
 /// Set the default OHTTP client trace prefix (process-wide). This should be called before any
 /// OHTTP connections are made, typically during SDK initialization. Pass NULL to disable tracing.
 ///
-/// ZIP 1872-1873: DEBUG-only export. Release builds cannot enable trace IDs at run time.
-///
 /// # Safety
 ///
 /// - `prefix` must be NULL or a valid UTF-8 C string.
-#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(prefix: *const c_char) {
     let prefix_opt = if prefix.is_null() {
