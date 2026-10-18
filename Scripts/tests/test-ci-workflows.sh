@@ -283,5 +283,8 @@ test_release_ffi_builds_never_enable_ohttp_trace() {
     for f in ffi-all ffi-ci ffi-macos; do
         assert_file_lacks "$(_dry_run "$f")" " --features" "make $f enables no Cargo feature"
     done
+    local out; out="$SCRATCH/dry-run-ffi-all-env-trace.txt"
+    FFI_CARGO_FEATURES=ohttp-trace make -C "$REPO_ROOT" -n ffi-all > "$out" 2>/dev/null
+    assert_file_lacks "$out" " --features" "make ffi-all ignores FFI_CARGO_FEATURES from the environment"
     assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
 }
