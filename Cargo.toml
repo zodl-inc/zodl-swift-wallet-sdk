@@ -188,7 +188,8 @@ gpu = ["slipstream-core/gpu"]
 
 # Lets zcashlc_set_default_ohttp_client_trace_prefix set OHTTP client trace ids;
 # without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
-# rebuild-local-ffi.sh --trace, make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
+# init-local-ffi.sh / rebuild-local-ffi.sh --trace,
+# make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
 # release builds (build-ffi.yml, prepare-release.sh) never enable it.
 ohttp-trace = []
 
