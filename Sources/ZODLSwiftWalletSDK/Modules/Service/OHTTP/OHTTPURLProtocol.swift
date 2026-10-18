@@ -31,7 +31,8 @@ public final class OHTTPURLProtocol: URLProtocol {
 
     /// `configuration` with this protocol first in its protocol classes.
     public static func configuration(_ configuration: URLSessionConfiguration) -> URLSessionConfiguration {
-        configuration.protocolClasses = [OHTTPURLProtocol.self] + (configuration.protocolClasses ?? [])
+        let others = (configuration.protocolClasses ?? []).filter { ObjectIdentifier($0) != ObjectIdentifier(OHTTPURLProtocol.self) }
+        configuration.protocolClasses = [OHTTPURLProtocol.self] + others
         return configuration
     }
 
