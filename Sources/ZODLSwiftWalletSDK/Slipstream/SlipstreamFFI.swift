@@ -113,8 +113,8 @@ public struct SlipstreamSnapshot {
 /// This MUST be called before the engine starts the first time. If the prefix is nil,
 /// trace headers are disabled. Debug only — never set in release builds (see OHTTPEndpoints docs).
 public func setDefaultOhttpClientTracePrefix(_ prefix: String?) {
-    // The Rust side no longer gates this on debug_assertions (always built in release), so the
-    // debug-only rule is enforced here.
+    // The FFI is always built with the release profile, so the debug-only rule is enforced here;
+    // the Rust side also ignores the prefix unless built with its `ohttp-trace` feature (QA/E2E).
     #if DEBUG
     let prefix = prefix
     #else

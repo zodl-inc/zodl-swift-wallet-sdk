@@ -28,6 +28,8 @@ fi
 
 # Parse a target (ios-sim|ios-device|macos) + optional --gpu (v0.3 GPU Orchard offload
 # build; links wgpu via the libzcashlc `gpu` feature). Runtime opt-in: ZCASH_GPU_SUBTREE.
+# --trace: QA build with the `ohttp-trace` feature, so OHTTP client trace ids work (DEBUG
+# app builds only); never use it for a build that ships.
 # --universal (macos, ios-sim): build BOTH archs of the slice and lipo them — REQUIRED
 # before an Xcode ARCHIVE (Release links arm64+x86_64; a host-arch-only macOS slice
 # fails with hundreds of undefined _zcashlc_* symbols — bit the Beta5 archive
@@ -38,10 +40,11 @@ CARGO_FEATURES=""
 UNIVERSAL=false
 for arg in "$@"; do
     case "$arg" in
-        --gpu) CARGO_FEATURES="--features gpu" ;;
+        --gpu) CARGO_FEATURES="${CARGO_FEATURES:+$CARGO_FEATURES,}gpu" ;;
+        --trace) CARGO_FEATURES="${CARGO_FEATURES:+$CARGO_FEATURES,}ohttp-trace" ;;
         --universal) UNIVERSAL=true ;;
         ios-sim|ios-device|macos) TARGET="$arg" ;;
-        *) echo "Unknown arg: $arg"; echo "Usage: rebuild-local-ffi.sh [ios-sim|ios-device|macos] [--gpu] [--universal]"; exit 1 ;;
+        *) echo "Unknown arg: $arg"; echo "Usage: rebuild-local-ffi.sh [ios-sim|ios-device|macos] [--gpu] [--trace] [--universal]"; exit 1 ;;
     esac
 done
 if [[ "$UNIVERSAL" == "true" && "$TARGET" != "macos" && "$TARGET" != "ios-sim" ]]; then
@@ -103,7 +106,7 @@ case "$TARGET" in
         ;;
 esac
 
-echo "Building for $TARGET ($RUST_TARGET)...${CARGO_FEATURES:+ [v0.3 GPU: $CARGO_FEATURES]}"
+echo "Building for $TARGET ($RUST_TARGET)...${CARGO_FEATURES:+ [features: $CARGO_FEATURES]}"
 echo ""
 
 # Check if Rust target is installed
@@ -120,14 +123,15 @@ fi
 
 # Incremental cargo build (fast for small changes!)
 # Cargo.toml is at the repo root, so we run cargo from there.
-# $CARGO_FEATURES is intentionally unquoted (empty = no extra args; "--features gpu" splits).
+# $FEATURE_ARGS is intentionally unquoted (empty = no extra args; "--features gpu" splits).
+FEATURE_ARGS="${CARGO_FEATURES:+--features $CARGO_FEATURES}"
 if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
     echo "Universal macOS build (arm64 + x86_64)..."
     for t in aarch64-apple-darwin x86_64-apple-darwin; do
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        cargo build --target "$t" --release $CARGO_FEATURES
+        cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-macos-universal.a"
     lipo -create \
@@ -140,7 +144,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        cargo build --target "$t" --release $CARGO_FEATURES
+        cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
     lipo -create \
@@ -148,7 +152,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         target/x86_64-apple-ios/release/libzcashlc.a \
         -output "$BUILT_LIB"
 else
-    cargo build --target "$RUST_TARGET" --release $CARGO_FEATURES
+    cargo build --target "$RUST_TARGET" --release $FEATURE_ARGS
     # Path to built static library (target/ is at repo root)
     BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
 fi

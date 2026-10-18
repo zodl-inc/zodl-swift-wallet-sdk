@@ -1822,17 +1822,66 @@ mod recovery_hold_tests {
 /// Set the default OHTTP client trace prefix (process-wide). This should be called before any
 /// OHTTP connections are made, typically during SDK initialization. Pass NULL to disable tracing.
 ///
+/// A no-op unless the library is built with the `ohttp-trace` feature (QA and E2E builds only),
+/// so a released framework never sends client trace ids whatever the caller passes.
+///
 /// # Safety
 ///
 /// - `prefix` must be NULL or a valid UTF-8 C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(prefix: *const c_char) {
-    let prefix_opt = if prefix.is_null() {
-        None
-    } else {
-        let c_str = unsafe { std::ffi::CStr::from_ptr(prefix) };
-        c_str.to_str().ok().map(|s| s.to_string())
-    };
+    if let Some(prefix_opt) = unsafe { ohttp_client_trace_prefix_to_set(prefix) } {
+        slipstream_core::ohttp::set_default_client_trace_prefix(prefix_opt);
+    }
+}
 
-    slipstream_core::ohttp::set_default_client_trace_prefix(prefix_opt);
+/// The value `zcashlc_set_default_ohttp_client_trace_prefix` hands to slipstream, or `None` to
+/// leave the default untouched.
+///
+/// # Safety
+///
+/// - `prefix` must be NULL or a valid UTF-8 C string.
+unsafe fn ohttp_client_trace_prefix_to_set(prefix: *const c_char) -> Option<Option<String>> {
+    if !cfg!(feature = "ohttp-trace") {
+        return None;
+    }
+    if prefix.is_null() {
+        return Some(None);
+    }
+    let c_str = unsafe { std::ffi::CStr::from_ptr(prefix) };
+    Some(c_str.to_str().ok().map(|s| s.to_string()))
+}
+
+#[cfg(test)]
+mod ohttp_client_trace_prefix_tests {
+    use super::ohttp_client_trace_prefix_to_set;
+    use std::ffi::CString;
+
+    #[cfg(not(feature = "ohttp-trace"))]
+    #[test]
+    fn ignored_without_the_ohttp_trace_feature() {
+        let prefix = CString::new("qa-trace").unwrap();
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(prefix.as_ptr()) },
+            None
+        );
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(std::ptr::null()) },
+            None
+        );
+    }
+
+    #[cfg(feature = "ohttp-trace")]
+    #[test]
+    fn forwarded_with_the_ohttp_trace_feature() {
+        let prefix = CString::new("qa-trace").unwrap();
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(prefix.as_ptr()) },
+            Some(Some("qa-trace".to_string()))
+        );
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(std::ptr::null()) },
+            Some(None)
+        );
+    }
 }

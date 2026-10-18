@@ -262,3 +262,26 @@ test_swift_workflow_cargo_key_includes_the_toolchain() {
     assert_file_contains "$(_swift_workflow)" 'cargo-v2-${{ steps.toolchain.outputs.cachekey }}-' \
         "the cargo cache key carries the rustc version"
 }
+
+# The ohttp-trace feature turns OHTTP client trace ids on: QA/E2E builds only.
+test_ohttp_e2e_builds_the_ffi_with_ohttp_trace() {
+    assert_file_contains "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" \
+        "make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace" \
+        "ohttp-e2e.yml builds the FFI with ohttp-trace"
+    local out; out="$SCRATCH/dry-run-ffi-macos-trace.txt"
+    make -C "$REPO_ROOT" -n ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace > "$out" 2>/dev/null
+    assert_file_contains "$out" "cargo build --manifest-path ../Cargo.toml --release --features ohttp-trace" \
+        "FFI_CARGO_FEATURES reaches cargo"
+}
+
+test_release_ffi_builds_never_enable_ohttp_trace() {
+    local f
+    for f in .github/workflows/build-ffi.yml Scripts/prepare-release.sh Scripts/release.sh; do
+        assert_file_lacks "$REPO_ROOT/$f" "ohttp-trace" "$f does not enable ohttp-trace"
+        assert_file_lacks "$REPO_ROOT/$f" "FFI_CARGO_FEATURES" "$f passes no extra Cargo features"
+    done
+    for f in ffi-all ffi-ci ffi-macos; do
+        assert_file_lacks "$(_dry_run "$f")" " --features" "make $f enables no Cargo feature"
+    done
+    assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
+}

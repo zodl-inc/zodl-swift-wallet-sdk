@@ -82,7 +82,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: BuildSupport/products/libzcashlc.xcframework
-          key: ohttp-e2e-xcframework-macos-arm64-${{ steps.ffi-hash.outputs.hash }}
+          key: ohttp-e2e-xcframework-macos-arm64-ohttp-trace-${{ steps.ffi-hash.outputs.hash }}
 
       - name: Setup Rust
         if: steps.cache-ffi.outputs.cache-hit != 'true'
@@ -106,10 +106,11 @@ jobs:
             ohttp-e2e-cargo-
 
       # arm64 only: the runner is arm64 and nothing here links an x86_64 slice.
+      # ohttp-trace: client trace ids (client_trace_prefix input) work only in such a build.
       - name: Build FFI for macOS
         if: steps.cache-ffi.outputs.cache-hit != 'true'
         timeout-minutes: 75
-        run: make ffi-macos MACOS_ARCHS=aarch64-apple-darwin
+        run: make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace
 
       - name: Verify XCFramework
         run: make verify-ffi
