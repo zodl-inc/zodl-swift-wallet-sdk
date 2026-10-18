@@ -1,0 +1,241 @@
+//
+//  OHTTPZipConformanceTests.swift
+//  OfflineTests
+//
+//  The transport rules on key caching, relay headers, 429 back-off, request resends, error mapping and
+//  gateway selection.
+//
+
+import XCTest
+@testable import ZODLSwiftWalletSDK
+
+final class OHTTPZipConformanceTests: XCTestCase {
+    private final class Recorder: @unchecked Sendable {
+        var keyFetches = 0
+        var posts: [URLRequest] = []
+        var gets: [URLRequest] = []
+    }
+
+    private let request = OHTTPRequest(
+        method: "POST",
+        scheme: "https",
+        authority: "ohttp-gateway-testnet.example",
+        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+        headers: [],
+        body: Data([0x00])
+    )
+
+    private func makeTransport(
+        recorder: Recorder,
+        cache: OHTTPKeyCache,
+        postAnswer: @escaping (URLRequest) -> (Int, [String: String]?) = { _ in (503, nil) }
+    ) -> OHTTPTransport {
+        OHTTPTestSupport.makeTransport(keyCache: cache) { request, _ in
+            if request.httpMethod == "GET" {
+                recorder.keyFetches += 1
+                recorder.gets.append(request)
+                return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+            recorder.posts.append(request)
+            let (status, headers) = postAnswer(request)
+            return (Data(), OHTTPTestSupport.response(for: request.url, status: status, headers: headers))
+        }
+    }
+
+    // MARK: - Key configuration cache
+
+    func testTransportsOfOneRelayShareTheCachedKeyConfiguration() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+
+        for _ in 0..<3 {
+            let transport = makeTransport(recorder: recorder, cache: cache)
+            _ = try await transport.keyConfig()
+        }
+
+        XCTAssertEqual(recorder.keyFetches, 1, "a transport made per call must reuse the cached key configuration")
+    }
+
+    func testTorAndDirectTransportsKeepSeparateEntries() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let sender: OHTTPTransport.HTTPSender = { request, _ in
+            recorder.keyFetches += 1
+            return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+        }
+        for viaTor in [false, true, false, true] {
+            let transport = OHTTPTransport(
+                gatewayHost: "ohttp-gateway-testnet.example",
+                relayURL: "https://testnet-operator-relay.example.invalid/relay",
+                keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
+                testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+                viaTor: viaTor,
+                keyCache: cache,
+                httpSender: sender
+            )
+            _ = try await transport.keyConfig()
+        }
+
+        XCTAssertEqual(recorder.keyFetches, 2)
+    }
+
+    // MARK: - Relay headers
+
+    func testRelayRequestsCarryFixedUserAgentAndLanguage() async throws {
+        let recorder = Recorder()
+        let transport = makeTransport(recorder: recorder, cache: OHTTPKeyCache())
+
+        _ = try? await transport.roundTrip(request: request, timeoutMS: 5000)
+
+        let requests = recorder.gets + recorder.posts
+        XCTAssertFalse(recorder.posts.isEmpty)
+        for sent in requests {
+            XCTAssertEqual(sent.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1.0")
+            XCTAssertEqual(sent.value(forHTTPHeaderField: "Accept-Language"), "en")
+            XCTAssertNil(sent.value(forHTTPHeaderField: "Cookie"))
+        }
+    }
+
+    // MARK: - 429
+
+    func testRetryAfterIsReadInSecondsAndCapped() {
+        XCTAssertEqual(OHTTPTransport.retryAfter("7"), 7)
+        XCTAssertEqual(OHTTPTransport.retryAfter("3600"), OHTTPTransport.maxRetryAfter)
+        XCTAssertNil(OHTTPTransport.retryAfter(nil))
+        XCTAssertNil(OHTTPTransport.retryAfter("soon"))
+        XCTAssertNil(OHTTPTransport.retryAfter("-5"))
+    }
+
+    func testThePostAfterA429WaitsForRetryAfterWithoutRefetchingTheKey() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let transport = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
+
+        do {
+            _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
+            XCTFail("a 429 is an error")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(recorder.posts.count, 1, "a 429 is not retried within the call")
+
+        let started = Date()
+        _ = try? await transport.roundTrip(request: request, timeoutMS: 5000)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.9, "the next post waits out Retry-After")
+        XCTAssertEqual(recorder.keyFetches, 1, "a 429 never refetches the key configuration")
+    }
+
+    // MARK: - No transparent resend
+
+    func testTheRelayBodyIsAStreamThatCannotBeReplayed() throws {
+        var post = URLRequest(url: try XCTUnwrap(URL(string: "https://testnet-operator-relay.example.invalid/relay")))
+        post.httpMethod = "POST"
+        post.httpBody = Data(repeating: 7, count: 42)
+
+        let streamed = OHTTPTransport.oneShotBody(post)
+
+        XCTAssertNil(streamed.httpBody)
+        XCTAssertNotNil(streamed.httpBodyStream)
+        XCTAssertEqual(streamed.value(forHTTPHeaderField: "Content-Length"), "42")
+    }
+
+    func testTheRelaySessionIsReplacedAfterItsLifetime() {
+        XCTAssertLessThanOrEqual(OHTTPTransport.sessionLifetime, 30 * 60)
+        let first = OHTTPTransport.session
+        XCTAssertTrue(first === OHTTPTransport.session, "within its lifetime the session is reused")
+    }
+
+    // MARK: - gRPC status of a failed exchange
+
+    func testFailedExchangesMapToTheZipStatuses() {
+        func code(_ error: Error) -> Int? {
+            if case LightWalletServiceError.failed(let code, _) = OHTTPGRPCClient.serviceError(for: error) {
+                return code
+            }
+            return nil
+        }
+
+        XCTAssertEqual(code(OHTTPError.requestTooLarge("big")), 8)
+        XCTAssertEqual(code(OHTTPError.httpStatusError(statusCode: 413, message: "")), 8)
+        XCTAssertEqual(code(OHTTPError.binaryHttpError("bad framing")), 13)
+        XCTAssertEqual(code(OHTTPError.responseTooLarge("big answer")), 13)
+        for status in [401, 403, 409, 426, 429, 500, 502, 503] {
+            XCTAssertEqual(code(OHTTPError.httpStatusError(statusCode: status, message: "")), 14, "\(status)")
+        }
+        XCTAssertEqual(code(OHTTPError.transportError("cut")), 14)
+        XCTAssertEqual(code(OHTTPError.keyConfigError("refused")), 14)
+        XCTAssertEqual(code(URLError(.networkConnectionLost)), 14)
+        XCTAssertTrue(OHTTPGRPCClient.serviceError(for: CancellationError()) is CancellationError)
+    }
+
+    func testNativeOpenFailuresAreFormatErrors() {
+        guard case .binaryHttpError = OHTTPError.native("the gateway's answer does not open") else {
+            return XCTFail("an answer that does not open is a format failure")
+        }
+        guard case .responseTooLarge = OHTTPError.native("an answer larger than 10 bytes") else {
+            return XCTFail("an oversized answer is a size failure")
+        }
+    }
+
+    func testGRPCStatusIsTakenFromTheTrailersFirst() {
+        let response = OHTTPResponse(
+            status: 200,
+            headers: [("grpc-status", "0")],
+            body: Data(),
+            trailers: [("grpc-status", "14")]
+        )
+        XCTAssertEqual(response.field("grpc-status"), "14")
+    }
+
+    // MARK: - Gateway selection
+
+    func testThirdPartyHostsUseTheGatewayOfTheWalletNetwork() throws {
+        let testnet = try OHTTPEndpoints.proxyRoute(for: "vote.zodl.com", network: .testnet)
+        XCTAssertEqual(testnet.gatewayHost, "ohttp-gateway-testnet.example")
+        XCTAssertEqual(testnet.relayURL, OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example"))
+
+        let mainnet = try OHTTPEndpoints.proxyRoute(for: "cmc.zodl.com", network: .mainnet)
+        XCTAssertEqual(mainnet.gatewayHost, "ohttp-gateway.example")
+
+        let gateway = try OHTTPEndpoints.proxyRoute(for: "ohttp-gateway-testnet.example", network: .testnet)
+        XCTAssertEqual(gateway.gatewayHost, "ohttp-gateway-testnet.example")
+    }
+
+    func testTheBuiltInRelaysAreIndependent() {
+        XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway.example"))
+        XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway-testnet.example"))
+        XCTAssertTrue(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "lwd.example.com"))
+    }
+
+    // MARK: - Tor mode on the gRPC service
+
+    func testDirectCallsGoOverTorWhileTorModeIsOn() async throws {
+        let endpoint = LightWalletEndpoint(address: "lwd.example.com", port: 443, secure: true)
+        let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+
+        var resolved = await service.resolvedMode(.direct)
+        XCTAssertEqual(resolved, .direct, "no Tor mode known: direct stays direct")
+
+        service.sdkFlags = SDKFlags(torEnabled: true, exchangeRateEnabled: false)
+        resolved = await service.resolvedMode(.direct)
+        XCTAssertEqual(resolved, .defaultTor)
+        resolved = await service.resolvedMode(.uniqueTor)
+        XCTAssertEqual(resolved, .uniqueTor)
+
+        service.sdkFlags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        resolved = await service.resolvedMode(.direct)
+        XCTAssertEqual(resolved, .direct)
+    }
+
+    func testStreamingCallsAreRefusedOverPlainGRPCWhileTorModeIsOn() async throws {
+        let endpoint = LightWalletEndpoint(address: "lwd.example.com", port: 443, secure: true)
+        let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+        service.sdkFlags = SDKFlags(torEnabled: true, exchangeRateEnabled: false)
+
+        do {
+            for try await _ in try service.blockStream(startHeight: 1, endHeight: 2, mode: .direct) {}
+            XCTFail("a plain gRPC stream must not be opened in Tor mode")
+        } catch ZcashError.grpcServiceCalledWithTorMode {
+        }
+    }
+}
