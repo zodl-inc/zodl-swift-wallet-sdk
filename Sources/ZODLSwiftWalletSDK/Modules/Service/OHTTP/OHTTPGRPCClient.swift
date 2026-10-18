@@ -7,6 +7,7 @@
 
 import Foundation
 import SwiftProtobuf
+import os
 
 /// Generic gRPC client that carries every RPC as one OHTTP exchange.
 actor OHTTPGRPCClient {
@@ -14,6 +15,7 @@ actor OHTTPGRPCClient {
     private let transport: OHTTPTransport
     private let singleCallTimeoutMS: Int
     private let streamingCallTimeoutMS: Int
+    private let logger = Logger(subsystem: "ZODLSwiftWalletSDK", category: "OHTTPGRPCClient")
 
     private static let grpcContentType = "application/grpc"
     private static let userAgent = "zodl-ohttp-swift/1.0"
@@ -150,26 +152,40 @@ actor OHTTPGRPCClient {
 
     private func checkGRPCStatus(_ response: OHTTPResponse) throws {
         guard response.status == Self.httpOK else {
-            let grpcStatus = httpStatusToGRPCCode(response.status)
+            // Log 426 (Upgrade Required: client used plain HTTP when server expects OHTTP)
+            if response.status == 426 {
+                logger.error("OHTTP: gateway returned 426 Upgrade Required")
+            }
+            // Inner non-200 maps to INTERNAL (13) per ZIP, regardless of HTTP status code
             throw LightWalletServiceError.failed(
-                statusCode: grpcStatus,
+                statusCode: 13,
                 message: "gateway/lightwalletd returned HTTP \(response.status)"
             )
         }
 
         let contentType = response.field("content-type") ?? ""
         guard contentType.hasPrefix(Self.grpcContentType) else {
-            throw LightWalletServiceError.generalError(message: "unexpected content-type '\(contentType)'")
+            throw LightWalletServiceError.failed(
+                statusCode: 13,
+                message: "unexpected content-type '\(contentType)'"
+            )
         }
 
         let encoding = response.field("grpc-encoding")
         if let encoding = encoding, encoding != "identity" {
-            throw LightWalletServiceError.generalError(message: "unsupported grpc-encoding '\(encoding)'")
+            throw LightWalletServiceError.failed(
+                statusCode: 13,
+                message: "unsupported grpc-encoding '\(encoding)'"
+            )
         }
 
         guard let grpcStatusString = response.field("grpc-status"),
               let grpcStatusCode = Int(grpcStatusString) else {
-            throw LightWalletServiceError.generalError(message: "response is missing grpc-status")
+            // Missing grpc-status maps to INTERNAL (13) per ZIP
+            throw LightWalletServiceError.failed(
+                statusCode: 13,
+                message: "response is missing grpc-status"
+            )
         }
 
         guard grpcStatusCode == 0 else {

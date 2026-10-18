@@ -26,10 +26,10 @@ struct OHTTPResponse {
     let body: Data
     let trailers: [(String, String)]
 
-    /// Case-insensitive lookup across headers then trailers.
+    /// Case-insensitive lookup: trailers first, then headers. gRPC status is in trailers.
     func field(_ name: String) -> String? {
         let lowercaseName = name.lowercased()
-        for (key, value) in headers + trailers where key.lowercased() == lowercaseName {
+        for (key, value) in trailers + headers where key.lowercased() == lowercaseName {
             return value
         }
         return nil

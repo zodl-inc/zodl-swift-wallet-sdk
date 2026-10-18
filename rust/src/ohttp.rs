@@ -274,14 +274,15 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
         // Encode the request as Binary HTTP
         let encoded_request = encode_bhttp_request(&request, &profile.encode)?;
 
-        // The gateway and the relay answer 413 above the cap: refuse here, before the HPKE work.
-        check_size(
-            encoded_request.len(),
-            profile.limits.max_sealed_request_bytes,
-        )?;
-
         // Encapsulate as chunked OHTTP
         let (sealed_body, response_opener) = encapsulate_chunked_request(&key, &encoded_request)?;
+
+        // The gateway and the relay answer 413 above the cap. Check the sealed length after
+        // encapsulation, not the BHTTP length before it.
+        check_size(
+            sealed_body.len(),
+            profile.limits.max_sealed_request_bytes,
+        )?;
         let (body, body_len) = ptr_from_vec(sealed_body);
         let opener = Box::into_raw(Box::new(OhttpOpener {
             inner: response_opener,

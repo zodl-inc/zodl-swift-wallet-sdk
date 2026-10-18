@@ -196,12 +196,16 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             return try await super.getInfo(mode: mode)
         }
 
-        // The protocol returns the `LightWalletdInfo` existential; decode the concrete proto message.
-        let info: LightdInfo = try await client.unary(
-            path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
-            request: Empty()
-        )
-        return info
+        do {
+            let info: LightdInfo = try await client.unary(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+                request: Empty()
+            )
+            return info
+        } catch {
+            let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+            throw ZcashError.serviceGetInfoFailed(serviceError)
+        }
     }
 
     override func latestBlock(mode: ServiceMode) async throws -> BlockID {
@@ -209,10 +213,15 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             return try await super.latestBlock(mode: mode)
         }
 
-        return try await client.unary(
-            path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
-            request: ChainSpec()
-        )
+        do {
+            return try await client.unary(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+                request: ChainSpec()
+            )
+        } catch {
+            let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+            throw ZcashError.serviceLatestBlockFailed(serviceError)
+        }
     }
 
     override func latestBlockHeight(mode: ServiceMode) async throws -> BlockHeight {
@@ -259,13 +268,18 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             return try await super.submit(spendTransaction: spendTransaction, mode: mode)
         }
 
-        var transaction = RawTransaction()
-        transaction.data = spendTransaction
-        let response: SendResponse = try await client.unary(
-            path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
-            request: transaction
-        )
-        return response
+        do {
+            var transaction = RawTransaction()
+            transaction.data = spendTransaction
+            let response: SendResponse = try await client.unary(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+                request: transaction
+            )
+            return response
+        } catch {
+            let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+            throw ZcashError.serviceSubmitFailed(serviceError)
+        }
     }
 
     override func fetchTransaction(txId: Data, mode: ServiceMode) async throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {

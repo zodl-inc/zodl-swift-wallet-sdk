@@ -329,6 +329,11 @@ actor OHTTPTransport {
         var request = URLRequest(url: urlObj, timeoutInterval: TimeInterval(timeoutMS) / 1000.0)
         request.httpMethod = "POST"
         request.httpBody = body
+
+        // Fixed User-Agent and Accept-Language to prevent relay fingerprinting
+        request.setValue("zodl-ohttp/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("en-US", forHTTPHeaderField: "Accept-Language")
+
         for (name, value) in profile.postHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
@@ -338,7 +343,35 @@ actor OHTTPTransport {
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
-        return try await httpSender(request, Self.maxRelayResponseBytes)
+        let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
+
+        // Handle 429 with Retry-After
+        if response.statusCode == 429 {
+            if let retryAfterHeader = response.value(forHTTPHeaderField: "Retry-After") {
+                let retryAfterSeconds: TimeInterval
+                if let seconds = TimeInterval(retryAfterHeader) {
+                    retryAfterSeconds = min(seconds, 120.0)  // Cap at 120 seconds
+                } else if let date = Self.parseHTTPDate(retryAfterHeader) {
+                    retryAfterSeconds = min(date.timeIntervalSinceNow, 120.0)
+                } else {
+                    retryAfterSeconds = 0
+                }
+
+                if retryAfterSeconds > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(retryAfterSeconds * 1_000_000_000))
+                }
+            }
+        }
+
+        return (data, response)
+    }
+
+    private static func parseHTTPDate(_ dateString: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(abbreviation: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: dateString)
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to
