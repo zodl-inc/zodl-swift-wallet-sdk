@@ -22,6 +22,8 @@ actor OHTTPGRPCClient {
     private static let frameHeaderSize = 5
     private static let httpOK = 200
     private static let timeoutSlackMS = 5000
+    private static let httpPayloadTooLarge = 413
+    private static let httpUpgradeRequired = 426
 
     // Gateway upstream timeout is 80 s; keep grpc-timeout under that with margin
     private static let maxGRPCTimeoutMS = 75000
@@ -69,10 +71,7 @@ actor OHTTPGRPCClient {
             body: body
         )
 
-        let bhttpResponse = try await transport.roundTrip(
-            request: bhttpRequest,
-            timeoutMS: exchangeTimeoutMS
-        )
+        let bhttpResponse = try await exchange(bhttpRequest, timeoutMS: exchangeTimeoutMS)
 
         return try parseUnaryResponse(bhttpResponse)
     }
@@ -106,12 +105,42 @@ actor OHTTPGRPCClient {
             body: body
         )
 
-        let bhttpResponse = try await transport.roundTrip(
-            request: bhttpRequest,
-            timeoutMS: exchangeTimeoutMS
-        )
+        let bhttpResponse = try await exchange(bhttpRequest, timeoutMS: exchangeTimeoutMS)
 
         return try parseStreamingResponse(bhttpResponse)
+    }
+
+    private func exchange(_ request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+        do {
+            return try await transport.roundTrip(request: request, timeoutMS: timeoutMS)
+        } catch {
+            if case OHTTPError.httpStatusError(let status, _) = error, status == Self.httpUpgradeRequired {
+                logger.error("OHTTP: the relay or gateway answered 426 Upgrade Required")
+            }
+            throw Self.serviceError(for: error)
+        }
+    }
+
+    /// The gRPC status a failed exchange is surfaced as: INVALID_ARGUMENT or RESOURCE_EXHAUSTED for a
+    /// request too large to send (or refused with 413), INTERNAL for an answer that does not open or does
+    /// not parse, UNAVAILABLE for every outer refusal and transport failure.
+    static func serviceError(for error: Error) -> Error {
+        if error is CancellationError || error is LightWalletServiceError {
+            return error
+        }
+        guard let ohttpError = error as? OHTTPError else {
+            return LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.unavailable, message: "OHTTP transport: \(error)")
+        }
+        switch ohttpError {
+        case .requestTooLarge(let message):
+            return LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.resourceExhausted, message: message)
+        case .httpStatusError(let status, let message) where status == httpPayloadTooLarge:
+            return LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.resourceExhausted, message: message)
+        case .binaryHttpError(let message), .hpkeError(let message), .responseTooLarge(let message):
+            return LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: message)
+        case .httpStatusError(_, let message), .transportError(let message), .keyConfigError(let message):
+            return LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.unavailable, message: message)
+        }
     }
 
     // MARK: - gRPC Message Encoding/Decoding
@@ -129,12 +158,12 @@ actor OHTTPGRPCClient {
         try checkGRPCStatus(response)
 
         guard response.body.count >= Self.frameHeaderSize else {
-            throw LightWalletServiceError.generalError(message: "Empty gRPC response body")
+            throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "Empty gRPC response body")
         }
 
         let messages: [T] = try parseGRPCFrames(response.body)
         guard let message = messages.first else {
-            throw LightWalletServiceError.generalError(message: "No message in unary response")
+            throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "No message in unary response")
         }
 
         return message
@@ -152,13 +181,8 @@ actor OHTTPGRPCClient {
 
     private func checkGRPCStatus(_ response: OHTTPResponse) throws {
         guard response.status == Self.httpOK else {
-            // Log 426 (Upgrade Required: client used plain HTTP when server expects OHTTP)
-            if response.status == 426 {
-                logger.error("OHTTP: gateway returned 426 Upgrade Required")
-            }
-            // Inner non-200 maps to INTERNAL (13) per ZIP, regardless of HTTP status code
             throw LightWalletServiceError.failed(
-                statusCode: 13,
+                statusCode: OHTTPGRPCStatus.internalError,
                 message: "gateway/lightwalletd returned HTTP \(response.status)"
             )
         }
@@ -166,7 +190,7 @@ actor OHTTPGRPCClient {
         let contentType = response.field("content-type") ?? ""
         guard contentType.hasPrefix(Self.grpcContentType) else {
             throw LightWalletServiceError.failed(
-                statusCode: 13,
+                statusCode: OHTTPGRPCStatus.internalError,
                 message: "unexpected content-type '\(contentType)'"
             )
         }
@@ -174,16 +198,15 @@ actor OHTTPGRPCClient {
         let encoding = response.field("grpc-encoding")
         if let encoding = encoding, encoding != "identity" {
             throw LightWalletServiceError.failed(
-                statusCode: 13,
+                statusCode: OHTTPGRPCStatus.internalError,
                 message: "unsupported grpc-encoding '\(encoding)'"
             )
         }
 
         guard let grpcStatusString = response.field("grpc-status"),
               let grpcStatusCode = Int(grpcStatusString) else {
-            // Missing grpc-status maps to INTERNAL (13) per ZIP
             throw LightWalletServiceError.failed(
-                statusCode: 13,
+                statusCode: OHTTPGRPCStatus.internalError,
                 message: "response is missing grpc-status"
             )
         }
@@ -202,7 +225,7 @@ actor OHTTPGRPCClient {
 
         while pos < body.count {
             guard body.count - pos >= Self.frameHeaderSize else {
-                throw LightWalletServiceError.generalError(message: "truncated frame header")
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "truncated frame header")
             }
 
             let compressed = body[pos]
@@ -213,33 +236,32 @@ actor OHTTPGRPCClient {
             pos += Self.frameHeaderSize
 
             guard compressed == 0 else {
-                throw LightWalletServiceError.generalError(message: "compressed frames are not supported")
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "compressed frames are not supported")
             }
 
             guard length >= 0, length <= body.count - pos else {
-                throw LightWalletServiceError.generalError(message: "truncated frame body")
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "truncated frame body")
             }
 
             let messageData = body.subdata(in: pos..<pos + length)
-            let message = try T(serializedData: messageData)
-            messages.append(message)
+            do {
+                messages.append(try T(serializedData: messageData))
+            } catch {
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "malformed gRPC message: \(error)")
+            }
             pos += length
         }
 
         return messages
     }
+}
 
-    private func httpStatusToGRPCCode(_ httpStatus: Int) -> Int {
-        switch httpStatus {
-        case 400: return 13  // INTERNAL
-        case 401: return 14  // UNAVAILABLE (per ZIP, outer auth failure)
-        case 403: return 7   // PERMISSION_DENIED
-        case 404: return 12  // UNIMPLEMENTED
-        case 426: return 14  // UNAVAILABLE (per ZIP, non-encapsulated/wrong protocol)
-        case 429, 500, 502, 503, 504: return 14  // UNAVAILABLE
-        default: return 2    // UNKNOWN
-        }
-    }
+/// The gRPC status codes this client surfaces.
+enum OHTTPGRPCStatus {
+    static let invalidArgument = 3
+    static let resourceExhausted = 8
+    static let internalError = 13
+    static let unavailable = 14
 }
 
 // MARK: - String Extension for Percent Decoding

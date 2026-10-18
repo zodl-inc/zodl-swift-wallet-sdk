@@ -53,6 +53,7 @@ enum OHTTPTestSupport {
         relayURL: String = "https://testnet-operator-relay.example.invalid/relay",
         keyConfigURL: String = "https://testnet-operator-relay.example.invalid/ohttp-configs",
         clientTraceIdPrefix: String? = nil,
+        keyCache: OHTTPKeyCache = OHTTPKeyCache(),
         sender: @escaping OHTTPTransport.HTTPSender
     ) -> OHTTPTransport {
         OHTTPTransport(
@@ -61,6 +62,7 @@ enum OHTTPTestSupport {
             keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: clientTraceIdPrefix,
             testKeyVerifier: makeKeyVerifier(),
+            keyCache: keyCache,
             httpSender: sender
         )
     }

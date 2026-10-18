@@ -26,6 +26,68 @@ private final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, 
         // The task will complete with the redirect response instead of following it.
         completionHandler(nil)
     }
+
+    /// The relay POST body is a stream with no replacement, so the session cannot transparently send the
+    /// same sealed bytes a second time (an `enc_request` resent byte for byte is a replay).
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        needNewBodyStream completionHandler: @escaping (InputStream?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
+/// Process-wide state of the OHTTP transports, keyed by relay, gateway network and sender kind (Tor or
+/// not): the verified key configuration, fetched once and reused by every transport until it expires, and
+/// the `Retry-After` of the last 429 through that relay.
+actor OHTTPKeyCache {
+    static let shared = OHTTPKeyCache()
+
+    private var keys: [String: OHTTPVerifiedKey] = [:]
+    private var notBefore: [String: Date] = [:]
+
+    func key(for cacheKey: String) -> OHTTPVerifiedKey? {
+        keys[cacheKey]
+    }
+
+    func store(_ key: OHTTPVerifiedKey?, for cacheKey: String) {
+        keys[cacheKey] = key
+    }
+
+    func backoffDeadline(for cacheKey: String) -> Date? {
+        notBefore[cacheKey]
+    }
+
+    func setBackoff(until deadline: Date, for cacheKey: String) {
+        notBefore[cacheKey] = max(deadline, notBefore[cacheKey] ?? deadline)
+    }
+}
+
+/// The relay session in use, replaced by a fresh one (new connections) once it is `lifetime` old. The old
+/// one finishes the tasks it has and is then invalidated.
+private final class RotatingSession: @unchecked Sendable {
+    private let lock = NSLock()
+    private let lifetime: TimeInterval
+    private var session: URLSession?
+    private var created = Date.distantPast
+
+    init(lifetime: TimeInterval) {
+        self.lifetime = lifetime
+    }
+
+    func current(now: Date = Date()) -> URLSession {
+        lock.lock()
+        defer { lock.unlock() }
+        if let session, now.timeIntervalSince(created) < lifetime {
+            return session
+        }
+        session?.finishTasksAndInvalidate()
+        let fresh = OHTTPTransport.makeSession()
+        session = fresh
+        created = now
+        return fresh
+    }
 }
 
 actor OHTTPTransport {
@@ -42,7 +104,19 @@ actor OHTTPTransport {
     /// or gateway returns (e.g. Set-Cookie) can be stored and replayed, which would link a wallet's
     /// requests across IPs / Tor circuits. Delegate refuses redirects (3xx responses surface as errors
     /// rather than being followed). Scoped to this transport; the app's URLSession.shared is untouched.
-    internal static let session: URLSession = {
+    ///
+    /// The session is replaced every ``sessionLifetime``, so the relay does not see one connection for
+    /// the whole life of the app: connection lifetime is linkable metadata.
+    internal static var session: URLSession {
+        sessionBox.current()
+    }
+
+    /// How long one relay session, and so its connections, is used before a new one replaces it.
+    internal static let sessionLifetime: TimeInterval = 10 * 60
+
+    private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
+
+    static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
         cfg.httpShouldSetCookies = false
@@ -52,12 +126,22 @@ actor OHTTPTransport {
         cfg.httpAdditionalHeaders = nil
         cfg.waitsForConnectivity = false
         return URLSession(configuration: cfg, delegate: RedirectRefusingDelegate.shared, delegateQueue: nil)
-    }()
+    }
 
     /// Test-only accessor for the session configuration.
     internal static var sessionConfigurationForTesting: URLSessionConfiguration {
         session.configuration
     }
+
+    /// Fixed relay-facing `User-Agent` and `Accept-Language`, so URLSession does not add the app's name
+    /// and build, the CFNetwork and Darwin versions, or the device locale.
+    internal static let fixedRelayHeaders: [(name: String, value: String)] = [
+        ("User-Agent", "zodl-ohttp/1.0"),
+        ("Accept-Language", "en")
+    ]
+
+    /// The longest relay `Retry-After` that is honoured.
+    internal static let maxRetryAfter: TimeInterval = 120
 
     /// Maximum size of a signed key-configuration response (64 KiB). ZIP MUST: clients bound the
     /// key-config response while reading.
@@ -84,7 +168,7 @@ actor OHTTPTransport {
         maxBytes: Int,
         session: URLSession = OHTTPTransport.session
     ) async throws -> (Data, URLResponse) {
-        let (bytes, response) = try await session.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: oneShotBody(request))
 
         // Reject early if Content-Length header exceeds the limit
         // `expectedContentLength` is -1 when the length is unknown.
@@ -114,6 +198,18 @@ actor OHTTPTransport {
         return (accumulated, response)
     }
 
+    /// `request` with its body as a stream the session cannot rewind: with no replacement stream on offer
+    /// (`needNewBodyStream` answers nil), URLSession fails the task rather than repeat the body on its
+    /// own, for example on a reused connection that turns out to be closed.
+    static func oneShotBody(_ request: URLRequest) -> URLRequest {
+        guard let body = request.httpBody else { return request }
+        var streamed = request
+        streamed.httpBody = nil
+        streamed.httpBodyStream = InputStream(data: body)
+        streamed.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
+        return streamed
+    }
+
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
     /// signed key configuration is checked against.
     private let gatewayHost: String
@@ -121,7 +217,9 @@ actor OHTTPTransport {
     private let keyConfigURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
-    private var cachedKey: OHTTPVerifiedKey?
+    private let keyCache: OHTTPKeyCache
+    /// The entry of this relay, gateway network and sender kind in ``keyCache``.
+    private let cacheKey: String
     private let httpSender: HTTPSender
     /// Optional client trace ID prefix. When set, every outer OHTTP POST to the relay carries
     /// `X-Client-Trace-Id: <prefix>-<uuid>` so a tester can tag and follow requests end-to-end in
@@ -147,6 +245,8 @@ actor OHTTPTransport {
         clientTraceIdPrefix: String? = nil,
         testNow: Date? = nil,
         testKeyVerifier: KeyVerifier? = nil,
+        viaTor: Bool = false,
+        keyCache: OHTTPKeyCache = .shared,
         httpSender: @escaping HTTPSender = { request, maxBytes in
             let (data, response) = try await OHTTPTransport.boundedData(
                 for: request,
@@ -167,6 +267,8 @@ actor OHTTPTransport {
         self.clientTraceIdPrefix = clientTraceIdPrefix
         self.testNow = testNow
         self.testKeyVerifier = testKeyVerifier
+        self.keyCache = keyCache
+        self.cacheKey = "\(relayURL)|\(OHTTPEndpoints.network(for: gatewayHost))|\(viaTor ? "tor" : "direct")"
         self.httpSender = httpSender
     }
 
@@ -176,7 +278,7 @@ actor OHTTPTransport {
         let profile = try OHTTPNative.profileInfo()
 
         // The cached key is used while the profile says it is fresh.
-        if !forceRefresh, let cached = cachedKey, profile.isFresh(cached, at: Date()) {
+        if !forceRefresh, let cached = await keyCache.key(for: cacheKey), profile.isFresh(cached, at: Date()) {
             return cached
         }
 
@@ -203,7 +305,7 @@ actor OHTTPTransport {
             verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
         }
 
-        cachedKey = verified
+        await keyCache.store(verified, for: cacheKey)
         return verified
     }
 
@@ -248,7 +350,7 @@ actor OHTTPTransport {
                 // Discard the refused key before fetching the one that replaces it, so that a failed fetch
                 // leaves none to be used next.
                 if try OHTTPNative.profileInfo().dropBeforeRefetch {
-                    cachedKey = nil
+                    await keyCache.store(nil, for: cacheKey)
                 }
                 key = try await self.keyConfig(forceRefresh: true)
                 attempt = 1
@@ -297,6 +399,9 @@ actor OHTTPTransport {
 
         var request = URLRequest(url: urlObj, timeoutInterval: TimeInterval(timeoutMS) / 1000.0)
         request.httpMethod = "GET"
+        for (name, value) in Self.fixedRelayHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         for (name, value) in profile.keyFetchHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
@@ -330,9 +435,9 @@ actor OHTTPTransport {
         request.httpMethod = "POST"
         request.httpBody = body
 
-        // Fixed User-Agent and Accept-Language to prevent relay fingerprinting
-        request.setValue("zodl-ohttp/1.0", forHTTPHeaderField: "User-Agent")
-        request.setValue("en-US", forHTTPHeaderField: "Accept-Language")
+        for (name, value) in Self.fixedRelayHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
 
         for (name, value) in profile.postHeaders {
             request.setValue(value, forHTTPHeaderField: name)
@@ -343,35 +448,28 @@ actor OHTTPTransport {
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
+        try await waitForRelayBackoff()
         let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
-
-        // Handle 429 with Retry-After
-        if response.statusCode == 429 {
-            if let retryAfterHeader = response.value(forHTTPHeaderField: "Retry-After") {
-                let retryAfterSeconds: TimeInterval
-                if let seconds = TimeInterval(retryAfterHeader) {
-                    retryAfterSeconds = min(seconds, 120.0)  // Cap at 120 seconds
-                } else if let date = Self.parseHTTPDate(retryAfterHeader) {
-                    retryAfterSeconds = min(date.timeIntervalSinceNow, 120.0)
-                } else {
-                    retryAfterSeconds = 0
-                }
-
-                if retryAfterSeconds > 0 {
-                    try await Task.sleep(nanoseconds: UInt64(retryAfterSeconds * 1_000_000_000))
-                }
-            }
+        if response.statusCode == 429, let delay = Self.retryAfter(response.value(forHTTPHeaderField: "Retry-After")) {
+            await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: cacheKey)
         }
-
         return (data, response)
     }
 
-    private static func parseHTTPDate(_ dateString: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(abbreviation: "GMT")
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return formatter.date(from: dateString)
+    /// Waits out the `Retry-After` of an earlier 429 through this relay before the next post.
+    private func waitForRelayBackoff() async throws {
+        guard let deadline = await keyCache.backoffDeadline(for: cacheKey) else { return }
+        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
+        if remaining > 0 {
+            try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+        }
+    }
+
+    /// The delay of a `Retry-After` value in the delay-seconds form, capped at ``maxRetryAfter``; nil for a
+    /// missing, malformed or date-form value.
+    static func retryAfter(_ value: String?) -> TimeInterval? {
+        guard let value, let seconds = UInt64(value.trimmingCharacters(in: .whitespaces)) else { return nil }
+        return min(TimeInterval(seconds), maxRetryAfter)
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to

@@ -234,10 +234,11 @@ final class OHTTPBehavioralTests: XCTestCase {
         do {
             _ = try await transport.roundTrip(request: testRequest, timeoutMS: 5000)
             XCTFail("A sealed response that does not open must fail")
-        } catch OHTTPError.transportError(let message) {
+        } catch OHTTPError.binaryHttpError(let message) {
+            // A failed open is a format failure (surfaced as INTERNAL), not a transport failure.
             XCTAssertFalse(message.isEmpty)
         } catch {
-            XCTFail("Expected transportError, got \(error)")
+            XCTFail("Expected binaryHttpError, got \(error)")
         }
         XCTAssertEqual(counters.posts, 1)
     }

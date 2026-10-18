@@ -15,14 +15,19 @@ enum OHTTPError: Error {
     case httpStatusError(statusCode: Int, message: String)
     case keyConfigError(String)
     case responseTooLarge(String)
+    /// The sealed request is larger than the relay and the gateway accept; it was not sent.
+    case requestTooLarge(String)
 }
 
 extension OHTTPError {
     /// The error for a failure the shared Rust core reported, by the fixed prefix of its message.
     /// The core's messages never echo request or response content.
     static func native(_ message: String) -> OHTTPError {
-        if message.hasPrefix("binary HTTP") {
+        if message.hasPrefix("binary HTTP") || message.hasPrefix("the gateway's answer") {
             return .binaryHttpError(message)
+        }
+        if message.hasPrefix("an answer larger than") {
+            return .responseTooLarge(message)
         }
         if message.hasPrefix("sealing failed") {
             return .hpkeError(message)

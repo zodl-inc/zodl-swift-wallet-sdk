@@ -135,7 +135,11 @@ enum OHTTPNative {
             }
         }
         guard let sealed else {
-            throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP request could not be sealed"))
+            let error = OHTTPError.native(lastErrorMessage(fallback: "OHTTP request could not be sealed"))
+            if case .responseTooLarge(let message) = error {
+                throw OHTTPError.requestTooLarge(message)
+            }
+            throw error
         }
         defer { zcashlc_free_ohttp_sealed(sealed) }
 
