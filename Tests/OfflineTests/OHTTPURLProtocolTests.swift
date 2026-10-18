@@ -202,7 +202,7 @@ final class OHTTPURLProtocolTests: XCTestCase {
     func testABodyThatBreaksOffLosesTheConnection() async throws {
         OHTTPURLProtocol.streamer = { [self] request in
             OHTTPStreamedResponse(
-                response: response(request),
+                response: response(request, headers: ["Content-Type": "text/event-stream"]),
                 body: body([Data("partial".utf8)], failing: OHTTPError.transportError("the gateway's answer ended before its final chunk"))
             )
         }
