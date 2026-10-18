@@ -21,9 +21,9 @@ actor OHTTPGRPCClient {
     private static let httpOK = 200
     private static let timeoutSlackMS = 5000
 
-    // ZIP 1093: gateway upstream timeout is 80 s; keep grpc-timeout under that with margin
+    // Gateway upstream timeout is 80 s; keep grpc-timeout under that with margin
     private static let maxGRPCTimeoutMS = 75000
-    // ZIP 661: suitable request timeout, leaving room for retries and key fetch
+    // Suitable request timeout, leaving room for retries and key fetch
     private static let maxExchangeTimeoutMS = 100000
 
     init(

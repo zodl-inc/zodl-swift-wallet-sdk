@@ -227,7 +227,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async throws -> MigrationBroadcastOutcome {
-        // ZIP 1619: gateway endpoints must go through OHTTP, even when Tor is enabled.
+        // Gateway endpoints must go through OHTTP, even when Tor is enabled.
         // The Tor transport is used for the OHTTP relay connection, maintaining IP privacy.
         if OHTTPEndpoints.isGateway(endpoint.host) {
             // Fail-closed: any failure to build the runtime is reported as Tor-unavailable.
@@ -285,7 +285,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         to endpoint: LightWalletEndpoint,
         onWillSubmit: @Sendable () -> Void
     ) async -> MigrationBroadcastOutcome {
-        // ZIP 1619: gateway endpoints must go through OHTTP, not plain gRPC.
+        // Gateway endpoints must go through OHTTP, not plain gRPC.
         // Gateways don't speak gRPC directly; they only accept OHTTP-encapsulated requests.
         if OHTTPEndpoints.isGateway(endpoint.host) {
             return await broadcastViaOHTTP(
