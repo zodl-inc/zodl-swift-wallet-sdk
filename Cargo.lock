@@ -3230,7 +3230,7 @@ dependencies = [
  "zcash_voting",
  "zeroize",
  "zip32",
- "zodl-ohttp-client",
+ "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=1b6ab2d83a3fea8d4824cecdbf5a98869d3601de)",
  "zodl-slipstream",
 ]
 
@@ -8849,6 +8849,25 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zodl-ohttp-client"
 version = "0.1.0"
+source = "git+https://github.com/zodl-inc/ohttp.git?rev=1b6ab2d83a3fea8d4824cecdbf5a98869d3601de#1b6ab2d83a3fea8d4824cecdbf5a98869d3601de"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "hpke",
+ "rand_core 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "zeroize",
+]
+
+[[package]]
+name = "zodl-ohttp-client"
+version = "0.1.0"
 source = "git+https://github.com/zodl-inc/ohttp.git?rev=a2986679ec50494755a432e57d97a64c64544d66#a2986679ec50494755a432e57d97a64c64544d66"
 dependencies = [
  "aes-gcm",
@@ -8915,7 +8934,7 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zip32",
- "zodl-ohttp-client",
+ "zodl-ohttp-client 0.1.0 (git+https://github.com/zodl-inc/ohttp.git?rev=a2986679ec50494755a432e57d97a64c64544d66)",
  "zodl-slipstream-gpuhash",
 ]
 

@@ -853,7 +853,30 @@ pub unsafe extern "C" fn zcashlc_free_ohttp_profile_info(ptr: *mut OhttpProfileI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{zcashlc_clear_last_error, zcashlc_last_error_length};
+    use crate::{zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length};
+
+    /// The thread's last error, which the Swift side maps by its prefix (`OHTTPError.native`).
+    fn last_error_message() -> String {
+        let len = zcashlc_last_error_length();
+        assert!(len > 0);
+        let mut error = vec![0u8; len as usize];
+        let copied =
+            unsafe { zcashlc_error_message_utf8(error.as_mut_ptr().cast::<c_char>(), len) };
+        assert_eq!(copied, len);
+        unsafe { CStr::from_ptr(error.as_ptr().cast::<c_char>()) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The 16-byte response nonce, then a non-final chunk of 20 bytes that does not authenticate
+    /// (no AES-GCM ciphertext under the request's secret).
+    fn tampered_non_final_chunk() -> Vec<u8> {
+        let mut wire = vec![0u8; 16];
+        wire.push(20);
+        wire.extend_from_slice(&[0u8; 20]);
+        wire
+    }
 
     /// The profile number of iOS (`ClientProfile::IOS`).
     const IOS: u32 = 2;
@@ -1218,7 +1241,9 @@ mod tests {
         // The answer ends before its final chunk: truncated, a transport failure.
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_stream_finish(decoder) }.is_null());
-        assert!(zcashlc_last_error_length() > 0);
+        assert!(
+            last_error_message().starts_with("the gateway's answer ended before its final chunk")
+        );
         zcashlc_clear_last_error();
         unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
     }
@@ -1230,17 +1255,27 @@ mod tests {
         let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
         assert!(!decoder.is_null());
 
-        // The 16-byte response nonce, then a 20-byte chunk of zeros, which is no AES-GCM
-        // ciphertext.
-        let mut wire = vec![0u8; 16];
-        wire.push(20);
-        wire.extend_from_slice(&[0u8; 20]);
+        // An authentication failure (INTERNAL on the Swift side), not a sealing one.
+        let wire = tampered_non_final_chunk();
         zcashlc_clear_last_error();
         let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), wire.len()) };
         assert!(events.is_null());
-        assert!(zcashlc_last_error_length() > 0);
+        assert_eq!(last_error_message(), "the gateway's answer does not open");
         zcashlc_clear_last_error();
         unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+    }
+
+    #[test]
+    fn a_whole_answer_with_a_non_final_chunk_that_does_not_open_is_an_authentication_failure() {
+        let key = gateway_key();
+        let (opener, _) = take_opener(seal(b"/x", &key));
+        let mut wire = tampered_non_final_chunk();
+        wire.push(0);
+        wire.extend_from_slice(&[0u8; 16]);
+        zcashlc_clear_last_error();
+        assert!(complete(opener, 200, &wire, 0).is_null());
+        assert_eq!(last_error_message(), "the gateway's answer does not open");
+        zcashlc_clear_last_error();
     }
 
     #[test]

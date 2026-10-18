@@ -203,6 +203,8 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertEqual(code(OHTTPError.httpStatusError(statusCode: 413, message: "")), 8)
         XCTAssertEqual(code(OHTTPError.binaryHttpError("bad framing")), 13)
         XCTAssertEqual(code(OHTTPError.responseTooLarge("big answer")), 13)
+        XCTAssertEqual(code(OHTTPError.native("the gateway's answer does not open")), 13)
+        XCTAssertEqual(code(OHTTPError.native("the gateway's answer ended before its final chunk")), 14)
         for status in [401, 403, 409, 426, 429, 500, 502, 503] {
             XCTAssertEqual(code(OHTTPError.httpStatusError(statusCode: status, message: "")), 14, "\(status)")
         }
