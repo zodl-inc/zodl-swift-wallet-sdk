@@ -21,6 +21,11 @@ actor OHTTPGRPCClient {
     private static let httpOK = 200
     private static let timeoutSlackMS = 5000
 
+    // ZIP 1093: gateway upstream timeout is 80 s; keep grpc-timeout under that with margin
+    private static let maxGRPCTimeoutMS = 75000
+    // ZIP 661: suitable request timeout, leaving room for retries and key fetch
+    private static let maxExchangeTimeoutMS = 100000
+
     init(
         authority: String,
         transport: OHTTPTransport,
@@ -39,7 +44,10 @@ actor OHTTPGRPCClient {
         request: Req,
         timeout: Int? = nil
     ) async throws -> Resp {
-        let timeoutMS = timeout ?? singleCallTimeoutMS
+        let requestedTimeoutMS = timeout ?? singleCallTimeoutMS
+        let grpcTimeoutMS = min(requestedTimeoutMS, Self.maxGRPCTimeoutMS)
+        let exchangeTimeoutMS = min(requestedTimeoutMS + Self.timeoutSlackMS, Self.maxExchangeTimeoutMS)
+
         let body = try encodeGRPCMessage(request)
 
         let headers: [(String, String)] = [
@@ -47,7 +55,7 @@ actor OHTTPGRPCClient {
             ("te", "trailers"),
             ("grpc-accept-encoding", "identity"),
             ("user-agent", Self.userAgent),
-            ("grpc-timeout", "\(timeoutMS)m")
+            ("grpc-timeout", "\(grpcTimeoutMS)m")
         ]
 
         let bhttpRequest = OHTTPRequest(
@@ -61,7 +69,7 @@ actor OHTTPGRPCClient {
 
         let bhttpResponse = try await transport.roundTrip(
             request: bhttpRequest,
-            timeoutMS: timeoutMS + Self.timeoutSlackMS
+            timeoutMS: exchangeTimeoutMS
         )
 
         return try parseUnaryResponse(bhttpResponse)
@@ -73,7 +81,10 @@ actor OHTTPGRPCClient {
         request: Req,
         timeout: Int? = nil
     ) async throws -> [Resp] {
-        let timeoutMS = timeout ?? streamingCallTimeoutMS
+        let requestedTimeoutMS = timeout ?? streamingCallTimeoutMS
+        let grpcTimeoutMS = min(requestedTimeoutMS, Self.maxGRPCTimeoutMS)
+        let exchangeTimeoutMS = min(requestedTimeoutMS + Self.timeoutSlackMS, Self.maxExchangeTimeoutMS)
+
         let body = try encodeGRPCMessage(request)
 
         let headers: [(String, String)] = [
@@ -81,7 +92,7 @@ actor OHTTPGRPCClient {
             ("te", "trailers"),
             ("grpc-accept-encoding", "identity"),
             ("user-agent", Self.userAgent),
-            ("grpc-timeout", "\(timeoutMS)m")
+            ("grpc-timeout", "\(grpcTimeoutMS)m")
         ]
 
         let bhttpRequest = OHTTPRequest(
@@ -95,7 +106,7 @@ actor OHTTPGRPCClient {
 
         let bhttpResponse = try await transport.roundTrip(
             request: bhttpRequest,
-            timeoutMS: timeoutMS + Self.timeoutSlackMS
+            timeoutMS: exchangeTimeoutMS
         )
 
         return try parseStreamingResponse(bhttpResponse)
