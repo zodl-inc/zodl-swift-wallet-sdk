@@ -87,6 +87,12 @@ Changes are relative to `5.2.1`.
 - The `libzcashlc` XCFramework's C objects claimed the Xcode SDK version they were built with as their
   minimum OS, above the package's platforms, so linking it could warn that objects were "built for
   newer version". They now claim iOS 16 / macOS 14. No caller changes are required.
+- The Rust core's gRPC connections to lightwalletd, which carry `SlipstreamSynchronizer`'s sync and
+  every lightwalletd request sent over Tor (`TorClient.connectToLightwalletd(endpoint:)`), now run
+  on `h2` 0.4.20. It closes a connection whose server floods it with small HTTP/2 DATA frames,
+  failing the calls on it, where the flood was previously processed without limit. lightwalletd's
+  block streams, which send one small frame per compact block, stay within the limit. No caller
+  changes are required.
 
 # 5.2.1 - 2026-10-14
 
