@@ -118,6 +118,9 @@ Changes are relative to `5.2.1`.
 - The `libzcashlc` XCFramework's C objects claimed the Xcode SDK version they were built with as their
   minimum OS, above the package's platforms, so linking it could warn that objects were "built for
   newer version". They now claim iOS 16 / macOS 14. No caller changes are required.
+- A streamed answer read over Tor (`httpStreamOverOHTTP` in Tor mode, and `OHTTPURLProtocol`
+  sessions in Tor mode) now fails with `URLError.timedOut` when no body bytes arrive for the
+  request's `timeoutInterval`, instead of waiting forever.
 
 # 5.2.1 - 2026-10-14
 

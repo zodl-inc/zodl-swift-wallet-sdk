@@ -263,7 +263,8 @@ public actor TorClient {
     /// resent; only a failure to reach the server, before any of it was sent, is tried again on a new circuit.
     /// The body follows as it arrives, at most `maxBytes` of it. Iterating the body no longer closes the
     /// stream. The body is read on a queue of its own, so a long stream holds no thread of the Swift
-    /// concurrency pool.
+    /// concurrency pool. A body that gets no bytes for `request.timeoutInterval` fails with
+    /// `URLError.timedOut`: a stream may last as long as the server keeps it open, but not stand still for that long.
     func httpPostStream(for request: URLRequest, maxBytes: Int) throws -> OHTTPOuterStream {
         let runtime = try resolveRuntime()
 
@@ -306,7 +307,7 @@ public actor TorClient {
             )
         }
 
-        let reader = TorHTTPStreamReader(stream: streamPtr, owner: self)
+        let reader = TorHTTPStreamReader(stream: streamPtr, owner: self, idleTimeout: request.timeoutInterval)
         return OHTTPOuterStream(
             status: Int(zcashlc_tor_http_stream_status(streamPtr)),
             contentType: reader.header("Content-Type"),
