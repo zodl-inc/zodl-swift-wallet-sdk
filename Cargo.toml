@@ -160,9 +160,8 @@ hex = "0.4"
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. 1b6ab2d8: Error::Open for any chunk that does not
-# authenticate, an empty request sealed as the final chunk alone, checked length sums.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "1b6ab2d83a3fea8d4824cecdbf5a98869d3601de", default-features = false }
+# fails loudly, a branch would follow a force-push. dc65e399: sealed-response cap 256 MiB + 1 MiB, library preset decapsulates outer 200 only, fuzzing fixes.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "dc65e3991d34c1ba29d078d0ddbd28f74d27d0e2", default-features = false }
 
 [dev-dependencies]
 hyper = { version = "1", features = ["client", "http1"] }
@@ -215,10 +214,9 @@ strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.1 lives in slipstream-internal
-# PR #16 (head dc760ef2, not merged yet: chunked connector, grpc-status fix, request freshness, gateway
-# network check, relay rate limits, zodl-ohttp-client 1b6ab2d8 like this package; on 0.4.0-pre.1). Git
+# PR #16 (head 4c91c108, not merged yet: zodl-ohttp-client dc65e399 with sealed-response cap 256 MiB + 1 MiB, library preset decapsulates outer 200 only, fuzzing fixes; on 0.4.0-pre.1). Git
 # dependency pinned by commit; the rev moves to the slipstream-internal main commit once #16 merges.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "3fdc30e900d7d82ec20d2b7c1901eafdfb4ecf39" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "39dee870fea69499367c5a86e7a687912fcd7a02" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
