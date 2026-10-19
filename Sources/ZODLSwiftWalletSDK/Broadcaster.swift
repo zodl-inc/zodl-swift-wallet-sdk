@@ -253,8 +253,10 @@ public struct SubmissionTiming: Equatable {
 public enum TransactionSubmissionOutcome: Equatable {
     /// At least one endpoint accepted the transaction.
     case accepted(by: LightWalletEndpoint)
-    /// Every endpoint responded and none accepted. Carries the first
-    /// lightwalletd rejection (error code + message) that was observed.
+    /// Every endpoint responded and none accepted. Carries the terminal refusal
+    /// (``SubmitRejection``) the SDK recorded when it marked the transaction rejected,
+    /// whichever endpoint gave it; otherwise the first lightwalletd rejection (error
+    /// code + message) that was observed. ``rejection`` tells the two apart.
     case rejected(code: Int, message: String)
     /// Every endpoint failed at the transport level (gRPC/connection error);
     /// no server-level rejection was observed.
@@ -262,7 +264,10 @@ public enum TransactionSubmissionOutcome: Equatable {
     /// No clear decision within `responseTimeout`: at least one endpoint had
     /// not responded when the timer fired (others may have rejected or failed
     /// in the meantime — details are logged). The transaction may still have
-    /// been broadcast — treat as pending, not failed.
+    /// been broadcast — treat as pending, not failed. Once every endpoint's
+    /// submission has ended, a late acceptance is recorded, or the rejection
+    /// their complete answers make; `Synchronizer.transactionSubmissionStatus(for:)`
+    /// and `rejectedTransactionIdsStream` report it.
     case timedOut
     /// Skipped because an earlier transaction in the batch was not accepted.
     case notAttempted

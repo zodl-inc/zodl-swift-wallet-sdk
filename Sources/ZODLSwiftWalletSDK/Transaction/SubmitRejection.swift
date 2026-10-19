@@ -80,8 +80,15 @@ public extension TransactionSubmitResult {
 
 public extension TransactionSubmissionOutcome {
     /// The terminal refusal this outcome reports, or `nil` for any other outcome or a refusal that
-    /// may be transient. `.rejected` carries the first refusal observed; the transaction is
-    /// recorded as rejected when any endpoint refused it terminally and none accepted it.
+    /// may be transient.
+    ///
+    /// From `Broadcaster.submit(transaction:to:timing:)` this is the SDK's own verdict: non-`nil`
+    /// exactly when every endpoint answered, none accepted, at least one refused for good, and the
+    /// SDK recorded the transaction as rejected (``TransactionSubmissionStatus/rejected(_:)``) and
+    /// stopped resubmitting it. `.rejected` then carries that terminal refusal, whichever endpoint
+    /// gave it and in whatever order the answers arrived. A transaction an endpoint had not answered
+    /// by the deadline is `.timedOut` (pending) instead. An Orchard migration preparation is never
+    /// recorded as rejected, and its outcome reports the first refusal observed, as before.
     var rejection: SubmitRejection? {
         guard case let .rejected(code, message) = self else { return nil }
         return SubmitRejection(code: code, message: message)

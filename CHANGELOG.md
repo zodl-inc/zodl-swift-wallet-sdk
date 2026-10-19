@@ -80,7 +80,13 @@ Changes are relative to `5.2.0`.
   bound other than `.consensus` rather than ignore it.
 - `SubmitRejection` (`.tooLarge`, `.expired`, `.invalid`) names a server's refusal of a submitted
   transaction that retrying cannot get past, and `TransactionSubmitResult.rejection` and
-  `TransactionSubmissionOutcome.rejection` report it (`nil` for anything else). `.tooLarge` is error
+  `TransactionSubmissionOutcome.rejection` report it (`nil` for anything else). The outcome of
+  `Broadcaster.submit(transaction:to:timing:)` is the SDK's verdict: its `rejection` is non-`nil`
+  exactly when the SDK recorded the transaction as rejected
+  (`TransactionSubmissionStatus.rejected`) and stopped resubmitting it, and `.rejected(code:message:)`
+  then carries that terminal refusal rather than the first refusal to arrive, so a transient
+  refusal from one endpoint no longer hides a terminal one from another. Migration preparations
+  keep reporting the first refusal, as before. `.tooLarge` is error
   code `-25` with a message naming the configured mempool maximum or the next block's ZIP 218
   limit; `.expired` is code `-25` or `-26` with a message naming an expiry (`greater than its
   expiry`, `tx-overwinter-expired`, `tx-expiring-soon`); `.invalid` is any other `-26` except a
@@ -110,10 +116,13 @@ Changes are relative to `5.2.0`.
   transaction was submitted to explicitly refused it terminally and none accepted it. The SDK then stops
   resubmitting it in the background, where it previously retried until expiry; its inputs stay
   reserved until it expires. A transaction with a retry plan (the endpoints given to
-  `Broadcaster.submit` or `releaseForResubmission`) is recorded as rejected as soon as one endpoint
-  explicitly refuses it terminally and none accepts it, whether on submission or on a background
-  retry; endpoints that did not answer, timed out, failed at the transport level or refused
-  transiently neither prevent nor count towards it. A later acceptance clears the rejection. Transactions submitted by `createProposedTransactions` or
+  `Broadcaster.submit` or `releaseForResubmission`) is recorded as rejected once every endpoint
+  has answered, none accepted it and at least one explicitly refused it terminally, whether on
+  submission or on a background retry; a transient refusal or a transport failure beside it
+  neither prevents nor counts towards it. An endpoint still in flight at the response deadline
+  keeps the transaction pending: `Broadcaster.submit` returns `.timedOut`, and once every
+  endpoint's submission has ended the SDK records a late acceptance, or the rejection the complete
+  answers make. Any acceptance, including a late one, clears the rejection. Transactions submitted by `createProposedTransactions` or
   `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected, and
   neither are migration preparations handed out by `takeMigrationPreparation(accountUUID:byTxid:)`,
   which are resubmitted until they expire, as before. An

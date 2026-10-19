@@ -14,6 +14,7 @@ final class SDKBroadcaster: Broadcaster {
     private let submitPlanStore: SubmitPlanStoring
     private let multiEndpointSubmitter: MultiEndpointSubmitter
     private let statusCheck: () throws -> Void
+    private let settlements = SubmissionSettlements()
 
     init(
         transactionEncoder: TransactionEncoder,
@@ -94,53 +95,38 @@ final class SDKBroadcaster: Broadcaster {
         let lifecycle = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
 
         let result = await multiEndpointSubmitter.submitClassifyingRejection(transaction: transaction, to: endpoints, timing: timing)
-        let outcome = result.outcome
+        var outcome = result.outcome
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
 
-        // A node refused it for good and none took it: report it rejected and stop background
-        // resubmission, which could only repeat the refusal until the transaction expires.
         switch outcome {
-        case .rejected, .timedOut, .unreachable:
+        case .accepted(by: let endpoint):
+            // Remember which server took it, so the app can tell "handed to a
+            // server" apart from "still trying" while the transaction waits to be
+            // mined. Retrying continues either way — a mempool is not a commitment.
+            await submitPlanStore.markAccepted(txId: transaction.txId, host: endpointKey(endpoint), lifecycle: lifecycle)
+
+        case .rejected, .unreachable:
+            // Every endpoint answered and none took it. A node that refused it for good makes it
+            // rejected, and background resubmission stops: it could only repeat the refusal until
+            // the transaction expires.
             await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
-        case .accepted, .notAttempted, .cancelled:
+            // Report the verdict the SDK recorded, so the caller routes on the same terminal
+            // refusal that stopped resubmission rather than on whichever refusal arrived first.
+            if case .rejected = outcome, case let .rejected(code, reason)? = await submitPlanStore.plan(for: transaction.txId) {
+                outcome = .rejected(code: code, message: reason)
+            }
+
+        case .timedOut, .cancelled:
+            // An endpoint had not answered when the caller was released, so the transaction is
+            // pending: it may still take it. Once every endpoint's submission has ended, record a
+            // late acceptance, or the rejection the complete answers make.
+            await reconcileWhenSettled(txId: transaction.txId, endpoints: endpoints, result: result, lifecycle: lifecycle)
+
+        case .notAttempted:
             break
         }
 
-        // Remember which server took it, so the app can tell "handed to a
-        // server" apart from "still trying" while the transaction waits to be
-        // mined. Retrying continues either way — a mempool is not a commitment.
-        if case .accepted(by: let endpoint) = outcome {
-            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)", lifecycle: lifecycle)
-        }
-
         return outcome
-    }
-
-    /// Records the transaction as rejected when the verdict over its endpoints' answers says so.
-    private func recordRejectionVerdict(
-        txId: Data,
-        endpoints: [LightWalletEndpoint],
-        outcomes: [String: EndpointSubmission],
-        lifecycle: SubmitPlanLifecycle
-    ) async {
-        let planEndpoints: [LightWalletEndpoint]
-        let previous: StoredRejection?
-        switch await submitPlanStore.plan(for: txId) {
-        case let .ready(stored, acceptedBy: nil):
-            planEndpoints = stored
-            previous = nil
-        case let .rejected(code, reason):
-            // The plan just recorded is this call's endpoints; the rejection columns survive it.
-            planEndpoints = endpoints
-            previous = StoredRejection(code: code, reason: reason)
-        default:
-            // Accepted at some point, unreadable, or gone: never rejected.
-            return
-        }
-        guard let verdict = submitRejectionVerdict(planEndpoints: planEndpoints, outcomes: outcomes, previous: previous) else {
-            return
-        }
-        await submitPlanStore.markRejected(txId: txId, code: verdict.code, reason: verdict.reason, lifecycle: lifecycle)
     }
 
     func releaseForResubmission(
@@ -323,5 +309,89 @@ final class SDKBroadcaster: Broadcaster {
         }
 
         return createdTransactions
+    }
+}
+
+// MARK: - Rejection verdict and settlement
+
+extension SDKBroadcaster {
+    /// Waits, off the caller's path, for every endpoint's submission in `result` to end, then
+    /// records what the complete answers say: any acceptance marks the transaction accepted (which
+    /// clears a recorded rejection), otherwise the rejection verdict over all of them applies.
+    private func reconcileWhenSettled(
+        txId: Data,
+        endpoints: [LightWalletEndpoint],
+        result: MultiEndpointSubmitter.RaceResult,
+        lifecycle: SubmitPlanLifecycle
+    ) async {
+        await settlements.run { [self] in
+            let answers = await result.settledEndpointOutcomes()
+            if let accepting = endpoints.first(where: { answers[endpointKey($0)] == .accepted }) {
+                logger.info("Transaction \(txId.toHexStringTxId()) accepted by \(endpointKey(accepting)) after the caller was released.")
+                await submitPlanStore.markAccepted(txId: txId, host: endpointKey(accepting), lifecycle: lifecycle)
+            } else {
+                await recordRejectionVerdict(txId: txId, endpoints: endpoints, outcomes: answers, lifecycle: lifecycle)
+            }
+        }
+    }
+
+    /// Waits for every reconciliation of a submission that outlived its caller to finish.
+    func waitForSettledSubmissions() async {
+        await settlements.waitForAll()
+    }
+
+    /// Records the transaction as rejected when the verdict over its endpoints' answers says so.
+    private func recordRejectionVerdict(
+        txId: Data,
+        endpoints: [LightWalletEndpoint],
+        outcomes: [String: EndpointSubmission],
+        lifecycle: SubmitPlanLifecycle
+    ) async {
+        let planEndpoints: [LightWalletEndpoint]
+        let previous: StoredRejection?
+        switch await submitPlanStore.plan(for: txId) {
+        case let .ready(stored, acceptedBy: nil):
+            planEndpoints = stored
+            previous = nil
+        case let .rejected(code, reason):
+            // The plan just recorded is this call's endpoints; the rejection columns survive it.
+            planEndpoints = endpoints
+            previous = StoredRejection(code: code, reason: reason)
+        default:
+            // Accepted at some point, unreadable, or gone: never rejected.
+            return
+        }
+        guard let verdict = submitRejectionVerdict(planEndpoints: planEndpoints, outcomes: outcomes, previous: previous) else {
+            return
+        }
+        await submitPlanStore.markRejected(txId: txId, code: verdict.code, reason: verdict.reason, lifecycle: lifecycle)
+    }
+}
+
+/// The reconciliations of submissions that outlived their caller (see
+/// `SDKBroadcaster.reconcileWhenSettled`), kept so tests can wait for them.
+private actor SubmissionSettlements {
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+
+    func run(_ operation: @escaping () async -> Void) {
+        let id = UUID()
+        // Inserted before the task can reach `finished(_:)`, which needs this actor.
+        tasks[id] = Task {
+            await operation()
+            await self.finished(id)
+        }
+    }
+
+    func waitForAll() async {
+        while !tasks.isEmpty {
+            for (id, task) in tasks {
+                await task.value
+                tasks[id] = nil
+            }
+        }
+    }
+
+    private func finished(_ id: UUID) {
+        tasks[id] = nil
     }
 }

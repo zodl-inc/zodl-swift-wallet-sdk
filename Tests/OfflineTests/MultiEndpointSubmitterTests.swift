@@ -107,6 +107,28 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         )
     }
 
+    func testAnAnswerAfterTheDeadlineIsInTheSettledOutcomes() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        let gate = Gate()
+        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .gated(gate, then: .succeed), for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(
+            transaction: makeTransaction(),
+            to: endpoints,
+            timing: SubmissionTiming(responseTimeout: 0.2, postAcceptanceGraceDelay: 0.1)
+        )
+        XCTAssertEqual(result.outcome, .timedOut)
+        XCTAssertNil(result.endpointOutcomes[endpointKey(endpoint(2))])
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+
+        gate.open()
+        let settled = await result.settledEndpointOutcomes()
+
+        XCTAssertEqual(settled[endpointKey(endpoint(1))], .refused(code: -26, message: "bad-txns"))
+        XCTAssertEqual(settled[endpointKey(endpoint(2))], .accepted, "work that ignores cancellation still answers")
+    }
+
     func testAnAcceptanceIsNeverRejectedByAll() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))

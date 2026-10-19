@@ -21,7 +21,7 @@ enum StoredSubmitPlan: Equatable {
     /// A node the transaction was submitted to refused it for good (see `SubmitRejection`) and
     /// none accepted it. Resubmission must skip it: the same transaction
     /// cannot succeed, and retrying would only repeat the refusal until it expires. `code` and
-    /// `reason` are the first refusal's.
+    /// `reason` are the recorded terminal refusal's (see `submitRejectionVerdict`).
     case rejected(code: Int, reason: String)
     /// The store cannot be read, so whether a plan exists is unknown.
     /// Resubmission must skip the transaction: auto-submitting something the

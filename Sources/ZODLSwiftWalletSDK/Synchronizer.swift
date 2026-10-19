@@ -139,8 +139,9 @@ public enum TransactionSubmissionStatus: Equatable {
     case submitted
     /// A server accepted the transaction into its mempool. `host` is `host:port`.
     case accepted(host: String)
-    /// A server explicitly refused the transaction for good (``SubmitRejection``) and none accepted
-    /// it; servers that did not answer or failed transiently do not prevent this.
+    /// A server explicitly refused the transaction for good (``SubmitRejection``), every other
+    /// server answered, and none accepted it; transient refusals and transport failures beside it do
+    /// not prevent this, but a server that has not answered yet does.
     /// The SDK no longer resubmits it. Its inputs stay reserved until it expires, when the
     /// transaction's state becomes expired and the funds spendable again.
     case rejected(SubmitRejection)

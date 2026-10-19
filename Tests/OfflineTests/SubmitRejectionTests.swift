@@ -89,11 +89,16 @@ final class SubmitRejectionTests: XCTestCase {
         XCTAssertEqual(verdict, StoredRejection(code: -26, reason: "bad"), "the first refusal in plan order is recorded")
     }
 
-    func testOneExplicitRejectionWithAnUnansweredEndpointIsRejected() {
-        XCTAssertEqual(
+    func testOneExplicitRejectionWithAnUnansweredEndpointStaysPending() {
+        XCTAssertNil(
             submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: nil),
-            StoredRejection(code: -26, reason: "bad"),
-            "an endpoint that timed out does not hold back an explicit rejection"
+            "an endpoint that has not answered may still accept it"
+        )
+        let previous = StoredRejection(code: -25, reason: zakuraTooLarge)
+        XCTAssertEqual(
+            submitRejectionVerdict(planEndpoints: [endpointA, endpointB], outcomes: [endpointKey(endpointA): terminal], previous: previous),
+            previous,
+            "no new rejection is drawn; an earlier one merely stands"
         )
     }
 
