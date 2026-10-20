@@ -318,7 +318,19 @@ actor OHTTPTransport {
     }
 
     /// Fetches the signed key configuration through the relay and verifies it.
+    /// On relay failure, tries DNS-over-HTTPS as a fallback source.
     private func fetchKeyConfig(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
+        // Try relay first (primary source)
+        do {
+            return try await fetchKeyConfigFromRelay(profile: profile)
+        } catch let relayError {
+            // Relay fetch failed, try DNS fallback
+            return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
+        }
+    }
+
+    /// Fetches the signed key configuration through the relay.
+    private func fetchKeyConfigFromRelay(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
         // Derive signed config URL from relayURL (replace path suffix /relay with /ohttp-configs/signed)
         let signedURL = try OHTTPNative.signedConfigURL(relayURL: relayURL)
 
@@ -343,6 +355,77 @@ actor OHTTPTransport {
         }
 
         return verified
+    }
+
+    /// Tries DNS-over-HTTPS as a fallback source when relay fetch fails.
+    /// Queries each resolver in order (Cloudflare, then Google), parses the DoH JSON
+    /// response to extract the signed envelope, and verifies it.
+    private func fetchKeyConfigFromDNS(relayError: Error, profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
+        // Get DNS resolvers
+        guard let resolvers = try? OHTTPNative.dohResolvers() else {
+            throw relayError  // DNS fallback not available, throw original error
+        }
+
+        var lastError: Error = relayError
+
+        for resolver in resolvers {
+            do {
+                // Construct DoH URL for this resolver
+                guard let dohURL = try? OHTTPNative.dohQueryURL(resolver: resolver, gatewayHost: gatewayHost) else {
+                    continue
+                }
+
+                // Fetch DoH JSON
+                let dohBody = try await httpGetForDNS(url: dohURL, timeoutMS: keyFetchTimeoutMS)
+
+                // Parse envelope from DoH JSON
+                guard let envelope = try? OHTTPNative.envelopeFromDohJSON(dohBody: dohBody, gatewayHost: gatewayHost) else {
+                    lastError = OHTTPError.transportError("DoH parse failed for \(resolver)")
+                    continue
+                }
+
+                // Verify envelope (same path as relay)
+                let now = testNow ?? Date()
+                let verified: OHTTPVerifiedKey
+                if let testKeyVerifier {
+                    verified = try testKeyVerifier(envelope, now)
+                } else {
+                    verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: envelope, now: now)
+                }
+
+                return verified
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+
+        // All resolvers failed
+        throw lastError
+    }
+
+    /// HTTP GET for DoH queries (adds Accept: application/dns-json header).
+    private func httpGetForDNS(url: String, timeoutMS: Int) async throws -> Data {
+        guard let urlObj = URL(string: url) else {
+            throw OHTTPError.transportError("Invalid DoH URL: \(url)")
+        }
+
+        var request = URLRequest(url: urlObj)
+        request.httpMethod = "GET"
+        request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = TimeInterval(timeoutMS) / 1000.0
+
+        let (data, response) = try await httpSender(request, 64 * 1024) // 64 KiB limit for DoH
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OHTTPError.transportError("DoH response is not HTTP")
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw OHTTPError.transportError("DoH query failed: HTTP \(httpResponse.statusCode)")
+        }
+
+        return data
     }
 
     /// Performs one OHTTP call: `roundTripOnce`, and once more (sealed afresh) when the gateway refused the

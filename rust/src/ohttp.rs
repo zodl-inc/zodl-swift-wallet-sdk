@@ -1300,3 +1300,154 @@ mod tests {
         zcashlc_clear_last_error();
     }
 }
+
+/// Returns the DNS name of the signed Key Configuration TXT record for `gateway_host`:
+/// `ohttp-keys.example` or `ohttp-keys-testnet.example`.
+///
+/// The returned string is NUL-terminated and must be freed with [`zcashlc_string_free`].
+/// On error, returns null and leaves the error in the thread-local last error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_key_config_dns_name(
+    gateway_host: *const c_char,
+) -> *mut c_char {
+    let res = catch_panic(|| {
+        use zodl_ohttp_client::{NetworkRule, key_config_dns_name};
+
+        let host = unsafe { CStr::from_ptr(gateway_host) }
+            .to_str()
+            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
+
+        let network = NetworkRule::KnownHosts
+            .network_for(host)
+            .map_err(|e| anyhow!("{}", e))?;
+
+        let dns_name = key_config_dns_name(network);
+
+        CString::new(dns_name)
+            .map(|s| s.into_raw())
+            .map_err(|e| anyhow!("DNS name contains null byte: {}", e))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Returns the DoH query URL (JSON API) for `resolver` and `gateway_host`: the URL to GET
+/// to fetch the TXT record as JSON.
+///
+/// The returned string is NUL-terminated and must be freed with [`zcashlc_string_free`].
+/// On error, returns null and leaves the error in the thread-local last error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
+    resolver: *const c_char,
+    gateway_host: *const c_char,
+) -> *mut c_char {
+    let res = catch_panic(|| {
+        use zodl_ohttp_client::{NetworkRule, doh_query_url};
+
+        let resolver = unsafe { CStr::from_ptr(resolver) }
+            .to_str()
+            .map_err(|e| anyhow!("invalid resolver: {}", e))?;
+
+        let host = unsafe { CStr::from_ptr(gateway_host) }
+            .to_str()
+            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
+
+        let network = NetworkRule::KnownHosts
+            .network_for(host)
+            .map_err(|e| anyhow!("{}", e))?;
+
+        let url = doh_query_url(resolver, network);
+
+        CString::new(url)
+            .map(|s| s.into_raw())
+            .map_err(|e| anyhow!("DoH URL contains null byte: {}", e))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Parses a DoH JSON response (`doh_body`) and extracts the signed envelope.
+/// The envelope can then be verified with [`zcashlc_ohttp_verify_key_config`].
+///
+/// Returns a pointer to the envelope bytes and stores the length in `*envelope_len_out`.
+/// The returned pointer must be freed with [`zcashlc_vec_u8_free`].
+/// On error, returns null and leaves the error in the thread-local last error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_envelope_from_doh_json(
+    doh_body: *const u8,
+    doh_body_len: usize,
+    gateway_host: *const c_char,
+    envelope_len_out: *mut usize,
+) -> *mut u8 {
+    let res = catch_panic(|| {
+        use zodl_ohttp_client::{NetworkRule, envelope_from_doh_json};
+
+        let body = unsafe { std::slice::from_raw_parts(doh_body, doh_body_len) };
+
+        let host = unsafe { CStr::from_ptr(gateway_host) }
+            .to_str()
+            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
+
+        let network = NetworkRule::KnownHosts
+            .network_for(host)
+            .map_err(|e| anyhow!("{}", e))?;
+
+        let envelope = envelope_from_doh_json(body, network)?;
+
+        unsafe {
+            *envelope_len_out = envelope.len();
+        }
+
+        Ok(ptr_from_vec(envelope))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Returns the DNS-over-HTTPS resolvers as a null-terminated array of C strings.
+/// Each string must be freed with [`zcashlc_string_free`], and the array itself
+/// must be freed with [`zcashlc_free_ohttp_doh_resolvers`].
+/// On error, returns null (though this function should not normally fail).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_doh_resolvers() -> *mut *mut c_char {
+    let res = catch_panic(|| {
+        use zodl_ohttp_client::DOH_RESOLVERS;
+
+        let mut ptrs: Vec<*mut c_char> = DOH_RESOLVERS
+            .iter()
+            .map(|&resolver| {
+                CString::new(resolver)
+                    .map(|s| s.into_raw())
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("resolver contains null byte"))?;
+
+        // Add null terminator
+        ptrs.push(ptr::null_mut());
+
+        Ok(ptr_from_vec(ptrs))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Frees the array returned by [`zcashlc_ohttp_doh_resolvers`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_ohttp_doh_resolvers(resolvers: *mut *mut c_char) {
+    if resolvers.is_null() {
+        return;
+    }
+
+    // Free each string
+    let mut i = 0;
+    loop {
+        let ptr = unsafe { *resolvers.add(i) };
+        if ptr.is_null() {
+            break;
+        }
+        unsafe {
+            drop(CString::from_raw(ptr));
+        }
+        i += 1;
+    }
+
+    // Free the array itself
+    free_ptr_from_vec(resolvers);
+}

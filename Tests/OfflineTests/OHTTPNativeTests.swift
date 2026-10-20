@@ -291,3 +291,72 @@ final class OHTTPNativeTests: XCTestCase {
         }
     }
 }
+
+    // MARK: - DNS Fallback Helpers
+
+    func testDNSHelpersAvailable() throws {
+        // Test that DNS resolver list is available
+        let resolvers = try OHTTPNative.dohResolvers()
+        XCTAssertEqual(resolvers.count, 2, "Expected two DNS resolvers (Cloudflare and Google)")
+        XCTAssertTrue(resolvers[0].contains("cloudflare"), "First resolver should be Cloudflare")
+        XCTAssertTrue(resolvers[1].contains("google"), "Second resolver should be Google")
+    }
+
+    func testDNSQueryURLConstruction() throws {
+        // Test mainnet URL construction
+        let mainnetURL = try OHTTPNative.dohQueryURL(
+            resolver: "https://cloudflare-dns.com/dns-query",
+            gatewayHost: "ohttp-gateway.example"
+        )
+        XCTAssertTrue(mainnetURL.contains("ohttp-keys.example"), "Mainnet URL should contain mainnet DNS name")
+        XCTAssertTrue(mainnetURL.contains("type=TXT"), "URL should request TXT records")
+
+        // Test testnet URL construction
+        let testnetURL = try OHTTPNative.dohQueryURL(
+            resolver: "https://dns.google/resolve",
+            gatewayHost: "ohttp-gateway-testnet.example"
+        )
+        XCTAssertTrue(testnetURL.contains("ohttp-keys-testnet.example"), "Testnet URL should contain testnet DNS name")
+        XCTAssertTrue(testnetURL.contains("edns_client_subnet=0.0.0.0/0"), "Google resolver should include ECS parameter")
+    }
+
+    func testDNSEnvelopeParsingWithRealFixture() throws {
+        // Real captured Cloudflare mainnet DoH JSON response (2026-10-20)
+        let cloudflareJSON = """
+        {
+          "Status": 0,
+          "TC": false,
+          "RD": true,
+          "RA": true,
+          "AD": false,
+          "CD": false,
+          "Question": [
+            {
+              "name": "ohttp-keys.example",
+              "type": 16
+            }
+          ],
+          "Answer": [
+            {
+              "name": "ohttp-keys.example",
+              "type": 16,
+              "TTL": 300,
+              "data": "\\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\\" \\"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\\""
+            }
+          ]
+        }
+        """
+
+        let dohBody = Data(cloudflareJSON.utf8)
+        let envelope = try OHTTPNative.envelopeFromDohJSON(dohBody: dohBody, gatewayHost: "ohttp-gateway.example")
+
+        XCTAssertFalse(envelope.isEmpty, "Parsed envelope should not be empty")
+        XCTAssertEqual(envelope.count, 264, "Expected envelope length from fixture")
+
+        // Verify the envelope can be parsed as JSON and has expected fields
+        let json = try JSONSerialization.jsonObject(with: envelope) as? [String: Any]
+        XCTAssertNotNil(json, "Envelope should be valid JSON")
+        XCTAssertEqual(json?["v"] as? Int, 1, "Envelope version should be 1")
+        XCTAssertEqual(json?["network"] as? String, "mainnet", "Network should be mainnet")
+        XCTAssertEqual(json?["key_id"] as? String, "ba8a2dbd", "Key ID should match fixture")
+    }

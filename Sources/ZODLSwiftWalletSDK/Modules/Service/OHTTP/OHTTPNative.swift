@@ -345,4 +345,63 @@ final class OHTTPPendingResponse: @unchecked Sendable {
     private static func withOptionalCString<R>(_ string: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
         OHTTPNative.withOptionalCString(string, body)
     }
+
+    /// Returns the DNS-over-HTTPS resolvers tried in order (Cloudflare, then Google).
+    static func dohResolvers() throws -> [String] {
+        guard let resolvers = zcashlc_ohttp_doh_resolvers() else {
+            throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH resolvers not available"))
+        }
+        defer { zcashlc_free_ohttp_doh_resolvers(resolvers) }
+
+        var result: [String] = []
+        var i = 0
+        while true {
+            guard let ptr = resolvers[i] else {
+                break
+            }
+            if ptr == nil {
+                break
+            }
+            result.append(String(cString: ptr!))
+            i += 1
+        }
+        return result
+    }
+
+    /// Returns the DoH query URL (JSON API) for `resolver` and `gatewayHost`.
+    static func dohQueryURL(resolver: String, gatewayHost: String) throws -> String {
+        let resolverBytes = Array(resolver.utf8)
+        let hostBytes = Array(gatewayHost.utf8)
+        let result: UnsafeMutablePointer<CChar>? = resolverBytes.withUnsafeBufferPointer { resolverBuffer in
+            hostBytes.withUnsafeBufferPointer { hostBuffer in
+                zcashlc_ohttp_doh_query_url(resolverBuffer.baseAddress, hostBuffer.baseAddress)
+            }
+        }
+        guard let result else {
+            throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH query URL could not be constructed"))
+        }
+        defer { zcashlc_string_free(result) }
+        return String(cString: result)
+    }
+
+    /// Parses a DoH JSON response and extracts the signed envelope.
+    static func envelopeFromDohJSON(dohBody: Data, gatewayHost: String) throws -> Data {
+        let hostBytes = Array(gatewayHost.utf8)
+        var envelopeLen: UInt = 0
+        let result: UnsafeMutablePointer<UInt8>? = dohBody.withUnsafeBytes { bodyBuffer in
+            hostBytes.withUnsafeBufferPointer { hostBuffer in
+                zcashlc_ohttp_envelope_from_doh_json(
+                    bodyBuffer.bindMemory(to: UInt8.self).baseAddress,
+                    UInt(bodyBuffer.count),
+                    hostBuffer.baseAddress,
+                    &envelopeLen
+                )
+            }
+        }
+        guard let result else {
+            throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH response could not be parsed"))
+        }
+        defer { zcashlc_vec_u8_free(result, envelopeLen) }
+        return Data(bytes: result, count: Int(envelopeLen))
+    }
 }
