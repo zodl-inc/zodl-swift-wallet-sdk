@@ -26,7 +26,7 @@
 //! thread-local last error. The text is the core's fixed `Display` of the failure, which does not
 //! quote the request or the response body.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
