@@ -613,9 +613,9 @@ final class OHTTPE2ETests: ZcashTestCase {
             return try await sync.httpRequestOverOHTTP(for: request, viaTor: true)
         } else {
             // OHTTP only (clearnet → relay → gateway)
-            let relayURL = try OHTTPEndpoints.relayURL(for: proxyHost)
-            let keyConfigURL = OHTTPEndpoints.keyConfigURL(for: proxyHost)
-            let transport = OHTTPTransport(gatewayHost: proxyHost, relayURL: relayURL, keyConfigURL: keyConfigURL)
+            // These services are mainnet ones; the alias is the authority, the gateway is mainnet's.
+            let route = try OHTTPEndpoints.proxyRoute(for: proxyHost, network: .mainnet)
+            let transport = OHTTPTransport(gatewayHost: route.gatewayHost, relayURL: route.relayURL, keyConfigURL: route.keyConfigURL)
 
             // For allowlisted hosts, authority is the original host; for static mappings, it's the proxy host
             let authority = (proxyHost.lowercased() != originalHost.lowercased()) ? proxyHost : originalHost
