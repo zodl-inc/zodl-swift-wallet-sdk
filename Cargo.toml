@@ -216,7 +216,7 @@ strip = false
 # The slipstream engine's OHTTP connector for 0.4.0-pre.1 lives in slipstream-internal
 # PR #16 (head 54b84f89, DNS fallback: zodl-ohttp-client b0b2087c with DNS support; on 0.4.0-pre.1). Git
 # dependency pinned by commit; the rev moves to the slipstream-internal main commit once #16 merges.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "2de250de044fde55ed72e82f229ef27254be33e4" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "8e6cbc93e1fff6f6be18d8d4531731055321f846" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
