@@ -294,30 +294,20 @@ final class OHTTPNativeTests: XCTestCase {
 
     // MARK: - DNS Fallback Helpers
 
-    func testDNSHelpersAvailable() throws {
-        // Test that DNS resolver list is available
-        let resolvers = try OHTTPNative.dohResolvers()
-        XCTAssertEqual(resolvers.count, 2, "Expected two DNS resolvers (Cloudflare and Google)")
-        XCTAssertTrue(resolvers[0].contains("cloudflare"), "First resolver should be Cloudflare")
-        XCTAssertTrue(resolvers[1].contains("google"), "Second resolver should be Google")
+    func testDNSQueryURLsFollowTheResolverOrderAndTheNetwork() throws {
+        let mainnet = try OHTTPNative.dohQueryURLs(gatewayHost: "ohttp-gateway.example")
+        XCTAssertEqual(mainnet.count, 2)
+        XCTAssertTrue(mainnet[0].hasPrefix("https://cloudflare-dns.com/dns-query?"), mainnet[0])
+        XCTAssertTrue(mainnet[1].hasPrefix("https://dns.google/resolve?"), mainnet[1])
+        XCTAssertTrue(mainnet[1].contains("edns_client_subnet=0.0.0.0/0"), mainnet[1])
+        XCTAssertTrue(mainnet.allSatisfy { $0.contains("ohttp-keys.example") && $0.contains("type=TXT") })
+
+        let testnet = try OHTTPNative.dohQueryURLs(gatewayHost: "OHTTP-GATEWAY-TESTNET.zodl.com")
+        XCTAssertTrue(testnet.allSatisfy { $0.contains("ohttp-keys-testnet.example") })
     }
 
-    func testDNSQueryURLConstruction() throws {
-        // Test mainnet URL construction
-        let mainnetURL = try OHTTPNative.dohQueryURL(
-            resolver: "https://cloudflare-dns.com/dns-query",
-            gatewayHost: "ohttp-gateway.example"
-        )
-        XCTAssertTrue(mainnetURL.contains("ohttp-keys.example"), "Mainnet URL should contain mainnet DNS name")
-        XCTAssertTrue(mainnetURL.contains("type=TXT"), "URL should request TXT records")
-
-        // Test testnet URL construction
-        let testnetURL = try OHTTPNative.dohQueryURL(
-            resolver: "https://dns.google/resolve",
-            gatewayHost: "ohttp-gateway-testnet.example"
-        )
-        XCTAssertTrue(testnetURL.contains("ohttp-keys-testnet.example"), "Testnet URL should contain testnet DNS name")
-        XCTAssertTrue(testnetURL.contains("edns_client_subnet=0.0.0.0/0"), "Google resolver should include ECS parameter")
+    func testDNSQueryURLsRefuseAnUnknownGatewayHost() {
+        XCTAssertThrowsError(try OHTTPNative.dohQueryURLs(gatewayHost: "gateway.example"))
     }
 
     func testDNSEnvelopeParsingWithRealFixture() throws {

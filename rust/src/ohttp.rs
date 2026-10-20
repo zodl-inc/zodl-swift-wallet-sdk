@@ -26,7 +26,7 @@
 //! thread-local last error. The text is the core's fixed `Display` of the failure, which does not
 //! quote the request or the response body.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
@@ -1301,149 +1301,81 @@ mod tests {
     }
 }
 
-/// Returns the DNS name of the signed Key Configuration TXT record for `gateway_host`:
-/// `ohttp-keys.example` or `ohttp-keys-testnet.example`.
-///
-/// The returned string is NUL-terminated and must be freed with [`zcashlc_string_free`].
-/// On error, returns null and leaves the error in the thread-local last error.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_ohttp_key_config_dns_name(
-    gateway_host: *const c_char,
-) -> *mut c_char {
-    let res = catch_panic(|| {
-        use zodl_ohttp_client::{NetworkRule, key_config_dns_name};
-
-        let host = unsafe { CStr::from_ptr(gateway_host) }
-            .to_str()
-            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
-
-        let network = NetworkRule::KnownHosts
-            .network_for(host)
-            .map_err(|e| anyhow!("{}", e))?;
-
-        let dns_name = key_config_dns_name(network);
-
-        CString::new(dns_name)
-            .map(|s| s.into_raw())
-            .map_err(|e| anyhow!("DNS name contains null byte: {}", e))
-    });
-    unwrap_exc_or_null(res)
+/// The network of a gateway host for the DNS source: the same static known-hosts rule as the
+/// key-config verification, on the lower-cased host.
+fn dns_network(host: *const u8, host_len: usize) -> anyhow::Result<Network> {
+    let host = std::str::from_utf8(unsafe { bytes(host, host_len)? })
+        .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
+    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&host.to_ascii_lowercase())?)
 }
 
-/// Returns the DoH query URL (JSON API) for `resolver` and `gateway_host`: the URL to GET
-/// to fetch the TXT record as JSON.
+/// The number of DNS-over-HTTPS resolvers of the signed Key Configuration DNS source, tried in
+/// index order by [`zcashlc_ohttp_doh_query_url`].
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_doh_resolver_count() -> u32 {
+    zodl_ohttp_client::DOH_RESOLVERS.len() as u32
+}
+
+/// The DoH (JSON API) query URL of resolver `index` for the TXT record of `gateway_host`'s network.
+/// Send it with `accept: application/dns-json`, only after the relay source failed.
 ///
-/// The returned string is NUL-terminated and must be freed with [`zcashlc_string_free`].
-/// On error, returns null and leaves the error in the thread-local last error.
+/// Returns a NUL-terminated string to free with [`zcashlc_string_free`], or null with the error
+/// in the thread-local last error.
+///
+/// # Safety
+///
+/// - `gateway_host` must be valid for reads for `gateway_host_len` bytes, or null when the length
+///   is zero.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
-    resolver: *const c_char,
-    gateway_host: *const c_char,
+    index: u32,
+    gateway_host: *const u8,
+    gateway_host_len: usize,
 ) -> *mut c_char {
     let res = catch_panic(|| {
-        use zodl_ohttp_client::{NetworkRule, doh_query_url};
-
-        let resolver = unsafe { CStr::from_ptr(resolver) }
-            .to_str()
-            .map_err(|e| anyhow!("invalid resolver: {}", e))?;
-
-        let host = unsafe { CStr::from_ptr(gateway_host) }
-            .to_str()
-            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
-
-        let network = NetworkRule::KnownHosts
-            .network_for(host)
-            .map_err(|e| anyhow!("{}", e))?;
-
-        let url = doh_query_url(resolver, network);
-
-        CString::new(url)
-            .map(|s| s.into_raw())
-            .map_err(|e| anyhow!("DoH URL contains null byte: {}", e))
+        let network = dns_network(gateway_host, gateway_host_len)?;
+        let resolver = zodl_ohttp_client::DOH_RESOLVERS
+            .get(index as usize)
+            .ok_or_else(|| anyhow!("no DoH resolver {index}"))?;
+        Ok(CString::new(zodl_ohttp_client::doh_query_url(resolver, network))?.into_raw())
     });
     unwrap_exc_or_null(res)
 }
 
-/// Parses a DoH JSON response (`doh_body`) and extracts the signed envelope.
-/// The envelope can then be verified with [`zcashlc_ohttp_verify_key_config`].
+/// The signed envelope carried by a DoH JSON response (`doh_body`) for `gateway_host`'s network;
+/// verify it with [`zcashlc_ohttp_verify_key_config`] like one fetched through the relay.
 ///
-/// Returns a pointer to the envelope bytes and stores the length in `*envelope_len_out`.
-/// The returned pointer must be freed with [`zcashlc_vec_u8_free`].
-/// On error, returns null and leaves the error in the thread-local last error.
+/// Returns the envelope bytes (length in `*envelope_len_out`) to free with
+/// [`zcashlc_ohttp_free_bytes`], or null with the error in the thread-local last error.
+///
+/// # Safety
+///
+/// - `doh_body` and `gateway_host` must be valid for reads for their lengths, or null when the
+///   length is zero; `envelope_len_out` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_ohttp_envelope_from_doh_json(
     doh_body: *const u8,
     doh_body_len: usize,
-    gateway_host: *const c_char,
+    gateway_host: *const u8,
+    gateway_host_len: usize,
     envelope_len_out: *mut usize,
 ) -> *mut u8 {
     let res = catch_panic(|| {
-        use zodl_ohttp_client::{NetworkRule, envelope_from_doh_json};
-
-        let body = unsafe { std::slice::from_raw_parts(doh_body, doh_body_len) };
-
-        let host = unsafe { CStr::from_ptr(gateway_host) }
-            .to_str()
-            .map_err(|e| anyhow!("invalid gateway host: {}", e))?;
-
-        let network = NetworkRule::KnownHosts
-            .network_for(host)
-            .map_err(|e| anyhow!("{}", e))?;
-
-        let envelope = envelope_from_doh_json(body, network)?;
-
-        unsafe {
-            *envelope_len_out = envelope.len();
-        }
-
-        Ok(ptr_from_vec(envelope))
+        let body = unsafe { bytes(doh_body, doh_body_len)? };
+        let network = dns_network(gateway_host, gateway_host_len)?;
+        let (ptr, len) = ptr_from_vec(zodl_ohttp_client::envelope_from_doh_json(body, network)?);
+        unsafe { *envelope_len_out = len };
+        Ok(ptr)
     });
     unwrap_exc_or_null(res)
 }
 
-/// Returns the DNS-over-HTTPS resolvers as a null-terminated array of C strings.
-/// Each string must be freed with [`zcashlc_string_free`], and the array itself
-/// must be freed with [`zcashlc_free_ohttp_doh_resolvers`].
-/// On error, returns null (though this function should not normally fail).
+/// Frees bytes returned by [`zcashlc_ohttp_envelope_from_doh_json`].
+///
+/// # Safety
+///
+/// - `ptr` must be null or returned by that function with this `len`, and not freed before.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_ohttp_doh_resolvers() -> *mut *mut c_char {
-    let res = catch_panic(|| {
-        use zodl_ohttp_client::DOH_RESOLVERS;
-
-        let mut ptrs: Vec<*mut c_char> = DOH_RESOLVERS
-            .iter()
-            .map(|&resolver| CString::new(resolver).map(|s| s.into_raw()).ok())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| anyhow!("resolver contains null byte"))?;
-
-        // Add null terminator
-        ptrs.push(ptr::null_mut());
-
-        Ok(ptr_from_vec(ptrs))
-    });
-    unwrap_exc_or_null(res)
-}
-
-/// Frees the array returned by [`zcashlc_ohttp_doh_resolvers`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_free_ohttp_doh_resolvers(resolvers: *mut *mut c_char) {
-    if resolvers.is_null() {
-        return;
-    }
-
-    // Free each string
-    let mut i = 0;
-    loop {
-        let ptr = unsafe { *resolvers.add(i) };
-        if ptr.is_null() {
-            break;
-        }
-        unsafe {
-            drop(CString::from_raw(ptr));
-        }
-        i += 1;
-    }
-
-    // Free the array itself
-    free_ptr_from_vec(resolvers);
+pub unsafe extern "C" fn zcashlc_ohttp_free_bytes(ptr: *mut u8, len: usize) {
+    free_ptr_from_vec(ptr, len);
 }

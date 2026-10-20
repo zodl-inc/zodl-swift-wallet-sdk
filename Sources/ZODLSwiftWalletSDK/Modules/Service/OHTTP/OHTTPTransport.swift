@@ -361,26 +361,20 @@ actor OHTTPTransport {
     /// Queries each resolver in order (Cloudflare, then Google), parses the DoH JSON
     /// response to extract the signed envelope, and verifies it.
     private func fetchKeyConfigFromDNS(relayError: Error, profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
-        // Get DNS resolvers
-        guard let resolvers = try? OHTTPNative.dohResolvers() else {
-            throw relayError  // DNS fallback not available, throw original error
+        guard let dohURLs = try? OHTTPNative.dohQueryURLs(gatewayHost: gatewayHost) else {
+            throw relayError
         }
 
         var lastError: Error = relayError
 
-        for resolver in resolvers {
+        for dohURL in dohURLs {
             do {
-                // Construct DoH URL for this resolver
-                guard let dohURL = try? OHTTPNative.dohQueryURL(resolver: resolver, gatewayHost: gatewayHost) else {
-                    continue
-                }
-
                 // Fetch DoH JSON
                 let dohBody = try await httpGetForDNS(url: dohURL, timeoutMS: keyFetchTimeoutMS)
 
                 // Parse envelope from DoH JSON
                 guard let envelope = try? OHTTPNative.envelopeFromDohJSON(dohBody: dohBody, gatewayHost: gatewayHost) else {
-                    lastError = OHTTPError.transportError("DoH parse failed for \(resolver)")
+                    lastError = OHTTPError.transportError("DoH parse failed for \(dohURL)")
                     continue
                 }
 
