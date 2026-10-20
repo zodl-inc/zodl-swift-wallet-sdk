@@ -244,7 +244,10 @@ public enum OHTTPEndpoints {
     /// of the wallet's network, never the other network's.
     static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String, keyConfigURL: String) {
         if let relay = OHTTPNative.relayURL(for: host.lowercased()) {
-            guard self.network(for: host) == (network == .mainnet ? "mainnet" : "testnet") else {
+            guard let gatewayNetwork = self.network(for: host) else {
+                throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
+            }
+            guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
                 throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
             }
             return (host, relay, keyConfigURL(for: host))
@@ -264,7 +267,9 @@ public enum OHTTPEndpoints {
     /// host passes; its network is checked against the server's chain name when it is validated.
     public static func checkGatewayNetwork(host: String, network: NetworkType) throws {
         guard OHTTPNative.relayURL(for: host.lowercased()) != nil else { return }
-        let gatewayNetwork = self.network(for: host)
+        guard let gatewayNetwork = self.network(for: host) else {
+            throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
+        }
         guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
             throw ZcashError.compactBlockProcessorChainName(gatewayNetwork)
         }
@@ -290,10 +295,17 @@ public enum OHTTPEndpoints {
     }
 
     /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.
-    /// Testnet gateway hosts contain "-testnet"; all others default to mainnet. `OHTTPTransport` does not
-    /// call this: the shared core applies the same rule to the gateway host when it verifies the signed
-    /// key configuration.
-    public static func network(for gatewayHost: String) -> String {
-        return gatewayHost.lowercased().contains("-testnet") ? "testnet" : "mainnet"
+    /// ZIP #10 "Client configuration": the network is part of the static configuration and MUST NOT be
+    /// inferred from the gateway host name. Exactly `ohttp-gateway.example` is mainnet and
+    /// `ohttp-gateway-testnet.example` is testnet; any other host returns nil (unknown gateway).
+    public static func network(for gatewayHost: String) -> String? {
+        switch gatewayHost.lowercased() {
+        case "ohttp-gateway.example":
+            return "mainnet"
+        case "ohttp-gateway-testnet.example":
+            return "testnet"
+        default:
+            return nil
+        }
     }
 }

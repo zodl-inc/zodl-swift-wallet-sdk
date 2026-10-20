@@ -234,26 +234,31 @@ final class OHTTPSignedConfigTests: XCTestCase {
     // MARK: - Network
 
     func testOHTTPEndpointsNetworkDetection() {
+        // ZIP #10: network is statically configured, not inferred from hostname.
+        // Only the two known gateway hosts have a configured network.
         XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway-testnet.example"), "testnet")
         XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway.example"), "mainnet")
-        XCTAssertEqual(OHTTPEndpoints.network(for: "cmc.zodl.com"), "mainnet")
-        XCTAssertEqual(OHTTPEndpoints.network(for: "vote.zodl.com"), "mainnet")
+        XCTAssertNil(OHTTPEndpoints.network(for: "cmc.zodl.com"))
+        XCTAssertNil(OHTTPEndpoints.network(for: "vote.zodl.com"))
+        XCTAssertNil(OHTTPEndpoints.network(for: "unknown.zodl.com"))
     }
 
-    /// The core applies the rule `OHTTPEndpoints.network(for:)` states (a host containing `-testnet`,
-    /// lower-cased, is testnet; every other host is mainnet) to the gateway host, so the pinned key follows
-    /// the host as before.
+    /// ZIP #10: The network is statically configured (NetworkRule::KnownHosts), not inferred from the host name.
+    /// Only ohttp-gateway.example (mainnet) and ohttp-gateway-testnet.example (testnet) have a configured
+    /// network; all other hosts return nil and would be rejected before signature verification.
     func testTheCoreAndOHTTPEndpointsAgreeOnTheNetworkOfAHost() throws {
-        for host in [
-            "ohttp-gateway-testnet.example",
-            "OHTTP-GATEWAY-TESTNET.ZODL.COM",
-            "ohttp-gateway.example",
-            "cmc.zodl.com",
-            "vote.zodl.com",
-            "prod.vote-chain-primary.valargroup.org",
-            "testnet.example.com"
+        // Test the two known gateway hosts (case-insensitive)
+        for (host, expectedNetwork) in [
+            ("ohttp-gateway-testnet.example", "testnet"),
+            ("OHTTP-GATEWAY-TESTNET.ZODL.COM", "testnet"),
+            ("ohttp-gateway.example", "mainnet"),
+            ("OHTTP-GATEWAY.ZODL.COM", "mainnet")
         ] {
-            let network = OHTTPEndpoints.network(for: host)
+            guard let network = OHTTPEndpoints.network(for: host) else {
+                XCTFail("\(host) should have a configured network")
+                continue
+            }
+            XCTAssertEqual(network, expectedNetwork, "\(host)")
             let otherNetwork = network == "testnet" ? "mainnet" : "testnet"
 
             // An envelope for the network the host is on gets past the network check ...
@@ -262,6 +267,11 @@ final class OHTTPSignedConfigTests: XCTestCase {
             // ... and one for the other network does not.
             let other = try XCTUnwrap(failure(of: envelope(network: otherNetwork), host: host), host)
             XCTAssertTrue(other.contains("signed for \(otherNetwork), not \(network)"), "\(host): \(other)")
+        }
+
+        // Unknown hosts have no configured network and would be rejected by the native layer
+        for host in ["cmc.zodl.com", "vote.zodl.com", "unknown.zodl.com", "testnet.example.com"] {
+            XCTAssertNil(OHTTPEndpoints.network(for: host), "\(host) should have no configured network")
         }
     }
 }
