@@ -6419,6 +6419,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             task: None,
             pass_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            unfinished_passes: Vec::new(),
             endpoint: slipstream_core::config::Endpoint {
                 host: host.to_string(),
                 port: server_port,
