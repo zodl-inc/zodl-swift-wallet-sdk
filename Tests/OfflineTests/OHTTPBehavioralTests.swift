@@ -268,3 +268,54 @@ final class OHTTPBehavioralTests: XCTestCase {
         XCTAssertEqual(counters.posts, 0)
     }
 }
+
+    // MARK: - DNS Fallback on Relay Failure
+
+    /// Tests that OHTTP transport falls back to DNS when the relay key config fetch fails.
+    /// The relay GET returns 500, forcing DNS fallback which succeeds.
+    func testDNSFallbackOnRelayKeyConfigFailure() async throws {
+        let counters = Counters()
+        var dohFetched = false
+
+        // Real Cloudflare DoH JSON fixture (mainnet, key ba8a2dbd)
+        let cloudflareDoHResponse = """
+        {
+          "Status": 0,
+          "Answer": [
+            {
+              "name": "ohttp-keys.example",
+              "type": 16,
+              "data": "\\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\\" \\"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\\""
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let transport = OHTTPTestSupport.makeTransport { request, _ in
+            let url = request.url?.absoluteString ?? ""
+
+            // Relay key config fetch fails with 500
+            if url.hasSuffix("/ohttp-configs/signed") {
+                counters.keyFetches += 1
+                return (Data(), OHTTPTestSupport.response(for: request.url, status: 500))
+            }
+
+            // DoH query succeeds (DNS fallback)
+            if url.contains("cloudflare-dns.com") || url.contains("dns.google") {
+                dohFetched = true
+                return (cloudflareDoHResponse, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+
+            // Relay POST (should succeed after DNS fallback gets the key)
+            counters.posts += 1
+            return (OHTTPTestSupport.unopenableSealedResponse(), OHTTPTestSupport.response(for: request.url, status: 200))
+        }
+
+        // The round trip should succeed via DNS fallback
+        _ = await statusError(from: transport)
+
+        XCTAssertEqual(counters.keyFetches, 1, "Should attempt relay key fetch once")
+        XCTAssertTrue(dohFetched, "Should fall back to DNS after relay failure")
+        XCTAssertEqual(counters.posts, 1, "Should POST after getting key via DNS")
+    }
+}
