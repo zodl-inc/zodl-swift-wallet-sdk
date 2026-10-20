@@ -1412,11 +1412,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_doh_resolvers() -> *mut *mut c_char {
 
         let mut ptrs: Vec<*mut c_char> = DOH_RESOLVERS
             .iter()
-            .map(|&resolver| {
-                CString::new(resolver)
-                    .map(|s| s.into_raw())
-                    .ok()
-            })
+            .map(|&resolver| CString::new(resolver).map(|s| s.into_raw()).ok())
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| anyhow!("resolver contains null byte"))?;
 
