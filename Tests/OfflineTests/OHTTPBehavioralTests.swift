@@ -276,13 +276,14 @@ final class OHTTPBehavioralTests: XCTestCase {
         let counters = Counters()
         var dohFetched = false
 
-        // Real Cloudflare DoH JSON fixture (mainnet, key ba8a2dbd)
+        // Cloudflare DoH JSON with a real envelope (key ba8a2dbd). The record name matches the testnet
+        // gateway of the test transport; its stub verifier accepts the envelope content.
         let cloudflareDoHResponse = """
         {
           "Status": 0,
           "Answer": [
             {
-              "name": "ohttp-keys.example",
+              "name": "ohttp-keys-testnet.example",
               "type": 16,
               "data": "\\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\\" \\"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\\""
             }
