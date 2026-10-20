@@ -616,6 +616,12 @@ public protocol Synchronizer: AnyObject {
 
     /// This API stops the synchronization and re-initalizes everything according to the new endpoint provided.
     /// It can be called anytime.
+    ///
+    /// Between a completed `wipe()` and the next `prepare(...)`, the Slipstream implementation only records the endpoint and
+    /// leaves its engine closed, because opening it would recreate the wallet database the wipe deleted. That `prepare` fetches
+    /// the new wallet's provisioning anchor (a restore's chain tip, a new wallet's tree state) from the recorded endpoint and
+    /// opens the engine there. This is how a host names the server a reset wallet talks to; without such a switch the next
+    /// wallet stays on the server in use before the wipe.
     /// - Throws: ZcashError when failures occur and related to `synchronizer.start(retry: Bool)`, it's the only throwing operation
     /// during the whole endpoint change.
     func switchTo(endpoint: LightWalletEndpoint) async throws

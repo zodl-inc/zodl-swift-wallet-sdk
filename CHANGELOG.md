@@ -121,6 +121,15 @@ Changes are relative to `5.2.1`.
 - A streamed answer read over Tor (`httpStreamOverOHTTP` in Tor mode, and `OHTTPURLProtocol`
   sessions in Tor mode) now fails with `URLError.timedOut` when no body bytes arrive for the
   request's `timeoutInterval`, instead of waiting forever.
+- `SlipstreamSynchronizer.switchTo(endpoint:)` made after `wipe()` completes and before the next
+  `prepare(with:walletBirthday:name:keySource:)` now only records the endpoint: that `prepare`
+  fetches the new wallet's provisioning anchor (a restore's chain tip, a new wallet's tree state)
+  from it and opens the engine there. The switch used to reopen the engine at once, recreating the
+  wallet database the wipe had just deleted, so a host could move a reset wallet only after
+  `prepare`, by which time its anchor had been fetched from the server in use before the wipe. A
+  host that resets a wallet to leave a server should now switch after the wipe and before
+  preparing; without that switch the next wallet stays on the server in use before the wipe, as
+  before. `SDKSynchronizer` is unaffected.
 
 # 5.2.1 - 2026-10-14
 
