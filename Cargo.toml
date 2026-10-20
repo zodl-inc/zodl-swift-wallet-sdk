@@ -214,9 +214,9 @@ strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.1 lives in slipstream-internal
-# PR #16 (head 8a4e7317, DNS fallback: zodl-ohttp-client b0b2087c with DNS support; on 0.4.0-pre.1). Git
+# PR #16 (head 54b84f89, DNS fallback: zodl-ohttp-client b0b2087c with DNS support; on 0.4.0-pre.1). Git
 # dependency pinned by commit; the rev moves to the slipstream-internal main commit once #16 merges.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "8a4e73174f5b0a6e9d62ffc3e0c42c2e4fa5e08d" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "2de250de044fde55ed72e82f229ef27254be33e4" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
