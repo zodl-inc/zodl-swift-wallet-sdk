@@ -267,7 +267,6 @@ final class OHTTPBehavioralTests: XCTestCase {
         }
         XCTAssertEqual(counters.posts, 0)
     }
-}
 
     // MARK: - DNS Fallback on Relay Failure
 
