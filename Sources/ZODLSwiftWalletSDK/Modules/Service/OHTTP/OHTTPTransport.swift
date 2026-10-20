@@ -339,8 +339,8 @@ actor OHTTPTransport {
         do {
             return try await fetchKeyConfigFromRelay(signedURL: signedURL, profile: profile)
         } catch let relayError {
-            // Relay failed (fetch or verification), try DNS fallback
-            // Only if gateway is known; unknown gateway is a configuration error
+            // A failed relay fetch or verification falls back to DNS; a cancelled task does not.
+            if relayError is CancellationError { throw relayError }
             return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
         }
     }
@@ -395,8 +395,9 @@ actor OHTTPTransport {
                 }
 
                 return verified
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
-                // Try next resolver
                 continue
             }
         }
