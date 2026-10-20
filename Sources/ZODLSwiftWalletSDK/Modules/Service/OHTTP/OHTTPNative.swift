@@ -240,6 +240,45 @@ enum OHTTPNative {
         guard let pointer, count > 0 else { return Data() }
         return Data(bytes: pointer, count: Int(count))
     }
+
+    /// The DoH query URLs of the signed key configuration of `gatewayHost`'s network, in resolver
+    /// order (Cloudflare, then Google). Only for the DNS source, after the relay source failed.
+    static func dohQueryURLs(gatewayHost: String) throws -> [String] {
+        let host = Array(gatewayHost.lowercased().utf8)
+        return try (0..<zcashlc_ohttp_doh_resolver_count()).map { index in
+            let url: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer {
+                zcashlc_ohttp_doh_query_url(index, $0.baseAddress, UInt($0.count))
+            }
+            guard let url else {
+                throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH query URL could not be built"))
+            }
+            defer { zcashlc_string_free(url) }
+            return String(cString: url)
+        }
+    }
+
+    /// The signed envelope carried by a DoH JSON response for `gatewayHost`'s network; verify it with
+    /// `verifyKeyConfig` like one fetched through the relay.
+    static func envelopeFromDohJSON(dohBody: Data, gatewayHost: String) throws -> Data {
+        let host = Array(gatewayHost.lowercased().utf8)
+        var envelopeLen: UInt = 0
+        let result: UnsafeMutablePointer<UInt8>? = dohBody.withUnsafeBytes { bodyBuffer in
+            host.withUnsafeBufferPointer { hostBuffer in
+                zcashlc_ohttp_envelope_from_doh_json(
+                    bodyBuffer.bindMemory(to: UInt8.self).baseAddress,
+                    UInt(bodyBuffer.count),
+                    hostBuffer.baseAddress,
+                    UInt(hostBuffer.count),
+                    &envelopeLen
+                )
+            }
+        }
+        guard let result else {
+            throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH response could not be parsed"))
+        }
+        defer { zcashlc_ohttp_free_bytes(result, envelopeLen) }
+        return Data(bytes: result, count: Int(envelopeLen))
+    }
 }
 
 /// What opens the response to one sealed request, and no other: a handle to the core's single-use response
@@ -346,42 +385,4 @@ final class OHTTPPendingResponse: @unchecked Sendable {
         OHTTPNative.withOptionalCString(string, body)
     }
 
-    /// The DoH query URLs of the signed key configuration of `gatewayHost`'s network, in resolver
-    /// order (Cloudflare, then Google). Only for the DNS source, after the relay source failed.
-    static func dohQueryURLs(gatewayHost: String) throws -> [String] {
-        let host = Array(gatewayHost.lowercased().utf8)
-        return try (0..<zcashlc_ohttp_doh_resolver_count()).map { index in
-            let url: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer {
-                zcashlc_ohttp_doh_query_url(index, $0.baseAddress, UInt($0.count))
-            }
-            guard let url else {
-                throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH query URL could not be built"))
-            }
-            defer { zcashlc_string_free(url) }
-            return String(cString: url)
-        }
-    }
-
-    /// The signed envelope carried by a DoH JSON response for `gatewayHost`'s network; verify it with
-    /// `verifyKeyConfig` like one fetched through the relay.
-    static func envelopeFromDohJSON(dohBody: Data, gatewayHost: String) throws -> Data {
-        let host = Array(gatewayHost.lowercased().utf8)
-        var envelopeLen: UInt = 0
-        let result: UnsafeMutablePointer<UInt8>? = dohBody.withUnsafeBytes { bodyBuffer in
-            host.withUnsafeBufferPointer { hostBuffer in
-                zcashlc_ohttp_envelope_from_doh_json(
-                    bodyBuffer.bindMemory(to: UInt8.self).baseAddress,
-                    UInt(bodyBuffer.count),
-                    hostBuffer.baseAddress,
-                    UInt(hostBuffer.count),
-                    &envelopeLen
-                )
-            }
-        }
-        guard let result else {
-            throw OHTTPError.transportError(lastErrorMessage(fallback: "DoH response could not be parsed"))
-        }
-        defer { zcashlc_ohttp_free_bytes(result, envelopeLen) }
-        return Data(bytes: result, count: Int(envelopeLen))
-    }
 }
