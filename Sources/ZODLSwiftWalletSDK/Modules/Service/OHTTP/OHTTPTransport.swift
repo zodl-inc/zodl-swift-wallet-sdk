@@ -318,23 +318,16 @@ actor OHTTPTransport {
     }
 
     /// Fetches the signed key configuration through the relay and verifies it.
-    /// On relay failure, tries DNS-over-HTTPS as a fallback source.
+    /// On relay fetch or verification failure, tries DNS-over-HTTPS as a fallback source.
+    /// Configuration errors (non-https URLs, unknown gateway) fail closed without any network requests.
     private func fetchKeyConfig(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
-        // Try relay first (primary source)
-        do {
-            return try await fetchKeyConfigFromRelay(profile: profile)
-        } catch let relayError {
-            // Relay fetch failed, try DNS fallback
-            return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
+        // Validate relay URL is https before any network call
+        guard relayURL.lowercased().hasPrefix("https://") else {
+            throw OHTTPError.transportError("OHTTP endpoints must use https: \(relayURL)")
         }
-    }
 
-    /// Fetches the signed key configuration through the relay.
-    private func fetchKeyConfigFromRelay(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
-        // Derive signed config URL from relayURL (replace path suffix /relay with /ohttp-configs/signed)
+        // Derive and validate signed config URL before any network call
         let signedURL = try OHTTPNative.signedConfigURL(relayURL: relayURL)
-
-        // Validate the derived URL before any network call or decoding
         guard signedURL.lowercased().hasPrefix("https://") else {
             throw OHTTPError.transportError("OHTTP endpoints must use https: \(signedURL)")
         }
@@ -342,6 +335,19 @@ actor OHTTPTransport {
             throw OHTTPError.transportError("Invalid URL: \(signedURL)")
         }
 
+        // Try relay first (fetch AND verify)
+        do {
+            return try await fetchKeyConfigFromRelay(signedURL: signedURL, profile: profile)
+        } catch let relayError {
+            // Relay failed (fetch or verification), try DNS fallback
+            // Only if gateway is known; unknown gateway is a configuration error
+            return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
+        }
+    }
+
+    /// Fetches the signed key configuration through the relay.
+    /// The signed config URL is pre-validated by fetchKeyConfig.
+    private func fetchKeyConfigFromRelay(signedURL: String, profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
         // Fetch JSON via hardened httpSender (not URLSession.shared)
         let jsonData = try await httpGet(url: signedURL, timeoutMS: keyFetchTimeoutMS, profile: profile)
 
@@ -357,15 +363,17 @@ actor OHTTPTransport {
         return verified
     }
 
-    /// Tries DNS-over-HTTPS as a fallback source when relay fetch fails.
+    /// Tries DNS-over-HTTPS as a fallback source when relay fetch or verification fails.
     /// Queries each resolver in order (Cloudflare, then Google), parses the DoH JSON
     /// response to extract the signed envelope, and verifies it.
+    /// If the gateway is unknown (no DNS source), the original relay error is thrown.
+    /// If all DNS resolvers fail, the original relay error is thrown (preserving its kind).
     private func fetchKeyConfigFromDNS(relayError: Error, profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
+        // Check if gateway is known (has a DNS source)
         guard let dohURLs = try? OHTTPNative.dohQueryURLs(gatewayHost: gatewayHost) else {
+            // Unknown gateway: fail with original relay error (configuration error)
             throw relayError
         }
-
-        var lastError: Error = relayError
 
         for dohURL in dohURLs {
             do {
@@ -374,7 +382,6 @@ actor OHTTPTransport {
 
                 // Parse envelope from DoH JSON
                 guard let envelope = try? OHTTPNative.envelopeFromDohJSON(dohBody: dohBody, gatewayHost: gatewayHost) else {
-                    lastError = OHTTPError.transportError("DoH parse failed for \(dohURL)")
                     continue
                 }
 
@@ -389,13 +396,13 @@ actor OHTTPTransport {
 
                 return verified
             } catch {
-                lastError = error
+                // Try next resolver
                 continue
             }
         }
 
-        // All resolvers failed
-        throw lastError
+        // All DNS resolvers failed: throw original relay error, preserving its kind
+        throw relayError
     }
 
     /// HTTP GET for DoH queries (adds Accept: application/dns-json header).
