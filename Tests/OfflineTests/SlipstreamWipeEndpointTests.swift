@@ -19,6 +19,10 @@ import XCTest
 ///
 /// So in that window a switch only records the server, and `prepare` provisions from it and opens the engine there.
 /// Everywhere else a switch reopens the engine at once, as it always has.
+///
+/// The window ends when `prepare`'s engine step has reopened the engine, and that step takes its turn with the
+/// switches: a switch queued before it is the server the engine opens at, and one made while it runs waits for it and
+/// then moves the engine.
 final class SlipstreamWipeEndpointTests: ZcashTestCase {
     private let constructionServer = LightWalletEndpoint(address: "construction.example.com", port: 443, secure: true)
     private let preWipeServer = LightWalletEndpoint(address: "pre-wipe.example.com", port: 443, secure: true)
@@ -135,6 +139,84 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
 
         let switchCalls = await engineCalls(of: fixture, since: callsBeforeTheSwitch)
         XCTAssertEqual(Self.engineOpens(switchCalls), ["reopen(later.example.com:443)"], "\(switchCalls)")
+    }
+
+    // MARK: - A switch made while prepare runs
+
+    /// The break this catches: a `prepare` that opens the engine outside the order switches take. Until its reopen
+    /// returns the wipe's window is still open, so a switch made meanwhile only records its server and returns, and
+    /// `prepare` then closes the window with the engine on the server it was reopened at and the record on the
+    /// switch's: a retry of that switch is a no-op, because it is the recorded server. The engine step takes its turn
+    /// with the switches instead, so the switch waits for the reopen and then moves the engine, and the engine ends on
+    /// the server of the last switch.
+    func testASwitchMadeWhileThePostWipePrepareReopensTheEngineIsAppliedAfterIt() async throws {
+        let fixture = try makeFixture()
+        try await prepare(fixture, restoringFrom: nil)
+        try await wipe(fixture.synchronizer)
+        let callsBeforeThePrepare = await fixture.engine.calls.count
+        await fixture.engine.closeGate(.reopen)
+        defer { fixture.engine.reopenGate.open() }
+
+        let preparing = Task { try await prepare(fixture, restoringFrom: nil) }
+        let reopenIsHeld = await waitUntil {
+            await engineCalls(of: fixture, since: callsBeforeThePrepare).contains("reopen(construction.example.com:443)")
+        }
+        guard reopenIsHeld else {
+            return XCTFail("the prepare after the wipe never reached its engine reopen")
+        }
+        let switching = Task { try await fixture.synchronizer.switchTo(endpoint: nextWalletServer) }
+        // Bounded, not observable: nothing marks a switch that is queued and waiting, so this leaves a switch that
+        // does not wait for the reopen room to run to completion. For one that does, it is only a delay.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        await fixture.engine.openGate(.reopen)
+        try await preparing.value
+        try await switching.value
+
+        let calls = await engineCalls(of: fixture, since: callsBeforeThePrepare)
+        XCTAssertEqual(
+            Self.engineOpens(calls),
+            ["reopen(construction.example.com:443)", "reopen(next-wallet.example.com:443)"],
+            "the switch made during the reopen moves the engine once it is open: \(calls)"
+        )
+        let recorded = await fixture.synchronizer.currentEndpointForTesting()
+        XCTAssertEqual(recorded, nextWalletServer)
+    }
+
+    /// A switch made after `prepare` has begun, while it is still provisioning, is ahead of the engine step in the
+    /// queue, so the step reads the server that switch recorded and opens the engine once, there. The break: an engine
+    /// step that opens at the server `prepare` began with, whatever was recorded since. The anchor server is not
+    /// asserted: provisioning had already chosen the server it asks when the switch was made.
+    func testASwitchMadeWhileThePostWipePrepareIsProvisioningIsTheServerTheEngineOpensAt() async throws {
+        let fixture = try makeFixture()
+        try await prepare(fixture, restoringFrom: nil)
+        try await wipe(fixture.synchronizer)
+        let callsBeforeThePrepare = await fixture.engine.calls.count
+        let provisioning = XCTestExpectation(description: "the prepare after the wipe is held inside provisioning")
+        let release = Gate()
+        defer { release.open() }
+        fixture.backend.initDataDbSeedClosure = { _ in
+            provisioning.fulfill()
+            await release.wait()
+            return DbInitResult.success
+        }
+
+        let preparing = Task { try await prepare(fixture, restoringFrom: nil) }
+        let held = await XCTWaiter.fulfillment(of: [provisioning], timeout: 5)
+        guard held == .completed else {
+            return XCTFail("the prepare after the wipe never reached provisioning")
+        }
+        try await fixture.synchronizer.switchTo(endpoint: nextWalletServer)
+        release.open()
+        try await preparing.value
+
+        let calls = await engineCalls(of: fixture, since: callsBeforeThePrepare)
+        XCTAssertEqual(
+            Self.engineOpens(calls),
+            ["reopen(next-wallet.example.com:443)"],
+            "the engine is opened once, at the server the switch made during provisioning recorded: \(calls)"
+        )
+        let recorded = await fixture.synchronizer.currentEndpointForTesting()
+        XCTAssertEqual(recorded, nextWalletServer)
     }
 
     // MARK: - Unchanged without a completed wipe

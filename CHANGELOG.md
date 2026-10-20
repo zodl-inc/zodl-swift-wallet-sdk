@@ -129,7 +129,8 @@ Changes are relative to `5.2.1`.
   `prepare`, by which time its anchor had been fetched from the server in use before the wipe. A
   host that resets a wallet to leave a server should now switch after the wipe and before
   preparing; without that switch the next wallet stays on the server in use before the wipe, as
-  before. `SDKSynchronizer` is unaffected.
+  before. A switch made while that `prepare` is opening the engine is applied once the engine is
+  open, so the engine ends on the server of the last switch. `SDKSynchronizer` is unaffected.
 
 # 5.2.1 - 2026-10-14
 

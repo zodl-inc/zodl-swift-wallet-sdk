@@ -477,8 +477,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Initialises the wallet database (same as `SDKSynchronizer.prepare`) and opens the
     /// engine handle.  Handles `SeedRequired` migrations identically to `SDKSynchronizer`.
     ///
-    /// After a `wipe()`, provisioning and the engine use the server a `switchTo(endpoint:)` recorded
-    /// since the wipe, or without one the server in use before it.
+    /// After a `wipe()`, provisioning uses the server a `switchTo(endpoint:)` recorded since the wipe and
+    /// before this call, or without one the server in use before the wipe. The engine is opened in turn
+    /// with switches, at the server recorded when its turn comes: a switch made during provisioning still
+    /// decides the server it opens at, and one made while it is opening waits for it and then moves the
+    /// engine.
     public func prepare(
         with seed: [UInt8]?,
         walletBirthday: BlockHeight?,
@@ -512,15 +515,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         ) {
             return .seedRequired
         }
-        if engineClosedByWipe {
-            // The engine still holds the server it had before the wipe: a switch since then only
-            // recorded the next one. `reopen` binds the fresh handle to the recorded server; the
-            // close it starts with has nothing to free, because the wipe already closed the handle.
-            try await engine.reopen(server: currentEndpoint, network: initializer.network)
-            engineClosedByWipe = false
-        } else {
-            try await engine.open(network: initializer.network)
-        }
+        // The engine step is one lifecycle operation, in turn with every switch. A switch queued before
+        // it has already recorded its server, and the step opens the engine at what is recorded when
+        // its turn comes. A switch made while it runs waits for it and then moves the engine, so the
+        // engine ends on the server of the last switch. Were the step to run outside the queue, a
+        // switch overlapping its reopen would only record its server, because the engine counts as
+        // closed until the reopen returns, and `prepare` would end with the engine on a server other
+        // than the recorded one.
+        try await lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }.value
         // [v2.1 E-3] The snapshot is truthful FROM OPEN: the engine seeds `isRecovering`,
         // the permille floor, the persisted chain tip and spendability from the wallet DB
         // (the same inputs the first suggest round would use), so the cold-launch emission
@@ -544,6 +546,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             isSpendableMasked: summaries.isSpendableMasked ?? false
         ))
         return .success
+    }
+
+    /// The queued body of `prepare`'s engine step. It reads `currentEndpoint` and `engineClosedByWipe`
+    /// here, in its own turn, so what it sees is what every switch queued before it left behind.
+    private func openEngineOnLifecycleQueue() async throws {
+        if engineClosedByWipe {
+            // The engine still holds the server it had before the wipe: a switch since then only
+            // recorded the next one. `reopen` binds the fresh handle to the recorded server; the
+            // close it starts with has nothing to free, because the wipe already closed the handle.
+            try await engine.reopen(server: currentEndpoint, network: initializer.network)
+            // Only a reopen that returned ends the window. One that threw leaves the engine closed
+            // and the flag set, so the next `prepare` reopens it and a switch still only records.
+            engineClosedByWipe = false
+        } else {
+            try await engine.open(network: initializer.network)
+        }
     }
 
     // ── start ──────────────────────────────────────────────────────────────────
@@ -2211,7 +2229,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///    documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan
     ///    database file", MIGRATING.md) that only `SDKSynchronizer` used to honor ([#1976]).
     /// 7. Reset the state subject to `.zero` (status `.unprepared`), and keep the engine closed until
-    ///    the next `prepare`: a `switchTo(endpoint:)` in between only records the server.
+    ///    the next `prepare` opens it: a `switchTo(endpoint:)` before that only records the server.
     /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
     /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
@@ -2320,8 +2338,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             //    wallet wipe succeeded (this `do` block only reaches here on success).
             await submitPlanStore.wipe()
 
-            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`:
-            //    a switch in between only records its server (`engineClosedByWipe`).
+            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`
+            //    opens it: a switch before that only records its server (`engineClosedByWipe`).
             engineClosedByWipe = true
             stateSubject.send(.zero)
 
@@ -2571,10 +2589,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 1. F2: No-op immediately if `endpoint` equals `currentEndpoint` (same host + port + secure).
     ///    Prevents AutoServerSelection from restarting a sync pass when the benchmark selects the
     ///    same server already in use.
-    /// 2. Between a completed `wipe()` and the next `prepare`: store `endpoint` in `currentEndpoint`
-    ///    and return. Reopening the engine there would recreate the deleted wallet database before
-    ///    `prepare` has initialized it; `prepare` instead provisions the next wallet from `endpoint`
-    ///    and opens the engine there. This is how a host names the server a reset wallet uses.
+    /// 2. Between a completed `wipe()` and the moment the next `prepare` opens the engine: store
+    ///    `endpoint` in `currentEndpoint` and return. Reopening the engine there would recreate the
+    ///    deleted wallet database before `prepare` has initialized it; `prepare` instead provisions the
+    ///    next wallet from the server recorded when it began and opens the engine at the one recorded
+    ///    when its turn on the lifecycle queue comes. This is how a host names the server a reset wallet
+    ///    uses. A switch made while `prepare` is opening the engine waits for it and is then an ordinary
+    ///    switch (steps 3 to 8), so the engine ends on the server of the last switch.
     /// 3. Snapshot whether the sync was running (to decide whether to restart).
     /// 4. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
