@@ -148,7 +148,9 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
     /// `prepare` then closes the window with the engine on the server it was reopened at and the record on the
     /// switch's: a retry of that switch is a no-op, because it is the recorded server. The engine step takes its turn
     /// with the switches instead, so the switch waits for the reopen and then moves the engine, and the engine ends on
-    /// the server of the last switch.
+    /// the server of the last switch. A step that stays off the queue but clears the mark before its reopen breaks it
+    /// the other way: the switch stops and reopens the engine beside the reopen still in flight, and both finish when
+    /// the gate opens, so only the calls recorded while the reopen is held tell that from the right order.
     func testASwitchMadeWhileThePostWipePrepareReopensTheEngineIsAppliedAfterIt() async throws {
         let fixture = try makeFixture()
         try await prepare(fixture, restoringFrom: nil)
@@ -165,9 +167,15 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
             return XCTFail("the prepare after the wipe never reached its engine reopen")
         }
         let switching = Task { try await fixture.synchronizer.switchTo(endpoint: nextWalletServer) }
-        // Bounded, not observable: nothing marks a switch that is queued and waiting, so this leaves a switch that
-        // does not wait for the reopen room to run to completion. For one that does, it is only a delay.
+        // Bounded, not observable: nothing marks a switch that is queued and waiting, so this gives a switch that
+        // does not wait for the reopen time to finish. For one that does, it is only a delay.
         try await Task.sleep(nanoseconds: 200_000_000)
+        let callsWhileTheReopenIsHeld = await engineCalls(of: fixture, since: callsBeforeThePrepare)
+        XCTAssertEqual(
+            callsWhileTheReopenIsHeld,
+            ["reopen(construction.example.com:443)"],
+            "the switch must leave the engine alone until the held reopen has returned: \(callsWhileTheReopenIsHeld)"
+        )
         await fixture.engine.openGate(.reopen)
         try await preparing.value
         try await switching.value
@@ -205,8 +213,19 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
         guard held == .completed else {
             return XCTFail("the prepare after the wipe never reached provisioning")
         }
-        try await fixture.synchronizer.switchTo(endpoint: nextWalletServer)
+        let switched = XCTestExpectation(description: "the switch made while the prepare is provisioning returns")
+        let switching = Task {
+            defer { switched.fulfill() }
+            try await fixture.synchronizer.switchTo(endpoint: nextWalletServer)
+        }
+        // Bounded, so that a switch that waited for the held prepare fails here instead of hanging the run: the `defer`
+        // above releases the latch on the way out.
+        let returned = await XCTWaiter.fulfillment(of: [switched], timeout: 5)
+        guard returned == .completed else {
+            return XCTFail("the switch made while the prepare is provisioning waited for the prepare instead of returning")
+        }
         release.open()
+        try await switching.value
         try await preparing.value
 
         let calls = await engineCalls(of: fixture, since: callsBeforeThePrepare)
