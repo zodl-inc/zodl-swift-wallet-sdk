@@ -2595,7 +2595,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///    next wallet from the server recorded when it began and opens the engine at the one recorded
     ///    when its turn on the lifecycle queue comes. This is how a host names the server a reset wallet
     ///    uses. A switch made while `prepare` is opening the engine waits for it and is then an ordinary
-    ///    switch (steps 3 to 8), so the engine ends on the server of the last switch.
+    ///    switch, from step 1, so the engine ends on the server of the last switch.
     /// 3. Snapshot whether the sync was running (to decide whether to restart).
     /// 4. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
