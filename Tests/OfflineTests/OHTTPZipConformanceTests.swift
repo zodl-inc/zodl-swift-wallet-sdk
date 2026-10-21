@@ -127,7 +127,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertNil(OHTTPTransport.retryAfter("-5"))
     }
 
-    func testThePostAfterA429WaitsForRetryAfterWithoutRefetchingTheKey() async throws {
+    func testACallDuringTheRetryAfterPauseFailsLocallyWithoutRefetchingTheKey() async throws {
         let recorder = Recorder()
         let cache = OHTTPKeyCache()
         let transport = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
@@ -140,9 +140,13 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
         XCTAssertEqual(recorder.posts.count, 1, "a 429 is not retried within the call")
 
-        let started = Date()
-        _ = try? await transport.roundTrip(request: request, timeoutMS: 5000)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.9, "the next post waits out Retry-After")
+        do {
+            _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
+            XCTFail("a call during the pause fails")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(recorder.posts.count, 1, "a call during the pause is failed locally, not posted")
         XCTAssertEqual(recorder.keyFetches, 1, "a 429 never refetches the key configuration")
     }
 
@@ -151,6 +155,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let cache = OHTTPKeyCache()
         let limited = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
         _ = try? await limited.roundTrip(request: request, timeoutMS: 5000)
+        var otherRequests = 0
 
         let other = OHTTPTransport(
             gatewayHost: "cmc.zodl.com",
@@ -159,14 +164,19 @@ final class OHTTPZipConformanceTests: XCTestCase {
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: cache
         ) { request, _ in
+            otherRequests += 1
             if request.httpMethod == "GET" {
                 return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
             }
             return (Data(), OHTTPTestSupport.response(for: request.url, status: 503))
         }
-        let started = Date()
-        _ = try? await other.roundTrip(request: request, timeoutMS: 5000)
-        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.9, "the back-off belongs to the relay, not to one gateway")
+        do {
+            _ = try await other.roundTrip(request: request, timeoutMS: 5000)
+            XCTFail("the relay pause applies to every gateway behind it")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(otherRequests, 0, "the back-off belongs to the relay, not to one gateway")
     }
 
     // MARK: - No transparent resend
