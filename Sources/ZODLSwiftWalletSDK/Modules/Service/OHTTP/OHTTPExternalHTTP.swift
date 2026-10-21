@@ -100,7 +100,8 @@ enum OHTTPExternalHTTP {
         torStreamSender: @escaping OHTTPTransport.StreamSender
     ) async throws -> OHTTPStreamedResponse {
         guard let url = request.url, let host = url.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host)
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                || OHTTPEndpoints.isProxyAllowlisted(host: host)
                 || OHTTPEndpoints.isPathRestrictedProxyURL(url) else {
             throw ZcashError.ohttpUnsupportedHost
         }

@@ -44,8 +44,9 @@ public enum OHTTPEndpoints {
     /// Derived from the native relay map for the mainnet gateway host `ohttp-gateway.example`.
     private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: mainnetGatewayHost) }
 
-    /// Proxy-only gateway hosts that are not in the native relay map (cmc, near, vote aliases).
-    private static let proxyOnlyGateways: Set<String> = [
+    /// The alias hosts the gateway serves with its own credentials (cmc, near, vote, flexa). HTTP
+    /// destinations only: none of them is a lightwalletd gateway (``isGateway(_:)`` is false).
+    private static let aliasHosts: Set<String> = [
         "cmc.zodl.com",    // CoinMarketCap price feed
         "near.zodl.com",   // NEAR 1click intents API
         "vote.zodl.com",   // Voting config / vote servers
@@ -66,9 +67,8 @@ public enum OHTTPEndpoints {
     ///
     /// MUST equal the predefined vote/PIR hosts of the BACKENDS list and the Rust voting route's
     /// `OHTTP_VOTE_HOSTS` (`rust/src/voting/route.rs`); a host missing here fails closed in the app.
-    /// The `cmc.zodl.com` and `near.zodl.com` aliases are not listed: they are gateways
-    /// (`relayByGatewayHost`) that carry gateway-injected credentials, reached through
-    /// `proxyHostMapping`.
+    /// The `cmc.zodl.com` and `near.zodl.com` aliases are not listed: they carry gateway-injected
+    /// credentials (``isAliasHost(_:)``) and are reached through `proxyHostMapping`.
     public static let proxyAllowedHosts: Set<String> = [
         // Vote servers
         "vote.zodl.com",
@@ -95,19 +95,21 @@ public enum OHTTPEndpoints {
         proxyAllowedHosts.contains(host.lowercased())
     }
 
-    /// True only for hosts that have a configured relay. Case-insensitive.
-    /// F-13 fix: exact host match only, so custom LWD hosts are never forced through OHTTP.
+    /// True only for the lightwalletd gateway hosts, those with a configured relay. Case-insensitive.
+    /// Exact host match only, so custom LWD hosts are never forced through OHTTP, and the alias hosts
+    /// (``isAliasHost(_:)``) can never become a lightwalletd endpoint.
     ///
     /// Relay URLs come from the native zodl-ohttp-client library and can be overridden at build time
     /// via environment variables `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
     public static func isGateway(_ host: String) -> Bool {
-        let lowerHost = host.lowercased()
-        // Check native relay map first
-        if OHTTPNative.relayURL(for: lowerHost) != nil {
-            return true
-        }
-        // Check proxy-only gateways
-        return proxyOnlyGateways.contains(lowerHost)
+        OHTTPNative.relayURL(for: host.lowercased()) != nil
+    }
+
+    /// True for an alias host the gateway serves with gateway-injected credentials (CMC, NEAR, voting,
+    /// Flexa): a destination of the HTTP paths (`httpRequestOverOHTTP`, `httpStreamOverOHTTP`), never
+    /// a lightwalletd endpoint. Case-insensitive.
+    public static func isAliasHost(_ host: String) -> Bool {
+        aliasHosts.contains(host.lowercased())
     }
 
     public static func relayURL(for gatewayHost: String) throws -> String {
@@ -116,8 +118,8 @@ public enum OHTTPEndpoints {
         if let relay = OHTTPNative.relayURL(for: lowerHost) {
             return relay
         }
-        // Check proxy-only gateways
-        if proxyOnlyGateways.contains(lowerHost) {
+        // Alias hosts ride the mainnet gateway's relay
+        if aliasHosts.contains(lowerHost) {
             guard let relay = mainnetRelayURL else {
                 throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
             }

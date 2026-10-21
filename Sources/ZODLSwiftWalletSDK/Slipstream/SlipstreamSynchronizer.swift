@@ -2897,12 +2897,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
-        // Allowlisted passthrough hosts (vote servers learned at run time, e.g.
-        // prod.vote-chain-primary.valargroup.org) keep their own name: proxyURL(for:) returns them
-        // unchanged and relayURL(for:) routes them to the mainnet relay. Only checking isGateway
-        // rejected them with ohttpUnsupportedHost before any request was sent.
+        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+        // and the path-restricted voting-config mirror.
         guard let host = request.url?.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isProxyAllowlisted(host: host)
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                || OHTTPEndpoints.isProxyAllowlisted(host: host)
                 || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
             throw ZcashError.ohttpUnsupportedHost
         }

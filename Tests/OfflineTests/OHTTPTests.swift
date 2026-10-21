@@ -19,6 +19,19 @@ final class OHTTPTests: XCTestCase {
         XCTAssertFalse(OHTTPEndpoints.isGateway("example.com"))
     }
 
+    func testTheCredentialAliasesAreNotLightwalletdGateways() {
+        // An alias is an HTTP destination the gateway serves with its own credentials. Typed as a custom
+        // server it must stay a plain host: never sealed to the gateway as a lightwalletd endpoint.
+        for alias in ["cmc.zodl.com", "near.zodl.com", "vote.zodl.com", "flexa.zodl.com", "CMC.zodl.com"] {
+            XCTAssertFalse(OHTTPEndpoints.isGateway(alias), alias)
+            XCTAssertTrue(OHTTPEndpoints.isAliasHost(alias), alias)
+            XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: alias, network: .testnet), alias)
+        }
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost("ohttp-gateway.example"))
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost("prod.vote-chain-primary.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost("example.com"))
+    }
+
     func testOHTTPEndpointsRelayMapping() throws {
         // Relay URLs come from zodl-ohttp-client (native lib) and can be overridden at build time
         // via ZODL_OHTTP_RELAY_URL_MAINNET / ZODL_OHTTP_RELAY_URL_TESTNET. These assertions verify
@@ -182,18 +195,23 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testProxyAllowlistGatewayDetection() {
-        // F-13: isGateway now uses exact host matching for configured relays only.
-        // Zodl gateways and proxy hosts (in relayByGatewayHost) return true:
+        // isGateway uses exact host matching for configured relays only; the aliases are HTTP
+        // destinations (isAliasHost), not gateways.
         XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway.example"))
         XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway-testnet.example"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("cmc.zodl.com"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("near.zodl.com"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("vote.zodl.com"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("cmc.zodl.com"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("near.zodl.com"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("vote.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("cmc.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("near.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("vote.zodl.com"))
 
-        // External allowlisted hosts (valargroup, chaindefuser) are NOT gateways (F-13 fix):
+        // External allowlisted hosts (valargroup, chaindefuser) are neither gateways nor aliases:
         XCTAssertFalse(OHTTPEndpoints.isGateway("prod.vote-chain-primary.valargroup.org"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("1click.chaindefuser.com"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("voting.valargroup.dev"))
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost("prod.vote-chain-primary.valargroup.org"))
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost("1click.chaindefuser.com"))
 
         // The exact vote/PIR hosts ARE proxy-allowlisted; chaindefuser only via the near alias:
         XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "prod.vote-chain-primary.valargroup.org"))
@@ -232,9 +250,10 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNotNil(OHTTPEndpoints.proxyHost(for: cmcURL), "CMC should be a mapped host")
         XCTAssertNotNil(OHTTPEndpoints.proxyHost(for: nearURL), "NEAR should be a mapped host")
 
-        // The proxy hosts should be recognized as gateways
-        XCTAssertTrue(OHTTPEndpoints.isGateway("cmc.zodl.com"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("near.zodl.com"))
+        // The proxy hosts are aliases, and still reach the mainnet relay
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("cmc.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("near.zodl.com"))
+        XCTAssertNoThrow(try OHTTPEndpoints.relayURL(for: "cmc.zodl.com"))
     }
 
     func testSecretStrippingForNonMappedHosts() {

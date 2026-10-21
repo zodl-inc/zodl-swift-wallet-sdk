@@ -243,7 +243,8 @@ final class OHTTPExternalHTTPTests: XCTestCase {
     func testFlexaMapsToItsGatewayAliasAndKeepsItsAuthorization() throws {
         let url = try XCTUnwrap(URL(string: "https://api.flexa.co/commerce_sessions/cs_1/approve"))
         XCTAssertEqual(OHTTPEndpoints.proxyURL(for: url)?.absoluteString, "https://flexa.zodl.com/commerce_sessions/cs_1/approve")
-        XCTAssertTrue(OHTTPEndpoints.isGateway("flexa.zodl.com"))
+        XCTAssertTrue(OHTTPEndpoints.isAliasHost("flexa.zodl.com"))
+        XCTAssertFalse(OHTTPEndpoints.isGateway("flexa.zodl.com"))
         XCTAssertFalse(OHTTPEndpoints.needsHeaderStripping(host: "flexa.zodl.com"))
         XCTAssertTrue(OHTTPEndpoints.needsHeaderStripping(host: "cmc.zodl.com"))
 
