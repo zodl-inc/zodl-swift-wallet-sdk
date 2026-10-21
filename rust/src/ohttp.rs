@@ -846,6 +846,89 @@ pub unsafe extern "C" fn zcashlc_free_ohttp_profile_info(ptr: *mut OhttpProfileI
     }
 }
 
+/// The network of a gateway host for the DNS source: the same static known-hosts rule as the
+/// key-config verification, on the lower-cased host.
+///
+/// # Safety
+///
+/// - `host` must be valid for reads for `host_len` bytes, or null when the length is zero.
+unsafe fn dns_network(host: *const u8, host_len: usize) -> anyhow::Result<Network> {
+    let host = std::str::from_utf8(unsafe { bytes(host, host_len)? })
+        .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
+    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&host.to_ascii_lowercase())?)
+}
+
+/// The number of DNS-over-HTTPS resolvers of the signed Key Configuration DNS source, tried in
+/// index order by [`zcashlc_ohttp_doh_query_url`].
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_doh_resolver_count() -> u32 {
+    zodl_ohttp_client::DOH_RESOLVERS.len() as u32
+}
+
+/// The DoH (JSON API) query URL of resolver `index` for the TXT record of `gateway_host`'s network.
+/// Send it with `accept: application/dns-json`, only after the relay source failed.
+///
+/// Returns a NUL-terminated string to free with [`zcashlc_string_free`], or null with the error
+/// in the thread-local last error.
+///
+/// # Safety
+///
+/// - `gateway_host` must be valid for reads for `gateway_host_len` bytes, or null when the length
+///   is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
+    index: u32,
+    gateway_host: *const u8,
+    gateway_host_len: usize,
+) -> *mut c_char {
+    let res = catch_panic(|| {
+        let network = unsafe { dns_network(gateway_host, gateway_host_len)? };
+        let resolver = zodl_ohttp_client::DOH_RESOLVERS
+            .get(index as usize)
+            .ok_or_else(|| anyhow!("no DoH resolver {index}"))?;
+        Ok(CString::new(zodl_ohttp_client::doh_query_url(resolver, network))?.into_raw())
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// The signed envelope carried by a DoH JSON response (`doh_body`) for `gateway_host`'s network;
+/// verify it with [`zcashlc_ohttp_verify_key_config`] like one fetched through the relay.
+///
+/// Returns the envelope bytes (length in `*envelope_len_out`) to free with
+/// [`zcashlc_ohttp_free_bytes`], or null with the error in the thread-local last error.
+///
+/// # Safety
+///
+/// - `doh_body` and `gateway_host` must be valid for reads for their lengths, or null when the
+///   length is zero; `envelope_len_out` must be valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_envelope_from_doh_json(
+    doh_body: *const u8,
+    doh_body_len: usize,
+    gateway_host: *const u8,
+    gateway_host_len: usize,
+    envelope_len_out: *mut usize,
+) -> *mut u8 {
+    let res = catch_panic(|| {
+        let body = unsafe { bytes(doh_body, doh_body_len)? };
+        let network = unsafe { dns_network(gateway_host, gateway_host_len)? };
+        let (ptr, len) = ptr_from_vec(zodl_ohttp_client::envelope_from_doh_json(body, network)?);
+        unsafe { *envelope_len_out = len };
+        Ok(ptr)
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Frees bytes returned by [`zcashlc_ohttp_envelope_from_doh_json`].
+///
+/// # Safety
+///
+/// - `ptr` must be null or returned by that function with this `len`, and not freed before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_ohttp_free_bytes(ptr: *mut u8, len: usize) {
+    free_ptr_from_vec(ptr, len);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,83 +1378,105 @@ mod tests {
         assert!(zcashlc_last_error_length() > 0);
         zcashlc_clear_last_error();
     }
-}
 
-/// The network of a gateway host for the DNS source: the same static known-hosts rule as the
-/// key-config verification, on the lower-cased host.
-fn dns_network(host: *const u8, host_len: usize) -> anyhow::Result<Network> {
-    let host = std::str::from_utf8(unsafe { bytes(host, host_len)? })
-        .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
-    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&host.to_ascii_lowercase())?)
-}
+    #[test]
+    fn the_doh_query_urls_follow_the_resolver_order_and_the_network() {
+        assert_eq!(zcashlc_ohttp_doh_resolver_count(), 2);
+        for (host, name) in [
+            ("ohttp-gateway.example", "ohttp-keys.example"),
+            (
+                "OHTTP-GATEWAY-TESTNET.zodl.com",
+                "ohttp-keys-testnet.example",
+            ),
+        ] {
+            let urls: Vec<String> = (0..2)
+                .map(|index| {
+                    let url =
+                        unsafe { zcashlc_ohttp_doh_query_url(index, host.as_ptr(), host.len()) };
+                    assert!(!url.is_null());
+                    let text = unsafe { CStr::from_ptr(url) }.to_str().unwrap().to_owned();
+                    unsafe { zcashlc_string_free(url) };
+                    text
+                })
+                .collect();
+            assert_eq!(
+                urls[0],
+                format!("https://cloudflare-dns.com/dns-query?name={name}&type=TXT")
+            );
+            assert_eq!(
+                urls[1],
+                format!(
+                    "https://dns.google/resolve?name={name}&type=TXT&edns_client_subnet=0.0.0.0/0"
+                )
+            );
+        }
+    }
 
-/// The number of DNS-over-HTTPS resolvers of the signed Key Configuration DNS source, tried in
-/// index order by [`zcashlc_ohttp_doh_query_url`].
-#[unsafe(no_mangle)]
-pub extern "C" fn zcashlc_ohttp_doh_resolver_count() -> u32 {
-    zodl_ohttp_client::DOH_RESOLVERS.len() as u32
-}
+    #[test]
+    fn a_doh_query_url_needs_a_known_gateway_and_an_existing_resolver() {
+        let host = "cmc.zodl.com";
+        zcashlc_clear_last_error();
+        assert!(unsafe { zcashlc_ohttp_doh_query_url(0, host.as_ptr(), host.len()) }.is_null());
+        assert!(last_error_message().contains("no OHTTP network configured"));
+        let host = "ohttp-gateway.example";
+        zcashlc_clear_last_error();
+        assert!(unsafe { zcashlc_ohttp_doh_query_url(2, host.as_ptr(), host.len()) }.is_null());
+        assert!(last_error_message().contains("no DoH resolver 2"));
+        zcashlc_clear_last_error();
+    }
 
-/// The DoH (JSON API) query URL of resolver `index` for the TXT record of `gateway_host`'s network.
-/// Send it with `accept: application/dns-json`, only after the relay source failed.
-///
-/// Returns a NUL-terminated string to free with [`zcashlc_string_free`], or null with the error
-/// in the thread-local last error.
-///
-/// # Safety
-///
-/// - `gateway_host` must be valid for reads for `gateway_host_len` bytes, or null when the length
-///   is zero.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
-    index: u32,
-    gateway_host: *const u8,
-    gateway_host_len: usize,
-) -> *mut c_char {
-    let res = catch_panic(|| {
-        let network = dns_network(gateway_host, gateway_host_len)?;
-        let resolver = zodl_ohttp_client::DOH_RESOLVERS
-            .get(index as usize)
-            .ok_or_else(|| anyhow!("no DoH resolver {index}"))?;
-        Ok(CString::new(zodl_ohttp_client::doh_query_url(resolver, network))?.into_raw())
-    });
-    unwrap_exc_or_null(res)
-}
+    /// The DoH JSON answer `name` with the TXT value `data`.
+    fn doh_json(name: &str, data: &str) -> String {
+        format!(
+            r#"{{"Status":0,"Answer":[{{"name":"{name}","type":16,"TTL":300,"data":"{data}"}}]}}"#
+        )
+    }
 
-/// The signed envelope carried by a DoH JSON response (`doh_body`) for `gateway_host`'s network;
-/// verify it with [`zcashlc_ohttp_verify_key_config`] like one fetched through the relay.
-///
-/// Returns the envelope bytes (length in `*envelope_len_out`) to free with
-/// [`zcashlc_ohttp_free_bytes`], or null with the error in the thread-local last error.
-///
-/// # Safety
-///
-/// - `doh_body` and `gateway_host` must be valid for reads for their lengths, or null when the
-///   length is zero; `envelope_len_out` must be valid for writes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_ohttp_envelope_from_doh_json(
-    doh_body: *const u8,
-    doh_body_len: usize,
-    gateway_host: *const u8,
-    gateway_host_len: usize,
-    envelope_len_out: *mut usize,
-) -> *mut u8 {
-    let res = catch_panic(|| {
-        let body = unsafe { bytes(doh_body, doh_body_len)? };
-        let network = dns_network(gateway_host, gateway_host_len)?;
-        let (ptr, len) = ptr_from_vec(zodl_ohttp_client::envelope_from_doh_json(body, network)?);
-        unsafe { *envelope_len_out = len };
-        Ok(ptr)
-    });
-    unwrap_exc_or_null(res)
-}
+    #[test]
+    fn the_envelope_of_a_doh_answer_is_extracted_for_the_gateway_network() {
+        let host = "ohttp-gateway-testnet.example";
+        // "hello world" in two quoted strings, as the record is published.
+        let body = doh_json(
+            "ohttp-keys-testnet.example",
+            r#"\"aGVsbG8g\" \"d29ybGQ=\""#,
+        );
+        let mut len = 0usize;
+        let envelope = unsafe {
+            zcashlc_ohttp_envelope_from_doh_json(
+                body.as_ptr(),
+                body.len(),
+                host.as_ptr(),
+                host.len(),
+                &mut len,
+            )
+        };
+        assert!(!envelope.is_null());
+        assert_eq!(unsafe { slice(envelope, len) }, b"hello world");
+        unsafe { zcashlc_ohttp_free_bytes(envelope, len) };
+    }
 
-/// Frees bytes returned by [`zcashlc_ohttp_envelope_from_doh_json`].
-///
-/// # Safety
-///
-/// - `ptr` must be null or returned by that function with this `len`, and not freed before.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_ohttp_free_bytes(ptr: *mut u8, len: usize) {
-    free_ptr_from_vec(ptr, len);
+    #[test]
+    fn a_doh_answer_for_another_name_or_an_unknown_gateway_is_refused() {
+        let body = doh_json("ohttp-keys.example", "aGVsbG8gd29ybGQ=");
+        for (host, error) in [
+            ("ohttp-gateway-testnet.example", "DoH response"),
+            ("gateway.example", "no OHTTP network configured"),
+        ] {
+            zcashlc_clear_last_error();
+            let mut len = 0usize;
+            let envelope = unsafe {
+                zcashlc_ohttp_envelope_from_doh_json(
+                    body.as_ptr(),
+                    body.len(),
+                    host.as_ptr(),
+                    host.len(),
+                    &mut len,
+                )
+            };
+            assert!(envelope.is_null(), "{host}");
+            assert!(last_error_message().contains(error), "{host}");
+        }
+        zcashlc_clear_last_error();
+        unsafe { zcashlc_ohttp_free_bytes(ptr::null_mut(), 0) };
+    }
 }
