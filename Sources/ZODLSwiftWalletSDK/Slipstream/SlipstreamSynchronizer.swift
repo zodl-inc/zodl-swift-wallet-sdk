@@ -2940,30 +2940,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             viaTor: viaTor,
             httpSender: httpSender
         )
-        let scheme = request.url?.scheme ?? "https"
-        // Use percent-encoded path to preserve special characters
-        let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
-        let path = rawPath + (request.url?.query.map { "?\($0)" } ?? "")
-
-        // Strip gateway-injected secrets for alias hosts (CMC, NEAR, voting).
-        var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
-        if OHTTPEndpoints.needsHeaderStripping(host: host) {
-            let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
-            let originalCount = headers.count
-            headers = headers.filter { !strippedHeaders.contains($0.0) }
-            if headers.count < originalCount {
-                initializer.logger.info("httpRequestOverOHTTP: stripped \(originalCount - headers.count) gateway-injected secret header(s) for \(host)")
-            }
-        }
-
-        let bhttp = OHTTPRequest(
-            method: request.httpMethod ?? "GET",
-            scheme: scheme,
-            authority: host,
-            path: path,
-            headers: headers,
-            body: request.httpBody ?? Data()
-        )
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
         let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
         guard let httpResp = HTTPURLResponse(
             url: request.url!,

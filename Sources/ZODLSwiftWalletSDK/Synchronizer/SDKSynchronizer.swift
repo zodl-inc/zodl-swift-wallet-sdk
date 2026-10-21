@@ -1414,8 +1414,6 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     /// Gateway-injected secrets: external APIs that need a secret (CMC, NEAR) must NOT receive the
     /// app's secret when Tor is ON. With `viaTor: true`, the gateway injects the secret on behalf
     /// of the client after decrypting the OHTTP-encapsulated request.
-    ///
-    /// Authored on Linux — compile validation pending on macOS.
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
         // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
         // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
@@ -1461,33 +1459,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             httpSender: httpSender
         )
 
-        let scheme = request.url?.scheme ?? "https"
-        // Use percent-encoded path to preserve special characters
-        let rawPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? "/"
-        let queryStr = request.url?.query.map { "?\($0)" } ?? ""
-
-        // Strip gateway-injected secrets for alias hosts (CMC, NEAR, voting).
-        var headers = (request.allHTTPHeaderFields ?? [:]).map { ($0.key.lowercased(), $0.value) }
-        if OHTTPEndpoints.needsHeaderStripping(host: host) {
-            let strippedHeaders = ["x-cmc_pro_api_key", "authorization"]
-            let originalCount = headers.count
-            headers = headers.filter { !strippedHeaders.contains($0.0) }
-            if headers.count < originalCount {
-                logger.info("httpRequestOverOHTTP: stripped \(originalCount - headers.count) gateway-injected secret header(s) for \(host)")
-            }
-        }
-
-        let body = request.httpBody ?? Data()
-
-        let bhttpRequest = OHTTPRequest(
-            method: request.httpMethod ?? "GET",
-            scheme: scheme,
-            authority: host,
-            path: rawPath + queryStr,
-            headers: headers,
-            body: body
-        )
-
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttpRequest = try OHTTPExternalHTTP.innerRequest(for: request)
         let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
 
         guard let httpResponse = HTTPURLResponse(
