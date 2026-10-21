@@ -36,7 +36,7 @@ use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
     ChunkedResponseDecoder, ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network,
-    OuterOutcome, OuterPolicy, OuterResponse, ResponseEvent, check_size, classify_outer_response,
+    OuterOutcome, OuterResponse, ResponseEvent, check_size, classify_outer_response,
     encapsulate_chunked_request, encode_bhttp_request, pack_fields, signed_config_url,
     unpack_fields, verify_signed_config,
 };
@@ -372,14 +372,14 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
             )
         };
 
-        // Classify the outer response using the iOS policy
+        // Classify the outer response under the profile's policy
         let sealed = unsafe { bytes(body, body_len)? };
         let outer_response = OuterResponse {
             status: outer_status,
             content_type,
             body: sealed,
         };
-        let outer_outcome = classify_outer_response(&OuterPolicy::IOS, &outer_response, attempt);
+        let outer_outcome = classify_outer_response(&profile.outer, &outer_response, attempt);
 
         // Process based on classification
         let outcome = match outer_outcome {
