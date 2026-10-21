@@ -147,10 +147,10 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# 0.4.0-pre.1 is built against the NU7 pre-release crates, the same
+# 0.4.0-pre.2 is built against the NU7 pre-release crates, the same
 # librustzcash generation as this package, so the graph stays a single
 # family instance.
-slipstream-core = { version = "=0.4.0-pre.1", package = "zodl-slipstream" }
+slipstream-core = { version = "=0.4.0-pre.2", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -213,11 +213,11 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# The slipstream engine's OHTTP connector for 0.4.0-pre.1 lives in slipstream-internal
-# PR #16 (head 21111dc2428ae298d474c7345e41c6c77b77a350): DNS fallback for signed key configuration
-# with fail-closed configuration validation, public slipstream main merged (wallet-change stop),
-# zodl-ohttp-client b0b2087c.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "21111dc2428ae298d474c7345e41c6c77b77a350" }
+# The slipstream engine's OHTTP connector for 0.4.0-pre.2 lives in slipstream-internal
+# PR #25 (head a27fecc57618484951364b4d6bd3afe88ebeb706), stacked on PR #16 with public slipstream
+# 0.4.0-pre.2 merged: the relay dispatch hook runs right before the sealed request is written, and
+# an HTTP answer is read only up to the caller's ceiling.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "a27fecc57618484951364b4d6bd3afe88ebeb706" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #

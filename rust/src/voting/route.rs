@@ -22,7 +22,9 @@ use std::sync::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use slipstream_core::ohttp::{Dialer, NetworkType, http_round_trip, http_round_trip_with_dispatch};
+use slipstream_core::ohttp::{
+    Dialer, HttpRoundTripError, NetworkType, http_round_trip_with_dispatch,
+};
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
@@ -468,13 +470,31 @@ fn dispatch_tracking<'a>(
 }
 
 /// A transport failure or timeout is ambiguous only once the sealed request may have left the
-/// device: before `on_dispatch` (key-config fetch, encapsulation, relay connect) it is provably
-/// unsent, so it keeps the before-dispatch phase and its safe retry.
+/// device. `on_dispatch` runs right before the sealed request is written to the relay
+/// connection, so a key-config failure, a relay pause or a relay that cannot be reached stays
+/// before dispatch: the request is provably unsent, and it keeps the before-dispatch phase and
+/// its safe retry.
 fn dispatch_phase_error(dispatched: &AtomicBool, message: String) -> RouteError {
     if dispatched.load(Ordering::SeqCst) {
         RouteError::after_dispatch(message)
     } else {
         RouteError::before_dispatch(format!("{message} (before dispatch)"))
+    }
+}
+
+/// The route failure for an OHTTP round trip that ended in `error`.
+///
+/// An answer past the ceiling is a response-read failure whether or not the hook fired, because
+/// the engine reads an answer only after it has sent the request. Any other failure follows the
+/// hook, as [`dispatch_phase_error`] describes.
+fn ohttp_route_error(dispatched: &AtomicBool, error: HttpRoundTripError) -> RouteError {
+    match error {
+        HttpRoundTripError::ResponseTooLarge(message) => {
+            RouteError::response_read(format!("OHTTP response too large: {message}"))
+        }
+        HttpRoundTripError::Failed(message) => {
+            dispatch_phase_error(dispatched, format!("OHTTP transport: {message}"))
+        }
     }
 }
 
@@ -504,8 +524,10 @@ impl RouteHttp for OhttpRoute {
             let wrapped_on_dispatch = dispatch_tracking(&dispatched, on_dispatch);
 
             // The relay leg uses the device's own connection (`Dialer::Direct`).
-            // The callback fires right before the sealed request is sent, so failures
-            // during key-config fetch or relay connect are not classified as dispatched.
+            // The callback fires right before the sealed request is written to the relay
+            // connection, so a key-config failure, a relay pause or a relay that cannot be
+            // reached stays before dispatch. The engine also stops reading an answer once it
+            // is past `max_response_bytes`, instead of buffering it in full.
             let call = http_round_trip_with_dispatch(
                 &self.gateway_host,
                 self.network,
@@ -514,6 +536,7 @@ impl RouteHttp for OhttpRoute {
                 request.url,
                 request.headers,
                 &request.body,
+                max_response_bytes,
                 &wrapped_on_dispatch,
             );
             let (status, headers, body) = tokio::time::timeout(request.timeout, call)
@@ -521,10 +544,10 @@ impl RouteHttp for OhttpRoute {
                 .map_err(|_| {
                     dispatch_phase_error(&dispatched, "OHTTP request timed out".to_string())
                 })?
-                .map_err(|error| {
-                    dispatch_phase_error(&dispatched, format!("OHTTP transport: {error}"))
-                })?;
+                .map_err(|error| ohttp_route_error(&dispatched, error))?;
 
+            // The engine refuses a longer body itself; this check only keeps the ceiling true
+            // should that ever change.
             if body.len() > max_response_bytes {
                 return Err(RouteError::response_read(format!(
                     "response body too large: {} > {max_response_bytes} bytes",
@@ -724,6 +747,50 @@ mod tests {
             "the caller's callback still runs"
         );
         let error = dispatch_phase_error(&dispatched, "relay reset".to_string());
+        assert_eq!(error.phase, RoutePhase::AfterDispatch);
+    }
+
+    #[test]
+    fn ohttp_response_too_large_is_a_response_read_failure() {
+        // An answer is only read once the request has been sent, so whether the hook fired
+        // does not decide this failure.
+        for dispatched in [false, true] {
+            let error = ohttp_route_error(
+                &AtomicBool::new(dispatched),
+                HttpRoundTripError::ResponseTooLarge(
+                    "response body too large: 300 > 200 bytes".into(),
+                ),
+            );
+            assert_eq!(
+                error.phase,
+                RoutePhase::ResponseRead,
+                "an answer past the ceiling is a response-read failure (dispatched: {dispatched})"
+            );
+            assert!(
+                error.message.contains("300 > 200"),
+                "the sizes reach the caller: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn ohttp_failures_follow_the_dispatch_hook() {
+        let error = ohttp_route_error(
+            &AtomicBool::new(false),
+            HttpRoundTripError::Failed("relay down".into()),
+        );
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+        assert!(
+            error.message.ends_with("(before dispatch)"),
+            "{}",
+            error.message
+        );
+
+        let error = ohttp_route_error(
+            &AtomicBool::new(true),
+            HttpRoundTripError::Failed("relay down".into()),
+        );
         assert_eq!(error.phase, RoutePhase::AfterDispatch);
     }
 
