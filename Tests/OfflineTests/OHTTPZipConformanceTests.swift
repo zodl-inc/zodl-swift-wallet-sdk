@@ -310,6 +310,38 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertTrue(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "lwd.example.com"))
     }
 
+    // MARK: - One client per circuit
+
+    func testConcurrentFirstCallsOnOneCircuitMakeOneClient() async throws {
+        final class Made: @unchecked Sendable { var count = 0 }
+        let pool = OHTTPClientPool()
+        let made = Made()
+        let make: @Sendable () async throws -> OHTTPGRPCClient = {
+            made.count += 1
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let transport = OHTTPTestSupport.makeTransport { _, _ in throw OHTTPError.transportError("unused") }
+            return OHTTPGRPCClient(authority: "ohttp-gateway-testnet.example", transport: transport, singleCallTimeoutMS: 1000, streamingCallTimeoutMS: 1000)
+        }
+
+        let clients = try await withThrowingTaskGroup(of: OHTTPGRPCClient.self) { group in
+            for _ in 0..<4 {
+                group.addTask { try await pool.client(for: "shared", make: make) }
+            }
+            var clients: [OHTTPGRPCClient] = []
+            for try await client in group {
+                clients.append(client)
+            }
+            return clients
+        }
+
+        XCTAssertEqual(made.count, 1, "concurrent first calls on one circuit share one creation")
+        XCTAssertTrue(clients.allSatisfy { $0 === clients[0] })
+        let later = try await pool.client(for: "shared", make: make)
+        XCTAssertTrue(later === clients[0], "a later call finds the stored client")
+        _ = try await pool.client(for: nil, make: make)
+        XCTAssertEqual(made.count, 2, "another circuit gets its own client")
+    }
+
     // MARK: - Tor mode on the gRPC service
 
     func testDirectCallsGoOverTorWhileTorModeIsOn() async throws {

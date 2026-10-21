@@ -110,12 +110,19 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             circuit = nil
         }
 
-        if mode != .uniqueTor, let existing = await clients.client(for: circuit) {
-            return existing
-        }
-
-        let httpSender: OHTTPTransport.HTTPSender
         let viaTor = mode == .uniqueTor || circuit != nil
+        if mode == .uniqueTor {
+            return try await makeClient(host: host, relayURL: relayURL, viaTor: viaTor)
+        }
+        return try await clients.client(for: circuit) {
+            try await self.makeClient(host: host, relayURL: relayURL, viaTor: viaTor)
+        }
+    }
+
+    /// A client of the gateway `host` through `relayURL`, its relay leg on an isolated Tor circuit with
+    /// `viaTor`, on the hardened clearnet session otherwise.
+    private func makeClient(host: String, relayURL: String, viaTor: Bool) async throws -> OHTTPGRPCClient {
+        let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
             let isolated = try await torClient.isolatedClient()
             // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
@@ -146,17 +153,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             httpSender: httpSender
         )
 
-        let client = OHTTPGRPCClient(
+        return OHTTPGRPCClient(
             authority: host,
             transport: transport,
             singleCallTimeoutMS: Int(singleCallTimeoutMS),
             streamingCallTimeoutMS: Int(streamingCallTimeoutMS)
         )
-
-        if mode != .uniqueTor {
-            await clients.store(client, for: circuit)
-        }
-        return client
     }
 
     /// The circuit name of the calls that carry public, non-identifying chain data.
@@ -503,15 +505,29 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
 }
 
 /// The OHTTP clients of one service, by Tor circuit (nil: no Tor). Each keeps its transport, and so its
-/// relay connection; the key configuration itself is shared process-wide (`OHTTPKeyCache`).
-private actor OHTTPClientPool {
+/// relay connection; the key configuration itself is shared process-wide (`OHTTPKeyCache`). A circuit's
+/// client is made once: concurrent first calls wait for the one creation under way.
+actor OHTTPClientPool {
     private var clients: [String: OHTTPGRPCClient] = [:]
+    private var creations: [String: Task<OHTTPGRPCClient, Error>] = [:]
 
-    func client(for circuit: String?) -> OHTTPGRPCClient? {
-        clients[circuit ?? ""]
-    }
-
-    func store(_ client: OHTTPGRPCClient, for circuit: String?) {
-        clients[circuit ?? ""] = client
+    /// The client of `circuit`, made by `make` when there is none and no creation is under way.
+    func client(
+        for circuit: String?,
+        make: @escaping @Sendable () async throws -> OHTTPGRPCClient
+    ) async throws -> OHTTPGRPCClient {
+        let key = circuit ?? ""
+        if let existing = clients[key] {
+            return existing
+        }
+        if let running = creations[key] {
+            return try await running.value
+        }
+        let creation = Task { try await make() }
+        creations[key] = creation
+        defer { creations[key] = nil }
+        let client = try await creation.value
+        clients[key] = client
+        return client
     }
 }
