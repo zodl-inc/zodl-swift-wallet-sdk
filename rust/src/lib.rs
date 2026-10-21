@@ -5439,6 +5439,188 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
     unwrap_exc_or_null(res)
 }
 
+/// Selects the single-use transparent address most overdue for a check: exposed in the past day,
+/// not yet funded, with no check scheduled in the future. The caller fetches its transactions over
+/// its own transport, stores them with [`zcashlc_decrypt_and_store_transaction`] and, when there
+/// were none, calls [`zcashlc_schedule_single_use_taddr_check`]. This is the wallet half of
+/// [`zcashlc_tor_lwd_conn_check_single_use_taddr`].
+///
+/// Returns a [`ffi::TransparentAddressCheck`] if successful, or a null pointer in the case of an
+/// error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - Call [`ffi::zcashlc_free_transparent_address_check`] to free the memory associated with the
+///   returned pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_single_use_taddr_to_check(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+) -> *mut ffi::TransparentAddressCheck {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        // one day's worth of blocks.
+        let max_exposure_depth = (24 * 60 * 60) / 75;
+        let addrs =
+            db_data.get_ephemeral_transparent_receivers(account_uuid, max_exposure_depth, true)?;
+
+        // pick the address with the minimum check time that is less than or equal to now (or
+        // absent)
+        let now = SystemTime::now();
+        let selected_addr_meta = addrs
+            .into_iter()
+            .filter(|(_, meta)| {
+                meta.next_check_time().iter().all(|t| t <= &now)
+                    && matches!(meta.exposure(), Exposure::Exposed { .. })
+            })
+            .min_by_key(|(_, meta)| meta.next_check_time());
+
+        let Some((addr, meta)) = selected_addr_meta else {
+            return Ok(ffi::TransparentAddressCheck::from_rust(&network, None));
+        };
+        let cur_height = db_data
+            .chain_height()?
+            .ok_or(SqliteClientError::ChainHeightUnknown)?;
+        let start = match meta.exposure() {
+            Exposure::Exposed { at_height, .. } => at_height,
+            Exposure::Unknown | Exposure::CannotKnow => {
+                panic!("unexposed addresses should have already been filtered out");
+            }
+        };
+
+        Ok(ffi::TransparentAddressCheck::from_rust(
+            &network,
+            Some((addr, u32::from(start), u32::from(cur_height + 1))),
+        ))
+    });
+
+    unwrap_exc_or_null(res)
+}
+
+/// Schedules the next check of a single-use transparent address whose check found nothing, after
+/// approximately log2(blocks since exposure) additional blocks (exponential back-off).
+///
+/// Returns `true` on success, `false` on error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_schedule_single_use_taddr_check(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+        let addr = TransparentAddress::decode(&network, addr_str)?;
+
+        let cur_height = db_data
+            .chain_height()?
+            .ok_or(SqliteClientError::ChainHeightUnknown)?;
+        let meta = db_data
+            .get_transparent_address_metadata(account_uuid, &addr)?
+            .ok_or_else(|| anyhow!("{addr_str} is not an address of the account"))?;
+
+        let blocks_since_exposure = match meta.exposure() {
+            Exposure::Exposed { at_height, .. } => {
+                f64::from(std::cmp::max(cur_height - at_height, 1))
+            }
+            Exposure::Unknown => 1.0,
+            Exposure::CannotKnow => 1.0,
+        };
+
+        // We will schedule the next check to occur after approximately
+        // log2(blocks_since_exposure) additional blocks.
+        let offset_blocks = blocks_since_exposure.log2();
+        // Convert the offset in blocks to an offset in seconds; this will always fit in a
+        // u32.
+        let offset_seconds = (offset_blocks * 75.0).round() as u32;
+        db_data.schedule_next_check(&addr, offset_seconds)?;
+
+        Ok(true)
+    });
+
+    unwrap_exc_or(res, false)
+}
+
+/// The height from which UTXOs of `address` are looked for: its exposure height when known, else
+/// the birthday of the account. This is the wallet half of [`zcashlc_tor_lwd_conn_fetch_utxos_by_address`];
+/// the UTXOs found are stored with [`zcashlc_put_utxo`].
+///
+/// Returns the height, `-1` when `address` is not one of the account's, or `-2` in the case of an
+/// error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_transparent_address_utxo_start_height(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> i64 {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+        let addr = TransparentAddress::decode(&network, addr_str)?;
+
+        let Some(meta) = db_data.get_transparent_address_metadata(account_uuid, &addr)? else {
+            return Ok(-1);
+        };
+        let start = match meta.exposure() {
+            Exposure::Exposed { at_height, .. } => at_height,
+            Exposure::Unknown | Exposure::CannotKnow => {
+                db_data.get_account_birthday(account_uuid)?
+            }
+        };
+
+        Ok(i64::from(u32::from(start)))
+    });
+
+    unwrap_exc_or(res, -2)
+}
+
 //
 // Utility functions
 //

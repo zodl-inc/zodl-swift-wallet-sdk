@@ -62,6 +62,7 @@ fn main() {
         .rename_item("HttpResponseHeader", "FfiHttpResponseHeader")
         .rename_item("SingleUseTaddr", "FfiSingleUseTaddr")
         .rename_item("AddressCheckResult", "FfiAddressCheckResult")
+        .rename_item("TransparentAddressCheck", "FfiTransparentAddressCheck")
         .rename_item("ZecUsdExchange", "FfiZecUsdExchange")
         .rename_item("ErrorReport", "FfiErrorReport")
         .rename_item("GiftCardLink", "FfiGiftCardLink")
@@ -109,6 +110,11 @@ fn main() {
             "zcashlc_ohttp_doh_query_url",
             "zcashlc_ohttp_envelope_from_doh_json",
             "zcashlc_ohttp_free_bytes",
+            // The wallet half of the transparent-address checks `LightWalletOHTTPService` runs.
+            "zcashlc_single_use_taddr_to_check",
+            "zcashlc_free_transparent_address_check",
+            "zcashlc_schedule_single_use_taddr_check",
+            "zcashlc_transparent_address_utxo_start_height",
         ] {
             assert!(
                 header.contains(symbol),

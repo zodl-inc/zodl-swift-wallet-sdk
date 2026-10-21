@@ -1445,6 +1445,55 @@ pub unsafe extern "C" fn zcashlc_free_single_use_taddr(ptr: *mut SingleUseTaddr)
     }
 }
 
+/// The transparent-address check the wallet is due for.
+///
+/// cbindgen:prefix-with-name
+#[repr(C, u8)]
+pub enum TransparentAddressCheck {
+    /// No address is due for a check.
+    None,
+    /// `address` is to be checked for transactions mined from `start_height` to `end_height`.
+    Due {
+        address: *mut c_char,
+        start_height: u32,
+        end_height: u32,
+    },
+}
+
+impl TransparentAddressCheck {
+    pub(crate) fn from_rust(
+        network: &impl Parameters,
+        due: Option<(TransparentAddress, u32, u32)>,
+    ) -> *mut Self {
+        let res = match due {
+            None => TransparentAddressCheck::None,
+            Some((addr, start_height, end_height)) => TransparentAddressCheck::Due {
+                address: CString::new(addr.encode(&network)).unwrap().into_raw(),
+                start_height,
+                end_height,
+            },
+        };
+
+        Box::into_raw(Box::new(res))
+    }
+}
+
+/// Frees a [`TransparentAddressCheck`] value.
+///
+/// # Safety
+///
+/// - `ptr` must be non-null and must point to a struct having the layout of [`TransparentAddressCheck`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_transparent_address_check(ptr: *mut TransparentAddressCheck) {
+    if !ptr.is_null() {
+        let res = unsafe { Box::from_raw(ptr) };
+        if let TransparentAddressCheck::Due { address, .. } = *res {
+            unsafe { zcashlc_string_free(address) }
+        };
+        drop(res)
+    }
+}
+
 /// The result of checking for UTXOs received by an ephemeral address.
 ///
 /// cbindgen:prefix-with-name

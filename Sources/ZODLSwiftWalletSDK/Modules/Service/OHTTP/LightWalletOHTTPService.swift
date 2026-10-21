@@ -2,8 +2,9 @@
 //  LightWalletOHTTPService.swift
 //  ZODLSwiftWalletSDK
 //
-//  LightWalletService implementation using OHTTP transport for .direct mode.
-//  Tor modes delegate to the parent's FFI TorLwdConn path.
+//  LightWalletService implementation over the OHTTP transport for a gateway endpoint, in every mode: a Tor
+//  mode puts the relay leg on an isolated Tor circuit. The parent's FFI TorLwdConn path is for clearnet
+//  servers only.
 //
 
 import Foundation
@@ -23,6 +24,10 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private let streamingCallTimeoutMS: Int64
     /// The wallet's network. When set, a gateway of the other network is refused before any request.
     var walletNetwork: NetworkType?
+    /// Test-only: replaces the hardened clearnet session as the relay sender of the clients made from now on.
+    var testClearnetSender: OHTTPTransport.HTTPSender?
+    /// Test-only: verifies the key configuration instead of the native code.
+    var testKeyVerifier: OHTTPTransport.KeyVerifier?
 
     // `init(endpoint:tor:)` is inherited from the superclass: this class overrides its only
     // designated initializer, so the superclass convenience initializers come along.
@@ -130,6 +135,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             httpSender = { request, maxBytes in
                 try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
             }
+        } else if let testClearnetSender {
+            httpSender = testClearnetSender
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
             // with bounded response reading per ZIP MUST requirement
@@ -149,6 +156,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             gatewayHost: host,
             relayURL: relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            testKeyVerifier: testKeyVerifier,
             viaTor: viaTor,
             httpSender: httpSender
         )
@@ -496,6 +504,141 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    // MARK: - Transparent-address checks
+
+    // The wallet half (which address, its range, the storing) is `TransparentAddressWalletStore`; the server
+    // half rides the OHTTP transport like every other RPC, so these never reach the Tor gRPC connector. In
+    // Tor mode the synchronizers ask for `.uniqueTor`: each wallet-identifying call gets its own circuit.
+
+    override func checkSingleUseTransparentAddresses(
+        dbData: (String, UInt),
+        networkType: NetworkType,
+        accountUUID: AccountUUID,
+        mode: ServiceMode
+    ) async throws -> TransparentAddressCheckResult {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
+            return try await super.checkSingleUseTransparentAddresses(dbData: dbData, networkType: networkType, accountUUID: accountUUID, mode: mode)
+        }
+
+        guard let due = try await TransparentAddressWalletStore.singleUseAddressToCheck(
+            dbData: dbData,
+            networkType: networkType,
+            accountUUID: accountUUID
+        ) else {
+            return .notFound
+        }
+        let found = try await storeTransactions(client, of: due.address, from: due.startHeight, to: due.endHeight, dbData: dbData, networkType: networkType)
+        if !found {
+            try await TransparentAddressWalletStore.scheduleNextSingleUseAddressCheck(
+                address: due.address,
+                dbData: dbData,
+                networkType: networkType,
+                accountUUID: accountUUID
+            )
+        }
+        return found ? .found(due.address) : .notFound
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    override func updateTransparentAddressTransactions(
+        address: String,
+        start: BlockHeight,
+        end: BlockHeight,
+        dbData: (String, UInt),
+        networkType: NetworkType,
+        mode: ServiceMode
+    ) async throws -> TransparentAddressCheckResult {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
+            return try await super.updateTransparentAddressTransactions(
+                address: address,
+                start: start,
+                end: end,
+                dbData: dbData,
+                networkType: networkType,
+                mode: mode
+            )
+        }
+
+        // A negative end is open-ended, as `zcashlc_tor_lwd_conn_update_transparent_address_transactions` reads it.
+        let found = try await storeTransactions(client, of: address, from: start, to: end < 0 ? nil : end, dbData: dbData, networkType: networkType)
+        return found ? .found(address) : .notFound
+    }
+
+    override func fetchUTXOsByAddress(
+        address: String,
+        dbData: (String, UInt),
+        networkType: NetworkType,
+        accountUUID: AccountUUID,
+        mode: ServiceMode
+    ) async throws -> TransparentAddressCheckResult {
+        guard let client = try await ensureOHTTPClient(mode: mode) else {
+            return try await super.fetchUTXOsByAddress(
+                address: address,
+                dbData: dbData,
+                networkType: networkType,
+                accountUUID: accountUUID,
+                mode: mode
+            )
+        }
+
+        guard let start = try await TransparentAddressWalletStore.utxoStartHeight(
+            address: address,
+            dbData: dbData,
+            networkType: networkType,
+            accountUUID: accountUUID
+        ) else {
+            return .notFound
+        }
+
+        var args = GetAddressUtxosArg()
+        args.addresses = [address]
+        args.startHeight = UInt64(start)
+        let replies: [GetAddressUtxosReply]
+        do {
+            replies = try await client.serverStreaming(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream",
+                request: args
+            )
+        } catch {
+            let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+            throw ZcashError.serviceFetchUTXOsFailed(serviceError)
+        }
+        for reply in replies {
+            try await TransparentAddressWalletStore.store(reply, dbData: dbData, networkType: networkType)
+        }
+        return replies.isEmpty ? .notFound : .found(address)
+    }
+
+    /// Fetches the transactions of `address` mined from `start` to `end` (nil: the chain tip) through
+    /// `client`, stores each in the wallet, and returns whether there was one.
+    // swiftlint:disable:next function_parameter_count
+    private func storeTransactions(
+        _ client: OHTTPGRPCClient,
+        of address: String,
+        from start: BlockHeight,
+        to end: BlockHeight?,
+        dbData: (String, UInt),
+        networkType: NetworkType
+    ) async throws -> Bool {
+        var filter = TransparentAddressBlockFilter()
+        filter.address = address
+        filter.range = BlockRange(startHeight: start, endHeight: end)
+        let transactions: [RawTransaction]
+        do {
+            transactions = try await client.serverStreaming(
+                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
+                request: filter
+            )
+        } catch {
+            let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+            throw ZcashError.serviceGetTaddressTxidsFailed(serviceError)
+        }
+        for transaction in transactions {
+            try await TransparentAddressWalletStore.store(transaction, dbData: dbData, networkType: networkType)
+        }
+        return !transactions.isEmpty
     }
 
     override func closeConnections() async {
