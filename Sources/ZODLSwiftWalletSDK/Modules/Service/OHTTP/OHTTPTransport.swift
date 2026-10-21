@@ -414,6 +414,11 @@ actor OHTTPTransport {
 
         var request = URLRequest(url: urlObj)
         request.httpMethod = "GET"
+        // The fixed headers keep URLSession from naming the app build, the OS and the locale to the
+        // resolver.
+        for (name, value) in Self.fixedRelayHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = TimeInterval(timeoutMS) / 1000.0
 
@@ -536,7 +541,9 @@ actor OHTTPTransport {
             request.setValue(traceId, forHTTPHeaderField: "X-Client-Trace-Id")
         }
 
+        try await checkRelayBackoff()
         let (data, httpResponse) = try await httpSender(request, Self.maxKeyConfigBytes)
+        await noteRelayAnswer(status: httpResponse.statusCode, retryAfter: httpResponse.value(forHTTPHeaderField: "Retry-After"))
 
         guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
             throw OHTTPError.transportError("Key config fetch failed: HTTP \(httpResponse.statusCode)")
@@ -547,7 +554,7 @@ actor OHTTPTransport {
 
     private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> (Data, HTTPURLResponse) {
         let request = try relayPost(url: url, body: body, timeoutMS: timeoutMS)
-        try await waitForRelayBackoff()
+        try await checkRelayBackoff()
         let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
         await noteRelayAnswer(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         return (data, response)
@@ -592,14 +599,16 @@ actor OHTTPTransport {
         }
     }
 
-    /// Waits out the `Retry-After` of an earlier 429 through this relay before the next post, including a
-    /// later one that extended it while this post was waiting.
-    func waitForRelayBackoff() async throws {
-        while let deadline = await keyCache.backoffDeadline(for: backoffKey) {
-            let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
-            guard remaining > 0 else { return }
-            try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-        }
+    /// Fails at once, without sending, while the `Retry-After` of an earlier 429 through this relay runs
+    /// (ZIP "Outer response contract": a call made during the pause is failed locally, as a 429).
+    func checkRelayBackoff() async throws {
+        guard let deadline = await keyCache.backoffDeadline(for: backoffKey) else { return }
+        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
+        guard remaining > 0 else { return }
+        throw OHTTPError.httpStatusError(
+            statusCode: 429,
+            message: "relay rate limit: not sent, \(Int(remaining.rounded(.up)))s of the relay's pause left"
+        )
     }
 
     /// The delay of a `Retry-After` value in the delay-seconds form, capped at ``maxRetryAfter``; nil for a

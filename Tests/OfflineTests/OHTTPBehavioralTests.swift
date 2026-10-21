@@ -275,6 +275,7 @@ final class OHTTPBehavioralTests: XCTestCase {
     func testDNSFallbackOnRelayKeyConfigFailure() async throws {
         let counters = Counters()
         var dohFetched = false
+        var dohUserAgent: String?
 
         // Cloudflare DoH JSON with a real envelope (key ba8a2dbd). The record name matches the testnet
         // gateway of the test transport; its stub verifier accepts the envelope content.
@@ -303,6 +304,7 @@ final class OHTTPBehavioralTests: XCTestCase {
             // DoH query succeeds (DNS fallback)
             if url.contains("cloudflare-dns.com") || url.contains("dns.google") {
                 dohFetched = true
+                dohUserAgent = request.value(forHTTPHeaderField: "User-Agent")
                 return (cloudflareDoHResponse, OHTTPTestSupport.response(for: request.url, status: 200))
             }
 
@@ -316,6 +318,7 @@ final class OHTTPBehavioralTests: XCTestCase {
 
         XCTAssertEqual(counters.keyFetches, 1, "Should attempt relay key fetch once")
         XCTAssertTrue(dohFetched, "Should fall back to DNS after relay failure")
+        XCTAssertEqual(dohUserAgent, "zodl-ohttp/1.0", "The DoH query carries the fixed User-Agent, not the platform one")
         XCTAssertEqual(counters.posts, 1, "Should POST after getting key via DNS")
     }
 }

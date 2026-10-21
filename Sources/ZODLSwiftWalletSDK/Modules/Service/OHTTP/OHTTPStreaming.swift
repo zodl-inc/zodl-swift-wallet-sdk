@@ -135,7 +135,7 @@ extension OHTTPTransport {
         while true {
             let sealed = try OHTTPNative.encapsulate(key: key, request: request)
             let post = try relayPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
-            try await waitForRelayBackoff()
+            try await checkRelayBackoff()
             let outer = try await streamSender(post, Self.maxRelayResponseBytes)
             await noteRelayAnswer(status: outer.status, retryAfter: outer.retryAfter)
 

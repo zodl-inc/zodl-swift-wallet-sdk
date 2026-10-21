@@ -188,6 +188,23 @@ final class OHTTPStreamingTests: XCTestCase {
         XCTAssertGreaterThan(remaining, 20)
     }
 
+    func testACallDuringTheRelayPauseFailsWithoutAPost() async throws {
+        var posts = 0
+        let transport = makeTransport(keyCache: OHTTPKeyCache()) { [self] _, _ in
+            posts += 1
+            return outer(status: 429, retryAfter: "30", chunks: [Data("slow down".utf8)])
+        }
+        for _ in 0..<2 {
+            do {
+                _ = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+                XCTFail("a 429 must fail")
+            } catch OHTTPError.httpStatusError(let status, _) {
+                XCTAssertEqual(status, 429)
+            }
+        }
+        XCTAssertEqual(posts, 1, "the second call must fail locally while the pause runs")
+    }
+
     func testAFreshnessRefusalIsRetriedOnce() async throws {
         var posts = 0
         let refusal = [("ohttp-freshness", "rejected")]
