@@ -68,7 +68,7 @@ const OHTTP_VOTE_HOSTS: &[&str] = &[
     "zpir-1.stardust.rest",
 ];
 
-/// 64 MiB response cap (matches the gateway's MAX_UPSTREAM_RESPONSE_BYTES default).
+/// 64 MiB response cap for one voting call (the client's own bound; the gateway allows up to 256 MiB).
 const MAX_OHTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The request executor a voting session routes its traffic through.
