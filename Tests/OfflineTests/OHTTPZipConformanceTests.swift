@@ -88,7 +88,6 @@ final class OHTTPZipConformanceTests: XCTestCase {
             let transport = OHTTPTransport(
                 gatewayHost: "ohttp-gateway-testnet.example",
                 relayURL: "https://testnet-operator-relay.example.invalid/relay",
-                keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
                 testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
                 viaTor: viaTor,
                 keyCache: cache,
@@ -160,7 +159,6 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let other = OHTTPTransport(
             gatewayHost: "cmc.zodl.com",
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
-            keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: cache
         ) { request, _ in

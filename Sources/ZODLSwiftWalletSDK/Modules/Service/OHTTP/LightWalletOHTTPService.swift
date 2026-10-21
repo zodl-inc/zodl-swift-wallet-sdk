@@ -19,7 +19,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private let torClient: TorClient
     private let gatewayHost: String?
     private let gatewayRelayURL: String?
-    private let gatewayKeyConfigURL: String?
     private let singleCallTimeoutMS: Int64
     private let streamingCallTimeoutMS: Int64
     /// The wallet's network. When set, a gateway of the other network is refused before any request.
@@ -40,17 +39,10 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         // Store gateway configuration but defer OHTTPTransport creation until first use
         if OHTTPEndpoints.isGateway(endpoint.host) {
             self.gatewayHost = endpoint.host
-            do {
-                self.gatewayRelayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
-                self.gatewayKeyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
-            } catch {
-                self.gatewayRelayURL = nil
-                self.gatewayKeyConfigURL = nil
-            }
+            self.gatewayRelayURL = try? OHTTPEndpoints.relayURL(for: endpoint.host)
         } else {
             self.gatewayHost = nil
             self.gatewayRelayURL = nil
-            self.gatewayKeyConfigURL = nil
         }
 
         super.init(
@@ -76,17 +68,10 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         // Store gateway configuration but defer OHTTPTransport creation until first use
         if OHTTPEndpoints.isGateway(endpoint.host) {
             self.gatewayHost = endpoint.host
-            do {
-                self.gatewayRelayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
-                self.gatewayKeyConfigURL = OHTTPEndpoints.keyConfigURL(for: endpoint.host)
-            } catch {
-                self.gatewayRelayURL = nil
-                self.gatewayKeyConfigURL = nil
-            }
+            self.gatewayRelayURL = try? OHTTPEndpoints.relayURL(for: endpoint.host)
         } else {
             self.gatewayHost = nil
             self.gatewayRelayURL = nil
-            self.gatewayKeyConfigURL = nil
         }
 
         super.init(
@@ -105,9 +90,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     /// circuit follows the mode: `.direct` and `.defaultTor` (block ranges, tree states, chain tip) share
     /// one circuit, each `.torInGroup` name has its own, and `.uniqueTor` gets a new one per call.
     private func ensureOHTTPClient(mode: ServiceMode) async throws -> OHTTPGRPCClient? {
-        guard let host = gatewayHost,
-              let relayURL = gatewayRelayURL,
-              let keyConfigURL = gatewayKeyConfigURL else {
+        guard let host = gatewayHost, let relayURL = gatewayRelayURL else {
             return nil
         }
         if let walletNetwork {
@@ -158,7 +141,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         let transport = OHTTPTransport(
             gatewayHost: host,
             relayURL: relayURL,
-            keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             viaTor: viaTor,
             httpSender: httpSender

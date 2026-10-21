@@ -45,27 +45,22 @@ final class OHTTPTests: XCTestCase {
         XCTAssertThrowsError(try OHTTPEndpoints.relayURL(for: "unknown.zodl.com"))
     }
 
-    func testOHTTPEndpointsKeyConfigURL() {
-        // Key config URLs derived from relay URLs by replacing /relay → /ohttp-configs
-        let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(url, "https://testnet-relay.example.invalid/ohttp-configs")
-    }
-
-    func testOHTTPEndpointsKeyConfigURLMainnet() {
-        let url = OHTTPEndpoints.keyConfigURL(for: "ohttp-gateway.example")
-        XCTAssertEqual(url, "https://mainnet-relay.example.invalid/ohttp-configs")
-    }
-
-    func testOHTTPEndpointsKeyConfigURLProxyHosts() {
-        // Proxy hosts (static mappings and allowlisted) use mainnet relay (from native lib)
-        let cmcURL = OHTTPEndpoints.keyConfigURL(for: "cmc.zodl.com")
-        XCTAssertEqual(cmcURL, "https://mainnet-relay.example.invalid/ohttp-configs")
-
-        let nearURL = OHTTPEndpoints.keyConfigURL(for: "near.zodl.com")
-        XCTAssertEqual(nearURL, "https://mainnet-relay.example.invalid/ohttp-configs")
-
-        let voteURL = OHTTPEndpoints.keyConfigURL(for: "vote.zodl.com")
-        XCTAssertEqual(voteURL, "https://mainnet-relay.example.invalid/ohttp-configs")
+    func testTheSignedKeyConfigurationURLFollowsTheRelay() throws {
+        // The alias hosts ride the mainnet relay; the signed key configuration is fetched next to it.
+        for host in ["ohttp-gateway.example", "cmc.zodl.com", "near.zodl.com", "vote.zodl.com"] {
+            let relay = try OHTTPEndpoints.relayURL(for: host)
+            XCTAssertEqual(relay, "https://mainnet-relay.example.invalid/relay", host)
+            XCTAssertEqual(
+                try OHTTPNative.signedConfigURL(relayURL: relay),
+                "https://mainnet-relay.example.invalid/ohttp-configs/signed",
+                host
+            )
+        }
+        let testnetRelay = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
+        XCTAssertEqual(
+            try OHTTPNative.signedConfigURL(relayURL: testnetRelay),
+            "https://testnet-relay.example.invalid/ohttp-configs/signed"
+        )
     }
 
     // MARK: Finding D - GitHub voting config path routing
@@ -388,7 +383,6 @@ final class OHTTPTests: XCTestCase {
 
         let transport = OHTTPTestSupport.makeTransport(
             relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs",
             sender: torSender
         )
 
@@ -409,8 +403,7 @@ final class OHTTPTests: XCTestCase {
         // without mocking URLSession, so this is more of a smoke test that the default path compiles.
         let transport = OHTTPTransport(
             gatewayHost: "ohttp-gateway-testnet.example",
-            relayURL: "https://operator-relay.example.invalid/relay",
-            keyConfigURL: "https://simulator-relay.example.invalid/ohttp-configs"
+            relayURL: "https://operator-relay.example.invalid/relay"
         )
 
         // The transport should be created successfully with default httpSender
@@ -490,7 +483,7 @@ final class OHTTPTests: XCTestCase {
         }
     }
 
-    func testNonHTTPSKeyConfigURLFails() async throws {
+    func testNonHTTPSSignedConfigURLFails() async throws {
         var senderCalls = 0
         let transport = OHTTPTestSupport.makeTransport(relayURL: "http://operator-relay.example.invalid/relay") { request, _ in
             senderCalls += 1
@@ -516,8 +509,7 @@ final class OHTTPTests: XCTestCase {
         // that is not a signed envelope.
         let transport = OHTTPTransport(
             gatewayHost: "ohttp-gateway-testnet.example",
-            relayURL: "https://testnet-operator-relay.example.invalid/relay",
-            keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs"
+            relayURL: "https://testnet-operator-relay.example.invalid/relay"
         ) { request, _ in
             if request.httpMethod == "GET" {
                 return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))

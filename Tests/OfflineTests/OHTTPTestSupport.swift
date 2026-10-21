@@ -51,7 +51,6 @@ enum OHTTPTestSupport {
     /// A transport on the testnet gateway host, the test key verifier and `sender`.
     static func makeTransport(
         relayURL: String = "https://testnet-operator-relay.example.invalid/relay",
-        keyConfigURL: String = "https://testnet-operator-relay.example.invalid/ohttp-configs",
         clientTraceIdPrefix: String? = nil,
         keyCache: OHTTPKeyCache = OHTTPKeyCache(),
         sender: @escaping OHTTPTransport.HTTPSender
@@ -59,7 +58,6 @@ enum OHTTPTestSupport {
         OHTTPTransport(
             gatewayHost: "ohttp-gateway-testnet.example",
             relayURL: relayURL,
-            keyConfigURL: keyConfigURL,
             clientTraceIdPrefix: clientTraceIdPrefix,
             testKeyVerifier: makeKeyVerifier(),
             keyCache: keyCache,

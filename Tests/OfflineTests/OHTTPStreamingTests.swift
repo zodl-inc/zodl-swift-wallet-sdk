@@ -72,7 +72,6 @@ final class OHTTPStreamingTests: XCTestCase {
         OHTTPTransport(
             gatewayHost: "ohttp-gateway-testnet.example",
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
-            keyConfigURL: "https://testnet-operator-relay.example.invalid/ohttp-configs",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: keyCache,
             streamSender: streamSender,

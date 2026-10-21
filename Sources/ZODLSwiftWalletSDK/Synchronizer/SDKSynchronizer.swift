@@ -1456,7 +1456,6 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         let transport = OHTTPTransport(
             gatewayHost: route.gatewayHost,
             relayURL: route.relayURL,
-            keyConfigURL: route.keyConfigURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             viaTor: viaTor,
             httpSender: httpSender

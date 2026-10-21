@@ -233,7 +233,6 @@ actor OHTTPTransport {
     /// signed key configuration is checked against.
     private let gatewayHost: String
     let relayURL: String
-    private let keyConfigURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
     private let keyCache: OHTTPKeyCache
@@ -264,7 +263,6 @@ actor OHTTPTransport {
     init(
         gatewayHost: String,
         relayURL: String,
-        keyConfigURL: String,
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
@@ -287,10 +285,9 @@ actor OHTTPTransport {
             return (data, httpResponse)
         }
     ) {
-        // Store URLs; https validation is deferred until request time (see httpGet/httpPost).
+        // The relay URL is checked for https at request time (see httpGet/httpPost).
         self.gatewayHost = gatewayHost
         self.relayURL = relayURL
-        self.keyConfigURL = keyConfigURL
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
         self.clientTraceIdPrefix = clientTraceIdPrefix

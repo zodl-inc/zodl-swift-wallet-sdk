@@ -340,7 +340,6 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         let transport = OHTTPTransport(
             gatewayHost: endpoint.host,
             relayURL: relayURL,
-            keyConfigURL: OHTTPEndpoints.keyConfigURL(for: endpoint.host),
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             viaTor: viaTor,
             httpSender: httpSender

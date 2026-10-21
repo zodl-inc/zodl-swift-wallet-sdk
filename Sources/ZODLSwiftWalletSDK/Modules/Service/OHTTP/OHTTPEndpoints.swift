@@ -9,8 +9,8 @@
 //
 //    app ──HPKE-encrypted──▶ relay (sees IP, not content) ──▶ gateway (sees content, not IP) ──▶ lightwalletd
 //
-//  The gateway's HPKE key configuration is fetched through the relay at `https://<relay-host>/ohttp-configs`
-//  (the relay passes it through from the gateway).
+//  The gateway's signed HPKE key configuration is fetched through the relay at
+//  `https://<relay-host>/ohttp-configs/signed` (the relay passes it through from the gateway).
 //
 //  Non-LWD proxy hosts (CMC, NEAR, voting) also route through the same relay→gateway
 //  pair. The gateway proxies these to their real backends; the destination never sees the client IP.
@@ -141,19 +141,6 @@ public enum OHTTPEndpoints {
         }
         throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
     }
-    /// Key config URL, derived from the gateway's relay URL by replacing the path `/relay` with `/ohttp-configs`.
-    /// The relay proxies `/ohttp-configs` to the gateway's key endpoint.
-    public static func keyConfigURL(for gatewayHost: String) -> String {
-        guard var relayURL = try? relayURL(for: gatewayHost) else {
-            fatalError("keyConfigURL called for gateway \(gatewayHost) with no relay mapping")
-        }
-        // Replace only the path suffix, not the hostname (relay-simulator stays relay-simulator)
-        if relayURL.hasSuffix("/relay") {
-            relayURL.removeLast("/relay".count)
-            relayURL = "\(relayURL)/ohttp-configs"
-        }
-        return relayURL
-    }
 
     /// Maps a real external-service URL to its OHTTP proxy hostname.
     /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
@@ -240,11 +227,11 @@ public enum OHTTPEndpoints {
     static let mainnetGatewayHost = "ohttp-gateway.example"
     static let testnetGatewayHost = "ohttp-gateway-testnet.example"
 
-    /// The gateway, relay and key-configuration URL a request to `host` goes through for a wallet on
-    /// `network`. A lightwalletd gateway host is its own gateway; every other host the gateways carry
-    /// (the CMC and NEAR aliases, vote and PIR servers, the voting-config mirror) goes through the gateway
-    /// of the wallet's network, never the other network's.
-    static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String, keyConfigURL: String) {
+    /// The gateway and relay a request to `host` goes through for a wallet on `network`. A lightwalletd
+    /// gateway host is its own gateway; every other host the gateways carry (the CMC and NEAR aliases,
+    /// vote and PIR servers, the voting-config mirror) goes through the gateway of the wallet's network,
+    /// never the other network's.
+    static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String) {
         if let relay = OHTTPNative.relayURL(for: host.lowercased()) {
             guard let gatewayNetwork = self.network(for: host) else {
                 throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
@@ -252,7 +239,7 @@ public enum OHTTPEndpoints {
             guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
                 throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
             }
-            return (host, relay, keyConfigURL(for: host))
+            return (host, relay)
         }
         if network != .mainnet, mainnetOnlyAliases.contains(host.lowercased()) {
             throw OHTTPError.transportError("\(host) is served by the mainnet gateway only")
@@ -261,7 +248,7 @@ public enum OHTTPEndpoints {
         guard let relay = OHTTPNative.relayURL(for: gateway) else {
             throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gateway)")
         }
-        return (gateway, relay, keyConfigURL(for: gateway))
+        return (gateway, relay)
     }
 
     /// Refuses a gateway `host` of the other network than the wallet's `network`, before any request is
