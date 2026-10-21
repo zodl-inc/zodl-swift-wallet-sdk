@@ -155,7 +155,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let cache = OHTTPKeyCache()
         let limited = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
         _ = try? await limited.roundTrip(request: request, timeoutMS: 5000)
-        var otherRequests = 0
+        let otherRecorder = Recorder()
 
         let other = OHTTPTransport(
             gatewayHost: "cmc.zodl.com",
@@ -164,7 +164,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: cache
         ) { request, _ in
-            otherRequests += 1
+            otherRecorder.gets.append(request)
             if request.httpMethod == "GET" {
                 return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
             }
@@ -176,7 +176,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         } catch OHTTPError.httpStatusError(let status, _) {
             XCTAssertEqual(status, 429)
         }
-        XCTAssertEqual(otherRequests, 0, "the back-off belongs to the relay, not to one gateway")
+        XCTAssertEqual(otherRecorder.gets.count, 0, "the back-off belongs to the relay, not to one gateway")
     }
 
     // MARK: - No transparent resend
