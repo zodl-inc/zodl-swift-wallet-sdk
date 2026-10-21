@@ -162,10 +162,10 @@ jobs:
         timeout-minutes: 30
         run: make build
 
-      - name: Offline OHTTP unit tests
+      - name: Offline OHTTP unit tests (every OHTTP* class of OfflineTests)
         if: matrix.mode == 'ohttp'
         timeout-minutes: 20
-        run: swift test --filter 'OHTTPTests' 2>&1 | tee offline-ohttp-tests.log
+        run: swift test --filter 'OfflineTests\.OHTTP' 2>&1 | tee offline-ohttp-tests.log
 
       - name: Runner egress IP
         if: ${{ !cancelled() }}
