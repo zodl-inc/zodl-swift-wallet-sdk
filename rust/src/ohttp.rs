@@ -582,17 +582,13 @@ fn stream_events(events: Vec<ResponseEvent>) -> anyhow::Result<*mut OhttpStreamE
             ResponseEvent::End => end = true,
         }
     }
-    let (headers, headers_len) = if status == 0 {
-        (ptr::null_mut(), 0)
-    } else {
-        ptr_from_vec(pack_fields(&headers)?)
-    };
-    let (body, body_len) = ptr_from_vec(body);
+    // Everything fallible happens while the buffers are still owned: an error here frees them.
+    let headers = (status != 0).then(|| pack_fields(&headers)).transpose()?;
     let has_trailers = trailers.is_some();
-    let (trailers, trailers_len) = match trailers {
-        Some(t) => ptr_from_vec(pack_fields(&t)?),
-        None => (ptr::null_mut(), 0),
-    };
+    let trailers = trailers.map(|t| pack_fields(&t)).transpose()?;
+    let (headers, headers_len) = headers.map_or((ptr::null_mut(), 0), ptr_from_vec);
+    let (body, body_len) = ptr_from_vec(body);
+    let (trailers, trailers_len) = trailers.map_or((ptr::null_mut(), 0), ptr_from_vec);
     Ok(Box::into_raw(Box::new(OhttpStreamEvents {
         status,
         headers,
