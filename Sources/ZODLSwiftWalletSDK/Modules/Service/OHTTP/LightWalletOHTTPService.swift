@@ -162,24 +162,35 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     /// The circuit name of the calls that carry public, non-identifying chain data.
     private static let sharedCircuit = "shared"
 
+    /// The longest `GetBlockRange` span asked of the gateway in one exchange (ZIP "Deployment": the
+    /// client's span is 2 000 blocks); a longer range is fetched in halves.
+    private static let maximumSpan = 2000
+
     /// Below this many blocks a `GetBlockRange` refused with INVALID_ARGUMENT is not split any further:
-    /// the gateway's span limit is at least 10 000 blocks, so a smaller range is refused for another reason.
+    /// the gateway's span limit (reference 10 000 blocks) is above it, so the refusal has another cause.
     private static let minimumSplitSpan = 1000
 
-    /// The blocks `start...end`, split in halves when the gateway refuses the span with INVALID_ARGUMENT
-    /// (its block range limit).
+    /// The blocks `start...end`, in halves while the span is above `maximumSpan` or when the gateway
+    /// refuses it with INVALID_ARGUMENT (its own span limit).
     private func fetchBlocks(_ client: OHTTPGRPCClient, from start: BlockHeight, to end: BlockHeight) async throws -> [CompactBlock] {
+        if end - start >= Self.maximumSpan {
+            return try await fetchHalves(client, from: start, to: end)
+        }
         do {
             return try await client.serverStreaming(
                 path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
                 request: BlockRange(startHeight: start, endHeight: end)
             )
         } catch LightWalletServiceError.failed(let code, _) where code == OHTTPGRPCStatus.invalidArgument && end - start >= Self.minimumSplitSpan {
-            let middle = start + (end - start) / 2
-            let lower = try await fetchBlocks(client, from: start, to: middle)
-            let upper = try await fetchBlocks(client, from: middle + 1, to: end)
-            return lower + upper
+            return try await fetchHalves(client, from: start, to: end)
         }
+    }
+
+    private func fetchHalves(_ client: OHTTPGRPCClient, from start: BlockHeight, to end: BlockHeight) async throws -> [CompactBlock] {
+        let middle = start + (end - start) / 2
+        let lower = try await fetchBlocks(client, from: start, to: middle)
+        let upper = try await fetchBlocks(client, from: middle + 1, to: end)
+        return lower + upper
     }
 
     // MARK: - LightWalletService Protocol
@@ -400,37 +411,16 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
     }
 
+    /// lightwalletd keeps `GetMempoolStream` open until the next block, longer than one OHTTP exchange
+    /// can last (`grpc-timeout` 75 s, gateway upstream cut 80 s), so a gateway endpoint refuses the call
+    /// before anything is sent.
     override func getMempoolStream() throws -> AsyncThrowingStream<RawTransaction, Error> {
-        // Note: getMempoolStream doesn't take a mode parameter in the protocol
-        // We default to .direct mode for backward compatibility
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    guard let client = try await self.ensureOHTTPClient(mode: .direct) else {
-                        // Fall back to parent implementation
-                        for try await tx in try super.getMempoolStream() {
-                            continuation.yield(tx)
-                        }
-                        continuation.finish()
-                        return
-                    }
-
-                    let transactions: [RawTransaction] = try await client.serverStreaming(
-                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
-                        request: Empty()
-                    )
-
-                    for tx in transactions {
-                        continuation.yield(tx)
-                    }
-                    continuation.finish()
-                } catch {
-                    let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
-                    continuation.finish(throwing: ZcashError.serviceGetMempoolStreamFailed(serviceError))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+        guard gatewayHost == nil else {
+            throw ZcashError.serviceGetMempoolStreamFailed(
+                LightWalletServiceError.generalError(message: "GetMempoolStream is not available over OHTTP")
+            )
         }
+        return try super.getMempoolStream()
     }
 
     override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {

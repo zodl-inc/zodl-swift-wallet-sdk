@@ -285,6 +285,16 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
     }
 
+    func testTheMempoolStreamIsRefusedOverOHTTPBeforeAnyRequest() {
+        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+        XCTAssertThrowsError(try service.getMempoolStream()) { error in
+            guard case ZcashError.serviceGetMempoolStreamFailed = error else {
+                return XCTFail("Expected serviceGetMempoolStreamFailed, got \(error)")
+            }
+        }
+    }
+
     func testTheBuiltInRelaysAreIndependent() {
         XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway.example"))
         XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway-testnet.example"))
