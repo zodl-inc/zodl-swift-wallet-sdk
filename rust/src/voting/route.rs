@@ -23,7 +23,7 @@ use std::sync::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use slipstream_core::ohttp::{
-    Dialer, HttpRoundTripError, NetworkType, http_round_trip, http_round_trip_with_dispatch,
+    Dialer, HttpRoundTripError, NetworkType, http_round_trip_with_dispatch,
 };
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{

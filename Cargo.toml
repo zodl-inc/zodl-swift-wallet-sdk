@@ -214,7 +214,9 @@ strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.2 lives in slipstream-internal
-# PR #25 (head a27fecc57618484951364b4d6bd3afe88ebeb706), stacked on PR #16 with public slipstream 0.4.0-pre.2 merged: the relay dispatch hook runs right before the sealed request is written, and an HTTP answer is read only up to the caller's ceiling.
+# PR #25 (head a27fecc57618484951364b4d6bd3afe88ebeb706), stacked on PR #16 with public slipstream
+# 0.4.0-pre.2 merged: the relay dispatch hook runs right before the sealed request is written, and
+# an HTTP answer is read only up to the caller's ceiling.
 zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "a27fecc57618484951364b4d6bd3afe88ebeb706" }
 
 # Coinholder voting on the NU7 pre-release crates.
