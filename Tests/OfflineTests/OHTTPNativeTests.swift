@@ -290,7 +290,6 @@ final class OHTTPNativeTests: XCTestCase {
             _ = try OHTTPNative.encapsulate(key: makeKey(), request: makeRequest())
         }
     }
-}
 
     // MARK: - DNS Fallback Helpers
 
@@ -350,3 +349,4 @@ final class OHTTPNativeTests: XCTestCase {
         XCTAssertEqual(json?["network"] as? String, "mainnet", "Network should be mainnet")
         XCTAssertEqual(json?["key_id"] as? String, "ba8a2dbd", "Key ID should match fixture")
     }
+}

@@ -85,7 +85,7 @@ actor OHTTPKeyCache {
 
 /// The relay session in use, replaced by a fresh one (new connections) once it is `lifetime` old. The old
 /// one finishes the tasks it has and is then invalidated.
-private final class RotatingSession: @unchecked Sendable {
+final class RotatingSession: @unchecked Sendable {
     private let lock = NSLock()
     private let lifetime: TimeInterval
     private var session: URLSession?

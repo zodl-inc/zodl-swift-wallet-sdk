@@ -270,55 +270,65 @@ final class OHTTPBehavioralTests: XCTestCase {
 
     // MARK: - DNS Fallback on Relay Failure
 
-    /// Tests that OHTTP transport falls back to DNS when the relay key config fetch fails.
-    /// The relay GET returns 500, forcing DNS fallback which succeeds.
-    func testDNSFallbackOnRelayKeyConfigFailure() async throws {
+    /// What the DNS fallback asked and verified.
+    private final class DNSFallback: @unchecked Sendable {
+        var resolvers: [String] = []
+        var verifiedNetworks: [String] = []
+    }
+
+    /// A DoH JSON answer under the testnet record name whose TXT value is an envelope signed for `network`
+    /// (as the test verifier reads it: the real signature check is `OHTTPSignedConfigTests`).
+    private func dohAnswer(network: String) -> Data {
+        let envelope = Data("{\"v\":1,\"network\":\"\(network)\",\"key_id\":\"a3620fb6\"}".utf8).base64EncodedString()
+        return Data(
+            "{\"Status\":0,\"Answer\":[{\"name\":\"ohttp-keys-testnet.example\",\"type\":16,\"TTL\":300,\"data\":\"\\\"\(envelope)\\\"\"}]}".utf8
+        )
+    }
+
+    func testDNSFallbackVerifiesEachEnvelopeForTheGatewayNetworkInResolverOrder() async throws {
         let counters = Counters()
-        var dohFetched = false
-        var dohUserAgent: String?
-
-        // Cloudflare DoH JSON with a real envelope (key ba8a2dbd). The record name matches the testnet
-        // gateway of the test transport; its stub verifier accepts the envelope content.
-        let cloudflareDoHResponse = """
-        {
-          "Status": 0,
-          "Answer": [
-            {
-              "name": "ohttp-keys-testnet.example",
-              "type": 16,
-              "data": "\\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\\" \\"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\\""
+        let fallback = DNSFallback()
+        let accept = OHTTPTestSupport.makeKeyVerifier()
+        // The verifier of this transport refuses an envelope of the other network, as the native one does.
+        let verifier: OHTTPTransport.KeyVerifier = { envelope, now in
+            let network = (try? JSONSerialization.jsonObject(with: envelope) as? [String: Any])?["network"] as? String ?? "?"
+            fallback.verifiedNetworks.append(network)
+            guard network == "testnet" else {
+                throw OHTTPError.keyConfigError("signed for \(network), not testnet")
             }
-          ]
-        }
-        """.data(using: .utf8)!
-
-        let transport = OHTTPTestSupport.makeTransport { request, _ in
-            let url = request.url?.absoluteString ?? ""
-
-            // Relay key config fetch fails with 500
-            if url.hasSuffix("/ohttp-configs/signed") {
-                counters.keyFetches += 1
-                return (Data(), OHTTPTestSupport.response(for: request.url, status: 500))
-            }
-
-            // DoH query succeeds (DNS fallback)
-            if url.contains("cloudflare-dns.com") || url.contains("dns.google") {
-                dohFetched = true
-                dohUserAgent = request.value(forHTTPHeaderField: "User-Agent")
-                return (cloudflareDoHResponse, OHTTPTestSupport.response(for: request.url, status: 200))
-            }
-
-            // Relay POST (should succeed after DNS fallback gets the key)
-            counters.posts += 1
-            return (OHTTPTestSupport.unopenableSealedResponse(), OHTTPTestSupport.response(for: request.url, status: 200))
+            return try accept(envelope, now)
         }
 
-        // The round trip should succeed via DNS fallback
+        let transport = OHTTPTransport(
+            gatewayHost: "ohttp-gateway-testnet.example",
+            relayURL: "https://testnet-operator-relay.example.invalid/relay",
+            testKeyVerifier: verifier,
+            keyCache: OHTTPKeyCache(),
+            httpSender: { request, _ in
+                let url = request.url?.absoluteString ?? ""
+                if url.hasSuffix("/ohttp-configs/signed") {
+                    counters.keyFetches += 1
+                    return (Data(), OHTTPTestSupport.response(for: request.url, status: 500))
+                }
+                if let host = request.url?.host, host == "cloudflare-dns.com" || host == "dns.google" {
+                    fallback.resolvers.append(host)
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1.0", "the DoH query carries the fixed User-Agent")
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/dns-json")
+                    // Cloudflare serves a mainnet envelope under the testnet name, Google the testnet one.
+                    let network = host == "cloudflare-dns.com" ? "mainnet" : "testnet"
+                    return (self.dohAnswer(network: network), OHTTPTestSupport.response(for: request.url, status: 200))
+                }
+                counters.posts += 1
+                return (OHTTPTestSupport.unopenableSealedResponse(), OHTTPTestSupport.response(for: request.url, status: 200))
+            }
+        )
+
         _ = await statusError(from: transport)
 
-        XCTAssertEqual(counters.keyFetches, 1, "Should attempt relay key fetch once")
-        XCTAssertTrue(dohFetched, "Should fall back to DNS after relay failure")
-        XCTAssertEqual(dohUserAgent, "zodl-ohttp/1.0", "The DoH query carries the fixed User-Agent, not the platform one")
-        XCTAssertEqual(counters.posts, 1, "Should POST after getting key via DNS")
+        XCTAssertEqual(counters.keyFetches, 1, "the relay is asked once before DNS")
+        XCTAssertEqual(fallback.resolvers, ["cloudflare-dns.com", "dns.google"], "the resolvers are asked in order, the next one once an envelope is refused")
+        XCTAssertEqual(fallback.verifiedNetworks, ["mainnet", "testnet"], "every DNS envelope is verified for the gateway's network before it is used")
+        XCTAssertEqual(counters.posts, 1, "the request is posted with the key of the first envelope that verified")
     }
 }
+

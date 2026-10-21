@@ -397,19 +397,6 @@ final class OHTTPTests: XCTestCase {
         XCTAssertTrue(relayRequestCaptured, "Custom sender should be used for relay POST")
     }
 
-    func testClearnetModeUsesDefaultSenderWhenNotProvided() async throws {
-        // This test verifies that when httpSender is not provided (uses default URLSession),
-        // it works as expected for clearnet. We can't easily test the actual URLSession call
-        // without mocking URLSession, so this is more of a smoke test that the default path compiles.
-        let transport = OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
-            relayURL: "https://operator-relay.example.invalid/relay"
-        )
-
-        // The transport should be created successfully with default httpSender
-        XCTAssertNotNil(transport, "Transport should initialize with default httpSender")
-    }
-
     func testSessionConfigurationIsEphemeralWithNoCookiesOrCache() {
         // Verify the dedicated OHTTP session has ephemeral configuration with cookies and caching disabled.
         // This prevents a relay or gateway from storing Set-Cookie headers or cached responses that would

@@ -129,7 +129,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
     func testACallDuringTheRetryAfterPauseFailsLocallyWithoutRefetchingTheKey() async throws {
         let recorder = Recorder()
         let cache = OHTTPKeyCache()
-        let transport = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "1"]) }
+        let transport = makeTransport(recorder: recorder, cache: cache) { _ in (429, ["Retry-After": "30"]) }
 
         do {
             _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
@@ -139,12 +139,14 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
         XCTAssertEqual(recorder.posts.count, 1, "a 429 is not retried within the call")
 
+        let secondCall = Date()
         do {
             _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
             XCTFail("a call during the pause fails")
         } catch OHTTPError.httpStatusError(let status, _) {
             XCTAssertEqual(status, 429)
         }
+        XCTAssertLessThan(Date().timeIntervalSince(secondCall), 1, "a call during the pause fails at once, it does not wait the pause out")
         XCTAssertEqual(recorder.posts.count, 1, "a call during the pause is failed locally, not posted")
         XCTAssertEqual(recorder.keyFetches, 1, "a 429 never refetches the key configuration")
     }
@@ -193,8 +195,15 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
     func testTheRelaySessionIsReplacedAfterItsLifetime() {
         XCTAssertLessThanOrEqual(OHTTPTransport.sessionLifetime, 30 * 60)
-        let first = OHTTPTransport.session
-        XCTAssertTrue(first === OHTTPTransport.session, "within its lifetime the session is reused")
+        let lifetime = OHTTPTransport.sessionLifetime
+        let sessions = RotatingSession(lifetime: lifetime)
+        let start = Date()
+
+        let first = sessions.current(now: start)
+        XCTAssertTrue(first === sessions.current(now: start.addingTimeInterval(lifetime - 1)), "within its lifetime the session is reused")
+        let second = sessions.current(now: start.addingTimeInterval(lifetime))
+        XCTAssertFalse(first === second, "once it is as old as its lifetime a fresh session replaces it")
+        XCTAssertTrue(second === sessions.current(now: start.addingTimeInterval(lifetime + 1)))
     }
 
     // MARK: - gRPC status of a failed exchange
