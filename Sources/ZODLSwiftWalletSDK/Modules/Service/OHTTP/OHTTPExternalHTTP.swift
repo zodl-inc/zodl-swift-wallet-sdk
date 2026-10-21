@@ -65,6 +65,9 @@ enum OHTTPExternalHTTP {
     /// The request body, read out of its stream when it has one (as a `URLProtocol` gets it).
     static func body(of request: URLRequest) throws -> Data {
         if let body = request.httpBody {
+            if body.count > maxRequestBodyBytes {
+                throw OHTTPError.requestTooLarge("The request body exceeds \(maxRequestBodyBytes) bytes")
+            }
             return body
         }
         guard let stream = request.httpBodyStream else {
@@ -126,8 +129,7 @@ enum OHTTPExternalHTTP {
             )
         }
 
-        let timeoutMS = Int(max(request.timeoutInterval, 1) * 1000)
-        let streamed = try await transport.stream(request: inner, timeoutMS: timeoutMS)
+        let streamed = try await transport.stream(request: inner, timeoutMS: timeoutMS(for: request.timeoutInterval))
         guard let response = HTTPURLResponse(
             url: url,
             statusCode: streamed.status,
@@ -137,5 +139,15 @@ enum OHTTPExternalHTTP {
             throw ZcashError.ohttpResponseError
         }
         return OHTTPStreamedResponse(response: response, body: streamed.body)
+    }
+
+    /// The longest wait for the relay a request can ask for.
+    static let maxTimeout: TimeInterval = 24 * 60 * 60
+
+    /// `interval` in milliseconds, between 1 s and ``maxTimeout``; a value that is not a number (NaN, an
+    /// infinity) gets URLRequest's default of 60 s.
+    static func timeoutMS(for interval: TimeInterval) -> Int {
+        guard interval.isFinite else { return 60_000 }
+        return Int(min(max(interval, 1), maxTimeout) * 1000)
     }
 }

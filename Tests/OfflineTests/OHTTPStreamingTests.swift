@@ -283,4 +283,32 @@ final class OHTTPExternalHTTPTests: XCTestCase {
         XCTAssertFalse(inner.headers.contains { $0.0 == "x-cmc_pro_api_key" || $0.0 == "authorization" })
         XCTAssertEqual(inner.body, Data("{\"a\":1}".utf8))
     }
+
+    func testTheBodyLimitAppliesToABodyGivenAsDataAsToAStream() throws {
+        let oversized = Data(count: OHTTPExternalHTTP.maxRequestBodyBytes + 1)
+        var asData = URLRequest(url: try XCTUnwrap(URL(string: "https://cmc.zodl.com/v1/fiat/map")))
+        asData.httpBody = oversized
+        var asStream = asData
+        asStream.httpBody = nil
+        asStream.httpBodyStream = InputStream(data: oversized)
+
+        for request in [asData, asStream] {
+            XCTAssertThrowsError(try OHTTPExternalHTTP.body(of: request)) { error in
+                guard case OHTTPError.requestTooLarge = error else {
+                    return XCTFail("an oversized body is refused whatever its form, got \(error)")
+                }
+            }
+        }
+        asData.httpBody = Data(count: OHTTPExternalHTTP.maxRequestBodyBytes)
+        XCTAssertEqual(try OHTTPExternalHTTP.body(of: asData).count, OHTTPExternalHTTP.maxRequestBodyBytes)
+    }
+
+    func testTheRelayTimeoutOfAnExternalRequestIsBounded() {
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: 30), 30_000)
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: 0.25), 1000)
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: -5), 1000)
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: 1e300), Int(OHTTPExternalHTTP.maxTimeout * 1000))
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: .infinity), 60_000)
+        XCTAssertEqual(OHTTPExternalHTTP.timeoutMS(for: .nan), 60_000)
+    }
 }

@@ -54,7 +54,8 @@ actor OHTTPKeyCache {
 
     /// The cached key of `cacheKey` if `accept` takes it, else the key `fetch` returns, stored. Checked and
     /// started in one step: a call while a fetch for the same entry is under way waits for that one, and
-    /// one that comes after it finds its key.
+    /// one that comes after it finds its key. The fetch is shared, so a caller that is cancelled stops
+    /// waiting (`CancellationError`) while the fetch runs on for the others and its key is still stored.
     func key(
         for cacheKey: String,
         accept: @Sendable (OHTTPVerifiedKey) -> Bool,
@@ -63,15 +64,85 @@ actor OHTTPKeyCache {
         if let cached = keys[cacheKey], accept(cached) {
             return cached
         }
-        if let running = fetches[cacheKey] {
-            return try await running.value
+        let task = fetches[cacheKey] ?? startFetch(for: cacheKey, fetch)
+        return try await Self.waitCancellable(task)
+    }
+
+    private func startFetch(
+        for cacheKey: String,
+        _ fetch: @escaping @Sendable () async throws -> OHTTPVerifiedKey
+    ) -> Task<OHTTPVerifiedKey, Error> {
+        let task = Task<OHTTPVerifiedKey, Error> {
+            let result: Result<OHTTPVerifiedKey, Error>
+            do {
+                result = .success(try await fetch())
+            } catch {
+                result = .failure(error)
+            }
+            await self.finishFetch(for: cacheKey, result)
+            return try result.get()
         }
-        let task = Task { try await fetch() }
         fetches[cacheKey] = task
-        defer { fetches[cacheKey] = nil }
-        let key = try await task.value
-        keys[cacheKey] = key
-        return key
+        return task
+    }
+
+    private func finishFetch(for cacheKey: String, _ result: Result<OHTTPVerifiedKey, Error>) {
+        fetches[cacheKey] = nil
+        if case .success(let key) = result {
+            keys[cacheKey] = key
+        }
+    }
+
+    /// `task.value`, unless the caller is cancelled first: then `CancellationError`, and `task` is left
+    /// running (`Task.value` itself waits for the task whatever happens to the caller).
+    static func waitCancellable(_ task: Task<OHTTPVerifiedKey, Error>) async throws -> OHTTPVerifiedKey {
+        let outcome = FirstOutcome()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                outcome.deliver(to: continuation)
+                Task {
+                    do {
+                        outcome.resume(with: .success(try await task.value))
+                    } catch {
+                        outcome.resume(with: .failure(error))
+                    }
+                }
+            }
+        } onCancel: {
+            outcome.resume(with: .failure(CancellationError()))
+        }
+    }
+
+    /// Resumes one continuation with the first of the outcomes it is given, whichever comes first, the
+    /// continuation or the outcome.
+    private final class FirstOutcome: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<OHTTPVerifiedKey, Error>?
+        private var outcome: Result<OHTTPVerifiedKey, Error>?
+
+        func deliver(to continuation: CheckedContinuation<OHTTPVerifiedKey, Error>) {
+            lock.lock()
+            if let outcome {
+                lock.unlock()
+                continuation.resume(with: outcome)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func resume(with result: Result<OHTTPVerifiedKey, Error>) {
+            lock.lock()
+            guard outcome == nil else {
+                lock.unlock()
+                return
+            }
+            outcome = result
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: result)
+        }
     }
 
     func backoffDeadline(for cacheKey: String) -> Date? {
@@ -315,7 +386,9 @@ actor OHTTPTransport {
     }
 
     /// Fetches the signed key configuration through the relay and verifies it.
-    /// On relay fetch or verification failure, tries DNS-over-HTTPS as a fallback source.
+    /// On relay fetch or verification failure, tries DNS-over-HTTPS as a fallback source. A 429 is not
+    /// such a failure: the relay's pause (answered now, or left by an earlier 429) is back-off, and the
+    /// fetch fails with it, without any DNS query (ZIP "Outer response contract", "Key configuration").
     /// Configuration errors (non-https URLs, unknown gateway) fail closed without any network requests.
     private func fetchKeyConfig(profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
         // Validate relay URL is https before any network call
@@ -335,9 +408,9 @@ actor OHTTPTransport {
         // Try relay first (fetch AND verify)
         do {
             return try await fetchKeyConfigFromRelay(signedURL: signedURL, profile: profile)
+        } catch OHTTPError.httpStatusError(let status, let message) where status == 429 {
+            throw OHTTPError.httpStatusError(statusCode: status, message: message)
         } catch let relayError {
-            // A failed relay fetch or verification falls back to DNS; a cancelled task does not.
-            if relayError is CancellationError { throw relayError }
             return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
         }
     }
@@ -392,8 +465,6 @@ actor OHTTPTransport {
                 }
 
                 return verified
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
                 continue
             }
@@ -543,7 +614,10 @@ actor OHTTPTransport {
         await noteRelayAnswer(status: httpResponse.statusCode, retryAfter: httpResponse.value(forHTTPHeaderField: "Retry-After"))
 
         guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
-            throw OHTTPError.transportError("Key config fetch failed: HTTP \(httpResponse.statusCode)")
+            throw OHTTPError.httpStatusError(
+                statusCode: httpResponse.statusCode,
+                message: "Key config fetch failed: HTTP \(httpResponse.statusCode)"
+            )
         }
 
         return data

@@ -179,6 +179,90 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertEqual(otherRecorder.gets.count, 0, "the back-off belongs to the relay, not to one gateway")
     }
 
+    func testAKeyFetchDuringTheRelayPauseIsFailedLocallyWithoutAnyRequest() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        // A known gateway host, so the DNS source exists; the key cache is empty.
+        let transport = makeTransport(recorder: recorder, cache: cache)
+        await transport.noteRelayAnswer(status: 429, retryAfter: "30")
+
+        do {
+            _ = try await transport.keyConfig()
+            XCTFail("a key fetch during the pause fails")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(recorder.gets.count, 0, "during the pause nothing is sent: no relay GET and no DoH query")
+    }
+
+    func testARelay429OnTheKeyFetchIsBackOffNotAReasonForDNS() async throws {
+        let recorder = Recorder()
+        let transport = OHTTPTestSupport.makeTransport(keyCache: OHTTPKeyCache()) { request, _ in
+            recorder.gets.append(request)
+            return (Data(), OHTTPTestSupport.response(for: request.url, status: 429, headers: ["Retry-After": "7"]))
+        }
+
+        do {
+            _ = try await transport.keyConfig()
+            XCTFail("a 429 on the key fetch is an error")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(recorder.gets.map { $0.url?.host }, ["testnet-operator-relay.example.invalid"], "the relay's 429 is final: no DoH resolver is asked")
+        do {
+            try await transport.checkRelayBackoff()
+            XCTFail("the Retry-After of the key fetch's 429 starts the relay pause")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+    }
+
+    func testACancelledCallerStopsWaitingWhileTheSharedKeyFetchContinues() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let transport = OHTTPTestSupport.makeTransport(keyCache: cache) { request, _ in
+            recorder.keyFetches += 1
+            try await Task.sleep(nanoseconds: 600_000_000)
+            return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+        }
+
+        let cancelled = Task { try await transport.keyConfig() }
+        let other = Task { try await transport.keyConfig() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let cancelledAt = Date()
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("a cancelled caller does not get the key")
+        } catch is CancellationError {
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(cancelledAt), 0.3, "a cancelled caller stops waiting at once")
+
+        _ = try await other.value
+        XCTAssertEqual(recorder.keyFetches, 1, "the fetch the cancelled caller started served the other caller")
+        _ = try await transport.keyConfig()
+        XCTAssertEqual(recorder.keyFetches, 1, "the shared fetch's key is stored")
+    }
+
+    func testTheKeyOfAFetchWhoseOnlyCallerWasCancelledIsStored() async throws {
+        let recorder = Recorder()
+        let cache = OHTTPKeyCache()
+        let transport = OHTTPTestSupport.makeTransport(keyCache: cache) { request, _ in
+            recorder.keyFetches += 1
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+        }
+
+        let only = Task { try await transport.keyConfig() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        only.cancel()
+        _ = try? await only.value
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        _ = try await transport.keyConfig()
+        XCTAssertEqual(recorder.keyFetches, 1, "the fetch ran on after its caller left and its key was stored")
+    }
+
     // MARK: - No transparent resend
 
     func testTheRelayBodyIsAStreamThatCannotBeReplayed() throws {
