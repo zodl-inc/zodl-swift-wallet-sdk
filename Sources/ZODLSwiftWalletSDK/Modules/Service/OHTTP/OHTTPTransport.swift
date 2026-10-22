@@ -619,7 +619,7 @@ actor OHTTPTransport {
 
     /// Records the pause of a 429 through this relay, which every later post waits out: its `Retry-After`,
     /// or ``defaultRateLimitPause`` when the answer carries none that can be read (ZIP "Outer response
-    /// contract": "otherwise apply its normal back-off").
+    /// contract": "otherwise SHOULD wait 30 s (reference default)").
     func noteRelayAnswer(status: Int, retryAfter: String?) async {
         guard status == 429 else { return }
         let delay = Self.retryAfter(retryAfter) ?? Self.defaultRateLimitPause
