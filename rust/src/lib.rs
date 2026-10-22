@@ -4231,33 +4231,32 @@ unsafe fn tor_http_post_bounded_impl(
             .collect::<Result<Vec<_>, _>>()?;
 
         let body_data = unsafe { slice::from_raw_parts(body, body_len) };
-        let status = SeenStatus::default();
-        let collect_response_body =
-            |body| collect_http_response_body_limited(body, status.body_limit(max_bytes));
-        let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
-            status.see(&res);
-            (*retry_filter)(res)
-        };
+        let retry_filter =
+            |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| (*retry_filter)(res);
 
-        let response = tor_runtime.runtime().block_on(async {
-            tor_runtime
-                .client()
-                .http_post(
-                    url,
-                    |builder| {
-                        headers.iter().fold(builder, |builder, (key, value)| {
-                            builder.header(*key, *value)
-                        })
-                    },
-                    http_body_util::Full::new(body_data),
-                    collect_response_body,
-                    retry_limit,
-                    retry_filter,
-                )
-                .await
-        })?;
+        let client = tor_runtime.client();
+        let response = tor_runtime.runtime().block_on(tor_http_with_body_guard(
+            max_bytes,
+            retry_filter,
+            |guard| async move {
+                client
+                    .http_post(
+                        url,
+                        |builder| {
+                            headers.iter().fold(builder, |builder, (key, value)| {
+                                builder.header(*key, *value)
+                            })
+                        },
+                        http_body_util::Full::new(body_data),
+                        |body| guard.collect(body),
+                        retry_limit,
+                        |res| guard.filter(res),
+                    )
+                    .await
+            },
+        ))?;
 
-        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
+        ffi::HttpResponseBytes::from_rust(response)
     });
     unwrap_exc_or_null(res)
 }
@@ -4305,11 +4304,7 @@ unsafe fn tor_http_get_impl(
             })
         };
         let max_response_bytes = max_bytes.unwrap_or(TOR_HTTP_MAX_RESPONSE_BYTES);
-        let status = SeenStatus::default();
-        let collect_response_body =
-            |body| collect_http_response_body_limited(body, status.body_limit(max_response_bytes));
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
-            status.see(&res);
             #[cfg(test)]
             crate::tor::http::network_tests::observe_retry(
                 res.as_ref().map(|status| status.as_u16()).map_err(|_| ()),
@@ -4318,20 +4313,20 @@ unsafe fn tor_http_get_impl(
                 .then_some(zcash_client_backend::tor::http::Retry::Same)
         };
 
+        let client = tor_runtime.client();
         let response = tor_runtime.runtime().block_on(async {
-            let operation = async {
-                let response = tor_runtime
-                    .client()
-                    .http_get(
-                        url,
-                        request_headers,
-                        collect_response_body,
-                        retry_limit,
-                        retry_filter,
-                    )
-                    .await?;
-                anyhow::Ok(response)
-            };
+            let operation =
+                tor_http_with_body_guard(max_response_bytes, retry_filter, |guard| async move {
+                    client
+                        .http_get(
+                            url,
+                            request_headers,
+                            |body| guard.collect(body),
+                            retry_limit,
+                            |res| guard.filter(res),
+                        )
+                        .await
+                });
 
             match timeout_ms {
                 Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
@@ -4339,7 +4334,7 @@ unsafe fn tor_http_get_impl(
             }
         })?;
 
-        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
+        ffi::HttpResponseBytes::from_rust(response)
     });
     unwrap_exc_or_null(res)
 }
@@ -4375,6 +4370,75 @@ impl SeenStatus {
     }
 }
 
+/// The response-body guard of a Tor HTTP call: the `retry_filter` and `parse_response` arguments
+/// every `zcashlc_tor_http_*` call hands `zcash_client_backend`, wired to one [`SeenStatus`].
+///
+/// The crate's `http_request` calls `retry_filter` with every response's status, the final one
+/// included, and only then hands that response's body to `parse_response`: [`Self::filter`]
+/// records the status, [`Self::collect`] reads the body up to the bound the status selects.
+struct TorHttpBodyGuard<R> {
+    status: SeenStatus,
+    max_bytes: usize,
+    retry_filter: R,
+}
+
+impl<R> TorHttpBodyGuard<R>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+{
+    /// The crate's `retry_filter`: records the attempt's status, then applies the caller's retry
+    /// policy to it.
+    fn filter(
+        &self,
+        res: Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry> {
+        self.status.see(&res);
+        (self.retry_filter)(res)
+    }
+
+    /// The crate's `parse_response`: reads the body up to `max_bytes` for a 2xx answer, up to
+    /// [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] for any other, as [`Self::filter`] recorded it.
+    fn collect<B>(
+        &self,
+        body: B,
+    ) -> impl std::future::Future<Output = Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>>
+    where
+        B: BodyExt<Data = bytes::Bytes> + Unpin,
+        HttpError: From<B::Error>,
+    {
+        collect_http_response_body_limited(body, self.status.body_limit(self.max_bytes))
+    }
+}
+
+/// Runs one Tor HTTP request with the response-body guard shared by every `zcashlc_tor_http_*`
+/// call. `request` makes the call on `zcash_client_backend` with the guard it is given: it passes
+/// [`TorHttpBodyGuard::filter`] as the crate's `retry_filter` and [`TorHttpBodyGuard::collect`]
+/// as its `parse_response`, and returns the crate's response. A body that ran past its bound
+/// ([`collect_http_response_body_limited`] returned `None`) comes back as an empty body for a
+/// non-2xx answer and as an error for a 2xx one ([`within_response_limit`]).
+async fn tor_http_with_body_guard<R, Fut>(
+    max_bytes: usize,
+    retry_filter: R,
+    request: impl FnOnce(TorHttpBodyGuard<R>) -> Fut,
+) -> anyhow::Result<http::Response<bytes::Bytes>>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+    Fut: std::future::Future<
+            Output = Result<http::Response<Option<bytes::Bytes>>, zcash_client_backend::tor::Error>,
+        >,
+{
+    let guard = TorHttpBodyGuard {
+        status: SeenStatus::default(),
+        max_bytes,
+        retry_filter,
+    };
+    within_response_limit(request(guard).await?)
+}
+
 /// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
 /// body exceeds `max_bytes`, without reading the rest, so a hostile relay or server cannot
 /// make the device buffer an unbounded response.
@@ -4387,7 +4451,7 @@ where
     HttpError: From<B::Error>,
 {
     #[cfg(test)]
-    crate::tor::http::network_tests::observe_body();
+    crate::tor::http::network_tests::observe_body(max_bytes);
     Ok(collect_body_limited(body, max_bytes)
         .await
         .map_err(HttpError::from)?)
@@ -4495,37 +4559,35 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body = unsafe { slice::from_raw_parts(body, body_len) };
-        let status = SeenStatus::default();
+        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            res.is_err()
+                .then_some(zcash_client_backend::tor::http::Retry::Same)
+        };
 
-        let response = tor_runtime.runtime().block_on(async {
-            tor_runtime
-                .client()
-                .http_post(
-                    url,
-                    |builder| {
-                        headers.iter().fold(builder, |builder, (key, value)| {
-                            builder.header(*key, *value)
-                        })
-                    },
-                    http_body_util::Full::new(body),
-                    |body| {
-                        collect_http_response_body_limited(
-                            body,
-                            status.body_limit(TOR_HTTP_MAX_RESPONSE_BYTES),
-                        )
-                    },
-                    retry_limit,
-                    |res| {
-                        status.see(&res);
-                        res.is_err()
-                            .then_some(zcash_client_backend::tor::http::Retry::Same)
-                    },
-                )
-                .await
-        })?;
+        let client = tor_runtime.client();
+        let response = tor_runtime.runtime().block_on(tor_http_with_body_guard(
+            TOR_HTTP_MAX_RESPONSE_BYTES,
+            retry_filter,
+            |guard| async move {
+                client
+                    .http_post(
+                        url,
+                        |builder| {
+                            headers.iter().fold(builder, |builder, (key, value)| {
+                                builder.header(*key, *value)
+                            })
+                        },
+                        http_body_util::Full::new(body_data),
+                        |body| guard.collect(body),
+                        retry_limit,
+                        |res| guard.filter(res),
+                    )
+                    .await
+            },
+        ))?;
 
-        ffi::HttpResponseBytes::from_rust(within_response_limit(response)?)
+        ffi::HttpResponseBytes::from_rust(response)
     });
     unwrap_exc_or_null(res)
 }
