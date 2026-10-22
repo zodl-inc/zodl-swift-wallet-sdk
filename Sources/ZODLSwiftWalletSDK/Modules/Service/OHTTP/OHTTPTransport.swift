@@ -252,85 +252,6 @@ actor OHTTPTransport {
     /// the call as soon as it is exceeded."
     internal static let maxRelayResponseBytes = (256 * 1024 * 1024) + (1024 * 1024)
 
-    /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
-    /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
-    /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
-    /// A non-2xx answer is read up to ``maxErrorBodyBytes`` at most, whatever `maxBytes`, and one that
-    /// is larger fails with its HTTP status, not as too large: the status is the answer.
-    ///
-    /// - Parameters:
-    ///   - request: The URL request to execute
-    ///   - maxBytes: Maximum allowed response size in bytes
-    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
-    /// - Returns: The response data and URLResponse
-    /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes,
-    ///   `OHTTPError.httpStatusError` if a non-2xx response exceeds the error-body bound, or transport errors
-    static func boundedData(
-        for request: URLRequest,
-        maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
-    ) async throws -> (Data, URLResponse) {
-        let (bytes, response) = try await session.bytes(for: oneShotBody(request))
-        let bound = bodyBound(for: response, maxBytes: maxBytes)
-
-        // Reject early if Content-Length header exceeds the limit
-        // `expectedContentLength` is -1 when the length is unknown.
-        let expectedLength = response.expectedContentLength
-        if expectedLength > Int64(bound.maxBytes) {
-            bytes.task.cancel()
-            throw bound.exceeded("Response Content-Length (\(expectedLength) bytes) exceeds limit (\(bound.maxBytes) bytes)")
-        }
-
-        var accumulated = Data()
-        if expectedLength > 0 {
-            accumulated.reserveCapacity(Int(expectedLength))
-        }
-
-        for try await byte in bytes {
-            accumulated.append(byte)
-            if accumulated.count > bound.maxBytes {
-                bytes.task.cancel()
-                throw bound.exceeded("Response size (\(accumulated.count) bytes) exceeded limit (\(bound.maxBytes) bytes)")
-            }
-        }
-
-        return (accumulated, response)
-    }
-
-    /// The bound on one answer's body and the error for a body past it: `maxBytes` and
-    /// `responseTooLarge` for a 2xx, ``maxErrorBodyBytes`` (or less, if `maxBytes` is) and the answer's
-    /// own status for anything else.
-    struct BodyBound {
-        let maxBytes: Int
-        let status: Int?
-
-        func exceeded(_ detail: String) -> OHTTPError {
-            if let status {
-                return .httpStatusError(statusCode: status, message: "Relay/gateway returned HTTP \(status): \(detail)")
-            }
-            return .responseTooLarge(detail)
-        }
-    }
-
-    static func bodyBound(for response: URLResponse, maxBytes: Int) -> BodyBound {
-        guard let status = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(status) else {
-            return BodyBound(maxBytes: maxBytes, status: nil)
-        }
-        return BodyBound(maxBytes: min(maxBytes, maxErrorBodyBytes), status: status)
-    }
-
-    /// `request` with its body as a stream the session cannot rewind: with no replacement stream on offer
-    /// (`needNewBodyStream` answers nil), URLSession fails the task rather than repeat the body on its
-    /// own, for example on a reused connection that turns out to be closed.
-    static func oneShotBody(_ request: URLRequest) -> URLRequest {
-        guard let body = request.httpBody else { return request }
-        var streamed = request
-        streamed.httpBody = nil
-        streamed.httpBodyStream = InputStream(data: body)
-        streamed.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
-        return streamed
-    }
-
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
     /// signed key configuration is checked against.
     private let gatewayHost: String
@@ -663,18 +584,6 @@ actor OHTTPTransport {
         return (data, response)
     }
 
-    /// `httpSender`, with one more rule: an answer the sender refused for its body (a non-2xx larger than
-    /// ``maxErrorBodyBytes``, `httpStatusError`) is still the relay's answer, so its status is noted (a 429
-    /// starts the default pause, its `Retry-After` being out of reach) before the error goes up.
-    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
-        do {
-            return try await httpSender(request, maxBytes)
-        } catch OHTTPError.httpStatusError(let status, let message) {
-            await noteRelayAnswer(status: status, retryAfter: nil)
-            throw OHTTPError.httpStatusError(statusCode: status, message: message)
-        }
-    }
-
     /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
     /// debug build with a prefix set, a trace id.
     func relayPost(url: String, body: Data, timeoutMS: Int) throws -> URLRequest {
@@ -726,13 +635,6 @@ actor OHTTPTransport {
         )
     }
 
-    /// How much of the relay's pause is left, capped at ``maxRetryAfter``; nil when none runs.
-    func relayPauseRemaining() async -> TimeInterval? {
-        guard let deadline = await keyCache.backoffDeadline(for: backoffKey) else { return nil }
-        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
-        return remaining > 0 ? remaining : nil
-    }
-
     /// The delay of a `Retry-After` value in the delay-seconds form, capped at ``maxRetryAfter``; nil for a
     /// missing, malformed or date-form value.
     static func retryAfter(_ value: String?) -> TimeInterval? {
@@ -748,5 +650,107 @@ actor OHTTPTransport {
         let uuid = UUID().uuidString
         let full = "\(sanitized)-\(uuid)"
         return full.count <= 64 ? full : String(full.prefix(64))
+    }
+}
+
+// MARK: - Bounded reading of the relay's answers
+
+extension OHTTPTransport {
+    /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
+    /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
+    /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
+    /// A non-2xx answer is read up to ``maxErrorBodyBytes`` at most, whatever `maxBytes`, and one that
+    /// is larger fails with its HTTP status, not as too large: the status is the answer.
+    ///
+    /// - Parameters:
+    ///   - request: The URL request to execute
+    ///   - maxBytes: Maximum allowed response size in bytes
+    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    /// - Returns: The response data and URLResponse
+    /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes,
+    ///   `OHTTPError.httpStatusError` if a non-2xx response exceeds the error-body bound, or transport errors
+    static func boundedData(
+        for request: URLRequest,
+        maxBytes: Int,
+        session: URLSession = OHTTPTransport.session
+    ) async throws -> (Data, URLResponse) {
+        let (bytes, response) = try await session.bytes(for: oneShotBody(request))
+        let bound = bodyBound(for: response, maxBytes: maxBytes)
+
+        // Reject early if Content-Length header exceeds the limit
+        // `expectedContentLength` is -1 when the length is unknown.
+        let expectedLength = response.expectedContentLength
+        if expectedLength > Int64(bound.maxBytes) {
+            bytes.task.cancel()
+            throw bound.exceeded("Response Content-Length (\(expectedLength) bytes) exceeds limit (\(bound.maxBytes) bytes)")
+        }
+
+        var accumulated = Data()
+        if expectedLength > 0 {
+            accumulated.reserveCapacity(Int(expectedLength))
+        }
+
+        for try await byte in bytes {
+            accumulated.append(byte)
+            if accumulated.count > bound.maxBytes {
+                bytes.task.cancel()
+                throw bound.exceeded("Response size (\(accumulated.count) bytes) exceeded limit (\(bound.maxBytes) bytes)")
+            }
+        }
+
+        return (accumulated, response)
+    }
+
+    /// The bound on one answer's body and the error for a body past it: `maxBytes` and
+    /// `responseTooLarge` for a 2xx, ``maxErrorBodyBytes`` (or less, if `maxBytes` is) and the answer's
+    /// own status for anything else.
+    struct BodyBound {
+        let maxBytes: Int
+        let status: Int?
+
+        func exceeded(_ detail: String) -> OHTTPError {
+            if let status {
+                return .httpStatusError(statusCode: status, message: "Relay/gateway returned HTTP \(status): \(detail)")
+            }
+            return .responseTooLarge(detail)
+        }
+    }
+
+    static func bodyBound(for response: URLResponse, maxBytes: Int) -> BodyBound {
+        guard let status = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(status) else {
+            return BodyBound(maxBytes: maxBytes, status: nil)
+        }
+        return BodyBound(maxBytes: min(maxBytes, maxErrorBodyBytes), status: status)
+    }
+
+    /// `request` with its body as a stream the session cannot rewind: with no replacement stream on offer
+    /// (`needNewBodyStream` answers nil), URLSession fails the task rather than repeat the body on its
+    /// own, for example on a reused connection that turns out to be closed.
+    static func oneShotBody(_ request: URLRequest) -> URLRequest {
+        guard let body = request.httpBody else { return request }
+        var streamed = request
+        streamed.httpBody = nil
+        streamed.httpBodyStream = InputStream(data: body)
+        streamed.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
+        return streamed
+    }
+
+    /// `httpSender`, with one more rule: an answer the sender refused for its body (a non-2xx larger than
+    /// ``maxErrorBodyBytes``, `httpStatusError`) is still the relay's answer, so its status is noted (a 429
+    /// starts the default pause, its `Retry-After` being out of reach) before the error goes up.
+    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        do {
+            return try await httpSender(request, maxBytes)
+        } catch OHTTPError.httpStatusError(let status, let message) {
+            await noteRelayAnswer(status: status, retryAfter: nil)
+            throw OHTTPError.httpStatusError(statusCode: status, message: message)
+        }
+    }
+
+    /// How much of the relay's pause is left, capped at ``maxRetryAfter``; nil when none runs.
+    func relayPauseRemaining() async -> TimeInterval? {
+        guard let deadline = await keyCache.backoffDeadline(for: backoffKey) else { return nil }
+        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
+        return remaining > 0 ? remaining : nil
     }
 }
