@@ -299,8 +299,28 @@ fn real_ffi_error_page_is_cut_at_the_fixed_guard() {
         let result = fixture.get_response(&url, 0, 30_000);
         let elapsed = start.elapsed();
         let stages = STAGES.with_borrow_mut(|stages| stages.take().unwrap());
+        // Whatever the fixture answered (a timeout included), a collector that entered did so
+        // with the status the retry filter had recorded for that response, and with the bound
+        // that status selects. Checked before any skip: this is the regression this test is for.
+        if stages.body_entries > 0 {
+            assert!(
+                stages.status.is_some(),
+                "the collector entered before the retry filter saw the final response: {result:?}"
+            );
+            let expected_bound = match stages.status {
+                Some(200..=299) => crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+                _ => crate::TOR_HTTP_MAX_ERROR_BODY_BYTES,
+            };
+            assert_eq!(
+                stages.body_limit,
+                Some(expected_bound),
+                "the collector's bound does not follow the status the filter recorded ({:?})",
+                stages.status
+            );
+        }
         // Fixture availability is read off the FFI result (the response's own status), never
-        // off the retry filter: a crate that stopped calling the filter must fail below, not skip.
+        // off the retry filter: a crate that stopped calling the filter must fail above or below,
+        // not skip.
         let (status, body_len) = match result {
             Ok((status, body_len)) if status == 429 => (status, body_len),
             result => {
