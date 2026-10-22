@@ -4231,7 +4231,13 @@ unsafe fn tor_http_post_bounded_impl(
             .collect::<Result<Vec<_>, _>>()?;
 
         let body_data = unsafe { slice::from_raw_parts(body, body_len) };
-        let collect_response_body = |body| collect_http_response_body_limited(body, max_bytes);
+        let status = SeenStatus::default();
+        let collect_response_body =
+            |body| collect_http_response_body_limited(body, status.body_limit(max_bytes));
+        let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            status.see(&res);
+            (*retry_filter)(res)
+        };
 
         let response = tor_runtime.runtime().block_on(async {
             tor_runtime
@@ -4246,7 +4252,7 @@ unsafe fn tor_http_post_bounded_impl(
                     http_body_util::Full::new(body_data),
                     collect_response_body,
                     retry_limit,
-                    &*retry_filter,
+                    retry_filter,
                 )
                 .await
         })?;
@@ -4299,9 +4305,11 @@ unsafe fn tor_http_get_impl(
             })
         };
         let max_response_bytes = max_bytes.unwrap_or(TOR_HTTP_MAX_RESPONSE_BYTES);
+        let status = SeenStatus::default();
         let collect_response_body =
-            |body| collect_http_response_body_limited(body, max_response_bytes);
+            |body| collect_http_response_body_limited(body, status.body_limit(max_response_bytes));
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            status.see(&res);
             #[cfg(test)]
             crate::tor::http::network_tests::observe_retry(
                 res.as_ref().map(|status| status.as_u16()).map_err(|_| ()),
@@ -4341,6 +4349,32 @@ unsafe fn tor_http_get_impl(
 /// these calls is an OHTTP relay response; Sapling parameters (~48 MB) stay well below it.
 const TOR_HTTP_MAX_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
 
+/// Bound on a non-2xx Tor HTTP response body (an error page), whatever the caller's limit; equal to
+/// `OHTTPTransport.maxErrorBodyBytes` on the clearnet path.
+const TOR_HTTP_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// The status of the last response the retry filter saw. `zcash_client_backend` hands the body
+/// collector the body only, but calls the retry filter with every response's status first, the
+/// final one included, so the collector can pick its bound from the status through this.
+#[derive(Default)]
+struct SeenStatus(std::sync::atomic::AtomicU16);
+
+impl SeenStatus {
+    fn see(&self, res: &Result<http::StatusCode, &zcash_client_backend::tor::Error>) {
+        let code = res.as_ref().map_or(0, |status| status.as_u16());
+        self.0.store(code, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `max_bytes` for a 2xx answer (or when no status was seen), the fixed
+    /// [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] for any other status.
+    fn body_limit(&self, max_bytes: usize) -> usize {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 | 200..=299 => max_bytes,
+            _ => TOR_HTTP_MAX_ERROR_BODY_BYTES,
+        }
+    }
+}
+
 /// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
 /// body exceeds `max_bytes`, without reading the rest, so a hostile relay or server cannot
 /// make the device buffer an unbounded response.
@@ -4357,19 +4391,6 @@ where
     Ok(collect_body_limited(body, max_bytes)
         .await
         .map_err(HttpError::from)?)
-}
-
-/// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
-/// body exceeds `TOR_HTTP_MAX_RESPONSE_BYTES`, without reading the rest, so a hostile relay or
-/// server cannot make the device buffer an unbounded response.
-async fn collect_http_response_body<B>(
-    body: B,
-) -> Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>
-where
-    B: BodyExt<Data = bytes::Bytes> + Unpin,
-    HttpError: From<B::Error>,
-{
-    collect_http_response_body_limited(body, TOR_HTTP_MAX_RESPONSE_BYTES).await
 }
 
 async fn collect_body_limited<B, E>(
@@ -4392,10 +4413,10 @@ where
     Ok(Some(bytes::Bytes::from(out)))
 }
 
-/// Fails the call when [`collect_http_response_body`] stopped at the size limit, unless the answer
-/// is a non-2xx one (an error page): that answer stands by its status, and is returned with an empty
-/// body, as the Swift clearnet reader returns one it cut at its 64 KiB guard. The collector reads
-/// the body without seeing the status, so the bound while reading is the caller's here.
+/// Fails the call when [`collect_http_response_body_limited`] stopped at the size limit, unless the
+/// answer is a non-2xx one (an error page): that answer stands by its status, and is returned with an
+/// empty body, as the Swift clearnet reader returns one it cut at its 64 KiB guard. The collector
+/// reads a non-2xx body up to [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] only ([`SeenStatus`]).
 fn within_response_limit(
     response: http::Response<Option<bytes::Bytes>>,
 ) -> anyhow::Result<http::Response<bytes::Bytes>> {
@@ -4475,6 +4496,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
             .collect::<Result<Vec<_>, _>>()?;
 
         let body = unsafe { slice::from_raw_parts(body, body_len) };
+        let status = SeenStatus::default();
 
         let response = tor_runtime.runtime().block_on(async {
             tor_runtime
@@ -4487,9 +4509,15 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                         })
                     },
                     http_body_util::Full::new(body),
-                    collect_http_response_body,
+                    |body| {
+                        collect_http_response_body_limited(
+                            body,
+                            status.body_limit(TOR_HTTP_MAX_RESPONSE_BYTES),
+                        )
+                    },
                     retry_limit,
                     |res| {
+                        status.see(&res);
                         res.is_err()
                             .then_some(zcash_client_backend::tor::http::Retry::Same)
                     },
@@ -8654,6 +8682,59 @@ mod tor_http_body_limit_tests {
         let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
         let out = rt.block_on(super::collect_body_limited(body, 9)).unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn an_error_status_bounds_the_body_at_64_kib_whatever_the_callers_limit() {
+        let status = super::SeenStatus::default();
+        status.see(&Ok(http::StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(
+            status.body_limit(usize::MAX),
+            super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+        );
+        assert_eq!(status.body_limit(10), super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        status.see(&Ok(http::StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            status.body_limit(1 << 20),
+            super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn a_success_status_or_none_keeps_the_callers_limit() {
+        let status = super::SeenStatus::default();
+        assert_eq!(status.body_limit(1 << 20), 1 << 20);
+        status.see(&Ok(http::StatusCode::SERVICE_UNAVAILABLE));
+        status.see(&Ok(http::StatusCode::OK));
+        assert_eq!(
+            status.body_limit(1 << 20),
+            1 << 20,
+            "the last status seen is the final one"
+        );
+    }
+
+    #[test]
+    fn an_error_page_past_64_kib_is_cut_and_kept_by_its_status() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let status = super::SeenStatus::default();
+        status.see(&Ok(http::StatusCode::TOO_MANY_REQUESTS));
+        let page = bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1]);
+        let body = rt
+            .block_on(super::collect_body_limited(
+                http_body_util::Full::new(page),
+                status.body_limit(super::TOR_HTTP_MAX_RESPONSE_BYTES),
+            ))
+            .unwrap();
+        assert!(body.is_none());
+        let response = http::Response::builder()
+            .status(http::StatusCode::TOO_MANY_REQUESTS)
+            .body(body)
+            .unwrap();
+        let response = super::within_response_limit(response).unwrap();
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.body().is_empty());
     }
 }
 
