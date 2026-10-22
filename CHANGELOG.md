@@ -66,9 +66,11 @@ Changes are relative to `5.2.1`.
   stops waiting at once (`CancellationError`); the fetch runs on for the other callers and its key is
   still stored.
 - A non-2xx answer of the OHTTP relay (an error page) is read up to 64 KiB
-  (`OHTTPTransport.maxErrorBodyBytes`), whatever the call's own ceiling, and one that is larger fails
-  with the answer's HTTP status (`OHTTPError.httpStatusError`) rather than `responseTooLarge`; the
-  pause of such a 429 is still noted.
+  (`OHTTPTransport.maxErrorBodyBytes`), a fixed guard whatever the call's own ceiling; the read stops
+  there and the answer is reported by its HTTP status (`OHTTPError.httpStatusError`, a 429 with its
+  `Retry-After` honoured) rather than as `responseTooLarge`. Over Tor, where the Rust connector reads
+  the body without seeing the status, an error page larger than the call's ceiling is likewise
+  reported by its status, with an empty body, instead of failing as too large.
 - The transparent-address RPCs of an OHTTP gateway endpoint (`checkSingleUseTransparentAddresses`,
   `updateTransparentAddressTransactions`, `fetchUTXOsByAddress`) ride the OHTTP transport like every
   other call of that endpoint, on an isolated Tor circuit per call in Tor mode; the wallet half runs

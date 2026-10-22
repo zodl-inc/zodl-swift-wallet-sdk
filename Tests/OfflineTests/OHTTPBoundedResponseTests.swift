@@ -87,25 +87,22 @@ final class OHTTPBoundedResponseTests: XCTestCase {
 
     // MARK: - Error answers (non-2xx)
 
-    /// A non-2xx answer (an error page) is read up to `maxErrorBodyBytes`, whatever ceiling the call set, and
-    /// one that runs past it fails with the answer's status: the status is what the caller needs, not a
-    /// `responseTooLarge` that would hide a 429 or a 503 behind a size complaint.
-    func testAnErrorAnswerPastTheErrorBodyBoundFailsWithItsStatus() async throws {
+    /// A non-2xx answer (an error page) is read up to `maxErrorBodyBytes`, a fixed guard whatever ceiling the call
+    /// set; the read stops there and the answer is returned with its status and headers, so that the caller
+    /// reports it by its status (a 429 stays a 429, with its `Retry-After`), never as `responseTooLarge`.
+    func testAnErrorAnswerPastTheGuardIsCutThereAndKeptWithItsStatus() async throws {
         MockResponseURLProtocol.statusCode = 503
-        MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes + 1
+        MockResponseURLProtocol.responseSize = 3 * OHTTPTransport.maxErrorBodyBytes
         MockResponseURLProtocol.shouldSimulateStreaming = true
         let request = URLRequest(url: URL(string: "https://example.com/relay")!)
 
-        do {
-            _ = try await OHTTPTransport.boundedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
-            XCTFail("an error page past the bound fails")
-        } catch OHTTPError.httpStatusError(let status, let message) {
-            XCTAssertEqual(status, 503, "the answer's own status, not responseTooLarge")
-            XCTAssertTrue(message.contains("exceeded limit (\(OHTTPTransport.maxErrorBodyBytes) bytes)"), message)
-        }
+        let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
+
+        XCTAssertEqual(data.count, OHTTPTransport.maxErrorBodyBytes, "read up to the guard, not beyond")
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503, "the answer stands by its status")
     }
 
-    func testAnErrorAnswerWithinTheErrorBodyBoundIsReturnedWhole() async throws {
+    func testAnErrorAnswerWithinTheGuardIsReturnedWhole() async throws {
         MockResponseURLProtocol.statusCode = 503
         MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes
         let request = URLRequest(url: URL(string: "https://example.com/relay")!)
@@ -116,41 +113,43 @@ final class OHTTPBoundedResponseTests: XCTestCase {
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503)
     }
 
-    func testTheErrorBodyBoundIsFixedAndNeverAboveTheCallsOwnCeiling() {
+    func testTheErrorBodyGuardIsFixedWhateverTheCallsCeiling() {
         XCTAssertEqual(OHTTPTransport.maxErrorBodyBytes, 64 * 1024)
         let url = URL(string: "https://example.com/relay")!
         func response(_ status: Int) -> HTTPURLResponse {
             HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!
         }
 
-        let errorPage = OHTTPTransport.bodyBound(for: response(503), maxBytes: OHTTPTransport.maxRelayResponseBytes)
-        XCTAssertEqual(errorPage.maxBytes, OHTTPTransport.maxErrorBodyBytes)
-        XCTAssertEqual(errorPage.status, 503)
-        let smallCall = OHTTPTransport.bodyBound(for: response(429), maxBytes: 1024)
-        XCTAssertEqual(smallCall.maxBytes, 1024, "a call's own, smaller ceiling still holds")
-        let sealed = OHTTPTransport.bodyBound(for: response(200), maxBytes: OHTTPTransport.maxRelayResponseBytes)
-        XCTAssertEqual(sealed.maxBytes, OHTTPTransport.maxRelayResponseBytes, "a 2xx keeps the call's ceiling")
-        XCTAssertNil(sealed.status)
-        guard case .responseTooLarge = sealed.exceeded("x") else { return XCTFail("a 2xx past its ceiling is responseTooLarge") }
-        guard case .httpStatusError(let status, _) = errorPage.exceeded("x"), status == 503 else {
-            return XCTFail("an error page past the bound carries its status")
-        }
+        XCTAssertEqual(
+            OHTTPTransport.bodyBound(for: response(503), maxBytes: OHTTPTransport.maxRelayResponseBytes),
+            OHTTPTransport.BodyBound(maxBytes: OHTTPTransport.maxErrorBodyBytes, truncates: true),
+            "an error page under a large ceiling: the fixed guard"
+        )
+        XCTAssertEqual(
+            OHTTPTransport.bodyBound(for: response(429), maxBytes: 1024),
+            OHTTPTransport.BodyBound(maxBytes: OHTTPTransport.maxErrorBodyBytes, truncates: true),
+            "an error page under a small ceiling: the same fixed guard, not the ceiling"
+        )
+        XCTAssertEqual(
+            OHTTPTransport.bodyBound(for: response(200), maxBytes: OHTTPTransport.maxRelayResponseBytes),
+            OHTTPTransport.BodyBound(maxBytes: OHTTPTransport.maxRelayResponseBytes, truncates: false),
+            "a 2xx keeps the call's ceiling and fails past it"
+        )
     }
 
-    func testAStreamedErrorAnswerPastTheBoundFailsWithItsStatus() async throws {
+    func testAStreamedErrorAnswerPastTheGuardEndsThereWithItsStatus() async throws {
         MockResponseURLProtocol.statusCode = 429
-        MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes + 1
+        MockResponseURLProtocol.responseSize = 3 * OHTTPTransport.maxErrorBodyBytes
         MockResponseURLProtocol.shouldSimulateStreaming = true
         let request = URLRequest(url: URL(string: "https://example.com/relay")!)
 
         let outer = try await OHTTPTransport.streamedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
         XCTAssertEqual(outer.status, 429, "the head is delivered as it is")
-        do {
-            for try await _ in outer.body {}
-            XCTFail("the body past the bound fails")
-        } catch OHTTPError.httpStatusError(let status, _) {
-            XCTAssertEqual(status, 429, "with the answer's status, so a 429 is still a 429")
+        var read = 0
+        for try await chunk in outer.body {
+            read += chunk.count
         }
+        XCTAssertEqual(read, OHTTPTransport.maxErrorBodyBytes, "the body ends at the guard, without an error: the status is the answer")
     }
 
     /// Test that a response under the limit succeeds.

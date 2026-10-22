@@ -4392,14 +4392,19 @@ where
     Ok(Some(bytes::Bytes::from(out)))
 }
 
-/// Fails the call when [`collect_http_response_body`] stopped at the size limit.
+/// Fails the call when [`collect_http_response_body`] stopped at the size limit, unless the answer
+/// is a non-2xx one (an error page): that answer stands by its status, and is returned with an empty
+/// body, as the Swift clearnet reader returns one it cut at its 64 KiB guard. The collector reads
+/// the body without seeing the status, so the bound while reading is the caller's here.
 fn within_response_limit(
     response: http::Response<Option<bytes::Bytes>>,
 ) -> anyhow::Result<http::Response<bytes::Bytes>> {
     let (parts, body) = response.into_parts();
-    let body = body.ok_or_else(|| {
-        anyhow!("Tor HTTP response body exceeds {TOR_HTTP_MAX_RESPONSE_BYTES} bytes")
-    })?;
+    let body = match body {
+        Some(body) => body,
+        None if !parts.status.is_success() => bytes::Bytes::new(),
+        None => anyhow::bail!("Tor HTTP response body exceeds {TOR_HTTP_MAX_RESPONSE_BYTES} bytes"),
+    };
     Ok(http::Response::from_parts(parts, body))
 }
 

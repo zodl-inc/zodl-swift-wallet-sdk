@@ -136,15 +136,7 @@ extension OHTTPTransport {
             let sealed = try OHTTPNative.encapsulate(key: key, request: request)
             let post = try relayPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
             try await checkRelayBackoff()
-            let outer: OHTTPOuterStream
-            do {
-                outer = try await streamSender(post, Self.maxRelayResponseBytes)
-            } catch OHTTPError.httpStatusError(let status, let message) {
-                // The sender refused the answer for its body (a non-2xx larger than `maxErrorBodyBytes`): still
-                // the relay's answer, so its status is noted before the error goes up.
-                await noteRelayAnswer(status: status, retryAfter: nil)
-                throw OHTTPError.httpStatusError(statusCode: status, message: message)
-            }
+            let outer = try await streamSender(post, Self.maxRelayResponseBytes)
             await noteRelayAnswer(status: outer.status, retryAfter: outer.retryAfter)
 
             if try OHTTPNative.answerIsSealed(status: outer.status, contentType: outer.contentType, attempt: attempt) {
@@ -242,9 +234,9 @@ extension OHTTPTransport {
     }
 
     /// Posts `request` on the relay session and returns once the relay's head has arrived, the body
-    /// following as it arrives. The body fails beyond `maxBytes` (a non-2xx one beyond ``maxErrorBodyBytes``,
-    /// with the answer's status; see ``bodyBound(for:maxBytes:)``); redirects are refused, and the body is
-    /// never sent twice (see ``oneShotBody(_:)``).
+    /// following as it arrives. The body fails beyond `maxBytes`; a non-2xx one is cut at ``maxErrorBodyBytes``
+    /// and the answer kept, status and headers intact (see ``bodyBound(for:maxBytes:)``); redirects are
+    /// refused, and the body is never sent twice (see ``oneShotBody(_:)``).
     static func streamedData(
         for request: URLRequest,
         maxBytes: Int,
@@ -313,9 +305,9 @@ private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchec
         }
         let bound = OHTTPTransport.bodyBound(for: response, maxBytes: maxBytes)
         lock.withLock { self.bound = bound }
-        if response.expectedContentLength > Int64(bound.maxBytes) {
+        if response.expectedContentLength > Int64(bound.maxBytes), !bound.truncates {
             completionHandler(.cancel)
-            takeHead()?.resume(throwing: bound.exceeded(
+            takeHead()?.resume(throwing: OHTTPError.responseTooLarge(
                 "Response Content-Length (\(response.expectedContentLength) bytes) exceeds limit (\(bound.maxBytes) bytes)"
             ))
             return
@@ -332,13 +324,22 @@ private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchec
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let (total, bound) = lock.withLock {
             received += data.count
-            return (received, self.bound ?? OHTTPTransport.BodyBound(maxBytes: maxBytes, status: nil))
+            return (received, self.bound ?? OHTTPTransport.BodyBound(maxBytes: maxBytes, truncates: false))
         }
         guard total <= bound.maxBytes else {
             dataTask.cancel()
-            bodyContinuation.finish(throwing: bound.exceeded(
-                "Response size (\(total) bytes) exceeded limit (\(bound.maxBytes) bytes)"
-            ))
+            guard bound.truncates else {
+                bodyContinuation.finish(throwing: OHTTPError.responseTooLarge(
+                    "Response size (\(total) bytes) exceeded limit (\(bound.maxBytes) bytes)"
+                ))
+                return
+            }
+            // An error page past the guard: keep what fits, end the body there, the answer stands by its status.
+            let room = bound.maxBytes - (total - data.count)
+            if room > 0 {
+                bodyContinuation.yield(data.prefix(room))
+            }
+            bodyContinuation.finish()
             return
         }
         bodyContinuation.yield(data)

@@ -245,35 +245,6 @@ final class OHTTPZipConformanceTests: XCTestCase {
         XCTAssertEqual(recorder.posts.count, 1, "the next call is failed locally, not posted")
     }
 
-    func testAnAnswerTheSenderRefusedForItsBodyStillStartsThePause() async throws {
-        let recorder = Recorder()
-        let transport = OHTTPTestSupport.makeTransport(keyCache: OHTTPKeyCache()) { request, _ in
-            if request.httpMethod == "GET" {
-                return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
-            }
-            recorder.posts.append(request)
-            // What `boundedData` throws for a non-2xx answer whose body runs past `maxErrorBodyBytes`.
-            throw OHTTPError.httpStatusError(statusCode: 429, message: "Relay/gateway returned HTTP 429: body past the bound")
-        }
-
-        do {
-            _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
-            XCTFail("a 429 is an error")
-        } catch OHTTPError.httpStatusError(let status, _) {
-            XCTAssertEqual(status, 429)
-        }
-        let remaining = await transport.relayPauseRemaining()
-        XCTAssertNotNil(remaining, "the status of an answer refused for its body is still the relay's answer, so its pause is noted")
-
-        do {
-            _ = try await transport.roundTrip(request: request, timeoutMS: 5000)
-            XCTFail("a call during the pause fails")
-        } catch OHTTPError.httpStatusError(let status, _) {
-            XCTAssertEqual(status, 429)
-        }
-        XCTAssertEqual(recorder.posts.count, 1, "the next call is failed locally, not posted")
-    }
-
     func testACancelledCallerStopsWaitingWhileTheSharedKeyFetchContinues() async throws {
         let recorder = Recorder()
         let cache = OHTTPKeyCache()
