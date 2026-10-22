@@ -514,7 +514,11 @@ async fn stalled_body_uses_outer_deadline() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -549,7 +553,11 @@ async fn complete_body_copies_exact_bytes() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -584,7 +592,11 @@ async fn truncated_body_is_an_error() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -617,7 +629,11 @@ async fn delayed_headers_use_outer_deadline() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -662,7 +678,11 @@ async fn one_deadline_spans_local_transport_attempts() {
             second_headers_seen
                 .send(())
                 .expect("observe parsed second-attempt response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
