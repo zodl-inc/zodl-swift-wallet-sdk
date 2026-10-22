@@ -12,6 +12,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses `encapsulate_chunked_request` internally. `zcashlc_ohttp_complete` decodes responses with
   `ChunkedResponseDecoder`. Content-Type constants updated to `message/ohttp-chunked-req` and
   `message/ohttp-chunked-res`. See zodl-inc/ohttp PR #4.
+- `zcashlc_tor_connect_to_lightwalletd` refuses an OHTTP gateway host (`ohttp-gateway*.zodl.com`) with an
+  error: a gateway is reached only through its relay, by the host's OHTTP transport, and is never dialled
+  over Tor. This is the FFI contract from here on; a host that still passes a gateway host gets the error
+  instead of a connection. The Tor-over-OHTTP connector the Rust side used to keep for that case
+  (`SharedOhttpTor`, `connect_ohttp_over_tor`) is gone with it.
 
 
 ### Added
@@ -38,6 +43,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
     with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
     key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
+- The wallet half of the transparent-address checks, for a host whose server half rides the OHTTP transport
+  (the Tor gRPC path keeps doing both inside `zcashlc_tor_lwd_conn_*`):
+  - `zcashlc_single_use_taddr_to_check(db_data, db_data_len, network_id, account_uuid_bytes)` returns a
+    `TransparentAddressCheck`: `tag` 0 when no single-use address of the account is due, else the address
+    most overdue and the block range to ask the server for (`due.address`, `due.start_height`,
+    `due.end_height`); null with the last error set on failure. Free it with
+    `zcashlc_free_transparent_address_check`, which also frees the address string.
+  - `zcashlc_schedule_single_use_taddr_check(db_data, db_data_len, network_id, account_uuid_bytes, address)`
+    reschedules the check of a single-use address whose check found nothing, with the same exposure-age
+    back-off (proportional to `log2` of the blocks since exposure) as the Tor path; returns false with the
+    last error set on failure.
+  - `zcashlc_transparent_address_utxo_start_height(db_data, db_data_len, network_id, account_uuid_bytes,
+    address)` returns the height from which the UTXOs of `address` are looked for (its exposure height,
+    else the account's birthday), `-1` when the address is not one of the account's, and a value below
+    `-1` with the last error set on failure.
 - `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
   internal JSON envelope for SDK bindings.
 - `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose

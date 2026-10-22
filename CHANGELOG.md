@@ -58,6 +58,25 @@ Changes are relative to `5.2.1`.
 - OHTTP voting route now tracks whether the `on_dispatch` callback fired. Failures before dispatch
   (e.g., key-config fetch, relay connect) are classified as Transport (safely retriable); failures
   after dispatch are Ambiguous (no retry). Previously all failures were marked after-dispatch.
+- An OHTTP relay's 429 is back-off, not a failure of the relay as a key source: a key-configuration
+  fetch the relay answers 429, or one made while the relay's pause runs, fails with that 429 and never
+  falls back to the DNS-over-HTTPS resolvers. A 429 that carries no usable `Retry-After` now starts a
+  30 s pause (`OHTTPTransport.defaultRateLimitPause`, the ZIP's reference default); it started none.
+- An OHTTP caller that is cancelled while the shared key-configuration fetch of its relay runs now
+  stops waiting at once (`CancellationError`); the fetch runs on for the other callers and its key is
+  still stored.
+- A non-2xx answer of the OHTTP relay (an error page) is read up to 64 KiB
+  (`OHTTPTransport.maxErrorBodyBytes`), whatever the call's own ceiling, and one that is larger fails
+  with the answer's HTTP status (`OHTTPError.httpStatusError`) rather than `responseTooLarge`; the
+  pause of such a 429 is still noted.
+- The transparent-address RPCs of an OHTTP gateway endpoint (`checkSingleUseTransparentAddresses`,
+  `updateTransparentAddressTransactions`, `fetchUTXOsByAddress`) ride the OHTTP transport like every
+  other call of that endpoint, on an isolated Tor circuit per call in Tor mode; the wallet half runs
+  through the new `zcashlc_single_use_taddr_to_check`, `zcashlc_schedule_single_use_taddr_check` and
+  `zcashlc_transparent_address_utxo_start_height` FFI. A gateway host is no longer dialled over Tor
+  by the Rust connector at all: `zcashlc_tor_connect_to_lightwalletd` refuses it (see
+  `rust/CHANGELOG.md`). A transaction height a block height cannot hold, other than lightwalletd's
+  `u64::MAX` for an unmined transaction, is now an error on this path as on the Tor gRPC one.
 - Sapling parameter Tor downloader now creates the destination directory before writing its temporary
   file, fixing ENOENT when the SDK caller supplies a new parameters directory.
 - OHTTP relay posts over Tor (`httpRequestOverOHTTP`, the lightwalletd and migration OHTTP clients)

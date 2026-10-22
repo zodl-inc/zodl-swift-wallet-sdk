@@ -143,6 +143,114 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
         XCTAssertTrue(recorder.gets.isEmpty && recorder.posts.isEmpty, "with no single-use address due, nothing is sent")
     }
 
+    /// The relay sees a sealed Chunked OHTTP request, never the plain gRPC call: the proof is the body and its
+    /// media type, not the URL, which a plaintext request to the same relay would share.
+    func testTheRelayPostIsTheSealedRequestNotThePlainRPC() async throws {
+        let recorder = Recorder()
+        let service = makeService(recorder: recorder)
+        let address = try await transparentAddress(of: account)
+
+        _ = try? await service.updateTransparentAddressTransactions(
+            address: address,
+            start: 0,
+            end: -1,
+            dbData: dbData.osStr(),
+            networkType: .testnet,
+            mode: .direct
+        )
+
+        XCTAssertEqual(recorder.posts.count, 1)
+        let post = try XCTUnwrap(recorder.posts.first)
+        XCTAssertEqual(post.httpMethod, "POST")
+        XCTAssertEqual(post.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-chunked-req", "the body is a sealed request")
+        let body = try XCTUnwrap(post.httpBody)
+        XCTAssertFalse(body.isEmpty)
+        XCTAssertNil(body.range(of: Data(address.utf8)), "the address never crosses the relay in the clear")
+        XCTAssertNil(body.range(of: Data("GetTaddressTxids".utf8)), "nor does the RPC name")
+        XCTAssertNil(post.value(forHTTPHeaderField: "Cookie"))
+    }
+
+    /// In Tor mode every wallet-identifying call asks for `.uniqueTor` and gets a client on a Tor circuit of its
+    /// own (ZIP: each such request SHOULD use an isolated circuit), while `.direct` calls share one circuit.
+    func testEachUniqueTorCallRidesItsOwnIsolatedCircuit() async throws {
+        final class Circuits: @unchecked Sendable {
+            var isolations = 0
+            var clientsOfPosts: [TorClient] = []
+        }
+        let circuits = Circuits()
+        let runtimes = TorTestRuntimes()
+        let native = TorHTTPGetNative(
+            get: { _, _, _, _, _, _ in
+                XCTFail("no plain GET over Tor is made")
+                return nil
+            },
+            freeResponse: { _ in },
+            isolateRuntime: { runtime in
+                circuits.isolations += 1
+                return runtimes.clone(runtime)
+            },
+            freeRuntime: { runtimes.free($0) }
+        )
+        let tor = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let service = LightWalletOHTTPService(
+            endpoint: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true),
+            singleCallTimeout: 1000,
+            streamingCallTimeout: 1000,
+            tor: tor,
+            sdkFlags: SDKFlags(torEnabled: true, exchangeRateEnabled: false)
+        )
+        service.testKeyVerifier = OHTTPTestSupport.makeKeyVerifier()
+        service.testTorSender = { (isolated: TorClient) -> OHTTPTransport.HTTPSender in
+            { request, _ in
+                if request.httpMethod == "GET" {
+                    return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+                }
+                circuits.clientsOfPosts.append(isolated)
+                return (Data(), OHTTPTestSupport.response(for: request.url, status: 503))
+            }
+        }
+        let address = try await transparentAddress(of: account)
+
+        for _ in 0..<2 {
+            _ = try? await service.updateTransparentAddressTransactions(
+                address: address,
+                start: 0,
+                end: -1,
+                dbData: dbData.osStr(),
+                networkType: .testnet,
+                mode: .uniqueTor
+            )
+        }
+        XCTAssertEqual(circuits.isolations, 2, "each .uniqueTor call isolates a circuit of its own")
+        XCTAssertEqual(circuits.clientsOfPosts.count, 2)
+        XCTAssertTrue(circuits.clientsOfPosts[0] !== circuits.clientsOfPosts[1], "the two posts rode different clients")
+
+        for _ in 0..<2 {
+            _ = try? await service.updateTransparentAddressTransactions(
+                address: address,
+                start: 0,
+                end: -1,
+                dbData: dbData.osStr(),
+                networkType: .testnet,
+                mode: .direct
+            )
+        }
+        XCTAssertEqual(circuits.isolations, 3, ".direct calls in Tor mode share one circuit")
+        XCTAssertEqual(circuits.clientsOfPosts.count, 4)
+        XCTAssertTrue(circuits.clientsOfPosts[2] === circuits.clientsOfPosts[3])
+        try await tor.close()
+    }
+
+    /// lightwalletd marks a transaction that is not in the main chain with a height of 0 or `u64::MAX`; any other
+    /// value a block height cannot hold is a malformed answer and fails, as it does on the Tor gRPC path.
+    func testOnlyZeroAndTheU64SentinelMeanUnmined() throws {
+        XCTAssertEqual(try TransparentAddressWalletStore.minedHeight(of: 0), 0)
+        XCTAssertEqual(try TransparentAddressWalletStore.minedHeight(of: UInt64.max), 0)
+        XCTAssertEqual(try TransparentAddressWalletStore.minedHeight(of: 2_500_000), 2_500_000)
+        XCTAssertEqual(try TransparentAddressWalletStore.minedHeight(of: UInt64(UInt32.max)), Int64(UInt32.max))
+        XCTAssertThrowsError(try TransparentAddressWalletStore.minedHeight(of: UInt64(UInt32.max) + 1))
+    }
+
     func testAClearnetServerKeepsTheTorRequiredAnswerWithTorOff() async throws {
         let service = LightWalletOHTTPService(
             endpoint: LightWalletEndpoint(address: "lwd.example.com", port: 443, secure: true),

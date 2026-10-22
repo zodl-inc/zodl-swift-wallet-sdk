@@ -167,9 +167,14 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
             return XCTFail("the prepare after the wipe never reached its engine reopen")
         }
         let switching = Task { try await fixture.synchronizer.switchTo(endpoint: nextWalletServer) }
-        // Bounded, not observable: nothing marks a switch that is queued and waiting, so this gives a switch that
-        // does not wait for the reopen time to finish. For one that does, it is only a delay.
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // The handshake: the switch has joined the lifecycle queue behind the held engine step (two operations on
+        // it). A switch that ran off the queue would not get the depth there, and a sleep could not tell the two apart.
+        let switchIsQueued = await waitUntil {
+            fixture.synchronizer.lifecycleQueueDepthForTesting() == 2
+        }
+        guard switchIsQueued else {
+            return XCTFail("the switch never joined the lifecycle queue behind the held reopen")
+        }
         let callsWhileTheReopenIsHeld = await engineCalls(of: fixture, since: callsBeforeThePrepare)
         XCTAssertEqual(
             callsWhileTheReopenIsHeld,

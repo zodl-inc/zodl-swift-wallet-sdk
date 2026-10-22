@@ -492,6 +492,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // state) through the engine's `restore_anchor` primitive — the offline fallback
         // policy and Tor privacy live ENGINE-side, one implementation for every host. The
         // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
+        //
+        // Read here, before the engine step takes its turn on the lifecycle queue, on purpose: the
+        // anchor is wanted by `initializer.initialize` below, which runs outside the queue. A switch
+        // that lands between this read and the engine step therefore provisions from the server
+        // recorded when `prepare` began and opens the engine at the one recorded when the step's turn
+        // comes (`SlipstreamWipeEndpointTests`). Queueing the anchor fetch as well would hold every
+        // switch for the whole of provisioning; the two servers differing in that window is accepted.
         let anchorServer = currentEndpoint
         try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
         let anchorNetwork = initializer.network
@@ -1248,6 +1255,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// [MOB-1850] Test seam: `isRunning` as `wasRunning` would sample it from the lifecycle queue.
     func isRunningForTesting() -> Bool {
         isRunning
+    }
+
+    /// Test seam: how many lifecycle operations are on the queue, running or waiting, so a test can tell
+    /// that an operation it started has joined the queue behind one it holds, instead of guessing with a sleep.
+    nonisolated func lifecycleQueueDepthForTesting() -> Int {
+        lifecycle.depth
     }
 
     /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.

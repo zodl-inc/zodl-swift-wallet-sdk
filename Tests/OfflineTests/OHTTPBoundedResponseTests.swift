@@ -12,6 +12,7 @@ import XCTest
 class MockResponseURLProtocol: URLProtocol {
     static var responseSize: Int = 0
     static var shouldSimulateStreaming: Bool = false
+    static var statusCode: Int = 200
 
     override class func canInit(with request: URLRequest) -> Bool {
         return true
@@ -27,10 +28,10 @@ class MockResponseURLProtocol: URLProtocol {
             return
         }
 
-        // Send a mock HTTP 200 response
+        // Send a mock HTTP response (200 unless a test says otherwise)
         let response = HTTPURLResponse(
             url: url,
-            statusCode: 200,
+            statusCode: Self.statusCode,
             httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": "application/octet-stream"]
         )!
@@ -80,7 +81,76 @@ final class OHTTPBoundedResponseTests: XCTestCase {
         testSession = nil
         MockResponseURLProtocol.responseSize = 0
         MockResponseURLProtocol.shouldSimulateStreaming = false
+        MockResponseURLProtocol.statusCode = 200
         super.tearDown()
+    }
+
+    // MARK: - Error answers (non-2xx)
+
+    /// A non-2xx answer (an error page) is read up to `maxErrorBodyBytes`, whatever ceiling the call set, and
+    /// one that runs past it fails with the answer's status: the status is what the caller needs, not a
+    /// `responseTooLarge` that would hide a 429 or a 503 behind a size complaint.
+    func testAnErrorAnswerPastTheErrorBodyBoundFailsWithItsStatus() async throws {
+        MockResponseURLProtocol.statusCode = 503
+        MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes + 1
+        MockResponseURLProtocol.shouldSimulateStreaming = true
+        let request = URLRequest(url: URL(string: "https://example.com/relay")!)
+
+        do {
+            _ = try await OHTTPTransport.boundedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
+            XCTFail("an error page past the bound fails")
+        } catch OHTTPError.httpStatusError(let status, let message) {
+            XCTAssertEqual(status, 503, "the answer's own status, not responseTooLarge")
+            XCTAssertTrue(message.contains("exceeded limit (\(OHTTPTransport.maxErrorBodyBytes) bytes)"), message)
+        }
+    }
+
+    func testAnErrorAnswerWithinTheErrorBodyBoundIsReturnedWhole() async throws {
+        MockResponseURLProtocol.statusCode = 503
+        MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes
+        let request = URLRequest(url: URL(string: "https://example.com/relay")!)
+
+        let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
+
+        XCTAssertEqual(data.count, OHTTPTransport.maxErrorBodyBytes)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503)
+    }
+
+    func testTheErrorBodyBoundIsFixedAndNeverAboveTheCallsOwnCeiling() {
+        XCTAssertEqual(OHTTPTransport.maxErrorBodyBytes, 64 * 1024)
+        let url = URL(string: "https://example.com/relay")!
+        func response(_ status: Int) -> HTTPURLResponse {
+            HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!
+        }
+
+        let errorPage = OHTTPTransport.bodyBound(for: response(503), maxBytes: OHTTPTransport.maxRelayResponseBytes)
+        XCTAssertEqual(errorPage.maxBytes, OHTTPTransport.maxErrorBodyBytes)
+        XCTAssertEqual(errorPage.status, 503)
+        let smallCall = OHTTPTransport.bodyBound(for: response(429), maxBytes: 1024)
+        XCTAssertEqual(smallCall.maxBytes, 1024, "a call's own, smaller ceiling still holds")
+        let sealed = OHTTPTransport.bodyBound(for: response(200), maxBytes: OHTTPTransport.maxRelayResponseBytes)
+        XCTAssertEqual(sealed.maxBytes, OHTTPTransport.maxRelayResponseBytes, "a 2xx keeps the call's ceiling")
+        XCTAssertNil(sealed.status)
+        guard case .responseTooLarge = sealed.exceeded("x") else { return XCTFail("a 2xx past its ceiling is responseTooLarge") }
+        guard case .httpStatusError(let status, _) = errorPage.exceeded("x"), status == 503 else {
+            return XCTFail("an error page past the bound carries its status")
+        }
+    }
+
+    func testAStreamedErrorAnswerPastTheBoundFailsWithItsStatus() async throws {
+        MockResponseURLProtocol.statusCode = 429
+        MockResponseURLProtocol.responseSize = OHTTPTransport.maxErrorBodyBytes + 1
+        MockResponseURLProtocol.shouldSimulateStreaming = true
+        let request = URLRequest(url: URL(string: "https://example.com/relay")!)
+
+        let outer = try await OHTTPTransport.streamedData(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, session: testSession)
+        XCTAssertEqual(outer.status, 429, "the head is delivered as it is")
+        do {
+            for try await _ in outer.body {}
+            XCTFail("the body past the bound fails")
+        } catch OHTTPError.httpStatusError(let status, _) {
+            XCTAssertEqual(status, 429, "with the answer's status, so a 429 is still a 429")
+        }
     }
 
     /// Test that a response under the limit succeeds.

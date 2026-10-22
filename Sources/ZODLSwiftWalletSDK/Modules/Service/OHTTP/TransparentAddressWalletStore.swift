@@ -77,11 +77,11 @@ enum TransparentAddressWalletStore {
         }
     }
 
-    /// Decrypts and stores `transaction` as the server returned it (height 0 or above `UInt32.max`: not
-    /// mined in the main chain).
+    /// Decrypts and stores `transaction` as the server returned it (height 0 or `UInt64.max`: not mined in
+    /// the main chain).
     @DBActor
     static func store(_ transaction: RawTransaction, dbData: (String, UInt), networkType: NetworkType) throws {
-        let minedHeight: Int64 = transaction.height == 0 || transaction.height > UInt64(UInt32.max) ? 0 : Int64(transaction.height)
+        let minedHeight = try minedHeight(of: transaction.height)
         let txBytes = [UInt8](transaction.data)
         var txid = [UInt8](repeating: 0, count: 32)
         let result = zcashlc_decrypt_and_store_transaction(
@@ -97,6 +97,21 @@ enum TransparentAddressWalletStore {
             throw ZcashError.rustDecryptAndStoreTransaction(
                 lastErrorMessage(fallback: "`decryptAndStoreTransaction` failed with unknown error")
             )
+        }
+    }
+
+    /// The mined height to store for a `RawTransaction.height` the server returned: 0 (unmined) for the two
+    /// values lightwalletd uses for a transaction that is not in the main chain, 0 and `u64::MAX`; the height
+    /// itself when it fits a block height; an error for anything else, a malformed answer. The same reading
+    /// as the Tor gRPC path (`rust/src/tor.rs`), which also fails on an overflow other than `u64::MAX`.
+    static func minedHeight(of height: UInt64) throws -> Int64 {
+        switch height {
+        case 0, UInt64.max:
+            return 0
+        case ...UInt64(UInt32.max):
+            return Int64(height)
+        default:
+            throw ZcashError.rustDecryptAndStoreTransaction("transaction height \(height) is not a block height")
         }
     }
 

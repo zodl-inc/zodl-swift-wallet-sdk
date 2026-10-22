@@ -26,6 +26,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     var walletNetwork: NetworkType?
     /// Test-only: replaces the hardened clearnet session as the relay sender of the clients made from now on.
     var testClearnetSender: OHTTPTransport.HTTPSender?
+    /// Test-only: makes the relay sender of a Tor leg from the isolated client it would ride, instead of
+    /// `TorClient.httpRequestSentOnce`, so a test can see which circuit each call was given.
+    var testTorSender: ((TorClient) -> OHTTPTransport.HTTPSender)?
     /// Test-only: verifies the key configuration instead of the native code.
     var testKeyVerifier: OHTTPTransport.KeyVerifier?
 
@@ -130,10 +133,14 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
             let isolated = try await torClient.isolatedClient()
-            // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
-            // tried again, on a new circuit, only when it failed before any of it was sent.
-            httpSender = { request, maxBytes in
-                try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            if let testTorSender {
+                httpSender = testTorSender(isolated)
+            } else {
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                httpSender = { request, maxBytes in
+                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                }
             }
         } else if let testClearnetSender {
             httpSender = testClearnetSender
@@ -511,6 +518,11 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     // The wallet half (which address, its range, the storing) is `TransparentAddressWalletStore`; the server
     // half rides the OHTTP transport like every other RPC, so these never reach the Tor gRPC connector. In
     // Tor mode the synchronizers ask for `.uniqueTor`: each wallet-identifying call gets its own circuit.
+    //
+    // The two wallet steps of a single-use check (the address due, then the back-off after a check that
+    // found nothing) are separate database handles around the network call, each reading the chain height
+    // anew. The Tor path does both inside one handle, but outside a transaction too, so nothing is lost:
+    // only the chain height the back-off is computed from may be a little newer here. Accepted as is.
 
     override func checkSingleUseTransparentAddresses(
         dbData: (String, UInt),

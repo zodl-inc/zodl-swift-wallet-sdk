@@ -233,6 +233,15 @@ actor OHTTPTransport {
     /// The longest relay `Retry-After` that is honoured.
     internal static let maxRetryAfter: TimeInterval = 120
 
+    /// The pause a 429 without a usable `Retry-After` starts: the Client's own back-off (ZIP "Outer
+    /// response contract", reference default 30 s), the same value as the slipstream and Android clients.
+    internal static let defaultRateLimitPause: TimeInterval = 30
+
+    /// The most of a non-2xx relay answer (an error page) that is read, whatever the call's own
+    /// ceiling: an error body has nothing a client needs beyond its first bytes, and the ceiling of a
+    /// sealed response is no measure for it. Past it the call fails with the answer's status.
+    internal static let maxErrorBodyBytes = 64 * 1024
+
     /// Maximum size of a signed key-configuration response (64 KiB). ZIP MUST: clients bound the
     /// key-config response while reading.
     internal static let maxKeyConfigBytes = 64 * 1024
@@ -246,28 +255,30 @@ actor OHTTPTransport {
     /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
     /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
     /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
+    /// A non-2xx answer is read up to ``maxErrorBodyBytes`` at most, whatever `maxBytes`, and one that
+    /// is larger fails with its HTTP status, not as too large: the status is the answer.
     ///
     /// - Parameters:
     ///   - request: The URL request to execute
     ///   - maxBytes: Maximum allowed response size in bytes
     ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
     /// - Returns: The response data and URLResponse
-    /// - Throws: `OHTTPError.responseTooLarge` if the response exceeds maxBytes, or transport errors
+    /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes,
+    ///   `OHTTPError.httpStatusError` if a non-2xx response exceeds the error-body bound, or transport errors
     static func boundedData(
         for request: URLRequest,
         maxBytes: Int,
         session: URLSession = OHTTPTransport.session
     ) async throws -> (Data, URLResponse) {
         let (bytes, response) = try await session.bytes(for: oneShotBody(request))
+        let bound = bodyBound(for: response, maxBytes: maxBytes)
 
         // Reject early if Content-Length header exceeds the limit
         // `expectedContentLength` is -1 when the length is unknown.
         let expectedLength = response.expectedContentLength
-        if expectedLength > Int64(maxBytes) {
+        if expectedLength > Int64(bound.maxBytes) {
             bytes.task.cancel()
-            throw OHTTPError.responseTooLarge(
-                "Response Content-Length (\(expectedLength) bytes) exceeds limit (\(maxBytes) bytes)"
-            )
+            throw bound.exceeded("Response Content-Length (\(expectedLength) bytes) exceeds limit (\(bound.maxBytes) bytes)")
         }
 
         var accumulated = Data()
@@ -277,15 +288,35 @@ actor OHTTPTransport {
 
         for try await byte in bytes {
             accumulated.append(byte)
-            if accumulated.count > maxBytes {
+            if accumulated.count > bound.maxBytes {
                 bytes.task.cancel()
-                throw OHTTPError.responseTooLarge(
-                    "Response size (\(accumulated.count) bytes) exceeded limit (\(maxBytes) bytes)"
-                )
+                throw bound.exceeded("Response size (\(accumulated.count) bytes) exceeded limit (\(bound.maxBytes) bytes)")
             }
         }
 
         return (accumulated, response)
+    }
+
+    /// The bound on one answer's body and the error for a body past it: `maxBytes` and
+    /// `responseTooLarge` for a 2xx, ``maxErrorBodyBytes`` (or less, if `maxBytes` is) and the answer's
+    /// own status for anything else.
+    struct BodyBound {
+        let maxBytes: Int
+        let status: Int?
+
+        func exceeded(_ detail: String) -> OHTTPError {
+            if let status {
+                return .httpStatusError(statusCode: status, message: "Relay/gateway returned HTTP \(status): \(detail)")
+            }
+            return .responseTooLarge(detail)
+        }
+    }
+
+    static func bodyBound(for response: URLResponse, maxBytes: Int) -> BodyBound {
+        guard let status = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(status) else {
+            return BodyBound(maxBytes: maxBytes, status: nil)
+        }
+        return BodyBound(maxBytes: min(maxBytes, maxErrorBodyBytes), status: status)
     }
 
     /// `request` with its body as a stream the session cannot rewind: with no replacement stream on offer
@@ -411,7 +442,7 @@ actor OHTTPTransport {
         } catch OHTTPError.httpStatusError(let status, let message) where status == 429 {
             throw OHTTPError.httpStatusError(statusCode: status, message: message)
         } catch let relayError {
-            return try await fetchKeyConfigFromDNS(relayError: relayError, profile: profile)
+            return try await fetchKeyConfigFromDNS(relayError: relayError)
         }
     }
 
@@ -438,7 +469,8 @@ actor OHTTPTransport {
     /// response to extract the signed envelope, and verifies it.
     /// If the gateway is unknown (no DNS source), the original relay error is thrown.
     /// If all DNS resolvers fail, the original relay error is thrown (preserving its kind).
-    private func fetchKeyConfigFromDNS(relayError: Error, profile: OHTTPProfileInfo) async throws -> OHTTPVerifiedKey {
+    /// The DoH request carries its own fixed headers (`httpGetForDNS`), none of the profile's relay-facing ones.
+    private func fetchKeyConfigFromDNS(relayError: Error) async throws -> OHTTPVerifiedKey {
         // Check if gateway is known (has a DNS source)
         guard let dohURLs = try? OHTTPNative.dohQueryURLs(gatewayHost: gatewayHost) else {
             // Unknown gateway: fail with original relay error (configuration error)
@@ -610,7 +642,7 @@ actor OHTTPTransport {
         }
 
         try await checkRelayBackoff()
-        let (data, httpResponse) = try await httpSender(request, Self.maxKeyConfigBytes)
+        let (data, httpResponse) = try await send(request, maxBytes: Self.maxKeyConfigBytes)
         await noteRelayAnswer(status: httpResponse.statusCode, retryAfter: httpResponse.value(forHTTPHeaderField: "Retry-After"))
 
         guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
@@ -626,9 +658,21 @@ actor OHTTPTransport {
     private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> (Data, HTTPURLResponse) {
         let request = try relayPost(url: url, body: body, timeoutMS: timeoutMS)
         try await checkRelayBackoff()
-        let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
+        let (data, response) = try await send(request, maxBytes: Self.maxRelayResponseBytes)
         await noteRelayAnswer(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         return (data, response)
+    }
+
+    /// `httpSender`, with one more rule: an answer the sender refused for its body (a non-2xx larger than
+    /// ``maxErrorBodyBytes``, `httpStatusError`) is still the relay's answer, so its status is noted (a 429
+    /// starts the default pause, its `Retry-After` being out of reach) before the error goes up.
+    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        do {
+            return try await httpSender(request, maxBytes)
+        } catch OHTTPError.httpStatusError(let status, let message) {
+            await noteRelayAnswer(status: status, retryAfter: nil)
+            throw OHTTPError.httpStatusError(statusCode: status, message: message)
+        }
     }
 
     /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
@@ -663,23 +707,30 @@ actor OHTTPTransport {
         return request
     }
 
-    /// Records the `Retry-After` of a 429 through this relay, which every later post waits out.
+    /// Records the pause of a 429 through this relay, which every later post waits out: its `Retry-After`,
+    /// or ``defaultRateLimitPause`` when the answer carries none that can be read (ZIP "Outer response
+    /// contract": "otherwise apply its normal back-off").
     func noteRelayAnswer(status: Int, retryAfter: String?) async {
-        if status == 429, let delay = Self.retryAfter(retryAfter) {
-            await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: backoffKey)
-        }
+        guard status == 429 else { return }
+        let delay = Self.retryAfter(retryAfter) ?? Self.defaultRateLimitPause
+        await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: backoffKey)
     }
 
-    /// Fails at once, without sending, while the `Retry-After` of an earlier 429 through this relay runs
+    /// Fails at once, without sending, while the pause of an earlier 429 through this relay runs
     /// (ZIP "Outer response contract": a call made during the pause is failed locally, as a 429).
     func checkRelayBackoff() async throws {
-        guard let deadline = await keyCache.backoffDeadline(for: backoffKey) else { return }
-        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
-        guard remaining > 0 else { return }
+        guard let remaining = await relayPauseRemaining() else { return }
         throw OHTTPError.httpStatusError(
             statusCode: 429,
             message: "relay rate limit: not sent, \(Int(remaining.rounded(.up)))s of the relay's pause left"
         )
+    }
+
+    /// How much of the relay's pause is left, capped at ``maxRetryAfter``; nil when none runs.
+    func relayPauseRemaining() async -> TimeInterval? {
+        guard let deadline = await keyCache.backoffDeadline(for: backoffKey) else { return nil }
+        let remaining = min(deadline.timeIntervalSinceNow, Self.maxRetryAfter)
+        return remaining > 0 ? remaining : nil
     }
 
     /// The delay of a `Retry-After` value in the delay-seconds form, capped at ``maxRetryAfter``; nil for a

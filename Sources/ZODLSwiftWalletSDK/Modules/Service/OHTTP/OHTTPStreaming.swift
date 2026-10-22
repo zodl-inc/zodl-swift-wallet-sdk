@@ -136,7 +136,15 @@ extension OHTTPTransport {
             let sealed = try OHTTPNative.encapsulate(key: key, request: request)
             let post = try relayPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
             try await checkRelayBackoff()
-            let outer = try await streamSender(post, Self.maxRelayResponseBytes)
+            let outer: OHTTPOuterStream
+            do {
+                outer = try await streamSender(post, Self.maxRelayResponseBytes)
+            } catch OHTTPError.httpStatusError(let status, let message) {
+                // The sender refused the answer for its body (a non-2xx larger than `maxErrorBodyBytes`): still
+                // the relay's answer, so its status is noted before the error goes up.
+                await noteRelayAnswer(status: status, retryAfter: nil)
+                throw OHTTPError.httpStatusError(statusCode: status, message: message)
+            }
             await noteRelayAnswer(status: outer.status, retryAfter: outer.retryAfter)
 
             if try OHTTPNative.answerIsSealed(status: outer.status, contentType: outer.contentType, attempt: attempt) {
@@ -234,7 +242,8 @@ extension OHTTPTransport {
     }
 
     /// Posts `request` on the relay session and returns once the relay's head has arrived, the body
-    /// following as it arrives. The body fails beyond `maxBytes`; redirects are refused, and the body is
+    /// following as it arrives. The body fails beyond `maxBytes` (a non-2xx one beyond ``maxErrorBodyBytes``,
+    /// with the answer's status; see ``bodyBound(for:maxBytes:)``); redirects are refused, and the body is
     /// never sent twice (see ``oneShotBody(_:)``).
     static func streamedData(
         for request: URLRequest,
@@ -257,6 +266,8 @@ struct OHTTPStreamedHead {
 private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private let maxBytes: Int
+    /// The bound of this answer's body, set with its head (``OHTTPTransport/bodyBound(for:maxBytes:)``).
+    private var bound: OHTTPTransport.BodyBound?
     private var head: CheckedContinuation<OHTTPOuterStream, Error>?
     private var received = 0
     private let body: AsyncThrowingStream<Data, Error>
@@ -300,10 +311,12 @@ private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchec
             takeHead()?.resume(throwing: OHTTPError.transportError("Invalid response type"))
             return
         }
-        if response.expectedContentLength > Int64(maxBytes) {
+        let bound = OHTTPTransport.bodyBound(for: response, maxBytes: maxBytes)
+        lock.withLock { self.bound = bound }
+        if response.expectedContentLength > Int64(bound.maxBytes) {
             completionHandler(.cancel)
-            takeHead()?.resume(throwing: OHTTPError.responseTooLarge(
-                "Response Content-Length (\(response.expectedContentLength) bytes) exceeds limit (\(maxBytes) bytes)"
+            takeHead()?.resume(throwing: bound.exceeded(
+                "Response Content-Length (\(response.expectedContentLength) bytes) exceeds limit (\(bound.maxBytes) bytes)"
             ))
             return
         }
@@ -317,14 +330,14 @@ private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchec
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        let total = lock.withLock {
+        let (total, bound) = lock.withLock {
             received += data.count
-            return received
+            return (received, self.bound ?? OHTTPTransport.BodyBound(maxBytes: maxBytes, status: nil))
         }
-        guard total <= maxBytes else {
+        guard total <= bound.maxBytes else {
             dataTask.cancel()
-            bodyContinuation.finish(throwing: OHTTPError.responseTooLarge(
-                "Response size (\(total) bytes) exceeded limit (\(maxBytes) bytes)"
+            bodyContinuation.finish(throwing: bound.exceeded(
+                "Response size (\(total) bytes) exceeded limit (\(bound.maxBytes) bytes)"
             ))
             return
         }
