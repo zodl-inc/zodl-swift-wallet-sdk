@@ -299,24 +299,27 @@ fn real_ffi_error_page_is_cut_at_the_fixed_guard() {
         let result = fixture.get_response(&url, 0, 30_000);
         let elapsed = start.elapsed();
         let stages = STAGES.with_borrow_mut(|stages| stages.take().unwrap());
-        if stages.status != Some(429) {
-            eprintln!(
-                "TOR STAGE-SKIP: fixture did not answer 429; status={:?}, result={result:?}",
-                stages.status
-            );
-            return;
-        }
+        // Fixture availability is read off the FFI result (the response's own status), never
+        // off the retry filter: a crate that stopped calling the filter must fail below, not skip.
+        let (status, body_len) = match result {
+            Ok((status, body_len)) if status == 429 => (status, body_len),
+            result => {
+                eprintln!("TOR STAGE-SKIP: fixture did not answer 429; result={result:?}");
+                return;
+            }
+        };
+        assert_eq!(
+            stages.status,
+            Some(status),
+            "the retry filter must have seen the final response's status"
+        );
         assert_eq!(stages.body_entries, 1);
         assert_eq!(
             stages.body_limit,
             Some(crate::TOR_HTTP_MAX_ERROR_BODY_BYTES),
             "the collector must enter after the filter recorded the final 429"
         );
-        assert_eq!(
-            result.expect("an error page past the guard is reported by its status"),
-            (429, 0),
-            "status kept, body cut"
-        );
+        assert_eq!(body_len, 0, "the cut error page comes back empty");
         assert!(
             elapsed < Duration::from_secs(15),
             "the 20 s drip was read to its end instead of stopping at 64 KiB: {elapsed:?}"
