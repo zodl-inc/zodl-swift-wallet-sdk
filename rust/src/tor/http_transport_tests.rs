@@ -836,7 +836,8 @@ async fn serve_large(
     bytes_written += script.written_at_once;
 
     if !script.trickle {
-        stream.shutdown().await?;
+        // A client that stopped at its ceiling may already have reset the connection.
+        let _ = stream.shutdown().await;
         let client_eof = matches!(wait_for_eof(&mut stream).await, Ok(true) | Err(_));
         return Ok(LargeServerOutcome {
             bytes_written,
