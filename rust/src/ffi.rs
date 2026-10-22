@@ -1306,6 +1306,12 @@ impl HttpResponseBytes {
             body_len,
         })))
     }
+
+    /// The response's status and body length, for the tests that call the Tor FFI.
+    #[cfg(test)]
+    pub(crate) fn status_and_body_len(&self) -> (u16, usize) {
+        (self.status, self.body_len)
+    }
 }
 
 /// Frees an HttpResponseBytes value
