@@ -59,6 +59,22 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.ready([], acceptedBy: "a.example.com:443"))
     }
 
+    /// An acceptance is persisted: after a restart the plan still reports it, and a later
+    /// refusal does not turn it into a rejection.
+    func testAnAcceptanceSurvivesARestart() async {
+        let txId = Data(repeating: 0x5A, count: 32)
+        let store = makeStore()
+        await store.recordPlan(txId: txId, endpoints: [endpointA])
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
+
+        let reopened = makeStore()
+        let plan = await reopened.plan(for: txId)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "a.example.com:443"))
+        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vin-empty", lifecycle: await reopened.currentLifecycle())
+        let afterRefusal = await makeStore().plan(for: txId)
+        XCTAssertEqual(afterRefusal, .ready([endpointA], acceptedBy: "a.example.com:443"))
+    }
+
     func testMarkAcceptedAgainRecordsTheLatestHost() async {
         let store = makeStore()
         let txId = Data(repeating: 0x24, count: 32)

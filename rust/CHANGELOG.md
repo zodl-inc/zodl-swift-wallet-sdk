@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_pczt_txid(pczt_ptr, pczt_len, txid_ret)` writes the id of the transaction a PCZT
+  commits to, in the SDK's raw byte order. A v5 or later transaction id commits to the
+  transaction's effects only, so it is known when the PCZT is created and is the id of the
+  transaction finally extracted from it. Returns `false` and sets the last error for bytes that are
+  not a PCZT, or a pre-v5 transaction.
 - `zcashlc_zip317_marginal_fee()` returns the ZIP 317 marginal fee in zatoshis, as
   `zcash_primitives` defines it. It reads no database and cannot fail.
 - `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an

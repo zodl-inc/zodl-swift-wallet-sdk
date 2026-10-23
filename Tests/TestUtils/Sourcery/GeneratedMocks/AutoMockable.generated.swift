@@ -5314,6 +5314,26 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - pcztTxid
+
+    var pcztTxidPcztCallsCount = 0
+    var pcztTxidPcztCalled: Bool {
+        return pcztTxidPcztCallsCount > 0
+    }
+    var pcztTxidPcztReceivedPczt: Pczt?
+    var pcztTxidPcztReturnValue: Data?
+    var pcztTxidPcztClosure: ((Pczt) async -> Data?)?
+
+    func pcztTxid(pczt: Pczt) async -> Data? {
+        pcztTxidPcztCallsCount += 1
+        pcztTxidPcztReceivedPczt = pczt
+        if let closure = pcztTxidPcztClosure {
+            return await closure(pczt)
+        } else {
+            return pcztTxidPcztReturnValue
+        }
+    }
+
     // MARK: - addProofsToPCZT
 
     var addProofsToPCZTPcztThrowableError: Error?

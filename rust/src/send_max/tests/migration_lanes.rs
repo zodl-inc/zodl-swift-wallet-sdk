@@ -352,3 +352,90 @@ fn building_an_oversized_immediate_sweep_reports_as_before() {
         "{pczt}"
     );
 }
+
+// The transaction id a sweep PCZT commits to
+
+/// The SDK keys an immediate sweep's "never rejected" mark on the id its PCZT commits to, read
+/// when the PCZT is created. The id is known then, is the same after the PCZT is serialized and
+/// parsed again (as an app moving it to a signer and back does), and is the id of the
+/// transaction finally extracted from it once proved and signed.
+#[test]
+fn an_immediate_sweep_pczt_has_a_stable_txid_from_creation() {
+    let mut st = ironwood_wallet_with_orchard_notes(&[NOTE_VALUE, NOTE_VALUE]);
+    let sweep = propose_immediate(&mut st).expect("the immediate lane proposes the sweep");
+    let account = st.test_account().unwrap().id();
+
+    let pczt = st
+        .create_pczt_from_proposal::<Infallible, _, Infallible>(
+            account,
+            zcash_client_backend::wallet::OvkPolicy::Sender,
+            &sweep,
+            None,
+        )
+        .expect("the sweep builds a PCZT");
+    let bytes = pczt.serialize().expect("the PCZT serializes");
+
+    let txid = crate::pczt_txid::pczt_txid(&bytes).expect("a fresh PCZT has a txid");
+    assert_ne!(txid, [0u8; 32]);
+
+    let reparsed = pczt::Pczt::parse(&bytes)
+        .expect("the PCZT parses")
+        .serialize()
+        .expect("the reparsed PCZT serializes");
+    assert_eq!(crate::pczt_txid::pczt_txid(&reparsed).unwrap(), txid);
+    assert_eq!(
+        crate::pczt_txid::pczt_txid(&bytes).unwrap(),
+        txid,
+        "deterministic"
+    );
+
+    // Prove and sign the reparsed PCZT, then extract the transaction.
+    let pczt = pczt::Pczt::parse(&reparsed).unwrap();
+    let branch_id =
+        zcash_protocol::consensus::BranchId::try_from(*pczt.global().consensus_branch_id())
+            .unwrap();
+    let proving_key = |pool| {
+        zcash_primitives::transaction::builder::cached_orchard_proving_key(
+            zcash_primitives::transaction::components::orchard::bundle_version_for_branch(
+                branch_id, pool,
+            )
+            .expect("the branch supports the pool")
+            .circuit_version(),
+        )
+    };
+    let mut prover = pczt::roles::prover::Prover::new(pczt);
+    if prover.requires_orchard_proof() {
+        prover = prover
+            .create_orchard_proof(
+                crate::system_rng(),
+                proving_key(orchard::ValuePool::Orchard),
+            )
+            .unwrap();
+    }
+    if prover.requires_ironwood_proof() {
+        prover = prover
+            .create_ironwood_proof(
+                crate::system_rng(),
+                proving_key(orchard::ValuePool::Ironwood),
+            )
+            .unwrap();
+    }
+    let proved = prover.finish();
+    assert_eq!(
+        crate::pczt_txid::pczt_txid(&proved.clone().serialize().unwrap()).unwrap(),
+        txid,
+        "proofs do not change it"
+    );
+
+    let usk = st.test_account().unwrap().usk().clone();
+    let mut signer = pczt::roles::signer::Signer::new(proved).unwrap();
+    <zcash_client_backend::data_api::testing::orchard::OrchardPoolTester as zcash_client_backend::data_api::testing::pool::ShieldedPoolTester>::apply_signatures_to_pczt(&mut signer, &usk).unwrap();
+    let extracted = st
+        .extract_and_store_transaction_from_pczt(signer.finish())
+        .expect("the proved and signed sweep extracts");
+    assert_eq!(
+        *extracted.as_ref(),
+        txid,
+        "the transaction finally built has the id read at creation"
+    );
+}

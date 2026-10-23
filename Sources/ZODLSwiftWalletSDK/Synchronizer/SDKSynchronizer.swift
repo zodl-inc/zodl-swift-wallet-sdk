@@ -629,11 +629,13 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
-        try await initializer.rustBackend.createPCZTFromProposal(
+        let pczt = try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
             proposal: proposal.inner,
             sizeBound: sizeBound
         )
+        await markMigrationPCZT(pczt, of: proposal, rustBackend: initializer.rustBackend, in: submitPlanStore, logger: logger)
+        return pczt
     }
 
     public func redactPCZTForSigner(pczt: Pczt) async throws -> Pczt {

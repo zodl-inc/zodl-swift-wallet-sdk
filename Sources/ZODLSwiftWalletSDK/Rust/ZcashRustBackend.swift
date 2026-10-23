@@ -614,6 +614,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
     }
 
+    func pcztTxid(pczt: Pczt) async -> Data? {
+        var txid = [UInt8](repeating: 0, count: 32)
+        let succeeded = pczt.withUnsafeBytes { buffer -> Bool in
+            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            return txid.withUnsafeMutableBufferPointer { txidPtr in
+                zcashlc_pczt_txid(bufferPtr, UInt(pczt.count), txidPtr.baseAddress)
+            }
+        }
+        return succeeded ? Data(txid) : nil
+    }
+
     func addProofsToPCZT(
         pczt: Pczt
     ) async throws -> Pczt {

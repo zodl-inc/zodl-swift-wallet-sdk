@@ -217,6 +217,13 @@ final class SDKBroadcaster: Broadcaster {
             ovkPolicy: ovkPolicy,
             sizeBound: sizeBound
         )
+        if recordingPlans && proposal.isMigration {
+            // A migration sweep keeps main's resubmission until expiry, even if every server
+            // rejects it.
+            for transaction in createdTransactions {
+                await submitPlanStore.markMigrationPreparation(txId: transaction.txId)
+            }
+        }
         let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 
         return await finishCreation(

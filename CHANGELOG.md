@@ -135,8 +135,12 @@ Changes are relative to `5.2.0`.
   endpoint's submission has ended the SDK records a late acceptance, or the rejection the complete
   answers make. Any acceptance, including a late one, clears the rejection. Transactions submitted by `createProposedTransactions` or
   `createTransactionFromPCZT`, which keep no retry plan, are never recorded as rejected, and
-  neither are migration preparations handed out by `takeMigrationPreparation(accountUUID:byTxid:)`,
-  which are resubmitted until they expire, as before. An
+  neither are Orchard migration transactions, which are resubmitted until they expire, as before:
+  preparations handed out by `takeMigrationPreparation(accountUUID:byTxid:)`, and the sweeps built
+  from a `proposeOrchardToIronwoodMigration` or `proposeImmediateMigration` proposal, whether by
+  `Broadcaster.createProposedTransactions` or from the PCZT `createPCZTFromProposal` returns. The
+  SDK records the mark under the transaction id, which a PCZT commits to from its creation, so it
+  holds through the PCZT's serialization, proving and signing and across a restart. An
   exhaustive `switch` over `TransactionSubmissionStatus` stops compiling until the new case is
   handled. See MIGRATING.md.
 - `ZcashError` and `ZcashErrorCode` have new cases, starting with `giftCardTooManyNotes` (`ZGIFT0017`):

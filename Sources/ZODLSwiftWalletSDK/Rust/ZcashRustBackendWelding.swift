@@ -389,6 +389,16 @@ protocol ZcashRustBackendWelding {
     /// - Returns `true` if this PCZT requires Sapling proofs.
     func PCZTRequiresSaplingProofs(pczt: Pczt) async -> Bool
 
+    /// The id of the transaction `pczt` commits to, in the SDK's raw/internal byte order.
+    ///
+    /// A v5 or later transaction id (ZIP 244) commits to the transaction's effects only, so it is
+    /// known as soon as the PCZT is created and stays the same through serialization, proving and
+    /// signing, up to the transaction `createTransactionFromPCZT` builds from it.
+    ///
+    /// - Returns: `nil` when the bytes are not a PCZT, or its transaction id is not yet known (a
+    ///   pre-v5 transaction); the Rust layer's last error then says why.
+    func pcztTxid(pczt: Pczt) async -> Data?
+
     /// Adds proofs to the given PCZT.
     ///
     /// - Parameter pczt: The partially created transaction in its serialized format.

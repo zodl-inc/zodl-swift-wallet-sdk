@@ -107,6 +107,36 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
         XCTAssertEqual(reread, .ready([endpointA], acceptedBy: nil))
     }
 
+    /// A migration mark set before the transaction has a plan, or even exists (a PCZT's id is
+    /// known when it is created), is persisted at once and holds across a restart.
+    func testAMigrationMarkWithoutAPlanSurvivesARestart() async {
+        let txId = Data(repeating: 0x4B, count: 32)
+        await makeStore().markMigrationPreparation(txId: txId)
+
+        let reopened = makeStore()
+        let marked = await reopened.isMigrationPreparation(txId: txId)
+        XCTAssertTrue(marked)
+        let unplanned = await reopened.plan(for: txId)
+        XCTAssertNil(unplanned, "the mark does not create a plan")
+
+        await reopened.recordPlan(txId: txId, endpoints: [endpointA])
+        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vin-empty", lifecycle: await reopened.currentLifecycle())
+        let plan = await reopened.plan(for: txId)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: nil))
+    }
+
+    func testPruningAPlanRemovesItsMigrationMark() async {
+        let txId = Data(repeating: 0x4C, count: 32)
+        let store = makeStore()
+        await store.markMigrationPreparation(txId: txId)
+        await store.recordPlan(txId: txId, endpoints: [endpointA])
+
+        await store.deletePlans(txIds: [txId])
+
+        let marked = await makeStore().isMigrationPreparation(txId: txId)
+        XCTAssertFalse(marked)
+    }
+
     func testARejectionFromAWipedLifecycleIsDropped() async {
         let txId = Data(repeating: 0x44, count: 32)
         let store = makeStore()

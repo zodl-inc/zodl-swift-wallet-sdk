@@ -1403,6 +1403,103 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "Legacy path must not register submit plans")
     }
 
+    // MARK: - Migration sweeps are never rejected
+
+    /// An immediate migration sweep created through the broadcaster from a migration proposal
+    /// keeps main's resubmission until expiry: a unanimous terminal refusal does not reject it.
+    func testAMigrationSweepCreatedThroughTheBroadcasterIsNeverRejected() async throws {
+        let rawID = Data(repeating: 0xE7, count: 32)
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)]),
+            endpointSubmitter: endpointSubmitter
+        )
+        await synchronizer.updateStatus(.stopped)
+        var sweep = Proposal.testOnlyFakeProposal(totalFee: 10)
+        sweep.isMigration = true
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: sweep,
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        let outcome = await synchronizer.broadcaster.submit(transaction: try XCTUnwrap(transactions.first), to: [endpoint])
+
+        XCTAssertEqual(outcome.rejection, .invalid, "the result is still classified, as on main")
+        let status = await synchronizer.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it until it expires")
+    }
+
+    /// End to end, through a restart: a migration proposal's PCZT is created, moved to a signer and
+    /// back (serialized and parsed again), proved, and only then built and submitted, by a new
+    /// process with a new submit-plan store over the same file. Every server refuses it for good,
+    /// and it is still never recorded as rejected, before or after another restart.
+    func testAMigrationPCZTSurvivesReparseAndRestartAndIsNeverRejected() async throws {
+        let rawID = Data(repeating: 0xE8, count: 32)
+        let created = Pczt([0x50, 0x43, 0x5A, 0x54, 0x01])
+        let proved = Pczt([0x50, 0x43, 0x5A, 0x54, 0x02])
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpoint)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue = created
+        // The id a PCZT commits to is the same before and after proving.
+        rustBackend.pcztTxidPcztClosure = { pczt in [created, proved].contains(pczt) ? rawID : nil }
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        let encoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+
+        // Process 1: propose and create the PCZT, then hand it off.
+        let first = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+        await first.updateStatus(.stopped)
+        var sweep = Proposal.testOnlyFakeProposal(totalFee: 10)
+        sweep.isMigration = true
+        let pczt = try await first.createPCZTFromProposal(accountUUID: TestsData.mockedAccountUUID, proposal: sweep)
+        let transported = Pczt(Array(pczt))
+        XCTAssertEqual(rustBackend.pcztTxidPcztReceivedPczt, created)
+        let databaseURL = submitPlanDatabaseURL(for: first)
+
+        // Process 2: a restart, with a fresh store over the same file. Build and submit the proved PCZT.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in
+            SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        }
+        let second = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+        await second.updateStatus(.stopped)
+        XCTAssertEqual(transported, created)
+        let transactions = try await second.broadcaster.createTransactionFromPCZT(pcztWithProofs: proved, pcztWithSigs: proved)
+        let outcome = await second.broadcaster.submit(transaction: try XCTUnwrap(transactions.first), to: [endpoint])
+
+        XCTAssertEqual(outcome.rejection, .tooLarge, "the result is still classified, as on main")
+        let status = await second.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "never rejected: resubmitted until it expires")
+
+        // Process 3: another restart still holds the mark and the plan.
+        let reopened = SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        let marked = await reopened.isMigrationPreparation(txId: rawID)
+        XCTAssertTrue(marked)
+        await reopened.markRejected(txId: rawID, code: -25, reason: "exceeding the configured mempool maximum", lifecycle: await reopened.currentLifecycle())
+        let plan = await reopened.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpoint], acceptedBy: nil))
+    }
+
+    /// An ordinary proposal's PCZT is not marked: its submission can be rejected.
+    func testAnOrdinaryPCZTIsNotMarkedAsAMigration() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue = Pczt([0x01])
+        rustBackend.pcztTxidPcztReturnValue = Data(repeating: 0xE9, count: 32)
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []), rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+
+        _ = try await synchronizer.createPCZTFromProposal(
+            accountUUID: TestsData.mockedAccountUUID,
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10)
+        )
+
+        XCTAssertFalse(rustBackend.pcztTxidPcztCalled)
+        let marked = await mockContainer.resolve(SubmitPlanStoring.self).isMigrationPreparation(txId: Data(repeating: 0xE9, count: 32))
+        XCTAssertFalse(marked)
+    }
+
     // MARK: - Helpers
 
     private func makeSynchronizer(

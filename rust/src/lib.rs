@@ -117,6 +117,7 @@ mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
 mod payment_uri;
+mod pczt_txid;
 mod retained_marks;
 mod sapling_prover;
 mod send_max;

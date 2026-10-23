@@ -88,9 +88,13 @@ protocol SubmitPlanStoring {
     /// The transactions currently recorded as rejected: emits the current set on subscription and
     /// again whenever it changes.
     var rejectedTransactionIds: AnyPublisher<Set<Data>, Never> { get }
-    /// Marks `txId` as an Orchard migration preparation, whose submission keeps main's behaviour:
-    /// it is never recorded as rejected, so background resubmission retries it until it expires.
-    /// The mark is kept in memory until the plan is recorded, and on the plan's row from then on.
+    /// Marks `txId` as an Orchard migration transaction (a preparation, or a sweep a migration
+    /// proposal creates), whose submission keeps main's behaviour: it is never recorded as
+    /// rejected, so background resubmission retries it until it expires. The mark is keyed by the
+    /// transaction id and persisted at once, before the transaction has a plan or even exists (a
+    /// PCZT's id is known from its creation), so it survives a restart and the PCZT's
+    /// serialization; it is also set on the plan's row once the plan is recorded. Pruning a plan
+    /// removes its mark, and so does `clear()` or `wipe()`.
     func markMigrationPreparation(txId: Data) async
     /// Whether `txId` was marked by `markMigrationPreparation(txId:)`.
     func isMigrationPreparation(txId: Data) async -> Bool
@@ -131,6 +135,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
     private static let rejectedCodeColumnName = "rejected_code"
     private static let rejectedReasonColumnName = "rejected_reason"
     private static let migrationPreparationColumnName = "migration_preparation"
+    private static let migrationMarksTableName = "tx_migration_marks"
 
     private let table = Table(SubmitPlanStore.tableName)
     private let txIdColumn = SQLite.Expression<Blob>("tx_id")
@@ -139,7 +144,11 @@ actor SubmitPlanStore: SubmitPlanStoring {
     private let rejectedCodeColumn = SQLite.Expression<Int64?>(SubmitPlanStore.rejectedCodeColumnName)
     private let rejectedReasonColumn = SQLite.Expression<String?>(SubmitPlanStore.rejectedReasonColumnName)
     private let migrationPreparationColumn = SQLite.Expression<Bool?>(SubmitPlanStore.migrationPreparationColumnName)
-    /// Migration preparations handed out in this lifecycle whose plan may not be recorded yet.
+    /// The migration marks, keyed by transaction id, independent of any plan row: a row in the
+    /// plans table would change what `plan(for:)` reports for a transaction that has no plan yet.
+    private let migrationMarksTable = Table(SubmitPlanStore.migrationMarksTableName)
+    /// Migration transactions marked in this lifecycle, so the mark holds even when the store
+    /// cannot write it.
     private var migrationPreparations: Set<Data> = []
 
     /// The rejected transaction ids, as `rejectedTransactionIds` publishes them. Seeded from the
@@ -199,7 +208,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
             )
             try connection.run(insert)
             try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(endpointsColumn <- json))
-            if migrationPreparations.contains(txId) { try flagMigrationPreparation(txId: txId, in: connection) }
+            if isMigrationPreparation(txId: txId) { try flagMigrationPreparation(txId: txId, in: connection) }
         } catch {
             logger.warn("SubmitPlanStore failed to record submit plan: \(error.localizedDescription)")
         }
@@ -332,6 +341,8 @@ actor SubmitPlanStore: SubmitPlanStoring {
         do {
             for txId in txIds {
                 try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).delete())
+                try connection.run(migrationMarksTable.filter(txIdColumn == Blob(bytes: txId.bytes)).delete())
+                migrationPreparations.remove(txId)
             }
         } catch {
             logger.warn("SubmitPlanStore failed to delete submit plans: \(error)")
@@ -343,6 +354,8 @@ actor SubmitPlanStore: SubmitPlanStoring {
         guard let connection = existingConnection() else { return }
         do {
             try connection.run(table.delete())
+            try connection.run(migrationMarksTable.delete())
+            migrationPreparations = []
         } catch {
             logger.warn("SubmitPlanStore failed to clear submit plans: \(error)")
         }
@@ -426,6 +439,10 @@ actor SubmitPlanStore: SubmitPlanStoring {
                 builder.column(rejectedReasonColumn)
                 builder.column(migrationPreparationColumn)
             })
+            // Additive like the columns below: an older SDK build never reads it.
+            try connection.run(migrationMarksTable.create(ifNotExists: true) { builder in
+                builder.column(txIdColumn, primaryKey: true)
+            })
             // `accepted_host` is added by presence check instead of by a schema
             // version bump on purpose. A nullable added column is backward
             // compatible: an older SDK build keeps reading and writing this
@@ -484,8 +501,9 @@ extension SubmitPlanStore {
 
     func markMigrationPreparation(txId: Data) {
         migrationPreparations.insert(txId)
-        guard let connection = existingConnection() else { return }
+        guard let connection = connection() else { return }
         do {
+            try connection.run(migrationMarksTable.insert(or: .ignore, txIdColumn <- Blob(bytes: txId.bytes)))
             try flagMigrationPreparation(txId: txId, in: connection)
         } catch {
             logger.warn("SubmitPlanStore failed to mark a migration preparation: \(error.localizedDescription)")
@@ -502,7 +520,8 @@ extension SubmitPlanStore {
         guard let connection = existingConnection() else { return false }
         do {
             let row = try connection.pluck(table.select(migrationPreparationColumn).filter(txIdColumn == Blob(bytes: txId.bytes)))
-            return row?[migrationPreparationColumn] == true
+            if row?[migrationPreparationColumn] == true { return true }
+            return try connection.pluck(migrationMarksTable.filter(txIdColumn == Blob(bytes: txId.bytes))) != nil
         } catch {
             logger.warn("SubmitPlanStore failed to read a migration preparation mark: \(error.localizedDescription)")
             return false
@@ -585,4 +604,24 @@ private struct StoredEndpoint: Codable, Equatable {
             streamingCallTimeoutInMillis: streamingCallTimeoutInMillis
         )
     }
+}
+
+/// Marks the transaction `pczt` commits to as an Orchard migration in `store` when `proposal` is a
+/// migration proposal, so its submission keeps main's resubmission until expiry whichever path
+/// later builds and submits it. The mark is keyed by the transaction id the PCZT commits to, which
+/// is known at creation and survives the PCZT's serialization, proving and signing, and is
+/// persisted at once, so it also survives a restart before the transaction is built.
+func markMigrationPCZT(
+    _ pczt: Pczt,
+    of proposal: Proposal,
+    rustBackend: ZcashRustBackendWelding,
+    in store: SubmitPlanStoring,
+    logger: Logger
+) async {
+    guard proposal.isMigration else { return }
+    guard let txId = await rustBackend.pcztTxid(pczt: pczt) else {
+        logger.error("Could not read the transaction id of a migration PCZT; it is not marked as a migration.")
+        return
+    }
+    await store.markMigrationPreparation(txId: txId)
 }
