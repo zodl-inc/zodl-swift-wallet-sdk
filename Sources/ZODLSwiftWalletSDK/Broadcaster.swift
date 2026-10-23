@@ -256,18 +256,24 @@ public enum TransactionSubmissionOutcome: Equatable {
     /// Every endpoint responded and none accepted. Carries the terminal refusal
     /// (``SubmitRejection``) the SDK recorded when it marked the transaction rejected,
     /// whichever endpoint gave it; otherwise the first lightwalletd rejection (error
-    /// code + message) that was observed. ``rejection`` tells the two apart.
+    /// code + message) that was observed, which is then never a terminal refusal
+    /// (except for an Orchard migration preparation, which is never recorded as
+    /// rejected). ``rejection`` tells the two apart.
     case rejected(code: Int, message: String)
     /// Every endpoint failed at the transport level (gRPC/connection error);
     /// no server-level rejection was observed.
     case unreachable
-    /// No clear decision within `responseTimeout`: at least one endpoint had
-    /// not responded when the timer fired (others may have rejected or failed
-    /// in the meantime — details are logged). The transaction may still have
+    /// No clear decision: at least one endpoint had not responded when the
+    /// `responseTimeout` timer fired (others may have rejected or failed in the
+    /// meantime — details are logged), or an endpoint refused the transaction
+    /// for good while another's submission failed at the transport level, so
+    /// whether that one took it is unknown. The transaction may still have
     /// been broadcast — treat as pending, not failed. Once every endpoint's
     /// submission has ended, a late acceptance is recorded, or the rejection
-    /// their complete answers make; `Synchronizer.transactionSubmissionStatus(for:)`
-    /// and `rejectedTransactionIdsStream` report it.
+    /// their complete answers make; background resubmission reconciles an
+    /// endpoint that failed at the transport level the same way.
+    /// `Synchronizer.transactionSubmissionStatus(for:)` and
+    /// `rejectedTransactionIdsStream` report it.
     case timedOut
     /// Skipped because an earlier transaction in the batch was not accepted.
     case notAttempted

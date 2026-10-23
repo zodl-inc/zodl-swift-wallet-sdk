@@ -85,7 +85,10 @@ Changes are relative to `5.2.0`.
   exactly when the SDK recorded the transaction as rejected
   (`TransactionSubmissionStatus.rejected`) and stopped resubmitting it, and `.rejected(code:message:)`
   then carries that terminal refusal rather than the first refusal to arrive, so a transient
-  refusal from one endpoint no longer hides a terminal one from another. Migration preparations
+  refusal from one endpoint no longer hides a terminal one from another. A transaction a server
+  has accepted, in this submission or earlier (including by background resubmission), is
+  `.accepted(by:)` whatever another refusal says, and a terminal refusal the SDK did not record,
+  because another endpoint's submission failed at the transport level, is `.timedOut` (pending). Migration preparations
   keep reporting the first refusal, as before. `.tooLarge` is error
   code `-25` with a message naming the configured mempool maximum or the next block's ZIP 218
   limit; `.expired` is code `-25` or `-26` with a message naming an expiry (`greater than its

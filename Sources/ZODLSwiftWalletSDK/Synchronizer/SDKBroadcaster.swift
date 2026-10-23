@@ -113,9 +113,10 @@ final class SDKBroadcaster: Broadcaster {
             // one the transaction stays pending and resubmission reconciles it.
             await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
             // Report the verdict the SDK recorded, so the caller routes on the same terminal
-            // refusal that stopped resubmission rather than on whichever refusal arrived first.
-            if case .rejected = outcome, case let .rejected(code, reason)? = await submitPlanStore.plan(for: transaction.txId) {
-                outcome = .rejected(code: code, message: reason)
+            // refusal that stopped resubmission rather than on whichever refusal arrived first,
+            // and never on a terminal refusal the SDK did not record.
+            if case .rejected = outcome {
+                outcome = await outcomeMatchingStoredPlan(outcome, txId: transaction.txId, endpoints: endpoints)
             }
 
         case .timedOut, .cancelled:
@@ -335,6 +336,40 @@ extension SDKBroadcaster {
                 await recordRejectionVerdict(txId: txId, endpoints: endpoints, outcomes: answers, lifecycle: lifecycle)
             }
         }
+    }
+
+    /// The outcome to report for a submission whose race ended `.rejected`, consistent with what
+    /// the submit-plan store recorded: ``TransactionSubmissionOutcome/rejection`` is non-`nil` only
+    /// when the store recorded the transaction as rejected.
+    ///
+    /// - Recorded rejected: `.rejected` with the recorded terminal refusal.
+    /// - Accepted, in this submission's race or earlier (by an earlier submission or background
+    ///   resubmission): `.accepted(by:)` with the accepting endpoint, when it is one this
+    ///   submission or the stored plan names.
+    /// - Otherwise (an endpoint's transport failure left the verdict inconclusive, an acceptance by
+    ///   an endpoint neither names, or a store that cannot be read): `.timedOut` when the race
+    ///   carries a terminal refusal, since the transaction is pending and may still be mined, or the
+    ///   race's own outcome when its refusal is not terminal.
+    ///
+    /// A migration preparation is never recorded as rejected; its outcome reports the first
+    /// refusal observed, as before.
+    private func outcomeMatchingStoredPlan(
+        _ outcome: TransactionSubmissionOutcome,
+        txId: Data,
+        endpoints: [LightWalletEndpoint]
+    ) async -> TransactionSubmissionOutcome {
+        guard !(await submitPlanStore.isMigrationPreparation(txId: txId)) else { return outcome }
+        switch await submitPlanStore.plan(for: txId) {
+        case let .rejected(code, reason):
+            return .rejected(code: code, message: reason)
+        case let .ready(planEndpoints, acceptedBy: host?):
+            if let accepting = (endpoints + planEndpoints).first(where: { endpointKey($0) == host }) {
+                return .accepted(by: accepting)
+            }
+        default:
+            break
+        }
+        return outcome.rejection == nil ? outcome : .timedOut
     }
 
     /// Waits for every reconciliation of a submission that outlived its caller to finish.

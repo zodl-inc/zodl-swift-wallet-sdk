@@ -832,13 +832,90 @@ final class BroadcasterTests: ZcashTestCase {
             .sink { rejected.append($0) }
             .store(in: &cancellables)
 
-        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, lost])
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, lost])
 
+        XCTAssertEqual(outcome, .timedOut, "pending, not failed")
+        XCTAssertNil(outcome.rejection, "no terminal rejection the SDK did not record")
         let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
         XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "inconclusive: the transport failure may hide an acceptance")
         let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: transaction.txId)
         XCTAssertEqual(plan, StoredSubmitPlan.ready([rejecting, lost], acceptedBy: nil), "resubmission keeps retrying it")
         XCTAssertFalse(rejected.contains { $0.contains(transaction.txId) }, "it is never reported rejected")
+    }
+
+    // MARK: - The outcome agrees with the stored plan
+
+    private let invalidMessage = "bad-txns-sapling-binding-signature-invalid"
+
+    /// A server accepted the transaction, then refuses it with `-26` on a later submission: the
+    /// plan stays accepted and resubmitted, so the outcome reports the acceptance, not a rejection.
+    func testAMinus26RefusalAfterAnAcceptanceReportsTheAcceptance() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let first = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+        XCTAssertEqual(first, .accepted(by: endpoint))
+
+        endpointSubmitter.set(behavior: .reject(code: -26, message: invalidMessage), for: endpoint)
+        let second = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+
+        XCTAssertEqual(second, .accepted(by: endpoint))
+        XCTAssertNil(second.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(endpoint)))
+    }
+
+    /// The same, when the later refusal comes from a server other than the one that accepted it:
+    /// the outcome is not a rejection.
+    func testAMinus26RefusalElsewhereAfterAnAcceptanceIsNotARejection() async throws {
+        let accepting = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let refusing = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: invalidMessage), for: refusing)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [accepting])
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [refusing])
+
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(accepting)))
+    }
+
+    /// Background resubmission records an acceptance while the foreground submission is still
+    /// waiting on a refusal: the outcome reports the acceptance the store holds.
+    func testAnAcceptanceRecordedDuringTheRaceWinsOverItsRefusal() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -26, message: invalidMessage)), for: endpoint)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let transaction = makeCreatedTransaction()
+
+        let submission = Task {
+            await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+        }
+        await endpointSubmitter.awaitSubmissionStarted(to: endpoint)
+        await store.markAccepted(txId: transaction.txId, host: endpointKey(endpoint), lifecycle: await store.currentLifecycle())
+        gate.open()
+        let outcome = await submission.value
+
+        XCTAssertEqual(outcome, .accepted(by: endpoint))
+        let plan = await store.plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpoint], acceptedBy: endpointKey(endpoint)))
     }
 
     // MARK: - Deadline: an endpoint still in flight keeps the transaction pending
