@@ -102,7 +102,7 @@ final class SubmitRejectionTests: XCTestCase {
         )
     }
 
-    func testOneExplicitRejectionWithATransientOrTransportFailureIsRejected() {
+    func testOneExplicitRejectionWithATransientRefusalIsRejected() {
         XCTAssertEqual(
             submitRejectionVerdict(
                 planEndpoints: [endpointA, endpointB],
@@ -111,13 +111,46 @@ final class SubmitRejectionTests: XCTestCase {
             ),
             StoredRejection(code: -26, reason: "bad")
         )
-        XCTAssertEqual(
+    }
+
+    func testAnExplicitRejectionBesideATransportFailureStaysPending() {
+        XCTAssertNil(
             submitRejectionVerdict(
                 planEndpoints: [endpointA, endpointB],
                 outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .failed],
                 previous: nil
             ),
-            StoredRejection(code: -26, reason: "bad")
+            "a transport failure may hide an acceptance whose reply was lost"
+        )
+        let previous = StoredRejection(code: -25, reason: zakuraTooLarge)
+        XCTAssertEqual(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .failed],
+                previous: previous
+            ),
+            previous,
+            "no new rejection is drawn; an earlier one merely stands"
+        )
+    }
+
+    func testAnInconclusiveEndpointReconcilesOnItsNextExplicitAnswer() {
+        XCTAssertNil(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .accepted],
+                previous: nil
+            ),
+            "a later acceptance by the inconclusive endpoint clears it"
+        )
+        XCTAssertEqual(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .refused(code: -25, message: zakuraTooLarge)],
+                previous: nil
+            ),
+            StoredRejection(code: -26, reason: "bad"),
+            "a later explicit refusal by the inconclusive endpoint completes the verdict"
         )
     }
 

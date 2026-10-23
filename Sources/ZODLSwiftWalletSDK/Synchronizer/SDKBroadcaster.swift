@@ -106,9 +106,11 @@ final class SDKBroadcaster: Broadcaster {
             await submitPlanStore.markAccepted(txId: transaction.txId, host: endpointKey(endpoint), lifecycle: lifecycle)
 
         case .rejected, .unreachable:
-            // Every endpoint answered and none took it. A node that refused it for good makes it
-            // rejected, and background resubmission stops: it could only repeat the refusal until
-            // the transaction expires.
+            // Every endpoint's submission ended and none took it. When every endpoint answered
+            // explicitly, a node that refused it for good makes it rejected, and background
+            // resubmission stops: it could only repeat the refusal until the transaction expires.
+            // A transport failure is not an answer (the reply may be all that was lost), so beside
+            // one the transaction stays pending and resubmission reconciles it.
             await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
             // Report the verdict the SDK recorded, so the caller routes on the same terminal
             // refusal that stopped resubmission rather than on whichever refusal arrived first.

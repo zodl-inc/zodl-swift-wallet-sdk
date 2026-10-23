@@ -814,6 +814,33 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.invalid))
     }
 
+    /// A transport failure may hide an acceptance whose reply was lost: beside a terminal refusal it
+    /// keeps the transaction pending, and background resubmission goes on.
+    func testAnExplicitRejectionBesideATransportFailureStaysPending() async throws {
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let lost = LightWalletEndpoint(address: "lost.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "tx size exceeding the configured mempool maximum"), for: rejecting)
+        endpointSubmitter.set(behavior: .failTransport, for: lost)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+        var rejected: [Set<Data>] = []
+        synchronizer.rejectedTransactionIdsStream
+            .sink { rejected.append($0) }
+            .store(in: &cancellables)
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, lost])
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "inconclusive: the transport failure may hide an acceptance")
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([rejecting, lost], acceptedBy: nil), "resubmission keeps retrying it")
+        XCTAssertFalse(rejected.contains { $0.contains(transaction.txId) }, "it is never reported rejected")
+    }
+
     // MARK: - Deadline: an endpoint still in flight keeps the transaction pending
 
     private let tooLargeMessage = "tx size exceeding the configured mempool maximum"

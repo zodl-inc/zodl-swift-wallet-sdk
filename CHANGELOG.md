@@ -117,9 +117,13 @@ Changes are relative to `5.2.0`.
   resubmitting it in the background, where it previously retried until expiry; its inputs stay
   reserved until it expires. A transaction with a retry plan (the endpoints given to
   `Broadcaster.submit` or `releaseForResubmission`) is recorded as rejected once every endpoint
-  has answered, none accepted it and at least one explicitly refused it terminally, whether on
-  submission or on a background retry; a transient refusal or a transport failure beside it
-  neither prevents nor counts towards it. An endpoint still in flight at the response deadline
+  gave an explicit server answer, none accepted it and at least one explicitly refused it
+  terminally, whether on submission or on a background retry; a transient refusal beside it
+  neither prevents nor counts towards it. A transport failure (a lost connection, a timeout, any
+  thrown error) is not an answer, because the server may have accepted the transaction and only
+  its reply was lost: beside it the transaction stays pending, background resubmission keeps
+  retrying, and a later acceptance clears it while a later explicit refusal completes the verdict.
+  An endpoint still in flight at the response deadline
   keeps the transaction pending: `Broadcaster.submit` returns `.timedOut`, and once every
   endpoint's submission has ended the SDK records a late acceptance, or the rejection the complete
   answers make. Any acceptance, including a late one, clears the rejection. Transactions submitted by `createProposedTransactions` or
