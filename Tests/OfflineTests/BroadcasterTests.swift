@@ -777,7 +777,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmitRejectedTerminallyByEveryEndpointIsRecordedAsRejected() async throws {
-        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? first.stop() }
         let second = try RecordingCompactTxStreamerService(
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "tx size exceeding the configured mempool maximum")
@@ -801,7 +801,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testOneExplicitRejectionBesideATransientRefusalIsRecordedAsRejected() async throws {
-        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? terminal.stop() }
         let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
         defer { try? transient.stop() }
@@ -1127,7 +1127,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testARejectionBesideAnAcceptanceIsNotRejected() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? rejecting.stop() }
         let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }
@@ -1147,7 +1147,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testLegacySubmitWithoutAPlanRecordsNoRejection() async throws {
         let rawID = Data(repeating: 0xE1, count: 32)
         let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
-        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns")
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns-vin-empty")
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
         await synchronizer.updateStatus(.stopped)
 
@@ -1216,7 +1216,7 @@ final class BroadcasterTests: ZcashTestCase {
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "exceeding the next block's ZIP 218 limit")
         )
         defer { try? first.stop() }
-        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? second.stop() }
 
         let transactions = try await synchronizer.broadcaster.createProposedTransactions(
@@ -1236,7 +1236,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testAMigrationPreparationRejectedByEveryEndpointStaysSubmitted() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? rejecting.stop() }
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
@@ -1250,7 +1250,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testALaterAcceptanceClearsARejection() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
         defer { try? rejecting.stop() }
         let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }

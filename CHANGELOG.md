@@ -89,12 +89,16 @@ Changes are relative to `5.2.0`.
   has accepted, in this submission or earlier (including by background resubmission), is
   `.accepted(by:)` whatever another refusal says, and a terminal refusal the SDK did not record,
   because another endpoint's submission failed at the transport level, is `.timedOut` (pending). Migration preparations
-  keep reporting the first refusal, as before. `.tooLarge` is error
-  code `-25` with a message naming the configured mempool maximum or the next block's ZIP 218
-  limit; `.expired` is code `-25` or `-26` with a message naming an expiry (`greater than its
-  expiry`, `tx-overwinter-expired`, `tx-expiring-soon`); `.invalid` is any other `-26` except a
-  full mempool or a transaction already known. Every other failure, such as a transport error or
-  missing inputs, is still treated as transient.
+  keep reporting the first refusal, as before. Each kind is recognized from an explicit list of
+  server messages under error code `-25` or `-26`: `.tooLarge` names the configured mempool
+  maximum, the next block's ZIP 218 limit or the transaction size limit (`tx-size`,
+  `bad-txns-oversize`, too large); `.expired` names an expiry (`greater than its expiry`,
+  `tx-overwinter-expired`, `tx-expiring-soon`); `.invalid` is a `-26` naming a known permanent
+  refusal (`bad-txns-`, `invalid`, `non-final`, `mandatory-script-verify-flag`). Every other
+  failure is transient, including a transport error, an unrecognized `-26`, and refusals over the
+  mempool fee, an unconfirmed chain limit, a transaction already known or in the mempool, a
+  mempool conflict, or missing inputs. These lists are the SDK's reading of the node
+  implementations and still need their confirmation.
 - `GiftCardRedeemer.redeemProgress()` returns an `AsyncStream<RedeemProgress>` reporting each
   redemption round when its transactions are submitted and when they are mined, with the
   transactions' ids and the notes and value the card still holds (`remainingNotes`,
