@@ -70,7 +70,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
 
     func testEveryEndpointRefusingTerminallyIsRejected() async {
         let endpoints = [endpoint(1), endpoint(2)]
-        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpoint(2))
 
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
@@ -81,7 +81,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
 
     func testATransientRefusalBesideAnExplicitOneIsStillRejected() async {
         let endpoints = [endpoint(1), endpoint(2)]
-        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpoint(2))
 
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
@@ -92,25 +92,25 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
-    func testATransportFailureBesideAnExplicitRejectionIsStillRejected() async {
+    func testATransportFailureBesideAnExplicitRejectionIsInconclusive() async {
         let endpoints = [endpoint(1), endpoint(2)]
-        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint(1))
         mock.set(behavior: .failTransport, for: endpoint(2))
 
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
 
-        XCTAssertEqual(result.outcome, .rejected(code: -26, message: "bad-txns"))
+        XCTAssertEqual(result.outcome, .rejected(code: -26, message: "bad-txns-vin-empty"))
         XCTAssertEqual(result.endpointOutcomes[endpointKey(endpoint(2))], .failed)
-        XCTAssertNotNil(
+        XCTAssertNil(
             submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil),
-            "a transport failure does not hold back an explicit rejection"
+            "a transport failure may hide an acceptance, so it holds back the rejection"
         )
     }
 
     func testAnAnswerAfterTheDeadlineIsInTheSettledOutcomes() async {
         let endpoints = [endpoint(1), endpoint(2)]
         let gate = Gate()
-        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint(1))
         mock.set(behavior: .gated(gate, then: .succeed), for: endpoint(2))
 
         let result = await submitter.submitClassifyingRejection(
@@ -125,13 +125,13 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         gate.open()
         let settled = await result.settledEndpointOutcomes()
 
-        XCTAssertEqual(settled[endpointKey(endpoint(1))], .refused(code: -26, message: "bad-txns"))
+        XCTAssertEqual(settled[endpointKey(endpoint(1))], .refused(code: -26, message: "bad-txns-vin-empty"))
         XCTAssertEqual(settled[endpointKey(endpoint(2))], .accepted, "work that ignores cancellation still answers")
     }
 
     func testAnAcceptanceIsNeverRejectedByAll() async {
         let endpoints = [endpoint(1), endpoint(2)]
-        mock.set(behavior: .reject(code: -26, message: "bad-txns"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint(1))
         mock.set(behavior: .succeed, for: endpoint(2))
 
         let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
