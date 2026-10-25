@@ -2645,8 +2645,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 7. Store `endpoint` in `currentEndpoint`.
     /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
-    /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
-    public func switchTo(endpoint: LightWalletEndpoint) async throws {
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
         // comparison belongs in this operation's own turn rather than before it.
