@@ -9910,6 +9910,7 @@ mod tor_http_stream_tests {
         use http_body_util::BodyExt;
 
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
 
@@ -9919,8 +9920,9 @@ mod tor_http_stream_tests {
         let body = http_body_util::Full::new(large_body)
             .map_err(|never| match never {})
             .boxed_unsync();
+        let preferred_runtime = tor_rtcompat::tokio::TokioRuntimeHandle::new(rt.handle().clone());
         let mut stream = super::TorHttpStream {
-            runtime: rt.handle().clone().into(),
+            runtime: preferred_runtime,
             status: 429,
             headers: http::HeaderMap::new(),
             body,
