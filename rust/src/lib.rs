@@ -9910,12 +9910,27 @@ mod tor_http_stream_tests {
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
 
-        // Create a 429 response with a body larger than 64 KiB
-        let large_body =
-            bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024]);
-        let body = http_body_util::Full::new(large_body)
-            .map_err(|never| match never {})
-            .boxed_unsync();
+        // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
+        let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
+        let chunk_size = 1024;
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..total_size)
+            .step_by(chunk_size)
+            .map(|i| {
+                let remaining = total_size - i;
+                let size = if remaining < chunk_size {
+                    remaining
+                } else {
+                    chunk_size
+                };
+                Ok(bytes::Bytes::from(vec![b'x'; size]))
+            })
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| {
+            chunk.map(http_body_util::Frame::data)
+        }))
+        .map_err(|never: std::io::Error| match never.kind() {})
+        .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
             runtime,
@@ -9977,12 +9992,27 @@ mod tor_http_stream_tests {
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
 
-        // Create a 503 response with a body larger than 64 KiB
-        let large_body =
-            bytes::Bytes::from(vec![b'y'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048]);
-        let body = http_body_util::Full::new(large_body)
-            .map_err(|never| match never {})
-            .boxed_unsync();
+        // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
+        let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
+        let chunk_size = 1024;
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..total_size)
+            .step_by(chunk_size)
+            .map(|i| {
+                let remaining = total_size - i;
+                let size = if remaining < chunk_size {
+                    remaining
+                } else {
+                    chunk_size
+                };
+                Ok(bytes::Bytes::from(vec![b'y'; size]))
+            })
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| {
+            chunk.map(http_body_util::Frame::data)
+        }))
+        .map_err(|never: std::io::Error| match never.kind() {})
+        .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
             runtime,
