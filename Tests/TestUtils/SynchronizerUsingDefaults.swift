@@ -14,6 +14,7 @@ final class SynchronizerUsingDefaults: Synchronizer {
         fatalError("SynchronizerUsingDefaults.\(member) is not exercised: only the protocol-extension defaults are")
     }
 
+    var internalSyncStatus: InternalSyncStatus { Self.unused() }
     var alias: ZcashSynchronizerAlias { Self.unused() }
     var latestState: SynchronizerState { Self.unused() }
     var connectionState: ConnectionState { Self.unused() }
