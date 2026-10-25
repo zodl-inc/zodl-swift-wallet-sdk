@@ -9909,6 +9909,7 @@ mod tor_http_stream_tests {
     fn streaming_tor_error_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
+        use futures::StreamExt as _;
 
         // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
@@ -9991,6 +9992,7 @@ mod tor_http_stream_tests {
     fn streaming_tor_503_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
+        use futures::StreamExt as _;
 
         // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
@@ -10008,9 +10010,9 @@ mod tor_http_stream_tests {
             })
             .collect();
         let stream = futures::stream::iter(chunks);
-        let body = http_body_util::StreamBody::new(
-            stream.map(|chunk| chunk.map(http_body_util::Frame::data)),
-        )
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| {
+            chunk.map(|bytes| http_body_util::Frame::data(bytes))
+        }))
         .map_err(|never: std::io::Error| match never.kind() {})
         .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
