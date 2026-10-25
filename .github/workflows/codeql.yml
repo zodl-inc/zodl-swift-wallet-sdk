@@ -122,7 +122,7 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+        key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
     - name: Authorize cargo against the private slipstream repository
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'

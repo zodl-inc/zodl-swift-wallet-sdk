@@ -470,11 +470,11 @@ test_swift_cache_identity_uses_actual_compiler_output() {
 test_ohttp_e2e_builds_the_ffi_with_ohttp_trace() {
     assert_file_contains "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" \
         "make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace" \
-        "ohttp-e2e.yml builds the FFI with ohttp-trace"
+        "ohttp-e2e.yml passes FFI_CARGO_FEATURES=ohttp-trace to make"
     local out; out="$SCRATCH/dry-run-ffi-macos-trace.txt"
     make -C "$REPO_ROOT" -n ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace > "$out" 2>/dev/null
-    assert_file_contains "$out" "cargo build --manifest-path ../Cargo.toml --release --features ohttp-trace" \
-        "FFI_CARGO_FEATURES reaches cargo"
+    assert_file_contains "$out" "cargo build --locked --manifest-path ../Cargo.toml --release --features ohttp-trace" \
+        "FFI_CARGO_FEATURES turns into --features flag"
 }
 
 test_release_ffi_builds_never_enable_ohttp_trace() {
