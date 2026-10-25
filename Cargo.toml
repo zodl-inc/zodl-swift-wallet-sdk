@@ -149,12 +149,9 @@ zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard"] }
 incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
-# family instance. The `[patch.crates-io]` entry below replaces the published
-# crate with a revision that implements `WalletWrite::set_account_name`.
-slipstream-core = { version = "=0.4.0-pre.2", package = "zodl-slipstream" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-base64 = "0.22"
-# family instance.
+# drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
+# 0.4.0-pre.2 is built against the NU7 pre-release crates, the same
+# librustzcash generation as this package, so the graph stays a single
 # family instance. The `[patch.crates-io]` entry below replaces the published
 # crate with a revision that implements `WalletWrite::set_account_name`.
 slipstream-core = { version = "=0.4.0-pre.2", package = "zodl-slipstream" }
