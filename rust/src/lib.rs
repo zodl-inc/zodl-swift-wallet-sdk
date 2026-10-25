@@ -10010,9 +10010,9 @@ mod tor_http_stream_tests {
             })
             .collect();
         let stream = futures::stream::iter(chunks);
-        let body = http_body_util::StreamBody::new(stream.map(|chunk| {
-            chunk.map(|bytes| http_body_util::Frame::data(bytes))
-        }))
+        let body = http_body_util::StreamBody::new(
+            stream.map(|chunk| chunk.map(http_body_util::Frame::data)),
+        )
         .map_err(|never: std::io::Error| match never.kind() {})
         .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
