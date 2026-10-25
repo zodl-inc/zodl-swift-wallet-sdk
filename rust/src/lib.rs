@@ -9907,9 +9907,9 @@ mod tor_http_stream_tests {
 
     #[test]
     fn streaming_tor_error_response_body_capped_at_64_kib() {
+        use futures::StreamExt as _;
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
-        use futures::StreamExt as _;
 
         // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
@@ -9990,9 +9990,9 @@ mod tor_http_stream_tests {
 
     #[test]
     fn streaming_tor_503_response_body_capped_at_64_kib() {
+        use futures::StreamExt as _;
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
-        use futures::StreamExt as _;
 
         // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
