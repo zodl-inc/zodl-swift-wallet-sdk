@@ -9958,7 +9958,7 @@ mod tor_http_stream_tests {
             assert!(!slice_ptr.is_null(), "stream read should not fail");
 
             if state == super::TOR_HTTP_STREAM_END {
-                unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
+                unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
             unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
@@ -10021,7 +10021,7 @@ mod tor_http_stream_tests {
             assert!(!slice_ptr.is_null(), "stream read should not fail");
 
             if state == super::TOR_HTTP_STREAM_END {
-                unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
+                unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
             unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
