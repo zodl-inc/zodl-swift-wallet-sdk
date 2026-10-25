@@ -1,165 +1,28 @@
 #!/bin/bash
-# Initialize local FFI development environment
-# Usage: ./Scripts/init-local-ffi.sh [option] [--trace]
-#
-# Options:
-#   (no option)   Build the full XCFramework (all 5 architectures) from your rust/.
-#   --arm-macos   Build only the arm64 macOS slice (aarch64-apple-darwin).
-#   --arm-ios     Build only the arm64 iOS slices: simulator (aarch64-apple-ios-sim)
-#                 and device (aarch64-apple-ios).
-#   --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
-#   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
-#   --cached      Download the pre-built release XCFramework instead of building.
-#   --trace       QA build with the `ohttp-trace` feature, so OHTTP client trace ids
-#                 work (DEBUG app builds only). Never use it for a build that ships.
-#
-# The --arm-* options skip the x86_64 simulator/Mac slices, which you cannot run on
-# Apple Silicon anyway, so local iteration is faster. They always build the aarch64
-# targets regardless of host architecture.
-#
-# This creates LocalPackages/ with a locally-built xcframework.
-# Package.swift automatically detects LocalPackages/ and switches
-# from the release binary to the local build.
-#
-# To switch back to the release binary: rm -rf LocalPackages/
-
-set -e
+# Initialize ARM64 local FFI development.
+# --arm-macos, --arm-ios, --arm-simulator select subsets; --arm-all (or no flag)
+# builds all three slices. --cached downloads the pinned ARM64 release.
+# --trace enables OHTTP client trace ids for QA builds only; never ship it.
+set -eo pipefail
 cd "$(dirname "$0")/.."
 
-# The minimum OS versions every slice is built for. Keep them equal to
-# Package.swift's platforms and BuildSupport/Makefile (a script test checks);
-# rustc and the cc crate both read them.
 export MACOSX_DEPLOYMENT_TARGET=14.0
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
 
-# Ensure cargo/rustup are on PATH (needed when invoked from Xcode)
-if ! command -v cargo >/dev/null 2>&1; then
-    export PATH="$HOME/.cargo/bin:$PATH"
-fi
-
-XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
-
 usage() {
-    if [[ -n "${1:-}" ]]; then
-        echo "Error: $1" >&2
-        echo "" >&2
-    fi
-    cat >&2 << 'USAGEEOF'
+    echo "Error: $1" >&2
+    cat >&2 <<'USAGE'
 Usage: ./Scripts/init-local-ffi.sh [option] [--trace]
-
-Options:
-  (no option)   Build the full XCFramework (all 5 architectures) from your rust/.
-  --arm-macos   Build only the arm64 macOS slice (aarch64-apple-darwin).
-  --arm-ios     Build only the arm64 iOS slices: simulator + device.
-  --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
-  --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
-  --cached      Download the pre-built release XCFramework instead of building.
-  --trace       QA build with the ohttp-trace feature (OHTTP client trace ids).
-                Never use it for a build that ships.
-
-Creates LocalPackages/ with a locally-built xcframework. Package.swift detects
-LocalPackages/ and uses it instead of the released binary.
-USAGEEOF
+  (no option)      Build all three ARM64 slices from source.
+  --arm-all        Build all three ARM64 slices from source.
+  --arm-macos      Build only ARM64 macOS.
+  --arm-ios        Build ARM64 iOS simulator and device.
+  --arm-simulator  Build only ARM64 iOS simulator.
+  --cached         Download the pinned canonical ARM64 release.
+  --trace          QA build with the ohttp-trace feature; never ship it.
+USAGE
     exit 1
 }
-
-# Build an arm64-only xcframework containing exactly the requested slices, then
-# atomically swap it into place. Each argument is one of: ios-sim, ios-device, macos.
-#
-# The slices reuse the same LibraryIdentifiers as the full build (e.g.
-# macos-arm64_x86_64) but declare only arm64 in SupportedArchitectures, matching
-# what rebuild-local-ffi.sh produces, so the two tools stay interchangeable.
-build_arm_xcframework() {
-    local targets=("$@")
-
-    local temp_dir temp_xcfw
-    temp_dir=$(mktemp -d)
-    temp_xcfw="$temp_dir/libzcashlc.xcframework"
-    mkdir -p "$temp_xcfw"
-
-    # One JSON object per slice, accumulated for the xcframework Info.plist.
-    local libraries_json=""
-
-    local target
-    for target in "${targets[@]}"; do
-        local rust_target slice platform variant
-        case "$target" in
-            ios-sim)
-                rust_target="aarch64-apple-ios-sim"
-                slice="ios-arm64_x86_64-simulator"
-                platform="ios"
-                variant="simulator"
-                ;;
-            ios-device)
-                rust_target="aarch64-apple-ios"
-                slice="ios-arm64"
-                platform="ios"
-                variant=""
-                ;;
-            macos)
-                rust_target="aarch64-apple-darwin"
-                slice="macos-arm64_x86_64"
-                platform="macos"
-                variant=""
-                ;;
-            *)
-                echo "Internal error: unknown arm target '$target'" >&2
-                exit 1
-                ;;
-        esac
-
-        echo "Building $rust_target -> $slice ..."
-
-        # Ensure the Rust target is available (idempotent), then build it.
-        # cargo is incremental, so repeat builds after small edits are fast.
-        rustup target add "$rust_target"
-        # $FEATURE_ARGS is intentionally unquoted (empty = no extra args).
-        python3 Scripts/lib/ohttp_env.py --required -- cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
-
-        # Populate the framework for this slice.
-        local framework="$temp_xcfw/$slice/libzcashlc.framework"
-        mkdir -p "$framework/Modules" "$framework/Headers"
-        cp "target/$rust_target/release/libzcashlc.a" "$framework/libzcashlc"
-        cp BuildSupport/module.modulemap "$framework/Modules/"
-        cp BuildSupport/platform-Info.plist "$framework/Info.plist"
-        if [[ -d "target/Headers" ]]; then
-            cp -R target/Headers/* "$framework/Headers/"
-        fi
-
-        # Assemble this slice's AvailableLibraries entry as JSON (arm64 only).
-        local variant_json=""
-        if [[ -n "$variant" ]]; then
-            variant_json=", \"SupportedPlatformVariant\": \"$variant\""
-        fi
-        local entry="{\"LibraryIdentifier\": \"$slice\", \"LibraryPath\": \"libzcashlc.framework\", \"SupportedArchitectures\": [\"arm64\"], \"SupportedPlatform\": \"$platform\"$variant_json}"
-        if [[ -n "$libraries_json" ]]; then
-            libraries_json="$libraries_json, $entry"
-        else
-            libraries_json="$entry"
-        fi
-    done
-
-    # Generate the xcframework Info.plist from JSON; plutil emits canonical XML
-    # and validates it in one step, so we avoid hand-writing plist whitespace.
-    printf '{"AvailableLibraries": [%s], "CFBundlePackageType": "XFWK", "XCFrameworkFormatVersion": "1.0"}' "$libraries_json" \
-        | plutil -convert xml1 -o "$temp_xcfw/Info.plist" -
-
-    # Atomically swap the freshly built xcframework into place.
-    mkdir -p LocalPackages
-    rm -rf "$XCFRAMEWORK_DIR"
-    mv "$temp_xcfw" "$XCFRAMEWORK_DIR"
-    rm -rf "$temp_dir"
-
-    # The slices above are assembled shallow (iOS layout). macOS embedded
-    # frameworks require the VERSIONED bundle layout, else the app build fails
-    # ("expected Versions/Current/Resources/Info.plist"). Same fix as the full
-    # make path below and rebuild-local-ffi.sh; guarded for iOS-only subsets.
-    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
-        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
-    fi
-}
-
-# Parse the single optional build option, plus --trace.
 FFI_CARGO_FEATURES=""
 ARGS=()
 for arg in "$@"; do
@@ -169,149 +32,146 @@ for arg in "$@"; do
         ARGS+=("$arg")
     fi
 done
-if [[ ${#ARGS[@]} -gt 1 ]]; then
-    usage "Too many arguments; pass at most one option."
-fi
-FEATURE_ARGS="${FFI_CARGO_FEATURES:+--features $FFI_CARGO_FEATURES}"
-
-BUILD_MODE="full"
-ARM_TARGETS=()
+[[ ${#ARGS[@]} -le 1 ]] || usage 'Too many arguments; pass at most one option.'
+CARGO_FEATURES=()
+[[ -z "$FFI_CARGO_FEATURES" ]] || CARGO_FEATURES=(--features "$FFI_CARGO_FEATURES")
+MODE=source
+TARGETS=()
 case "${ARGS[0]:-}" in
-    "")
-        BUILD_MODE="full"
-        ;;
-    --cached)
-        BUILD_MODE="cached"
-        ;;
-    --arm-macos)
-        BUILD_MODE="arm"
-        ARM_TARGETS=(macos)
-        ;;
-    --arm-ios)
-        BUILD_MODE="arm"
-        ARM_TARGETS=(ios-sim ios-device)
-        ;;
-    --arm-simulator)
-        BUILD_MODE="arm"
-        ARM_TARGETS=(ios-sim)
-        ;;
-    --arm-all)
-        BUILD_MODE="arm"
-        ARM_TARGETS=(ios-sim ios-device macos)
-        ;;
-    *)
-        usage "Unknown option: ${ARGS[0]}"
-        ;;
+    '') MODE=full ;;
+    --arm-all) TARGETS=(ios-sim ios-device macos) ;;
+    --arm-macos) TARGETS=(macos) ;;
+    --arm-ios) TARGETS=(ios-sim ios-device) ;;
+    --arm-simulator) TARGETS=(ios-sim) ;;
+    --cached) MODE=cached ;;
+    *) usage "Unknown option: ${ARGS[0]}" ;;
 esac
 
-if [[ "$BUILD_MODE" == "cached" && -n "$FFI_CARGO_FEATURES" ]]; then
+if [[ "$MODE" == cached && -n "$FFI_CARGO_FEATURES" ]]; then
     usage "--trace needs a source build; it cannot be combined with --cached."
+fi
+
+# Keep an explicitly selected compiler or fixture toolchain on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 # Resolve before any architecture loop or product replacement. Inner Cargo
 # invocations validate the inherited complete environment without loading it again.
-if [[ "$BUILD_MODE" != "cached" && "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
+if [[ "$MODE" != cached && "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
     exec python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 /bin/bash Scripts/init-local-ffi.sh "$@"
 fi
 
-if [[ "$BUILD_MODE" == "arm" ]]; then
-    echo "Initializing local FFI for arm64 (${ARM_TARGETS[*]})..."
-    build_arm_xcframework "${ARM_TARGETS[@]}"
-elif [[ "$BUILD_MODE" == "cached" ]]; then
-    echo "Downloading pre-built xcframework..."
-
-    # Derive BOTH the repo (owner/name — releases may live on a fork) and the full
-    # release tag (including any pre-release suffix like 2.6.0-alpha.6) from the
-    # binary-target download URL in Package.swift, so --cached always fetches the
-    # exact release the manifest pins.
-    DOWNLOAD_URL=$(grep -oE 'https://github.com/[^"]+/releases/download/[^"]+/libzcashlc\.xcframework\.zip' Package.swift | head -1)
-    if [[ -z "$DOWNLOAD_URL" ]]; then
-        echo "Error: Could not find the libzcashlc.xcframework.zip download URL in Package.swift"
-        exit 1
+XCFRAMEWORK_DIR=LocalPackages/libzcashlc.xcframework
+mkdir -p LocalPackages
+STAGE=$(mktemp -d LocalPackages/.ffi-stage.XXXXXX)
+STAGED_XCFW="$STAGE/libzcashlc.xcframework"
+OLD_FRAMEWORK=false
+OLD_WRAPPER=false
+NEW_FRAMEWORK=false
+NEW_WRAPPER=false
+COMMITTED=false
+cleanup() {
+    local status=$?
+    if [[ "$COMMITTED" != true ]]; then
+        [[ "$NEW_WRAPPER" != true ]] || rm -f LocalPackages/Package.swift
+        [[ "$NEW_FRAMEWORK" != true ]] || rm -rf "$XCFRAMEWORK_DIR"
+        [[ "$OLD_FRAMEWORK" != true ]] || mv "$STAGE/previous.xcframework" "$XCFRAMEWORK_DIR"
+        [[ "$OLD_WRAPPER" != true ]] || mv "$STAGE/previous-Package.swift" LocalPackages/Package.swift
     fi
-    REPO=$(echo "$DOWNLOAD_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
-    SDK_VERSION=$(echo "$DOWNLOAD_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
-    if [[ -z "$REPO" || -z "$SDK_VERSION" ]]; then
-        echo "Error: Could not parse repo/version from download URL: $DOWNLOAD_URL"
-        exit 1
-    fi
-    echo "  release $SDK_VERSION from $REPO"
+    rm -rf "$STAGE"
+    exit "$status"
+}
+trap cleanup EXIT
 
-    # Extract the expected checksum from Package.swift
-    EXPECTED_CHECKSUM=$(grep -A1 'libzcashlc.xcframework.zip' Package.swift | grep 'checksum:' | sed -E 's/.*checksum: "([a-f0-9]+)".*/\1/')
-    if [[ -z "$EXPECTED_CHECKSUM" ]]; then
-        echo "Error: Could not extract checksum from Package.swift"
-        exit 1
-    fi
-
-    mkdir -p LocalPackages
-    # Use gh CLI to download release assets (works for both draft and published releases)
-    gh release download "$SDK_VERSION" \
-        --repo "$REPO" \
-        --pattern "libzcashlc.xcframework.zip" \
-        --dir LocalPackages
-
-    # Verify checksum
-    ACTUAL_CHECKSUM=$(shasum -a 256 LocalPackages/libzcashlc.xcframework.zip | awk '{print $1}')
-    if [[ "$ACTUAL_CHECKSUM" != "$EXPECTED_CHECKSUM" ]]; then
-        echo "Error: Checksum mismatch!"
-        echo "  Expected: $EXPECTED_CHECKSUM"
-        echo "  Actual:   $ACTUAL_CHECKSUM"
-        rm -f LocalPackages/libzcashlc.xcframework.zip
-        exit 1
-    fi
-    echo "Checksum verified."
-
-    # Remove any existing framework first: extracting/copying onto an existing
-    # directory leaves stale files (or, for cp -R, nests the new framework inside
-    # the old one), so installs must always start from a clean target.
-    rm -rf "$XCFRAMEWORK_DIR"
-    unzip -o LocalPackages/libzcashlc.xcframework.zip -d LocalPackages/
-    rm LocalPackages/libzcashlc.xcframework.zip
-
-    # Release zips ship every slice shallow (iOS layout); macOS embedding requires
-    # the versioned bundle layout, same as the build paths above. Idempotent — a
-    # future zip that ships versioned is left untouched.
-    if [[ -d "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework" ]]; then
-        ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
-    fi
-    echo ""
-    echo "Note: Downloaded pre-built xcframework may not match your local source."
-    echo "      Run './Scripts/rebuild-local-ffi.sh' to rebuild for your target platform."
+if [[ "$MODE" == full ]]; then
+    (cd BuildSupport && make xcframework FFI_CARGO_FEATURES="$FFI_CARGO_FEATURES")
+    cp -RP BuildSupport/products/libzcashlc.xcframework "$STAGED_XCFW"
+elif [[ "$MODE" == cached ]]; then
+    # The pinned URL and checksum always travel together; download into owned storage.
+    read -r REPO SDK_VERSION EXPECTED_CHECKSUM < <(python3 - <<'PY'
+import re
+from pathlib import Path
+text = Path('Package.swift').read_text()
+match = re.search(r'https://github.com/([^/]+/[^/]+)/releases/download/([^/]+)/libzcashlc\.xcframework\.zip"\s*,\s*checksum:\s*"([a-f0-9]{64})"', text)
+if match:
+    print(*match.groups())
+PY
+    ) || { echo 'Error: Could not parse pinned libzcashlc URL and checksum.' >&2; exit 1; }
+    gh release download "$SDK_VERSION" --repo "$REPO" --pattern libzcashlc.xcframework.zip --dir "$STAGE"
+    ACTUAL_CHECKSUM=$(shasum -a 256 "$STAGE/libzcashlc.xcframework.zip" | awk '{print $1}')
+    [[ "$ACTUAL_CHECKSUM" == "$EXPECTED_CHECKSUM" ]] || { echo 'Error: Checksum mismatch!' >&2; exit 1; }
+    # Check every member before extracting anything. Release products are shallow:
+    # links and special files are rejected, including entries outside the bundle.
+    python3 - "$STAGE/libzcashlc.xcframework.zip" "$STAGE" <<'PY'
+from pathlib import Path, PurePosixPath
+import stat
+import sys
+import zipfile
+archive, stage = sys.argv[1:]
+with zipfile.ZipFile(archive) as source:
+    seen = set()
+    for item in source.infolist():
+        path = PurePosixPath(item.filename)
+        kind = stat.S_IFMT(item.external_attr >> 16)
+        if (path.is_absolute() or '\\' in item.filename or '..' in path.parts
+                or not path.parts or path.parts[0] != 'libzcashlc.xcframework'
+                or kind not in (0, stat.S_IFREG, stat.S_IFDIR) or path in seen):
+            raise ValueError('unsafe or duplicate archive member: ' + item.filename)
+        seen.add(path)
+    source.extractall(Path(stage))
+PY
 else
-    echo "Building full xcframework from source (this takes a while)..."
-    cd BuildSupport
-    make xcframework FFI_CARGO_FEATURES="$FFI_CARGO_FEATURES"
-    cd ..
-    mkdir -p LocalPackages
-    # cp -R into an EXISTING directory copies the source INSIDE it (nested
-    # libzcashlc.xcframework/libzcashlc.xcframework with stale slices at the top
-    # level — device builds silently run old code). Always replace, never merge.
-    rm -rf "$XCFRAMEWORK_DIR"
-    cp -R BuildSupport/products/libzcashlc.xcframework "$XCFRAMEWORK_DIR"
-    # The Makefile assembles every slice shallow (iOS layout). macOS embedded
-    # frameworks require the versioned bundle layout, else Xcode rejects the app
-    # ("expected Versions/Current/Resources/Info.plist"). Fix the macOS slice.
-    ./Scripts/version-macos-framework.sh "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libzcashlc.framework"
+    mkdir -p "$STAGED_XCFW"
+    SLICES=()
+    for target in "${TARGETS[@]}"; do
+        case "$target" in
+            ios-sim) triple=aarch64-apple-ios-sim; slice=ios-arm64-simulator ;;
+            ios-device) triple=aarch64-apple-ios; slice=ios-arm64 ;;
+            macos) triple=aarch64-apple-darwin; slice=macos-arm64 ;;
+        esac
+        rustup target add "$triple"
+        python3 Scripts/lib/ohttp_env.py --required -- cargo build --locked --target "$triple" --release "${CARGO_FEATURES[@]}"
+        framework="$STAGED_XCFW/$slice/libzcashlc.framework"
+        mkdir -p "$framework/Headers" "$framework/Modules"
+        cp "target/$triple/release/libzcashlc.a" "$framework/libzcashlc"
+        cp BuildSupport/module.modulemap "$framework/Modules/"
+        cp BuildSupport/platform-Info.plist "$framework/Info.plist"
+        cp -R target/Headers/. "$framework/Headers/"
+        SLICES+=("$slice")
+    done
+    python3 Scripts/lib/ffi_layout.py manifest "$STAGED_XCFW/Info.plist" "${SLICES[@]}"
 fi
 
-# Create local SPM package wrapper
-cp BuildSupport/LocalPackages-Package.swift LocalPackages/Package.swift
-
-echo ""
-echo "Local FFI initialized at LocalPackages/"
-echo "Package.swift will automatically use the local build."
-echo ""
-echo "Next steps:"
-echo "  1. Open ZcashSDK.xcworkspace in Xcode (or run: swift build)"
-echo "  2. The workspace scheme rebuilds FFI automatically on each build."
-echo "     If opening Package.swift directly, run ./Scripts/rebuild-local-ffi.sh after Rust changes."
-if [[ "$BUILD_MODE" == "arm" ]]; then
-    echo ""
-    echo "Note: this produced an arm64-only XCFramework (${ARM_TARGETS[*]})."
-    echo "      Building for an x86_64 simulator/Mac or a slice you didn't include will fail"
-    echo "      until you build it. Run ./Scripts/rebuild-local-ffi.sh <target> for a single"
-    echo "      arch, or ./Scripts/init-local-ffi.sh (no flags) for the full 5-architecture build."
+VALIDATION=()
+[[ "$MODE" != full && "$MODE" != cached ]] || VALIDATION=(--require-full)
+python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" "${VALIDATION[@]}"
+if [[ -d "$STAGED_XCFW/macos-arm64" ]]; then
+    ./Scripts/version-macos-framework.sh "$STAGED_XCFW/macos-arm64/libzcashlc.framework"
 fi
-echo ""
-echo "To switch back to the release binary: rm -rf LocalPackages/"
+python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" --allow-versioned-macos "${VALIDATION[@]}"
+cp BuildSupport/LocalPackages-Package.swift "$STAGE/Package.swift"
+
+# Same-filesystem renames with rollback keep the installed bundle and wrapper
+# intact if either replacement fails. Old contents survive until both succeed.
+if [[ -e "$XCFRAMEWORK_DIR" || -L "$XCFRAMEWORK_DIR" ]]; then
+    mv "$XCFRAMEWORK_DIR" "$STAGE/previous.xcframework"
+    OLD_FRAMEWORK=true
+fi
+if [[ -e LocalPackages/Package.swift || -L LocalPackages/Package.swift ]]; then
+    mv LocalPackages/Package.swift "$STAGE/previous-Package.swift"
+    OLD_WRAPPER=true
+fi
+mv "$STAGED_XCFW" "$XCFRAMEWORK_DIR"
+NEW_FRAMEWORK=true
+mv "$STAGE/Package.swift" LocalPackages/Package.swift
+NEW_WRAPPER=true
+COMMITTED=true
+
+echo 'Local ARM64 FFI initialized at LocalPackages/.'
+echo 'Use ARM64 Xcode destinations. Rebuild missing slices with rebuild-local-ffi.sh.'
+if [[ "$MODE" == cached ]]; then
+    echo 'Downloaded FFI may not match local source. Rebuild after Rust changes.'
+fi
+echo 'Open ZcashSDK.xcworkspace for automatic FFI rebuilds, or run swift build.'
+echo 'To switch back to the release binary: ./Scripts/reset-local-ffi.sh'
