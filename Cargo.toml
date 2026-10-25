@@ -229,18 +229,6 @@ zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git",
 
 # Coinholder voting on the NU7 pre-release crates.
 #
-# To build against an unreleased slipstream revision, patch it in here by COMMIT HASH rather than a
-# branch: a branch pin silently follows a force-push, so a build can pick up code nobody reviewed,
-# whereas a stale hash fails loudly. The revision must be built against the librustzcash generation
-# the versions above declare.
-# On zodl-inc/slipstream's feature/set-account-name-0.23.0-pre.1 branch: 0.4.0-pre.2 (which
-# includes slipstream#28) plus slipstream#30 and the facades' `set_account_name`, patched to the
-# same librustzcash revision as the entries below.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "586479698acade5b15cd8baaf937e660f564185a" }
->>>>>>> origin/main
-
-# Coinholder voting on the NU7 pre-release crates.
-#
 # No `zcash_voting` release is built on the NU7 crates yet, and the crate is not ours to publish,
 # so it and the crates under it come from the heads of the pull requests that move them there.
 # A `[patch]` table in a dependency's own workspace does not reach its consumers, so this repeats
