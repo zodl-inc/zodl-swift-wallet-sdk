@@ -9909,20 +9909,15 @@ mod tor_http_stream_tests {
     fn streaming_tor_error_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
         // Create a 429 response with a body larger than 64 KiB
         let large_body =
             bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024]);
         let body = http_body_util::Full::new(large_body)
             .map_err(|never| match never {})
             .boxed_unsync();
-        let preferred_runtime = tor_rtcompat::tokio::TokioRuntimeHandle::new(rt.handle().clone());
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
-            runtime: preferred_runtime,
+            runtime,
             status: 429,
             headers: http::HeaderMap::new(),
             body,
@@ -9980,20 +9975,15 @@ mod tor_http_stream_tests {
     fn streaming_tor_503_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
         // Create a 503 response with a body larger than 64 KiB
         let large_body =
             bytes::Bytes::from(vec![b'y'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048]);
         let body = http_body_util::Full::new(large_body)
             .map_err(|never| match never {})
             .boxed_unsync();
-        let preferred_runtime = tor_rtcompat::tokio::TokioRuntimeHandle::new(rt.handle().clone());
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
-            runtime: preferred_runtime,
+            runtime,
             status: 503,
             headers: http::HeaderMap::new(),
             body,
