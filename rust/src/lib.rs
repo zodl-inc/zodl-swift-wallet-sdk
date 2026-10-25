@@ -9929,8 +9929,8 @@ mod tor_http_stream_tests {
             .collect();
         let stream = futures::stream::iter(chunks);
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
-        .map_err(|never: std::io::Error| match never.kind() {})
-        .boxed_unsync();
+            .map_err(|never: std::io::Error| match never.kind() {})
+            .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
             runtime,
@@ -10011,8 +10011,8 @@ mod tor_http_stream_tests {
             .collect();
         let stream = futures::stream::iter(chunks);
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
-        .map_err(|never: std::io::Error| match never.kind() {})
-        .boxed_unsync();
+            .map_err(|never: std::io::Error| match never.kind() {})
+            .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
             runtime,
