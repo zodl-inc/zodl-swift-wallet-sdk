@@ -5029,16 +5029,20 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                 let frame = frame?;
                 match frame.into_data() {
                     Ok(data) if !data.is_empty() => {
-                        if data.len() > effective_limit - *read {
-                            return if is_error {
-                                Err(anyhow!("Tor HTTP error response (status {status})"))
-                            } else {
-                                Err(anyhow!("Tor HTTP response body exceeds {max_bytes} bytes"))
-                            };
+                        let remaining = effective_limit.saturating_sub(*read);
+                        if data.len() > remaining {
+                            // Truncate to the cap, return the truncated data, and mark END so the
+                            // next read returns end-of-stream. This preserves status/headers for
+                            // classification rather than failing with a size error (ZIP #10).
+                            let truncated = &data[..remaining];
+                            *read += truncated.len();
+                            *state = TOR_HTTP_STREAM_END;
+                            Ok(ffi::BoxedSlice::some(truncated.to_vec()))
+                        } else {
+                            *read += data.len();
+                            *state = TOR_HTTP_STREAM_DATA;
+                            Ok(ffi::BoxedSlice::some(data.to_vec()))
                         }
-                        *read += data.len();
-                        *state = TOR_HTTP_STREAM_DATA;
-                        Ok(ffi::BoxedSlice::some(data.to_vec()))
                     }
                     _ => {
                         *state = TOR_HTTP_STREAM_PENDING;
@@ -9910,7 +9914,6 @@ mod tor_http_stream_tests {
         use futures::StreamExt as _;
         use http_body::Frame;
         use http_body_util::BodyExt;
-        use tor_rtcompat::ToplevelBlockOn as _;
 
         // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
@@ -9931,59 +9934,46 @@ mod tor_http_stream_tests {
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
             .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
             .boxed_unsync();
-        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
-        let mut stream = super::TorHttpStream {
+
+        // Create a runtime with the timer driver (required for tokio::time::timeout)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut stream_box = Box::new(super::TorHttpStream {
             runtime,
             status: 429,
             headers: http::HeaderMap::new(),
             body,
             read: 0,
             max_bytes: 257 * 1024 * 1024, // 257 MiB relay response limit
-        };
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
 
         let mut total_read = 0;
+        let mut state: u8 = 0;
 
-        // Read frames until we hit the cap or an error
+        // Read via the FFI entry point until we hit END
         loop {
-            let result = stream.runtime.block_on(async {
-                let next =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), stream.body.frame())
-                        .await;
-                match next {
-                    Ok(Some(frame)) => {
-                        let frame = frame.unwrap();
-                        match frame.into_data() {
-                            Ok(data) if !data.is_empty() => {
-                                let is_error = stream.status < 200 || stream.status >= 300;
-                                let effective_limit = if is_error {
-                                    super::TOR_HTTP_MAX_ERROR_BODY_BYTES
-                                } else {
-                                    stream.max_bytes
-                                };
-                                if data.len() > effective_limit - stream.read {
-                                    return Err(format!("status {}", stream.status));
-                                }
-                                stream.read += data.len();
-                                total_read += data.len();
-                                Ok(())
-                            }
-                            _ => Ok(()),
-                        }
-                    }
-                    Ok(None) => Ok(()),
-                    Err(_) => Ok(()),
-                }
-            });
+            let slice_ptr = unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            assert!(!slice_ptr.is_null(), "stream read should not fail");
 
-            if let Err(err_msg) = result {
-                // Verify we got the status error, not a size-limit error
-                assert_eq!(err_msg, "status 429");
+            let slice = unsafe { &*slice_ptr };
+            if state == super::TOR_HTTP_STREAM_DATA && slice.len > 0 {
+                total_read += slice.len as usize;
+            } else if state == super::TOR_HTTP_STREAM_END {
+                unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
+            unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
-        // Verify we read up to the 64 KiB cap
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved
         assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        assert_eq!(stream_box.status, 429);
+
+        // Don't free the stream (stream_box drops it)
     }
 
     #[test]
@@ -9991,7 +9981,6 @@ mod tor_http_stream_tests {
         use futures::StreamExt as _;
         use http_body::Frame;
         use http_body_util::BodyExt;
-        use tor_rtcompat::ToplevelBlockOn as _;
 
         // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
@@ -10012,58 +10001,45 @@ mod tor_http_stream_tests {
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
             .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
             .boxed_unsync();
-        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
-        let mut stream = super::TorHttpStream {
+
+        // Create a runtime with the timer driver (required for tokio::time::timeout)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut stream_box = Box::new(super::TorHttpStream {
             runtime,
             status: 503,
             headers: http::HeaderMap::new(),
             body,
             read: 0,
             max_bytes: 257 * 1024 * 1024,
-        };
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
 
         let mut total_read = 0;
+        let mut state: u8 = 0;
 
-        // Read frames until we hit the cap
+        // Read via the FFI entry point until we hit END
         loop {
-            let result = stream.runtime.block_on(async {
-                let next =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), stream.body.frame())
-                        .await;
-                match next {
-                    Ok(Some(frame)) => {
-                        let frame = frame.unwrap();
-                        match frame.into_data() {
-                            Ok(data) if !data.is_empty() => {
-                                let is_error = stream.status < 200 || stream.status >= 300;
-                                let effective_limit = if is_error {
-                                    super::TOR_HTTP_MAX_ERROR_BODY_BYTES
-                                } else {
-                                    stream.max_bytes
-                                };
-                                if data.len() > effective_limit - stream.read {
-                                    return Err(format!("status {}", stream.status));
-                                }
-                                stream.read += data.len();
-                                total_read += data.len();
-                                Ok(())
-                            }
-                            _ => Ok(()),
-                        }
-                    }
-                    Ok(None) => Ok(()),
-                    Err(_) => Ok(()),
-                }
-            });
+            let slice_ptr = unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            assert!(!slice_ptr.is_null(), "stream read should not fail");
 
-            if let Err(err_msg) = result {
-                // Verify we got the status error
-                assert_eq!(err_msg, "status 503");
+            let slice = unsafe { &*slice_ptr };
+            if state == super::TOR_HTTP_STREAM_DATA && slice.len > 0 {
+                total_read += slice.len as usize;
+            } else if state == super::TOR_HTTP_STREAM_END {
+                unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
+            unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
-        // Verify we read exactly 64 KiB
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved
         assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        assert_eq!(stream_box.status, 503);
+
+        // Don't free the stream (stream_box drops it)
     }
 }
