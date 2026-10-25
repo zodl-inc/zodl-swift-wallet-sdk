@@ -168,6 +168,7 @@ hex = "0.4"
 zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "b0b2087c9d867115f38ddfbd6021988b64abf8f9", default-features = false }
 
 [dev-dependencies]
+futures = "0.3"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Plays the device in the Ledger signing tests (`rust/src/ledger/tests.rs`). Matches the engine's
