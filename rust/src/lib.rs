@@ -9930,7 +9930,7 @@ mod tor_http_stream_tests {
 
         // Read frames until we hit the cap or an error
         loop {
-            let result = rt.block_on(async {
+            let result = stream.runtime.block_on(async {
                 let next =
                     tokio::time::timeout(std::time::Duration::from_secs(1), stream.body.frame())
                         .await;
