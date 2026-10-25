@@ -547,6 +547,21 @@ public protocol Synchronizer: AnyObject {
     /// Returns a list of the accounts in the wallet.
     func listAccounts() async throws -> [Account]
 
+    /// Finds the account in the wallet that shares a viewing key component (Orchard, Sapling or transparent P2PKH) with
+    /// `ufvk`, and reports what importing `ufvk` with
+    /// ``importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`` would do to it.
+    ///
+    /// The answer is a snapshot: the lookup and an import run in separate transactions, so an account imported, changed or
+    /// deleted in between can make the import do something else. The lookup reads the wallet database without changing
+    /// it, and does not stop synchronization.
+    ///
+    /// - Parameter ufvk: the key to look up. No part of it is put in an error.
+    /// - Returns: `nil` when importing `ufvk` would add a new account; otherwise the account that shares a component with
+    ///   `ufvk`, and what importing `ufvk` would do to it.
+    /// - Throws: `ZcashError.accountKeyOverlapMultipleAccounts` when several accounts share a component with `ufvk`, which
+    ///   also makes importing it fail, and `ZcashError.rustFindAccountKeyOverlap` when the lookup itself fails.
+    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap?
+
     /// Imports a new account with UnifiedFullViewingKey.
     /// - Parameters:
     ///   - ufvk: unified full viewing key
@@ -879,6 +894,19 @@ public protocol Synchronizer: AnyObject {
     ///
     /// - Throws rustDeleteAccount as a common indicator of the operation failure
     func deleteAccount(_ accountUUID: AccountUUID) async throws -> Void
+
+    /// Sets the human-readable name of an account, replacing any name it had. The account's keys and all other state are
+    /// unchanged, and ``listAccounts()`` returns the new name afterwards. The rename does not stop synchronization.
+    ///
+    /// A name is a label to show, not an identity: it can change at any time, so never derive keys, file names or other
+    /// identifiers from it.
+    ///
+    /// - Parameters:
+    ///   - accountUUID: the account to rename.
+    ///   - name: the new name. It is stored as given, except that an empty name is refused.
+    /// - Throws: `ZcashError.rustSetAccountName` when the name cannot be stored, for example when no account has
+    ///   `accountUUID`, or when `name` is empty or contains a null character.
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws
 
     /// Provides access to transaction creation and submission operations
     /// that are decoupled from the synchronizer's built-in submission flow.
@@ -1649,6 +1677,26 @@ private struct RestartSyncUnimplemented: LocalizedError {
     }
 }
 
+/// Error thrown by the default `Synchronizer.findAccountSharingKeyComponents(_:)` implementation.
+private struct AccountSharingKeyComponentsUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        """
+        Synchronizer.findAccountSharingKeyComponents(_:) has no default implementation. \
+        Override this method in your Synchronizer conformer to look up the account that shares a viewing key component.
+        """
+    }
+}
+
+/// Error thrown by the default `Synchronizer.renameAccount(_:name:)` implementation.
+private struct RenameAccountUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        """
+        Synchronizer.renameAccount(_:name:) has no default implementation. \
+        Override this method in your Synchronizer conformer to store a new name for an account.
+        """
+    }
+}
+
 /// Error thrown by the default `Synchronizer.signPCZTWithLedger` implementation.
 private struct LedgerSigningUnimplemented: LocalizedError {
     var errorDescription: String? {
@@ -1842,6 +1890,20 @@ public extension Synchronizer {
     /// transports fall through here and report the capability as unavailable.
     func restartSync(at endpoint: LightWalletEndpoint) async throws {
         throw RestartSyncUnimplemented()
+    }
+
+    /// Default implementation so adding `findAccountSharingKeyComponents(_:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Both shipped synchronizers override it; the
+    /// rest report the capability as unavailable.
+    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        throw AccountSharingKeyComponentsUnimplemented()
+    }
+
+    /// Default implementation so adding `renameAccount(_:name:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Both shipped synchronizers override it; the
+    /// rest report the capability as unavailable.
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        throw RenameAccountUnimplemented()
     }
 
     /// Default implementation so adding `broadcaster` to the protocol is not a

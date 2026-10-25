@@ -291,6 +291,24 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         return uuidPtr.pointee.unsafeToAccountUUID()
     }
 
+    // DB-READ (audited 2026-10-14): read-only wallet database connection.
+    func findAccountKeyOverlap(ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        let overlapPtr = zcashlc_find_account_key_overlap(
+            dbData.0,
+            dbData.1,
+            [CChar](ufvk.stringEncoded.utf8CString),
+            networkType.networkId
+        )
+
+        guard let overlapPtr else {
+            throw ZcashError.rustFindAccountKeyOverlap(lastErrorMessage(fallback: "`findAccountKeyOverlap` failed with unknown error"))
+        }
+
+        defer { zcashlc_free_account_key_overlap(overlapPtr) }
+
+        return try overlapPtr.pointee.unsafeToAccountKeyOverlap()
+    }
+
     @DBActor
     func createAccount(
         seed: [UInt8],
@@ -1654,6 +1672,28 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
     }
 
+    @DBActor
+    func setAccountName(_ accountUUID: AccountUUID, name: String) async throws {
+        // The rust layer reads the name up to its first null character, so it would store less than it was given.
+        guard !name.containsCStringNullBytesBeforeStringEnding() else {
+            throw ZcashError.rustSetAccountName("The name contains a null character.")
+        }
+
+        let success = zcashlc_set_account_name(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            accountUUID.id,
+            [CChar](name.utf8CString)
+        )
+
+        guard success else {
+            throw ZcashError.rustSetAccountName(
+                lastErrorMessage(fallback: "`setAccountName` failed with unknown error")
+            )
+        }
+    }
+
     // MARK: - Ironwood migration
 
     @DBActor
@@ -2976,30 +3016,32 @@ extension FfiAccount {
 
     /// converts an [`FfiAccount`] into a [`Account`]
     /// - Note: This does not check that the converted value actually holds a valid Account
+    /// - Note: An account imported without derivation data, such as a view-only or a hardware-wallet account, has no seed fingerprint
+    ///   or ZIP 32 account index. It carries the viewing keys it was imported with, as every other account does.
     func unsafeToAccount() -> Account? {
         // Invalid UUID check
         guard uuidArray != [UInt8](repeating: 0, count: 16) else {
             return nil
         }
 
-        // Invalid ZIP 32 account index
+        let ufvkTyped = ufvk.map { UnifiedFullViewingKey(validatedEncoding: String(cString: $0)) }
+        let uivkTyped = uivk.map { UnifiedIncomingViewingKey(validatedEncoding: String(cString: $0)) }
+
+        // Invalid ZIP 32 account index: the account was imported without derivation data, but its viewing keys are stored all the same.
         if hd_account_index == UInt32.max {
-            return .init(
+            return Account(
                 id: AccountUUID(id: uuidArray),
                 name: account_name != nil ? String(cString: account_name) : nil,
                 keySource: key_source != nil ? String(cString: key_source) : nil,
                 seedFingerprint: nil,
                 hdAccountIndex: nil,
-                ufvk: nil,
-                uivk: nil
+                ufvk: ufvkTyped,
+                uivk: uivkTyped
             )
         }
 
-        let ufvkTyped = ufvk.map { UnifiedFullViewingKey(validatedEncoding: String(cString: $0)) }
-        let uivkTyped = uivk.map { UnifiedIncomingViewingKey(validatedEncoding: String(cString: $0)) }
-
         // Valid ZIP32 account index
-        return .init(
+        return Account(
             id: AccountUUID(id: uuidArray),
             name: account_name != nil ? String(cString: account_name) : nil,
             keySource: key_source != nil ? String(cString: key_source) : nil,
@@ -3008,6 +3050,43 @@ extension FfiAccount {
             ufvk: ufvkTyped,
             uivk: uivkTyped
         )
+    }
+}
+
+extension FfiAccountKeyOverlap {
+    /// Converts what `zcashlc_find_account_key_overlap` reported into the answer of
+    /// `ZcashRustBackendWelding.findAccountKeyOverlap(ufvk:)`. Call it before the struct is freed, because it reads the
+    /// strings of the account.
+    /// - Returns: `nil` when importing the key would add an account.
+    /// - Throws:
+    ///     - `accountKeyOverlapMultipleAccounts` when the components of the key match more than one account.
+    ///     - `rustFindAccountKeyOverlap` for a kind this version of the SDK does not know, or when no account is reported
+    ///       for a kind that needs one.
+    func unsafeToAccountKeyOverlap() throws -> AccountKeyOverlap? {
+        let overlapKind: AccountKeyOverlap.Kind
+
+        switch kind {
+        case FfiAccountKeyOverlapKind_None:
+            return nil
+        case FfiAccountKeyOverlapKind_MultipleAccounts:
+            throw ZcashError.accountKeyOverlapMultipleAccounts
+        case FfiAccountKeyOverlapKind_AlreadyImported:
+            overlapKind = .alreadyImported
+        case FfiAccountKeyOverlapKind_WouldUpgrade:
+            overlapKind = .wouldUpgrade
+        case FfiAccountKeyOverlapKind_Conflicting:
+            overlapKind = .conflicting
+        default:
+            // The rust layer returned a value, so it set no error. Reading the last error here would pick up one that an
+            // earlier, unread failure on this thread left behind.
+            throw ZcashError.rustFindAccountKeyOverlap("`findAccountKeyOverlap` reported an unknown kind")
+        }
+
+        guard let overlappingAccount = account.unsafeToAccount() else {
+            throw ZcashError.rustFindAccountKeyOverlap("`findAccountKeyOverlap` reported no account")
+        }
+
+        return AccountKeyOverlap(account: overlappingAccount, kind: overlapKind)
     }
 }
 

@@ -737,11 +737,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
         // non-quiescent one changes nothing here beyond what a reader of the logs should know:
         // the pass is stopped either way, and an engine writer that outlives it has only the
-        // engine's own file to finish with.
-        let quiescent = await engine.stop()
-        if !quiescent {
+        // engine's own file to finish with. [MOB-2184] For the same reason this is the plain stop,
+        // not `stopForWalletChange()`: nothing about the wallet changes, so a scan call in progress
+        // may run to the end of its chunk rather than leave its blocks for the next pass.
+        let report = await engine.stop()
+        if let reason = report.refusalReason {
             initializer.logger.warn(
-                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop",
+                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop: \(reason)",
                 file: #file,
                 function: #function,
                 line: #line
@@ -1164,12 +1166,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // stop it here: two handles onto a wallet the first may still be writing is the very
         // collision the recovery exists to clear. Thrown into the reopen's own failure handling,
         // so the attempt counts as spent and the host hears the give-up exactly as it would from
-        // an endpoint that could not be reopened at all.
-        let quiescent = await engine.stop()
+        // an endpoint that could not be reopened at all. [MOB-2184] Reopening a handle onto the same
+        // wallet is a wallet change to the engine, so this is its stop for one: the scan ends at its
+        // next block instead of finishing its chunk inside the budget the proof needs.
+        let report = await engine.stopForWalletChange()
 
         do {
-            guard quiescent else {
-                throw ZcashError.slipstreamEngineNotQuiescent
+            guard report.isQuiescent else {
+                throw ZcashError.slipstreamEngineNotQuiescent(report)
             }
             try await engine.reopen(server: currentEndpoint, network: initializer.network)
         } catch {
@@ -1511,6 +1515,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await initializer.rustBackend.listAccounts()
     }
 
+    public func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        try await initializer.rustBackend.findAccountKeyOverlap(ufvk: ufvk)
+    }
+
     // swiftlint:disable:next function_parameter_count
     public func importAccount(
         ufvk: String,
@@ -1526,13 +1534,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // tip; offline ⇒ the engine's max(checkpoint, birthday+1) fallback — an offline
         // import now keeps its recovery identity instead of provisioning recover_until=NULL).
         // Identifying fetches ride Tor when enabled (same engine state dir as start()).
-        let anchor = await SlipstreamEngine.restoreAnchor(
-            isRestore: true,
-            birthday: birthday ?? 0,
-            fallbackCheckpointHeight: checkpointSource.birthday(for: BlockHeight.max).height,
-            server: currentEndpoint,
-            network: initializer.network,
-            torDirPath: await slipstreamTorDirPath()
+        // [MOB-2184] Resolved through `restoreAnchor`, as `prepare` resolves its anchor: the
+        // resolver a shipped synchronizer is built with is exactly that primitive, and a test can
+        // hand in one that needs no server.
+        let fallbackCheckpoint = checkpointSource.birthday(for: BlockHeight.max).height
+        let anchor = await restoreAnchor(
+            true, // a restore: the anchor is the account's recover-until height
+            birthday ?? 0,
+            fallbackCheckpoint,
+            currentEndpoint,
+            initializer.network,
+            await slipstreamTorDirPath()
         )
         let chainTipHeight = anchor.map { UInt32($0.height) }
         let effectiveBirthday = birthday ?? (chainTipHeight.map { BlockHeight($0) } ?? initializer.walletBirthday)
@@ -1606,9 +1618,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // proceed on the assumption: an orphan commit landing after the force-re-queue is exactly
         // the silent scope loss this serialization exists to prevent. Leave the wallet untouched,
         // put the pass back the way it was found, and tell the caller.
-        guard await engine.stop() else {
+        // [MOB-2184] The stop for a wallet change, as in every operation below that changes the
+        // wallet or reopens a handle onto it: a plain stop lets the scan finish its whole chunk
+        // first, which outlasted the ten-second budget when accounts were added in quick
+        // succession, and every one of those imports was refused.
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         let uuid: AccountUUID
@@ -1694,9 +1711,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] See `importAccountOnLifecycleQueue`: deleting an account whose key an
         // in-flight pass may still be writing notes for is what killed the wallet in the first
         // place, so a stop the engine could not prove refuses the delete rather than risking it.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         do {
@@ -1723,6 +1741,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             throw error
         }
+    }
+
+    /// Unlike `deleteAccount(_:)`, a rename neither stops nor restarts the sync pass, so it does not take the lifecycle
+    /// queue: it changes only the account's name, which the engine never reads.
+    public func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        try await initializer.rustBackend.setAccountName(accountUUID, name: name)
     }
 
     // ── Addresses ─────────────────────────────────────────────────────────────
@@ -2186,9 +2210,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // writer the engine could not account for is precisely what stopping first is meant to
         // rule out, so an unproved stop refuses the truncate instead of gambling on it. Reported
         // on the subject, the channel every other rewind failure uses.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent))
+            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent(report)))
             return
         }
 
@@ -2233,7 +2258,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
     /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
     ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
-    /// 2. `engine.stop()` — cancel any in-flight sync task.
+    /// 2. `engine.stopForWalletChange()` — cancel any in-flight sync task, its scan at the next block.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
     /// 5. Delete the `fsBlockDbRoot` directory (parity with old SDK's `storage.clear()` +
@@ -2303,9 +2328,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // that most needs the stop it is standing on to have been real. On an unproved stop it
         // frees nothing and deletes nothing: closing the handle under a live writer, or removing
         // the database out from under one, is worse than any wipe that did not happen.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent))
+            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent(report)))
             return
         }
 
@@ -2612,10 +2638,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 3. Snapshot whether the sync was running (to decide whether to restart).
     /// 4. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
-    /// 5. Stop polling + await `engine.stop()` — cancel any in-flight sync task.
+    /// 5. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
+    ///    scan at the next block.
     /// 6. `engine.reopen(server:network:)` — close old handle + open new one bound
     ///    to the new endpoint (frees Rust-side tokio runtime, then allocates a fresh one).
     /// 7. Store `endpoint` in `currentEndpoint`.
+    /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
+    public func switchTo(endpoint: LightWalletEndpoint) async throws {
     /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
@@ -2679,9 +2708,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] A switch REOPENS the handle, and a second handle onto a wallet the first one
         // may still be writing is a collision no endpoint change is worth. On an unproved stop the
         // switch is refused and the pass is put back where it was found.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         // Re-open the engine handle against the new endpoint.
@@ -2746,9 +2776,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] `switchToOnLifecycleQueue`'s reasoning verbatim: this rebuilds the handle, so
         // an unproved stop must not be built on. Unlike a switch this is usually called when
         // nothing is running, in which case there is nothing to put back.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         try await engine.reopen(server: endpoint, network: initializer.network)

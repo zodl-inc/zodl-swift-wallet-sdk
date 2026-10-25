@@ -73,7 +73,10 @@ pczt_ledger = "=0.1.0-pre.0"
 # TODO: temporary git-rev pin -- switch to a published crates.io release once payment_uri ships
 # one. Pinned to the zcash/librustzcash#2989 merge commit specifically (not main's moving tip),
 # so this doesn't pick up unrelated later changes; that merge commit is a permanent part of
-# main's history now, so it stays reachable even as main moves on. Same rev as the Android SDK.
+# main's history now, so it stays reachable even as main moves on. iOS keeps 330e4c0a on purpose:
+# moving payment_uri would also move eip681, whose parsing changed in later revisions (a stricter
+# address-length check, and `from_parts` constructors in place of `from_native_request_parts` and
+# `from_erc20_request_parts`), and this SDK's payment-URI parsing would change with it.
 eip681 = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9" }
 payment_uri = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9", features = ["json"] }
 
@@ -146,10 +149,14 @@ zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard"] }
 incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
-# drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# 0.4.0-pre.2 is built against the NU7 pre-release crates, the same
-# librustzcash generation as this package, so the graph stays a single
+# family instance. The `[patch.crates-io]` entry below replaces the published
+# crate with a revision that implements `WalletWrite::set_account_name`.
+slipstream-core = { version = "=0.4.0-pre.2", package = "zodl-slipstream" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+base64 = "0.22"
 # family instance.
+# family instance. The `[patch.crates-io]` entry below replaces the published
+# crate with a revision that implements `WalletWrite::set_account_name`.
 slipstream-core = { version = "=0.4.0-pre.2", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
@@ -210,7 +217,6 @@ lto = true
 # output is aligned. The static libraries the SDK ships were never stripped, so this setting does
 # not apply to them.
 [profile.release.build-override]
-strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.2 lives in slipstream-internal
@@ -220,6 +226,18 @@ strip = false
 # right before the sealed request is written, and an HTTP answer is read only up to the caller's
 # ceiling.
 zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "719076cb5a407893f88704156cc0b34071d7b918" }
+
+# Coinholder voting on the NU7 pre-release crates.
+#
+# To build against an unreleased slipstream revision, patch it in here by COMMIT HASH rather than a
+# branch: a branch pin silently follows a force-push, so a build can pick up code nobody reviewed,
+# whereas a stale hash fails loudly. The revision must be built against the librustzcash generation
+# the versions above declare.
+# On zodl-inc/slipstream's feature/set-account-name-0.23.0-pre.1 branch: 0.4.0-pre.2 (which
+# includes slipstream#28) plus slipstream#30 and the facades' `set_account_name`, patched to the
+# same librustzcash revision as the entries below.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "586479698acade5b15cd8baaf937e660f564185a" }
+>>>>>>> origin/main
 
 # Coinholder voting on the NU7 pre-release crates.
 #
@@ -252,17 +270,23 @@ zakura-wallet-lib = { git = "https://github.com/zodl-inc/zakura-wallet-libraries
 # author and reviewer should have certainty that the revision *will end up
 # merged to `main`* so that commits in our history can always be successfully
 # built.
-#pczt = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
-#zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
+# The `zcash_client_sqlite-0.23.0-pre.1` tag plus a cherry-pick of zcash/librustzcash#3139 (merged
+# upstream as 357359a4), which adds `WalletWrite::set_account_name`, on the
+# feature/account-rename-trait-0.23.0-pre.1 branch.
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes

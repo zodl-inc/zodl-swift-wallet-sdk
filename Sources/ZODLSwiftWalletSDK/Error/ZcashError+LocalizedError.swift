@@ -8,7 +8,8 @@
 import Foundation
 
 extension ZcashError: LocalizedError {
-    /// The code and the static per-case message, plus the redacted rust detail when there is one.
+    /// The code and the static per-case message, plus the redacted `detail` when there is one: a
+    /// rust failure's message, or which wait a refused Slipstream stop ran out on.
     ///
     /// The detail is what makes a user's error report actionable. Without it every failure in the
     /// four proposal and transaction-creation paths rendered as the same sentence, so a report

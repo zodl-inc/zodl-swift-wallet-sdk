@@ -1,5 +1,140 @@
 # Migrating from previous versions to _Unreleased_
 
+## `ZcashError.slipstreamEngineNotQuiescent` carries the refused stop's report
+
+`ZRUST0155` now carries the `SlipstreamStopReport` of the stop that refused the operation, so its
+`localizedDescription` can say which of the engine's waits ran out and after how long. Patterns
+that ignore the payload keep compiling; a value of the case now needs one:
+
+```swift
+// Before
+XCTAssertEqual(error as? ZcashError, .slipstreamEngineNotQuiescent)
+let refusal = ZcashError.slipstreamEngineNotQuiescent
+
+// After: compare the code, or build the case from a report. `ZcashError` equality compares
+// only the code, so any report matches: an error equals `refusal` whatever report it carries.
+XCTAssertEqual((error as? ZcashError)?.code, .slipstreamEngineNotQuiescent)
+let refusal = ZcashError.slipstreamEngineNotQuiescent(
+    SlipstreamStopReport(settled: false, drained: true, settleWait: .seconds(10), drainWait: .zero)
+)
+
+// Unchanged: these match the case whatever it carries.
+// catch ZcashError.slipstreamEngineNotQuiescent { ... }
+// case .slipstreamEngineNotQuiescent: ...
+
+// New: bind the report to see which wait ran out.
+if case .slipstreamEngineNotQuiescent(let report) = error {
+    log(report.refusalReason ?? "")
+}
+```
+
+## `SlipstreamEngine.stop()` returns a `SlipstreamStopReport`
+
+The stop used to answer only whether it proved the wallet file quiescent. It now says what it
+found, and the old answer is the report's `isQuiescent`:
+
+```swift
+// Before
+let quiescent = await engine.stop()
+if !quiescent {
+    // The engine could not prove its pass and its wallet writer had stopped.
+}
+
+// After
+let report = await engine.stop()
+if !report.isQuiescent {
+    // `report.settled` and `report.drained` say which of the two waits ran out, and
+    // `report.settleWait` and `report.drainWait` how long each took.
+}
+```
+
+A call that discards the result, such as `await engine.stop()`, compiles unchanged.
+
+## Imported accounts return their viewing keys — `Account.ufvk` and `Account.uivk`
+
+`Synchronizer.listAccounts()`, and every other API that returns an `Account`, now returns the
+viewing keys of an account imported without derivation data, such as a hardware-wallet or a
+view-only account. Its `ufvk` and `uivk` used to be `nil`. Its `seedFingerprint` and
+`hdAccountIndex` are still `nil`, so recognise such an account by `hdAccountIndex == nil`; a test
+for `ufvk == nil` no longer matches it.
+
+Whatever a wallet derives from `account.ufvk` changes for these accounts. A wallet that passes
+`account.ufvk` to `AccountMetadataKey.derivePrivateUseMetadataKey(ufvk:privateUseSubject:)` derived
+such an account's keys from `ufvk: nil`, and now derives different ones, which cannot read the
+metadata written under the old keys. To keep that metadata reachable, go on deriving with
+`ufvk: nil` for an imported account that already has metadata.
+
+Before:
+
+```swift
+let isImported = account.ufvk == nil
+
+// `account.ufvk` was `nil` for an imported account, so this derived the keys of `ufvk: nil`.
+let keys = try metadataKey.derivePrivateUseMetadataKey(
+    ufvk: account.ufvk,
+    privateUseSubject: subject
+)
+```
+
+After:
+
+```swift
+let isImported = account.hdAccountIndex == nil
+
+// An imported account that already has metadata keeps the keys it was written under.
+let keys = try metadataKey.derivePrivateUseMetadataKey(
+    ufvk: isImported && hasStoredMetadata(for: account.id) ? nil : account.ufvk,
+    privateUseSubject: subject
+)
+```
+
+Such an `Account` also no longer equals, or hashes like, the value an earlier version returned, so
+match accounts by `id`. Its `Codable` encoding now includes `ufvk` and `uivk`: an `Account` a wallet
+stores or sends carries the account's viewing key, so keep it only where that key may go.
+
+## `ZcashError` gained cases — viewing key checks
+
+`ZcashError` and `ZcashErrorCode` have three new cases, which only the viewing key checks throw. An
+exhaustive `switch` over either type stops compiling until they are handled.
+
+- `rustDescribeUnifiedFullViewingKey` (`ZRUST0172`): `DerivationTool.describeUnifiedFullViewingKey(_:)`
+  could not check the key.
+- `rustFindAccountKeyOverlap` (`ZRUST0170`): `Synchronizer.findAccountSharingKeyComponents(_:)` could
+  not look the key up, for instance because the wallet database could not be read.
+- `accountKeyOverlapMultipleAccounts` (`ZRUST0171`): `Synchronizer.findAccountSharingKeyComponents(_:)`
+  found more than one account that shares a viewing key component with the key, so importing the key
+  would fail.
+
+The payloads of the first two are the rust layer's message, which never contains any part of the key.
+With one exception, those two failures say nothing about the key itself, so report that the key could
+not be checked, not that it is invalid. The exception is a key for another network than the wallet's:
+`findAccountSharingKeyComponents(_:)` throws `rustFindAccountKeyOverlap` for it every time, so build
+the `UnifiedFullViewingKey` for the wallet's own network, or check it first with
+`DerivationTool.describeUnifiedFullViewingKey(_:)`, which returns `nil` for it. The third is an answer
+about the key: its import would fail, so refuse it.
+
+```swift
+case .rustDescribeUnifiedFullViewingKey, .rustFindAccountKeyOverlap:
+    // The check itself failed, so the key is neither accepted nor rejected: offer another attempt.
+    break
+case .accountKeyOverlapMultipleAccounts:
+    // Several accounts share the key's components, so importing it would fail: refuse it.
+    break
+```
+
+## `ZcashError` gained a case — `rustSetAccountName`
+
+`ZcashError` and `ZcashErrorCode` have a new case, `rustSetAccountName` (`ZRUST0173`), which only
+`Synchronizer.renameAccount(_:name:)` throws: the name could not be stored, for instance because no
+account has the given UUID or the name contains a null character. The account keeps the name it had.
+An exhaustive `switch` over either type stops compiling until the new case is handled.
+
+```swift
+case .rustSetAccountName:
+    // The account kept its old name: say that the rename failed, and keep showing the old name.
+    break
+```
+
 ## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
 
 The package, its library product, and its module are renamed, and the repository has moved to

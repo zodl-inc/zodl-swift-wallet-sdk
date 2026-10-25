@@ -108,7 +108,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         } catch ZcashError.giftCardCleanupTimedOut { }
         let calls = await fixture.engine.calls
         XCTAssertFalse(calls.contains("close"))
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
         fixture.engine.startGate.open()
         try await fixture.redeemer.cleanup()

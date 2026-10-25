@@ -413,6 +413,10 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         try await initializer.rustBackend.listAccounts()
     }
 
+    public func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        try await initializer.rustBackend.findAccountKeyOverlap(ufvk: ufvk)
+    }
+
     // swiftlint:disable:next function_parameter_count
     public func importAccount(
         ufvk: String,
@@ -1565,6 +1569,10 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
     public func deleteAccount(_ accountUUID: AccountUUID) async throws {
         try await initializer.rustBackend.deleteAccount(accountUUID)
+    }
+
+    public func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        try await initializer.rustBackend.setAccountName(accountUUID, name: name)
     }
 
     // MARK: Immediate incoming transactions

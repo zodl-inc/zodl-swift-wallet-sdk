@@ -28,13 +28,13 @@ IPHONEOS_DEPLOYMENT_TARGET = 16.0
 # per architecture cannot overlap them — `make -j` does not help. That matters
 # most for the link step: `lto = true` is a single-threaded whole-program pass
 # costing roughly two minutes per architecture, so five of them run back to back.
-#
-# Passing several `--target` flags to one invocation puts every architecture in a
-# single job graph, letting those passes run concurrently.
 # Extra Cargo features, for QA builds only (ohttp-e2e.yml passes ohttp-trace);
 # release builds leave it empty.
 FFI_CARGO_FEATURES ?=
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --locked --manifest-path ../Cargo.toml --release $(if $(FFI_CARGO_FEATURES),--features $(FFI_CARGO_FEATURES))
+cargo_targets = $(addprefix --target ,$(1))
 CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --manifest-path ../Cargo.toml --release $(if $(FFI_CARGO_FEATURES),--features $(FFI_CARGO_FEATURES))
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --locked --manifest-path ../Cargo.toml --release
 cargo_targets = $(addprefix --target ,$(1))
 
 RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml

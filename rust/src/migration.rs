@@ -68,7 +68,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr;
 use std::slice;
 
@@ -244,38 +244,13 @@ struct CallCtx {
     account_bytes: [u8; 16],
 }
 
-/// Refuses a wallet-database path where no database exists, before any connection that could
-/// create it is opened.
-///
-/// Only `zcashlc_init_data_database` creates the wallet database, so a migration call must not
-/// let a read-write open make SQLite create an empty file at a path for a wallet that was never
-/// initialized. The path the platform passes may be a SQLite `file:` URI, which only SQLite
-/// resolves, so asking the filesystem whether it exists would refuse every real wallet. SQLite is
-/// asked instead, with a read-only open: that cannot create the file, and it fails with
-/// `SQLITE_CANTOPEN` when there is none. SQLite reports that code for a file that exists but
-/// cannot be opened too, for example on a permissions or data-protection failure, so the refusal
-/// says "does not exist or cannot be opened". Its own message for that failure carries the
-/// database path, so it is replaced by one that names no path, the same for both contexts.
-fn require_wallet_db(db_path: &Path) -> anyhow::Result<()> {
-    match crate::wallet_db_connection(db_path, crate::WalletDbAccess::ReadOnly) {
-        Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::CannotOpen => {
-            Err(anyhow!(
-                "the wallet database does not exist or cannot be opened; initialize it with \
-                 zcashlc_init_data_database before using the migration surface"
-            ))
-        }
-        Err(e) => Err(anyhow!("Error checking for the wallet database: {e}")),
-    }
-}
-
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
 /// drops it at the end (no persistent handle).
 ///
 /// `open()` creates neither the wallet database nor any of its schema: only
 /// `zcashlc_init_data_database` does, through `zcash_client_sqlite`'s own migrations and the SDK's
 /// external ones in [`crate::ext_schema`]. A path where no database exists is therefore refused,
-/// by [`require_wallet_db`], before the call's own connections are opened. That check asks SQLite
+/// by [`crate::require_wallet_db`], before the call's own connections are opened. That check asks SQLite
 /// through a read-only open, which cannot create the file.
 ///
 /// # Safety
@@ -292,7 +267,7 @@ unsafe fn open(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    require_wallet_db(&db_path)?;
+    crate::require_wallet_db(&db_path, "using the migration surface")?;
     let wallet = unsafe { crate::wallet_db(rng, db_data, db_data_len, network.clone())? };
     let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadWrite)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
@@ -310,7 +285,7 @@ unsafe fn open(
 }
 
 /// Read-only twin of [`open`]: both connections are opened read-only. A path where no database
-/// exists is refused by the same [`require_wallet_db`] check. The pure read entry points open
+/// exists is refused by the same [`crate::require_wallet_db`] check. The pure read entry points open
 /// through this; a read-only connection fails any write with `SQLITE_READONLY`, so an accidental
 /// write anywhere down their call graph fails loudly instead of silently reclassifying the call.
 ///
@@ -327,7 +302,7 @@ unsafe fn open_read(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    require_wallet_db(&db_path)?;
+    crate::require_wallet_db(&db_path, "using the migration surface")?;
     let wallet = unsafe { crate::wallet_db_read_only(rng, db_data, db_data_len, network.clone())? };
     let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadOnly)
         .map_err(|e| anyhow!("Error opening read-only migration store connection: {e}"))?;

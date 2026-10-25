@@ -59,6 +59,18 @@ protocol ZcashRustBackendWelding {
         keySource: String?
     ) async throws -> AccountUUID
 
+    /// Finds the account in the wallet that shares an incoming viewing key component (Orchard, Sapling or transparent P2PKH)
+    /// with `ufvk`, and reports what importing `ufvk` with `importAccount` would do to it. The wallet database is opened
+    /// read-only, so the lookup never changes it.
+    ///
+    /// - Parameter ufvk: the key to look up. The rust layer never puts any part of it in the error it reports.
+    /// - Returns: `nil` when importing `ufvk` would add an account; otherwise the account that shares a component with `ufvk`,
+    ///   and what importing `ufvk` would do to it.
+    /// - Throws:
+    ///     - `accountKeyOverlapMultipleAccounts` if the components of `ufvk` match more than one account.
+    ///     - `rustFindAccountKeyOverlap` if the rust layer fails to look `ufvk` up.
+    func findAccountKeyOverlap(ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap?
+
     /// Adds the next available account-level spend authority, given the current set of [ZIP 316]
     /// account identifiers known, to the wallet database.
     ///
@@ -476,6 +488,12 @@ protocol ZcashRustBackendWelding {
 
     /// Attempts to delete an account defined by UUID
     func deleteAccount(_ accountUUID: AccountUUID) async throws
+
+    /// Sets the human-readable name of the account `accountUUID` to `name`, replacing any name it had. The account's keys
+    /// and all other state are unchanged.
+    /// - Throws: `rustSetAccountName` if the name cannot be stored, including when no account has `accountUUID` and when
+    ///   `name` contains a null character, which would cut it short at the FFI boundary.
+    func setAccountName(_ accountUUID: AccountUUID, name: String) async throws
 
     // MARK: - Ironwood migration
 

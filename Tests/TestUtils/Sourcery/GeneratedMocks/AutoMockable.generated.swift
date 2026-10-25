@@ -2384,6 +2384,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - findAccountSharingKeyComponents
+
+    var findAccountSharingKeyComponentsThrowableError: Error?
+    var findAccountSharingKeyComponentsCallsCount = 0
+    var findAccountSharingKeyComponentsCalled: Bool {
+        return findAccountSharingKeyComponentsCallsCount > 0
+    }
+    var findAccountSharingKeyComponentsReceivedUfvk: UnifiedFullViewingKey?
+    var findAccountSharingKeyComponentsReturnValue: AccountKeyOverlap?
+    var findAccountSharingKeyComponentsClosure: ((UnifiedFullViewingKey) async throws -> AccountKeyOverlap?)?
+
+    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        if let error = findAccountSharingKeyComponentsThrowableError {
+            throw error
+        }
+        findAccountSharingKeyComponentsCallsCount += 1
+        findAccountSharingKeyComponentsReceivedUfvk = ufvk
+        if let closure = findAccountSharingKeyComponentsClosure {
+            return try await closure(ufvk)
+        } else {
+            return findAccountSharingKeyComponentsReturnValue
+        }
+    }
+
     // MARK: - importAccount
 
     var importAccountUfvkSeedFingerprintZip32AccountIndexPurposeNameKeySourceBirthdayThrowableError: Error?
@@ -2983,6 +3007,25 @@ class SynchronizerMock: Synchronizer {
         deleteAccountCallsCount += 1
         deleteAccountReceivedAccountUUID = accountUUID
         try await deleteAccountClosure!(accountUUID)
+    }
+
+    // MARK: - renameAccount
+
+    var renameAccountNameThrowableError: Error?
+    var renameAccountNameCallsCount = 0
+    var renameAccountNameCalled: Bool {
+        return renameAccountNameCallsCount > 0
+    }
+    var renameAccountNameReceivedArguments: (accountUUID: AccountUUID, name: String)?
+    var renameAccountNameClosure: ((AccountUUID, String) async throws -> Void)?
+
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        if let error = renameAccountNameThrowableError {
+            throw error
+        }
+        renameAccountNameCallsCount += 1
+        renameAccountNameReceivedArguments = (accountUUID: accountUUID, name: name)
+        try await renameAccountNameClosure!(accountUUID, name)
     }
 
     // MARK: - transactionSubmissionStatus
@@ -4469,6 +4512,30 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         }
     }
 
+    // MARK: - findAccountKeyOverlap
+
+    var findAccountKeyOverlapUfvkThrowableError: Error?
+    var findAccountKeyOverlapUfvkCallsCount = 0
+    var findAccountKeyOverlapUfvkCalled: Bool {
+        return findAccountKeyOverlapUfvkCallsCount > 0
+    }
+    var findAccountKeyOverlapUfvkReceivedUfvk: UnifiedFullViewingKey?
+    var findAccountKeyOverlapUfvkReturnValue: AccountKeyOverlap?
+    var findAccountKeyOverlapUfvkClosure: ((UnifiedFullViewingKey) async throws -> AccountKeyOverlap?)?
+
+    func findAccountKeyOverlap(ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        if let error = findAccountKeyOverlapUfvkThrowableError {
+            throw error
+        }
+        findAccountKeyOverlapUfvkCallsCount += 1
+        findAccountKeyOverlapUfvkReceivedUfvk = ufvk
+        if let closure = findAccountKeyOverlapUfvkClosure {
+            return try await closure(ufvk)
+        } else {
+            return findAccountKeyOverlapUfvkReturnValue
+        }
+    }
+
     // MARK: - createAccount
 
     var createAccountSeedTreeStateRecoverUntilNameKeySourceThrowableError: Error?
@@ -5482,6 +5549,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
         deleteAccountCallsCount += 1
         deleteAccountReceivedAccountUUID = accountUUID
         try await deleteAccountClosure!(accountUUID)
+    }
+
+    // MARK: - setAccountName
+
+    var setAccountNameNameThrowableError: Error?
+    var setAccountNameNameCallsCount = 0
+    var setAccountNameNameCalled: Bool {
+        return setAccountNameNameCallsCount > 0
+    }
+    var setAccountNameNameReceivedArguments: (accountUUID: AccountUUID, name: String)?
+    var setAccountNameNameClosure: ((AccountUUID, String) async throws -> Void)?
+
+    func setAccountName(_ accountUUID: AccountUUID, name: String) async throws {
+        if let error = setAccountNameNameThrowableError {
+            throw error
+        }
+        setAccountNameNameCallsCount += 1
+        setAccountNameNameReceivedArguments = (accountUUID: accountUUID, name: name)
+        try await setAccountNameNameClosure!(accountUUID, name)
     }
 
     // MARK: - migrationAdvanceStep

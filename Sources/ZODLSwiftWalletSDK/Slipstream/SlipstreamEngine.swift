@@ -183,19 +183,44 @@ public actor SlipstreamEngine {
     /// FFI blocks, bounded ≤10 s, waiting for the wallet file to fall quiet). Hopped off
     /// the cooperative pool — the drain is a real wait; never block an actor thread.
     ///
-    /// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the engine confirmed that
-    /// both its aborted pass and its wallet writer had finished, `false` when either was still
-    /// running when the ten-second budget ran out. The pass is stopped either way — what the
-    /// answer reports is whether the wallet file was PROVED free of the engine's own writers.
-    /// It is the contract `deleteAccount`/`importAccount`/`rewind`/`wipe` serialize on: on
-    /// `false` they refuse to write rather than interleave with a commit that may still land.
+    /// [MOB-1850] Returns what the stop found. `isQuiescent` is `true` when the engine confirmed
+    /// that both its aborted pass and its wallet writer had finished, `false` when either was still
+    /// running when its ten-second budget ran out; `settled`, `drained`, `settleWait` and
+    /// `drainWait` say which wait it was and how long each took. The pass is stopped either way —
+    /// what the report says is whether the wallet file was PROVED free of the engine's own writers.
     /// A nil handle is quiescent by definition — there is no engine to be writing.
+    ///
+    /// This is the plain stop, for backgrounding and shutdown: a scan call in progress runs to its
+    /// end, by default the end of its chunk, before the stop reaches it. Right before changing the
+    /// wallet, stop with `stopForWalletChange()` instead.
     @discardableResult
-    public func stop() async -> Bool {
-        guard let handlePtr = handle else { return true }
+    public func stop() async -> SlipstreamStopReport {
+        await stopOffTheCooperativePool(zcashlc_slipstream_stop)
+    }
+
+    /// [MOB-2184] The stop to make right before changing the wallet: adding or removing an account,
+    /// a rewind, a wipe, or reopening a handle onto the same wallet. It asks the running sync pass
+    /// to end its scan at the next block, then stops exactly as `stop()` does and returns the same
+    /// report, on which `deleteAccount`/`importAccount`/`rewind`/`wipe` refuse to write when it is
+    /// not quiescent.
+    ///
+    /// `stop()` lets a scan call in progress run to the end of its chunk first, which can outlast
+    /// the ten-second budget when accounts are added in quick succession. This stop ends the scan at
+    /// its next block, writes nothing for the scan call it interrupted, and leaves those blocks for
+    /// the next pass to scan again. A nil handle is quiescent by definition, as for `stop()`.
+    public func stopForWalletChange() async -> SlipstreamStopReport {
+        await stopOffTheCooperativePool(zcashlc_slipstream_stop_for_wallet_change)
+    }
+
+    /// Runs one of the two C stops off the cooperative pool: both wait, bounded, for the engine's
+    /// aborted passes and its wallet commit, and an actor thread must never block on that.
+    private func stopOffTheCooperativePool(
+        _ stop: @escaping @Sendable (OpaquePointer?) -> FfiSlipstreamStopReport
+    ) async -> SlipstreamStopReport {
+        guard let handlePtr = handle else { return .quiescent }
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: zcashlc_slipstream_stop(handlePtr))
+                continuation.resume(returning: SlipstreamStopReport(stop(handlePtr)))
             }
         }
     }
