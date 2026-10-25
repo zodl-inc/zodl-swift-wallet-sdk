@@ -9914,6 +9914,7 @@ mod tor_http_stream_tests {
         use futures::StreamExt as _;
         use http_body::Frame;
         use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
 
         // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
@@ -9936,10 +9937,7 @@ mod tor_http_stream_tests {
             .boxed_unsync();
 
         // Create a runtime with the timer driver (required for tokio::time::timeout)
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
 
         let mut stream_box = Box::new(super::TorHttpStream {
             runtime,
@@ -9951,26 +9949,24 @@ mod tor_http_stream_tests {
         });
         let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
 
-        let mut total_read = 0;
         let mut state: u8 = 0;
 
         // Read via the FFI entry point until we hit END
         loop {
-            let slice_ptr = unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
             assert!(!slice_ptr.is_null(), "stream read should not fail");
 
-            let slice = unsafe { &*slice_ptr };
-            if state == super::TOR_HTTP_STREAM_DATA && slice.len > 0 {
-                total_read += slice.len as usize;
-            } else if state == super::TOR_HTTP_STREAM_END {
+            if state == super::TOR_HTTP_STREAM_END {
                 unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
             unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
-        // Verify we read exactly 64 KiB (the cap), then got END with status preserved
-        assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
+        // The stream's internal `read` field tracks total bytes read.
+        assert_eq!(stream_box.read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
         assert_eq!(stream_box.status, 429);
 
         // Don't free the stream (stream_box drops it)
@@ -9981,6 +9977,7 @@ mod tor_http_stream_tests {
         use futures::StreamExt as _;
         use http_body::Frame;
         use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
 
         // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
         let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
@@ -10003,10 +10000,7 @@ mod tor_http_stream_tests {
             .boxed_unsync();
 
         // Create a runtime with the timer driver (required for tokio::time::timeout)
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
 
         let mut stream_box = Box::new(super::TorHttpStream {
             runtime,
@@ -10018,26 +10012,24 @@ mod tor_http_stream_tests {
         });
         let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
 
-        let mut total_read = 0;
         let mut state: u8 = 0;
 
         // Read via the FFI entry point until we hit END
         loop {
-            let slice_ptr = unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
             assert!(!slice_ptr.is_null(), "stream read should not fail");
 
-            let slice = unsafe { &*slice_ptr };
-            if state == super::TOR_HTTP_STREAM_DATA && slice.len > 0 {
-                total_read += slice.len as usize;
-            } else if state == super::TOR_HTTP_STREAM_END {
+            if state == super::TOR_HTTP_STREAM_END {
                 unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
             unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
-        // Verify we read exactly 64 KiB (the cap), then got END with status preserved
-        assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
+        // The stream's internal `read` field tracks total bytes read.
+        assert_eq!(stream_box.read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
         assert_eq!(stream_box.status, 503);
 
         // Don't free the stream (stream_box drops it)
