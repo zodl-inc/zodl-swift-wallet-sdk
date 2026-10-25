@@ -9929,7 +9929,7 @@ mod tor_http_stream_tests {
             .collect();
         let stream = futures::stream::iter(chunks);
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
-            .map_err(|never: std::io::Error| match never.kind() {})
+            .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
             .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {
@@ -9942,7 +9942,6 @@ mod tor_http_stream_tests {
         };
 
         let mut total_read = 0;
-        let mut state = 0u8;
 
         // Read frames until we hit the cap or an error
         loop {
@@ -10011,7 +10010,7 @@ mod tor_http_stream_tests {
             .collect();
         let stream = futures::stream::iter(chunks);
         let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
-            .map_err(|never: std::io::Error| match never.kind() {})
+            .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
             .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream = super::TorHttpStream {

@@ -426,7 +426,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                 outcome_from_response(bhttp_response)?
             }
             OuterOutcome::RefetchKeyConfig => {
-                let mut outcome = OhttpOutcome {
+                let outcome = OhttpOutcome {
                     kind: OUTCOME_REFETCH_KEY,
                     status: 0,
                     headers: ptr::null_mut(),
@@ -440,7 +440,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                 outcome
             }
             OuterOutcome::Refused { status, detail } => {
-                let mut outcome = OhttpOutcome {
+                let outcome = OhttpOutcome {
                     kind: OUTCOME_REFUSED,
                     status,
                     headers: ptr::null_mut(),
@@ -454,7 +454,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
                 outcome
             }
             OuterOutcome::WrongMediaType { content_type } => {
-                let mut outcome = OhttpOutcome {
+                let outcome = OhttpOutcome {
                     kind: OUTCOME_WRONG_MEDIA_TYPE,
                     status: 0,
                     headers: ptr::null_mut(),
