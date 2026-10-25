@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 SLICES = {'ios-arm64': ('ios', None), 'ios-arm64-simulator': ('ios', 'simulator'), 'macos-arm64': ('macos', None)}
@@ -47,7 +48,7 @@ class LocalFFITests(unittest.TestCase):
         self.home = self.base / 'home'
         self.home.mkdir()
         self.log = self.base / 'calls'
-        self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.tools) + os.pathsep + os.environ['PATH'], CALLS=str(self.log))
+        self.env = dict(os.environ, **VALUES, HOME=str(self.home), PATH=str(self.tools) + os.pathsep + os.environ['PATH'], CALLS=str(self.log))
         self.env.pop('CARGO_TARGET_DIR', None)
         self.tool('python3', '#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         self.tool('uname', '#!/bin/sh\necho x86_64\n')
@@ -68,8 +69,9 @@ h.write_text('void rebuilt(void);')
 ''')
         self.tool('make', '''#!/usr/bin/env python3
 import os, pathlib, shutil, sys
-assert sys.argv[1:] == ['xcframework']
-with open(os.environ['CALLS'], 'a') as log: log.write('make\\n')
+assert sys.argv[1] == 'xcframework'
+assert sys.argv[2].startswith('FFI_CARGO_FEATURES=')
+with open(os.environ['CALLS'], 'a') as log: log.write('make ' + ' '.join(sys.argv[1:]) + '\\n')
 shutil.copytree(os.environ['MAKE_PRODUCT'], pathlib.Path('products/libzcashlc.xcframework'))
 ''')
         self.tool('gh', '''#!/usr/bin/env python3
@@ -160,6 +162,20 @@ shutil.copyfile(os.environ['ARCHIVE'], dest / 'libzcashlc.xcframework.zip')
                     if not path.startswith('libzcashlc.xcframework/' + rebuilt + '/'):
                         self.assertEqual(after[path], contents)
                 self.assertEqual(set(p.name for p in self.install.iterdir()), set(SLICES) | {'Info.plist'})
+
+    def test_trace_feature_survives_full_subset_and_gpu_rebuilds(self):
+        for args in (('--trace',), ('--arm-macos', '--trace')):
+            with self.subTest(args=args):
+                self.log.unlink(missing_ok=True)
+                self.require_ok(self.run_script('init-local-ffi.sh', *args))
+                calls = self.log.read_text()
+                if len(args) == 1:
+                    self.assertIn('make xcframework FFI_CARGO_FEATURES=ohttp-trace', calls)
+                else:
+                    self.assertIn('cargo build --locked --target aarch64-apple-darwin --release --features ohttp-trace', calls)
+        self.log.unlink()
+        self.require_ok(self.run_script('rebuild-local-ffi.sh', 'macos', '--gpu', '--trace'))
+        self.assertIn('--features gpu,ohttp-trace', self.log.read_text())
 
     def test_universal_rejected_before_external_build_or_download(self):
         self.seed()

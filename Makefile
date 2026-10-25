@@ -269,18 +269,7 @@ verify-ffi: ## Check the XCFramework exists and show its contents
 # the released binary target.
 .PHONY: configure-local-ffi
 configure-local-ffi: verify-ffi ## Point Package.swift at the locally built FFI
-	mkdir -p LocalPackages
-	# Replace rather than merge: `cp -R` into an existing xcframework leaves the
-	# previous build's slices behind, so a slice that is no longer produced keeps
-	# shadowing the current one.
-	rm -rf LocalPackages/$(notdir $(XCFRAMEWORK))
-	cp -R $(XCFRAMEWORK) LocalPackages/
-	# The release XCFramework stays shallow; only this local copy gets the
-	# versioned layout macOS apps need when embedding the framework.
-	if [ -d LocalPackages/$(notdir $(XCFRAMEWORK))/macos-arm64_x86_64/libzcashlc.framework ]; then \
-		./$(SCRIPTS)/version-macos-framework.sh LocalPackages/$(notdir $(XCFRAMEWORK))/macos-arm64_x86_64/libzcashlc.framework; \
-	fi
-	cp $(BUILD_SUPPORT)/LocalPackages-Package.swift LocalPackages/Package.swift
+	$(PYTHON) $(SCRIPTS)/lib/ffi_layout.py install "$(XCFRAMEWORK)" "$(BUILD_SUPPORT)/LocalPackages-Package.swift" LocalPackages
 	@echo "LocalPackages created; Package.swift will use the local FFI"
 
 .PHONY: clean-ffi

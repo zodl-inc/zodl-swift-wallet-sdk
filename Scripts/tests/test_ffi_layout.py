@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'Scripts/lib/ffi_layout.py'
@@ -26,7 +27,7 @@ class LayoutTests(unittest.TestCase):
         lipo = self.tools / 'lipo'
         lipo.write_text('#!/bin/sh\n[ "$1" = -archs ] || exit 7\ncat "$2"\n')
         lipo.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.tools) + os.pathsep + os.environ['PATH'])
+        self.env = dict(os.environ, **VALUES, PATH=str(self.tools) + os.pathsep + os.environ['PATH'])
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(HELPER), *map(str, args)], env=self.env, text=True, capture_output=True)
@@ -165,6 +166,7 @@ class MakePackagingTests(unittest.TestCase):
         (source / 'Scripts/lib').mkdir(parents=True)
         if HELPER.exists():
             shutil.copy(HELPER, source / 'Scripts/lib/ffi_layout.py')
+        shutil.copy(ROOT / 'Scripts/lib/ohttp_env.py', source / 'Scripts/lib/ohttp_env.py')
         (source / 'Cargo.toml').write_text('fixture')
         (source / 'rust').mkdir()
         (source / 'target/Headers').mkdir(parents=True)
@@ -202,6 +204,134 @@ else:
         self.assertEqual(set(p.name for p in product.iterdir()), {'macos-arm64', 'Info.plist'})
         info = plistlib.loads((product / 'Info.plist').read_bytes())
         self.assertEqual([i['LibraryIdentifier'] for i in info['AvailableLibraries']], ['macos-arm64'])
+
+
+class ConfigureLocalFFITests(unittest.TestCase):
+    fixture = LayoutTests.fixture
+    save = LayoutTests.save
+
+    def setUp(self):
+        LayoutTests.setUp(self)
+        self.repo = self.base / 'sdk'
+        (self.repo / 'Scripts/lib').mkdir(parents=True)
+        (self.repo / 'BuildSupport/products').mkdir(parents=True)
+        shutil.copy(ROOT / 'Makefile', self.repo / 'Makefile')
+        shutil.copy(HELPER, self.repo / 'Scripts/lib/ffi_layout.py')
+        shutil.copy(ROOT / 'Scripts/version-macos-framework.sh', self.repo / 'Scripts/version-macos-framework.sh')
+        shutil.copy(ROOT / 'BuildSupport/platform-Info.plist', self.repo / 'BuildSupport/platform-Info.plist')
+        self.product = self.repo / 'BuildSupport/products/libzcashlc.xcframework'
+        self.product.mkdir()
+        self.source_wrapper = self.repo / 'BuildSupport/LocalPackages-Package.swift'
+        self.source_wrapper.write_text('new wrapper')
+        self.local = self.repo / 'LocalPackages'
+        self.install = self.local / 'libzcashlc.xcframework'
+        self.install.mkdir(parents=True)
+        (self.install / 'previous-framework').write_text('previous framework')
+        (self.local / 'Package.swift').write_text('previous wrapper')
+
+    def configure(self, python=None):
+        return subprocess.run(['make', '-C', str(self.repo), 'configure-local-ffi',
+                               'PYTHON=' + str(python or sys.executable)],
+                              env=self.env, text=True, capture_output=True)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.local)): (os.readlink(p) if p.is_symlink() else p.read_bytes())
+                for p in self.local.rglob('*') if p.is_file() or p.is_symlink()}
+
+    def assert_preserved_failure(self, before, python=None):
+        result = self.configure(python)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        return result
+
+    def test_missing_invalid_old_and_fat_products_preserve_both_installed_paths(self):
+        for damage in ('missing-product', 'missing-manifest', 'malformed-manifest',
+                       'old-slice', 'fat-binary', 'missing-payload'):
+            with self.subTest(damage=damage):
+                shutil.rmtree(self.product, ignore_errors=True)
+                self.product.mkdir()
+                self.fixture()
+                if damage == 'missing-product':
+                    shutil.rmtree(self.product)
+                elif damage == 'missing-manifest':
+                    (self.product / 'Info.plist').unlink()
+                elif damage == 'malformed-manifest':
+                    (self.product / 'Info.plist').write_bytes(b'bad plist')
+                elif damage == 'old-slice':
+                    (self.product / 'macos-arm64').rename(self.product / 'macos-arm64_x86_64')
+                elif damage == 'fat-binary':
+                    (self.product / 'macos-arm64/libzcashlc.framework/libzcashlc').write_text('arm64 x86_64')
+                else:
+                    (self.product / 'ios-arm64/libzcashlc.framework/Headers/zcashlc.h').unlink()
+                self.assert_preserved_failure(self.snapshot())
+
+    def test_missing_wrapper_preserves_both_installed_paths(self):
+        self.fixture()
+        self.source_wrapper.unlink()
+        self.assert_preserved_failure(self.snapshot())
+
+    def test_full_and_macos_only_products_replace_previous_installation_without_rebuild(self):
+        for identifiers in (tuple(SLICES), ('macos-arm64',)):
+            with self.subTest(identifiers=identifiers):
+                shutil.rmtree(self.product)
+                self.product.mkdir()
+                self.fixture(identifiers)
+                result = self.configure()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual({p.name for p in self.install.iterdir()}, set(identifiers) | {'Info.plist'})
+                self.assertEqual((self.local / 'Package.swift').read_text(), 'new wrapper')
+                self.assertEqual((self.install / 'macos-arm64/libzcashlc.framework/libzcashlc').read_text(), 'arm64')
+
+    def test_versioning_failure_preserves_both_installed_paths(self):
+        self.fixture()
+        versioner = self.repo / 'Scripts/version-macos-framework.sh'
+        for script in ('#!/bin/sh\nexit 9\n', '#!/bin/sh\nrm "$1/Headers/zcashlc.h"\n'):
+            with self.subTest(script=script):
+                versioner.write_text(script)
+                self.assert_preserved_failure(self.snapshot())
+                self.assertTrue((self.product / 'macos-arm64/libzcashlc.framework/Headers/zcashlc.h').is_file())
+
+    def test_staged_copy_and_replacement_failures_restore_both_installed_paths(self):
+        self.fixture()
+        python = self.tools / 'failure-python'
+        python.write_text('#!' + sys.executable + '\n' + r'''
+import os, pathlib, runpy, shutil, sys
+failure = os.environ['INSTALL_FAILURE']
+copytree, copy2, replace = shutil.copytree, shutil.copy2, os.replace
+
+def fail_copytree(source, destination, *args, **kwargs):
+    if failure == 'framework-copy':
+        pathlib.Path(destination).mkdir()
+        (pathlib.Path(destination) / 'partial').write_text('partial')
+        raise OSError('injected framework copy failure')
+    return copytree(source, destination, *args, **kwargs)
+
+def fail_copy2(source, destination, *args, **kwargs):
+    if failure == 'wrapper-copy' and pathlib.Path(source).name == 'LocalPackages-Package.swift':
+        pathlib.Path(destination).write_text('partial wrapper')
+        raise OSError('injected wrapper copy failure')
+    return copy2(source, destination, *args, **kwargs)
+
+def fail_replace(source, destination, *args, **kwargs):
+    source, destination = pathlib.Path(source), pathlib.Path(destination)
+    kind = 'framework' if source.name.endswith('.xcframework') else 'wrapper'
+    action = 'backup' if source.parent.name == 'LocalPackages' else 'replace'
+    if failure == kind + '-' + action:
+        globals()['failure'] = ''
+        raise OSError('injected ' + kind + ' ' + action + ' failure')
+    return replace(source, destination, *args, **kwargs)
+
+shutil.copytree, shutil.copy2, os.replace = fail_copytree, fail_copy2, fail_replace
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+''')
+        python.chmod(0o755)
+        for failure in ('framework-copy', 'wrapper-copy', 'framework-backup',
+                        'wrapper-backup', 'framework-replace', 'wrapper-replace'):
+            with self.subTest(failure=failure):
+                self.env['INSTALL_FAILURE'] = failure
+                result = self.assert_preserved_failure(self.snapshot(), python)
+                self.assertIn('injected ' + failure.replace('-', ' ') + ' failure', result.stderr)
 
 
 if __name__ == '__main__':

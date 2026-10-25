@@ -142,6 +142,8 @@ Cached installation verifies the pinned checksum, rejects unsafe archive members
 
 Compile and test on the CLI. Use an ARM64 iOS simulator/device or Apple Silicon Mac destination. Every `xcodebuild` build/test command must include `-skipMacroValidation` and an explicit `-derivedDataPath DerivedData` (or another path outside the Xcode app's DerivedData directory). If the testing scheme is unclear, ask before running it. Do not add Intel destinations to a build or archive.
 
+For generic macOS or iOS Simulator destinations, pass `ARCHS=arm64` to the `xcodebuild` build or archive command. An Apple Silicon host alone does not restrict a generic destination to ARM64; Xcode may also request x86_64. Keep `-skipMacroValidation` and an explicit `-derivedDataPath` outside the Xcode app's DerivedData directory on these commands too.
+
 ### Opening in Xcode
 
 You can open the project two ways:

@@ -6,8 +6,10 @@ import argparse
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
+import tempfile
 from xml.parsers.expat import ExpatError
 
 SLICES = {
@@ -119,6 +121,57 @@ def validate(root, require_full=False, allow_versioned_macos=False):
     return identifiers
 
 
+def install(root, wrapper, destination):
+    """Stage a validated subset and replace both local paths with rollback."""
+    validate(root)
+    destination.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".ffi-install-", dir=str(destination)))
+    backups = []
+    installed = []
+    cleanup = True
+    try:
+        staged_framework = stage / root.name
+        staged_wrapper = stage / "Package.swift"
+        shutil.copytree(root, staged_framework, symlinks=True)
+        shutil.copy2(wrapper, staged_wrapper)
+        validate(staged_framework)
+        # Release products stay shallow. Convert only the staged local copy,
+        # so a failed conversion leaves the installed framework untouched.
+        macos = staged_framework / "macos-arm64/libzcashlc.framework"
+        if macos.is_dir():
+            versioner = Path(__file__).resolve().parents[1] / "version-macos-framework.sh"
+            result = subprocess.run(["bash", str(versioner), str(macos)], check=False)
+            if result.returncode:
+                raise LayoutError("could not version the staged macOS framework")
+        validate(staged_framework, allow_versioned_macos=True)
+        replacements = [(staged_framework, destination / root.name),
+                        (staged_wrapper, destination / "Package.swift")]
+        try:
+            for _, target in replacements:
+                if target.exists() or target.is_symlink():
+                    backup = stage / ("previous-" + target.name)
+                    os.replace(target, backup)
+                    backups.append((backup, target))
+            for source, target in replacements:
+                os.replace(source, target)
+                installed.append(target)
+        except BaseException:
+            # Keep backups available for recovery if the filesystem also refuses rollback.
+            cleanup = False
+            for target in reversed(installed):
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            for backup, target in reversed(backups):
+                os.replace(backup, target)
+            cleanup = True
+            raise
+    finally:
+        if cleanup:
+            shutil.rmtree(stage)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -129,10 +182,16 @@ def main(argv=None):
     check.add_argument("root", type=Path)
     check.add_argument("--require-full", action="store_true")
     check.add_argument("--allow-versioned-macos", action="store_true")
+    local = operations.add_parser("install")
+    local.add_argument("root", type=Path)
+    local.add_argument("wrapper", type=Path)
+    local.add_argument("destination", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.operation == "manifest":
             args.output.write_bytes(plistlib.dumps(manifest(args.identifiers)))
+        elif args.operation == "install":
+            install(args.root, args.wrapper, args.destination)
         else:
             validate(args.root, args.require_full, args.allow_versioned_macos)
     except (LayoutError, OSError, RuntimeError) as error:

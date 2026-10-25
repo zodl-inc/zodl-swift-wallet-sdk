@@ -196,7 +196,7 @@ test_ffi_hash_covers_relay_runner_source() {
     local repo before
     repo="$(_ffi_fixture)"
     before="$(_ffi_hash "$repo")"
-    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py"
+    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py"
     _assert_hash_changed "$before" "$repo" 'runner source invalidates committed native input hash'
     before="$(_ffi_hash "$repo")"
     assert_succeeds 'relay values fingerprint cache identity' test "$before" != "$(HASH_RELAY_MAINNET=https://synthetic.example.invalid _ffi_hash "$repo")"

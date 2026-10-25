@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 import zipfile
+from test_local_ffi import bundle
 
 ROOT = Path(__file__).resolve().parents[2]
 MAINNET = 'ZODL_OHTTP_RELAY_URL_MAINNET'
@@ -32,7 +33,7 @@ class NativeRelayEnvironmentTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for path in ('Makefile', 'Scripts/init-local-ffi.sh', 'Scripts/rebuild-local-ffi.sh', 'Scripts/version-macos-framework.sh',
+        for path in ('Makefile', 'Scripts/init-local-ffi.sh', 'Scripts/rebuild-local-ffi.sh', 'Scripts/version-macos-framework.sh', 'Scripts/lib/ffi_layout.py',
                      'BuildSupport/Makefile', 'BuildSupport/Info.plist', 'BuildSupport/module.modulemap', 'BuildSupport/platform-Info.plist',
                      'BuildSupport/LocalPackages-Package.swift', 'Scripts/prepare-release.sh', 'Scripts/lib/release-lib.sh'):
             dest = self.root / path
@@ -109,6 +110,14 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
         suite.parent.mkdir(parents=True)
         suite.write_text(swift.read_text().replace('swift.jsonl', 'suite.jsonl'))
         suite.chmod(0o755)
+        suite.with_name('test_environment.py').write_text(
+            'import os, unittest\n'
+            f'EXPECTED = {dict(VALUES, ZODL_OHTTP_REQUIRE="1")!r}\n'
+            'class EnvironmentTests(unittest.TestCase):\n'
+            '    def test_python_suite_receives_the_resolved_configuration(self):\n'
+            '        self.assertEqual({key: value for key, value in os.environ.items()\n'
+            '                          if key.startswith("ZODL_OHTTP_")}, EXPECTED)\n'
+        )
         self.env.update(PATH=str(tools) + os.pathsep + self.env['PATH'], ZDOTDIR=str(startup),
                         CAPTURE=str(self.root / 'cargo.jsonl'), FIXTURE_ROOT=str(self.root))
 
@@ -207,14 +216,13 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
                 calls = self.run_native(['bash', 'Scripts/init-local-ffi.sh', flag])
                 self.assertEqual([argv[argv.index('--target')+1] for argv, _ in calls], targets)
 
-    def test_rebuild_single_and_universal_slices_receive_local_exports(self):
-        (self.root / 'LocalPackages/libzcashlc.xcframework').mkdir(parents=True)
-        for target, flag, count in (('ios-device', '', 1), ('ios-sim', '', 1), ('macos', '', 1),
-                                    ('ios-sim', '--universal', 2), ('macos', '--universal', 2)):
-            with self.subTest(target=target, flag=flag):
+    def test_rebuild_arm64_slices_receive_local_exports(self):
+        bundle(self.root / 'LocalPackages/libzcashlc.xcframework')
+        for target in ('ios-device', 'ios-sim', 'macos'):
+            with self.subTest(target=target):
                 (self.root / 'cargo.jsonl').unlink(missing_ok=True)
                 command = ['bash', 'Scripts/rebuild-local-ffi.sh', target]
-                self.assertEqual(len(self.run_native(command + ([flag] if flag else []))), count)
+                self.assertEqual(len(self.run_native(command)), 1)
 
     def test_root_native_cargo_commands_receive_local_exports(self):
         for target, argv in (('build-rust', ['build']), ('build-rust-release', ['build', '--release']),
@@ -225,7 +233,7 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
                 self.assertEqual(calls[0][0], argv)
 
     def test_buildsupport_native_cargo_targets_receive_local_exports(self):
-        for target, count in (('cargo-all', 5), ('cargo-macos', 2), ('cargo-ios-device', 1), ('cargo-ios-simulator', 2)):
+        for target, count in (('cargo-all', 3), ('cargo-macos', 1), ('cargo-ios-device', 1), ('cargo-ios-simulator', 1)):
             with self.subTest(target=target):
                 (self.root / 'cargo.jsonl').unlink(missing_ok=True)
                 calls = self.run_native(['make', '-C', 'BuildSupport', target])
@@ -248,7 +256,7 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
         lipo = shims / 'lipo'
         lipo.write_text('''#!/usr/bin/env python3
 import sys
-print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
+print('arm64')
 ''')
         lipo.chmod(0o755)
         sys.path.insert(0, str(ROOT / 'Scripts/ci'))
@@ -270,11 +278,11 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
     def assert_local_copy_versioned_and_product_shallow(self):
         product = self.root / 'BuildSupport/products/libzcashlc.xcframework'
         self.assertEqual([path for path in product.rglob('*') if path.is_symlink()], [])
-        shallow = product / 'macos-arm64_x86_64/libzcashlc.framework'
+        shallow = product / 'macos-arm64/libzcashlc.framework'
         self.assertTrue((shallow / 'Info.plist').is_file())
         self.assertFalse((shallow / 'Versions').exists())
         local = self.root / 'LocalPackages/libzcashlc.xcframework'
-        macos = local / 'macos-arm64_x86_64/libzcashlc.framework'
+        macos = local / 'macos-arm64/libzcashlc.framework'
         self.assertTrue((macos / 'Versions/A/Resources/Info.plist').is_file())
         self.assertFalse((macos / 'Versions/A/Versions').exists())
         self.assertEqual(os.readlink(macos / 'Versions/Current'), 'A')
@@ -292,7 +300,7 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
         self.assertEqual(metadata['CFBundleShortVersionString'], version)
         for relative in ('libzcashlc', 'Headers/zcashlc.h', 'Modules/module.modulemap'):
             self.assertEqual((macos / relative).read_bytes(), (shallow / relative).read_bytes())
-        for identifier in ('ios-arm64', 'ios-arm64_x86_64-simulator'):
+        for identifier in ('ios-arm64', 'ios-arm64-simulator'):
             ios = local / identifier / 'libzcashlc.framework'
             original = product / identifier / 'libzcashlc.framework'
             self.assertEqual({path.name for path in ios.iterdir()},
@@ -313,9 +321,13 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
 
     def test_configure_local_ffi_without_macos_slice(self):
         self.run_native(['make', 'ffi-all'])
-        shutil.rmtree(self.root / 'BuildSupport/products/libzcashlc.xcframework/macos-arm64_x86_64')
+        product = self.root / 'BuildSupport/products/libzcashlc.xcframework'
+        shutil.rmtree(product / 'macos-arm64')
+        info = plistlib.loads((product / 'Info.plist').read_bytes())
+        info['AvailableLibraries'] = [item for item in info['AvailableLibraries'] if item['LibraryIdentifier'] != 'macos-arm64']
+        (product / 'Info.plist').write_bytes(plistlib.dumps(info))
         self.configure_local_ffi()
-        self.assertFalse((self.root / 'LocalPackages/libzcashlc.xcframework/macos-arm64_x86_64').exists())
+        self.assertFalse((self.root / 'LocalPackages/libzcashlc.xcframework/macos-arm64').exists())
 
     def test_missing_configuration_is_rejected_before_cleanup_even_with_recursion_marker(self):
         product = self.root / 'BuildSupport/products/macos/keep'
@@ -360,22 +372,28 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
 
     def test_cached_initializer_needs_no_configuration(self):
         archive = self.root / 'fixture.zip'
-        with zipfile.ZipFile(archive, 'w') as bundle:
-            bundle.writestr('libzcashlc.xcframework/Info.plist', 'cached binary')
+        product = self.root / 'cached/libzcashlc.xcframework'
+        bundle(product)
+        with zipfile.ZipFile(archive, 'w') as output:
+            for path in product.rglob('*'):
+                if path.is_file():
+                    output.write(path, str(path.relative_to(product.parent)))
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         (self.root / 'Package.swift').write_text(
-            'https://github.com/example/sdk/releases/download/1/libzcashlc.xcframework.zip\n'
+            'url: "https://github.com/example/sdk/releases/download/1/libzcashlc.xcframework.zip",\n'
             f'checksum: "{checksum}"\n')
         gh = self.root / 'bin/gh'
         gh.write_text(
             '#!/usr/bin/env python3\nimport os, pathlib, shutil, sys\n'
             'assert sys.argv[1:4] == ["release", "download", "1"]\n'
             'root=pathlib.Path(os.environ["FIXTURE_ROOT"])\n'
-            'shutil.copyfile(root/"fixture.zip", root/"LocalPackages/libzcashlc.xcframework.zip")\n')
+            'destination=pathlib.Path(sys.argv[sys.argv.index("--dir")+1])\n'
+            'shutil.copyfile(root/"fixture.zip", destination/"libzcashlc.xcframework.zip")\n')
         result = subprocess.run(['bash', 'Scripts/init-local-ffi.sh', '--cached'], cwd=self.root,
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.root / 'LocalPackages/libzcashlc.xcframework/Info.plist').read_text(), 'cached binary')
+        self.assertEqual(plistlib.loads((self.root / 'LocalPackages/libzcashlc.xcframework/Info.plist').read_bytes()),
+                         plistlib.loads((product / 'Info.plist').read_bytes()))
         self.assertTrue((self.root / 'LocalPackages/Package.swift').exists())
         self.assertFalse((self.root / 'cargo.jsonl').exists())
         self.assertFalse((self.root / 'gh.jsonl').exists())
@@ -397,7 +415,7 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
     def test_relative_script_paths_work_from_another_directory(self):
         outside = self.root / 'outside'
         outside.mkdir()
-        (self.root / 'LocalPackages/libzcashlc.xcframework').mkdir(parents=True)
+        bundle(self.root / 'LocalPackages/libzcashlc.xcframework')
         for command in (['bash', '../Scripts/init-local-ffi.sh', '--arm-macos'],
                         ['bash', '../Scripts/rebuild-local-ffi.sh', 'macos']):
             (self.root / 'cargo.jsonl').unlink(missing_ok=True)
@@ -430,7 +448,7 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
         match = re.search(r'shellScript = ("(?:\\.|[^"\\])*");', project.read_text())
         self.assertIsNotNone(match)
         script = json.loads(match.group(1))
-        (self.root / 'LocalPackages/libzcashlc.xcframework').mkdir(parents=True)
+        bundle(self.root / 'LocalPackages/libzcashlc.xcframework')
         for platform, target in (('macosx', 'aarch64-apple-darwin'), ('iphonesimulator', 'aarch64-apple-ios-sim'), ('iphoneos', 'aarch64-apple-ios')):
             with self.subTest(platform=platform):
                 self.env.update(SRCROOT=str(self.root / 'BuildSupport'), PLATFORM_NAME=platform)
