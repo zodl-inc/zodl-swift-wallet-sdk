@@ -3182,6 +3182,7 @@ dependencies = [
  "ff 0.14.0",
  "ffi_helpers",
  "fs-mistrust",
+ "futures",
  "hex",
  "http",
  "http-body-util",
