@@ -145,14 +145,6 @@ jobs:
         commit_date="$(sed -n 's/^commit-date: //p' <<< "$rustc_version" | tr -d -)"
         commit_hash="$(sed -n 's/^commit-hash: //p' <<< "$rustc_version")"
         echo "cachekey=${commit_date}${commit_hash:0:4}" >> "$GITHUB_OUTPUT"
-          target
-          ~/.cargo/bin
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/registry/src
-        key: codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-        restore-keys: |
-          codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-
 
     # The arm64 macOS slice without fat LTO is all the Swift build needs for
     # analysis; the universal LTO build used to run into the 30-minute limit.
