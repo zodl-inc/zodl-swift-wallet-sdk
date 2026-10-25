@@ -9908,6 +9908,7 @@ mod tor_http_stream_tests {
     #[test]
     fn streaming_tor_error_response_body_capped_at_64_kib() {
         use futures::StreamExt as _;
+        use http_body::Frame;
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
 
@@ -9927,9 +9928,7 @@ mod tor_http_stream_tests {
             })
             .collect();
         let stream = futures::stream::iter(chunks);
-        let body = http_body_util::StreamBody::new(
-            stream.map(|chunk| chunk.map(http_body_util::Frame::data)),
-        )
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
         .map_err(|never: std::io::Error| match never.kind() {})
         .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
@@ -9991,6 +9990,7 @@ mod tor_http_stream_tests {
     #[test]
     fn streaming_tor_503_response_body_capped_at_64_kib() {
         use futures::StreamExt as _;
+        use http_body::Frame;
         use http_body_util::BodyExt;
         use tor_rtcompat::ToplevelBlockOn as _;
 
@@ -10010,9 +10010,7 @@ mod tor_http_stream_tests {
             })
             .collect();
         let stream = futures::stream::iter(chunks);
-        let body = http_body_util::StreamBody::new(
-            stream.map(|chunk| chunk.map(http_body_util::Frame::data)),
-        )
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
         .map_err(|never: std::io::Error| match never.kind() {})
         .boxed_unsync();
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
