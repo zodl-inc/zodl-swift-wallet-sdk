@@ -9961,7 +9961,7 @@ mod tor_http_stream_tests {
                 unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
-            unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
         // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
@@ -10024,7 +10024,7 @@ mod tor_http_stream_tests {
                 unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
                 break;
             }
-            unsafe { super::zcashlc_free_boxed_slice(slice_ptr) };
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
         }
 
         // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
