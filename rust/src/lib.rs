@@ -9915,8 +9915,11 @@ mod tor_http_stream_tests {
             .unwrap();
 
         // Create a 429 response with a body larger than 64 KiB
-        let large_body = bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024]);
-        let body = http_body_util::Full::new(large_body).map_err(super::HttpError::from).boxed_unsync();
+        let large_body =
+            bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024]);
+        let body = http_body_util::Full::new(large_body)
+            .map_err(super::HttpError::from)
+            .boxed_unsync();
         let mut stream = super::TorHttpStream {
             runtime: rt.handle().clone().into(),
             status: 429,
@@ -9932,10 +9935,9 @@ mod tor_http_stream_tests {
         // Read frames until we hit the cap or an error
         loop {
             let result = rt.block_on(async {
-                let next = tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    stream.body.frame()
-                ).await;
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), stream.body.frame())
+                        .await;
                 match next {
                     Ok(Some(frame)) => {
                         let frame = frame.unwrap();
@@ -9982,8 +9984,11 @@ mod tor_http_stream_tests {
             .unwrap();
 
         // Create a 503 response with a body larger than 64 KiB
-        let large_body = bytes::Bytes::from(vec![b'y'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048]);
-        let body = http_body_util::Full::new(large_body).map_err(super::HttpError::from).boxed_unsync();
+        let large_body =
+            bytes::Bytes::from(vec![b'y'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048]);
+        let body = http_body_util::Full::new(large_body)
+            .map_err(super::HttpError::from)
+            .boxed_unsync();
         let mut stream = super::TorHttpStream {
             runtime: rt.handle().clone().into(),
             status: 503,
@@ -9998,10 +10003,9 @@ mod tor_http_stream_tests {
         // Read frames until we hit the cap
         loop {
             let result = rt.block_on(async {
-                let next = tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    stream.body.frame()
-                ).await;
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), stream.body.frame())
+                        .await;
                 match next {
                     Ok(Some(frame)) => {
                         let frame = frame.unwrap();

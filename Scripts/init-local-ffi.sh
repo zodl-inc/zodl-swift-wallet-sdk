@@ -115,7 +115,6 @@ build_arm_xcframework() {
         rustup target add "$rust_target"
         # $FEATURE_ARGS is intentionally unquoted (empty = no extra args).
         cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
->>>>>>> origin/main
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"

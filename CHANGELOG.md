@@ -196,7 +196,6 @@ Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3525000.json
   preparing; without that switch the next wallet stays on the server in use before the wipe, as
   before. A switch made while that `prepare` is opening the engine is applied once the engine is
   open, so the engine ends on the server of the last switch. `SDKSynchronizer` is unaffected.
-=======
 - Errors from importing or decoding a unified viewing key no longer contain the key. The `rustError`
   of `ZcashError.rustImportAccountUfvk`, `rustDeriveAddressFromUfvk` and `rustSlipstreamStart` used
   to repeat the value that failed to decode, followed by the decoder's description of it; it is now
@@ -250,7 +249,6 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4510000.json
 ...
 Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4520000.json
 ````
->>>>>>> origin/main
 
 # 5.2.1 - 2026-10-14
 
