@@ -5001,11 +5001,18 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
 
         let TorHttpStream {
             runtime,
+            status,
             body,
             read,
             max_bytes,
             ..
         } = stream;
+        let is_error = *status < 200 || *status >= 300;
+        let effective_limit = if is_error {
+            TOR_HTTP_MAX_ERROR_BODY_BYTES
+        } else {
+            *max_bytes
+        };
         let next = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_millis(wait_ms), body.frame()).await
         });
@@ -5022,10 +5029,12 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                 let frame = frame?;
                 match frame.into_data() {
                     Ok(data) if !data.is_empty() => {
-                        if data.len() > *max_bytes - *read {
-                            return Err(anyhow!(
-                                "Tor HTTP response body exceeds {max_bytes} bytes"
-                            ));
+                        if data.len() > effective_limit - *read {
+                            return if is_error {
+                                Err(anyhow!("Tor HTTP error response (status {status})"))
+                            } else {
+                                Err(anyhow!("Tor HTTP response body exceeds {max_bytes} bytes"))
+                            };
                         }
                         *read += data.len();
                         *state = TOR_HTTP_STREAM_DATA;
@@ -9895,5 +9904,138 @@ mod tor_http_stream_tests {
         ] {
             assert!(retry_if_unsent(Ok(status)).is_none());
         }
+    }
+
+    #[test]
+    fn streaming_tor_error_response_body_capped_at_64_kib() {
+        use http_body_util::BodyExt;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Create a 429 response with a body larger than 64 KiB
+        let large_body = bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024]);
+        let body = http_body_util::Full::new(large_body).map_err(super::HttpError::from).boxed_unsync();
+        let mut stream = super::TorHttpStream {
+            runtime: rt.handle().clone().into(),
+            status: 429,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024, // 257 MiB relay response limit
+        };
+
+        let mut total_read = 0;
+        let mut state = 0u8;
+
+        // Read frames until we hit the cap or an error
+        loop {
+            let result = rt.block_on(async {
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    stream.body.frame()
+                ).await;
+                match next {
+                    Ok(Some(frame)) => {
+                        let frame = frame.unwrap();
+                        match frame.into_data() {
+                            Ok(data) if !data.is_empty() => {
+                                let is_error = stream.status < 200 || stream.status >= 300;
+                                let effective_limit = if is_error {
+                                    super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+                                } else {
+                                    stream.max_bytes
+                                };
+                                if data.len() > effective_limit - stream.read {
+                                    return Err(format!("status {}", stream.status));
+                                }
+                                stream.read += data.len();
+                                total_read += data.len();
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                    }
+                    Ok(None) => Ok(()),
+                    Err(_) => Ok(()),
+                }
+            });
+
+            if let Err(err_msg) = result {
+                // Verify we got the status error, not a size-limit error
+                assert_eq!(err_msg, "status 429");
+                break;
+            }
+        }
+
+        // Verify we read up to the 64 KiB cap
+        assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+    }
+
+    #[test]
+    fn streaming_tor_503_response_body_capped_at_64_kib() {
+        use http_body_util::BodyExt;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Create a 503 response with a body larger than 64 KiB
+        let large_body = bytes::Bytes::from(vec![b'y'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048]);
+        let body = http_body_util::Full::new(large_body).map_err(super::HttpError::from).boxed_unsync();
+        let mut stream = super::TorHttpStream {
+            runtime: rt.handle().clone().into(),
+            status: 503,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024,
+        };
+
+        let mut total_read = 0;
+
+        // Read frames until we hit the cap
+        loop {
+            let result = rt.block_on(async {
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    stream.body.frame()
+                ).await;
+                match next {
+                    Ok(Some(frame)) => {
+                        let frame = frame.unwrap();
+                        match frame.into_data() {
+                            Ok(data) if !data.is_empty() => {
+                                let is_error = stream.status < 200 || stream.status >= 300;
+                                let effective_limit = if is_error {
+                                    super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+                                } else {
+                                    stream.max_bytes
+                                };
+                                if data.len() > effective_limit - stream.read {
+                                    return Err(format!("status {}", stream.status));
+                                }
+                                stream.read += data.len();
+                                total_read += data.len();
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                    }
+                    Ok(None) => Ok(()),
+                    Err(_) => Ok(()),
+                }
+            });
+
+            if let Err(err_msg) = result {
+                // Verify we got the status error
+                assert_eq!(err_msg, "status 503");
+                break;
+            }
+        }
+
+        // Verify we read exactly 64 KiB
+        assert_eq!(total_read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
     }
 }
