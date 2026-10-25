@@ -214,12 +214,12 @@ strip = false
 
 [patch.crates-io]
 # The slipstream engine's OHTTP connector for 0.4.0-pre.2 lives in slipstream-internal
-# PR #26 (head 1e091f08: PR #16 frozen at f3e1f765, plus enhancement fetches capped at 8 with a
+# PR #26 (head 719076cb: PR #16 frozen at f3e1f765, plus measured per-chunk scan CPU, enhancement fetches capped at 8 with a
 # per-txid retry that no longer fails the pass, one h2 dial per relay at a time, mempool monitoring
 # re-armed after an outage) with public slipstream 0.4.0-pre.2 merged: the relay dispatch hook runs
 # right before the sealed request is written, and an HTTP answer is read only up to the caller's
 # ceiling.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "1e091f086b2f7c1f8ef806a98af05f2f2998c627" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "719076cb5a407893f88704156cc0b34071d7b918" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
