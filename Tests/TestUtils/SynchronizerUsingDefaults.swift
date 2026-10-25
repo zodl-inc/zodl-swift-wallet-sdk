@@ -156,4 +156,5 @@ final class SynchronizerUsingDefaults: Synchronizer {
     func fetchUTXOsBy(address: String, accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult { Self.unused() }
     func enhanceTransactionBy(txId: TxId) async throws { Self.unused() }
     func deleteAccount(_ accountUUID: AccountUUID) async throws { Self.unused() }
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws { Self.unused() }
 }
