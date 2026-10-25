@@ -12,7 +12,7 @@ _ffi_fixture() {
     for input in Cargo.toml Cargo.lock Makefile rust/lib.rs BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py BuildSupport/ohttp-config-version; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py BuildSupport/ohttp-config-version; do
         printf 'fixture\n' > "$repo/$input"
     done
     printf 'BuildSupport/products/\n' > "$repo/.gitignore"
@@ -56,7 +56,7 @@ test_ffi_hash_covers_packaging() {
     local repo input before
     repo="$(_ffi_fixture)"
     for input in BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
-        BuildSupport/platform-Info.plist Scripts/version-macos-framework.sh; do
+        BuildSupport/platform-Info.plist Scripts/version-macos-framework.sh Scripts/lib/ffi_layout.py; do
         before="$(_ffi_hash "$repo")"
         printf 'changed\n' >> "$repo/$input"
         _assert_hash_changed "$before" "$repo" "hash changes for $input"
@@ -108,7 +108,7 @@ test_ffi_hash_rejects_invalid_inputs() {
     for input in Cargo.toml Cargo.lock Makefile rust BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py BuildSupport/ohttp-config-version; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py BuildSupport/ohttp-config-version; do
         copy="$(mktemp -d "$SCRATCH/ffi-missing.XXXXXX")"
         git clone -q "$repo" "$copy"
         git -C "$copy" rm -qr "$input"
@@ -196,7 +196,7 @@ test_ffi_hash_covers_relay_runner_source() {
     local repo before
     repo="$(_ffi_fixture)"
     before="$(_ffi_hash "$repo")"
-    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py"
+    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py"
     _assert_hash_changed "$before" "$repo" 'runner source invalidates committed native input hash'
     before="$(_ffi_hash "$repo")"
     assert_succeeds 'relay values fingerprint cache identity' test "$before" != "$(HASH_RELAY_MAINNET=https://synthetic.example.invalid _ffi_hash "$repo")"

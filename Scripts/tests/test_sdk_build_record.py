@@ -36,9 +36,11 @@ if name == "make":
     if target == "ffi-all":
         slices = {
             "ios-arm64": ("ios", None, ["arm64"]),
-            "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]),
-            "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"]),
+            "ios-arm64-simulator": ("ios", "simulator", ["arm64"]),
+            "macos-arm64": ("macos", None, ["arm64"]),
         }
+        if os.environ.get("OLD_UNIVERSAL"):
+            slices = {"ios-arm64": ("ios", None, ["arm64"]), "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]), "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"])}
         libraries = []
         for identifier, (platform, variant, arches) in slices.items():
             if os.environ.get("MISSING_SLICE") == identifier:
@@ -66,6 +68,10 @@ if name == "make":
             (framework / "Modules/module.modulemap").write_text("module wrong {}")
         if broken == "plist":
             (framework / "Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "999"}))
+        if os.environ.get("FAT_ARCH"):
+            (product / "macos-arm64/libzcashlc.framework/libzcashlc").write_text("arm64 x86_64")
+        if os.environ.get("STALE_EXTRA"):
+            (product / "macos-arm64_x86_64").mkdir()
         if os.environ.get("WRONG_ARCH"):
             (product / "ios-arm64/libzcashlc.framework/libzcashlc").write_text("x86_64")
         if os.environ.get("MUTATE_SOURCE") == target:
@@ -292,7 +298,8 @@ if sys.argv[1:] == ["--version"]:
         self.assertEqual(self.make_calls(), [[target] for target in TARGETS])
         self.assertEqual(proof["commands"], [["make", target] for target in TARGETS])
         self.assertEqual(proof["component_versions"], dict(cargo="5.0.0", lock="5.0.0", plist_short="5.0.0", plist_build="42"))
-        self.assertEqual(len(proof["slices"]), 3)
+        self.assertEqual({s["identifier"] for s in proof["slices"]}, {"ios-arm64", "ios-arm64-simulator", "macos-arm64"})
+        self.assertTrue(all(s["architectures"] == ["arm64"] for s in proof["slices"]))
         self.assertEqual(proof["execution"], dict(backend="local", request_id="c"*32, workflow=None))
         self.assertTrue(all(proof["toolchains"].values()))
         self.assertFalse((self.source / "LocalPackages").exists())
@@ -413,6 +420,14 @@ if sys.argv[1:] == ["--version"]:
         result = self.artifacts(WRONG_ARCH="1")
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_release_write()
+
+    def test_universal_fat_and_stale_extra_products_are_rejected(self):
+        for variable in ("OLD_UNIVERSAL", "FAT_ARCH", "STALE_EXTRA"):
+            with self.subTest(variable=variable):
+                self.ghlog.unlink(missing_ok=True)
+                result = self.artifacts(**{variable: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_no_release_write()
 
     def test_symlink_product_is_rejected(self):
         result = self.artifacts(SYMLINK_PRODUCT="1")

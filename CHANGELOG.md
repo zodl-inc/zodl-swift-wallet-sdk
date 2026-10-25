@@ -73,6 +73,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- The FFI XCFramework now supports ARM64 only on iOS devices, iOS simulators, and macOS.
+  Intel Macs and x86_64 simulators are no longer supported. Use an Apple Silicon Mac and an
+  ARM64 simulator; macOS 14 and iOS 16 remain the minimum versions.
+
 - Custom `Synchronizer` conformers and test doubles must implement
   `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)`;
   existing conformances without these

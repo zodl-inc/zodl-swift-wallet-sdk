@@ -42,9 +42,9 @@ test_ffi_ci_clears_the_macos_products_before_building() {
     assert_succeeds "the removal comes before the build" test "${rm_line:-0}" -lt "${make_line:-0}"
 }
 
-test_ffi_macos_still_builds_both_macos_architectures_with_lto() {
+test_ffi_macos_builds_only_arm64_with_lto() {
     local f; f="$(_dry_run ffi-macos)"
-    assert_file_contains "$f" "target x86_64-apple-darwin" "make ffi-macos still builds x86_64"
+    assert_file_lacks "$f" "target x86_64-apple-darwin" "make ffi-macos excludes x86_64"
     assert_file_contains "$f" "target aarch64-apple-darwin" "make ffi-macos still builds arm64"
     assert_file_lacks "$f" "CARGO_PROFILE_RELEASE_LTO" "make ffi-macos keeps the release profile's lto"
 }
@@ -319,7 +319,7 @@ test_ci_cache_keys_include_complete_rust_identity() {
             assert_file_contains "$SCRATCH/rust-key.txt" '${{ steps.toolchain.outputs.cachekey }}' 'all compiled keys and fallbacks constrain Rust'
         done <<< "$lines"
     done
-    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
+    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
 }
 
 test_ci_cache_rust_identity_changes_for_verbose_fields() {
@@ -395,7 +395,7 @@ test_codeql_validation_is_required_on_ffi_cache_hits() {
 test_ci_cache_release_keeps_publication_and_targets() {
     local workflow
     workflow="$(_build_ffi_workflow)"
-    assert_file_contains "$workflow" 'target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin' 'release retains all five architecture targets'
+    assert_file_contains "$workflow" 'target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin' 'release installs all three ARM targets'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"' 'release force publication command is preserved'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts "$VERSION"' 'release publication command is preserved'
 }
@@ -624,4 +624,35 @@ test_ohttp_e2e_push_trigger_tracks_integration_branch() {
           abort "wrong integration branch" unless trigger.fetch("push").fetch("branches") == ["feature/ohttp"]
           abort "manual dispatch removed" unless trigger.key?("workflow_dispatch")
         ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+test_ci_full_build_excludes_intel_targets() {
+    assert_file_lacks "$(_dry_run ffi-all)" 'target x86_64-' 'full builds compile no Intel target'
+    assert_file_lacks "$(_build_ffi_workflow)" 'x86_64-apple-' 'release setup installs no Intel target'
+}
+
+# A newly added Python suite must be discovered by the same entrypoint CI runs.
+test_ci_make_test_scripts_discovers_python_regressions() {
+    local repo output
+    repo="$(mktemp -d "$SCRATCH/python-entrypoint.XXXXXX")"
+    mkdir -p "$repo/Scripts/tests"
+    cp "$REPO_ROOT/Makefile" "$repo/Makefile"
+    printf '#!/bin/sh\nexit 0\n' > "$repo/Scripts/tests/run-tests.sh"
+    chmod +x "$repo/Scripts/tests/run-tests.sh"
+    printf 'import unittest\nclass Regression(unittest.TestCase):\n    def test_future_regression(self):\n        self.fail("python discovery sentinel")\n' > "$repo/Scripts/tests/test_future.py"
+    output="$repo/output"
+    if make -C "$repo" test-scripts "PYTHON=${PYTHON:-python3}" > "$output" 2>&1; then
+        _fail 'make test-scripts must fail when a discovered Python regression fails'
+    fi
+    assert_file_contains "$output" 'python discovery sentinel' 'ordinary script test entrypoint reaches new Python suites'
+}
+
+test_ci_install_excludes_intel_rust_targets() {
+    local output
+    output="$SCRATCH/install-targets.txt"
+    make -C "$REPO_ROOT/BuildSupport" -n install > "$output" 2>/dev/null
+    assert_file_lacks "$output" 'x86_64-apple-' 'BuildSupport install sets up only ARM targets'
+    assert_file_contains "$output" 'aarch64-apple-ios' 'device target remains available'
+    assert_file_contains "$output" 'aarch64-apple-ios-sim' 'simulator target remains available'
+    assert_file_contains "$output" 'aarch64-apple-darwin' 'macOS target remains available'
 }

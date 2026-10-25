@@ -63,7 +63,7 @@ jobs:
           app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
-      # Release builds retain every existing Apple target.
+      # Release builds support all three ARM64 Apple platforms.
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
@@ -72,7 +72,7 @@ jobs:
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update \
-            --target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin
+            --target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
 
       - name: Validate Rust
         id: toolchain
@@ -106,9 +106,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
 
       - name: Build and upload draft release
         env:
