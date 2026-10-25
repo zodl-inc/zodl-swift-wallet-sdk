@@ -214,6 +214,7 @@ lto = true
 # output is aligned. The static libraries the SDK ships were never stripped, so this setting does
 # not apply to them.
 [profile.release.build-override]
+strip = false
 
 [patch.crates-io]
 # Slipstream 0.4.0-pre.2 OHTTP transport (zodl-inc/slipstream-internal PR #26) with
