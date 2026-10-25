@@ -9908,6 +9908,7 @@ mod tor_http_stream_tests {
     #[test]
     fn streaming_tor_error_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
+        use tor_rtcompat::ToplevelBlockOn as _;
 
         // Create a 429 response with a body larger than 64 KiB
         let large_body =
@@ -9974,6 +9975,7 @@ mod tor_http_stream_tests {
     #[test]
     fn streaming_tor_503_response_body_capped_at_64_kib() {
         use http_body_util::BodyExt;
+        use tor_rtcompat::ToplevelBlockOn as _;
 
         // Create a 503 response with a body larger than 64 KiB
         let large_body =
