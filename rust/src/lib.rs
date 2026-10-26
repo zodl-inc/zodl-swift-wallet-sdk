@@ -10051,8 +10051,9 @@ mod tor_http_stream_tests {
 
         // A 200 whose body exceeds the caller's ceiling must fail the read (the 64 KiB
         // truncation is only for error statuses): 8 chunks of 1 KiB against a 4 KiB ceiling.
-        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-            (0..8).map(|_| Ok(bytes::Bytes::from(vec![b'z'; 1024]))).collect();
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..8)
+            .map(|_| Ok(bytes::Bytes::from(vec![b'z'; 1024])))
+            .collect();
         let body = http_body_util::StreamBody::new(
             futures::stream::iter(chunks).map(|chunk| chunk.map(Frame::data)),
         )
@@ -10081,7 +10082,10 @@ mod tor_http_stream_tests {
             }
             let ended = state == super::TOR_HTTP_STREAM_END;
             unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
-            assert!(!ended, "a success body past the ceiling must not end normally");
+            assert!(
+                !ended,
+                "a success body past the ceiling must not end normally"
+            );
         }
         assert!(failed, "the read past the ceiling must fail");
         assert_eq!(stream_box.read, 4 * 1024);
