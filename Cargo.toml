@@ -223,7 +223,7 @@ strip = false
 # Slipstream 0.4.0-pre.2 OHTTP transport (zodl-inc/slipstream-internal PR #26) with
 # zodl-inc/slipstream 58647969 merged (the public facades that implement
 # `WalletWrite::set_account_name`, which main now requires). slipstream-internal rev
-# be313a7f replaces both the published `zodl-slipstream` and main's public patch: it
+# 36c8b2e3 replaces both the published `zodl-slipstream` and main's public patch: it
 # contains our OHTTP connector frozen at f3e1f765, measured per-chunk scan CPU,
 # bounded enhancement fetches with per-txid retry, one h2 dial per relay at a time,
 # mempool re-arm after outage, relay dispatch hook before sealed request write, HTTP
@@ -231,8 +231,9 @@ strip = false
 # one pooled relay connection with bulk block streams on their own connection, one Tor
 # session connection for public sync metadata, the engine Tor client reused across
 # sessions, an own Tor circuit per fetch worker, enhancement skip-guard and round fixes,
-# and isolated fetch concurrency 8.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "be313a7fe140a5241e05ebd6963f08ef263b55b4" }
+# isolated fetch concurrency 8, and SQLite checkpoint/cache tuning with per-chunk
+# persist timings.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "36c8b2e3f5086f0104a85824ff0cbb057ef0b203" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
