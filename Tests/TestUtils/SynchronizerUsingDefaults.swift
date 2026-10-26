@@ -55,12 +55,6 @@ final class SynchronizerUsingDefaults: Synchronizer {
         spendingKey: UnifiedSpendingKey
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> { Self.unused() }
 
-    func createProposedTransactions(
-        proposal: Proposal,
-        spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
-    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> { Self.unused() }
-
     func proposefulfillingPaymentURI(_ uri: String, accountUUID: AccountUUID) async throws -> Proposal { Self.unused() }
 
     func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt { Self.unused() }
@@ -73,14 +67,6 @@ final class SynchronizerUsingDefaults: Synchronizer {
         pcztWithSigs: Pczt
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> { Self.unused() }
 
-    func signPCZTWithLedger(
-        pczt: Pczt,
-        accountUUID: AccountUUID,
-        binding: LedgerAccountBinding,
-        transport: LedgerAPDUTransport,
-        progress: (@Sendable (LedgerSigningProgress) -> Void)?
-    ) async throws -> Pczt { Self.unused() }
-
     var transactions: [ZcashTransaction.Overview] { get async { Self.unused() } }
     var sentTransactions: [ZcashTransaction.Overview] { get async { Self.unused() } }
     var receivedTransactions: [ZcashTransaction.Overview] { get async { Self.unused() } }
@@ -91,16 +77,13 @@ final class SynchronizerUsingDefaults: Synchronizer {
     func getMemos(for transaction: ZcashTransaction.Overview) async throws -> [Memo] { Self.unused() }
     func getRecipients(for transaction: ZcashTransaction.Overview) async -> [TransactionRecipient] { Self.unused() }
     func getTransactionOutputs(for transaction: ZcashTransaction.Overview) async -> [ZcashTransaction.Output] { Self.unused() }
-    func getTransactionOutputs(for transactions: [ZcashTransaction.Overview]) async -> [Data: [ZcashTransaction.Output]] { Self.unused() }
     func allTransactions() async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func allTransactions(from transaction: ZcashTransaction.Overview, limit: Int) async throws -> [ZcashTransaction.Overview] { Self.unused() }
     func latestHeight() async throws -> BlockHeight { Self.unused() }
     func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs { Self.unused() }
     func getAccountsBalances() async throws -> [AccountUUID: AccountBalance] { Self.unused() }
-    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? { Self.unused() }
     func refreshExchangeRateUSD() { Self.unused() }
     func listAccounts() async throws -> [Account] { Self.unused() }
-    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? { Self.unused() }
 
     func importAccount(
         ufvk: String,
@@ -167,5 +150,4 @@ final class SynchronizerUsingDefaults: Synchronizer {
     func fetchUTXOsBy(address: String, accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult { Self.unused() }
     func enhanceTransactionBy(txId: TxId) async throws { Self.unused() }
     func deleteAccount(_ accountUUID: AccountUUID) async throws { Self.unused() }
-    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws { Self.unused() }
 }
