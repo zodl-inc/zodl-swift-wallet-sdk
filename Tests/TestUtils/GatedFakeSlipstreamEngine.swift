@@ -142,6 +142,21 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         }
     }
 
+    /// Convenience property for tests to control whether stops are quiescent. When false, returns
+    /// `.passStillRunning` to simulate a non-quiescent stop.
+    nonisolated var stopQuiescent: Bool {
+        get {
+            stopReportLock.lock()
+            defer { stopReportLock.unlock() }
+            return stopReportStorage.isQuiescent
+        }
+        set {
+            stopReportLock.lock()
+            stopReportStorage = newValue ? .quiescent : .passStillRunning
+            stopReportLock.unlock()
+        }
+    }
+
     private nonisolated let stopReportLock = NSLock()
     private nonisolated(unsafe) var stopReportStorage = SlipstreamStopReport.quiescent
 
