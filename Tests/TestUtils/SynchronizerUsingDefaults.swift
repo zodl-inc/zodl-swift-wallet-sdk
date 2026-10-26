@@ -141,12 +141,23 @@ final class SynchronizerUsingDefaults: Synchronizer {
     func exchangeRateOverTor(enabled: Bool) async throws { Self.unused() }
     func isTorSuccessfullyInitialized() async -> Bool? { Self.unused() }
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+    func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse { Self.unused() }
 
     func httpGetOverTor(
         for request: URLRequest,
         retryLimit: UInt8,
         timeoutMilliseconds: UInt64
     ) async throws -> (data: Data, response: HTTPURLResponse) { Self.unused() }
+
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        isCustomServer: Bool,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession { Self.unused() }
 
     func debugDatabase(sql: String) -> String { Self.unused() }
 
