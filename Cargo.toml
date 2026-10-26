@@ -233,7 +233,7 @@ strip = false
 # sessions, an own Tor circuit per fetch worker, enhancement skip-guard and round fixes,
 # isolated fetch concurrency 8, and SQLite checkpoint/cache tuning with per-chunk
 # persist timings.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "36c8b2e3f5086f0104a85824ff0cbb057ef0b203" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "019cbb4bd9a82060bdf4648a8ef4e71a0a0468fa" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
