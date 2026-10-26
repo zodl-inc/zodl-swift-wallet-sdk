@@ -5030,10 +5030,18 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                 match frame.into_data() {
                     Ok(data) if !data.is_empty() => {
                         let remaining = effective_limit.saturating_sub(*read);
+                        if data.len() > remaining && !is_error {
+                            // A success body past the caller's ceiling fails the call: the
+                            // client must not accept a truncated sealed response.
+                            return Err(anyhow!(
+                                "Tor HTTP response body exceeds {max_bytes} bytes"
+                            ));
+                        }
                         if data.len() > remaining {
-                            // Truncate to the cap, return the truncated data, and mark END so the
-                            // next read returns end-of-stream. This preserves status/headers for
-                            // classification rather than failing with a size error (ZIP #10).
+                            // An error body (non-2xx) is cut at the 64 KiB guard: return the bytes
+                            // up to the cap and mark END, so the status and headers still reach the
+                            // classifier (key refetch on 400/422, HTTP status on 429/503) instead
+                            // of a size error (ZIP #10).
                             let truncated = &data[..remaining];
                             *read += truncated.len();
                             *state = TOR_HTTP_STREAM_END;
@@ -10033,5 +10041,49 @@ mod tor_http_stream_tests {
         assert_eq!(stream_box.status, 503);
 
         // Don't free the stream (stream_box drops it)
+    }
+
+    #[test]
+    fn streaming_tor_success_body_past_the_ceiling_fails() {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+
+        // A 200 whose body exceeds the caller's ceiling must fail the read (the 64 KiB
+        // truncation is only for error statuses): 8 chunks of 1 KiB against a 4 KiB ceiling.
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            (0..8).map(|_| Ok(bytes::Bytes::from(vec![b'z'; 1024]))).collect();
+        let body = http_body_util::StreamBody::new(
+            futures::stream::iter(chunks).map(|chunk| chunk.map(Frame::data)),
+        )
+        .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+        .boxed_unsync();
+
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
+        let mut stream_box = Box::new(super::TorHttpStream {
+            runtime,
+            status: 200,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 4 * 1024,
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
+        let mut state: u8 = 0;
+
+        let mut failed = false;
+        for _ in 0..16 {
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            if slice_ptr.is_null() {
+                failed = true;
+                break;
+            }
+            let ended = state == super::TOR_HTTP_STREAM_END;
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+            assert!(!ended, "a success body past the ceiling must not end normally");
+        }
+        assert!(failed, "the read past the ceiling must fail");
+        assert_eq!(stream_box.read, 4 * 1024);
     }
 }
