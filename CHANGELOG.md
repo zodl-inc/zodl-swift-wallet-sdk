@@ -89,16 +89,28 @@ Changes are relative to `5.2.0`.
   has accepted, in this submission or earlier (including by background resubmission), is
   `.accepted(by:)` whatever another refusal says, and a terminal refusal the SDK did not record,
   because another endpoint's submission failed at the transport level, is `.timedOut` (pending). Migration preparations
-  keep reporting the first refusal, as before. Each kind is recognized from an explicit list of
-  server messages under error code `-25` or `-26`: `.tooLarge` names the configured mempool
-  maximum, the next block's ZIP 218 limit or the transaction size limit (`tx-size`,
-  `bad-txns-oversize`, too large); `.expired` names an expiry (`greater than its expiry`,
-  `tx-overwinter-expired`, `tx-expiring-soon`); `.invalid` is a `-26` naming a known permanent
-  refusal (`bad-txns-`, `invalid`, `non-final`, `mandatory-script-verify-flag`). Every other
-  failure is transient, including a transport error, an unrecognized `-26`, and refusals over the
-  mempool fee, an unconfirmed chain limit, a transaction already known or in the mempool, a
-  mempool conflict, or missing inputs. These lists are the SDK's reading of the node
-  implementations and still need their confirmation.
+  keep reporting the first refusal, as before. A refusal is terminal only if the transaction can
+  never become valid on a later attempt; each kind is recognized from an explicit list of zcashd
+  and Zebra messages (the lists live in one place, `SubmitRefusal`, with each entry's source, and
+  match the Android SDK's). Under error code `-25` or `-26`: `.tooLarge` names a size limit (a
+  relay's `exceeding the configured mempool maximum`, Zebra's `ZIP 218` limit, zcashd's
+  `bad-txns-oversize`); `.expired` names an expiry (`tx-overwinter-expired`, `tx-expiring-soon`,
+  `expired`, Zebra's `greater than its expiry`); `.invalid` names only a signature, proof or
+  structural failure (zcashd's `bad-txns-invalid-joinsplit-signature`, `bad-txns-joinsplit-`,
+  `bad-txns-sapling-bundle-invalid`, `bad-sapling-bundle-authorization`,
+  `bad-orchard-bundle-authorization`, `bad-txns-vout-`, `bad-txns-txouttotal-toolarge`,
+  `bad-txns-txintotal-toolarge`, `mandatory-script-verify-flag-failed`, `bad-txns-no-`,
+  `tx-version`, `bad-tx-`; Zebra's `MUST represent a valid signature`, `proof MUST be valid`,
+  `proof is malformed`, `proof or signature verification failed`, `proof verification failed`,
+  `proof has a non-canonical size`). A refusal saying the server already holds the transaction
+  (`already-in`, `txn-already-known`, `already in block chain`, Zebra's
+  `already exists in mempool`), under any code, counts as that server's acceptance. Every other
+  failure is inconclusive and the transaction keeps being resubmitted: a transport error, a
+  refusal that depends on the server's view of the chain or its mempool (`unknown-anchor`, as when
+  the server has not reached the wallet's anchor yet, `duplicate-nullifier`, `inputs-spent`,
+  `inputs-missingorspent`, `txn-mempool-conflict`, `Missing inputs`, `min relay fee`,
+  `too-long-mempool-chain`, `non-final`), and any unrecognized refusal. These lists are the SDK's
+  reading of the node implementations and still need confirmation from the node teams.
 - `GiftCardRedeemer.redeemProgress()` returns an `AsyncStream<RedeemProgress>` reporting each
   redemption round when its transactions are submitted and when they are mined, with the
   transactions' ids and the notes and value the card still holds (`remainingNotes`,
