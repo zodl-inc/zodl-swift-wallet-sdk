@@ -234,7 +234,7 @@ strip = false
 # isolated fetch concurrency 8, SQLite checkpoint/cache tuning with per-chunk
 # persist timings, persist commits decoupled from the OHTTP window, and HTTP/2
 # keepalive PINGs on pooled relay connections (29626a86).
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "29626a864a7e420d82c983fc321a35f000b9da8d" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "cc6c29686e60f79afcc47dd4c0756d8890606b39" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
