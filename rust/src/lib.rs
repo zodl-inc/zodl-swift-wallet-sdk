@@ -6114,8 +6114,11 @@ pub unsafe extern "C" fn zcashlc_single_use_taddr_to_check(
         let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
-        // one day's worth of blocks.
-        let max_exposure_depth = (24 * 60 * 60) / 75;
+        // The look-back is measured from the chain tip across target-spacing changes.
+        let cur_height = db_data
+            .chain_height()?
+            .ok_or(SqliteClientError::ChainHeightUnknown)?;
+        let max_exposure_depth = single_use_taddr_exposure_depth(&network, cur_height);
         let addrs =
             db_data.get_ephemeral_transparent_receivers(account_uuid, max_exposure_depth, true)?;
 
@@ -6133,9 +6136,6 @@ pub unsafe extern "C" fn zcashlc_single_use_taddr_to_check(
         let Some((addr, meta)) = selected_addr_meta else {
             return Ok(ffi::TransparentAddressCheck::from_rust(&network, None));
         };
-        let cur_height = db_data
-            .chain_height()?
-            .ok_or(SqliteClientError::ChainHeightUnknown)?;
         let start = match meta.exposure() {
             Exposure::Exposed { at_height, .. } => at_height,
             Exposure::Unknown | Exposure::CannotKnow => {
@@ -6176,41 +6176,59 @@ pub unsafe extern "C" fn zcashlc_schedule_single_use_taddr_check(
     account_uuid_bytes: *const u8,
     address: *const c_char,
 ) -> bool {
-    let res = catch_panic(|| {
-        let network = parse_network(network_id)?;
-        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
-        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
-
-        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
-        let addr = TransparentAddress::decode(&network, addr_str)?;
-
-        let cur_height = db_data
-            .chain_height()?
-            .ok_or(SqliteClientError::ChainHeightUnknown)?;
-        let meta = db_data
-            .get_transparent_address_metadata(account_uuid, &addr)?
-            .ok_or_else(|| anyhow!("{addr_str} is not an address of the account"))?;
-
-        let blocks_since_exposure = match meta.exposure() {
-            Exposure::Exposed { at_height, .. } => {
-                f64::from(std::cmp::max(cur_height - at_height, 1))
-            }
-            Exposure::Unknown => 1.0,
-            Exposure::CannotKnow => 1.0,
-        };
-
-        // We will schedule the next check to occur after approximately
-        // log2(blocks_since_exposure) additional blocks.
-        let offset_blocks = blocks_since_exposure.log2();
-        // Convert the offset in blocks to an offset in seconds; this will always fit in a
-        // u32.
-        let offset_seconds = (offset_blocks * 75.0).round() as u32;
-        db_data.schedule_next_check(&addr, offset_seconds)?;
-
-        Ok(true)
+    let res = catch_panic(|| unsafe {
+        schedule_single_use_taddr_check_with_rng(
+            system_rng(),
+            db_data,
+            db_data_len,
+            network_id,
+            account_uuid_bytes,
+            address,
+        )
     });
-
     unwrap_exc_or(res, false)
+}
+
+/// The OHTTP wallet scheduling operation, with randomness supplied at the FFI boundary.
+///
+/// # Safety
+///
+/// The pointer arguments follow `zcashlc_schedule_single_use_taddr_check`'s contract.
+unsafe fn schedule_single_use_taddr_check_with_rng(
+    rng: impl rand::CryptoRng,
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> anyhow::Result<bool> {
+    let network = parse_network(network_id)?;
+    let mut db_data = unsafe { wallet_db(rng, db_data, db_data_len, network)? };
+    let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+    let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+    let addr = TransparentAddress::decode(&network, addr_str)?;
+
+    let cur_height = db_data
+        .chain_height()?
+        .ok_or(SqliteClientError::ChainHeightUnknown)?;
+    let meta = db_data
+        .get_transparent_address_metadata(account_uuid, &addr)?
+        .ok_or_else(|| anyhow!("{addr_str} is not an address of the account"))?;
+
+    let blocks_since_exposure = match meta.exposure() {
+        Exposure::Exposed { at_height, .. } => f64::from(std::cmp::max(cur_height - at_height, 1)),
+        Exposure::Unknown => 1.0,
+        Exposure::CannotKnow => 1.0,
+    };
+
+    // We will schedule the next check to occur after approximately
+    // log2(blocks_since_exposure) additional blocks.
+    let offset_blocks = blocks_since_exposure.log2();
+    let offset_seconds = single_use_taddr_check_offset_seconds(&network, cur_height, offset_blocks);
+    db_data.schedule_next_check(&addr, offset_seconds)?;
+
+    Ok(true)
 }
 
 /// The height from which UTXOs of `address` are looked for: its exposure height when known, else
@@ -11286,5 +11304,255 @@ mod single_use_taddr_timing_tests {
             ),
             83
         );
+    }
+}
+
+#[cfg(test)]
+mod ohttp_single_use_taddr_timing_tests {
+    use super::*;
+
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    struct Wallet {
+        _dir: tempfile::TempDir,
+        path: String,
+        account: [u8; 16],
+        address: TransparentAddress,
+        network_id: u32,
+    }
+
+    impl Wallet {
+        fn new(network_id: u32, exposed_at: u32, tip: u32) -> Self {
+            let (dir, path, account) =
+                crate::voting::test_support::temp_wallet_db_with_account(network_id);
+            let account = Uuid::parse_str(&account).unwrap().into_bytes();
+            let network = parse_network(network_id).unwrap();
+            let mut db = WalletDb::for_path(&path, network, SystemClock, system_rng()).unwrap();
+            db.update_chain_tip(BlockHeight::from_u32(exposed_at))
+                .unwrap();
+            let account_id = account_uuid_from_bytes(account.as_ptr()).unwrap();
+            let address = db
+                .reserve_next_n_ephemeral_addresses(account_id, 1)
+                .unwrap()[0]
+                .0;
+            db.schedule_next_check(&address, 0).unwrap();
+            db.update_chain_tip(BlockHeight::from_u32(tip)).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                account,
+                address,
+                network_id,
+            }
+        }
+
+        fn assert_due(&self, exposed_at: u32, tip: u32, expected_due: bool) {
+            let result = unsafe {
+                zcashlc_single_use_taddr_to_check(
+                    self.path.as_ptr(),
+                    self.path.len(),
+                    self.network_id,
+                    self.account.as_ptr(),
+                )
+            };
+            assert!(!result.is_null(), "the OHTTP wallet check must succeed");
+            match unsafe { &*result } {
+                ffi::TransparentAddressCheck::Due {
+                    address,
+                    start_height,
+                    end_height,
+                } => {
+                    assert!(
+                        expected_due,
+                        "an address outside one day must not be selected"
+                    );
+                    assert_eq!(*start_height, exposed_at);
+                    assert_eq!(*end_height, tip + 1);
+                    let expected = self
+                        .address
+                        .encode(&parse_network(self.network_id).unwrap());
+                    assert_eq!(
+                        unsafe { CStr::from_ptr(*address) }.to_str().unwrap(),
+                        expected
+                    );
+                }
+                ffi::TransparentAddressCheck::None => {
+                    assert!(
+                        !expected_due,
+                        "an address exposed within one day must still be checked"
+                    );
+                }
+            }
+            unsafe { ffi::zcashlc_free_transparent_address_check(result) };
+        }
+    }
+
+    fn assert_look_back(network_id: u32, tip: u32, expected_depth: u32) {
+        for (age, due) in [(expected_depth - 1, true), (expected_depth + 1, false)] {
+            let exposed_at = tip - age;
+            Wallet::new(network_id, exposed_at, tip).assert_due(exposed_at, tip, due);
+        }
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_before_nu7_covers_1152_blocks() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 - 2, 1_152);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_across_nu7_covers_the_full_day() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 + 1_000, 1_819);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_after_nu7_covers_3456_blocks() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 + 5_000, 3_456);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_uses_custom_nu7_activation() {
+        let _custom = lock_custom_network();
+        assert!(zcashlc_set_custom_network(
+            NETWORK_ID_TESTNET,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            100,
+            4_500_000,
+        ));
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 - 2, 1_152);
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 + 1_000, 1_819);
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 + 5_000, 3_456);
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock(SystemTime);
+
+    impl zcash_client_sqlite::util::Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    fn assert_schedule(network_id: u32, tip: u32, expected_interval: u32) {
+        use rand::{SeedableRng, rngs::StdRng};
+        use std::time::Duration;
+        let fixture = Wallet::new(network_id, tip - 10, tip);
+        let network = parse_network(network_id).unwrap();
+        let account = account_uuid_from_bytes(fixture.account.as_ptr()).unwrap();
+        // Use the real backend's jitter with a literal, hand-derived interval as the oracle.
+        // Its old timestamp also ensures the production call replaces, rather than caps, it.
+        let epoch = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut reference = WalletDb::for_path(
+            &fixture.path,
+            network,
+            FixedClock(epoch),
+            StdRng::seed_from_u64(42),
+        )
+        .unwrap();
+        let sampled_delay = reference
+            .schedule_next_check(&fixture.address, expected_interval)
+            .unwrap()
+            .unwrap()
+            .duration_since(epoch)
+            .unwrap();
+        assert!(sampled_delay > Duration::ZERO);
+        drop(reference);
+
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let address = CString::new(fixture.address.encode(&network)).unwrap();
+        assert!(
+            unsafe {
+                schedule_single_use_taddr_check_with_rng(
+                    StdRng::seed_from_u64(42),
+                    fixture.path.as_ptr(),
+                    fixture.path.len(),
+                    network_id,
+                    fixture.account.as_ptr(),
+                    address.as_ptr(),
+                )
+            }
+            .unwrap()
+        );
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let db = WalletDb::for_path(&fixture.path, network, SystemClock, system_rng()).unwrap();
+        let scheduled = db
+            .get_transparent_address_metadata(account, &fixture.address)
+            .unwrap()
+            .unwrap()
+            .next_check_time()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            scheduled >= before + sampled_delay.as_secs(),
+            "tip {tip}: delay too short"
+        );
+        assert!(
+            scheduled <= after + sampled_delay.as_secs(),
+            "tip {tip}: wrong spacing delayed the recheck"
+        );
+        drop(db);
+
+        // Exercise the exported wrapper too; it delegates this same wallet operation with system entropy.
+        assert!(unsafe {
+            zcashlc_schedule_single_use_taddr_check(
+                fixture.path.as_ptr(),
+                fixture.path.len(),
+                network_id,
+                fixture.account.as_ptr(),
+                address.as_ptr(),
+            )
+        });
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_before_nu7_uses_75_second_blocks() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 - 2, 249);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_at_nu7_uses_the_next_blocks_25_second_spacing() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 - 1, 83);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_after_nu7_uses_25_second_blocks() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 + 5_000, 83);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_uses_custom_nu7_activation() {
+        let _custom = lock_custom_network();
+        assert!(zcashlc_set_custom_network(
+            NETWORK_ID_TESTNET,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            100,
+            4_500_000,
+        ));
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 - 2, 249);
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 - 1, 83);
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 + 5_000, 83);
     }
 }

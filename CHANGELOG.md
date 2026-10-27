@@ -8,6 +8,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP gateway connections keep checking single-use transparent addresses exposed within the previous
+  24 hours of target time across NU7, and recheck unfunded addresses using the next block's target
+  spacing. After activation they previously checked only eight hours of exposure and delayed rechecks
+  three times as long. Custom networks follow their registered activation heights. No caller changes
+  are required.
+
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
+
 - Refused stale migration submissions now persist recovery state: `advanceStep()` returns `.reevaluate`
   until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
   or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures

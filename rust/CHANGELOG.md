@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_single_use_taddr_to_check` and `zcashlc_schedule_single_use_taddr_check` follow the network's
+  target-spacing schedule, including custom NU7 activation heights. The OHTTP wallet path retains a
+  24-hour exposure window and uses 25-second blocks for recheck delays after NU7, matching the Tor path.
+  Exported signatures are unchanged.
+
 - Refused stale migration submissions now persist recovery state: `zcashlc_migration_advance_step` returns Reevaluate
   until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
   or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
