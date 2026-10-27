@@ -298,12 +298,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mempool or mined on a fork: it is stored without a mined height, and a mempool transaction at such
   a height produces no `foundTransactions` event. Apart from handling the new `ZcashError` case
   listed under Changed, no caller changes are required.
-- The Rust core's gRPC connections to lightwalletd, which carry `SlipstreamSynchronizer`'s sync and
-  every lightwalletd request sent over Tor (`TorClient.connectToLightwalletd(endpoint:)`), now run
-  on `h2` 0.4.20. It closes a connection whose server floods it with small HTTP/2 DATA frames,
-  failing the calls on it, where the flood was previously processed without limit. lightwalletd's
-  block streams, which send one small frame per compact block, stay within the limit. No caller
-  changes are required.
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
 
 # 6.0.0 - 2026-10-15
 
