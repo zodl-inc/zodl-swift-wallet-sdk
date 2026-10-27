@@ -45,10 +45,12 @@ enum FfiProposalFixtures {
         }
 
         /// Convenience for the common case where every input is a fresh wallet spend. Wraps each
-        /// value as a `receivedOutput` input and delegates to the designated initializer.
-        init(inputValues: [UInt64], changeValues: [ChangeValue], fee: UInt64) {
+        /// value as a `receivedOutput` input from `pool` and delegates to the designated
+        /// initializer. An unspecified pool counts as Sapling, so creating from such a proposal
+        /// downloads the Sapling parameters; pass `.orchard` for an Orchard-only spend.
+        init(inputValues: [UInt64], changeValues: [ChangeValue], fee: UInt64, pool: FfiValuePool = .poolNotSpecified) {
             self.init(
-                inputs: inputValues.map { FfiProposalFixtures.receivedOutputInput($0) },
+                inputs: inputValues.map { FfiProposalFixtures.receivedOutputInput($0, pool: pool) },
                 changeValues: changeValues,
                 fee: fee
             )
@@ -56,9 +58,10 @@ enum FfiProposalFixtures {
     }
 
     /// An input that draws fresh value from a wallet note.
-    static func receivedOutputInput(_ value: UInt64) -> FfiProposedInput {
+    static func receivedOutputInput(_ value: UInt64, pool: FfiValuePool = .poolNotSpecified) -> FfiProposedInput {
         var receivedOutput = FfiReceivedOutput()
         receivedOutput.value = value
+        receivedOutput.valuePool = pool
         var input = FfiProposedInput()
         input.receivedOutput = receivedOutput
         return input

@@ -58,7 +58,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             predecessorEntered.fulfill()
             await gate.wait()
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         let predecessor = Task { try await fixture.redeemer.check() }
         await fulfillment(of: [predecessorEntered], timeout: 5)
@@ -76,7 +76,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         redemption.cancel()
         fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             XCTFail("Cancelled queued redemption must not prepare a proposal")
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         await gate.open()
         _ = try await predecessor.value
@@ -99,7 +99,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             proposalEntered.fulfill()
             await gate.wait()
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         let finished = XCTestExpectation(description: "cancelled preparation finished")
         let redemption = Task {
@@ -336,9 +336,12 @@ struct GiftCardCancellationFixture {
             nextIronwoodSubtreeIndex: 0
         )
         backend.getWalletSummaryReturnValue = summary
+        // A card is swept from Orchard. An unspecified pool would count as Sapling and make each
+        // redemption download the Sapling parameters from the network before native creation,
+        // which can outlast the tests' waits.
         backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue =
             FfiProposalFixtures.makeProposal(
-                steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]
+                steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]
             ).inner
         backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [Data(repeating: 0xA1, count: 32)]
         backend.getTransactionTxIdReturnValue = TransactionData(txId: Data(repeating: 0xA1, count: 32), raw: Data([1]), expiryHeight: 3_000_100)
