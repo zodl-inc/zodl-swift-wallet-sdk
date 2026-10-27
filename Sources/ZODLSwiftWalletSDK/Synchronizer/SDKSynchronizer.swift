@@ -183,6 +183,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
         guard await status == .unprepared else { return .success }
+        try OHTTPEndpoints.checkGatewayNetwork(host: initializer.endpoint.host, network: initializer.network.networkType)
 
         if let error = checkIfCanContinueInitialisation() {
             throw error
@@ -616,12 +617,17 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // TODO [#1724]: zcash_client_backend: Make Sapling parameters optional for extract_and_store_transaction
         // TODO [#1724]: https://github.com/zcash/librustzcash/issues/1724
 //        if await initializer.rustBackend.PCZTRequiresSaplingProofs(pczt: pczt) {
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
+            logger: logger,
+            torClientProvider: {
+                let isTorEnabled = await self.sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
 //        }
 
@@ -914,6 +920,37 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         try await initializer.rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
     }
 
+    /// The service for any endpoint: OHTTP gateways get the RFC 9458 transport, everything else the
+    /// grpc-swift / Tor service — the same choice `Dependencies.setupForNewInstance` makes for the main
+    /// service. `evaluateBestOf`/`evaluateServerSwitch` and `switchTo` used to build a plain
+    /// `LightWalletGRPCServiceOverTor` here, which speaks plain gRPC to a gateway that refuses it
+    /// (426), so a healthy gateway failed validation and could never be a switch target.
+    static func makeService(
+        endpoint: LightWalletEndpoint,
+        tor: TorClient,
+        singleCallTimeout: Int64? = nil,
+        sdkFlags: SDKFlags? = nil
+    ) -> LightWalletGRPCServiceOverTor {
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            if let sdkFlags {
+                if let singleCallTimeout {
+                    return LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: singleCallTimeout, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+                }
+                return LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: 30_000, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+            } else {
+                if let singleCallTimeout {
+                    return LightWalletOHTTPService(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+                }
+                return LightWalletOHTTPService(endpoint: endpoint, tor: tor)
+            }
+        }
+        let service = singleCallTimeout.map {
+            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: $0)
+        } ?? LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+        service.sdkFlags = sdkFlags
+        return service
+    }
+
     /// Takes the list of endpoints and runs it through a series of checks to evaluate its performance.
     /// - Parameters:
     ///    - endpoints: Array of endpoints to evaluate.
@@ -997,12 +1034,13 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Initialize services for the endpoints
         let services = endpoints.map {
             Service(
                 originalEndpoint: $0,
-                service: LightWalletGRPCServiceOverTor(endpoint: $0, tor: torClient),
+                service: Self.makeService(endpoint: $0, tor: torClient, sdkFlags: sdkFlags),
                 // The scheme-qualified form so endpoints differing only in the TLS flag —
                 // distinct servers under `isSameServer` — cannot collide on one key.
                 url: $0.urlString
@@ -1280,16 +1318,24 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    // swiftlint:disable function_parameter_count
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let torEnabled = await sdkFlags.torEnabled
             let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
@@ -1304,12 +1350,25 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
+    /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+    }
+
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from, bootstrapped on first use. Throws
+    /// unless Tor or the exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1327,8 +1386,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         guard let httpTor else {
             throw ZcashError.torClientUnavailable
         }
-
-        return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+        return httpTor
     }
 
     public func httpGetOverTor(
@@ -1361,6 +1419,98 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         let torClient = initializer.container.resolve(TorClient.self)
         return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+    }
+
+    /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
+    /// destination service. The request URL must use a hostname registered in `OHTTPEndpoints`
+    /// (e.g. `cmc.zodl.com`, `near.zodl.com`). Use `OHTTPEndpoints.proxyURL(for:)` to convert a
+    /// real API URL to its OHTTP proxy counterpart before calling this method.
+    ///
+    /// Tor/OHTTP matrix:
+    ///   - Tor OFF: call this method → OHTTP → gateway → destination (IP hidden from destination)
+    ///   - Tor ON:  call this method with `viaTor: true` → Tor → relay → gateway → destination
+    ///              (the relay POST rides a Tor circuit; the gateway injects secrets for mapped hosts)
+    ///
+    /// Gateway-injected secrets: external APIs that need a secret (CMC, NEAR) must NOT receive the
+    /// app's secret when Tor is ON. With `viaTor: true`, the gateway injects the secret on behalf
+    /// of the client after decrypting the OHTTP-encapsulated request.
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+        // and the path-restricted voting-config mirror.
+        guard let host = request.url?.host,
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await sdkFlags.torEnabled
+        let viaTor = viaTor || torMode
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            httpSender = { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            }
+        } else {
+            httpSender = { request, maxBytes in
+                let (data, response) = try await OHTTPTransport.boundedData(
+                    for: request,
+                    maxBytes: maxBytes
+                )
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
+
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttpRequest = try OHTTPExternalHTTP.innerRequest(for: request)
+        let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
+
+        guard let httpResponse = HTTPURLResponse(
+            url: request.url!,
+            statusCode: bhttpResponse.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(bhttpResponse.headers.map { $0 }, uniquingKeysWith: { _, last in last })
+        ) else {
+            throw ZcashError.ohttpResponseError
+        }
+        return (bhttpResponse.body, httpResponse)
+    }
+
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await sdkFlags.torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
     }
 
     public func debugDatabase(sql: String) -> String {
@@ -1708,6 +1858,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     // MARK: Server switch
 
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+
         // Stop synchronization
         let status = await self.status
         if status != .stopped && status != .disconnected {
@@ -1715,11 +1867,12 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Validation of the server is first because any custom endpoint can be passed here
         // Extra instance of the service is created with lower timeout for a single call
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000)
+            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000, sdkFlags: sdkFlags)
         }
 
         let validateSever = ValidateServerAction(
@@ -1740,7 +1893,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         // LightWalletService dependency update
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            Self.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags)
         }
 
         // DEPENDENCIES

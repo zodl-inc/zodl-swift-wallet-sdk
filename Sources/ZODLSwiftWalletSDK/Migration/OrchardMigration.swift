@@ -22,10 +22,10 @@ public struct MigrationNetworkPrivacyOptions: Equatable {
     public let useTor: Bool
 
     /// The endpoint this broadcast is submitted to. The app picks the submission server explicitly
-    /// for every migration transfer; the SDK never supplies a default. Per the migration privacy
-    /// spec this should differ from the wallet's ordinary sync server, so a migration broadcast is
-    /// not correlated with the wallet's sync traffic. A typed endpoint (an iOS-specific choice; the
-    /// Android SDK passes a `host:port` string).
+    /// for every migration transfer; the SDK never supplies a default. It must be a server the user
+    /// chose (the sync server, or the gateway in Automatic mode): a clearnet server the user did not
+    /// select is never contacted. A gateway is reached through its OHTTP relay. A typed endpoint (an
+    /// iOS-specific choice; the Android SDK passes a `host:port` string).
     public let submissionEndpoint: LightWalletEndpoint
 
     /// Creates network-privacy options.

@@ -234,9 +234,10 @@ ffi-ci: require-macos ## Build the FFI the way CI does: arm64 macOS only, withou
 	rm -rf $(BUILD_SUPPORT)/products/macos
 	CARGO_PROFILE_RELEASE_LTO=false $(MAKE) ffi-macos MACOS_ARCHS=aarch64-apple-darwin
 
+# Releases never get extra Cargo features (ohttp-trace), whatever the environment holds.
 .PHONY: ffi-all
 ffi-all: require-macos ## Build the full XCFramework for every platform
-	$(MAKE) -C $(BUILD_SUPPORT) xcframework
+	$(MAKE) -C $(BUILD_SUPPORT) xcframework FFI_CARGO_FEATURES=
 
 .PHONY: verify-ffi
 verify-ffi: ## Check the XCFramework exists and show its contents

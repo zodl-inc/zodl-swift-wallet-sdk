@@ -39,3 +39,11 @@ test_init_local_ffi_header_comment_mentions_arm_simulator() {
     assert_succeeds "header comment block documents --arm-simulator" \
         sh -c "sed -n '2,/^set -e/p' '$REPO_ROOT/Scripts/init-local-ffi.sh' | grep -qF -- --arm-simulator"
 }
+
+test_init_local_ffi_rejects_trace_with_cached() {
+    assert_fails "--trace with --cached" _init_local_ffi --cached --trace
+}
+
+test_init_local_ffi_rejects_too_many_arguments_with_trace() {
+    assert_fails "too many arguments besides --trace" _init_local_ffi --trace foo bar
+}

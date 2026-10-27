@@ -95,9 +95,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     public nonisolated var broadcaster: Broadcaster { broadcasterStorage }
 
     // ── Endpoint (mutable for switchTo) ───────────────────────────────────────
-    // Tracks the endpoint currently in use.  `engine.reopen(server:network:)` uses
-    // this value; `initializer.endpoint` is the initial value.
+    // Tracks the endpoint currently in use — or, between a wipe and the next `prepare`, the one that
+    // `prepare` will use.  `engine.reopen(server:network:)` uses this value; `initializer.endpoint` is
+    // the initial value.
     private var currentEndpoint: LightWalletEndpoint
+    /// Whether a completed `wipe()` closed the engine and no `prepare` has opened it since. In that window
+    /// the wallet database does not exist, and opening an engine handle opens the database, which SQLite
+    /// would recreate before `prepare` has initialized it. So while this is set `switchTo(endpoint:)` only
+    /// records the server, and `prepare` opens the engine at whatever was recorded.
+    private var engineClosedByWipe = false
 
     // ── Running state (for switchTo restart decision) ──────────────────────────
     private var isRunning: Bool = false
@@ -470,6 +476,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Initialises the wallet database (same as `SDKSynchronizer.prepare`) and opens the
     /// engine handle.  Handles `SeedRequired` migrations identically to `SDKSynchronizer`.
+    ///
+    /// After a `wipe()`, provisioning uses the server a `switchTo(endpoint:)` recorded since the wipe and
+    /// before this call, or without one the server in use before the wipe. The engine is opened in turn
+    /// with switches, at the server recorded when its turn comes: a switch made during provisioning still
+    /// decides the server it opens at, and one made while it is opening waits for it and then moves the
+    /// engine.
     public func prepare(
         with seed: [UInt8]?,
         walletBirthday: BlockHeight?,
@@ -480,7 +492,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // state) through the engine's `restore_anchor` primitive — the offline fallback
         // policy and Tor privacy live ENGINE-side, one implementation for every host. The
         // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
+        //
+        // Read here, before the engine step takes its turn on the lifecycle queue, on purpose: the
+        // anchor is wanted by `initializer.initialize` below, which runs outside the queue. A switch
+        // that lands between this read and the engine step therefore provisions from the server
+        // recorded when `prepare` began and opens the engine at the one recorded when the step's turn
+        // comes (`SlipstreamWipeEndpointTests`). Queueing the anchor fetch as well would hold every
+        // switch for the whole of provisioning; the two servers differing in that window is accepted.
         let anchorServer = currentEndpoint
+        try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
         let anchorNetwork = initializer.network
         let anchorTorDir = await slipstreamTorDirPath()
         let resolveAnchor = restoreAnchor
@@ -502,7 +522,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         ) {
             return .seedRequired
         }
-        try await engine.open(network: initializer.network)
+        // The engine step is one lifecycle operation, in turn with every switch. A switch queued before
+        // it has already recorded its server, and the step opens the engine at what is recorded when
+        // its turn comes. A switch made while it runs waits for it and then moves the engine, so the
+        // engine ends on the server of the last switch. Were the step to run outside the queue, a
+        // switch overlapping its reopen would only record its server, because the engine counts as
+        // closed until the reopen returns, and `prepare` would end with the engine on a server other
+        // than the recorded one.
+        try await lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }.value
         // [v2.1 E-3] The snapshot is truthful FROM OPEN: the engine seeds `isRecovering`,
         // the permille floor, the persisted chain tip and spendability from the wallet DB
         // (the same inputs the first suggest round would use), so the cold-launch emission
@@ -526,6 +553,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             isSpendableMasked: summaries.isSpendableMasked ?? false
         ))
         return .success
+    }
+
+    /// The queued body of `prepare`'s engine step. It reads `currentEndpoint` and `engineClosedByWipe`
+    /// here, in its own turn, so what it sees is what every switch queued before it left behind.
+    private func openEngineOnLifecycleQueue() async throws {
+        if engineClosedByWipe {
+            // The engine still holds the server it had before the wipe: a switch since then only
+            // recorded the next one. `reopen` binds the fresh handle to the recorded server; the
+            // close it starts with has nothing to free, because the wipe already closed the handle.
+            try await engine.reopen(server: currentEndpoint, network: initializer.network)
+            // Only a reopen that returned ends the window. One that threw leaves the engine closed
+            // and the flag set, so the next `prepare` reopens it and a switch still only records.
+            engineClosedByWipe = false
+        } else {
+            try await engine.open(network: initializer.network)
+        }
     }
 
     // ── start ──────────────────────────────────────────────────────────────────
@@ -1220,6 +1263,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         isRunning
     }
 
+    /// Test seam: how many lifecycle operations are on the queue, running or waiting, so a test can tell
+    /// that an operation it started has joined the queue behind one it holds, instead of guessing with a sleep.
+    nonisolated func lifecycleQueueDepthForTesting() -> Int {
+        lifecycle.depth
+    }
+
     /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.
     ///
     /// Both failure exits of `runStallRecovery` land here, and both are terminal in the
@@ -1859,12 +1908,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func addProofsToPCZT(pczt: Pczt) async throws -> Pczt {
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: initializer.logger
+            logger: initializer.logger,
+            torClientProvider: {
+                let isTorEnabled = await sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
         return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
     }
@@ -2044,10 +2099,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
         // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: address.stringEncoded,
             startHeight: height,
-            mode: .direct
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
         var utxos: [UnspentTransactionOutputEntity] = []
         for try await utxo in stream {
@@ -2213,7 +2269,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 6. Delete the submit-plan-store database file (`submitPlanStore.wipe()`) — restores the
     ///    documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan
     ///    database file", MIGRATING.md) that only `SDKSynchronizer` used to honor ([#1976]).
-    /// 7. Reset the state subject to `.zero` (status `.unprepared`).
+    /// 7. Reset the state subject to `.zero` (status `.unprepared`), and keep the engine closed until
+    ///    the next `prepare` opens it: a `switchTo(endpoint:)` before that only records the server.
     /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
     /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
@@ -2323,7 +2380,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             //    wallet wipe succeeded (this `do` block only reaches here on success).
             await submitPlanStore.wipe()
 
-            // 7. Reset state to unprepared/zero.
+            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`
+            //    opens it: a switch before that only records its server (`engineClosedByWipe`).
+            engineClosedByWipe = true
             stateSubject.send(.zero)
 
             // 8. Signal completion.
@@ -2587,15 +2646,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 1. F2: No-op immediately if `endpoint` equals `currentEndpoint` (same host + port + secure).
     ///    Prevents AutoServerSelection from restarting a sync pass when the benchmark selects the
     ///    same server already in use.
-    /// 2. Snapshot whether the sync was running (to decide whether to restart).
-    /// 3. F3: If a sync is active, log a warning — the pass will restart from the current scan
+    /// 2. Between a completed `wipe()` and the moment the next `prepare` opens the engine: store
+    ///    `endpoint` in `currentEndpoint` and return. Reopening the engine there would recreate the
+    ///    deleted wallet database before `prepare` has initialized it; `prepare` instead provisions the
+    ///    next wallet from the server recorded when it began and opens the engine at the one recorded
+    ///    when its turn on the lifecycle queue comes. This is how a host names the server a reset wallet
+    ///    uses. A switch made while `prepare` is opening the engine waits for it and is then an ordinary
+    ///    switch, from step 1, so the engine ends on the server of the last switch.
+    /// 3. Snapshot whether the sync was running (to decide whether to restart).
+    /// 4. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
-    /// 4. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
+    /// 5. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
     ///    scan at the next block.
-    /// 5. `engine.reopen(server:network:)` — close old handle + open new one bound
+    /// 6. `engine.reopen(server:network:)` — close old handle + open new one bound
     ///    to the new endpoint (frees Rust-side tokio runtime, then allocates a fresh one).
-    /// 6. Store `endpoint` in `currentEndpoint`.
-    /// 7. If the engine was running before the switch, restart via `start(retry: false)`.
+    /// 7. Store `endpoint` in `currentEndpoint`.
+    /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
@@ -2607,6 +2673,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// The queued body of `switchTo(endpoint:)`.
     private func switchToOnLifecycleQueue(endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
         // host, port and TLS flag must all match (`isSameServer`). [MOB-1850] Checked BEFORE the
         // generation bump: a switch that turns out to be a no-op changes nothing about who owns the
@@ -2615,6 +2682,19 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             initializer.logger.debug(
                 "switchTo: endpoint unchanged (\(endpoint.host):\(endpoint.port)) — no-op",
                 file: #file, function: #function, line: #line
+            )
+            return
+        }
+
+        // After a wipe the engine stays closed until `prepare`, which opens it at this server. Nothing
+        // runs and no handle exists, so the switch changes no owner and moves no generation.
+        if engineClosedByWipe {
+            currentEndpoint = endpoint
+            initializer.logger.debug(
+                "switchTo after wipe: \(endpoint.host):\(endpoint.port) recorded for the next prepare, engine stays closed",
+                file: #file,
+                function: #function,
+                line: #line
             )
             return
         }
@@ -2759,6 +2839,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// is fine for a real request but far too slow for a benchmark that must return promptly.
     /// Matches the app-side `evaluationTimeoutSeconds`. `internal` so tests can reference it.
     static let serverProbeTimeoutSeconds: Double = 5
+    /// Probe bound with Tor enabled: a fresh circuit plus a TLS handshake through it routinely
+    /// takes longer than the direct bound, and a benchmark that times out every clearnet fallback
+    /// leaves the wallet with nowhere to go when the gateway is down.
+    static let serverProbeTimeoutSecondsOverTor: Double = 20
 
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
@@ -2801,11 +2885,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     static func probe(
         _ endpoint: LightWalletEndpoint,
         timeoutSeconds: Double,
-        using service: LightWalletService
+        using service: LightWalletService,
+        mode: ServiceMode = .direct
     ) async -> (roundTrip: TimeInterval, info: LightWalletdInfo)? {
         let start = DispatchTime.now()
         let info = try? await withTaskTimeout(UInt64(timeoutSeconds * 1_000_000_000)) {
-            try await service.getInfo(mode: .direct)
+            try await service.getInfo(mode: mode)
         }
         let elapsed = DispatchTime.now().secondsSince(start)
         await service.closeConnections()
@@ -2819,19 +2904,28 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// identify with a different base chain and report a nonstandard consensus branch id, so
     /// only the chain-name and branch-id checks are skipped for it, mirroring
     /// `ValidateServerAction`; the synced-height check runs for every network. Delegates to
-    /// ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// ephemeral connections from `SDKSynchronizer.makeService`, retaining OHTTP gateway routing
+    /// and Tor privacy for every probe.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let probeTimeout = await sdkFlags.torEnabled ? Self.serverProbeTimeoutSecondsOverTor : Self.serverProbeTimeoutSeconds
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = LightWalletGRPCService(endpoint: endpoint)
-                    guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags)
+                    let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
+                    guard let probed = await Self.probe(
+                        endpoint,
+                        timeoutSeconds: probeTimeout,
+                        using: service,
+                        mode: mode
+                    ) else {
                         return nil
                     }
                     return (endpoint, probed.roundTrip, probed.info)
@@ -2925,6 +3019,82 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+        // and the path-restricted voting-config mirror.
+        guard let host = request.url?.host,
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+        let viaTor = viaTor || torMode
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+            // tried again, on a new circuit, only when it failed before any of it was sent.
+            httpSender = { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            }
+        } else {
+            httpSender = { request, maxBytes in
+                let (data, response) = try await OHTTPTransport.boundedData(
+                    for: request,
+                    maxBytes: maxBytes
+                )
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
+        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+        guard let httpResp = HTTPURLResponse(
+            url: request.url!,
+            statusCode: response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
+        ) else { throw ZcashError.ohttpResponseError }
+        return (response.body, httpResp)
+    }
+
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
+    }
+
+    // swiftlint:disable function_parameter_count
     /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
     /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
@@ -2934,11 +3104,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let sdkFlags = initializer.container.resolve(SDKFlags.self)
             let torEnabled = await sdkFlags.torEnabled
@@ -2954,20 +3131,32 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
+    /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+    }
+
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from. Throws unless Tor or the
+    /// exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
         guard torEnabled || exchangeRateEnabled else {
             throw ZcashError.torNotEnabled
         }
-        let torClient = initializer.container.resolve(TorClient.self)
-        return try await torClient.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+        return initializer.container.resolve(TorClient.self)
     }
 
     public nonisolated func httpGetOverTor(

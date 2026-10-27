@@ -88,8 +88,24 @@ enum Dependencies {
 
         container.register(type: LightWalletService.self, isSingleton: true) { di in
             let torClient = di.resolve(TorClient.self)
+            let sdkFlags = di.resolve(SDKFlags.self)
 
-            return LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            // OHTTP gateways get the RFC 9458 transport (`isGateway` only matches hosts with a
+            // configured relay); everything else keeps the grpc-swift / Tor service.
+            if OHTTPEndpoints.isGateway(endpoint.host) {
+                let service = LightWalletOHTTPService(
+                    endpoint: endpoint,
+                    singleCallTimeout: endpoint.singleCallTimeoutInMillis,
+                    streamingCallTimeout: endpoint.streamingCallTimeoutInMillis,
+                    tor: torClient,
+                    sdkFlags: sdkFlags
+                )
+                service.walletNetwork = networkType
+                return service
+            }
+            let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            service.sdkFlags = sdkFlags
+            return service
         }
 
         container.register(type: TransactionRepository.self, isSingleton: true) { _ in
@@ -239,7 +255,8 @@ enum Dependencies {
                 config: utxoFetcherConfig,
                 rustBackend: rustBackend,
                 metrics: metrics,
-                logger: logger
+                logger: logger,
+                sdkFlags: di.resolve(SDKFlags.self)
             )
         }
 
@@ -256,7 +273,8 @@ enum Dependencies {
             return SaplingParametersHandlerImpl(
                 config: saplingParametersHandlerConfig,
                 rustBackend: rustBackend,
-                logger: logger
+                logger: logger,
+                container: container
             )
         }
     }

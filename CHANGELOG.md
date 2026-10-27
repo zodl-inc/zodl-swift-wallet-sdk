@@ -8,10 +8,120 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP gateway connections keep checking single-use transparent addresses exposed within the previous
+  24 hours of target time across NU7, and recheck unfunded addresses using the next block's target
+  spacing. After activation they previously checked only eight hours of exposure and delayed rechecks
+  three times as long. Custom networks follow their registered activation heights. No caller changes
+  are required.
+
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
+
 - Refused stale migration submissions now persist recovery state: `advanceStep()` returns `.reevaluate`
   until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
   or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
   are unchanged.
+
+- `performMigrationBroadcast(accountUUID:_:options:)` and `takeMigrationPreparation(accountUUID:byTxid:)` no
+  longer serve a transaction of a run that has ended. An instruction a crank issued before
+  `cancelMigrationRun(accountUUID:)` (or before the run completed, failed or was superseded) could still be
+  discharged after it, which recorded the transaction in the wallet and marked the notes the cancel had just
+  released as spent again. They now throw `ZcashError.rustMigrationTakeBroadcastTransaction(_:)` and
+  `ZcashError.rustMigrationTakePreparation(_:)` for it. No caller changes are required.
+
+- Transactions created by `createProposedTransactions(proposal:spendingKey:)`,
+  `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` or `createPCZTFromProposal(accountUUID:proposal:)`
+  at a target height with NU7 active (mainnet from 3,543,405, testnet from 4,465,026) expired after 40
+  blocks, about 17 minutes of 25-second blocks; they now expire after 120, the 50 minutes they have
+  before NU7. ZIP 318 canonical crossings keep their ZIP 318 expiry, and nothing changes from Blossom
+  until NU7.
+  From NU7 activation, a payment to a ZIP 316 revision 2 unified address whose expiry height falls
+  before the new default expiry (target height + 120) but not before the old one (target height + 40),
+  which used to succeed, is still proposed but fails at creation: `createProposedTransactions` throws
+  `ZcashError.rustCreateToAddress` (`ZRUST0002`) with `RustErrorKind.unclassified`, and
+  `createPCZTFromProposal` throws `ZcashError.rustCreatePCZTFromProposal` (`ZRUST0069`).
+
+- `evaluateBestOf(endpoints:fetchThresholdSeconds:nBlocksToFetch:kServers:network:)` and
+  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)` rule out servers
+  trailing their estimated tip by more than six hours of target time. The fixed 288 blocks were two hours
+  at NU7's 25-second blocks, too strict for a check that must stay loose. Nothing changes before NU7 on mainnet
+  and testnet.
+
+- A `SlipstreamSynchronizer` stopped and restarted within 120 seconds kept spendable balances unmasked
+  (`SynchronizerState.isSpendableMasked`) even where NU7's 25-second blocks let almost five blocks arrive.
+  The window is now 1.6 target block intervals of the block after the last known tip: 120 s before NU7, 40 s from NU7.
+
+- `estimateBirthdayHeight(for:)` returns the height of the newest bundled checkpoint whose time is strictly
+  before the date. For a date at or after the newest checkpoint's time it returns that checkpoint, and when no
+  checkpoint is before the date it returns Sapling activation, the floor. The answer does not depend on how
+  fast blocks were mined, so NU7's 25-second blocks do not affect it. It used to return an older checkpoint,
+  or Sapling activation, for some dates: those just after a checkpoint's time, those equal to one, and early
+  dates near the start of either chain. Restores from such a date scanned more blocks than needed. No caller
+  changes are required.
+
+- `checkSingleUseTransparentAddresses(accountUUID:)` checks addresses exposed within the past day of target
+  time and spaces rechecks by the target spacing of the block after the tip; after NU7 it looked back eight
+  hours and rescheduled three times too far out. In wall-clock terms, an address that has received nothing is
+  now rechecked roughly 2–3× as often after NU7 as before it, each recheck being one address over its own
+  Tor circuit. Nothing changes before NU7 on mainnet and testnet.
+
+- `estimatedMigrationChainTip()` and `estimatedMigrationSecondsPerBlock()` account for NU7's 25-second blocks.
+  The rate is measured over up to 1,000 scanned blocks as the chain's speed relative to their target time, so the
+  first blocks after NU7 activation do not swing it, and it is reported in the target spacing of the block after
+  the projected tip. Its 5–150 s bounds scale with that spacing (5/3–50 s at 25 s), and when it cannot be measured it
+  is that spacing. A projection that reaches NU7 activation counts the later blocks at their own spacing, at the
+  measured speed. To convert wake-up heights across activation, pass the rate to
+  `TargetBlockSpacing.estimatedSeconds(from:to:secondsPerBlock:)` with `estimatedMigrationChainTip()` as `from`.
+  Nothing changes for a window and tip within the 75-second era, except that a tip right before NU7 activation
+  has its rate reported at NU7's spacing, since its next block is an NU7 block. A window spanning Blossom, seen
+  only early in a restore from a pre-Blossom birthday, now also measures speed against target time, and a latest
+  scanned block below Blossom gets the 150-second era's bounds and fallback.
+
+- `MigrationSchedule.estimatedDurationHours` counts blocks at their target spacing (25 s from NU7); after NU7
+  it read up to three times too long. Nothing changes before NU7 on mainnet and testnet.
+
+- `migrationProgress(accountUUID:)` reports an unconfirmed immediate migration with no known expiry as pending
+  for 120 blocks after it was recorded once NU7 is active, not 40, which ended the report while it could still
+  mine. Nothing changes before NU7.
+
+- Server validation keeps checking for Ironwood tree state after NU7 activation (mainnet from 3,543,405,
+  testnet from 4,465,026). It stopped when the server's tip reached NU7, so a lightwalletd that serves no
+  Ironwood data passed validation there, and syncing against it detected nothing in the Ironwood pool. It now throws
+  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`) as it did from NU6.3 activation
+  until NU7. No caller changes are required.
+
+- `estimateTimestamp(for:)` on `Synchronizer`, `SDKSynchronizer` and `SlipstreamSynchronizer` now
+  returns `nil` instead of never returning when the checkpoint files in the SDK's resource bundle
+  are missing or damaged. The result was already optional, so no caller changes are required.
+
+- A server that reports a block height above `Int32.max` no longer crashes the app. That covers the
+  tip in `getInfo`, the latest block, a compact block, a UTXO, a tree state and the height of a
+  transaction; only a broken or malicious server sends one. The call that received such a height
+  fails with its usual error (`serviceLatestBlockHeightFailed`, `serviceBlockRangeFailed`,
+  `serviceBlockStreamFailed` or `serviceFetchUTXOsFailed`), and `SDKSynchronizer`'s sync fails with
+  it (a UTXO's inside `unspentTransactionFetcherStream`). When the tip in `getInfo` is the problem,
+  `SDKSynchronizer`'s sync fails with the new
+  `ZcashError.compactBlockProcessorServerBlockHeightOutOfRange` on mainnet and testnet, and
+  `switchTo(endpoint:)` reports the error as `synchronizerServerSwitch`; a regtest or other custom
+  network does not check that tip during sync, and `SlipstreamSynchronizer` never reports it.
+  `evaluateBestOf(...)` and `evaluateServerSwitch(...)` skip such a server on every network. A
+  wallet or gift card wallet that is created while the server sends such a tree state keeps the
+  bundled checkpoint. A restore while the server reports such a tip recovers until the same height
+  as when the server cannot be reached, with `SDKSynchronizer` and `SlipstreamSynchronizer` alike,
+  and `importAccount` does what it does then too: `SDKSynchronizer`'s throws
+  `synchronizerNotPrepared`, and `SlipstreamSynchronizer`'s imports the account with the recovery
+  height it gets when the server cannot be reached. With Tor enabled,
+  `getTreeState(height:)` on `Synchronizer`, `SDKSynchronizer` and `SlipstreamSynchronizer` throws
+  `ZcashError.rustTorLwdGetTreeState` for a height above `Int32.max` without contacting the server,
+  where it used to crash above `UInt32.max`. A transaction that a server reports at such a height
+  (from the mempool, by its id or for a transparent address) is treated as unmined, like one in the
+  mempool or mined on a fork: it is stored without a mined height, and a mempool transaction at such
+  a height produces no `foundTransactions` event. Apart from handling the new `ZcashError` case
+  listed under Changed, no caller changes are required.
 
 ## Added
 
@@ -25,7 +135,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relative to the target. Use it instead of multiplying block counts by 75 seconds. It is `Sendable`
   and `Equatable` (equal for equal network types). A custom network used before its `Initializer`
   registered it fails an assertion in debug builds and follows the 75-second schedule in release builds.
+
 - `ZcashSDK.nu7ConsensusBranchID` (`0x77190ad9`) is the consensus branch ID of NU7, next to `nu63ConsensusBranchID`.
+
 - `Synchronizer.setMigrationNetworkUpgradeGateBypass(_:)` turns the NU7 network-upgrade gate's bypass on or
   off for the synchronizer's migrations. It is for internal builds only: a production build must never turn it
   on. It is off by default. With it on, `migrationAdvanceStep(accountUUID:)` never answers
@@ -33,6 +145,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run are not refused with `migrationPausedUntilNetworkUpgrade(_:)`, and `restartCurrentMigrationStep(accountUUID:)`
   plans at every height; it does not disable the detection of an interrupted run. A conformer that does not
   support migration gets a no-op default.
+
 - `Synchronizer.migrationAvailability()` returns a `MigrationAvailability`: what the migration may start at
   the wallet's next height, so an app can decide which options to offer before anything is planned. It takes
   no account and makes no network request; it is judged at the wallet's own chain tip, plus one, by the same
@@ -46,6 +159,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With `setMigrationNetworkUpgradeGateBypass(_:)` on, the phase is `.available` at every height. It throws
   `ZcashError.rustMigrationAvailability(_:)` for a wallet that has no chain tip yet (sync first) on a network
   with an NU7 activation height. A conformer that does not support migration throws by default.
+
 - `Synchronizer.cancelMigrationRun(accountUUID:)` cancels the account's pending run without planning a new
   one: the run is stored as cancelled and eligible advisory note reservations are released. Recorded spends
   remain subject to the wallet's expiry and scan rules, even if network submission failed or was never attempted.
@@ -57,6 +171,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing, so the NU7 gate never refuses it. With no run pending it succeeds and changes no stored run. It
   throws `ZcashError.rustMigrationCancelRun(_:)` for a rust-layer failure. A conformer that does not support
   migration throws by default.
+
 - `TransactionSubmissionRefusal` says why the SDK refused to submit a transaction: it cannot be valid in the
   next block, which is the one after the higher of the wallet's chain tip and the latest block height reported
   by the server the transaction is about to go to. `wrongConsensusBranch` means it is built for another
@@ -67,11 +182,26 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ZcashError.migrationSubmissionRefused(_:)`; any other transaction with
   `TransactionSubmitResult.submitFailure(txId:code:description:)` or `TransactionSubmissionOutcome.rejected(code:message:)`.
 
+- `Synchronizer.httpStreamOverOHTTP(for:viaTor:)` sends an HTTP request through the OHTTP relay and
+  gateway like `httpRequestOverOHTTP` and returns once the response head is in, with the body read
+  as the gateway sends it (`OHTTPStreamedResponse`): a server-sent event stream arrives event by
+  event, and a body that breaks off before the gateway's final chunk throws. In Tor mode the relay
+  leg, read as it arrives too, rides Tor.
+
+- `OHTTPURLProtocol` sends every request of the sessions it is registered in through
+  `httpStreamOverOHTTP`, mapped to the host's gateway alias; a host with no alias fails and never
+  goes out directly. `OHTTPURLProtocol.session(configuration:headers:delegate:delegateQueue:)` also
+  passes header fields the session would set (`Last-Event-ID`), which a `URLProtocol` is not given.
+
+- `api.flexa.co` maps to the mainnet gateway alias `flexa.zodl.com`, whose `Authorization` is the
+  client's own and goes through (the gateway replaces only the placeholder publishable key).
+
 ## Changed
 
 - On mainnet, NU7 activates at height 3,543,405, as it does on testnet at 4,465,026. From that height the
   target block spacing is 25 seconds and the default expiry of SDK-built transactions is 120 blocks, so
   everything the NU7 entries describe applies to mainnet from there.
+
 - A migration schedule keeps ZIP 318's delays and expiry windows, which the ZIP states in 75-second blocks,
   the same length in time once NU7 shortens the block: from NU7 they are three times as many blocks. The
   `nextExecutableAfterHeight` and `expiryHeight` of a `MigrationTransferProposal`, and the broadcast heights of
@@ -80,6 +210,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there are unchanged. Measure a span of heights with `TargetBlockSpacing`, not at 75 seconds a block. The
   migration also waits 10 reference blocks before it treats a step that a reorg displaced as permanent: 10
   blocks below the activation and 30 from it, the same 12.5 minutes.
+
 - From NU7, a transaction whose expiry height the wallet does not know is assumed to expire 120 blocks after
   the height at which the wallet first observed it, not 40: the 50 minutes it was at 75-second blocks, where 40
   blocks are about 17 minutes of 25-second ones. While such an unmined transaction stays inside that window,
@@ -87,13 +218,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AccountBalance.unshielded` and out of new proposals, so one that never mines holds its inputs 80 blocks
   longer than before, and the SDK asks the server about it for as long. Nothing changes from Blossom until
   NU7, and no caller changes are required.
+
 - Building `libzcashlc` from source now requires Rust 1.97 or newer (was 1.91).
+
 - `ZcashError` and `ZcashErrorCode` gain `compactBlockProcessorServerBlockHeightOutOfRange`
   (`ZCBPEO0025`). `SDKSynchronizer`'s sync fails with it on mainnet and testnet when the connected
   lightwalletd reports a chain tip above `Int32.max`, something only a broken or malicious server
   does; `switchTo(endpoint:)` reports it as `synchronizerServerSwitch`, and `SlipstreamSynchronizer`
   never reports it. An exhaustive `switch` over either type stops compiling until the new case is
   handled; see `MIGRATING.md`.
+
 - `MigrationAdvanceStep` has two new cases, `pausedForNetworkUpgrade(activationHeight:)` and
   `interruptedByNetworkUpgrade(activationHeight:)`, so an exhaustive `switch` over it stops compiling until
   both are handled; see `MIGRATING.md`. `migrationAdvanceStep(accountUUID:)` answers them from the wallet's own
@@ -109,6 +243,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     block before it and every unmined transaction built for the old branch may already have been sent: sync and
     ask again, and the answer becomes `interruptedByNetworkUpgrade` once the scan has reached that block without
     finding them.
+
 - `ZcashError` and `ZcashErrorCode` gain `migrationPausedUntilNetworkUpgrade(_:)` (`ZRUST0159`), whose payload is
   the NU7 activation height of the wallet's network. While the wallet's tip plus one is below activation, the calls
   that plan, build, sign, store or rebuild a scheduled migration run throw it: `prepareNoteSplit`, `submitNoteSplit`,
@@ -122,6 +257,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a terminal one, whatever the wallet's tip, and still does with `setMigrationNetworkUpgradeGateBypass(_:)` on or
   on a network with no NU7 activation height. An exhaustive `switch` over either type stops compiling until the
   new case is handled; see `MIGRATING.md`.
+
 - `Synchronizer.restartCurrentMigrationStep(accountUUID:)` returns a `MigrationRestartOutcome` in place of a
   `MigrationSchedule`, so a call site that used the schedule stops compiling, and any conformer or test double
   must return the new type; see `MIGRATING.md`. It still cancels the stored run.
@@ -130,9 +266,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the run is cancelled and nothing is planned, and `activationHeight` is the height at which the upgrade
     activates. The call succeeds, and a plan proposed before it can no longer be committed. Offer the user a new
     migration once the wallet's tip plus one reaches `activationHeight`.
+
 - `ZcashError` and `ZcashErrorCode` gain `rustMigrationAvailability(_:)` (`ZRUST0160`) and
   `rustMigrationCancelRun(_:)` (`ZRUST0161`), whose payload is the rust layer's message. An exhaustive `switch`
   over either type stops compiling until they are handled; see `MIGRATING.md`.
+
 - `performMigrationBroadcast(accountUUID:_:options:)` and `submitNoteSplit(accountUUID:proposal:usk:options:)`
   connect to the submission server (`options.submissionEndpoint`, over the dedicated migration Tor runtime when
   `options.useTor` is set) and read its latest block height on that connection before they take the transaction
@@ -156,6 +294,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instruction now costs a connection and a height read before the executor refuses it with
   `ZcashError.rustMigrationTakeBroadcastTransaction(_:)`. A call that finds the run already ended (cancelled,
   completed, failed or superseded) throws that same error; see Fixed.
+
 - `takeMigrationPreparation(accountUUID:byTxid:)` keeps its signature but now makes one network request of its
   own: it reads the latest block height of the synchronizer's own lightwalletd server and checks the preparation
   against the next block as above before the wallet records it. With Tor enabled the request goes over a Tor
@@ -166,10 +305,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ZcashError.serviceLatestBlockHeightFailed(_:)`, for instance) when the server cannot be asked, in which case
   nothing is taken. An app that submits the bytes it gets to other servers than the synchronizer's should judge
   them against those servers' own heights as well.
+
 - `ZcashError` and `ZcashErrorCode` gain `migrationSubmissionRefused(_:)` (`ZRUST0162`), whose payload is the
   `TransactionSubmissionRefusal` that says why. `performMigrationBroadcast`, `submitNoteSplit` and
   `takeMigrationPreparation` throw it. An exhaustive `switch` over either type stops compiling until it is
   handled; see `MIGRATING.md`.
+
 - Every transaction the SDK submits is checked against the next block first, not only a migration's: the transactions
   of the streams `createProposedTransactions(proposal:spendingKey:)`, `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`
   and `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)` return, those of `Broadcaster.submit(transaction:to:)` and
@@ -198,112 +339,94 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transaction cannot be judged at all, because it does not parse or the wallet database is missing, which no retry fixes,
     nothing is submitted either and a stream throws `ZcashError.rustCheckTransactionSubmittable(_:)`. Background resubmission
     skips either and tries again in a later pass.
+
 - `ZcashError` and `ZcashErrorCode` gain `rustCheckTransactionSubmittable(_:)` (`ZRUST0163`), whose payload is the rust layer's
   message, and `TransactionEncoderError` gains `notSubmittable(_:)`, whose payload is the `TransactionSubmissionRefusal`. An
   exhaustive `switch` over any of the three types stops compiling until the new case is handled; see `MIGRATING.md`. The
   synchronizers and the broadcaster report a refusal as above, so `notSubmittable(_:)` is not one a consumer meets from them.
+
+- Sapling parameter files are now verified with SHA-256 instead of SHA-1.
+
+- OHTTP key-configuration response size limit (64 KiB) is now enforced incrementally while reading
+  the body, not post-read. The per-request limit is carried through every HTTPSender implementation
+  (clearnet URLSession and Tor) so that key-config GETs use the 64 KiB limit and relay POSTs use
+  the 257 MiB limit. Addresses ZIP MUST requirement.
+
+- OHTTP voting route now tracks whether the `on_dispatch` callback fired. Failures before dispatch
+  (e.g., key-config fetch, relay connect) are classified as Transport (safely retriable); failures
+  after dispatch are Ambiguous (no retry). Previously all failures were marked after-dispatch.
+
+- An OHTTP relay's 429 is back-off, not a failure of the relay as a key source: a key-configuration
+  fetch the relay answers 429, or one made while the relay's pause runs, fails with that 429 and never
+  falls back to the DNS-over-HTTPS resolvers. A 429 that carries no usable `Retry-After` now starts a
+  30 s pause (`OHTTPTransport.defaultRateLimitPause`, the ZIP's reference default); it started none.
+
+- An OHTTP caller that is cancelled while the shared key-configuration fetch of its relay runs now
+  stops waiting at once (`CancellationError`); the fetch runs on for the other callers and its key is
+  still stored.
+
+- A non-2xx answer of the OHTTP relay (an error page) is read up to 64 KiB
+  (`OHTTPTransport.maxErrorBodyBytes`), a fixed guard whatever the call's own ceiling; the read stops
+  there and the answer is reported by its HTTP status (`OHTTPError.httpStatusError`, a 429 with its
+  `Retry-After` honoured) rather than as `responseTooLarge`. Over Tor the Rust connector applies the
+  same fixed 64 KiB guard while reading (it takes the status from the retry filter, which
+  `zcash_client_backend` calls before the body collector); an error page past it is reported by its
+  status, with an empty body, instead of failing as too large.
+
+- The transparent-address RPCs of an OHTTP gateway endpoint (`checkSingleUseTransparentAddresses`,
+  `updateTransparentAddressTransactions`, `fetchUTXOsByAddress`) ride the OHTTP transport like every
+  other call of that endpoint, on an isolated Tor circuit per call in Tor mode; the wallet half runs
+  through the new `zcashlc_single_use_taddr_to_check`, `zcashlc_schedule_single_use_taddr_check` and
+  `zcashlc_transparent_address_utxo_start_height` FFI. A gateway host is no longer dialled over Tor
+  by the Rust connector at all: `zcashlc_tor_connect_to_lightwalletd` refuses it (see
+  `rust/CHANGELOG.md`). A transaction height a block height cannot hold, other than lightwalletd's
+  `u64::MAX` for an unmined transaction, is now an error on this path as on the Tor gRPC one.
+
+- Sapling parameter Tor downloader now creates the destination directory before writing its temporary
+  file, fixing ENOENT when the SDK caller supplies a new parameters directory.
+
+- OHTTP relay posts over Tor (`httpRequestOverOHTTP`, the lightwalletd and migration OHTTP clients)
+  are tried again on a new isolated circuit, twice at most, when they fail to reach the relay
+  before any of the sealed request was sent (Tor stream or TLS); a sealed request is still never
+  resent. They were not retried at all.
+
+- OHTTP now routes `GET https://raw.githubusercontent.com/valargroup/token-holder-voting-config/*`
+  through the mainnet gateway. The host is returned unchanged (passthrough by :authority header),
+  so the inner request authority is `raw.githubusercontent.com` itself. Other paths on
+  raw.githubusercontent.com remain rejected as unsupportedPrivateDestination.
+
+- `TorClient.httpRequest(for:maxBytes:retryLimit:)` now has a default value for `maxBytes`
+  (257 MiB), preserving compatibility with existing callers that do not specify it.
+
+- A streamed answer read over Tor (`httpStreamOverOHTTP` in Tor mode, and `OHTTPURLProtocol`
+  sessions in Tor mode) now fails with `URLError.timedOut` when no body bytes arrive for the
+  request's `timeoutInterval`, instead of waiting forever.
+
+- `SlipstreamSynchronizer.switchTo(endpoint:)` made after `wipe()` completes and before the next
+  `prepare(with:walletBirthday:name:keySource:)` now only records the endpoint: that `prepare`
+  fetches the new wallet's provisioning anchor (a restore's chain tip, a new wallet's tree state)
+  from it and opens the engine there. The switch used to reopen the engine at once, recreating the
+  wallet database the wipe had just deleted, so a host could move a reset wallet only after
+  `prepare`, by which time its anchor had been fetched from the server in use before the wipe. A
+  host that resets a wallet to leave a server should now switch after the wipe and before
+  preparing; without that switch the next wallet stays on the server in use before the wipe, as
+  before. A switch made while that `prepare` is opening the engine is applied once the engine is
+  open, so the engine ends on the server of the last switch. `SDKSynchronizer` is unaffected.
+
+- OHTTP transport upgraded to Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08). The Swift SDK now
+  uses `encapsulate_chunked_request` and `ChunkedResponseDecoder` from `zodl-ohttp-client` to seal
+  requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
+  responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
+  no longer used. See PR #4 in zodl-inc/ohttp.
 
 ## Deprecated
 
 - `ZcashSDK.expiryOffset` is deprecated. It is not the expiry delta of SDK-built transactions (40 blocks
   after the target height before NU7, 120 from NU7); read a transaction's own `expiryHeight`. The SDK no
   longer uses it.
+
 - `ZcashSDK.syncedThresholdBlocks` is deprecated: the server-lag limit is six hours of target time, 288 blocks only at
   75-second blocks. Use `TargetBlockSpacing.seconds(from:to:)`. The SDK no longer uses it.
-
-## Fixed
-
-- `performMigrationBroadcast(accountUUID:_:options:)` and `takeMigrationPreparation(accountUUID:byTxid:)` no
-  longer serve a transaction of a run that has ended. An instruction a crank issued before
-  `cancelMigrationRun(accountUUID:)` (or before the run completed, failed or was superseded) could still be
-  discharged after it, which recorded the transaction in the wallet and marked the notes the cancel had just
-  released as spent again. They now throw `ZcashError.rustMigrationTakeBroadcastTransaction(_:)` and
-  `ZcashError.rustMigrationTakePreparation(_:)` for it. No caller changes are required.
-- Transactions created by `createProposedTransactions(proposal:spendingKey:)`,
-  `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` or `createPCZTFromProposal(accountUUID:proposal:)`
-  at a target height with NU7 active (mainnet from 3,543,405, testnet from 4,465,026) expired after 40
-  blocks, about 17 minutes of 25-second blocks; they now expire after 120, the 50 minutes they have
-  before NU7. ZIP 318 canonical crossings keep their ZIP 318 expiry, and nothing changes from Blossom
-  until NU7.
-  From NU7 activation, a payment to a ZIP 316 revision 2 unified address whose expiry height falls
-  before the new default expiry (target height + 120) but not before the old one (target height + 40),
-  which used to succeed, is still proposed but fails at creation: `createProposedTransactions` throws
-  `ZcashError.rustCreateToAddress` (`ZRUST0002`) with `RustErrorKind.unclassified`, and
-  `createPCZTFromProposal` throws `ZcashError.rustCreatePCZTFromProposal` (`ZRUST0069`).
-- `evaluateBestOf(endpoints:fetchThresholdSeconds:nBlocksToFetch:kServers:network:)` and
-  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)` rule out servers
-  trailing their estimated tip by more than six hours of target time. The fixed 288 blocks were two hours
-  at NU7's 25-second blocks, too strict for a check that must stay loose. Nothing changes before NU7 on mainnet
-  and testnet.
-- A `SlipstreamSynchronizer` stopped and restarted within 120 seconds kept spendable balances unmasked
-  (`SynchronizerState.isSpendableMasked`) even where NU7's 25-second blocks let almost five blocks arrive.
-  The window is now 1.6 target block intervals of the block after the last known tip: 120 s before NU7, 40 s from NU7.
-- `estimateBirthdayHeight(for:)` returns the height of the newest bundled checkpoint whose time is strictly
-  before the date. For a date at or after the newest checkpoint's time it returns that checkpoint, and when no
-  checkpoint is before the date it returns Sapling activation, the floor. The answer does not depend on how
-  fast blocks were mined, so NU7's 25-second blocks do not affect it. It used to return an older checkpoint,
-  or Sapling activation, for some dates: those just after a checkpoint's time, those equal to one, and early
-  dates near the start of either chain. Restores from such a date scanned more blocks than needed. No caller
-  changes are required.
-- `checkSingleUseTransparentAddresses(accountUUID:)` checks addresses exposed within the past day of target
-  time and spaces rechecks by the target spacing of the block after the tip; after NU7 it looked back eight
-  hours and rescheduled three times too far out. In wall-clock terms, an address that has received nothing is
-  now rechecked roughly 2–3× as often after NU7 as before it, each recheck being one address over its own
-  Tor circuit. Nothing changes before NU7 on mainnet and testnet.
-- `estimatedMigrationChainTip()` and `estimatedMigrationSecondsPerBlock()` account for NU7's 25-second blocks.
-  The rate is measured over up to 1,000 scanned blocks as the chain's speed relative to their target time, so the
-  first blocks after NU7 activation do not swing it, and it is reported in the target spacing of the block after
-  the projected tip. Its 5–150 s bounds scale with that spacing (5/3–50 s at 25 s), and when it cannot be measured it
-  is that spacing. A projection that reaches NU7 activation counts the later blocks at their own spacing, at the
-  measured speed. To convert wake-up heights across activation, pass the rate to
-  `TargetBlockSpacing.estimatedSeconds(from:to:secondsPerBlock:)` with `estimatedMigrationChainTip()` as `from`.
-  Nothing changes for a window and tip within the 75-second era, except that a tip right before NU7 activation
-  has its rate reported at NU7's spacing, since its next block is an NU7 block. A window spanning Blossom, seen
-  only early in a restore from a pre-Blossom birthday, now also measures speed against target time, and a latest
-  scanned block below Blossom gets the 150-second era's bounds and fallback.
-- `MigrationSchedule.estimatedDurationHours` counts blocks at their target spacing (25 s from NU7); after NU7
-  it read up to three times too long. Nothing changes before NU7 on mainnet and testnet.
-- `migrationProgress(accountUUID:)` reports an unconfirmed immediate migration with no known expiry as pending
-  for 120 blocks after it was recorded once NU7 is active, not 40, which ended the report while it could still
-  mine. Nothing changes before NU7.
-- Server validation keeps checking for Ironwood tree state after NU7 activation (mainnet from 3,543,405,
-  testnet from 4,465,026). It stopped when the server's tip reached NU7, so a lightwalletd that serves no
-  Ironwood data passed validation there, and syncing against it detected nothing in the Ironwood pool. It now throws
-  `ZcashError.compactBlockProcessorServerMissingIronwoodSupport` (`ZCBPEO0024`) as it did from NU6.3 activation
-  until NU7. No caller changes are required.
-- `estimateTimestamp(for:)` on `Synchronizer`, `SDKSynchronizer` and `SlipstreamSynchronizer` now
-  returns `nil` instead of never returning when the checkpoint files in the SDK's resource bundle
-  are missing or damaged. The result was already optional, so no caller changes are required.
-- A server that reports a block height above `Int32.max` no longer crashes the app. That covers the
-  tip in `getInfo`, the latest block, a compact block, a UTXO, a tree state and the height of a
-  transaction; only a broken or malicious server sends one. The call that received such a height
-  fails with its usual error (`serviceLatestBlockHeightFailed`, `serviceBlockRangeFailed`,
-  `serviceBlockStreamFailed` or `serviceFetchUTXOsFailed`), and `SDKSynchronizer`'s sync fails with
-  it (a UTXO's inside `unspentTransactionFetcherStream`). When the tip in `getInfo` is the problem,
-  `SDKSynchronizer`'s sync fails with the new
-  `ZcashError.compactBlockProcessorServerBlockHeightOutOfRange` on mainnet and testnet, and
-  `switchTo(endpoint:)` reports the error as `synchronizerServerSwitch`; a regtest or other custom
-  network does not check that tip during sync, and `SlipstreamSynchronizer` never reports it.
-  `evaluateBestOf(...)` and `evaluateServerSwitch(...)` skip such a server on every network. A
-  wallet or gift card wallet that is created while the server sends such a tree state keeps the
-  bundled checkpoint. A restore while the server reports such a tip recovers until the same height
-  as when the server cannot be reached, with `SDKSynchronizer` and `SlipstreamSynchronizer` alike,
-  and `importAccount` does what it does then too: `SDKSynchronizer`'s throws
-  `synchronizerNotPrepared`, and `SlipstreamSynchronizer`'s imports the account with the recovery
-  height it gets when the server cannot be reached. With Tor enabled,
-  `getTreeState(height:)` on `Synchronizer`, `SDKSynchronizer` and `SlipstreamSynchronizer` throws
-  `ZcashError.rustTorLwdGetTreeState` for a height above `Int32.max` without contacting the server,
-  where it used to crash above `UInt32.max`. A transaction that a server reports at such a height
-  (from the mempool, by its id or for a transparent address) is treated as unmined, like one in the
-  mempool or mined on a fork: it is stored without a mined height, and a mempool transaction at such
-  a height produces no `foundTransactions` event. Apart from handling the new `ZcashError` case
-  listed under Changed, no caller changes are required.
-- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
-  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
-  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
-  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
-  the flood was previously processed without limit. lightwalletd's block streams, which send one
-  small frame per compact block, stay within the limit. No caller changes are required.
 
 # 6.0.0 - 2026-10-15
 

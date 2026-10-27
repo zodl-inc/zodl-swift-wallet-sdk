@@ -75,6 +75,9 @@ protocol MigrationBroadcasting {
 /// - **Direct (`useTor == false`)** opens a fresh, ephemeral gRPC service for exactly the resolved
 ///   endpoint, submits once, and closes it.
 ///
+/// An OHTTP gateway endpoint takes no plain gRPC on either transport: the submit is sealed to the gateway
+/// and posted to its relay, over an isolated circuit of the dedicated Tor client when `useTor` is set.
+///
 /// Once the connection is established, a thrown error from the height read or the submit RPC is
 /// reported as ``MigrationBroadcastOutcome/transportError`` (a retryable network error), not as a
 /// fail-closed Tor failure.
@@ -82,6 +85,9 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     private let torDirURL: URL
     private let logger: Logger
     private let torClientFactory: @Sendable (URL) async throws -> TorClient
+    /// The SDK's Tor mode: while it is on, every broadcast goes over Tor whatever the caller asked for.
+    private let torMode: @Sendable () async -> Bool
+    private let ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)?
     private let directServiceFactory: @Sendable (LightWalletEndpoint) -> any LightWalletService
 
     /// The dedicated Tor client's bootstrap, cached as a `Task` on the first `useTor` broadcast so
@@ -105,8 +111,13 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     ///   documents), so sharing the directory is safe. ``torClientTask`` additionally removes the
     ///   duplicate-bootstrap race within a single broadcaster: concurrent `useTor` broadcasts on one
     ///   instance bootstrap the shared directory at most once (see ``dedicatedTorClient()``).
-    init(torDirURL: URL, logger: Logger) {
-        self.init(torDirURL: torDirURL, logger: logger, torClientFactory: MigrationBroadcaster.bootstrapTorClient)
+    init(torDirURL: URL, logger: Logger, torMode: @escaping @Sendable () async -> Bool = { false }) {
+        self.init(
+            torDirURL: torDirURL,
+            logger: logger,
+            torClientFactory: MigrationBroadcaster.bootstrapTorClient,
+            torMode: torMode
+        )
     }
 
     /// Injecting initializer for tests: substitutes the Tor-client factory ``dedicatedTorClient()``
@@ -120,12 +131,16 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         torDirURL: URL,
         logger: Logger,
         torClientFactory: @escaping @Sendable (URL) async throws -> TorClient,
-        directServiceFactory: @escaping @Sendable (LightWalletEndpoint) -> any LightWalletService = { LightWalletGRPCService(endpoint: $0) }
+        torMode: @escaping @Sendable () async -> Bool = { false },
+        directServiceFactory: @escaping @Sendable (LightWalletEndpoint) -> any LightWalletService = { LightWalletGRPCService(endpoint: $0) },
+        ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)? = nil
     ) {
         self.torDirURL = torDirURL
         self.logger = logger
         self.torClientFactory = torClientFactory
+        self.torMode = torMode
         self.directServiceFactory = directServiceFactory
+        self.ohttpClientFactory = ohttpClientFactory
     }
 
     /// The zcashd `sendrawtransaction` RPC error code for a transaction the node already knows
@@ -211,7 +226,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         onWillSubmit: @Sendable () -> Void,
         prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
-        if useTor {
+        let torModeOn = await torMode()
+        if useTor || torModeOn {
             return try await broadcastOverTor(
                 to: endpoint,
                 onWillSubmit: onWillSubmit,
@@ -281,6 +297,22 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             throw ZcashError.migrationTorUnavailable
         }
 
+        // A gateway takes no plain gRPC: the submit goes through its relay, the relay leg on an isolated
+        // circuit of the dedicated runtime.
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            let client: any MigrationOHTTPClient
+            do {
+                let isolated = try await runtime.isolatedClient()
+                client = try await preparedOHTTPClient(for: endpoint, viaTor: true) { request, maxBytes in
+                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                }
+            } catch {
+                logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host) over Tor: \(error)")
+                throw ZcashError.migrationTorUnavailable
+            }
+            return try await submitViaOHTTP(client: client, onWillSubmit: onWillSubmit, prepareTransaction: prepareTransaction)
+        }
+
         let connection: TorLwdConn
         do {
             let isolated = try await runtime.isolatedClient()
@@ -329,6 +361,24 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         onWillSubmit: @Sendable () -> Void,
         prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
+        // A gateway takes no plain gRPC: the submit goes through its relay.
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            let client: any MigrationOHTTPClient
+            do {
+                client = try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
+                    let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: maxBytes)
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw OHTTPError.transportError("Invalid response type")
+                    }
+                    return (data, httpResponse)
+                }
+            } catch {
+                logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host): \(error)")
+                return MigrationBroadcastOutcome.transportError
+            }
+            return try await submitViaOHTTP(client: client, onWillSubmit: onWillSubmit, prepareTransaction: prepareTransaction)
+        }
+
         // A fresh, ephemeral gRPC service for exactly this endpoint, closed after the single attempt.
         let service = directServiceFactory(endpoint)
 
@@ -400,5 +450,84 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         let client = TorClient(torDir: migrationTorDir)
         try await client.prepare()
         return client
+    }
+}
+
+private extension MigrationBroadcaster {
+    /// The OHTTP client for the gateway `endpoint`, with its key configuration already fetched. Both the
+    /// height read and submission share this client and its chosen sender.
+    func preparedOHTTPClient(
+        for endpoint: LightWalletEndpoint,
+        viaTor: Bool,
+        httpSender: @escaping OHTTPTransport.HTTPSender
+    ) async throws -> any MigrationOHTTPClient {
+        if let ohttpClientFactory {
+            return try await ohttpClientFactory(endpoint)
+        }
+        let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+        let transport = OHTTPTransport(
+            gatewayHost: endpoint.host,
+            relayURL: relayURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
+        _ = try await transport.keyConfig()
+        return OHTTPGRPCClient(
+            authority: endpoint.host,
+            transport: transport,
+            singleCallTimeoutMS: Self.ohttpSubmitTimeoutMS,
+            streamingCallTimeoutMS: Self.ohttpSubmitTimeoutMS
+        )
+    }
+
+    static let ohttpSubmitTimeoutMS = 30_000
+
+    func submitViaOHTTP(
+        client: any MigrationOHTTPClient,
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
+    ) async throws -> MigrationBroadcastOutcome {
+        let serverHeight: BlockHeight
+        do {
+            let latestBlock = try await client.latestBlock()
+            guard let height = BlockHeight(serverHeight: latestBlock.height) else {
+                logger.error("MigrationBroadcaster: the OHTTP submission server reported an unusable latest block height")
+                return MigrationBroadcastOutcome.transportError
+            }
+            serverHeight = height
+        } catch {
+            logger.error("MigrationBroadcaster: could not read the OHTTP submission server's height: \(error.localizedDescription)")
+            return MigrationBroadcastOutcome.transportError
+        }
+
+        // Preparation can refuse a transaction and must propagate its original error.
+        let rawTransaction = try await prepareTransaction(serverHeight)
+        var transaction = RawTransaction()
+        transaction.data = rawTransaction
+        onWillSubmit()
+        do {
+            let response = try await client.submit(transaction)
+            return outcome(from: response)
+        } catch {
+            logger.error("MigrationBroadcaster: OHTTP submit failure: \(error.localizedDescription)")
+            return MigrationBroadcastOutcome.transportError
+        }
+    }
+}
+
+/// The two RPCs of one prepared OHTTP client, retained together for a submission attempt.
+protocol MigrationOHTTPClient: Sendable {
+    func latestBlock() async throws -> BlockID
+    func submit(_ transaction: RawTransaction) async throws -> SendResponse
+}
+
+extension OHTTPGRPCClient: MigrationOHTTPClient {
+    func latestBlock() async throws -> BlockID {
+        try await unary(path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock", request: ChainSpec())
+    }
+
+    func submit(_ transaction: RawTransaction) async throws -> SendResponse {
+        try await unary(path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction", request: transaction)
     }
 }

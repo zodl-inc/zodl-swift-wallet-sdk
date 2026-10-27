@@ -47,6 +47,12 @@ jobs:
           cat "$xcode_version_file"
           echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      - name: Authorize cargo against the private slipstream repository
+        uses: ./.github/actions/authorize-slipstream
+        with:
+          app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
       # The runner image already ships rustup, so no toolchain action is needed.
       # The settings are those of swift.yml's build job, with every target a
       # release builds.

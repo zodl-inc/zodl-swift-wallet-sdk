@@ -124,6 +124,13 @@ jobs:
         path: BuildSupport/products/libzcashlc.xcframework
         key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
+    - name: Authorize cargo against the private slipstream repository
+      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
+      uses: ./.github/actions/authorize-slipstream
+      with:
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
     # The same Rust setup as swift.yml's build job, whose comment explains it.
     - name: Setup Rust
       id: toolchain

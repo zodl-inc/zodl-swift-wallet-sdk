@@ -1377,6 +1377,12 @@ impl HttpResponseBytes {
             body_len,
         })))
     }
+
+    /// The response's status and body length, for the tests that call the Tor FFI.
+    #[cfg(test)]
+    pub(crate) fn status_and_body_len(&self) -> (u16, usize) {
+        (self.status, self.body_len)
+    }
 }
 
 /// Frees an HttpResponseBytes value
@@ -1512,6 +1518,55 @@ pub unsafe extern "C" fn zcashlc_free_single_use_taddr(ptr: *mut SingleUseTaddr)
     if !ptr.is_null() {
         let res = unsafe { Box::from_raw(ptr) };
         unsafe { zcashlc_string_free(res.address) }
+        drop(res)
+    }
+}
+
+/// The transparent-address check the wallet is due for.
+///
+/// cbindgen:prefix-with-name
+#[repr(C, u8)]
+pub enum TransparentAddressCheck {
+    /// No address is due for a check.
+    None,
+    /// `address` is to be checked for transactions mined from `start_height` to `end_height`.
+    Due {
+        address: *mut c_char,
+        start_height: u32,
+        end_height: u32,
+    },
+}
+
+impl TransparentAddressCheck {
+    pub(crate) fn from_rust(
+        network: &impl Parameters,
+        due: Option<(TransparentAddress, u32, u32)>,
+    ) -> *mut Self {
+        let res = match due {
+            None => TransparentAddressCheck::None,
+            Some((addr, start_height, end_height)) => TransparentAddressCheck::Due {
+                address: CString::new(addr.encode(&network)).unwrap().into_raw(),
+                start_height,
+                end_height,
+            },
+        };
+
+        Box::into_raw(Box::new(res))
+    }
+}
+
+/// Frees a [`TransparentAddressCheck`] value.
+///
+/// # Safety
+///
+/// - `ptr` must be non-null and must point to a struct having the layout of [`TransparentAddressCheck`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_transparent_address_check(ptr: *mut TransparentAddressCheck) {
+    if !ptr.is_null() {
+        let res = unsafe { Box::from_raw(ptr) };
+        if let TransparentAddressCheck::Due { address, .. } = *res {
+            unsafe { zcashlc_string_free(address) }
+        };
         drop(res)
     }
 }
@@ -1887,5 +1942,72 @@ mod recovery_hold_tests {
         assert_eq!(latch, HoldLatch::Idle);
         assert!(balances_of(ptr).is_empty());
         unsafe { zcashlc_free_wallet_summary(ptr) };
+    }
+}
+
+/// Set the default OHTTP client trace prefix (process-wide). This should be called before any
+/// OHTTP connections are made, typically during SDK initialization. Pass NULL to disable tracing.
+///
+/// A no-op unless the library is built with the `ohttp-trace` feature (QA and E2E builds only),
+/// so a released framework never sends client trace ids whatever the caller passes.
+///
+/// # Safety
+///
+/// - `prefix` must be NULL or a valid UTF-8 C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_set_default_ohttp_client_trace_prefix(prefix: *const c_char) {
+    if let Some(prefix_opt) = unsafe { ohttp_client_trace_prefix_to_set(prefix) } {
+        slipstream_core::ohttp::set_default_client_trace_prefix(prefix_opt);
+    }
+}
+
+/// The value `zcashlc_set_default_ohttp_client_trace_prefix` hands to slipstream, or `None` to
+/// leave the default untouched.
+///
+/// # Safety
+///
+/// - `prefix` must be NULL or a valid UTF-8 C string.
+unsafe fn ohttp_client_trace_prefix_to_set(prefix: *const c_char) -> Option<Option<String>> {
+    if !cfg!(feature = "ohttp-trace") {
+        return None;
+    }
+    if prefix.is_null() {
+        return Some(None);
+    }
+    let c_str = unsafe { std::ffi::CStr::from_ptr(prefix) };
+    Some(c_str.to_str().ok().map(|s| s.to_string()))
+}
+
+#[cfg(test)]
+mod ohttp_client_trace_prefix_tests {
+    use super::ohttp_client_trace_prefix_to_set;
+    use std::ffi::CString;
+
+    #[cfg(not(feature = "ohttp-trace"))]
+    #[test]
+    fn ignored_without_the_ohttp_trace_feature() {
+        let prefix = CString::new("qa-trace").unwrap();
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(prefix.as_ptr()) },
+            None
+        );
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(std::ptr::null()) },
+            None
+        );
+    }
+
+    #[cfg(feature = "ohttp-trace")]
+    #[test]
+    fn forwarded_with_the_ohttp_trace_feature() {
+        let prefix = CString::new("qa-trace").unwrap();
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(prefix.as_ptr()) },
+            Some(Some("qa-trace".to_string()))
+        );
+        assert_eq!(
+            unsafe { ohttp_client_trace_prefix_to_set(std::ptr::null()) },
+            Some(None)
+        );
     }
 }

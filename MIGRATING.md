@@ -584,6 +584,7 @@ let session = try await synchronizer.makeVotingRoundSession(
     inputs: inputs,                                        // VotingSessionInputs
     binding: VotingSessionBinding(roster: roster, hotkeySecret: Data(hotkey.storedSecret)),
     route: .tor,
+    isCustomServer: false,                                 // true only for a server the voter added
     epoch: operationEpoch
 )
 
@@ -811,7 +812,7 @@ switches wallets or leaves the flow, and every bounded pass started under the ol
 its next boundary.
 
 **A route change means a new session.** The route is chosen once, at
-`makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, and is fixed for the session's whole
+`makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)`, and is fixed for the session's whole
 life: there is no setter, and `.tor` never falls back to `.direct`. It governs every service the
 session touches, not only chain traffic — helper delivery, PIR queries and vote-tree sync all ride
 the same route, because a PIR query hides which rows are fetched, not who fetches them. So a Tor
@@ -988,7 +989,7 @@ same height.
 
 Voting runs on NU6.3 on both sides, so where the two differ at least one of them has not reached
 NU6.3 at that height, and at least one half refuses the round on its own.
-`makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and refuses, naming both
+`makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` compares them and refuses, naming both
 branches and the snapshot height, as the first thing it does once its inputs decode — so a host
 reads one clear reason rather than an unsupported note version from note selection or an unsupported
 branch id from a delegation step:
@@ -996,7 +997,8 @@ branch id from a delegation step:
 ```swift
 do {
     let session = try await synchronizer.makeVotingRoundSession(
-        backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch
+        backend: backend, inputs: inputs, binding: binding, route: route,
+        isCustomServer: isCustomServer, epoch: epoch
     )
     drive(session)
 } catch let error as VotingError where error.kind == .invalidInput {

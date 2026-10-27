@@ -127,6 +127,18 @@ jobs:
         path: BuildSupport/products/libzcashlc.xcframework
         key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
 
+    # This branch fetches private git dependencies (see Cargo.lock), so every
+    # cargo invocation needs this token: an FFI cache miss (the FFI build below)
+    # and the Rust test step, which runs on every event. `~/.cargo/git` is
+    # deliberately left out of the cache, see `Cache Cargo`. Fork PRs get no
+    # secrets; the action then does nothing and their fetches of the private
+    # repositories fail.
+    - name: Authorize cargo against the private slipstream repository
+      uses: ./.github/actions/authorize-slipstream
+      with:
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
     # Used by both the FFI build and the Rust tests, so it is not conditional on
     # the FFI cache.
     - name: Cache Cargo
@@ -155,7 +167,6 @@ jobs:
         key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-
-
     # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
     # the Swift build and the offline tests need. Releases still build every
     # slice with LTO.

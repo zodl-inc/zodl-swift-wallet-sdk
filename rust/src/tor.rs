@@ -1,7 +1,12 @@
 //! Tor support
+//!
+//! Lightwalletd endpoints whose host is an OHTTP gateway (`slipstream_core::ohttp::relay_for`)
+//! are never dialled here: the gateway refuses plain gRPC, and the Swift `LightWalletOHTTPService`
+//! reaches it through its relay (over Tor when Tor is on). A gateway endpoint is refused.
 
 pub(crate) mod http;
 
+use std::convert::TryInto;
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -46,6 +51,13 @@ impl TorRuntime {
             .await
         })?;
         Ok(Self { runtime, client })
+    }
+
+    /// True when `endpoint` is an OHTTP gateway, which is never dialled directly.
+    fn is_ohttp_gateway(endpoint: &Uri) -> bool {
+        endpoint
+            .host()
+            .is_some_and(|h| slipstream_core::ohttp::relay_for(h).is_some())
     }
 
     pub(crate) fn runtime(&self) -> &PreferredRuntime {
@@ -93,6 +105,15 @@ impl TorRuntime {
     ///
     /// Each connection returned by this method is isolated from any other Tor usage.
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
+        // An OHTTP gateway refuses plain gRPC and is only reached through its relay, by the Swift
+        // OHTTP transport; it is never dialled from here.
+        if Self::is_ohttp_gateway(&endpoint) {
+            return Err(anyhow!(
+                "{} is an OHTTP gateway: reached through the OHTTP transport, not dialled over Tor",
+                endpoint
+            ));
+        }
+
         let Self { runtime, client } = self.isolated_client();
 
         let allow_onion_services = false;

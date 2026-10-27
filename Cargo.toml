@@ -156,7 +156,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 base64 = "0.22"
 hex = "0.4"
 
+# Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
+# key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
+# status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
+# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
+# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
+# fails loudly, a branch would follow a force-push. b0b2087c: DNS fallback for signed key configuration.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "b0b2087c9d867115f38ddfbd6021988b64abf8f9", default-features = false }
+
 [dev-dependencies]
+futures = "0.3"
+http-body = "1"
+http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Plays the device in the Ledger signing tests (`rust/src/ledger/tests.rs`). Matches the engine's
@@ -177,6 +188,13 @@ default = []
 # default — the released libzcashlc links zero wgpu. Enable for local device
 # builds via Scripts/init-local-ffi.sh --gpu / rebuild-local-ffi.sh --gpu.
 gpu = ["slipstream-core/gpu"]
+
+# Lets zcashlc_set_default_ohttp_client_trace_prefix set OHTTP client trace ids;
+# without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
+# init-local-ffi.sh / rebuild-local-ffi.sh --trace,
+# make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
+# release builds (build-ffi.yml, prepare-release.sh) never enable it.
+ohttp-trace = []
 
 [lib]
 name = "zcashlc"
@@ -199,10 +217,8 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# Pin the signed zodl_slipstream-0.4.0 release tag by immutable commit hash.
-# Keep the Git patch until 0.4.0 is published to crates.io. This release uses the same
-# librustzcash generation as the versions above, keeping a single family instance.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "8591b758ca0919058035a2453b41e035f84b2402" }
+# OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "a8d505d2ffe7bb7a8c275733b0e5d8005ef47d8b" }
 
 # DO NOT ALTER THIS COMMENT
 #

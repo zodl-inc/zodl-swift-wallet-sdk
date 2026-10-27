@@ -1,6 +1,6 @@
 #!/bin/bash
 # Initialize local FFI development environment
-# Usage: ./Scripts/init-local-ffi.sh [option]
+# Usage: ./Scripts/init-local-ffi.sh [option] [--trace]
 #
 # Options:
 #   (no option)   Build the full XCFramework (all 5 architectures) from your rust/.
@@ -10,6 +10,8 @@
 #   --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
 #   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
 #   --cached      Download the pre-built release XCFramework instead of building.
+#   --trace       QA build with the `ohttp-trace` feature, so OHTTP client trace ids
+#                 work (DEBUG app builds only). Never use it for a build that ships.
 #
 # The --arm-* options skip the x86_64 simulator/Mac slices, which you cannot run on
 # Apple Silicon anyway, so local iteration is faster. They always build the aarch64
@@ -43,7 +45,7 @@ usage() {
         echo "" >&2
     fi
     cat >&2 << 'USAGEEOF'
-Usage: ./Scripts/init-local-ffi.sh [option]
+Usage: ./Scripts/init-local-ffi.sh [option] [--trace]
 
 Options:
   (no option)   Build the full XCFramework (all 5 architectures) from your rust/.
@@ -52,6 +54,8 @@ Options:
   --arm-simulator   Build only the arm64 iOS simulator slice (aarch64-apple-ios-sim).
   --arm-all     Build all arm64 slices: iOS simulator + device + macOS.
   --cached      Download the pre-built release XCFramework instead of building.
+  --trace       QA build with the ohttp-trace feature (OHTTP client trace ids).
+                Never use it for a build that ships.
 
 Creates LocalPackages/ with a locally-built xcframework. Package.swift detects
 LocalPackages/ and uses it instead of the released binary.
@@ -109,7 +113,8 @@ build_arm_xcframework() {
         # Ensure the Rust target is available (idempotent), then build it.
         # cargo is incremental, so repeat builds after small edits are fast.
         rustup target add "$rust_target"
-        cargo build --locked --target "$rust_target" --release
+        # $FEATURE_ARGS is intentionally unquoted (empty = no extra args).
+        cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"
@@ -154,14 +159,24 @@ build_arm_xcframework() {
     fi
 }
 
-# Parse the single optional flag.
-if [[ $# -gt 1 ]]; then
+# Parse the single optional build option, plus --trace.
+FFI_CARGO_FEATURES=""
+ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--trace" ]]; then
+        FFI_CARGO_FEATURES="ohttp-trace"
+    else
+        ARGS+=("$arg")
+    fi
+done
+if [[ ${#ARGS[@]} -gt 1 ]]; then
     usage "Too many arguments; pass at most one option."
 fi
+FEATURE_ARGS="${FFI_CARGO_FEATURES:+--features $FFI_CARGO_FEATURES}"
 
 BUILD_MODE="full"
 ARM_TARGETS=()
-case "${1:-}" in
+case "${ARGS[0]:-}" in
     "")
         BUILD_MODE="full"
         ;;
@@ -185,9 +200,13 @@ case "${1:-}" in
         ARM_TARGETS=(ios-sim ios-device macos)
         ;;
     *)
-        usage "Unknown option: $1"
+        usage "Unknown option: ${ARGS[0]}"
         ;;
 esac
+
+if [[ "$BUILD_MODE" == "cached" && -n "$FFI_CARGO_FEATURES" ]]; then
+    usage "--trace needs a source build; it cannot be combined with --cached."
+fi
 
 if [[ "$BUILD_MODE" == "arm" ]]; then
     echo "Initializing local FFI for arm64 (${ARM_TARGETS[*]})..."
@@ -256,7 +275,7 @@ elif [[ "$BUILD_MODE" == "cached" ]]; then
 else
     echo "Building full xcframework from source (this takes a while)..."
     cd BuildSupport
-    make xcframework
+    make xcframework FFI_CARGO_FEATURES="$FFI_CARGO_FEATURES"
     cd ..
     mkdir -p LocalPackages
     # cp -R into an EXISTING directory copies the source INSIDE it (nested

@@ -4,11 +4,11 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use http_body_util::Empty;
+use http_body_util::{BodyExt, Empty};
 use hyper::{Request, client::conn::http1::SendRequest};
 use hyper_util::rt::TokioIo;
 use tokio::{
@@ -18,6 +18,8 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+
+use zcash_client_backend::tor::{Error, http::HttpError};
 
 use super::with_http_timeout;
 
@@ -514,7 +516,11 @@ async fn stalled_body_uses_outer_deadline() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -549,7 +555,11 @@ async fn complete_body_copies_exact_bytes() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -564,7 +574,10 @@ async fn complete_body_copies_exact_bytes() {
 
     assert!(outcome.client_eof, "the client must close its local socket");
     let result = guarded_result.expect("body copy exceeded the test guard");
-    assert_eq!(result.expect("complete body must succeed"), b"test"[..]);
+    assert_eq!(
+        result.expect("complete body must succeed"),
+        Some(bytes::Bytes::from_static(b"test"))
+    );
 }
 
 #[tokio::test]
@@ -581,7 +594,11 @@ async fn truncated_body_is_an_error() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -614,7 +631,11 @@ async fn delayed_headers_use_outer_deadline() {
             headers_seen
                 .send(())
                 .expect("observe parsed response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -659,7 +680,11 @@ async fn one_deadline_spans_local_transport_attempts() {
             second_headers_seen
                 .send(())
                 .expect("observe parsed second-attempt response headers");
-            let body = crate::collect_http_response_body(response.into_body()).await?;
+            let body = crate::collect_http_response_body_limited(
+                response.into_body(),
+                crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+            )
+            .await?;
             anyhow::Ok(body)
         }),
     )
@@ -683,5 +708,313 @@ async fn one_deadline_spans_local_transport_attempts() {
             .expect_err("the shared attempt budget must expire")
             .to_string(),
         "Tor HTTP request timed out"
+    );
+}
+
+// --- The response-body guard on a local server ---------------------------------------------
+//
+// These drive `tor_http_with_body_guard`, the wiring every `zcashlc_tor_http_*` call uses, with
+// a local hyper client in place of `zcash_client_backend`'s Tor client, replaying the crate's
+// `http_request` call order by hand: the retry filter sees the final response's status, then the
+// collector gets the body. Driving the crate's own client needs a bootstrapped Tor
+// (`network_tests::real_ffi_error_page_is_cut_at_the_fixed_guard`, opt-in).
+
+/// The declared length of an error page that never ends within a test.
+const ENDLESS_ERROR_PAGE_DECLARED_LEN: usize = 1 << 20;
+/// A 2xx body past the error-page guard but under every caller's ceiling.
+const LARGE_OK_BODY_LEN: usize = crate::TOR_HTTP_MAX_ERROR_BODY_BYTES + 4096;
+/// A small error page, returned whole.
+const SMALL_ERROR_PAGE_LEN: usize = 1024;
+/// How many bytes past the guard the collector may have consumed: the frame that overflowed it.
+/// The endless page is trickled one byte at a time past the guard, so that frame is a few bytes.
+const GUARD_OVERFLOW_FRAME_SLACK: usize = 64;
+const TRICKLE_INTERVAL: Duration = Duration::from_millis(10);
+
+struct LargeResponseScript {
+    status: u16,
+    declared_len: usize,
+    /// Bytes written right after the headers.
+    written_at_once: usize,
+    /// Then one byte every `TRICKLE_INTERVAL` until the client goes away.
+    trickle: bool,
+}
+
+impl LargeResponseScript {
+    /// `status` with `TOR_HTTP_MAX_ERROR_BODY_BYTES` bytes at once, then a trickle that never
+    /// reaches the declared length within a test.
+    fn endless_error_page(status: u16) -> Self {
+        Self {
+            status,
+            declared_len: ENDLESS_ERROR_PAGE_DECLARED_LEN,
+            written_at_once: crate::TOR_HTTP_MAX_ERROR_BODY_BYTES,
+            trickle: true,
+        }
+    }
+
+    /// `status` with a complete body of `len` bytes.
+    fn complete(status: u16, len: usize) -> Self {
+        Self {
+            status,
+            declared_len: len,
+            written_at_once: len,
+            trickle: false,
+        }
+    }
+}
+
+struct LargeServerOutcome {
+    bytes_written: usize,
+    client_eof: bool,
+}
+
+struct LargeHttpServer {
+    addr: SocketAddr,
+    task: JoinHandle<anyhow::Result<LargeServerOutcome>>,
+}
+
+impl LargeHttpServer {
+    async fn spawn(script: LargeResponseScript) -> Self {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback large-response server");
+        let addr = listener
+            .local_addr()
+            .expect("read large-response server address");
+        let task = tokio::spawn(async move { serve_large(listener, script).await });
+        Self { addr, task }
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    async fn join(mut self) -> LargeServerOutcome {
+        match timeout(FIXTURE_IO_GUARD, &mut self.task).await {
+            Ok(result) => result
+                .expect("large-response server task must not panic")
+                .expect("large-response server must complete cleanly"),
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                panic!("large-response server exceeded the teardown guard");
+            }
+        }
+    }
+}
+
+async fn serve_large(
+    listener: TcpListener,
+    script: LargeResponseScript,
+) -> anyhow::Result<LargeServerOutcome> {
+    let (mut stream, _) = timeout(FIXTURE_IO_GUARD, listener.accept())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out accepting the guarded request"))??;
+    read_request_headers(&mut stream).await?;
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {} Scripted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                script.status, script.declared_len
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let mut bytes_written = 0;
+    // A client that stopped reading closes its socket; the write then fails (or the read below
+    // sees EOF), which is the outcome, not a fixture error.
+    if stream
+        .write_all(&vec![b'e'; script.written_at_once])
+        .await
+        .is_err()
+    {
+        return Ok(LargeServerOutcome {
+            bytes_written,
+            client_eof: true,
+        });
+    }
+    bytes_written += script.written_at_once;
+
+    if !script.trickle {
+        // A client that stopped at its ceiling may already have reset the connection.
+        let _ = stream.shutdown().await;
+        let client_eof = matches!(wait_for_eof(&mut stream).await, Ok(true) | Err(_));
+        return Ok(LargeServerOutcome {
+            bytes_written,
+            client_eof,
+        });
+    }
+
+    let deadline = Instant::now() + FIXTURE_IO_GUARD;
+    let mut buffer = [0u8; 64];
+    loop {
+        match timeout(TRICKLE_INTERVAL, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                return Ok(LargeServerOutcome {
+                    bytes_written,
+                    client_eof: true,
+                });
+            }
+            Ok(Ok(_)) => anyhow::bail!("client sent bytes after its request headers"),
+            Err(_) => {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "the client kept reading the error page past the guard"
+                );
+                if stream.write_all(b"e").await.is_err() {
+                    return Ok(LargeServerOutcome {
+                        bytes_written,
+                        client_eof: true,
+                    });
+                }
+                bytes_written += 1;
+            }
+        }
+    }
+}
+
+struct GuardedCall {
+    response: anyhow::Result<http::Response<Bytes>>,
+    /// Body bytes the collector pulled from the connection, the frame that overflowed its bound
+    /// included.
+    body_bytes_consumed: usize,
+}
+
+/// One GET through `tor_http_with_body_guard` with the test's local hyper client, the crate's
+/// call order replayed: `guard.filter` with the final status, then `guard.collect` with the body.
+async fn guarded_local_get(addr: SocketAddr, max_bytes: usize) -> GuardedCall {
+    let (mut sender, driver) = connect_client(addr).await;
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let counted = consumed.clone();
+
+    let guarded = timeout(
+        TEST_GUARD,
+        crate::tor_http_with_body_guard(
+            max_bytes,
+            |_| None,
+            |guard| async move {
+                let response = sender
+                    .send_request(request_for(addr))
+                    .await
+                    .map_err(|error| Error::from(HttpError::from(error)))?;
+                // zcash_client_backend's http_request: the retry filter sees the final response's
+                // status, then parse_response gets the body.
+                let retry = guard.filter(Ok(response.status()));
+                assert!(retry.is_none(), "the test's retry policy never retries");
+                let (parts, body) = response.into_parts();
+                let body = body.map_frame(move |frame| {
+                    if let Some(data) = frame.data_ref() {
+                        counted.fetch_add(data.len(), Ordering::SeqCst);
+                    }
+                    frame
+                });
+                let body = guard.collect(body).await?;
+                Ok(http::Response::from_parts(parts, body))
+            },
+        ),
+    )
+    .await;
+
+    driver.abort();
+    let _ = driver.await;
+
+    GuardedCall {
+        response: guarded.expect(
+            "the guarded call must return within the test guard: the collector read past its bound",
+        ),
+        body_bytes_consumed: consumed.load(Ordering::SeqCst),
+    }
+}
+
+async fn endless_error_page_is_cut_at_the_guard(status: u16) {
+    let server = LargeHttpServer::spawn(LargeResponseScript::endless_error_page(status)).await;
+    let call = guarded_local_get(server.addr(), crate::TOR_HTTP_MAX_RESPONSE_BYTES).await;
+    let outcome = server.join().await;
+
+    let response = call
+        .response
+        .expect("an error page past the guard is reported by its status, not as too large");
+    assert_eq!(response.status().as_u16(), status);
+    assert!(
+        response.body().is_empty(),
+        "the cut error page comes back empty"
+    );
+    assert!(
+        call.body_bytes_consumed > crate::TOR_HTTP_MAX_ERROR_BODY_BYTES,
+        "the collector must have reached the guard: {} bytes",
+        call.body_bytes_consumed
+    );
+    assert!(
+        call.body_bytes_consumed
+            <= crate::TOR_HTTP_MAX_ERROR_BODY_BYTES + GUARD_OVERFLOW_FRAME_SLACK,
+        "the collector read past the 64 KiB guard: {} bytes",
+        call.body_bytes_consumed
+    );
+    assert!(outcome.client_eof, "the client must close its local socket");
+    assert!(
+        outcome.bytes_written < ENDLESS_ERROR_PAGE_DECLARED_LEN,
+        "the server must not have been read to the end of the page"
+    );
+}
+
+#[tokio::test]
+async fn an_endless_429_page_is_cut_at_the_guard_under_the_default_ceiling() {
+    endless_error_page_is_cut_at_the_guard(429).await;
+}
+
+#[tokio::test]
+async fn an_endless_503_page_is_cut_at_the_guard_under_the_default_ceiling() {
+    endless_error_page_is_cut_at_the_guard(503).await;
+}
+
+#[tokio::test]
+async fn a_small_error_page_is_returned_whole_with_its_status() {
+    let server =
+        LargeHttpServer::spawn(LargeResponseScript::complete(429, SMALL_ERROR_PAGE_LEN)).await;
+    let call = guarded_local_get(server.addr(), crate::TOR_HTTP_MAX_RESPONSE_BYTES).await;
+    let outcome = server.join().await;
+
+    let response = call.response.expect("a small error page is returned");
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.body().len(), SMALL_ERROR_PAGE_LEN);
+    assert_eq!(call.body_bytes_consumed, SMALL_ERROR_PAGE_LEN);
+    assert_eq!(outcome.bytes_written, SMALL_ERROR_PAGE_LEN);
+}
+
+#[tokio::test]
+async fn a_large_2xx_body_under_the_callers_ceiling_is_returned_whole() {
+    let server =
+        LargeHttpServer::spawn(LargeResponseScript::complete(200, LARGE_OK_BODY_LEN)).await;
+    let call = guarded_local_get(server.addr(), crate::TOR_HTTP_MAX_RESPONSE_BYTES).await;
+    let outcome = server.join().await;
+
+    let response = call
+        .response
+        .expect("a 2xx body past 64 KiB but under the ceiling is not cut");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.body().len(), LARGE_OK_BODY_LEN);
+    assert!(response.body().iter().all(|byte| *byte == b'e'));
+    assert_eq!(call.body_bytes_consumed, LARGE_OK_BODY_LEN);
+    assert_eq!(outcome.bytes_written, LARGE_OK_BODY_LEN);
+    assert!(outcome.client_eof, "the client must close its local socket");
+}
+
+#[tokio::test]
+async fn a_2xx_body_past_the_callers_ceiling_is_an_error() {
+    let server =
+        LargeHttpServer::spawn(LargeResponseScript::complete(200, LARGE_OK_BODY_LEN)).await;
+    let call = guarded_local_get(server.addr(), crate::TOR_HTTP_MAX_ERROR_BODY_BYTES).await;
+    let _ = server.join().await;
+
+    let error = call
+        .response
+        .expect_err("a 2xx body past the caller's ceiling must fail");
+    assert!(
+        error.to_string().contains("exceeds"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        call.body_bytes_consumed <= LARGE_OK_BODY_LEN,
+        "the collector cannot consume more than the body"
     );
 }
