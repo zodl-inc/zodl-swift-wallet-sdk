@@ -99,8 +99,8 @@ Changes are relative to `5.2.0`.
   structural failure (zcashd's `bad-txns-invalid-joinsplit-signature`, `bad-txns-joinsplit-`,
   `bad-txns-sapling-bundle-invalid`, `bad-sapling-bundle-authorization`,
   `bad-orchard-bundle-authorization`, `bad-txns-vout-`, `bad-txns-txouttotal-toolarge`,
-  `bad-txns-txintotal-toolarge`, `mandatory-script-verify-flag-failed`, `bad-txns-no-`,
-  `tx-version`, `bad-tx-`; Zebra's `MUST represent a valid signature`, `proof MUST be valid`,
+  `bad-txns-txintotal-toolarge`, `mandatory-script-verify-flag-failed`, `bad-txns-no-`;
+  Zebra's `MUST represent a valid signature`, `proof MUST be valid`,
   `proof is malformed`, `proof or signature verification failed`, `proof verification failed`,
   `proof has a non-canonical size`). A refusal saying the server already holds the transaction
   (`already-in`, `txn-already-known`, `already in block chain`, Zebra's
@@ -109,7 +109,10 @@ Changes are relative to `5.2.0`.
   refusal that depends on the server's view of the chain or its mempool (`unknown-anchor`, as when
   the server has not reached the wallet's anchor yet, `duplicate-nullifier`, `inputs-spent`,
   `inputs-missingorspent`, `txn-mempool-conflict`, `Missing inputs`, `min relay fee`,
-  `too-long-mempool-chain`, `non-final`), and any unrecognized refusal. These lists are the SDK's
+  `too-long-mempool-chain`, `non-final`, and zcashd's version and consensus-branch checks
+  `bad-tx-` and `tx-version`, which a node lagging near a network upgrade can apply to a
+  transaction that becomes valid once it catches up), and any unrecognized refusal. A transaction
+  refused only inconclusively keeps its funds reserved until it expires. These lists are the SDK's
   reading of the node implementations and still need confirmation from the node teams.
 - `GiftCardRedeemer.redeemProgress()` returns an `AsyncStream<RedeemProgress>` reporting each
   redemption round when its transactions are submitted and when they are mined, with the

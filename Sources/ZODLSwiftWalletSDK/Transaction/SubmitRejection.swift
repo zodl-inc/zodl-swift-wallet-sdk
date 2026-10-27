@@ -97,6 +97,13 @@ enum SubmitRefusal: Equatable {
     /// State-dependent refusals that may pass on a later attempt or at another server. Checked
     /// before ``invalidMarkers`` so that they never stop resubmission; anything on no list is
     /// inconclusive too.
+    ///
+    /// This includes zcashd's version and consensus-branch checks (`bad-tx-*`, such as
+    /// `bad-tx-consensus-branch-id-mismatch` or `bad-tx-zip225-version-too-low`, and the
+    /// `*-tx-version-group-id` family). They are judged against the server's own view of which
+    /// network upgrade is active, so a node lagging near an upgrade can refuse a transaction that
+    /// becomes valid once it catches up; by the principle they cannot be terminal. The cost is that
+    /// a transaction that really is invalid this way keeps its funds reserved until it expires.
     static let inconclusiveMarkers = [
         "unknown-anchor", // zcashd main.cpp:168-172, an anchor the server has not reached yet
         "duplicate-nullifier", // zcashd main.cpp:167-171
@@ -106,7 +113,9 @@ enum SubmitRefusal: Equatable {
         "missing inputs", // zcashd rawtransaction.cpp:1309
         "min relay fee", // zcashd main.cpp:2008
         "too-long-mempool-chain", // zcashd main.cpp:2040
-        "non-final" // zcashd main.cpp:1877
+        "non-final", // zcashd main.cpp:1877
+        "tx-version", // zcashd main.cpp `bad-*-tx-version-group-id`, upgrade-dependent
+        "bad-tx-" // zcashd main.cpp:954-1627, upgrade-dependent version and branch checks
     ]
     /// Signature, proof and structural failures: the transaction itself is invalid.
     static let invalidMarkers = [
@@ -121,8 +130,6 @@ enum SubmitRefusal: Equatable {
         "bad-txns-oversize", // zcashd main.cpp:1561 (``tooLargeMarkers`` match it first)
         "mandatory-script-verify-flag-failed", // zcashd main.cpp:2876
         "bad-txns-no-", // zcashd main.cpp:1539, 1554
-        "tx-version", // zcashd main.cpp `bad-*-tx-version-group-id`
-        "bad-tx-", // zcashd main.cpp:954-1627
         "MUST represent a valid signature", // Zebra consensus error.rs:154, 159, 163
         "proof MUST be valid", // Zebra consensus error.rs:146
         "proof is malformed", // Zebra consensus error.rs:150

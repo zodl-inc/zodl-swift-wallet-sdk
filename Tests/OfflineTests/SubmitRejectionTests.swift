@@ -64,10 +64,6 @@ final class SubmitRejectionTests: XCTestCase {
             "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
             "16: bad-txns-no-source-of-funds",
             "16: bad-txns-no-sink-of-funds",
-            "16: bad-tx-version-group-id",
-            "16: bad-nu5-tx-version-group-id",
-            "16: bad-tx-expiry-height-too-high",
-            "16: bad-tx-too-many-orchard-actions",
             "Sapling bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: x",
             "Orchard bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: x",
             "spend proof MUST be valid given a primary input formed from the other fields except spendAuthSig: x",
@@ -95,6 +91,12 @@ final class SubmitRejectionTests: XCTestCase {
 
     func testStateDependentRefusalsAreInconclusive() {
         let inconclusive = [
+            "16: bad-tx-version-group-id",
+            "16: bad-nu5-tx-version-group-id",
+            "16: bad-tx-expiry-height-too-high",
+            "16: bad-tx-too-many-orchard-actions",
+            "16: bad-tx-consensus-branch-id-mismatch",
+            "16: bad-tx-zip225-version-too-low",
             "18: bad-txns-orchard-duplicate-nullifier",
             "18: bad-txns-sapling-duplicate-nullifier",
             "18: bad-txns-inputs-spent",
