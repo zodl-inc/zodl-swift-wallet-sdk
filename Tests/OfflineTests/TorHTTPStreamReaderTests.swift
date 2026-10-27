@@ -85,6 +85,20 @@ final class TorHTTPStreamReaderTests: XCTestCase {
         await assertTheStreamIsFreedOnce(fake)
     }
 
+    func testTheLastBytesThatComeWithTheEndAreDelivered() async throws {
+        // The native read that brings an error body to its 64 KiB guard returns those bytes with END, and
+        // nothing is read after it: the script has no tail, so a further read would fail the test.
+        let capped = String(repeating: "x", count: 65_536)
+        let fake = FakeTorStream(script: [.data("a"), .dataEnd(capped)])
+
+        let outcome = await read(fake, idleTimeout: 1)
+
+        XCTAssertNil(outcome.error)
+        XCTAssertEqual(outcome.chunks, ["a", capped])
+        XCTAssertEqual(fake.reads, 2)
+        await assertTheStreamIsFreedOnce(fake)
+    }
+
     func testANativeFailureFinishesWithTheTorError() async throws {
         let fake = FakeTorStream(script: [.data("a"), .failure])
 
@@ -169,11 +183,109 @@ final class TorHTTPStreamReaderTests: XCTestCase {
     }
 }
 
+/// An error answer whose Tor body reaches the 64 KiB guard exactly and then pauses: the native read returns
+/// the capped bytes with END (`zcashlc_tor_http_stream_next`), so `OHTTPTransport.stream` classifies the
+/// status instead of timing out in the body loop.
+final class TorCappedErrorBodyClassificationTests: XCTestCase {
+    private static let cappedBody = String(repeating: "e", count: 65_536)
+
+    /// An outer answer read through a ``TorHTTPStreamReader`` whose native stream gives the capped body
+    /// with END and fails the test on any further read. The idle timeout is one second of the fake's clock,
+    /// so a reader that waited past the cap would end in `URLError.timedOut`, not in the classifier.
+    private func cappedOuter(status: Int) -> (OHTTPOuterStream, FakeTorStream) {
+        let fake = FakeTorStream(script: [.dataEnd(Self.cappedBody)])
+        let reader = TorHTTPStreamReader(
+            stream: fake.stream,
+            owner: nil,
+            idleTimeout: 1,
+            native: fake.native,
+            now: fake.now
+        )
+        let outer = OHTTPOuterStream(
+            status: status,
+            contentType: "text/plain",
+            retryAfter: nil,
+            body: reader.body()
+        )
+        return (outer, fake)
+    }
+
+    private func makeTransport(
+        keyFetches: @escaping () -> Void = {},
+        streamSender: @escaping OHTTPTransport.StreamSender
+    ) -> OHTTPTransport {
+        OHTTPTransport(
+            gatewayHost: "ohttp-gateway-testnet.example",
+            relayURL: "https://testnet-operator-relay.example.invalid/relay",
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+            keyCache: OHTTPKeyCache(),
+            streamSender: streamSender,
+            streamDecoderFactory: { _ in PassThroughStreamDecoder() },
+            httpSender: { request, _ in
+                keyFetches()
+                return (
+                    OHTTPTestSupport.stubEnvelope,
+                    OHTTPTestSupport.response(for: request.url, status: 200, headers: ["Content-Type": "application/json"])
+                )
+            }
+        )
+    }
+
+    func testA429Or503BodyOfExactly64KiBKeepsItsHTTPStatus() async throws {
+        for status in [429, 503] {
+            var fakes: [FakeTorStream] = []
+            let transport = makeTransport { [self] _, _ in
+                let (outer, fake) = cappedOuter(status: status)
+                fakes.append(fake)
+                return outer
+            }
+            do {
+                _ = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+                XCTFail("a \(status) must fail")
+            } catch OHTTPError.httpStatusError(let code, _) {
+                XCTAssertEqual(code, status)
+            } catch {
+                XCTFail("status \(status): expected the HTTP status error, got \(error)")
+            }
+            XCTAssertEqual(fakes.count, 1, "status \(status)")
+            XCTAssertEqual(fakes.first?.reads, 1, "status \(status): nothing is read after the capped END")
+        }
+    }
+
+    func testA400Or422BodyOfExactly64KiBFetchesTheKeyAgain() async throws {
+        for status in [400, 422] {
+            var keyFetches = 0
+            var posts = 0
+            let transport = makeTransport(keyFetches: { keyFetches += 1 }) { [self] _, _ in
+                posts += 1
+                if posts == 1 {
+                    return cappedOuter(status: status).0
+                }
+                return OHTTPOuterStream(
+                    status: 200,
+                    contentType: "message/ohttp-chunked-res",
+                    retryAfter: nil,
+                    body: AsyncThrowingStream { continuation in
+                        continuation.yield(Data("ok".utf8))
+                        continuation.finish()
+                    }
+                )
+            }
+            let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+            XCTAssertEqual(streamed.status, 200, "status \(status)")
+            XCTAssertEqual(keyFetches, 2, "status \(status): the key is fetched again")
+            XCTAssertEqual(posts, 2, "status \(status)")
+        }
+    }
+}
+
 /// A native stream that replays a script, one step per read. Its clock moves only by the time each read was
 /// asked to wait, as if every read waited all of it, so a test spends no real time on a stalled stream.
-private final class FakeTorStream: @unchecked Sendable {
+final class FakeTorStream: @unchecked Sendable {
     enum Step: Equatable {
         case data(String)
+        /// A read that reports the end and returns its last bytes with it.
+        case dataEnd(String)
         /// A read that reports data, with no bytes in it.
         case emptyData
         case pending
@@ -253,6 +365,10 @@ private final class FakeTorStream: @unchecked Sendable {
         switch step {
         case .data(let text):
             state.pointee = 0
+            return makeSlice(Array(text.utf8))
+
+        case .dataEnd(let text):
+            state.pointee = 2
             return makeSlice(Array(text.utf8))
 
         case .emptyData:

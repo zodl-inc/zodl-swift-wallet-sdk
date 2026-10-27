@@ -4976,8 +4976,10 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_header(
 ///
 /// Sets `*state` to 0 and returns the bytes when some came, to 1 with an empty slice when none
 /// came in time (the stream is still open), and to 2 with an empty slice when the body has
-/// ended. Returns null on failure (the connection broke or the body went beyond its limit); the
-/// stream must then only be freed. The result is freed with `zcashlc_free_boxed_slice`.
+/// ended. Returns null on failure (the connection broke or a 2xx body went beyond its limit);
+/// the stream must then only be freed. A non-2xx body ends at 64 KiB: the read that reaches that
+/// size returns its bytes with state 2, and no further frame is awaited. The result is freed
+/// with `zcashlc_free_boxed_slice`.
 ///
 /// # Safety
 ///
@@ -5013,6 +5015,12 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
         } else {
             *max_bytes
         };
+        if is_error && *read >= effective_limit {
+            // An error body that has reached the 64 KiB guard has ended: no further frame is
+            // awaited, so a peer that pauses at the cap cannot hold the classifier back.
+            *state = TOR_HTTP_STREAM_END;
+            return Ok(ffi::BoxedSlice::none());
+        }
         let next = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_millis(wait_ms), body.frame()).await
         });
@@ -5037,11 +5045,12 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                                 "Tor HTTP response body exceeds {max_bytes} bytes"
                             ));
                         }
-                        if data.len() > remaining {
-                            // An error body (non-2xx) is cut at the 64 KiB guard: return the bytes
-                            // up to the cap and mark END, so the status and headers still reach the
-                            // classifier (key refetch on 400/422, HTTP status on 429/503) instead
-                            // of a size error (ZIP #10).
+                        if is_error && data.len() >= remaining {
+                            // An error body (non-2xx) ends at the 64 KiB guard: return the bytes
+                            // up to the cap and mark END in the same call, also when a frame fills
+                            // the cap exactly, so the status and headers reach the classifier (key
+                            // refetch on 400/422, HTTP status on 429/503) without waiting for a
+                            // frame that may never come, and without a size error (ZIP #10).
                             let truncated = &data[..remaining];
                             *read += truncated.len();
                             *state = TOR_HTTP_STREAM_END;
@@ -10041,6 +10050,164 @@ mod tor_http_stream_tests {
         assert_eq!(stream_box.status, 503);
 
         // Don't free the stream (stream_box drops it)
+    }
+
+    /// A stream over an error body made of `frames` (bytes per frame) that then either ends or,
+    /// with `pause`, stays open without sending anything more.
+    fn error_stream(status: u16, frames: &[usize], pause: bool) -> Box<super::TorHttpStream> {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
+
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = frames
+            .iter()
+            .map(|size| Ok(bytes::Bytes::from(vec![b'e'; *size])))
+            .collect();
+        let tail = if pause {
+            futures::stream::pending().boxed()
+        } else {
+            futures::stream::empty().boxed()
+        };
+        let body = http_body_util::StreamBody::new(
+            futures::stream::iter(chunks)
+                .chain(tail)
+                .map(|chunk| chunk.map(Frame::data)),
+        )
+        .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+        .boxed_unsync();
+
+        Box::new(super::TorHttpStream {
+            runtime: tor_rtcompat::PreferredRuntime::create().unwrap(),
+            status,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024,
+        })
+    }
+
+    /// Reads `stream` through `zcashlc_tor_http_stream_next` until END or `max_calls` calls, and
+    /// returns the state and byte count of every call.
+    fn drive(stream: &mut super::TorHttpStream, max_calls: usize) -> Vec<(u8, usize)> {
+        let stream_ptr: *mut super::TorHttpStream = stream;
+        let mut calls = Vec::new();
+        for _ in 0..max_calls {
+            let mut state: u8 = 0xff;
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 50, &mut state) };
+            assert!(!slice_ptr.is_null(), "an error body read must not fail");
+            let len = unsafe { (*slice_ptr).as_slice() }.len();
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+            calls.push((state, len));
+            if state == super::TOR_HTTP_STREAM_END {
+                break;
+            }
+        }
+        calls
+    }
+
+    const CAP: usize = super::TOR_HTTP_MAX_ERROR_BODY_BYTES;
+    const STATUSES: [u16; 4] = [400, 422, 429, 503];
+
+    #[test]
+    fn error_body_of_exactly_64_kib_then_a_pause_ends_at_the_cap() {
+        assert_eq!(CAP, 65_536);
+        for status in STATUSES {
+            // One frame that fills the cap exactly, then the peer goes quiet.
+            let mut stream = error_stream(status, &[CAP], true);
+            let calls = drive(&mut stream, 8);
+            assert_eq!(
+                calls,
+                vec![(super::TOR_HTTP_STREAM_END, CAP)],
+                "status {status}: the bytes up to the cap come with END, no PENDING"
+            );
+            assert_eq!(stream.read, CAP);
+            assert_eq!(stream.status, status);
+
+            // A further read after END stays at END without awaiting the paused body.
+            assert_eq!(
+                drive(&mut stream, 1),
+                vec![(super::TOR_HTTP_STREAM_END, 0)],
+                "status {status}"
+            );
+
+            // The cap reached by the last of many frames ends just the same.
+            let mut stream = error_stream(status, &[1024; 64], true);
+            let calls = drive(&mut stream, 128);
+            assert_eq!(calls.len(), 64, "status {status}: {calls:?}");
+            assert_eq!(
+                calls.last(),
+                Some(&(super::TOR_HTTP_STREAM_END, 1024)),
+                "status {status}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|(state, _)| *state != super::TOR_HTTP_STREAM_PENDING),
+                "status {status}: no PENDING before END"
+            );
+            assert_eq!(stream.read, CAP);
+        }
+    }
+
+    #[test]
+    fn error_body_one_byte_short_of_64_kib_stays_open_until_it_ends() {
+        for status in STATUSES {
+            // Below the cap a paused body is still open: the caller's idle timeout bounds it.
+            let mut stream = error_stream(status, &[CAP - 1], true);
+            let calls = drive(&mut stream, 2);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_PENDING, 0)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP - 1);
+
+            // The same body, ended by the peer, ends normally with all of it.
+            let mut stream = error_stream(status, &[CAP - 1], false);
+            let calls = drive(&mut stream, 4);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_END, 0)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP - 1);
+
+            // One more byte, then a pause: the frame that reaches the cap ends the body.
+            let mut stream = error_stream(status, &[CAP - 1, 1], true);
+            let calls = drive(&mut stream, 4);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_END, 1)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP);
+        }
+    }
+
+    #[test]
+    fn error_body_one_byte_past_64_kib_then_a_pause_is_cut_at_the_cap() {
+        for status in STATUSES {
+            let mut stream = error_stream(status, &[CAP + 1], true);
+            let calls = drive(&mut stream, 8);
+            assert_eq!(
+                calls,
+                vec![(super::TOR_HTTP_STREAM_END, CAP)],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP);
+            assert_eq!(stream.status, status);
+        }
     }
 
     #[test]

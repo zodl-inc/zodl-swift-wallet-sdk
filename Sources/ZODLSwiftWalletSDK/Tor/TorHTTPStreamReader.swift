@@ -13,7 +13,8 @@ import os
 struct TorHTTPStreamNative: Sendable {
     /// One native read, which waits up to the given milliseconds for body bytes (`zcashlc_tor_http_stream_next`).
     /// It sets the state to 0 and returns the bytes when some came, to 1 when none came in time (also for a frame
-    /// that carries no body bytes) and to 2 when the body has ended. It returns null when the read failed, and the
+    /// that carries no body bytes) and to 2 when the body has ended, with the last bytes of an error body that
+    /// reached its 64 KiB guard. It returns null when the read failed, and the
     /// stream must then only be freed.
     var next: @Sendable (OpaquePointer, UInt64, UnsafeMutablePointer<UInt8>) -> UnsafeMutablePointer<FfiBoxedSlice>? = {
         zcashlc_tor_http_stream_next($0, $1, $2)
@@ -127,6 +128,11 @@ final class TorHTTPStreamReader: @unchecked Sendable {
                     lastProgress = now()
                 }
             case .end:
+                // The native read that reaches the 64 KiB guard of an error body returns its last bytes
+                // together with the end, so that the status classifier runs at once.
+                if let ptr = slice.pointee.ptr, slice.pointee.len > 0 {
+                    continuation.yield(Data(bytes: ptr, count: Int(slice.pointee.len)))
+                }
                 continuation.finish()
                 return
             case .pending, .none:
