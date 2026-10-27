@@ -231,9 +231,10 @@ strip = false
 # one pooled relay connection with bulk block streams on their own connection, one Tor
 # session connection for public sync metadata, the engine Tor client reused across
 # sessions, an own Tor circuit per fetch worker, enhancement skip-guard and round fixes,
-# isolated fetch concurrency 8, and SQLite checkpoint/cache tuning with per-chunk
-# persist timings.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "019cbb4bd9a82060bdf4648a8ef4e71a0a0468fa" }
+# isolated fetch concurrency 8, SQLite checkpoint/cache tuning with per-chunk
+# persist timings, persist commits decoupled from the OHTTP window, and HTTP/2
+# keepalive PINGs on pooled relay connections (29626a86).
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "29626a864a7e420d82c983fc321a35f000b9da8d" }
 
 # Coinholder voting on the NU7 pre-release crates.
 #
