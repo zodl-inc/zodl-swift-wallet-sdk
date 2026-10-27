@@ -5,6 +5,7 @@
 
 import Combine
 import Foundation
+import os
 
 /// Per-broadcast network-privacy options for a migration transfer.
 ///
@@ -83,6 +84,18 @@ actor OrchardMigration {
         let torDirURL: URL
         /// Directory for the SDK's general storage; the per-account sync-gate file lives here.
         let generalStorageURL: URL
+        /// The holder of the NU7 network-upgrade gate's bypass, which this migration's backend reads
+        /// on every gated FFI call. The host passes the one it shares with every migration it builds.
+        let upgradeGateBypass: MigrationUpgradeGateBypass
+        /// Reads the latest block height of the synchronizer's own lightwalletd server, for the one
+        /// submission check that has no connection of its own to read it on: a preparation retrieved
+        /// with ``OrchardMigration/takePreparation(byTxid:)`` is submitted by the host, possibly to
+        /// several servers, so there is no single submission server to ask. It is handed the txid of
+        /// the preparation being taken, so that the read can go over a connection that belongs to
+        /// that transaction alone, as every other request the SDK makes about one does, and not over
+        /// a connection the wallet uses for anything else. See
+        /// ``OrchardMigration/takePreparation(byTxid:)``.
+        let submissionHeight: @Sendable (_ txid: Data) async throws -> BlockHeight
         /// The logging policy, mirroring ``Initializer``'s.
         let loggingPolicy: Initializer.LoggingPolicy
 
@@ -97,6 +110,9 @@ actor OrchardMigration {
         ///   - accountUUID: the account this migration is bound to.
         ///   - torDirURL: the main Tor directory.
         ///   - generalStorageURL: directory for the per-account sync-gate file.
+        ///   - upgradeGateBypass: the holder of the network-upgrade gate's bypass the backend reads.
+        ///   - submissionHeight: reads the synchronizer's lightwalletd server's latest block height,
+        ///     for the txid of the preparation being taken.
         ///   - loggingPolicy: the logging policy.
         init(
             dataDbURL: URL,
@@ -107,6 +123,8 @@ actor OrchardMigration {
             accountUUID: AccountUUID,
             torDirURL: URL,
             generalStorageURL: URL,
+            upgradeGateBypass: MigrationUpgradeGateBypass,
+            submissionHeight: @escaping @Sendable (_ txid: Data) async throws -> BlockHeight,
             loggingPolicy: Initializer.LoggingPolicy = Initializer.LoggingPolicy.default(.debug)
         ) {
             self.dataDbURL = dataDbURL
@@ -117,6 +135,8 @@ actor OrchardMigration {
             self.accountUUID = accountUUID
             self.torDirURL = torDirURL
             self.generalStorageURL = generalStorageURL
+            self.upgradeGateBypass = upgradeGateBypass
+            self.submissionHeight = submissionHeight
             self.loggingPolicy = loggingPolicy
         }
     }
@@ -141,6 +161,11 @@ actor OrchardMigration {
     private let broadcaster: any MigrationBroadcasting
     private let syncGate: MigrationSyncGate
     private let logger: Logger
+    /// Reads the synchronizer's lightwalletd server's latest block height for the txid it is given,
+    /// for ``takePreparation(byTxid:)``.
+    private let submissionHeight: @Sendable (_ txid: Data) async throws -> BlockHeight
+    /// The network's target spacing schedule, which the estimate-consulting paths project on.
+    private let spacing: TargetBlockSpacing
 
     /// The clock every estimate-consulting path on this actor reads (mirroring
     /// ``OrchardMigrationHost``'s injected `now`), so tests can drive the wall-clock tip
@@ -214,7 +239,8 @@ actor OrchardMigration {
             logLevel: config.loggingPolicy.makeRustLogging(),
             // Migration welding calls are data-db operations that never consult these flags; the
             // dedicated broadcaster owns all migration networking.
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            migrationUpgradeGateBypass: config.upgradeGateBypass
         )
         let accountUUID = config.accountUUID
         let now: @Sendable () -> Date = { Date() }
@@ -222,6 +248,8 @@ actor OrchardMigration {
         self.welding = welding
         self.accountUUID = accountUUID
         self.logger = logger
+        self.submissionHeight = config.submissionHeight
+        self.spacing = TargetBlockSpacing(network: config.network)
         self.broadcaster = sharedBroadcaster
         self.now = now
         self.syncGate = MigrationSyncGate(
@@ -232,23 +260,37 @@ actor OrchardMigration {
     }
 
     /// Injecting initializer for tests: supply the welding, broadcaster, sync gate (with its test
-    /// clock/ticker), logger, and — for the actor's own estimate-consulting paths — a clock,
-    /// directly. `now` defaults to the real clock so call sites that do not exercise the
-    /// estimate stay unchanged.
+    /// clock/ticker), logger, and — for the actor's own estimate-consulting paths — the network's
+    /// target spacing schedule and a clock, directly. `now` defaults to the real clock so call
+    /// sites that do not exercise the estimate stay unchanged. `submissionHeight` defaults to a
+    /// server that cannot be read, which is what ``takePreparation(byTxid:)`` fails closed on: a
+    /// test that takes a preparation supplies the height it wants the take to receive.
     init(
         welding: ZcashRustBackendWelding,
         accountUUID: AccountUUID,
         broadcaster: any MigrationBroadcasting,
         syncGate: MigrationSyncGate,
         logger: Logger,
-        now: @escaping @Sendable () -> Date = { Date() }
+        spacing: TargetBlockSpacing,
+        now: @escaping @Sendable () -> Date = { Date() },
+        submissionHeight: @escaping @Sendable (_ txid: Data) async throws -> BlockHeight = OrchardMigration.unreadableSubmissionHeight
     ) {
         self.welding = welding
         self.accountUUID = accountUUID
         self.broadcaster = broadcaster
         self.syncGate = syncGate
         self.logger = logger
+        self.spacing = spacing
         self.now = now
+        self.submissionHeight = submissionHeight
+    }
+
+    /// A ``Config/submissionHeight`` for a migration with no server to ask: it always fails, so the
+    /// take that needs a height fails closed.
+    static let unreadableSubmissionHeight: @Sendable (_ txid: Data) async throws -> BlockHeight = { _ in
+        throw ZcashError.serviceLatestBlockHeightFailed(
+            LightWalletServiceError.generalError(message: "No server was given to read the submission height from.")
+        )
     }
 
     // MARK: - State
@@ -266,7 +308,7 @@ actor OrchardMigration {
     /// estimate may only ever ACCELERATE schedule due-ness — expiry stays scanned-tip — and an
     /// estimator failure degrades to scanned-tip behavior rather than blocking the advance.
     func advanceStep() async throws -> MigrationAdvance? {
-        let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now())
+        let estimatedTip = await MigrationTipEstimation.gatingEstimatedTip(welding: welding, spacing: spacing, now: now())
         let advance = try await welding.migrationAdvanceStep(for: accountUUID, estimatedTip: estimatedTip)
         // Every crank -- regardless of which caller drove it -- replaces the retained outlook,
         // including with `nil`: a stale outlook must not outlive the crank that superseded it (see
@@ -404,15 +446,37 @@ actor OrchardMigration {
     /// Unlike ``performBroadcast(_:options:)`` this does NOT broadcast, so it is not serialized
     /// against the broadcast flows and carries no privacy options of its own: what the host does
     /// with the bytes, and over what transport, is the host's ordinary submission policy.
+    ///
+    /// IT CHECKS THE PREPARATION AGAINST THE NEXT BLOCK FIRST, so one that cannot be valid there is
+    /// refused before the seam records it in the wallet. For an active proved preparation the SDK
+    /// persists the observed tip first, so ``advanceStep()`` returns `.reevaluate` until scanning
+    /// can adjudicate it. The host submits through machinery of its own, possibly to several
+    /// servers, so there is no single submission server to ask for the height the check needs:
+    /// this reads it from the synchronizer's own lightwalletd server
+    /// (``Config/submissionHeight``), with one request of its own, made for `txid` so that it can
+    /// ride a connection of that transaction's own (with Tor on, a Tor group named after the
+    /// transaction, never the default circuit the sync keeps for the wallet), and a height that
+    /// cannot be read fails closed — the error propagates and nothing is taken. The next block is
+    /// the one after the higher of that height and the wallet's chain tip; the preparation must be
+    /// built for its consensus branch and not have expired by it. Valid committed work can continue
+    /// before activation; these validity checks cannot be bypassed. A host that submits to servers other than
+    /// the synchronizer's should judge the result against each one's own height as well.
     /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
     ///   raw/internal byte order.
-    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
-    ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
-    ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
-    ///   of a preparation that is not proved — which a host discharges by proving again rather
-    ///   than retrying this.
+    /// - Throws: the error of the height read when the synchronizer's server cannot be reached;
+    ///   ``ZcashError/migrationSubmissionRefused(_:)`` when the preparation cannot be valid in the
+    ///   next block; ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot
+    ///   be turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
+    ///   transfer's txid, for a txid the stored run does not carry, for a run that has ended, and
+    ///   for the readiness refusal of a preparation that is not proved — which a host discharges by
+    ///   proving again rather than retrying this.
     func takePreparation(byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await welding.migrationTakePreparation(txid: txid, for: accountUUID)
+        let serverHeight = try await submissionHeight(txid)
+        return try await welding.migrationTakePreparation(
+            txid: txid,
+            submissionServerHeight: serverHeight,
+            for: accountUUID
+        )
     }
 
     /// Records the engine-side outcome of a preparation the host retrieved and submitted ITSELF —
@@ -493,14 +557,24 @@ actor OrchardMigration {
     /// the driver saw the step itself.
     ///
     /// Composition (identical to ``submitNoteSplit(proposal:usk:options:)``'s, which shares the
-    /// same private helper): serve the named transaction's already-finalized bytes through the
-    /// store's atomic broadcast seam, broadcast once under the in-flight marker, and record the
-    /// mapped result. Transport/rejection outcomes are RETURNED, not thrown.
+    /// same private helper): connect to the submission server and read its latest block height on
+    /// that connection, serve the named transaction's already-finalized bytes through the store's
+    /// atomic broadcast seam (which checks first, with that height, that the transaction can be valid
+    /// in the next block), broadcast once under the in-flight marker, and record the mapped result.
+    /// Transport/rejection outcomes are RETURNED, not thrown. When the server's height cannot be
+    /// read nothing is taken, submitted or recorded, and the result is
+    /// ``MigrationTransferResult/networkError(retryable:)`` — the next crank offers the instruction
+    /// again.
     ///
-    /// - Throws: a pre-broadcast failure throws untouched and nothing is recorded — a fail-closed
-    ///   ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
-    ///   established, or the seam's STALENESS refusal
-    ///   (``ZcashError/rustMigrationTakeBroadcastTransaction(_:)``) of a row that is no longer
+    /// - Throws: a pre-broadcast failure throws untouched and no wallet transaction is recorded —
+    ///   a fail-closed ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor
+    ///   cannot be established, ``ZcashError/migrationSubmissionRefused(_:)`` when the transaction
+    ///   cannot be valid in the next block (nothing was submitted and no wallet transaction was recorded).
+    ///   For an active proved row the SDK first persists the higher of the wallet and server tips,
+    ///   so ``advanceStep()`` returns `.reevaluate` until scanning reaches that height. Sync, then
+    ///   crank again to learn what becomes of the run. A persistence failure throws the store error
+    ///   instead of claiming the refusal was recorded. Other failures include the seam's STALENESS
+    ///   refusal (``ZcashError/rustMigrationTakeBroadcastTransaction(_:)``) of a row that is no longer
     ///   proved-and-servable. The staleness throw is the honest answer to a stale instruction —
     ///   discharge it by cranking ``advanceStep()`` again rather than retrying the executor. A
     ///   record failure *after* a successful broadcast throws
@@ -525,9 +599,16 @@ actor OrchardMigration {
         _ instruction: MigrationBroadcastInstruction,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
-            let prepared = try await welding.migrationTakeBroadcastTransaction(id: instruction.id, for: accountUUID)
-            return try await broadcastAndRecord(prepared: prepared, options: options)
+        let welding = self.welding
+        let accountUUID = self.accountUUID
+        return try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
+            try await broadcastAndRecord(options: options) { serverHeight in
+                try await welding.migrationTakeBroadcastTransaction(
+                    id: instruction.id,
+                    submissionServerHeight: serverHeight,
+                    for: accountUUID
+                )
+            }
         }
     }
 
@@ -557,18 +638,24 @@ actor OrchardMigration {
     /// Signs, extracts, broadcasts, and records the note-split transaction, returning the broadcast
     /// outcome.
     ///
-    /// Composition: sign the split (which serves the first preparation back as a finalized
-    /// transaction through the store's broadcast seam), broadcast once under the in-flight marker,
-    /// and record the mapped result. A transport failure or a server rejection is *returned* as a
-    /// ``MigrationTransferResult``, not thrown.
+    /// Composition: connect to the submission server and read its latest block height on that
+    /// connection, sign the split (which serves the first preparation back as a finalized
+    /// transaction through the store's broadcast seam, after checking with that height that it can
+    /// be valid in the next block), broadcast once under the in-flight marker, and record the mapped
+    /// result. A transport failure or a server rejection is *returned* as a
+    /// ``MigrationTransferResult``, not thrown. When the server's height cannot be read nothing is
+    /// signed, submitted or recorded, and the result is
+    /// ``MigrationTransferResult/networkError(retryable:)``.
     ///
     /// Throws: a pre-broadcast failure throws untouched (a signing error, or
     /// ``ZcashError/migrationTorUnavailable`` when `options.useTor` is set and Tor cannot be
-    /// established — nothing was broadcast and nothing is recorded). A record failure *after* a
-    /// successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the
-    /// broadcast DID land; the failure is transient from the migration's point of view, because a
-    /// later execution window self-heals (re-submitting draws a duplicate rejection, which records
-    /// as success).
+    /// established — nothing was broadcast and nothing is recorded — or
+    /// ``ZcashError/migrationSubmissionRefused(_:)`` when the transaction cannot be valid in the
+    /// next block: it is not submitted or recorded in the wallet, and the run it belongs to stays
+    /// committed). A record failure *after* a successful broadcast throws
+    /// ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast DID land; the failure
+    /// is transient from the migration's point of view, because a later execution window self-heals
+    /// (re-submitting draws a duplicate rejection, which records as success).
     ///
     /// Broadcast flows are single-flight on this actor: when another broadcast-performing call
     /// (this method or ``performBroadcast(_:options:)``) is in flight, this call first waits
@@ -578,9 +665,17 @@ actor OrchardMigration {
         usk: UnifiedSpendingKey,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
-            let prepared = try await welding.migrationSignNoteSplit(proposal: proposal, usk: usk, for: accountUUID)
-            return try await broadcastAndRecord(prepared: prepared, options: options)
+        let welding = self.welding
+        let accountUUID = self.accountUUID
+        return try await serializedBroadcastFlow { () async throws -> MigrationTransferResult in
+            try await broadcastAndRecord(options: options) { serverHeight in
+                try await welding.migrationSignNoteSplit(
+                    proposal: proposal,
+                    usk: usk,
+                    submissionServerHeight: serverHeight,
+                    for: accountUUID
+                )
+            }
         }
     }
 
@@ -723,7 +818,7 @@ actor OrchardMigration {
     /// only ACCELERATE due-ness (expiry stays scanned-tip), and an estimator failure degrades to
     /// the scanned-tip behavior — the same plumbing ``advanceStep()`` always applies.
     func hasOverdueTransfers(useEstimatedTip: Bool) async throws -> Bool {
-        let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, now: now()) : nil
+        let estimatedTip = useEstimatedTip ? await MigrationTipEstimation.gatingEstimatedTip(welding: welding, spacing: spacing, now: now()) : nil
         return try await welding.migrationHasOverdueTransfers(for: accountUUID, estimatedTip: estimatedTip)
     }
 
@@ -742,8 +837,25 @@ actor OrchardMigration {
     /// plan is previewed for the re-confirm lane — the follow-up
     /// ``signAndStoreMigrationSchedule(_:usk:)`` / ``submitNoteSplit(proposal:usk:options:)`` (or
     /// PCZT store) then commits it.
-    func restartCurrentMigrationStep() async throws -> MigrationSchedule {
+    ///
+    /// Before the NU7 network upgrade has activated no new scheduled run is planned: the run is
+    /// still cancelled, and the outcome is
+    /// ``MigrationRestartOutcome/cancelledUntilNetworkUpgrade(activationHeight:)`` rather than a
+    /// schedule.
+    func restartCurrentMigrationStep() async throws -> MigrationRestartOutcome {
         try await welding.migrationRestartStep(for: accountUUID)
+    }
+
+    /// Cancels the stored run and nothing more: it is persisted as cancelled and eligible advisory
+    /// note reservations are released. Recorded spends still follow the wallet's expiry and scan
+    /// rules, even if network submission failed or was never attempted. No fresh plan is made --
+    /// the cancel half of ``restartCurrentMigrationStep()``, for ending a run the NU7 network
+    /// upgrade interrupted before the user is offered a new migration. A plan proposed earlier can
+    /// no longer be committed; already-broadcast transactions are unaffected on-chain. With no run
+    /// pending the call succeeds and changes no stored run. The network-upgrade gate never refuses
+    /// it.
+    func cancelMigrationRun() async throws {
+        try await welding.migrationCancelRun(for: accountUUID)
     }
 
     /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine and
@@ -844,16 +956,37 @@ actor OrchardMigration {
         }
         return try await flow()
     }
+}
 
-    /// Shared broadcast/record composition for a prepared transfer: broadcast its already-finalized
-    /// bytes once to the resolved endpoint, and classify the outcome. A record failure after a
-    /// successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``.
+// MARK: - Broadcast composition
+
+// Hosted in an extension rather than the actor body, like the static utilities below, to keep the
+// actor's stateful core within the lint limit on a type's length. It is still the actor's own
+// private composition, which both broadcast-performing flows end in.
+extension OrchardMigration {
+    /// Shared broadcast/record composition: connect to the submission server, take the transaction
+    /// from the wallet's broadcast seam once the server's height is known, broadcast its
+    /// already-finalized bytes once to the resolved endpoint, and classify the outcome. A record
+    /// failure after a successful broadcast throws ``ZcashError/migrationRecordFailedAfterBroadcast(_:)``.
     /// Non-success outcomes are recorded first and returned; a record throw on that path clears
     /// the in-flight marker first only for a DEFINITIVE rejection (`.expired`/`.invalidNote` —
     /// the server's answer proves nothing landed, so the window is over), while a `.networkError`
     /// record throw keeps the marker (protective: a transport failure cannot prove the submit did
     /// not land, exactly the ambiguity the marker exists for) — the raw record error rethrows
     /// either way. Only pre-broadcast failures throw untouched.
+    ///
+    /// `take` is what the broadcaster calls, with the height it read from the server on the
+    /// connection the transaction goes over, between that read and the submit: it takes the
+    /// transaction from the seam (the delivery executor's take, or the note-split ceremony's signing)
+    /// and returns it. The seam is the one place that records the transaction in the wallet, and it
+    /// checks first, with that height, that the transaction can be valid in the next block, so a
+    /// transaction it refuses is never recorded in the wallet and never submitted. For an active
+    /// proved row it persists refusal testimony for ``advanceStep()`` to adjudicate after sync;
+    /// its error propagates out of the broadcaster and this flow, with the in-flight marker cleared.
+    /// What `take` returned is remembered here, for the record that follows the submit. When it was
+    /// never called, the broadcaster could not read the server's height, and returned without
+    /// submitting anything — nothing is taken, submitted or recorded, and the result is a retryable
+    /// network error.
     ///
     /// The whole submit-to-record window is bracketed by the sync gate's persisted in-flight
     /// marker (``MigrationSyncGate/markBroadcastInFlight()``) — the gate's ONLY condition, and the
@@ -870,36 +1003,50 @@ actor OrchardMigration {
     /// crash-recovery ceiling rather than a privacy interval; while it lives, sync (and with it
     /// the reconciliation probe that must not observe a just-broadcast transfer) stays blocked.
     private func broadcastAndRecord(
-        prepared: PreparedMigrationTransfer,
-        options: MigrationNetworkPrivacyOptions
+        options: MigrationNetworkPrivacyOptions,
+        take: @escaping @Sendable (_ serverHeight: BlockHeight) async throws -> PreparedMigrationTransfer
     ) async throws -> MigrationTransferResult {
-        // Both producers that reach here — the delivery executor and the note-split ceremony —
-        // serve through the store's atomic broadcast seam, so `prepared.pczt` is ALREADY the
-        // finalized consensus transaction. There is no extract step: the wallet's own record of
-        // this transaction was written in the same database transaction that produced these bytes.
-        let rawTransaction = prepared.pczt
-
-        // Arm the in-flight marker before the submit can reach the network (belt); the
-        // broadcaster's onWillSubmit hook re-arms it at the last pre-submit instant so the 120 s
-        // window covers the actual submit-to-record span rather than the Tor bootstrap. A crash
-        // from the submit until the record lands leaves it to self-expire.
+        // Arm the in-flight marker before anything can reach the network (belt); the broadcaster's
+        // onWillSubmit hook re-arms it at the last pre-submit instant so the 120 s window covers the
+        // actual submit-to-record span rather than the Tor bootstrap. A crash from the submit until
+        // the record lands leaves it to self-expire.
         syncGate.markBroadcastInFlight()
+
+        // What `take` took from the seam, for the record below. Both producers that reach here —
+        // the delivery executor and the note-split ceremony — serve through the store's atomic
+        // broadcast seam, so `prepared.pczt` is ALREADY the finalized consensus transaction. There
+        // is no extract step: the wallet's own record of this transaction was written in the same
+        // database transaction that produced these bytes.
+        let taken = OSAllocatedUnfairLock<PreparedMigrationTransfer?>(initialState: nil)
 
         let outcome: MigrationBroadcastOutcome
         do {
             let syncGate = self.syncGate
             outcome = try await broadcaster.broadcast(
-                rawTransaction: rawTransaction,
                 to: options.submissionEndpoint,
                 useTor: options.useTor,
-                onWillSubmit: { syncGate.markBroadcastInFlight() }
+                onWillSubmit: { syncGate.markBroadcastInFlight() },
+                prepareTransaction: { serverHeight in
+                    let prepared = try await take(serverHeight)
+                    taken.withLock { $0 = prepared }
+                    return prepared.pczt
+                }
             )
         } catch {
             // The broadcaster throws only when nothing was submitted (fail-closed Tor, a
-            // pre-connect failure): nothing is in flight, so clear the marker rather than
-            // leaving sync blocked for the full self-expiry window.
+            // pre-connect failure, or the seam refusing the transaction): nothing is in flight,
+            // so clear the marker rather than leaving sync blocked for the full self-expiry window.
             syncGate.clearBroadcastInFlight()
             throw error
+        }
+
+        guard let prepared = taken.withLock({ $0 }) else {
+            // The broadcaster returned without having asked for a transaction: it could not read the
+            // server's height. Nothing was taken from the seam, submitted or recorded, so there is
+            // no result to record and no transfer to record it for; the marker is cleared as for
+            // any other pre-submit end.
+            syncGate.clearBroadcastInFlight()
+            return MigrationTransferResult.networkError(retryable: true)
         }
 
         let result = MigrationBroadcaster.map(outcome: outcome, successTxId: prepared.txid.toHexStringTxId())

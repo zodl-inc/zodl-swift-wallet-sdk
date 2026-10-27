@@ -6,8 +6,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Refused stale migration submissions now persist recovery state: `zcashlc_migration_advance_step` returns Reevaluate
+  until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
+  or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
+  are unchanged.
+
 ### Added
 
+- `zcashlc_slipstream_stop_for_wallet_change(handle)`, the stop to call right before changing the
+  wallet (adding or removing an account, a rewind, a wipe, or reopening a handle on the same
+  wallet). It asks the running session to end its scan at the next block, then stops exactly as
+  `zcashlc_slipstream_stop` does and returns the same `FfiSlipstreamStopReport`. Refuse the change
+  unless `settled` and `drained` are both 1. `zcashlc_slipstream_stop` lets a scan call in progress
+  run to the end of its chunk first, which can outlast its ten-second budget.
+- `zcashlc_check_transaction_submittable(db_data, db_data_len, network_id, tx, tx_len,
+  submission_server_height)` reports whether a raw transaction can be valid in the next block, so that nothing is
+  submitted that no block can include. The next block is the one after the higher of the wallet's chain tip and
+  `submission_server_height`, the latest block height of the server the transaction is about to be submitted to (a wallet
+  that has no chain tip yet is judged by the server's height alone). It returns `0` when the transaction can be valid
+  there, `1` when it is built for another consensus branch than that block's, `2` when it has expired by then (an expiry
+  height of 0 never expires), and `-1` with the last error set when it cannot judge: `submission_server_height` is negative or
+  no block height, which fails closed, no block can follow it, the network is unknown, the wallet database does not exist
+  or cannot be read, or `tx` is no transaction. The branch is compared only for a v5 or later encoding, the only one that
+  commits to a consensus branch; an earlier one has just its expiry judged. The wallet database is opened read-only, and
+  nothing is written to it. These validity checks apply at every height.
 - `zcashlc_payment_uri_parse` validates supported cross-chain payment request URIs and returns an
   internal JSON envelope for SDK bindings.
 - `zcashlc_parse_gift_card_link(link, error_out)` reads a gift card link — any `https` URL whose
@@ -417,6 +441,81 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transactions from a proposal (`zcashlc_create_proposed_transactions`) fails because the wallet
   has not scanned to a height it can anchor them on. Such failures were reported as
   `ProposalInvalid` (`17`).
+- `zcashlc_describe_unified_full_viewing_key` reports which items (P2PKH, P2SH, Sapling, Orchard,
+  unknown) a unified full viewing key carries. It takes the key as a null-terminated string and a
+  `network_id`, ignores whitespace around the key, and returns a bitmask of the items: `1` P2PKH,
+  `2` P2SH, `4` Sapling, `8` Orchard, and `16` for an item of a typecode the library does not
+  recognize. It returns `-1`, with no last error set, when the input is not a unified full viewing
+  key for `network_id`, and `-2`, with the last error set, on an internal failure: a null pointer,
+  input that is not UTF-8, an invalid `network_id`, or a panic. The last error never contains any
+  part of the key.
+- `zcashlc_find_account_key_overlap(db_data, db_data_len, ufvk, network_id)` finds the account in
+  the wallet that shares an incoming viewing key component (Orchard, Sapling or transparent P2PKH)
+  with a unified full viewing key, and reports what importing that key with
+  `zcashlc_import_account_ufvk` would do to it. It opens the wallet database read-only and ignores
+  whitespace around the key. It returns an `FfiAccountKeyOverlap`, freed with
+  `zcashlc_free_account_key_overlap`, whose `kind` is an `FfiAccountKeyOverlapKind`:
+  - `None` (`0`): no account shares a component, so the import adds an account.
+  - `AlreadyImported` (`1`): the account's viewing key already covers every item of the key, so
+    the import fails.
+  - `WouldUpgrade` (`2`): the key carries every incoming viewing key item of the account and
+    something its viewing key does not cover, so the import adds no account: it replaces the
+    account's viewing key with the key instead.
+  - `Conflicting` (`3`): the key shares a component with the account but lacks or changes
+    another, so the import fails.
+  - `MultipleAccounts` (`4`): the key's components match more than one account, so the import
+    fails.
+
+  Its `account` is that `FfiAccount`. For `None` and `MultipleAccounts` it is the value
+  `zcashlc_get_account` returns for an unknown account, with all-zero `uuid_bytes` and null
+  strings. The function returns null, with the last error set, on any other outcome: a null key, a
+  key that is not UTF-8 or not a unified full viewing key for `network_id`, an invalid
+  `network_id`, a wallet database that cannot be read, or a panic. The last error never contains
+  any part of the key.
+- `zcashlc_set_account_name(db_data, db_data_len, network_id, account_uuid_bytes, name)` sets the
+  name of an account, replacing any name it had; the account's keys and all other state are
+  unchanged. `name` is a null-terminated UTF-8 string. It returns `true` on success, and `false`
+  with the last error set when no account has `account_uuid_bytes`, when `name` is null or not
+  UTF-8, or when the wallet database cannot be written.
+- `zcashlc_pow_target_spacing_era(network_id, height, start_ret, end_ret, spacing_ret)`,
+  `zcashlc_target_seconds_between(network_id, from_height, to_height, seconds_ret)`,
+  `zcashlc_height_after_target_seconds(network_id, from_height, seconds, height_ret)` and
+  `zcashlc_default_tx_target_height_for_expiry(network_id, expiry_height, target_height_ret)` convert
+  between heights and target time: 150 s a block before Blossom, 75 from Blossom, 25 from NU7, at the
+  network's activation heights (NU7: mainnet 3,543,405, testnet 4,465,026), a registered custom network's
+  included. They write, respectively, the run of equal spacing containing a height (`end_ret` `-1` when
+  it never changes again); the summed
+  spacing of the blocks after `from_height` through `to_height` (negative when lower); the height whole
+  blocks reach in `seconds` (walking back when negative, stopping at 0); and the target height whose
+  default expiry (40 blocks before NU7, 120 from NU7) is `expiry_height`, the earlier candidate for an
+  expiry neither produces. Each returns `false` with the last error set, writing nothing, for an
+  unknown or unregistered network or a null output pointer.
+- `zcashlc_migration_cancel_run(db_data, db_data_len, account_uuid_bytes, network_id)` cancels the
+  account's pending migration run and nothing more, and returns `true` (`false` with the last error
+  set otherwise). The run is stored as cancelled and eligible advisory note reservations are released.
+  Recorded spends retain the wallet's expiry and scan restrictions, even if network submission failed
+  or was never attempted; transactions already broadcast are unaffected on-chain and may still mine.
+  A proposal previewed earlier can no longer be committed
+  (`MIGRATION_PLAN_STALE`). Unlike `zcashlc_migration_restart_step`, which cancels the same way, it
+  plans nothing. It is never refused before the NU7 activation, so it takes no
+  `upgrade_gate_bypass` and needs no chain tip. With no run pending it succeeds and changes no stored
+  run. Afterwards `zcashlc_migration_advance_step` answers `ZCASHLC_ADVANCE_STEP_COMPLETE` for the run,
+  whatever the chain tip: this is how a run that `ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`
+  reported is ended.
+- `zcashlc_migration_availability(db_data, db_data_len, network_id, upgrade_gate_bypass)` reports what
+  the migration may start at the height after the wallet's own chain tip, for choosing which options
+  to offer before anything is planned. It takes no account, opens the wallet read-only and makes no
+  network request. It returns an `FfiMigrationAvailability`, freed with
+  `zcashlc_free_migration_availability`: `phase` is `ZCASHLC_MIGRATION_AVAILABLE` (`0`, both the
+  scheduled and the immediate lane may start), `ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE` (`1`, the
+  next block is before NU7: new scheduled work is paused); `activation_height` is the network's NU7
+  activation height in both phases, `-1` when it has none; `immediate_available` is always `true`,
+  retained for FFI compatibility. Valid committed transactions may still be proved and broadcast
+  before activation. It judges the same gate as the calls refused with `MIGRATION_PAUSED_UNTIL_UPGRADE`.
+  `upgrade_gate_bypass` is for internal builds: `true` makes the phase `0` at every height. A wallet
+  with no chain tip, on a network that has an NU7 activation height and without the bypass, returns
+  NULL with the last error set ("sync first"); with the bypass, or on a network with no NU7
+  activation height, no tip is read.
 
 ### Changed
 
@@ -438,10 +537,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero the wallet database reports for every non-stabilized note until that range is scanned. A
   pass that stalls before scanning it, or that never queues a ChainTip-priority range, keeps
   `tip_fresh = 0` until it reaches Done. The field and its type are unchanged.
-- `zcashlc_slipstream_stop` now returns `false` while any aborted pass is still unwinding or an
-  in-flight wallet commit has not drained within its bounded budget, and a pass that outlived an
-  earlier stop or start stays on record so a later stop keeps reporting `false` until it has
-  actually finished; previously it returned `true` regardless.
+- `zcashlc_slipstream_stop` returns an `FfiSlipstreamStopReport` by value instead of `bool`. Its
+  `settled` (`uint8_t`) is 0 while any aborted pass is still unwinding when the stop's ten-second
+  budget runs out, and `drained` is 0 while an in-flight wallet commit has not drained within its
+  own ten-second budget; each is 1 otherwise. `settle_ms` and `drain_ms` (`uint64_t`) say how long
+  each wait took. A pass that outlived an earlier stop or start stays on record, so a later stop
+  keeps reporting `settled = 0` until that pass has actually finished. A stop that cannot run, on a
+  null handle for instance, returns all zeros. The `bool` was `true` only when both waits finished
+  within their budgets, and `false` when either ran out or the stop could not run. A caller that
+  read the `bool` must read the struct: the wallet file was proved quiescent only when `settled`
+  and `drained` are both 1.
 - `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
   `zcashlc_propose_send_max_transfer`, and `zcashlc_create_proposed_transactions` classify their
   failures instead of flattening them into a string. Their last-error text now reads
@@ -479,7 +584,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   balance whose canonical split the notes cannot fund now reports the whole spendable balance where
   the call used to fail. It costs one planning pass per remaining run, like the estimate.
 - Coinholder voting hosts the `zcash_voting` 5.x native round driver with the `lrz` (librustzcash)
-  backend, pinned to the published `=5.1.0` release. Opening a voting
+  backend, pinned to the published `=5.2.0-rc.2` release. Opening a voting
   database migrates schema 13 to 24 in place; older cores cannot reopen it.
   The step-by-step entry points a host used to drive are gone (see Removed) and the session surface
   that replaces them is new (see Added); what changed for the entry points that survive is:
@@ -593,11 +698,38 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiet once the sweep mines instead of reporting a per-run completion — while an unmined, unexpired
   immediate run still reports present with `is_immediate: true`. `FfiMigrationProgress` gains a
   trailing `is_immediate` boolean.
-- The anchor bucket interval is selected per network: mainnet keeps the ZIP 318 144-block grid, while
-  testnet and custom-parameter networks retain anchors every 12 blocks and compress the transfer and
-  preparation delays by the same factor, so a migration crosses enough boundaries to be exercised in
-  a test run. Nothing crosses the FFI for this — each wallet handle is opened with the interval its
+- The anchor bucket interval is selected per network: mainnet keeps the ZIP 318 grid of 144 reference
+  blocks, while testnet and custom-parameter networks retain anchors every 12 reference blocks and
+  compress the transfer and preparation delays by the same factor, so a migration crosses enough
+  boundaries to be exercised in a test run. A reference block is one block until NU7 activates and spans
+  three blocks from it, so from NU7 the boundaries lie three times as many blocks apart (432 on mainnet, 36
+  on testnet). Nothing crosses the FFI for this — each wallet handle is opened with the interval its
   `network_id` selects — and a migration already in flight keeps the interval it was committed under.
+- The migration engine counts ZIP 318's delays and expiry windows in reference blocks, the 75-second blocks
+  of ZIP 318, and converts them to blocks with the network's NU7 activation height (mainnet 3,543,405,
+  testnet 4,465,026): from NU7 a wait of the same length in time is three times as many blocks, and a wait
+  that crosses the activation keeps its length in time. The broadcast and expiry heights of a schedule
+  planned from NU7 lie accordingly (`FfiTransferProposal.next_executable_after_height` and `.expiry_height`,
+  `FfiMigrationPreparationStep.broadcast_height`; from `zcashlc_migration_propose_transfers`,
+  `zcashlc_migration_restart_step` and `zcashlc_migration_refresh_stale_transfers`), and
+  `zcashlc_migration_advance_step` judges an overdue schedule and shifts a slept-through backlog by the same
+  rule. Below the activation a reference block is one block, so heights there are unchanged. Convert a span
+  of heights to time with `zcashlc_target_seconds_between`, not at 75 seconds a block. The reorg settle depth
+  `zcashlc_migration_advance_step` judges a displaced step by is 10 reference blocks too: 10 blocks below the
+  activation and 30 from it.
+- A transaction whose expiry height the wallet does not know is assumed to expire after the default expiry
+  delta for the height at which the wallet first observed it: 120 blocks from NU7 (mainnet 3,543,405,
+  testnet 4,465,026), where the assumption was a fixed 40, and still 40 from Blossom until NU7. The delta
+  sets how long the spends of such an unmined transaction keep counting, so the notes and transparent
+  outputs it spends stay out of the spendable amounts that `zcashlc_get_wallet_summary`,
+  `zcashlc_get_verified_transparent_balance`, `zcashlc_get_verified_transparent_balance_for_account`,
+  `zcashlc_get_total_transparent_balance` and `zcashlc_get_total_transparent_balance_for_account` report,
+  and out of new proposals, for as long as it stays unmined inside the window; how long
+  `zcashlc_transaction_data_requests` keeps returning its `GetStatus` request; and how far a
+  `TransactionsInvolvingAddress` request that searches for the spend of a transparent output reaches: its
+  `block_range_end` lies up to 121 blocks past its `block_range_start`, where it lay up to 41. A transaction
+  of that kind that never mines therefore frees its inputs 80 blocks later than before, the same 50 minutes
+  it took at 75-second blocks. Nothing changes from Blossom until NU7, and no caller changes are required.
 - Note locks are owner-keyed: the residual lock is keyed to a deterministic per-account owner, which
   makes re-locking idempotent, and `zcashlc_migration_unlock_residual` still clears the account's
   locks wholesale.
@@ -653,21 +785,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
-- The crate now builds against the NU7 pre-release generation of the `librustzcash` crates and
-  the `zodl-slipstream` 0.4.0-pre.1 engine.
+- The crate now builds against the NU7 release of the `librustzcash` crates and the `zodl-slipstream`
+  0.4.0 engine. Its `rust-version` is 1.97, up from 1.91: building `libzcashlc` from source needs
+  Rust 1.97 or newer.
 - Every unified address, UFVK and UIVK string a `zcashlc_*` function returns is ZIP 316
   revision 0, with every receiver or item the value carries, as before the NU7 move. Revision 2
   is used only for a value revision 0 cannot represent (one with expiry metadata, a P2SH
   viewing-key item, or only transparent items). Decoding accepts both revisions, unchanged.
-- `zcash_voting` moves from 5.1.0 to 5.1.1-rc.3 as it stands at the head of
-  valargroup/zcash_voting#373, which moves the crate's `lrz` backend to the NU7 pre-release
-  crates. No release carries that change yet, so `[patch.crates-io]` takes the crate from
-  `zodl-inc/zcash_voting@9bb3762`, and the crates under it that the change also needs from the
-  heads of their own pull requests: `voting-circuits`, `voting-crypto-deps` and `imt-tree`
-  (valargroup/voting-circuits#135), `pir-types` and `pir-client`
-  (valargroup/vote-nullifier-pir#173), and `zakura-wallet-lib`
-  (zakura-core/wallet-libraries#83). Each entry is replaced by the release that contains its
-  pull request. The `zcashlc_voting_*` C surface is unchanged.
+- `zcashlc_init_data_database` applies one more wallet-database migration. It changes stored data only, not
+  the schema, and cannot be reverted. No address that `zcashlc_get_current_address` or
+  `zcashlc_get_next_available_address` returns changes, and an older build can still open the database.
+- `zodl-slipstream` is now required as `=0.4.0`, and `[patch.crates-io]` takes it from
+  the signed `zodl_slipstream-0.4.0` release at `zodl-inc/slipstream@8591b758`. The Git patch
+  remains until 0.4.0 is published to crates.io. This release includes the NU7 block cadence,
+  the move to the librustzcash release, the engine facades' implementation of
+  `WalletWrite::set_account_name`, and the restore anchor's resolution of a server tip or
+  tree-state height above `i32::MAX` like an unreachable server (see the
+  `zcashlc_slipstream_restore_anchor` entry under Fixed). It also fixes stale graft-buffer rows
+  that could put commitment-tree leaves at the wrong position, or keep a shard out of the tree,
+  after a stopped pass, a reorg or an account import.
+- `zcashlc_slipstream_stop` and `zcashlc_slipstream_start` now call the engine for the bounded
+  stop that proves the wallet file quiescent, which zodl-inc/slipstream#28 moved into the engine;
+  that change also adds the stop for a wallet change.
 - `zcashlc_init_data_database` now creates the
   `ext_zcashlc_orchard_ironwood_migration_immediate_runs` extension table, moving into it any
   records held by the `sdk_immediate_runs` table that read-write `zcashlc_migration_*` calls used
@@ -679,6 +818,81 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_migration_*` calls no longer replay its rows into the migration state first. Rejection
   marks a wallet never replayed are discarded; the engine re-adjudicates the affected transfers on
   their next broadcast attempt.
+- `zcashlc_migration_advance_step` holds back the engine's step around the NU7 network upgrade,
+  judged at the height after the wallet's own chain tip and never at `estimated_tip`, and takes a
+  trailing `upgrade_gate_bypass: bool`. `FfiMigrationAdvanceStep` gains a final field,
+  `network_upgrade_height: i64`, which a caller that builds the struct itself must now provide. Two
+  steps are new, exported as `ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE` (`8`) and
+  `ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE` (`9`). Both carry the NU7 activation height in
+  `network_upgrade_height` (`-1` on every other step), name no transaction (`id` is `0`) and carry no
+  outlook (`next_height` is `-1`), so a `switch` over `step` needs an arm for each. A network with no
+  NU7 activation height is never gated.
+  - `PAUSED_FOR_NETWORK_UPGRADE` answers in place of a Rebuild or a Replan before activation.
+    Do nothing, and ask again as the chain advances. Valid committed work may still be proved
+    and broadcast before activation.
+  - `INTERRUPTED_BY_NETWORK_UPGRADE` answers from the activation on when a transaction of the stored
+    run that is not mined was built for another consensus branch than the next block's, so the run
+    cannot complete. While every such transaction is `Proved` or `Broadcast`, one of them may have
+    been mined before the activation at a block the wallet has not scanned yet, and the call answers
+    `ZCASHLC_ADVANCE_STEP_REEVALUATE` instead, to sync and ask again, until the wallet has scanned the
+    block before the activation.
+  - `upgrade_gate_bypass` is for internal builds: `true` lifts the pause on new scheduled work, so
+    the call never answers `PAUSED_FOR_NETWORK_UPGRADE` and otherwise returns the engine's own step.
+    It never lifts the interruption: the call still answers `INTERRUPTED_BY_NETWORK_UPGRADE`, or
+    `ZCASHLC_ADVANCE_STEP_REEVALUATE` while the wallet's scan has not reached the block before the
+    activation. Pass `false` to enforce the gate.
+- Until the NU7 network upgrade has activated, the calls that plan, build, sign, store or rebuild a
+  scheduled migration run are refused: `zcashlc_migration_propose_transfers`,
+  `zcashlc_migration_prepare_note_split`, `zcashlc_migration_sign_note_split`,
+  `zcashlc_migration_sign_and_store_schedule`, `zcashlc_migration_create_unsigned_note_split_pczts`,
+  `zcashlc_migration_create_unsigned_transfer_pczts`,
+  `zcashlc_migration_store_signed_note_split_pczts`,
+  `zcashlc_migration_store_signed_schedule_pczts` and `zcashlc_migration_refresh_stale_transfers`
+  return their failure value (NULL, or `false`) with the last error
+  `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>`, the height following the colon directly (for
+  example `MIGRATION_PAUSED_UNTIL_UPGRADE:3543405`). Nothing is planned, cached, built, signed or
+  stored by a refused call. The gate is judged at the height after the wallet's own chain tip, so a
+  wallet with no chain tip fails with the usual "sync first" error instead, and
+  `zcashlc_migration_refresh_stale_transfers` is no exception even where it has nothing to refresh (no
+  stored run, or a terminal one), which it used to answer before reading any tip. A network with no NU7
+  activation height is never gated. Each of the nine, and `zcashlc_migration_restart_step`, takes a
+  trailing `upgrade_gate_bypass: bool`, which every existing call site must now pass. It is for
+  internal builds: `true` lets the call through at every height. Pass `false` to enforce the gate. The
+  read-only calls, `zcashlc_migration_prove_transactions`,
+  `zcashlc_migration_take_broadcast_transaction`, `zcashlc_migration_take_preparation_by_txid`,
+  `zcashlc_migration_record_transfer_result`, `zcashlc_migration_record_immediate_run`, the residual
+  locks and the Keystone helpers are not gated.
+- `zcashlc_migration_restart_step` returns a `*mut FfiMigrationRestartOutcome`,
+  `{ schedule: *mut FfiMigrationSchedule, replan_after_height: i64 }`, in place of the
+  `*mut FfiMigrationSchedule`. Free it with the new `zcashlc_free_migration_restart_outcome`, which
+  also frees the schedule, and no longer with `zcashlc_free_migration_schedule`. The call still cancels
+  the stored run first. From the NU7 activation on, or with `upgrade_gate_bypass`, it then plans as
+  before: `schedule` is the fresh plan and `replan_after_height` is `-1`. Before the activation it
+  plans nothing and succeeds with no last error: `schedule` is NULL, `replan_after_height` is the NU7
+  activation height a new scheduled plan waits for, and a plan proposed earlier can no longer be
+  committed (`MIGRATION_PLAN_STALE`).
+- `zcashlc_migration_take_broadcast_transaction`, `zcashlc_migration_take_preparation_by_txid` and
+  `zcashlc_migration_sign_note_split` check the transaction they hand back against the block it would
+  be mined in, before the store's broadcast seam records it in the wallet, and refuse one that cannot
+  be valid there. `zcashlc_migration_take_broadcast_transaction` and
+  `zcashlc_migration_take_preparation_by_txid` take two trailing arguments,
+  `submission_server_height: i64` and `upgrade_gate_bypass: bool`; `zcashlc_migration_sign_note_split`
+  takes `submission_server_height: i64` right before its existing `upgrade_gate_bypass`. Every existing
+  call site must pass them.
+  - `submission_server_height` is the latest block height the server the transaction will be submitted
+    to reports, read just before the call. The next block is the one after the higher of that height
+    and the wallet's chain tip. A negative value means the height could not be read, and the call
+    fails closed with the last error `the submission server's height is unknown` (for
+    `zcashlc_migration_sign_note_split` before the run is committed), and so does a value above
+    `u32::MAX`.
+  - A transaction that is not built for the consensus branch of the next block or that has expired by it
+    (an expiry height of 0 never expires, and a transaction can still be mined at its expiry height)
+    makes the call return NULL with `MIGRATION_SUBMISSION_REFUSED:<code>`. `<code>` is `wrong_branch`
+    or `expired`, checked in that order. A refused call records nothing in the wallet: for
+    `zcashlc_migration_sign_note_split` the committed run and stored proof stay. A stored PCZT that
+    does not parse fails with `MIGRATION_PROVING_UNAVAILABLE`.
+  - `upgrade_gate_bypass` is retained on the broadcast accessors for ABI compatibility. It never
+    bypasses submission validity; branch, expiry and server-height checks apply on every network.
 
 ### Removed
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
@@ -781,6 +995,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+- `zcashlc_migration_take_broadcast_transaction` and `zcashlc_migration_take_preparation_by_txid`
+  refuse a run that has ended (completed, failed, superseded or cancelled) with a bare error, before
+  any other check. An instruction issued before `zcashlc_migration_cancel_run` could previously still
+  be served after it, which recorded the transaction in the wallet and marked the notes the cancel had
+  just released as spent again. No caller changes are required.
 - `zcashlc_payment_uri_parse` rejects Ethereum native recipients, ERC-20 recipients, and token
   contracts whose hexadecimal address is not exactly 40 digits, instead of trusting the pinned
   EIP-681 parser's over-length address result.
@@ -831,9 +1050,38 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_slipstream_wallet_summary` no longer returns the empty sentinel during the ~30 s gap after
   a restore completes, and once NU6.3 is active reports the collapsed recovery balance in the
   Ironwood pool rather than Orchard.
+- `zcashlc_slipstream_restore_anchor` resolves a server tip or tree-state height above `i32::MAX`
+  as it does an unreachable server: a restore gets `max(fallback_checkpoint_height, birthday + 1)`
+  and a new wallet gets `height` 0 with a null `treestate`. It used to return such a height as the
+  server reported it.
 - `zcashlc_migration_*` read-write entry points no longer create the wallet database, or any table
   in it, when asked about a wallet that does not exist or was never initialized; they return an
   error instead (a stray table used to make an empty file look like a wallet).
+- Decode errors from `zcashlc_import_account_ufvk`, `zcashlc_derive_address_from_ufvk`,
+  `zcashlc_derive_address_from_uivk` and `zcashlc_slipstream_start` no longer contain the key.
+- `zcashlc_create_proposed_transactions` and `zcashlc_create_pczt_from_proposal` give a proposal whose
+  target height has NU7 active an expiry 120 blocks after that height, not 40: the 50 minutes 40 blocks
+  took at 75 seconds. A proposal with any ZIP 318 canonical crossing step keeps the ZIP 318 expiry;
+  nothing changes from Blossom until NU7.
+  From NU7 activation, a payment to a ZIP 316 revision 2 unified address whose expiry height falls
+  before the new default expiry (target height + 120) but not before the old one (target height + 40),
+  which used to succeed, is still proposed but fails here: `zcashlc_create_proposed_transactions`
+  returns null with `zcashlc_take_last_error_report` reporting `ErrorKind::Unclassified` (`0`), and
+  `zcashlc_create_pczt_from_proposal` returns null with the address expiry conflict in the last error
+  message.
+- `zcashlc_slipstream_snapshot`'s `tip_fresh` survives a `zcashlc_slipstream_stop` → `zcashlc_slipstream_start`
+  gap shorter than 1.6 target block intervals of the block after the handle's last known chain tip: 120 s
+  before NU7, as before, and 40 s once that block is a 25-second NU7 block. With no known tip, 120 s.
+- `zcashlc_tor_lwd_conn_check_single_use_taddr` looks back over addresses exposed within one day of target
+  time before the chain tip, and delays rechecks by the target spacing of the next block. Both assumed 75 s,
+  so after NU7 the look-back covered eight hours and rechecks were three times too far out. In wall-clock
+  terms, an address that has received nothing is now rechecked roughly 2–3× as often after NU7 as before it,
+  each recheck being one address over its own Tor circuit. Unchanged before NU7 on mainnet and testnet.
+- `FfiMigrationSchedule.estimated_duration_hours` (from `zcashlc_migration_propose_transfers`,
+  `zcashlc_migration_restart_step` and `zcashlc_migration_refresh_stale_transfers`) counts blocks at their
+  target spacing instead of 48 to the hour, so after NU7 it no longer reads up to three times too long.
+- `zcashlc_migration_progress` keeps an unmined immediate migration with no known expiry pending for the
+  default expiry delta past its record height: 40 blocks as before, 120 when NU7 is active at the next height.
 
 ## 2.8.0-rc.2 - 2026-07-28
 

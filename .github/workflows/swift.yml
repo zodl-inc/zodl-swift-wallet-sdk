@@ -30,6 +30,11 @@ on:
       - 'SWIFTLINT.md'
       - 'docs/**'
 
+# Superseded PR revisions can stop; main cache-warming runs remain independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Checks that the Rust sources are rustfmt-clean. `--check` only reports; it never
   # rewrites. Run `make format-rust` (or `cargo fmt --all`) to fix a failure.
@@ -71,20 +76,45 @@ jobs:
         persist-credentials: false
       timeout-minutes: 1
 
-    - name: Select Xcode version
-      run: sudo xcode-select -s '/Applications/Xcode_27.0.app/Contents/Developer'
+    - name: Report Xcode and compute cache identity
+      id: xcode-cache-key
+      run: |
+        xcode_version_file=$(mktemp)
+        trap 'rm -f "$xcode_version_file"' EXIT
+        xcodebuild -version -skipMacroValidation -derivedDataPath "${RUNNER_TEMP}/DerivedData" > "$xcode_version_file"
+        cat "$xcode_version_file"
+        echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
     - name: Run release-script tests
       run: make test-scripts
+
+    # Needed unconditionally: even on an FFI cache hit, the Rust test step below
+    # compiles the crate's test profile and so needs the toolchain. Only the
+    # arm64 macOS target: `make ffi-ci` builds nothing else.
+    #
+    # The runner image already ships rustup, so no toolchain action is needed.
+    # Incremental compilation stays off, because its files would only swell the
+    # cached target directory. Hash the complete compiler identity so every
+    # compiler, host and LLVM change starts a compatible cache namespace.
+    - name: Setup Rust
+      id: toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+        rustup default stable
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        rustc_version_file=$(mktemp)
+        trap 'rm -f "$rustc_version_file"' EXIT
+        rustc +stable --version --verbose > "$rustc_version_file"
+        cat "$rustc_version_file"
+        echo "cachekey=$(shasum -a 256 "$rustc_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
     # Hash every input of the FFI build for the XCFramework cache key.
     - name: Generate FFI source hash
       id: ffi-hash
       run: |
-        # Hash the Rust sources, the Cargo files, the build support files and
-        # the root Makefile, whose ffi-ci target decides how CI builds the FFI.
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
-        echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
+        FFI_HASH=$(./Scripts/ci/ffi-input-hash.sh)
+        echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
         echo "FFI source hash: $FFI_HASH"
 
     # Cache the XCFramework `make ffi-ci` builds: the arm64 macOS slice, without
@@ -95,17 +125,7 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
-
-    # Needed unconditionally: even on an FFI cache hit, the Rust test step below
-    # compiles the crate's test profile and so needs the toolchain. Only the
-    # arm64 macOS target: `make ffi-ci` builds nothing else.
-    - name: Setup Rust
-      id: toolchain
-      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-      with:
-        toolchain: stable
-        targets: aarch64-apple-darwin
+        key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
 
     # Used by both the FFI build and the Rust tests, so it is not conditional on
     # the FFI cache.
@@ -123,19 +143,18 @@ jobs:
         #
         # `registry/` is crates.io content and safe to cache. `target/` holds compiled rlib/rmeta
         # files, never sources: a far smaller disclosure should a private dependency return, and
-        # too expensive to rebuild every run. The key names what built `target/`: v2 is ffi-ci's
-        # arm64-only, LTO-off build, so bump it whenever CI's build settings change, and the
-        # toolchain's cachekey starts a fresh cache with each stable Rust release, whose compiler
-        # cannot reuse the old one's artifacts.
+        # too expensive to rebuild every run. The namespace names ffi-ci's arm64-only,
+        # LTO-off build. Every fallback retains the complete compiler identity,
+        # architecture and build variant so incompatible artifacts cannot cross over.
         path: |
           target
           ~/.cargo/bin
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-
+          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-
 
     # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
     # the Swift build and the offline tests need. Releases still build every
@@ -161,6 +180,51 @@ jobs:
     # Set up LocalPackages so Package.swift auto-detects the local build
     - name: Configure local FFI for CI
       run: make configure-local-ffi
+
+    # Capture the actual compiler so dependency caches cannot cross toolchains.
+    - name: Compute Swift cache identity
+      id: swift-cache-key
+      continue-on-error: true
+      run: |
+        swift_version_file=$(mktemp)
+        trap 'rm -f "$swift_version_file"' EXIT
+        swift --version > "$swift_version_file"
+        cat "$swift_version_file"
+        echo "hash=$(shasum -a 256 "$swift_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+    # Cache only downloaded dependencies. Build products, workspace state and
+    # the local FFI override must be recreated by their normal build steps.
+    - name: Restore SwiftPM dependencies
+      id: cache-swift
+      if: steps.swift-cache-key.outcome == 'success'
+      continue-on-error: true
+      uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          .build/repositories
+          .build/checkouts
+          .build/artifacts
+        key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-dependencies-v1-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.swift-cache-key.outputs.hash }}-${{ hashFiles('Package.swift', 'Package.resolved', 'BuildSupport/LocalPackages-Package.swift', 'LocalPackages/Package.swift') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-swiftpm-dependencies-v1-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.swift-cache-key.outputs.hash }}-
+
+    - name: Resolve SwiftPM dependencies
+      id: resolve-swift
+      timeout-minutes: 15
+      run: make resolve
+
+    # Save before compilation so a later compiler/test failure still leaves
+    # resolved dependencies warm. Cache service failures do not fail the build.
+    - name: Save SwiftPM dependencies
+      if: steps.resolve-swift.outcome == 'success' && steps.cache-swift.outputs.cache-hit != 'true' && steps.swift-cache-key.outcome == 'success'
+      continue-on-error: true
+      uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      with:
+        path: |
+          .build/repositories
+          .build/checkouts
+          .build/artifacts
+        key: ${{ steps.cache-swift.outputs.cache-primary-key }}
 
     # Build the Swift package
     - name: Build ZODLSwiftWalletSDK Swift Package

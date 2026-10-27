@@ -109,6 +109,16 @@ public class DerivationTool: KeyDeriving {
         try backend.deriveUnifiedFullViewingKey(from: spendingKey)
     }
 
+    /// Reports which kinds of item a viewing key carries, such as whether it has an Orchard item.
+    /// - Parameter ufvk: the `UnifiedFullViewingKey` to describe.
+    /// - Returns: the components of `ufvk`, or `nil` when it is not a unified full viewing key for this tool's network, for instance
+    ///   because it was created for the other network.
+    /// - Throws: `ZcashError.rustDescribeUnifiedFullViewingKey` if the rust layer fails to check the key. The error does not contain
+    ///   any part of the key.
+    public func describeUnifiedFullViewingKey(_ ufvk: UnifiedFullViewingKey) throws -> UnifiedFullViewingKeyComponents? {
+        try backend.describeUnifiedFullViewingKey(ufvk)
+    }
+
     /// Given a seed and a number of accounts, return the associated spending keys.
     /// - Parameter seed: the seed from which to derive spending keys.
     /// - Parameter accountIndex: the ZIP 32 index of the account

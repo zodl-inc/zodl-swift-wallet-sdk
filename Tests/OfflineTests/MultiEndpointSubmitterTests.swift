@@ -88,6 +88,45 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertEqual(outcome, TransactionSubmissionOutcome.rejected(code: -25, message: "bad tx"))
     }
 
+    /// An endpoint that refuses the transaction as one that cannot be valid in the next block has not rejected it: nothing
+    /// reached its server. The race reports it as a rejection all the same, under the refusal's local code and its stable
+    /// description, so a caller that handles the rejection of a transaction handles this one.
+    func testAllEndpointsRefusingTheTransactionIsARejectionWithTheRefusalsCode() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .refuse(.wrongConsensusBranch), for: endpoint(1))
+        mock.set(behavior: .refuse(.wrongConsensusBranch), for: endpoint(2))
+
+        let outcome = await submitter.submit(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertEqual(
+            outcome,
+            TransactionSubmissionOutcome.rejected(code: -9101, message: TransactionSubmissionRefusal.wrongConsensusBranch.description)
+        )
+    }
+
+    func testARefusalCountsAsARejectionBesideATransportFailure() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .failTransport, for: endpoint(1))
+        mock.set(behavior: .refuse(.expired), for: endpoint(2))
+
+        let outcome = await submitter.submit(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertEqual(
+            outcome,
+            TransactionSubmissionOutcome.rejected(code: -9102, message: TransactionSubmissionRefusal.expired.description)
+        )
+    }
+
+    func testOneEndpointAcceptingBesideARefusalIsAccepted() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .refuse(.expired), for: endpoint(1))
+        mock.set(behavior: .succeed, for: endpoint(2))
+
+        let outcome = await submitter.submit(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertEqual(outcome, TransactionSubmissionOutcome.accepted(by: endpoint(2)))
+    }
+
     func testSuccessWithHangingEndpointResolvesImmediatelyAndCancelsAfterGrace() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .succeed, for: endpoint(1))

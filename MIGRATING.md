@@ -1,5 +1,140 @@
 # Migrating from previous versions to _Unreleased_
 
+## `ZcashError.slipstreamEngineNotQuiescent` carries the refused stop's report
+
+`ZRUST0155` now carries the `SlipstreamStopReport` of the stop that refused the operation, so its
+`localizedDescription` can say which of the engine's waits ran out and after how long. Patterns
+that ignore the payload keep compiling; a value of the case now needs one:
+
+```swift
+// Before
+XCTAssertEqual(error as? ZcashError, .slipstreamEngineNotQuiescent)
+let refusal = ZcashError.slipstreamEngineNotQuiescent
+
+// After: compare the code, or build the case from a report. `ZcashError` equality compares
+// only the code, so any report matches: an error equals `refusal` whatever report it carries.
+XCTAssertEqual((error as? ZcashError)?.code, .slipstreamEngineNotQuiescent)
+let refusal = ZcashError.slipstreamEngineNotQuiescent(
+    SlipstreamStopReport(settled: false, drained: true, settleWait: .seconds(10), drainWait: .zero)
+)
+
+// Unchanged: these match the case whatever it carries.
+// catch ZcashError.slipstreamEngineNotQuiescent { ... }
+// case .slipstreamEngineNotQuiescent: ...
+
+// New: bind the report to see which wait ran out.
+if case .slipstreamEngineNotQuiescent(let report) = error {
+    log(report.refusalReason ?? "")
+}
+```
+
+## `SlipstreamEngine.stop()` returns a `SlipstreamStopReport`
+
+The stop used to answer only whether it proved the wallet file quiescent. It now says what it
+found, and the old answer is the report's `isQuiescent`:
+
+```swift
+// Before
+let quiescent = await engine.stop()
+if !quiescent {
+    // The engine could not prove its pass and its wallet writer had stopped.
+}
+
+// After
+let report = await engine.stop()
+if !report.isQuiescent {
+    // `report.settled` and `report.drained` say which of the two waits ran out, and
+    // `report.settleWait` and `report.drainWait` how long each took.
+}
+```
+
+A call that discards the result, such as `await engine.stop()`, compiles unchanged.
+
+## Imported accounts return their viewing keys — `Account.ufvk` and `Account.uivk`
+
+`Synchronizer.listAccounts()`, and every other API that returns an `Account`, now returns the
+viewing keys of an account imported without derivation data, such as a hardware-wallet or a
+view-only account. Its `ufvk` and `uivk` used to be `nil`. Its `seedFingerprint` and
+`hdAccountIndex` are still `nil`, so recognise such an account by `hdAccountIndex == nil`; a test
+for `ufvk == nil` no longer matches it.
+
+Whatever a wallet derives from `account.ufvk` changes for these accounts. A wallet that passes
+`account.ufvk` to `AccountMetadataKey.derivePrivateUseMetadataKey(ufvk:privateUseSubject:)` derived
+such an account's keys from `ufvk: nil`, and now derives different ones, which cannot read the
+metadata written under the old keys. To keep that metadata reachable, go on deriving with
+`ufvk: nil` for an imported account that already has metadata.
+
+Before:
+
+```swift
+let isImported = account.ufvk == nil
+
+// `account.ufvk` was `nil` for an imported account, so this derived the keys of `ufvk: nil`.
+let keys = try metadataKey.derivePrivateUseMetadataKey(
+    ufvk: account.ufvk,
+    privateUseSubject: subject
+)
+```
+
+After:
+
+```swift
+let isImported = account.hdAccountIndex == nil
+
+// An imported account that already has metadata keeps the keys it was written under.
+let keys = try metadataKey.derivePrivateUseMetadataKey(
+    ufvk: isImported && hasStoredMetadata(for: account.id) ? nil : account.ufvk,
+    privateUseSubject: subject
+)
+```
+
+Such an `Account` also no longer equals, or hashes like, the value an earlier version returned, so
+match accounts by `id`. Its `Codable` encoding now includes `ufvk` and `uivk`: an `Account` a wallet
+stores or sends carries the account's viewing key, so keep it only where that key may go.
+
+## `ZcashError` gained cases — viewing key checks
+
+`ZcashError` and `ZcashErrorCode` have three new cases, which only the viewing key checks throw. An
+exhaustive `switch` over either type stops compiling until they are handled.
+
+- `rustDescribeUnifiedFullViewingKey` (`ZRUST0172`): `DerivationTool.describeUnifiedFullViewingKey(_:)`
+  could not check the key.
+- `rustFindAccountKeyOverlap` (`ZRUST0170`): `Synchronizer.findAccountSharingKeyComponents(_:)` could
+  not look the key up, for instance because the wallet database could not be read.
+- `accountKeyOverlapMultipleAccounts` (`ZRUST0171`): `Synchronizer.findAccountSharingKeyComponents(_:)`
+  found more than one account that shares a viewing key component with the key, so importing the key
+  would fail.
+
+The payloads of the first two are the rust layer's message, which never contains any part of the key.
+With one exception, those two failures say nothing about the key itself, so report that the key could
+not be checked, not that it is invalid. The exception is a key for another network than the wallet's:
+`findAccountSharingKeyComponents(_:)` throws `rustFindAccountKeyOverlap` for it every time, so build
+the `UnifiedFullViewingKey` for the wallet's own network, or check it first with
+`DerivationTool.describeUnifiedFullViewingKey(_:)`, which returns `nil` for it. The third is an answer
+about the key: its import would fail, so refuse it.
+
+```swift
+case .rustDescribeUnifiedFullViewingKey, .rustFindAccountKeyOverlap:
+    // The check itself failed, so the key is neither accepted nor rejected: offer another attempt.
+    break
+case .accountKeyOverlapMultipleAccounts:
+    // Several accounts share the key's components, so importing it would fail: refuse it.
+    break
+```
+
+## `ZcashError` gained a case — `rustSetAccountName`
+
+`ZcashError` and `ZcashErrorCode` have a new case, `rustSetAccountName` (`ZRUST0173`), which only
+`Synchronizer.renameAccount(_:name:)` throws: the name could not be stored, for instance because no
+account has the given UUID or the name contains a null character. The account keeps the name it had.
+An exhaustive `switch` over either type stops compiling until the new case is handled.
+
+```swift
+case .rustSetAccountName:
+    // The account kept its old name: say that the rename failed, and keep showing the old name.
+    break
+```
+
 ## The package is `zodl-swift-wallet-sdk` and the module is `ZODLSwiftWalletSDK`
 
 The package, its library product, and its module are renamed, and the repository has moved to
@@ -71,6 +206,32 @@ declares an older `swift-tools-version`, spell the platforms as strings instead:
 In an Xcode project, set the iOS Deployment Target to 16.0 and the macOS Deployment Target to 14.0
 (`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`).
 
+## NU7 activates on mainnet — measure block spans with `TargetBlockSpacing`
+
+NU7 activates on mainnet at height 3,543,405, as it does on testnet at 4,465,026. From that height the
+target block spacing is 25 seconds instead of 75, and the default expiry of a transaction the SDK builds is
+120 blocks instead of 40: the same 50 minutes. Nothing stops compiling, but code that turns a count of
+blocks into time at a fixed 75 seconds a block is a factor of three off for every span from that height on,
+and so is code that reads a transaction's expiry as its target height plus 40.
+
+`TargetBlockSpacing(network:)` knows the spacing at every height. `seconds(from:to:)` is the target time of
+the blocks after `from` through `to`, each at its own spacing, so a span that crosses the activation is right
+on both sides of it; `estimatedSeconds(from:to:secondsPerBlock:)` converts at a pace you measured instead.
+A migration schedule's heights follow the same rule: ZIP 318 states its delays in 75-second blocks, so from
+NU7 the same wait is three times as many blocks apart in `nextExecutableAfterHeight` and `expiryHeight` of a
+`MigrationTransferProposal`.
+
+```swift
+// Before: every block taken as 75 seconds.
+let secondsUntilBroadcast = Double(proposal.nextExecutableAfterHeight - tip) * 75
+let minutesToMine = Double(expiryHeight - targetHeight) * 75 / 60
+
+// After: each block at its own spacing.
+let spacing = TargetBlockSpacing(network: network)
+let secondsUntilBroadcast = spacing.seconds(from: tip, to: proposal.nextExecutableAfterHeight)
+let minutesToMine = spacing.seconds(from: targetHeight, to: expiryHeight) / 60
+```
+
 ## `RustErrorKind` gained a case — `anchorNotFound`
 
 `RustErrorKind`, the type of `RedactedRustError.kind`, has a new case, `anchorNotFound`: creating
@@ -101,6 +262,24 @@ catch ZcashError.rustCreateToAddress(let error) {
     // ... the rest of RustErrorKind's cases
     }
 }
+```
+
+## `ZcashError` gained a case — out-of-range server block height
+
+`ZcashError` and `ZcashErrorCode` have a new case, `compactBlockProcessorServerBlockHeightOutOfRange`
+(`ZCBPEO0025`). `SDKSynchronizer`'s sync fails with it on mainnet and testnet when the connected
+lightwalletd reports a chain tip above `Int32.max`. No real chain reaches that height, so only a
+broken or malicious server causes it. `SDKSynchronizer.switchTo(endpoint:)` reports the case as
+`synchronizerServerSwitch`. A regtest or other custom network does not check that tip during sync, and
+`SlipstreamSynchronizer` never reports the case. The case carries no payload: the height the server
+reported is not part of the error. An exhaustive `switch` over either type stops compiling until it is
+handled. Handle it like the other server-validation failures, `compactBlockProcessorNetworkMismatch`
+and `compactBlockProcessorWrongConsensusBranchId`: the server is unusable, so offer another one.
+
+```swift
+case .compactBlockProcessorServerBlockHeightOutOfRange:
+    // The server's chain tip is not one a real chain reaches: offer another server.
+    break
 ```
 
 ## `ZcashError` gained cases — Ledger hardware wallets
@@ -1330,6 +1509,229 @@ case .broadcast(let instruction): ...
 
 Existing call sites that only pattern-matched the step's cases now unwrap `.step` first (or switch
 over `advance?.step` directly, as above); the outlook is additive and safe to ignore.
+
+## `MigrationAdvanceStep` gained two cases — `pausedForNetworkUpgrade` and `interruptedByNetworkUpgrade`
+
+`MigrationAdvanceStep` is a public enum, so an exhaustive `switch` over the `.step` of
+`migrationAdvanceStep(accountUUID:)` stops compiling until both new cases are handled:
+`switch must be exhaustive`. `if case`, and a `switch` with a `default`, are unaffected.
+
+Both come from the gate that keeps the migration from acting across the NU7 network upgrade, and both
+are answered from the wallet's own chain tip, in front of the engine's step:
+
+- `.pausedForNetworkUpgrade(activationHeight:)` — the engine's step is one the gate holds back: a rebuild or a
+  re-plan before activation. Valid committed work may still be proved and broadcast up to activation.
+  Do nothing now and ask again as the chain advances. Nothing is handed out to
+  execute, and there is no outlook.
+- `.interruptedByNetworkUpgrade(activationHeight:)` — the wallet's tip plus one has reached activation, so
+  the next candidate block uses the new branch, and an unmined transaction of the run uses the old branch.
+  The run cannot complete. Cancel it with `cancelMigrationRun(accountUUID:)` and offer a new migration.
+  Other transactions of the run may already have mined or may still mine; interruption does not make every
+  input available at once. Cancellation releases eligible advisory reservations, while recorded spends
+  retain the wallet's expiry and scan restrictions, even if submission failed or was never attempted.
+
+`.reevaluate` has a second meaning once the next candidate block uses the new branch: when every unmined
+old-branch transaction may already have been submitted, the wallet must scan through the last preactivation
+block before declaring the run stranded. Sync and ask again, as for a rejected broadcast.
+
+```swift
+// Before
+switch try await synchronizer.migrationAdvanceStep(accountUUID: account)?.step {
+case .prove(let instruction): ...
+case .broadcast(let instruction): ...
+case .rebuild: ...
+case .replan, .reevaluate, .waiting, .complete, nil:
+    break
+}
+
+// After
+switch try await synchronizer.migrationAdvanceStep(accountUUID: account)?.step {
+case .prove(let instruction): ...
+case .broadcast(let instruction): ...
+case .rebuild: ...
+case .pausedForNetworkUpgrade(let activationHeight):
+    // Nothing to perform. Show the run as paused for the upgrade that activates at `activationHeight`.
+    break
+case .interruptedByNetworkUpgrade:
+    // The run cannot complete: cancel it and offer a new migration.
+    try await synchronizer.cancelMigrationRun(accountUUID: account)
+case .replan, .reevaluate, .waiting, .complete, nil:
+    break
+}
+```
+
+`Synchronizer` also gained `setMigrationNetworkUpgradeGateBypass(_:)`, `migrationAvailability()` and
+`cancelMigrationRun(accountUUID:)`, which have default implementations, so a custom conformer needs no change.
+
+`MigrationAvailability.Phase` has two cases: `.available` and `.pausedUntilNetworkUpgrade`. The latter
+pauses only new scheduled work until the next block is at the NU7 activation height. Immediate migration
+remains available, and `isImmediateLaneAvailable` is always `true` under this policy; the field remains for
+compatibility. Proof and broadcast of valid committed work continue before activation. Every submission
+still checks consensus branch, expiry and the submission server's height, independently of the internal
+scheduling bypass. `TransactionSubmissionRefusal` contains only `.wrongConsensusBranch` and `.expired`.
+
+## `restartCurrentMigrationStep` returns `MigrationRestartOutcome`
+
+`Synchronizer.restartCurrentMigrationStep(accountUUID:)` now returns a `MigrationRestartOutcome` in place of
+the `MigrationSchedule`. A restart always cancels the account's stored run. While the wallet's tip plus one is
+below NU7 activation it plans nothing after that, because a scheduled run planned now would be built for the
+consensus branch the upgrade ends, so it succeeds with `.cancelledUntilNetworkUpgrade(activationHeight:)` and the height
+at which the upgrade activates. A call site that used the returned schedule stops compiling, and any
+`Synchronizer` conformer or test double must return the new type. A conformer without migration support is
+unaffected: its default still throws.
+
+```swift
+// Before
+let schedule = try await synchronizer.restartCurrentMigrationStep(accountUUID: account)
+// Re-confirm `schedule` with the user, then commit it.
+
+// After
+switch try await synchronizer.restartCurrentMigrationStep(accountUUID: account) {
+case .replanned(let schedule):
+    // What the call returned before: re-confirm `schedule` with the user, then commit it.
+    break
+case .cancelledUntilNetworkUpgrade(let activationHeight):
+    // The run is cancelled and nothing was planned. Show that a new migration waits for the upgrade,
+    // and offer one once the wallet's tip plus one reaches `activationHeight`.
+    break
+}
+```
+
+`.replanned` is the only outcome once the wallet's tip plus one reaches activation. A plan proposed before a
+restart that answers `.cancelledUntilNetworkUpgrade` can no longer be committed. For internal builds,
+`setMigrationNetworkUpgradeGateBypass(_:)` makes the restart plan at every height.
+
+## `ZcashError` gained a case — `migrationPausedUntilNetworkUpgrade`
+
+`ZcashError` and `ZcashErrorCode` have a new case, `migrationPausedUntilNetworkUpgrade` (`ZRUST0159`), whose
+payload is the NU7 activation height of the wallet's network. While the wallet's tip plus one is below activation,
+the calls that plan, build, sign, store or rebuild a scheduled migration run throw it, and nothing is planned,
+built, signed, stored or broadcast: `prepareNoteSplit`, `submitNoteSplit`, `proposeMigrationTransfers`,
+`signAndStoreMigrationSchedule`, `refreshStaleMigrationTransfers`, `createUnsignedNoteSplitPCZTs`,
+`storeSignedNoteSplitPCZTs`, `createUnsignedMigrationTransferPCZTs` and `storeSignedMigrationSchedulePCZTs`.
+The reads, the proving and broadcast executors and the immediate lane are not affected. It is judged at the
+wallet's own chain tip plus one, and a network with no NU7 activation height never throws it. The judgment needs that
+tip, so a wallet that has none yet fails these calls with their rust error instead (sync first). That includes
+`refreshStaleMigrationTransfers`, which used to answer the empty schedule for an account with no stored run, or
+a terminal one, whatever the wallet's tip, and still does with `setMigrationNetworkUpgradeGateBypass(_:)` on or
+on a network with no NU7 activation height. An exhaustive `switch` over either type stops compiling until it is
+handled.
+
+```swift
+case .migrationPausedUntilNetworkUpgrade(let activationHeight):
+    // Scheduled migration waits for the upgrade: show the pause rather than a failure, and offer the
+    // migration again once the wallet's tip plus one reaches `activationHeight`.
+    break
+```
+
+For internal builds, `setMigrationNetworkUpgradeGateBypass(_:)` turns the refusal off.
+
+## `ZcashError` gained two cases — `rustMigrationAvailability` and `rustMigrationCancelRun`
+
+`ZcashError` and `ZcashErrorCode` have two new cases, `rustMigrationAvailability` (`ZRUST0160`) and
+`rustMigrationCancelRun` (`ZRUST0161`), each with the rust layer's message as its payload. `migrationAvailability()`
+throws the first, notably for a wallet that has no chain tip yet on a network with an NU7 activation height, and
+`cancelMigrationRun(accountUUID:)` throws the second. An exhaustive `switch` over either type stops compiling
+until they are handled.
+
+```swift
+case .rustMigrationAvailability:
+    // The wallet has not synced yet, so the migration's options cannot be judged: sync, then ask again.
+    break
+case .rustMigrationCancelRun:
+    // The run could not be cancelled and is still stored: log it, and try again.
+    break
+```
+
+Both calls are new requirements of `Synchronizer` with default implementations that throw, so a custom
+conformer needs no change.
+
+## `ZcashError` gained a case — `migrationSubmissionRefused`
+
+`ZcashError` and `ZcashErrorCode` have a new case, `migrationSubmissionRefused` (`ZRUST0162`), whose payload is a
+`TransactionSubmissionRefusal`: why a migration transaction cannot be valid in the next block, which is the one
+after the higher of the wallet's chain tip and the latest block height of the server the transaction is about to
+go to. `performMigrationBroadcast`, `submitNoteSplit` and `takeMigrationPreparation` throw it, and the
+transaction they refuse is neither submitted nor recorded in the wallet. An exhaustive `switch` over either type
+stops compiling until it is handled.
+
+```swift
+case .migrationSubmissionRefused(let refusal):
+    switch refusal {
+    case .wrongConsensusBranch, .expired:
+        // The transaction can never be mined: sync, then crank `migrationAdvanceStep(accountUUID:)` again,
+        // which says what becomes of the run (an interrupted one is cancelled, an expired transfer rebuilt).
+        break
+    }
+```
+
+The crank judges the run at the wallet's own chain tip, and the refusal is judged at the higher of that and the
+server's height, so a wallet that is behind the server is offered the same instruction again until it has synced.
+
+These calls also change how they reach the network, with no signature change. `performMigrationBroadcast` and
+`submitNoteSplit` connect to the submission server and read its height before they take the transaction from the
+wallet, so `ZcashError.migrationTorUnavailable` now arrives before the wallet is touched, and a server whose height
+cannot be read yields `MigrationTransferResult.networkError(retryable: true)` with nothing submitted or recorded.
+That includes `submitNoteSplit` before the NU7 upgrade has activated: it contacts the submission server first, and
+only then is refused with `migrationPausedUntilNetworkUpgrade`, so ask `migrationAvailability()`, which makes no
+network request, before calling it. `takeMigrationPreparation` makes one network request of its own, to the
+synchronizer's lightwalletd server, and throws the request's error when it fails. With Tor enabled that request uses
+a Tor group named after the transaction's txid, which is not the circuit the sync uses and is shared with no other
+transaction; no change is needed in the app. See `CHANGELOG.md`.
+
+## Every submission is checked against the next block
+
+Every transaction the SDK submits is checked before it reaches a server, not only a migration's. That covers the
+streams of `createProposedTransactions(proposal:spendingKey:)`, `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`
+and `createTransactionFromPCZT(pcztWithProofs:pcztWithSigs:)`, `Broadcaster.submit`, and the background resubmission
+of a transaction that has not been mined. The SDK reads the latest block height of the server the transaction is about to go
+to, on the connection it submits over, and refuses a transaction that cannot be valid in the next block, the one after the
+higher of that height and the wallet's chain tip: one built for another consensus branch than that block's, which is what the NU7
+activation does to a transaction created before it and not yet sent, or one that has expired by then. Nothing else changes for a
+transaction that can be valid, apart from the extra request, and a normal send is never held back in the blocks before the
+activation. Immediate migration remains available under this policy and follows the same normal transaction validity
+checks. Use `migrationAvailability()` when offering the scheduled option; immediate migration needs no availability prerequisite.
+
+A refusal is reported as the failure of the call, under the local code and the stable description of its
+`TransactionSubmissionRefusal`, which no server sends. Nothing was submitted, and no block can include the transaction as it
+is, so the caller syncs and creates it again. The sync matters: a wallet that is behind the server would build a transaction
+that is refused again, and the refused one, which the wallet stored when it created it, returns its inputs to the spendable
+balance only at its expiry height:
+
+```swift
+// Before
+case .submitFailure(let txId, let code, let description):
+    // A server rejected the transaction. Show `description`.
+    break
+
+// After
+case .submitFailure(let txId, let code, let description):
+    if code == TransactionSubmissionRefusal.wrongConsensusBranch.code || code == TransactionSubmissionRefusal.expired.code {
+        // The SDK did not submit it: it cannot be valid in the next block. Sync, then create the transaction again.
+    } else {
+        // A server rejected the transaction. Show `description`.
+    }
+```
+
+`Broadcaster.submit` reports the same refusal as `TransactionSubmissionOutcome.rejected(code:message:)` when every endpoint has
+answered, none accepted the transaction and at least one refused or rejected it, so the check above applies to its `code` as well;
+an endpoint still pending when `responseTimeout` ends makes the outcome `.timedOut` instead. When the server's height cannot be read,
+nothing is submitted either. The height is the first request of a submission, so this is reported like any other failure to reach the
+server, and a caller that handles that needs no change: a stream reports `TransactionSubmitResult.grpcFailure(txId:error:)` for the
+transaction, with the ones after it `.notAttempted`, and an endpoint of `Broadcaster.submit` counts as unreachable. A transaction the
+check cannot judge at all, because it does not parse or the wallet database is missing, is not submitted and ends a stream with
+`ZcashError.rustCheckTransactionSubmittable` (below).
+
+Three enums gained a case, so an exhaustive `switch` over any of them stops compiling until it is handled. `ZcashError` and `ZcashErrorCode` have
+`rustCheckTransactionSubmittable` (`ZRUST0163`), whose payload is the rust layer's message: the transaction could not be judged, so it was
+not submitted. `TransactionEncoderError` has `notSubmittable(_:)`, whose payload is the `TransactionSubmissionRefusal`; the
+synchronizers and the broadcaster report a refusal as above, so it is not one a consumer meets from them.
+
+```swift
+case .rustCheckTransactionSubmittable:
+    // The transaction was not submitted because it could not be judged. Log it, and try again.
+    break
+```
 
 ## The pool-migration surface rides the final engine
 

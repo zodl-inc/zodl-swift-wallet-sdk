@@ -70,6 +70,10 @@ info: ## Print the resolved toolchain and FFI state
 		if [ -d LocalPackages ]; then echo " present (local FFI in use)"; \
 		else echo " absent (Package.swift uses the released FFI)"; fi
 
+.PHONY: print-swift-version
+print-swift-version: ## Print the complete version of the selected Swift compiler
+	@$(SWIFT) --version
+
 # The FFI targets produce an Apple XCFramework, which only Xcode can do.
 .PHONY: require-macos
 require-macos:
@@ -146,7 +150,7 @@ test-all: ## Run the whole test suite, including networked tests
 # they are not reached by any `swift test` filter and need their own target.
 .PHONY: test-rust
 test-rust: ## Run the Rust unit tests
-	cargo test
+	cargo test --locked
 
 .PHONY: format-rust
 format-rust: ## Format the Rust sources with rustfmt

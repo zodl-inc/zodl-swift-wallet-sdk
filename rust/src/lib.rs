@@ -41,7 +41,7 @@ use zcash_client_backend::{
         Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
         MaxSpendMode, SeedRelevance, TransactionDataRequest, TransactionStatus,
         TransparentKeyOrigin, WalletCommitmentTrees, WalletRead, WalletWrite, Zip32Derivation,
-        anchor_retention::AnchorRetentionInterval,
+        anchor_retention::{AnchorRetention, AnchorRetentionInterval},
         chain::{CommitmentTreeRoot, scan_cached_blocks},
         scanning::ScanPriority,
         wallet::{
@@ -53,7 +53,10 @@ use zcash_client_backend::{
         },
     },
     encoding::AddressCodec,
-    fees::{DustOutputPolicy, SplitPolicy, StandardFeeRule, zip317::MultiOutputChangeStrategy},
+    fees::{
+        DustOutputPolicy, SplitPolicy, StandardFeeRule, canonical_crossing_fee,
+        zip317::MultiOutputChangeStrategy,
+    },
     keys::{
         DecodingError, Era, ReceiverRequirement, ReceiverRequirementError, UnifiedAddressRequest,
         UnifiedFullViewingKey, UnifiedSpendingKey,
@@ -74,7 +77,7 @@ use zcash_primitives::{
     block::BlockHash,
     merkle_tree::HashSer,
     transaction::builder::BundlePadding,
-    transaction::{Transaction, TxId},
+    transaction::{Transaction, TxId, TxVersion},
 };
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
@@ -91,6 +94,7 @@ use zcash_protocol::{
 use zcash_script::script;
 use zip32::fingerprint::SeedFingerprint;
 
+mod block_spacing;
 /// cbindgen:ignore
 #[cfg(target_vendor = "apple")]
 mod darwin_qos;
@@ -113,6 +117,7 @@ mod ledger;
 mod migration;
 mod migration_engine;
 mod migration_finalize;
+mod migration_gate;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
@@ -126,6 +131,7 @@ mod voting;
 mod os_log;
 
 use crate::error_report::{ClassifiedError, ErrorKind};
+use crate::migration_gate::{SubmissionRefusal, check_submittable};
 use crate::tor::{TorRuntime, http::with_http_timeout};
 
 fn unwrap_exc_or<T>(exc: Result<T, ()>, def: T) -> T {
@@ -145,9 +151,9 @@ where
     }
 }
 
-/// The anchor bucket interval used on every network other than production mainnet: 12 blocks, so
-/// that a ZIP 318 pool migration passes through enough anchor boundaries to be exercised end to
-/// end in a test run instead of over days of chain.
+/// The anchor bucket interval used on every network other than production mainnet: 12 reference
+/// blocks, so that a ZIP 318 pool migration passes through enough anchor boundaries to be
+/// exercised end to end in a test run instead of over days of chain.
 ///
 /// Shortening the grid also shortens the transfer and preparation delays, which the migration
 /// backend derives from it, so this is the only value to choose.
@@ -230,6 +236,32 @@ pub(crate) fn wallet_db_connection(
     conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)?;
     rusqlite::vtab::array::load_module(&conn)?;
     Ok(conn)
+}
+
+/// Refuses a wallet-database path where no database exists, before any connection that could
+/// create it is opened.
+///
+/// Only `zcashlc_init_data_database` creates the wallet database, so no other call may let a
+/// read-write open make SQLite create an empty file at a path for a wallet that was never
+/// initialized, or whose database a wipe has just deleted. The path the platform passes may be a
+/// SQLite `file:` URI, which only SQLite resolves, so asking the filesystem whether it exists would
+/// refuse every real wallet. SQLite is asked instead, with a read-only open: that cannot create the
+/// file, and it fails with `SQLITE_CANTOPEN` when there is none. SQLite reports that code for a file
+/// that exists but cannot be opened too, for example on a permissions or data-protection failure, so
+/// the refusal says "does not exist or cannot be opened". Its own message for that failure carries
+/// the database path, so it is replaced by one that names no path, the same for both contexts.
+/// `before` names what the caller was about to do.
+pub(crate) fn require_wallet_db(db_path: &Path, before: &str) -> anyhow::Result<()> {
+    match wallet_db_connection(db_path, WalletDbAccess::ReadOnly) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::CannotOpen => {
+            Err(anyhow!(
+                "the wallet database does not exist or cannot be opened; initialize it with \
+                 zcashlc_init_data_database before {before}"
+            ))
+        }
+        Err(e) => Err(anyhow!("Error checking for the wallet database: {e}")),
+    }
 }
 
 /// Builds a WalletDb value from path data provided over the FFI, over a connection that
@@ -782,13 +814,10 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
         let network = parse_network(network_id)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
         let ufvk_str = unsafe { CStr::from_ptr(ufvk).to_str()? };
-        let ufvk = UnifiedFullViewingKey::decode(&network, ufvk_str).map_err(|e| {
-            anyhow!(
-                "Value \"{}\" did not decode as a valid UFVK: {}",
-                ufvk_str,
-                e
-            )
-        })?;
+        // The message is fixed on purpose: the value is a viewing key, and neither it nor the
+        // decoder's description of it may reach error text that ends up in app logs.
+        let ufvk = UnifiedFullViewingKey::decode(&network, ufvk_str)
+            .map_err(|_| anyhow!("The value did not decode as a valid UFVK"))?;
         let treestate =
             TreeState::decode(unsafe { slice::from_raw_parts(treestate, treestate_len) })
                 .map_err(|e| anyhow!("Invalid TreeState: {}", e))?;
@@ -845,6 +874,130 @@ pub unsafe extern "C" fn zcashlc_import_account_ufvk(
             .map_err(|e| anyhow!("Error while initializing accounts: {}", e))?;
 
         Ok(Box::into_raw(Box::new(ffi::Uuid::new(account.id()))))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// The fixed `CorruptedData` message of `zcash_client_sqlite`'s viewing key lookup when the
+/// incoming viewing key items of a key match more than one account. If librustzcash rewords it,
+/// `overlap_multiple_accounts_reports_kind_4` fails.
+const MULTIPLE_ACCOUNTS_MATCHED_UIVK: &str = "Multiple account records matched the provided UIVK";
+
+/// Classifies what importing `candidate` would do to `existing`, an account that the wallet
+/// matched to it on at least one incoming viewing key item. The predicates are the ones
+/// `zcash_client_sqlite` applies when an imported UFVK meets an existing account.
+///
+/// The import replaces the account's viewing key exactly when `candidate` subsumes the account's
+/// incoming viewing key items and the account's viewing key does not already subsume `candidate`.
+/// Every other pair fails the import with an account collision; those are split here into a
+/// candidate the account already covers and one it does not.
+fn classify_account_key_overlap<A: Account>(
+    existing: &A,
+    candidate: &UnifiedFullViewingKey,
+) -> ffi::AccountKeyOverlapKind {
+    if existing
+        .ufvk()
+        .is_some_and(|existing_ufvk| existing_ufvk.subsumes_ufvk(candidate))
+    {
+        ffi::AccountKeyOverlapKind::AlreadyImported
+    } else if candidate.subsumes_uivk(&existing.uivk()) {
+        ffi::AccountKeyOverlapKind::WouldUpgrade
+    } else {
+        ffi::AccountKeyOverlapKind::Conflicting
+    }
+}
+
+/// Finds the account in `wallet` that shares at least one incoming viewing key item with
+/// `candidate`, and what importing `candidate` would do to it. The account is returned for the
+/// kinds `AlreadyImported`, `WouldUpgrade` and `Conflicting`, and not for the others.
+///
+/// The match is [`WalletRead::get_account_for_ufvk`], which compares the Orchard, Sapling and
+/// P2PKH incoming viewing key items: the lookup an import runs first. When the items match more
+/// than one account, that lookup fails as the import does, and this reports
+/// [`ffi::AccountKeyOverlapKind::MultipleAccounts`]. Any other failure is returned as it is.
+fn find_account_key_overlap<W>(
+    wallet: &W,
+    candidate: &UnifiedFullViewingKey,
+) -> Result<(ffi::AccountKeyOverlapKind, Option<W::Account>), SqliteClientError>
+where
+    W: WalletRead<Error = SqliteClientError>,
+{
+    match wallet.get_account_for_ufvk(candidate) {
+        Ok(Some(account)) => Ok((
+            classify_account_key_overlap(&account, candidate),
+            Some(account),
+        )),
+        Ok(None) => Ok((ffi::AccountKeyOverlapKind::None, None)),
+        Err(SqliteClientError::CorruptedData(msg)) if msg == MULTIPLE_ACCOUNTS_MATCHED_UIVK => {
+            Ok((ffi::AccountKeyOverlapKind::MultipleAccounts, None))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Finds the account in the wallet that shares an incoming viewing key component (Orchard,
+/// Sapling or transparent P2PKH) with the provided unified full viewing key, and reports what
+/// importing the key with [`zcashlc_import_account_ufvk`] would do to it. Whitespace around the
+/// key is ignored. The wallet database is opened read-only, so it is never changed.
+///
+/// The `kind` of the returned [`ffi::AccountKeyOverlap`] is one of:
+/// - `None`: no account shares a component, so the import adds an account;
+/// - `AlreadyImported`: the account's viewing key already covers every item of the key, so the
+///   import fails;
+/// - `WouldUpgrade`: the key carries every incoming viewing key item of the account and something
+///   its viewing key does not cover, so the import adds no account but replaces the account's
+///   viewing key with the key;
+/// - `Conflicting`: the key shares a component with the account but lacks or changes another, so
+///   the import fails;
+/// - `MultipleAccounts`: the key's components match more than one account, so the import fails.
+///
+/// Its `account` is that account, or [`ffi::Account::NOT_FOUND`] for `None` and
+/// `MultipleAccounts`.
+///
+/// Returns null on an error: a null key, a key that is not UTF-8 or is not a unified full viewing
+/// key for `network_id`, an invalid `network_id`, a wallet database that cannot be read, or a
+/// panic. The last error is set, and never contains any part of the key.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `ufvk` must be null or must point to a null-terminated string.
+/// - The memory referenced by `ufvk` must not be mutated for the duration of the function call.
+/// - Call [`ffi::zcashlc_free_account_key_overlap`] to free the memory associated with the
+///   returned pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_find_account_key_overlap(
+    db_data: *const u8,
+    db_data_len: usize,
+    ufvk: *const c_char,
+    network_id: u32,
+) -> *mut ffi::AccountKeyOverlap {
+    let res = catch_panic(|| {
+        if ufvk.is_null() {
+            return Err(anyhow!("no unified full viewing key was supplied"));
+        }
+        let network = parse_network(network_id)?;
+        let encoding = unsafe { CStr::from_ptr(ufvk) }
+            .to_str()
+            .map_err(|_| anyhow!("the unified full viewing key is not UTF-8"))?;
+        let (_, candidate) = derivation::decode_ufvk(&network, encoding)?;
+        let db_data = unsafe { wallet_db_read_only(system_rng(), db_data, db_data_len, network)? };
+
+        let (kind, account) = find_account_key_overlap(&db_data, &candidate).map_err(|e| {
+            anyhow!("Error while finding the account that shares a viewing key component: {e}")
+        })?;
+        let account = account.map_or(Ok(ffi::Account::NOT_FOUND), |account| {
+            ffi::Account::from_account(&account, &network)
+        })?;
+        Ok(Box::into_raw(Box::new(ffi::AccountKeyOverlap {
+            kind,
+            account,
+        })))
     });
     unwrap_exc_or_null(res)
 }
@@ -948,6 +1101,62 @@ pub unsafe extern "C" fn zcashlc_delete_account(
     unwrap_exc_or(res, false)
 }
 
+/// Sets the human-readable name of the specified account, replacing any name it had. The
+/// account's keys and all other state are left unchanged.
+///
+/// Returns `true` on success, or `false` if an error is raised, including when no wallet database
+/// exists at `db_data`, which this function never creates, when no account with the given UUID
+/// exists in the wallet, and when `name` is null, empty or not valid UTF-8. Any other name is stored
+/// as given.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - The memory referenced by `account_uuid_bytes` must not be mutated for the duration of the
+///   function call.
+/// - `name` must be null or must point to a null-terminated string.
+/// - The memory referenced by `name` must not be mutated for the duration of the function call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_set_account_name(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    name: *const c_char,
+) -> bool {
+    let res = catch_panic(|| {
+        if name.is_null() {
+            return Err(anyhow!("no account name was supplied"));
+        }
+        let network = parse_network(network_id)?;
+        // `wallet_db` opens read-write, which creates a missing database file. A rename that was
+        // still waiting for the database when a wipe deleted it must not leave an empty one behind.
+        let db_path = Path::new(OsStr::from_bytes(unsafe {
+            slice::from_raw_parts(db_data, db_data_len)
+        }));
+        require_wallet_db(db_path, "renaming an account")?;
+        let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+        let name = unsafe { CStr::from_ptr(name).to_str()? };
+        if name.is_empty() {
+            return Err(anyhow!("the account name is empty"));
+        }
+
+        db_data.set_account_name(account_uuid, name)?;
+
+        Ok(true)
+    });
+
+    unwrap_exc_or(res, false)
+}
+
 /// A private utility function to reduce duplication across functions that take an USK
 /// across the FFI. `usk_ptr` should point to an array of `usk_len` bytes containing
 /// a unified spending key encoded as returned from the `zcashlc_create_account` or
@@ -1013,7 +1222,7 @@ pub unsafe extern "C" fn zcashlc_get_current_address(
             UnifiedAddressRequest::AllAvailableKeys,
         ) {
             Ok(Some(ua)) => {
-                let address_str = ua.encode_receiver_preserving(&network);
+                let address_str = ua.encode(&network);
                 Ok(CString::new(address_str).unwrap().into_raw())
             }
             Ok(None) => Err(anyhow!(
@@ -1178,7 +1387,7 @@ pub unsafe extern "C" fn zcashlc_get_next_available_address(
 
         match db_data.get_next_available_address(account_uuid, address_request) {
             Ok(Some((ua, _))) => {
-                let address_str = ua.encode_receiver_preserving(&network);
+                let address_str = ua.encode(&network);
                 Ok(CString::new(address_str).unwrap().into_raw())
             }
             Ok(None) => Err(anyhow!(
@@ -2405,6 +2614,94 @@ pub unsafe extern "C" fn zcashlc_decrypt_and_store_transaction(
     unwrap_exc_or(res, -1)
 }
 
+/// Checks whether a raw transaction can be valid in the next block, so that nothing is submitted
+/// that no block can include.
+///
+/// A block accepts only a transaction built for the consensus branch its own height is under, and
+/// only one that has not expired by then. A transaction the wallet created before a network upgrade
+/// and has not sent yet can fail either test by the time it goes out. The next block is judged at
+/// one past the higher of the wallet's chain tip and `submission_server_height`, the latest block
+/// height of the server the transaction is about to be submitted to, which the caller reads on the
+/// connection it submits over, just before it calls this: the wallet lags every block it has not
+/// synced yet, and the server may lag the wallet. A wallet that has no chain tip yet is judged by
+/// the server's height alone.
+///
+/// The transaction is parsed with `Transaction::read(tx, BranchId::for_height(params, next))`.
+/// Only a v5 or later encoding commits to its consensus branch, so only for such a transaction is
+/// the branch it carries compared with the next block's. Earlier encodings carry none, and just
+/// their expiry height is judged. These validity checks apply at every height.
+///
+/// The wallet database is opened read-only and nothing is written to it.
+///
+/// Returns:
+/// - 0 if the transaction can be valid in the next block.
+/// - 1 if it is built for another consensus branch than the next block is under.
+/// - 2 if it has expired by the next block.
+/// - -1 on error, with the last error set: `submission_server_height` is negative or no block
+///   height (the caller could not read it, which fails closed), no block can follow it, the
+///   network is unknown, the wallet database does not exist or cannot be read, or the bytes are no
+///   transaction. The caller must not submit the transaction.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `tx` must be valid for reads for `tx_len` bytes, and it must have an alignment of `1`. It may
+///   be null when `tx_len` is 0, which is a transaction that cannot be parsed.
+/// - The memory referenced by `tx` must not be mutated for the duration of the function call.
+/// - The total size `tx_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_check_transaction_submittable(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    tx: *const u8,
+    tx_len: usize,
+    submission_server_height: i64,
+) -> i32 {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        // Validated before the wallet is opened: a height that is not one fails closed, whatever the
+        // transaction is.
+        let server_height = migration::known_submission_server_height(submission_server_height)?;
+
+        let db_path = Path::new(OsStr::from_bytes(unsafe {
+            slice::from_raw_parts(db_data, db_data_len)
+        }));
+        require_wallet_db(db_path, "checking whether a transaction can be submitted")?;
+        let wallet = unsafe { wallet_db_read_only(system_rng(), db_data, db_data_len, network)? };
+        // A wallet that has not synced has no tip, and then the server's height alone decides.
+        let tip = migration::known_chain_tip(&wallet)?.unwrap_or(server_height);
+        let next_height = migration::submission_target(tip, server_height)?;
+
+        let tx_bytes: &[u8] = if tx_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(tx, tx_len) }
+        };
+        // The consensus branch ID passed in matters only to a transaction that does not encode one:
+        // v4 and below attach it to the parsed value. A v5 or later transaction ignores the
+        // argument and parses the value from its encoding.
+        let tx = Transaction::read(tx_bytes, BranchId::for_height(&network, next_height))?;
+        let encoded_branch = match tx.version() {
+            TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => None,
+            _ => Some(u32::from(tx.consensus_branch_id())),
+        };
+
+        match check_submittable(&network, encoded_branch, tx.expiry_height(), next_height) {
+            Ok(()) => Ok(0),
+            Err(SubmissionRefusal::WrongBranch) => Ok(1),
+            Err(SubmissionRefusal::Expired) => Ok(2),
+        }
+    });
+    unwrap_exc_or(res, -1)
+}
+
 /// The `key_source` tag the platform layers stamp on a Ledger import, compared case-
 /// insensitively. It is the only account-level signal this SDK has that a proposal must be
 /// signable by the Ledger Zcash app rather than an in-app or Keystone signer. Mirrored in Swift
@@ -2827,6 +3124,137 @@ pub extern "C" fn zcashlc_branch_id_for_height(height: i32, network_id: u32) -> 
     unwrap_exc_or(res, -1)
 }
 
+/// Reports the proof-of-work target spacing era containing `height` on the network `network_id`
+/// names: the longest run of heights around it whose blocks share one target spacing. Writes its
+/// first height to `start_ret`, the first height after it to `end_ret` (`-1` when no later network
+/// upgrade changes the spacing), and the spacing in seconds to `spacing_ret`. Spacing is 150 s
+/// before Blossom, 75 s from Blossom and 25 s from NU7, at the network's activation heights,
+/// including those registered with [`zcashlc_set_custom_network`].
+///
+/// Returns `false`, with the last error set and nothing written, for an unknown or unregistered
+/// network or a null output pointer.
+///
+/// # Safety
+///
+/// - `start_ret` and `spacing_ret` must be null or valid for writing a `u32`; `end_ret` must be
+///   null or valid for writing an `i64`.
+/// - The three output pointers must not alias one another or overlap: each non-null one becomes
+///   a mutable reference for the whole call, so two that refer to the same memory (`start_ret`
+///   and `spacing_ret` share a type) are undefined behavior.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_pow_target_spacing_era(
+    network_id: u32,
+    height: u32,
+    start_ret: *mut u32,
+    end_ret: *mut i64,
+    spacing_ret: *mut u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let start_ret =
+            unsafe { start_ret.as_mut() }.ok_or_else(|| anyhow!("start_ret must not be null"))?;
+        let end_ret =
+            unsafe { end_ret.as_mut() }.ok_or_else(|| anyhow!("end_ret must not be null"))?;
+        let spacing_ret = unsafe { spacing_ret.as_mut() }
+            .ok_or_else(|| anyhow!("spacing_ret must not be null"))?;
+        let era = block_spacing::spacing_era(&network, BlockHeight::from_u32(height));
+        *start_ret = u32::from(era.start);
+        *end_ret = era.end.map_or(-1, |end| i64::from(u32::from(end)));
+        *spacing_ret = era.spacing;
+        Ok(true)
+    });
+    unwrap_exc_or(res, false)
+}
+
+/// Writes to `seconds_ret` the target time, in seconds, of the blocks after `from_height` up to
+/// and including `to_height`: the sum of their target spacings, negative when `to_height` is
+/// below `from_height`. Returns `false`, with the last error set and nothing written, for an
+/// unknown or unregistered network or a null `seconds_ret`.
+///
+/// # Safety
+///
+/// - `seconds_ret` must be null or valid for writing an `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_target_seconds_between(
+    network_id: u32,
+    from_height: u32,
+    to_height: u32,
+    seconds_ret: *mut i64,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let seconds_ret = unsafe { seconds_ret.as_mut() }
+            .ok_or_else(|| anyhow!("seconds_ret must not be null"))?;
+        *seconds_ret = block_spacing::target_seconds_between(
+            &network,
+            BlockHeight::from_u32(from_height),
+            BlockHeight::from_u32(to_height),
+        );
+        Ok(true)
+    });
+    unwrap_exc_or(res, false)
+}
+
+/// Writes to `height_ret` the height `seconds` of target time reach from `from_height`, counting
+/// whole blocks only. For a non-negative `seconds`, the highest height whose blocks after
+/// `from_height` take no more than `seconds`. For a negative `seconds`, the lowest height whose
+/// blocks up to `from_height` take no more than its magnitude, never below 0. Returns `false`,
+/// with the last error set and nothing written, for an unknown or unregistered network or a null
+/// `height_ret`.
+///
+/// # Safety
+///
+/// - `height_ret` must be null or valid for writing a `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_height_after_target_seconds(
+    network_id: u32,
+    from_height: u32,
+    seconds: i64,
+    height_ret: *mut u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let height_ret =
+            unsafe { height_ret.as_mut() }.ok_or_else(|| anyhow!("height_ret must not be null"))?;
+        *height_ret = u32::from(block_spacing::height_after_target_seconds(
+            &network,
+            BlockHeight::from_u32(from_height),
+            seconds,
+        ));
+        Ok(true)
+    });
+    unwrap_exc_or(res, false)
+}
+
+/// Writes to `target_height_ret` the target height of a transaction with the default expiry delta
+/// that expires at `expiry_height`: 40 blocks before it when NU7 is not active at that target, 120
+/// when it is. For an expiry no target produces (the 80 heights from 40 blocks after NU7
+/// activation) it writes the earlier candidate, so a derived height is never later than the real
+/// target height. Returns `false`, with the last error set and nothing written, for an unknown or
+/// unregistered network or a null `target_height_ret`.
+///
+/// # Safety
+///
+/// - `target_height_ret` must be null or valid for writing a `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_default_tx_target_height_for_expiry(
+    network_id: u32,
+    expiry_height: u32,
+    target_height_ret: *mut u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let target_height_ret = unsafe { target_height_ret.as_mut() }
+            .ok_or_else(|| anyhow!("target_height_ret must not be null"))?;
+        *target_height_ret = u32::from(block_spacing::default_tx_target_height_for_expiry(
+            &network,
+            BlockHeight::from_u32(expiry_height),
+        ));
+        Ok(true)
+    });
+    unwrap_exc_or(res, false)
+}
+
 /// Frees strings returned by other zcashlc functions.
 ///
 /// # Safety
@@ -3029,6 +3457,79 @@ pub unsafe extern "C" fn zcashlc_propose_shielding(
     unwrap_exc_or_null(res)
 }
 
+/// The expiry height the transaction-building FFIs ask librustzcash for, as a rule over plain
+/// inputs so it tests without a wallet; `requested_expiry_height` derives the inputs from a
+/// proposal. `None` leaves it to the builder, as every proposal got before NU7: 40 blocks past the
+/// target (20 below Blossom), or the ZIP 318 rolling expiry for a canonical crossing, which refuses
+/// an explicit expiry. Once NU7 is active at the target height, 40 blocks are under 17 minutes, so
+/// the transaction gets the 120-block default, which is also the builder's own default from NU7.
+fn explicit_expiry_height<P: Parameters>(
+    params: &P,
+    target_height: BlockHeight,
+    any_canonical_crossing: bool,
+) -> Option<BlockHeight> {
+    if any_canonical_crossing || !params.is_nu_active(NetworkUpgrade::Nu7, target_height) {
+        None
+    } else {
+        Some(target_height + block_spacing::default_tx_expiry_delta(params, target_height))
+    }
+}
+
+/// Whether any step of `proposal` will be built as a ZIP 318 canonical crossing, asked as
+/// librustzcash's builder asks it: of the wallet's pool-migration parameters, at the canonical fee
+/// for the proposal's target height.
+///
+/// This mirrors, applied to every step, librustzcash's non-public
+/// `zcash_client_backend::data_api::wallet::step_is_canonical_crossing`, so nothing but this note
+/// ties the two together. Re-check it against that function on every librustzcash bump. If they
+/// disagree, a send either fails with `ExpiryHeightConflictsWithCanonicalCrossing` (an explicit
+/// expiry given to a crossing) or takes the builder's own default expiry (an explicit expiry
+/// withheld from a transaction that is not a crossing).
+///
+/// The check, and the explicit expiry it guards (see `explicit_expiry_height`), date from a builder
+/// whose default expiry was a fixed 40 blocks. The builder's default is NU7-aware now
+/// (`zcash_primitives::transaction::builder::default_tx_expiry_delta`), so the explicit expiry
+/// repeats it and both can go.
+fn proposal_has_canonical_crossing<P, DbT, FeeRuleT, NoteRef>(
+    params: &P,
+    wallet_db: &DbT,
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRef>,
+) -> bool
+where
+    P: Parameters,
+    DbT: WalletRead,
+{
+    let pool_migration_params = wallet_db.pool_migration_params(params);
+    canonical_crossing_fee(params, BlockHeight::from(proposal.min_target_height())).is_ok_and(
+        |fee| {
+            proposal
+                .steps()
+                .iter()
+                .any(|step| step.is_canonical_crossing(&pool_migration_params, fee))
+        },
+    )
+}
+
+/// The expiry height the transaction-building FFIs, `zcashlc_create_proposed_transactions` and
+/// `zcashlc_create_pczt_from_proposal`, ask librustzcash for when they build `proposal`:
+/// [`explicit_expiry_height`] at the proposal's target height, told whether any step is a
+/// canonical crossing. Both go through here so the two builds cannot decide differently.
+fn requested_expiry_height<P, DbT, FeeRuleT, NoteRef>(
+    params: &P,
+    wallet_db: &DbT,
+    proposal: &zcash_client_backend::proposal::Proposal<FeeRuleT, NoteRef>,
+) -> Option<BlockHeight>
+where
+    P: Parameters,
+    DbT: WalletRead,
+{
+    explicit_expiry_height(
+        params,
+        BlockHeight::from(proposal.min_target_height()),
+        proposal_has_canonical_crossing(params, wallet_db, proposal),
+    )
+}
+
 /// Creates a transaction from the given proposal.
 ///
 /// Returns the row index of the newly-created transaction in the `transactions` table
@@ -3133,7 +3634,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
         }?;
         let proposal = proposal_proto.try_into_standard_proposal(&network, &db_data)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
-        let expiry_height = None;
+        let expiry_height = requested_expiry_height(&network, &db_data, &proposal);
 
         let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
             &mut db_data,
@@ -3267,7 +3768,7 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
         if proposal.steps().len() == 1 {
-            let target_expiry_height = None;
+            let target_expiry_height = requested_expiry_height(&network, &db_data, &proposal);
             let orchard_pool_padding = BundlePadding::DEFAULT;
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 &mut db_data,
@@ -4831,6 +5332,23 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_fetch_utxos_by_address(
     unwrap_exc_or_null(res)
 }
 
+/// How many blocks back the single-use transparent address check looks: the blocks within one day
+/// of target time before `tip` (1,152 at 75 s, 3,456 at 25 s).
+fn single_use_taddr_exposure_depth<P: Parameters>(params: &P, tip: BlockHeight) -> u32 {
+    const ONE_DAY_SECONDS: i64 = 24 * 60 * 60;
+    tip - block_spacing::height_after_target_seconds(params, tip, -ONE_DAY_SECONDS)
+}
+
+/// The delay before an address that received nothing is checked again: `offset_blocks` blocks at
+/// the target spacing of the block after `tip`. It always fits a `u32`.
+fn single_use_taddr_check_offset_seconds<P: Parameters>(
+    params: &P,
+    tip: BlockHeight,
+    offset_blocks: f64,
+) -> u32 {
+    (offset_blocks * f64::from(block_spacing::pow_target_spacing(params, tip + 1))).round() as u32
+}
+
 /// Checks to find any single-use ephemeral addresses exposed in the past day that have not yet
 /// received funds, excluding any whose next check time is in the future. This will then choose the
 /// address that is most overdue for checking, retrieve any UTXOs for that address over Tor, and
@@ -4875,8 +5393,11 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
         let lwd_conn = unsafe { lwd_conn.as_mut() }
             .ok_or_else(|| anyhow!("A Tor lightwalletd connection is required"))?;
 
-        // one day's worth of blocks.
-        let max_exposure_depth = (24 * 60 * 60) / 75;
+        // The look-back is measured back from the chain tip, so the tip is read first.
+        let cur_height = db_data
+            .chain_height()?
+            .ok_or(SqliteClientError::ChainHeightUnknown)?;
+        let max_exposure_depth = single_use_taddr_exposure_depth(&network, cur_height);
         let addrs =
             db_data.get_ephemeral_transparent_receivers(account_uuid, max_exposure_depth, true)?;
 
@@ -4890,10 +5411,6 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
                     && matches!(meta.exposure(), Exposure::Exposed { .. })
             })
             .min_by_key(|(_, meta)| meta.next_check_time());
-
-        let cur_height = db_data
-            .chain_height()?
-            .ok_or(SqliteClientError::ChainHeightUnknown)?;
 
         let mut found = None;
         if let Some((addr, meta)) = selected_addr_meta {
@@ -4931,9 +5448,8 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
                 // We will schedule the next check to occur after approximately
                 // log2(blocks_since_exposure) additional blocks.
                 let offset_blocks = blocks_since_exposure.log2();
-                // Convert the offset in blocks to an offset in seconds; this will always fit in a
-                // u32.
-                let offset_seconds = (offset_blocks * 75.0).round() as u32;
+                let offset_seconds =
+                    single_use_taddr_check_offset_seconds(&network, cur_height, offset_blocks);
                 db_data.schedule_next_check(&addr, offset_seconds)?;
             }
         }
@@ -5211,6 +5727,7 @@ pub(crate) fn parse_optional_height(value: i64) -> anyhow::Result<Option<BlockHe
 mod tests {
     use super::*;
     use tracing::Level;
+    use zcash_address::unified::{self, Container as _, Encoding as _};
 
     /// The C callers select the outgoing viewing key policy by number; only the two documented
     /// values are accepted, so a caller asking for an unrecoverable send is never silently given
@@ -5305,122 +5822,6 @@ mod tests {
         );
     }
 
-    /// [MOB-1850] A wallet writer still holding the gate when the drain's budget runs out is a
-    /// NON-QUIESCENT stop, and the drain must say so. Logging the timeout away and answering
-    /// "quiescent" is what let the host mutate the wallet on top of a live engine writer.
-    #[test]
-    fn drain_reports_a_writer_that_outlives_the_deadline() {
-        let progress = slipstream_core::ProgressArc::default();
-        // The RAII gate is the engine's own way of holding the counter up for the life of a
-        // commit, so the test raises it exactly as the persist lane does.
-        let gate = slipstream_core::events::WalletWriterGate::hold(progress.clone());
-        let quiescent =
-            drain_slipstream_wallet_writers_until(&progress, std::time::Duration::from_millis(50));
-        assert!(
-            !quiescent,
-            "a writer still running at the deadline must be reported, not logged away"
-        );
-        drop(gate);
-        assert!(drain_slipstream_wallet_writers_until(
-            &progress,
-            std::time::Duration::from_millis(50)
-        ));
-    }
-
-    /// Releases a `spawn_gated_pass` loop, explicitly via `release()` or implicitly when this
-    /// guard is dropped. A failing assertion panics and unwinds BEFORE a test reaches its explicit
-    /// release, and local variables are dropped in reverse declaration order during unwinding, so a
-    /// guard declared after the runtime is always dropped — and so releases its worker thread —
-    /// before the runtime itself is. Without that, `Runtime::drop` would block forever joining a
-    /// worker still parked in the gated loop, turning a failing assertion into a hang.
-    struct PassRelease(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-    impl PassRelease {
-        fn release(&self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    impl Drop for PassRelease {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// Spawns a pass parked in a synchronous loop (no await point, so `abort()` cannot take it
-    /// down) and returns its join handle plus the guard that releases it.
-    fn spawn_gated_pass(
-        runtime: &tokio::runtime::Runtime,
-    ) -> (tokio::task::JoinHandle<()>, PassRelease) {
-        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (held, running) = (release.clone(), started.clone());
-        let task = runtime.spawn(async move {
-            running.store(true, std::sync::atomic::Ordering::SeqCst);
-            while !held.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-        while !started.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        (task, PassRelease(release))
-    }
-
-    /// [MOB-1850] The pass half of the same contract, and the reason a pass has to STAY on record.
-    /// `abort()` cannot interrupt a task that is inside a synchronous stretch, so one that is still
-    /// there when the budget runs out must be reported — and it must go on being reported by every
-    /// later stop, because taking the handle out of the slot is not the same as the pass finishing.
-    #[test]
-    fn a_repeated_stop_stays_non_quiescent_while_the_original_pass_is_unfinished() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let budget = std::time::Duration::from_millis(50);
-        let (first, release_first) = spawn_gated_pass(&runtime);
-        let observer = first.abort_handle();
-        let mut slot = Some(first.abort_handle());
-        let mut unfinished: Vec<tokio::task::AbortHandle> = Vec::new();
-
-        assert!(
-            !settle_engine_passes(&mut slot, &mut unfinished, budget),
-            "first stop: the pass outlives the budget"
-        );
-        assert!(
-            !settle_engine_passes(&mut slot, &mut unfinished, budget),
-            "second stop must not claim quiescence while the first pass still runs"
-        );
-        assert!(!observer.is_finished());
-
-        // A start-style replacement installs a new pass while the old one is still unfinished.
-        let (second, release_second) = spawn_gated_pass(&runtime);
-        let _ = settle_engine_passes(&mut slot, &mut unfinished, budget);
-        slot = Some(second.abort_handle());
-        assert!(
-            !settle_engine_passes(&mut slot, &mut unfinished, budget),
-            "a stop after a replacement must still see the original unfinished pass"
-        );
-        assert_eq!(
-            unfinished.len(),
-            2,
-            "both unfinished passes stay on record after the replacement"
-        );
-
-        release_first.release();
-        release_second.release();
-        assert!(
-            settle_engine_passes(
-                &mut slot,
-                &mut unfinished,
-                std::time::Duration::from_secs(5)
-            ),
-            "quiescence once every pass has actually finished"
-        );
-        assert!(unfinished.is_empty());
-    }
-
     /// [MOB-1852] `update_chain_tip` re-queues the blocks up to the new tip as unscanned, and until
     /// they are scanned the wallet database reports every non-stabilized note as unspendable. A
     /// refresh alone therefore proves the tip moved, not that the spendable value can be trusted:
@@ -5456,6 +5857,155 @@ mod tests {
         assert!(
             !fresh_tip_decision(false, false, 1, 1),
             "a completed range without a refresh this run proves nothing"
+        );
+    }
+
+    // ── The stop report ──────────────────────────────────────────────────────────────────────
+
+    /// [MOB-2184] The C stop report carries the engine's whole report: each verdict as 1 or 0, each
+    /// wait in whole milliseconds, and a wait too long to count in a `u64` of milliseconds as
+    /// `u64::MAX`.
+    #[test]
+    fn the_c_stop_report_carries_both_verdicts_and_both_waits() {
+        let report = slipstream_core::ffi_handle::StopReport {
+            settled: true,
+            drained: false,
+            settle_wait: std::time::Duration::from_micros(1_500_999),
+            drain_wait: std::time::Duration::MAX,
+        };
+        assert_eq!(
+            FfiSlipstreamStopReport::from(report),
+            FfiSlipstreamStopReport {
+                settled: 1,
+                drained: 0,
+                settle_ms: 1_500,
+                drain_ms: u64::MAX,
+            }
+        );
+    }
+
+    /// [MOB-2184] HOSTING.md documents the stop report's C layout, and the engine requires every C
+    /// wrapper's re-declaration of it to keep the engine's field order: `repr(C)` lays the fields
+    /// out in declaration order, so a reordered copy would compile cleanly and put each field where
+    /// a host expects another one.
+    #[test]
+    fn the_c_stop_report_keeps_the_engines_layout() {
+        use slipstream_core::ffi_handle::FfiSlipstreamStopReport as EngineReport;
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(
+            size_of::<FfiSlipstreamStopReport>(),
+            size_of::<EngineReport>()
+        );
+        assert_eq!(
+            align_of::<FfiSlipstreamStopReport>(),
+            align_of::<EngineReport>()
+        );
+        assert_eq!(
+            offset_of!(FfiSlipstreamStopReport, settled),
+            offset_of!(EngineReport, settled)
+        );
+        assert_eq!(
+            offset_of!(FfiSlipstreamStopReport, drained),
+            offset_of!(EngineReport, drained)
+        );
+        assert_eq!(
+            offset_of!(FfiSlipstreamStopReport, settle_ms),
+            offset_of!(EngineReport, settle_ms)
+        );
+        assert_eq!(
+            offset_of!(FfiSlipstreamStopReport, drain_ms),
+            offset_of!(EngineReport, drain_ms)
+        );
+    }
+
+    /// [MOB-2184] A handle with no pass running has nothing to settle and nothing to drain, so its
+    /// stop is quiescent. A stop that cannot run at all, here on a null handle, answers the
+    /// all-zero report, which is not: a caller about to change the wallet refuses on it.
+    #[test]
+    fn a_stop_reports_what_it_found() {
+        let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        // A handle dials nothing until a pass is spawned. Port 9 is the discard port, so a stray
+        // connection would fail fast.
+        let host = "127.0.0.1";
+        let handle = unsafe {
+            zcashlc_slipstream_open(
+                db_path.as_ptr(),
+                db_path.len(),
+                host.as_ptr(),
+                host.len(),
+                9,
+                false,
+                NETWORK_ID_TESTNET,
+                0, // unknown physical memory
+            )
+        };
+        assert!(!handle.is_null(), "the handle must open");
+
+        let report = unsafe { zcashlc_slipstream_stop(handle) };
+        assert_eq!((report.settled, report.drained), (1, 1), "{report:?}");
+
+        unsafe { zcashlc_slipstream_free(handle) };
+
+        assert_eq!(
+            unsafe { zcashlc_slipstream_stop(std::ptr::null_mut()) },
+            FfiSlipstreamStopReport::default(),
+            "a stop that cannot run reports neither wait as finished"
+        );
+    }
+
+    /// [MOB-2184] Only the stop a host makes right before it changes the wallet asks the running
+    /// session to end at its next block; a plain stop leaves that request alone. Both stamp the
+    /// stop for tip freshness, and both are quiescent on a handle with no pass running.
+    #[test]
+    fn only_the_wallet_change_stop_asks_the_scan_to_stop() {
+        let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        // A handle dials nothing until a pass is spawned. Port 9 is the discard port, so a stray
+        // connection would fail fast.
+        let host = "127.0.0.1";
+        let handle = unsafe {
+            zcashlc_slipstream_open(
+                db_path.as_ptr(),
+                db_path.len(),
+                host.as_ptr(),
+                host.len(),
+                9,
+                false,
+                NETWORK_ID_TESTNET,
+                0, // unknown physical memory
+            )
+        };
+        assert!(!handle.is_null(), "the handle must open");
+        // Each look at the handle is a fresh shared borrow, taken only while no FFI call has it.
+        let stop_requested = || unsafe { &*handle }.inner.progress.stop_requested();
+        let stamped = || unsafe { &*handle }.last_stop_at.lock().unwrap().is_some();
+
+        let report = unsafe { zcashlc_slipstream_stop(handle) };
+        assert_eq!((report.settled, report.drained), (1, 1), "{report:?}");
+        assert!(
+            !stop_requested(),
+            "a plain stop must not ask the scan to stop early"
+        );
+        assert!(stamped(), "the plain stop stamps the stop");
+
+        *unsafe { &*handle }.last_stop_at.lock().unwrap() = None;
+        let report = unsafe { zcashlc_slipstream_stop_for_wallet_change(handle) };
+        assert_eq!((report.settled, report.drained), (1, 1), "{report:?}");
+        assert!(
+            stop_requested(),
+            "a stop for a wallet change must ask the running session to stop at its next block"
+        );
+        assert!(
+            stamped(),
+            "the stop for a wallet change stamps the stop too"
+        );
+
+        unsafe { zcashlc_slipstream_free(handle) };
+
+        assert_eq!(
+            unsafe { zcashlc_slipstream_stop_for_wallet_change(std::ptr::null_mut()) },
+            FfiSlipstreamStopReport::default(),
+            "a stop that cannot run reports neither wait as finished"
         );
     }
 
@@ -5620,6 +6170,1153 @@ mod tests {
     fn pasta_curves_runs_its_aarch64_assembly_backend() {
         assert_eq!(pasta_curves::BACKEND, "aarch64");
     }
+
+    // ── The account that shares a viewing key component ──────────────────────────────────────
+
+    /// The seed of the key the overlap tests import first. A throwaway: it holds no funds.
+    const OVERLAP_BASE_SEED: [u8; 32] = [7; 32];
+
+    /// A second throwaway seed, unrelated to [`OVERLAP_BASE_SEED`].
+    const OVERLAP_OTHER_SEED: [u8; 32] = [9; 32];
+
+    /// The encoded UFVK of ZIP 32 account 0 of `seed` on `network`. It carries a P2PKH, a Sapling
+    /// and an Orchard item.
+    fn seed_ufvk(network: &impl Parameters, seed: &[u8; 32]) -> String {
+        UnifiedSpendingKey::from_seed(network, seed, zip32::AccountId::ZERO)
+            .expect("a spending key derives")
+            .to_unified_full_viewing_key()
+            .encode(network)
+            .expect("the UFVK encodes")
+    }
+
+    /// The testnet key the overlap tests import first.
+    fn overlap_base_ufvk() -> String {
+        seed_ufvk(&TestNetwork, &OVERLAP_BASE_SEED)
+    }
+
+    /// A testnet key that shares no item with [`overlap_base_ufvk`].
+    fn overlap_other_ufvk() -> String {
+        seed_ufvk(&TestNetwork, &OVERLAP_OTHER_SEED)
+    }
+
+    fn is_orchard(item: &unified::Uitem<unified::Fvk>) -> bool {
+        matches!(item, unified::Uitem::Data(unified::Fvk::Orchard(_)))
+    }
+
+    fn is_sapling(item: &unified::Uitem<unified::Fvk>) -> bool {
+        matches!(item, unified::Uitem::Data(unified::Fvk::Sapling(_)))
+    }
+
+    fn is_p2pkh(item: &unified::Uitem<unified::Fvk>) -> bool {
+        matches!(item, unified::Uitem::Data(unified::Fvk::P2pkh(_)))
+    }
+
+    /// The items of the UFVK `encoding` that `keep` accepts.
+    fn ufvk_items(
+        encoding: &str,
+        keep: impl Fn(&unified::Uitem<unified::Fvk>) -> bool,
+    ) -> Vec<unified::Uitem<unified::Fvk>> {
+        let (_, _, ufvk) = unified::Ufvk::decode(encoding).expect("the UFVK decodes");
+        ufvk.items_as_parsed()
+            .iter()
+            .filter(|item| keep(item))
+            .cloned()
+            .collect()
+    }
+
+    /// Re-encodes the UFVK `encoding` with only the items `keep` accepts, followed by `extra`.
+    fn rebuild_ufvk(
+        encoding: &str,
+        keep: impl Fn(&unified::Uitem<unified::Fvk>) -> bool,
+        extra: Vec<unified::Uitem<unified::Fvk>>,
+    ) -> String {
+        let (network, revision, _) = unified::Ufvk::decode(encoding).expect("the UFVK decodes");
+        let items = ufvk_items(encoding, keep)
+            .into_iter()
+            .chain(extra)
+            .collect();
+        unified::Ufvk::try_from_items(revision, items)
+            .expect("the items form a UFVK")
+            .encode(&network)
+    }
+
+    /// The base key's `shared` item alone, with its other items taken from the unrelated key.
+    fn sharing_only(shared: fn(&unified::Uitem<unified::Fvk>) -> bool) -> String {
+        rebuild_ufvk(
+            &overlap_base_ufvk(),
+            shared,
+            ufvk_items(&overlap_other_ufvk(), |item| !shared(item)),
+        )
+    }
+
+    /// The birthday the overlap tests import with: the block before NU5 activation on testnet,
+    /// with empty note commitment trees.
+    fn overlap_birthday() -> AccountBirthday {
+        let nu5 = TestNetwork
+            .activation_height(NetworkUpgrade::Nu5)
+            .expect("NU5 is active on testnet");
+        AccountBirthday::from_parts(
+            zcash_client_backend::data_api::chain::ChainState::empty(nu5 - 1, BlockHash([0; 32])),
+            None,
+        )
+    }
+
+    /// An initialized, empty testnet wallet database in a fresh temporary directory, with the
+    /// read-write handle the tests import through.
+    struct OverlapWallet {
+        db: WalletDb<rusqlite::Connection, NetworkParams, SystemClock, SystemRng>,
+        path: std::path::PathBuf,
+        // Declared last, so the handle closes before the directory is removed.
+        dir: tempfile::TempDir,
+    }
+
+    impl OverlapWallet {
+        fn new() -> Self {
+            use zcash_client_sqlite::wallet::init::init_wallet_db;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("wallet.sqlite");
+            let mut db = WalletDb::for_path(
+                &path,
+                NetworkParams::Standard(TestNetwork),
+                SystemClock,
+                system_rng(),
+            )
+            .expect("opens a fresh wallet db");
+            init_wallet_db(&mut db, None).expect("initializes the wallet schema");
+            OverlapWallet { db, path, dir }
+        }
+
+        /// Imports the UFVK `encoding` as a view-only account.
+        fn import(
+            &mut self,
+            encoding: &str,
+        ) -> Result<zcash_client_sqlite::wallet::Account, SqliteClientError> {
+            let ufvk = UnifiedFullViewingKey::decode(&TestNetwork, encoding)
+                .expect("the test UFVK decodes");
+            self.db.import_account_ufvk(
+                "overlap",
+                &ufvk,
+                &overlap_birthday(),
+                AccountPurpose::ViewOnly,
+                None,
+            )
+        }
+
+        /// Asks [`zcashlc_find_account_key_overlap`] what importing `encoding` would do.
+        fn find_overlap(&self, encoding: &str) -> Result<ReportedOverlap, String> {
+            find_overlap(&self.path, encoding, NETWORK_ID_TESTNET)
+        }
+    }
+
+    /// What a [`zcashlc_find_account_key_overlap`] call returned, copied out of the struct it
+    /// allocated.
+    #[derive(Debug)]
+    struct ReportedOverlap {
+        kind: ffi::AccountKeyOverlapKind,
+        /// All zero when the reported account is [`ffi::Account::NOT_FOUND`].
+        account_uuid: [u8; 16],
+    }
+
+    /// Calls [`zcashlc_find_account_key_overlap`] on the wallet database at `db_path`, then frees
+    /// what it returned. A null return is the `Err` of the last error message. The last error is
+    /// cleared first, so that message was set by this call.
+    fn find_overlap(
+        db_path: &Path,
+        ufvk: impl Into<Vec<u8>>,
+        network_id: u32,
+    ) -> Result<ReportedOverlap, String> {
+        let db_data = db_path.as_os_str().as_bytes();
+        let ufvk = CString::new(ufvk).expect("the input has no interior NUL");
+        zcashlc_clear_last_error();
+        let ptr = unsafe {
+            zcashlc_find_account_key_overlap(
+                db_data.as_ptr(),
+                db_data.len(),
+                ufvk.as_ptr(),
+                network_id,
+            )
+        };
+        if ptr.is_null() {
+            return Err(last_error_message());
+        }
+        let reported = unsafe {
+            ReportedOverlap {
+                kind: (*ptr).kind,
+                account_uuid: (*ptr).account.uuid_bytes(),
+            }
+        };
+        unsafe { ffi::zcashlc_free_account_key_overlap(ptr) };
+        Ok(reported)
+    }
+
+    /// The last error message set on this thread, read through the C entry points.
+    fn last_error_message() -> String {
+        let len = zcashlc_last_error_length();
+        assert!(len > 0, "a last error must be set");
+        let mut buf = vec![0u8; len as usize];
+        let written = unsafe { zcashlc_error_message_utf8(buf.as_mut_ptr().cast::<c_char>(), len) };
+        // A failed copy leaves the buffer zeroed, which would read as an empty message that
+        // trivially contains no part of the key.
+        assert_eq!(written, len, "the whole message must be copied");
+        CStr::from_bytes_until_nul(&buf)
+            .expect("the message is NUL-terminated")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Imports `existing` into a fresh wallet, asks the FFI what importing `candidate` would do,
+    /// then imports `candidate` and asserts that the import does what the FFI said. The
+    /// classification is checked against `zcash_client_sqlite` itself, not only against the
+    /// predicates it mirrors. Returns the reported kind.
+    fn overlap_of(existing: &str, candidate: &str) -> ffi::AccountKeyOverlapKind {
+        let mut wallet = OverlapWallet::new();
+        let existing_id = wallet
+            .import(existing)
+            .expect("imports the existing key")
+            .id();
+        let existing_uuid = existing_id.expose_uuid().into_bytes();
+
+        let reported = wallet.find_overlap(candidate).expect("the lookup succeeds");
+        let imported = wallet.import(candidate);
+        match reported.kind {
+            ffi::AccountKeyOverlapKind::None => {
+                assert_eq!(reported.account_uuid, [0; 16], "no account is reported");
+                let account = imported.expect("a key sharing no component imports as an account");
+                assert_ne!(account.id(), existing_id, "the import must add an account");
+            }
+            ffi::AccountKeyOverlapKind::WouldUpgrade => {
+                assert_eq!(reported.account_uuid, existing_uuid, "reports the account");
+                let account = imported.expect("an upgrading key imports");
+                assert_eq!(
+                    account.id(),
+                    existing_id,
+                    "the upgrade must reuse the account"
+                );
+                let candidate_ufvk = UnifiedFullViewingKey::decode(&TestNetwork, candidate)
+                    .expect("the candidate decodes");
+                assert_eq!(
+                    account
+                        .ufvk()
+                        .expect("the account has a UFVK")
+                        .encode(&TestNetwork)
+                        .expect("the upgraded UFVK encodes"),
+                    candidate_ufvk
+                        .encode(&TestNetwork)
+                        .expect("the candidate encodes"),
+                    "the upgrade must replace the account's viewing key with the candidate"
+                );
+                assert_eq!(wallet.db.get_account_ids().expect("lists").len(), 1);
+            }
+            ffi::AccountKeyOverlapKind::AlreadyImported
+            | ffi::AccountKeyOverlapKind::Conflicting => {
+                assert_eq!(reported.account_uuid, existing_uuid, "reports the account");
+                assert!(
+                    matches!(
+                        imported,
+                        Err(SqliteClientError::AccountCollision(id)) if id == existing_id
+                    ),
+                    "expected an account collision on the existing account for {:?}",
+                    reported.kind
+                );
+            }
+            ffi::AccountKeyOverlapKind::MultipleAccounts => {
+                panic!("a wallet with a single account cannot match several")
+            }
+        }
+        reported.kind
+    }
+
+    /// The kind values are part of the C contract of [`zcashlc_find_account_key_overlap`].
+    #[test]
+    fn overlap_kind_values_match_the_ffi_contract() {
+        assert_eq!(ffi::AccountKeyOverlapKind::None as u32, 0);
+        assert_eq!(ffi::AccountKeyOverlapKind::AlreadyImported as u32, 1);
+        assert_eq!(ffi::AccountKeyOverlapKind::WouldUpgrade as u32, 2);
+        assert_eq!(ffi::AccountKeyOverlapKind::Conflicting as u32, 3);
+        assert_eq!(ffi::AccountKeyOverlapKind::MultipleAccounts as u32, 4);
+    }
+
+    #[test]
+    fn overlap_none_for_an_unrelated_key() {
+        assert_eq!(
+            overlap_of(&overlap_base_ufvk(), &overlap_other_ufvk()),
+            ffi::AccountKeyOverlapKind::None
+        );
+    }
+
+    #[test]
+    fn overlap_already_imported_for_the_identical_key() {
+        let base = overlap_base_ufvk();
+        assert_eq!(
+            overlap_of(&base, &base),
+            ffi::AccountKeyOverlapKind::AlreadyImported
+        );
+    }
+
+    /// An Orchard-only key whose Orchard item belongs to an existing full key adds nothing to it.
+    #[test]
+    fn overlap_already_imported_for_a_subset_key() {
+        let base = overlap_base_ufvk();
+        let orchard_only = rebuild_ufvk(&base, is_orchard, vec![]);
+        assert_eq!(
+            overlap_of(&base, &orchard_only),
+            ffi::AccountKeyOverlapKind::AlreadyImported
+        );
+    }
+
+    /// The full key of an Orchard-only account carries the account's Orchard item and more, so
+    /// importing it widens that account instead of adding one.
+    #[test]
+    fn overlap_would_upgrade_for_a_superset_key() {
+        let base = overlap_base_ufvk();
+        let orchard_only = rebuild_ufvk(&base, is_orchard, vec![]);
+        assert_eq!(
+            overlap_of(&orchard_only, &base),
+            ffi::AccountKeyOverlapKind::WouldUpgrade
+        );
+    }
+
+    /// A Sapling item's incoming viewing key is its diversifier key and `ivk`, so a key whose
+    /// Sapling item differs only in its outgoing viewing key matches the same account. The
+    /// account's viewing key does not cover the changed outgoing viewing key, so the import
+    /// replaces it.
+    #[test]
+    fn overlap_would_upgrade_for_a_key_differing_only_in_the_sapling_ovk() {
+        let base = overlap_base_ufvk();
+        let changed_sapling = ufvk_items(&base, is_sapling)
+            .into_iter()
+            .map(|item| match item {
+                unified::Uitem::Data(unified::Fvk::Sapling(mut bytes)) => {
+                    // The item is `ak || nk || ovk || dk`, 32 bytes each.
+                    for byte in &mut bytes[64..96] {
+                        *byte ^= 0xff;
+                    }
+                    unified::Uitem::Data(unified::Fvk::Sapling(bytes))
+                }
+                other => other,
+            })
+            .collect();
+        let candidate = rebuild_ufvk(&base, |item| !is_sapling(item), changed_sapling);
+        assert_ne!(candidate, base);
+        assert_eq!(
+            overlap_of(&base, &candidate),
+            ffi::AccountKeyOverlapKind::WouldUpgrade
+        );
+    }
+
+    /// A key that shares only its P2PKH item with an account, its shielded items coming from an
+    /// unrelated key, conflicts with that account.
+    #[test]
+    fn overlap_conflicting_for_a_partial_share() {
+        assert_eq!(
+            overlap_of(&overlap_base_ufvk(), &sharing_only(is_p2pkh)),
+            ffi::AccountKeyOverlapKind::Conflicting
+        );
+    }
+
+    /// The same holds for a key that shares only its Orchard item, or only its Sapling item.
+    #[test]
+    fn overlap_conflicting_for_a_shielded_item_shared_alone() {
+        for shared in [is_orchard, is_sapling] {
+            assert_eq!(
+                overlap_of(&overlap_base_ufvk(), &sharing_only(shared)),
+                ffi::AccountKeyOverlapKind::Conflicting
+            );
+        }
+    }
+
+    /// A key whose Orchard item belongs to one account and whose Sapling item belongs to another
+    /// matches both. The FFI reports kind 4 with no account, and the import fails on the same
+    /// lookup.
+    #[test]
+    fn overlap_multiple_accounts_reports_kind_4() {
+        let base = overlap_base_ufvk();
+        let other = overlap_other_ufvk();
+        let mut wallet = OverlapWallet::new();
+        wallet.import(&base).expect("imports the first key");
+        wallet.import(&other).expect("imports the second key");
+        let candidate = rebuild_ufvk(&base, is_orchard, ufvk_items(&other, is_sapling));
+
+        let reported = wallet
+            .find_overlap(&candidate)
+            .expect("the lookup succeeds");
+        assert_eq!(reported.kind, ffi::AccountKeyOverlapKind::MultipleAccounts);
+        assert_eq!(reported.kind as u32, 4);
+        assert_eq!(reported.account_uuid, [0; 16], "no account is reported");
+
+        // This also pins the librustzcash message that `MULTIPLE_ACCOUNTS_MATCHED_UIVK` matches.
+        let error = wallet.import(&candidate).expect_err("the import fails");
+        assert!(
+            matches!(
+                &error,
+                SqliteClientError::CorruptedData(msg) if msg == MULTIPLE_ACCOUNTS_MATCHED_UIVK
+            ),
+            "{error}"
+        );
+        assert_eq!(wallet.db.get_account_ids().expect("lists").len(), 2);
+    }
+
+    /// A key encoded for the other network is refused as one. The key of the same seed on the
+    /// other network shares no item with the account either.
+    #[test]
+    fn overlap_ignores_keys_of_the_other_network() {
+        let mut wallet = OverlapWallet::new();
+        wallet
+            .import(&overlap_base_ufvk())
+            .expect("imports the existing key");
+
+        let mainnet_encoding = seed_ufvk(&MainNetwork, &OVERLAP_BASE_SEED);
+        let message = wallet
+            .find_overlap(&mainnet_encoding)
+            .expect_err("a mainnet key is refused on testnet");
+        assert!(message.contains("another network"), "{message}");
+
+        let (_, mainnet_ufvk) = derivation::decode_ufvk(&MainNetwork, &mainnet_encoding)
+            .expect("the key decodes on mainnet");
+        let (kind, account) =
+            find_account_key_overlap(&wallet.db, &mainnet_ufvk).expect("the lookup succeeds");
+        assert_eq!(kind, ffi::AccountKeyOverlapKind::None);
+        assert!(account.is_none());
+    }
+
+    /// Whitespace around the key is ignored, as `zcashlc_describe_unified_full_viewing_key`
+    /// ignores it.
+    #[test]
+    fn overlap_ignores_whitespace_around_the_key() {
+        let mut wallet = OverlapWallet::new();
+        let base = overlap_base_ufvk();
+        wallet.import(&base).expect("imports the existing key");
+
+        let reported = wallet
+            .find_overlap(&format!(" \n{base}\t "))
+            .expect("the lookup succeeds");
+        assert_eq!(reported.kind, ffi::AccountKeyOverlapKind::AlreadyImported);
+    }
+
+    /// Only the lookup failure for several matching accounts is a kind. Every other failure is an
+    /// error that names it: a missing wallet database, which is opened read-only and so is not
+    /// created; a wallet without the accounts table; and an account whose stored key does not
+    /// decode for the network asked for.
+    #[test]
+    fn overlap_reports_every_other_failure_as_an_error() {
+        let mut wallet = OverlapWallet::new();
+        let base = overlap_base_ufvk();
+        wallet.import(&base).expect("imports the existing key");
+
+        let missing = wallet.dir.path().join("missing.sqlite");
+        let message = find_overlap(&missing, base.as_str(), NETWORK_ID_TESTNET)
+            .expect_err("a missing wallet database fails the lookup");
+        assert!(message.contains("read-only"), "{message}");
+        assert!(!missing.exists(), "the lookup must not create the database");
+
+        let uninitialized = wallet.dir.path().join("uninitialized.sqlite");
+        std::fs::File::create(&uninitialized).expect("creates an empty database file");
+        let message = find_overlap(&uninitialized, base.as_str(), NETWORK_ID_TESTNET)
+            .expect_err("a wallet without the accounts table fails the lookup");
+        assert!(message.contains("no such table"), "{message}");
+
+        // The same items encoded for mainnet match the testnet account, whose stored key then
+        // does not decode for mainnet.
+        let (_, _, container) = unified::Ufvk::decode(&base).expect("the base key decodes");
+        let base_on_mainnet = container.encode(&NetworkType::Main);
+        let message = find_overlap(&wallet.path, base_on_mainnet, NETWORK_ID_MAINNET)
+            .expect_err("an account whose stored key does not decode fails the lookup");
+        assert!(message.contains("Could not decode"), "{message}");
+    }
+
+    /// Asserts that `message` contains no 16-character slice of `input`, compared
+    /// case-insensitively.
+    fn assert_no_echo(message: &str, input: &[u8], case: &str) {
+        let message = message.to_lowercase();
+        let input: Vec<char> = String::from_utf8_lossy(input)
+            .to_lowercase()
+            .chars()
+            .collect();
+        assert!(input.len() >= 16, "{case}: the input is too short to check");
+        for (offset, window) in input.windows(16).enumerate() {
+            let slice: String = window.iter().collect();
+            assert!(
+                !message.contains(&slice),
+                "the error for {case} echoes the input at offset {offset}"
+            );
+        }
+    }
+
+    /// Every failure that receives the key leaves a last error that never contains any part of
+    /// it.
+    #[test]
+    fn overlap_errors_never_contain_the_input() {
+        let mut wallet = OverlapWallet::new();
+        let base = overlap_base_ufvk();
+        wallet.import(&base).expect("imports the existing key");
+
+        let mut bad_checksum = base.clone();
+        let last = bad_checksum.pop().expect("the key is not empty");
+        bad_checksum.push(if last == 'q' { 'p' } else { 'q' });
+        let uivk = UnifiedFullViewingKey::decode(&TestNetwork, &base)
+            .expect("the base key decodes")
+            .to_unified_incoming_viewing_key()
+            .encode(&TestNetwork)
+            .expect("the UIVK encodes");
+        let (_, _, container) = unified::Ufvk::decode(&base).expect("the base key decodes");
+        let base_on_mainnet = container.encode(&NetworkType::Main);
+        let missing = wallet.dir.path().join("missing.sqlite");
+        let uninitialized = wallet.dir.path().join("uninitialized.sqlite");
+        std::fs::File::create(&uninitialized).expect("creates an empty database file");
+
+        let cases: Vec<(&Path, Vec<u8>, u32, &str)> = vec![
+            (
+                wallet.path.as_path(),
+                format!("uviewtest1{}", "thisisnotbech32payloadbio".repeat(4)).into_bytes(),
+                NETWORK_ID_TESTNET,
+                "garbage",
+            ),
+            (
+                wallet.path.as_path(),
+                bad_checksum.into_bytes(),
+                NETWORK_ID_TESTNET,
+                "a bad checksum",
+            ),
+            (
+                wallet.path.as_path(),
+                uivk.into_bytes(),
+                NETWORK_ID_TESTNET,
+                "an incoming viewing key",
+            ),
+            (
+                wallet.path.as_path(),
+                seed_ufvk(&MainNetwork, &OVERLAP_BASE_SEED).into_bytes(),
+                NETWORK_ID_TESTNET,
+                "a key for the other network",
+            ),
+            (
+                wallet.path.as_path(),
+                [base.as_bytes(), &[0xff]].concat(),
+                NETWORK_ID_TESTNET,
+                "input that is not UTF-8",
+            ),
+            (
+                wallet.path.as_path(),
+                base.clone().into_bytes(),
+                99,
+                "an invalid network id",
+            ),
+            (
+                missing.as_path(),
+                base.clone().into_bytes(),
+                NETWORK_ID_TESTNET,
+                "a missing database",
+            ),
+            (
+                uninitialized.as_path(),
+                base.clone().into_bytes(),
+                NETWORK_ID_TESTNET,
+                "a database without the accounts table",
+            ),
+            (
+                wallet.path.as_path(),
+                base_on_mainnet.into_bytes(),
+                NETWORK_ID_MAINNET,
+                "a stored key that does not decode",
+            ),
+        ];
+        for (db_path, input, network_id, case) in cases {
+            let message = find_overlap(db_path, input.clone(), network_id).expect_err(case);
+            assert_no_echo(&message, &input, case);
+        }
+
+        // A null key is refused too, with a last error.
+        let db_data = wallet.path.as_os_str().as_bytes();
+        zcashlc_clear_last_error();
+        let ptr = unsafe {
+            zcashlc_find_account_key_overlap(
+                db_data.as_ptr(),
+                db_data.len(),
+                std::ptr::null(),
+                NETWORK_ID_TESTNET,
+            )
+        };
+        assert!(ptr.is_null());
+        assert!(zcashlc_last_error_length() > 0, "a last error must be set");
+    }
+
+    #[test]
+    fn free_account_key_overlap_accepts_null() {
+        unsafe { ffi::zcashlc_free_account_key_overlap(std::ptr::null_mut()) };
+    }
+
+    // ── Decode errors never contain the key ──────────────────────────────────────────────────
+
+    /// The whole error of a UFVK that does not decode.
+    const UFVK_DECODE_ERROR: &str = "The value did not decode as a valid UFVK";
+
+    /// What the decode error tests give an entry point that takes a testnet UFVK: a string that
+    /// is no key at all, and a real key for the other network, which is what a user who pastes
+    /// the wrong wallet's key would send.
+    fn undecodable_testnet_ufvks() -> [(String, &'static str); 2] {
+        [
+            (
+                format!("uviewtest1{}", "notakeypadding".repeat(5)),
+                "a string that is no key",
+            ),
+            (
+                seed_ufvk(&MainNetwork, &OVERLAP_BASE_SEED),
+                "a key for the other network",
+            ),
+        ]
+    }
+
+    /// An import refused because its key does not decode leaves a last error that holds no part
+    /// of the key. The error is one fixed sentence, so it cannot carry what the decoder reports
+    /// about the key either.
+    #[test]
+    fn import_account_ufvk_error_omits_the_input() {
+        let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        let treestate = crate::voting::test_support::synthetic_tree_state(1_000_000);
+        let account_name = CString::new("account").expect("the name has no interior NUL");
+
+        for (input, case) in undecodable_testnet_ufvks() {
+            let ufvk = CString::new(input.as_str()).expect("the input has no interior NUL");
+            zcashlc_clear_last_error();
+            let account = unsafe {
+                zcashlc_import_account_ufvk(
+                    db_path.as_ptr(),
+                    db_path.len(),
+                    ufvk.as_ptr(),
+                    treestate.as_ptr(),
+                    treestate.len(),
+                    -1, // no recover-until height
+                    NETWORK_ID_TESTNET,
+                    1, // view-only
+                    account_name.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    u32::MAX, // no ZIP 32 account index
+                )
+            };
+
+            assert!(account.is_null(), "{case} must not import an account");
+            let message = last_error_message();
+            assert_no_echo(&message, input.as_bytes(), case);
+            assert_eq!(message, UFVK_DECODE_ERROR, "{case}");
+        }
+    }
+
+    /// A sync started with a key that does not decode leaves a last error that holds no part of
+    /// the key, and no part of what the decoder reports about it.
+    #[test]
+    fn slipstream_start_ufvk_error_omits_the_input() {
+        let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        // A handle dials nothing until a pass is spawned, and a start that cannot decode its key
+        // never spawns one. Port 9 is the discard port, so a stray connection would fail fast.
+        let host = "127.0.0.1";
+        let handle = unsafe {
+            zcashlc_slipstream_open(
+                db_path.as_ptr(),
+                db_path.len(),
+                host.as_ptr(),
+                host.len(),
+                9,
+                false,
+                NETWORK_ID_TESTNET,
+                0, // unknown physical memory
+            )
+        };
+        assert!(!handle.is_null(), "the handle must open");
+
+        for (input, case) in undecodable_testnet_ufvks() {
+            zcashlc_clear_last_error();
+            let started = unsafe {
+                zcashlc_slipstream_start(
+                    handle,
+                    input.as_ptr(),
+                    input.len(),
+                    1_000_000,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+
+            assert!(!started, "{case} must not start a sync");
+            let message = last_error_message();
+            assert_no_echo(&message, input.as_bytes(), case);
+            assert_eq!(message, UFVK_DECODE_ERROR, "{case}");
+        }
+
+        unsafe { zcashlc_slipstream_free(handle) };
+    }
+
+    // ── Renaming an account ──────────────────────────────────────────────────────────────────
+
+    /// The name the rename tests give an account. Its emoji lies outside the Basic Multilingual
+    /// Plane, so the name crosses the FFI as multi-byte UTF-8 in both directions.
+    const RENAMED_ACCOUNT_NAME: &str = "Renamed account 🔐";
+
+    /// The name `temp_wallet_db_with_account` imports its account with.
+    const FIXTURE_ACCOUNT_NAME: &str = "voting";
+
+    /// A testnet wallet database holding one view-only account, with the uuid of that account.
+    fn wallet_with_account() -> (tempfile::TempDir, String, [u8; 16]) {
+        let (dir, db_path, account_uuid) =
+            crate::voting::test_support::temp_wallet_db_with_account(NETWORK_ID_TESTNET);
+        let account_uuid = Uuid::parse_str(&account_uuid)
+            .expect("the fixture reports a uuid")
+            .into_bytes();
+        (dir, db_path, account_uuid)
+    }
+
+    /// Calls [`zcashlc_set_account_name`] on the testnet wallet database at `db_path`, passing a
+    /// null pointer for a `None` name. The last error is cleared first, so an error it leaves was
+    /// set by this call.
+    fn set_account_name(db_path: &str, account_uuid: &[u8; 16], name: Option<&CStr>) -> bool {
+        zcashlc_clear_last_error();
+        unsafe {
+            zcashlc_set_account_name(
+                db_path.as_ptr(),
+                db_path.len(),
+                NETWORK_ID_TESTNET,
+                account_uuid.as_ptr(),
+                name.map_or(std::ptr::null(), CStr::as_ptr),
+            )
+        }
+    }
+
+    /// The name of the account `account_uuid`, read through [`zcashlc_get_account`], which is
+    /// how the Swift SDK reads each account it lists.
+    fn stored_account_name(db_path: &str, account_uuid: &[u8; 16]) -> Option<String> {
+        let account = unsafe {
+            zcashlc_get_account(
+                db_path.as_ptr(),
+                db_path.len(),
+                NETWORK_ID_TESTNET,
+                account_uuid.as_ptr(),
+            )
+        };
+        assert!(!account.is_null(), "the account is read");
+        let name = unsafe { (*account).account_name() };
+        unsafe { ffi::zcashlc_free_account(account) };
+        name
+    }
+
+    #[test]
+    fn set_account_name_replaces_the_name_of_the_account() {
+        let (_dir, db_path, account_uuid) = wallet_with_account();
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(FIXTURE_ACCOUNT_NAME)
+        );
+
+        let name = CString::new(RENAMED_ACCOUNT_NAME).expect("the name has no interior NUL");
+        assert!(set_account_name(&db_path, &account_uuid, Some(&name)));
+
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(RENAMED_ACCOUNT_NAME)
+        );
+    }
+
+    /// An account the wallet does not hold is refused with a last error, and the account the
+    /// wallet does hold keeps its name.
+    #[test]
+    fn set_account_name_refuses_an_unknown_account() {
+        let (_dir, db_path, account_uuid) = wallet_with_account();
+        let unknown = [0x07; 16];
+        assert_ne!(unknown, account_uuid);
+
+        let name = CString::new(RENAMED_ACCOUNT_NAME).expect("the name has no interior NUL");
+        assert!(!set_account_name(&db_path, &unknown, Some(&name)));
+
+        let message = last_error_message();
+        assert!(
+            message.contains("does not belong to this wallet"),
+            "{message}"
+        );
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(FIXTURE_ACCOUNT_NAME)
+        );
+    }
+
+    /// A name that is not UTF-8 is refused with a last error, and the account keeps its name.
+    #[test]
+    fn set_account_name_refuses_a_name_that_is_not_utf8() {
+        let (_dir, db_path, account_uuid) = wallet_with_account();
+        let name = c"Renamed \xff";
+
+        assert!(!set_account_name(&db_path, &account_uuid, Some(name)));
+
+        let message = last_error_message();
+        assert!(message.contains("utf-8"), "{message}");
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(FIXTURE_ACCOUNT_NAME)
+        );
+    }
+
+    /// A wallet database that does not exist is refused, and the rename does not create it, for
+    /// instance when a wipe deleted the database while the rename was waiting for it.
+    #[test]
+    fn set_account_name_does_not_create_a_missing_wallet_database() {
+        let (dir, _db_path, account_uuid) = wallet_with_account();
+        let missing = dir.path().join("missing.sqlite");
+        let missing_path = missing.to_str().expect("the temporary path is UTF-8");
+        let name = CString::new(RENAMED_ACCOUNT_NAME).expect("the name has no interior NUL");
+
+        assert!(!set_account_name(missing_path, &account_uuid, Some(&name)));
+
+        let message = last_error_message();
+        assert!(
+            message.contains("does not exist or cannot be opened"),
+            "{message}"
+        );
+        assert!(!missing.exists(), "the rename must not create the database");
+    }
+
+    /// An empty name is refused with a last error, and the account keeps its name.
+    #[test]
+    fn set_account_name_refuses_an_empty_name() {
+        let (_dir, db_path, account_uuid) = wallet_with_account();
+
+        assert!(!set_account_name(&db_path, &account_uuid, Some(c"")));
+
+        assert_eq!(last_error_message(), "the account name is empty");
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(FIXTURE_ACCOUNT_NAME)
+        );
+    }
+
+    /// A null name is refused with a last error instead of being read, and the account keeps its
+    /// name.
+    #[test]
+    fn set_account_name_refuses_a_null_name() {
+        let (_dir, db_path, account_uuid) = wallet_with_account();
+
+        assert!(!set_account_name(&db_path, &account_uuid, None));
+
+        assert_eq!(last_error_message(), "no account name was supplied");
+        assert_eq!(
+            stored_account_name(&db_path, &account_uuid).as_deref(),
+            Some(FIXTURE_ACCOUNT_NAME)
+        );
+    }
+
+    // ----- zcashlc_check_transaction_submittable -----
+    //
+    // The check judges a raw transaction against the next block, the one after the higher of the
+    // wallet's chain tip and the height the submission server reports. Mainnet activates NU7 at
+    // 3,543,405, so the next block is under NU6.3 up to a server at 3,543,403 and under NU7 from
+    // a server at 3,543,404 on.
+
+    /// The wallet database of a test, kept in a directory that goes away with the test.
+    struct SubmissionFixture {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        network_id: u32,
+    }
+
+    impl SubmissionFixture {
+        /// An initialized wallet database on the network `network_id` names, with its chain tip at
+        /// `tip`, or with no chain tip at all.
+        fn new(network_id: u32, tip: Option<u32>) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("wallet.sqlite");
+            let fixture = SubmissionFixture {
+                _dir: dir,
+                path,
+                network_id,
+            };
+            let path_bytes = fixture.path_bytes();
+            let init = unsafe {
+                zcashlc_init_data_database(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    std::ptr::null(),
+                    0,
+                    network_id,
+                )
+            };
+            assert_eq!(init, 0, "the wallet database initializes");
+            if let Some(tip) = tip {
+                fixture.set_tip(tip);
+            }
+            fixture
+        }
+
+        fn mainnet(tip: u32) -> Self {
+            Self::new(NETWORK_ID_MAINNET, Some(tip))
+        }
+
+        fn path_bytes(&self) -> &[u8] {
+            self.path.to_str().expect("a utf-8 path").as_bytes()
+        }
+
+        /// Moves the wallet's chain tip to `tip`. A wallet's tip only moves forward.
+        fn set_tip(&self, tip: u32) {
+            let path_bytes = self.path_bytes();
+            assert!(
+                unsafe {
+                    zcashlc_update_chain_tip(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        tip as i32,
+                        self.network_id,
+                    )
+                },
+                "the chain tip updates"
+            );
+        }
+
+        /// What the submission check answers for `raw` with the server at `server_height`.
+        fn check(&self, raw: &[u8], server_height: i64) -> i32 {
+            check_submittable_at(self.path_bytes(), self.network_id, raw, server_height)
+        }
+    }
+
+    fn check_submittable_at(
+        db_data: &[u8],
+        network_id: u32,
+        raw: &[u8],
+        server_height: i64,
+    ) -> i32 {
+        unsafe {
+            zcashlc_check_transaction_submittable(
+                db_data.as_ptr(),
+                db_data.len(),
+                network_id,
+                raw.as_ptr(),
+                raw.len(),
+                server_height,
+            )
+        }
+    }
+
+    /// The wire encoding of a transaction with no inputs or outputs, in the format of `version`,
+    /// built for `branch` and expiring at `expiry`.
+    fn empty_transaction(version: TxVersion, branch: BranchId, expiry: u32) -> Vec<u8> {
+        use zcash_primitives::transaction::{Authorized, TransactionData};
+
+        let expiry = BlockHeight::from_u32(expiry);
+        let data = match version {
+            TxVersion::V6 => TransactionData::<Authorized>::from_parts_v6(
+                branch, 0, expiry, None, None, None, None,
+            ),
+            version => TransactionData::<Authorized>::from_parts(
+                version, branch, 0, expiry, None, None, None, None,
+            ),
+        };
+        let mut raw = Vec::new();
+        data.freeze()
+            .expect("the empty transaction freezes")
+            .write(&mut raw)
+            .expect("the empty transaction serializes");
+        raw
+    }
+
+    fn empty_v6_transaction(branch: BranchId, expiry: u32) -> Vec<u8> {
+        empty_transaction(TxVersion::V6, branch, expiry)
+    }
+
+    /// The message the last FFI call left behind, which the caller reads before the next call.
+    fn last_error() -> String {
+        ffi_helpers::error_handling::take_last_error()
+            .expect("a failed check records a last error")
+            .to_string()
+    }
+
+    /// The check answers 0 for a transaction that can be valid in the next block, 1 for one built
+    /// for another branch, 2 for an expired one, and -1 when it cannot judge, which is a refusal
+    /// to submit as well.
+    #[test]
+    fn check_transaction_submittable_codes() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+        let old_branch = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+
+        // The server is on the last block under NU6.3, so the next block is the one before NU7.
+        assert_eq!(fixture.check(&old_branch, 3_543_403), 0);
+        // One block later the next block is the activation block, which only NU7 transactions fit.
+        assert_eq!(fixture.check(&old_branch, 3_543_404), 1);
+
+        // It can still be mined in the block at its expiry height, and no longer after it.
+        let expiring = empty_v6_transaction(BranchId::Nu7, 3_600_000);
+        assert_eq!(fixture.check(&expiring, 3_599_999), 0);
+        assert_eq!(fixture.check(&expiring, 3_600_000), 2);
+
+        // A height that is not one fails closed, and says why.
+        assert_eq!(fixture.check(&old_branch, -1), -1);
+        assert!(
+            last_error().contains("the submission server's height is unknown"),
+            "an unknown server height is reported as such"
+        );
+
+        // Bytes that are no transaction cannot be judged.
+        assert_eq!(fixture.check(&[0u8; 3], 3_543_403), -1);
+        assert!(!last_error().is_empty());
+    }
+
+    /// The wallet may be ahead of the server it submits to, and the block a transaction is mined in
+    /// is never earlier than the wallet's tip.
+    #[test]
+    fn check_transaction_submittable_uses_the_wallet_tip_when_it_is_higher() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+        let old_branch = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+        assert_eq!(
+            fixture.check(&old_branch, 3_543_000),
+            0,
+            "both stand on a block under NU6.3"
+        );
+
+        fixture.set_tip(3_543_404);
+
+        assert_eq!(
+            fixture.check(&old_branch, 3_543_000),
+            1,
+            "the wallet's tip makes the next block the activation block, the server's height does not"
+        );
+    }
+
+    /// A wallet that has not synced yet has no tip, and then the server's height is all there is to
+    /// judge by.
+    #[test]
+    fn check_transaction_submittable_uses_the_server_height_alone_without_a_wallet_tip() {
+        let fixture = SubmissionFixture::new(NETWORK_ID_MAINNET, None);
+        let old_branch = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+
+        assert_eq!(fixture.check(&old_branch, 3_543_403), 0);
+        assert_eq!(fixture.check(&old_branch, 3_543_404), 1);
+    }
+
+    /// The activation height is the network's own, not mainnet's.
+    #[test]
+    fn check_transaction_submittable_uses_the_networks_own_activation_height() {
+        let fixture = SubmissionFixture::new(NETWORK_ID_TESTNET, Some(4_465_000));
+        let old_branch = empty_v6_transaction(BranchId::Nu6_3, 4_500_000);
+        let new_branch = empty_v6_transaction(BranchId::Nu7, 4_500_000);
+
+        // Testnet activates NU7 at 4,465,026.
+        assert_eq!(fixture.check(&old_branch, 4_465_024), 0);
+        assert_eq!(fixture.check(&new_branch, 4_465_024), 1);
+        assert_eq!(fixture.check(&old_branch, 4_465_025), 1);
+        assert_eq!(fixture.check(&new_branch, 4_465_025), 0);
+    }
+
+    /// Only a v5 or later encoding commits to its consensus branch, so only its branch can be
+    /// compared. Before v5 the encoding has none to compare, and just the expiry is judged.
+    #[test]
+    fn check_transaction_submittable_compares_the_branch_only_for_v5_and_later() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+        // The next block is the activation block.
+        let server = 3_543_404;
+
+        for version in [TxVersion::V5, TxVersion::V6] {
+            let old_branch = empty_transaction(version, BranchId::Nu6_3, 3_600_000);
+            assert_eq!(fixture.check(&old_branch, server), 1, "{version:?}");
+        }
+
+        let v4 = empty_transaction(TxVersion::V4, BranchId::Nu6_3, 3_600_000);
+        assert_eq!(fixture.check(&v4, server), 0, "v4 commits to no branch");
+        let expired_v4 = empty_transaction(TxVersion::V4, BranchId::Nu6_3, 3_543_000);
+        assert_eq!(fixture.check(&expired_v4, server), 2, "v4 still expires");
+    }
+
+    /// An expiry height of 0 is no expiry at all, and a transaction that is wrong on both counts is
+    /// reported for its branch.
+    #[test]
+    fn check_transaction_submittable_treats_expiry_zero_as_none_and_reports_the_branch_first() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+
+        let never_expires = empty_v6_transaction(BranchId::Nu7, 0);
+        assert_eq!(fixture.check(&never_expires, 3_700_000), 0);
+
+        // Wrong on both counts: built for the old branch, and expired by the next block.
+        let both = empty_v6_transaction(BranchId::Nu6_3, 3_543_000);
+        assert_eq!(fixture.check(&both, 3_543_404), 1);
+    }
+
+    /// A valid transaction remains submittable through the final preactivation block.
+    #[test]
+    fn check_transaction_submittable_accepts_valid_work_until_activation() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+        let old_branch = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+
+        // Both next blocks are still under the transaction's NU6.3 branch.
+        assert_eq!(fixture.check(&old_branch, 3_543_356), 0);
+        assert_eq!(fixture.check(&old_branch, 3_543_403), 0);
+    }
+
+    /// Everything the check cannot judge fails closed: -1, with the reason left for the caller, and
+    /// nothing created on the way.
+    #[test]
+    fn check_transaction_submittable_fails_closed_when_it_cannot_judge() {
+        let fixture = SubmissionFixture::mainnet(3_543_000);
+        let raw = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+        assert_eq!(
+            fixture.check(&raw, 3_543_403),
+            0,
+            "the control is submittable"
+        );
+
+        // A server height that is no block height is unknown, whatever the C caller passes.
+        for height in [i64::MIN, -1, i64::from(u32::MAX) + 1, i64::MAX] {
+            assert_eq!(fixture.check(&raw, height), -1, "server height {height}");
+            assert!(last_error().contains("unknown"), "server height {height}");
+        }
+        // The highest block height there can be is followed by no block.
+        assert_eq!(fixture.check(&raw, i64::from(u32::MAX)), -1);
+        assert!(last_error().contains("no block can follow"));
+
+        // A network that does not exist.
+        assert_eq!(
+            check_submittable_at(fixture.path_bytes(), 99, &raw, 3_543_403),
+            -1
+        );
+        assert!(last_error().contains("Invalid network type"));
+
+        // No transaction at all, with the null pointer a caller with an empty buffer may pass.
+        assert_eq!(
+            unsafe {
+                zcashlc_check_transaction_submittable(
+                    fixture.path_bytes().as_ptr(),
+                    fixture.path_bytes().len(),
+                    fixture.network_id,
+                    std::ptr::null(),
+                    0,
+                    3_543_403,
+                )
+            },
+            -1
+        );
+        assert!(!last_error().is_empty());
+
+        // A transaction that is cut short.
+        assert_eq!(fixture.check(&raw[..raw.len() - 1], 3_543_403), -1);
+        assert!(!last_error().is_empty());
+    }
+
+    /// The check opens the wallet to read its tip and must neither create a wallet database where
+    /// there is none nor name its path in the error.
+    #[test]
+    fn check_transaction_submittable_without_a_wallet_database_creates_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.sqlite");
+        let raw = empty_v6_transaction(BranchId::Nu6_3, 3_594_240);
+
+        let result = check_submittable_at(
+            path.to_str().unwrap().as_bytes(),
+            NETWORK_ID_MAINNET,
+            &raw,
+            3_543_403,
+        );
+
+        assert_eq!(result, -1);
+        let error = last_error();
+        assert!(
+            !error.contains(path.to_str().unwrap()),
+            "the error must not leak the database path: {error}"
+        );
+        assert!(!path.exists(), "the check must not create the database");
+    }
 }
 
 // ── Slipstream FFI surface ────────────────────────────────────────────────────
@@ -5677,14 +7374,9 @@ pub struct SlipstreamHandle {
     tip_refreshes_at_run_start: std::sync::atomic::AtomicU64,
     tip_fresh: std::sync::atomic::AtomicBool,
     /// [API v2.1 E-2] `stop()` timestamp: freshness survives a stop→start hop shorter than
-    /// 120 s (the SDK's `SDKFlags.sdkStarted` quick-background parity).
+    /// [`tip_fresh_stop_window`] (quick-background parity with the SDK's `SDKFlags.sdkStarted()`
+    /// before NU7, which keeps a flat 120 s window).
     last_stop_at: std::sync::Mutex<Option<std::time::Instant>>,
-    /// [MOB-1850] Aborted passes that had not finished when a stop or start gave up waiting; a
-    /// later stop reports quiescence only once this is empty. The only handle the engine itself
-    /// keeps is `inner.task`, and the stop that aborts a pass TAKES it — so without this record
-    /// the next stop finds an empty slot and reports a pass quiescent that it never watched
-    /// finish, while that pass is still inside a synchronous wallet write.
-    unfinished_passes: Vec<tokio::task::AbortHandle>,
     /// [v0.7 P1b] Alternate lightwalletd servers for probe-then-commit + wire
     /// failover. Set via [`zcashlc_slipstream_set_alternate_servers`]; each
     /// `start()` merges them into the pass config, deduped against the
@@ -5717,8 +7409,31 @@ struct SummaryCacheEntry {
 
 /// [API v2.1 E-1] Idle refresh TTL — matches the SDK's historical idle/error refetch cadence.
 const SUMMARY_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
-/// [API v2.1 E-2] Freshness survives stop→start hops shorter than this (SDKFlags parity).
-const TIP_FRESH_STOP_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// [API v2.1 E-2] The stop→start hop tip freshness survives while the handle knows no tip yet:
+/// 1.6 blocks at the 75-second spacing that holds from Blossom until NU7, which is also the flat
+/// window the legacy synchronizer's `SDKFlags.sdkStarted()` keeps.
+const TIP_FRESH_STOP_WINDOW_WITHOUT_TIP: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The stop→start hop tip freshness survives: 1.6 target block intervals of the block after
+/// `known_tip`, the last tip this handle knows (`Progress::chain_tip`, seeded from the wallet
+/// database at open). That is 120 s at 75-second blocks and 40 s at NU7's 25 seconds. A
+/// `known_tip` of `0` (no tip is known) or above `u32::MAX` (not a block height) takes
+/// [`TIP_FRESH_STOP_WINDOW_WITHOUT_TIP`] instead.
+fn tip_fresh_stop_window<P: Parameters>(network: &P, known_tip: u64) -> std::time::Duration {
+    match u32::try_from(known_tip) {
+        Ok(tip) if tip > 0 => {
+            let spacing =
+                block_spacing::pow_target_spacing(network, BlockHeight::from_u32(tip) + 1);
+            std::time::Duration::from_millis(u64::from(spacing) * 1_600)
+        }
+        _ => TIP_FRESH_STOP_WINDOW_WITHOUT_TIP,
+    }
+}
+
+/// [MOB-1850] The budget the engine gives each of the two bounded waits a stop or start makes:
+/// one for the aborted passes, one for its wallet commit. Far above the worst observed device
+/// commit (a few seconds, A10).
+const SLIPSTREAM_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// C-compatible snapshot of Slipstream engine progress. Returned by
 /// [`zcashlc_slipstream_snapshot`] (by value — no heap allocation).
@@ -5767,9 +7482,10 @@ pub struct FfiSlipstreamSnapshot {
     /// past its `start()` baseline (bumped only after `update_chain_tip` succeeds) proves the
     /// tip moved; the completed range proves the wallet database can vouch for the spendable
     /// value at that tip — between the two it reports every non-stabilized note as unspendable.
-    /// Survives stop→start hops shorter than 120 s. While 0, hosts must mask spendable balances
-    /// (the mask transform stays host-side because the C `AccountBalance` cannot express the
-    /// awaiting-resolution shift).
+    /// Survives stop→start hops shorter than 1.6 target block intervals of the block after the
+    /// last known tip (120 s before NU7, 40 s from it). While 0, hosts must mask spendable
+    /// balances (the mask transform stays host-side because the C `AccountBalance` cannot
+    /// express the awaiting-resolution shift).
     pub tip_fresh: u8,
     /// [E-4] Monotonic version of the wallet's stored transaction set: bumps exactly when
     /// enhancement stores/updates a tx, the mempool monitor stores a 0-conf hit, a range
@@ -5778,6 +7494,40 @@ pub struct FfiSlipstreamSnapshot {
     /// version moved since the last poll → re-fetch transactions + publish
     /// `foundTransactions`. Never reset while the handle lives.
     pub tx_set_version: u64,
+}
+
+/// [MOB-1850] C-compatible stop report: what a Slipstream stop found. Returned by
+/// [`zcashlc_slipstream_stop`] and [`zcashlc_slipstream_stop_for_wallet_change`] (by value — no
+/// heap allocation).
+///
+/// The engine's own `FfiSlipstreamStopReport`, re-declared here because cbindgen reads only this
+/// crate, as the snapshot is. It is converted from the engine's C form, so the conversion stays
+/// the engine's. The fields keep the engine's order: `repr(C)` lays them out in declaration order,
+/// and the engine documents that layout for every C wrapper.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FfiSlipstreamStopReport {
+    /// 1 when every pass the engine had aborted finished unwinding within the budget, 0 otherwise.
+    pub settled: u8,
+    /// 1 when no engine wallet writer was still running within the budget, 0 otherwise. The wallet
+    /// file was proved quiescent only when this and `settled` are both 1.
+    pub drained: u8,
+    /// How long the wait for the aborted passes took, in whole milliseconds.
+    pub settle_ms: u64,
+    /// How long the wait for the engine's wallet writers took, in whole milliseconds.
+    pub drain_ms: u64,
+}
+
+impl From<slipstream_core::ffi_handle::StopReport> for FfiSlipstreamStopReport {
+    fn from(report: slipstream_core::ffi_handle::StopReport) -> Self {
+        let engine = slipstream_core::ffi_handle::FfiSlipstreamStopReport::from(report);
+        Self {
+            settled: engine.settled,
+            drained: engine.drained,
+            settle_ms: engine.settle_ms,
+            drain_ms: engine.drain_ms,
+        }
+    }
 }
 
 /// [API v2.1 E-6] C-compatible wallet-provisioning anchor. Returned by
@@ -5886,13 +7636,13 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             TestNetwork
         };
 
-        // [B6, second half] Persist the anchor-retention marks the engine's in-memory trees
-        // draw but its flush never writes: the open-time deep-history heal spares only ids
-        // present in the SQLITE store's retained set, so reconcile the marks BEFORE any
-        // engine session (and with it the heal) exists — including the E-3 snapshot seed's
-        // own `WalletSession::open` a few lines below, which already runs that heal on
-        // every open. Non-fatal by design — a wallet that cannot be marked must still open
-        // and sync.
+        // [B6, second half] Backfill the anchor-retention marks of a database an older engine
+        // wrote, whose flush never persisted the marks its in-memory trees drew: the open-time
+        // deep-history heal spares only ids present in the SQLITE store's retained set, so
+        // reconcile the marks BEFORE any engine session (and with it the heal) exists —
+        // including the E-3 snapshot seed's own `WalletSession::open` a few lines below, which
+        // already runs that heal on every open. Non-fatal by design — a wallet that cannot be
+        // marked must still open and sync.
         let network_params = NetworkParams::Standard(network);
         match unsafe { wallet_db(system_rng(), db_data, db_data_len, network_params) }.and_then(
             |mut wallet| {
@@ -5923,6 +7673,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             state: std::sync::Arc::new(std::sync::Mutex::new(SyncState::Idle)),
             events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             endpoint: slipstream_core::config::Endpoint {
                 host: host.to_string(),
@@ -5970,7 +7721,6 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             tip_refreshes_at_run_start: std::sync::atomic::AtomicU64::new(0),
             tip_fresh: std::sync::atomic::AtomicBool::new(false),
             last_stop_at: std::sync::Mutex::new(None),
-            unfinished_passes: Vec::new(),
             alternate_servers: std::sync::Mutex::new(Vec::new()),
             post_flip_hold: std::sync::Mutex::new(PostFlipHold::default()),
         })))
@@ -6035,14 +7785,18 @@ pub unsafe extern "C" fn zcashlc_slipstream_set_alternate_servers(
 
 /// [B6] The anchor-retention floor for the slipstream engine: the NU6.3 activation
 /// height, exactly the floor upstream's own `WalletDb::put_blocks` caller passes
-/// (`zcash_client_sqlite`), so checkpoints on the 144-block anchor grid from
-/// activation onward survive the engine's checkpoint downgrade/dooming/pruning.
+/// (`zcash_client_sqlite`), so checkpoints on the anchor grid from activation
+/// onward survive the engine's checkpoint downgrade/dooming/pruning.
 /// The pool-migration engine pre-signs every transfer against a drawn boundary
 /// anchor on that grid and proves it hours later — without this floor the
 /// engine's persist path retains nothing (`EngineConfig.anchor_retention_height`
 /// defaults to `None`) and the boundary checkpoint is pruned ~100 blocks behind
 /// the tip, leaving `prove_transfer` in a permanent transient `AnchorNotFound`
 /// retry and the scheduled migration stalled until expiry.
+///
+/// The grid's interval counts ZIP 318 reference blocks (144 on mainnet), which from NU7
+/// activation span three blocks each; [`anchor_retention_policy`] builds the policy on this
+/// floor with the network's block spacing, which places the grid's boundaries accordingly.
 ///
 /// `None` (a network without NU6.3, e.g. a custom regtest without the upgrade)
 /// keeps retention off — there are no boundary anchors to retain for. Generic
@@ -6051,6 +7805,30 @@ fn slipstream_anchor_retention_floor<P: Parameters>(network: &P) -> Option<u32> 
     network
         .activation_height(NetworkUpgrade::Nu6_3)
         .map(u32::from)
+}
+
+/// The anchor-retention policy of a wallet on `network`: the checkpoints on the grid of
+/// [`anchor_retention_interval`], placed by the network's block spacing, from
+/// [`slipstream_anchor_retention_floor`] upward. `None` where the network has no floor, so retention
+/// stays off.
+///
+/// This is the one place the policy is built. The slipstream engine runs its own tree-update path
+/// and the wallet-open reconcile (`retained_marks`) backfills the marks an older engine's flush
+/// never persisted, so the grid they retain is the grid a migration anchors to only while both
+/// come from here.
+///
+/// The two inputs fail differently. A coarser interval drops anchors a migration draws: an engine
+/// on the ZIP 318 interval would drop most of a test network's. The spacing only places the
+/// boundaries, three times as far apart from NU7 activation; a uniform spacing would retain every
+/// multiple of the interval, a superset of them, which costs storage and loses no anchor.
+pub(crate) fn anchor_retention_policy(network: NetworkParams) -> Option<AnchorRetention> {
+    slipstream_anchor_retention_floor(&network).map(|floor| {
+        AnchorRetention::new(
+            BlockHeight::from(floor),
+            zcash_protocol::zip318::BlockSpacing::for_network(&network),
+            anchor_retention_interval(network),
+        )
+    })
 }
 
 /// Starts a Slipstream sync pass.
@@ -6097,17 +7875,20 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         // [API v2.1 E-2] Tip-freshness bookkeeping (shouldMarkChainTipUpdated parity):
         // capture the refresh-counter baseline BEFORE the pass starts — a later advance
         // proves THIS run persisted a freshly-fetched tip (even when the fetched height
-        // equals the E-3 DB-seeded one). Freshness survives a stop→start hop < 120 s
-        // (quick background hop); a longer gap re-masks until the new pass proves the tip.
+        // equals the E-3 DB-seeded one). Freshness survives a stop→start hop shorter than
+        // `tip_fresh_stop_window` (quick background hop); a longer gap re-masks until the new
+        // pass proves the tip.
         let refreshes_now = handle.inner.progress.tip_refreshes();
         handle
             .tip_refreshes_at_run_start
             .store(refreshes_now, std::sync::atomic::Ordering::Relaxed);
+        let stop_window =
+            tip_fresh_stop_window(&handle.inner.network, handle.inner.progress.chain_tip());
         let stale_stop = handle
             .last_stop_at
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .map(|t| t.elapsed() >= TIP_FRESH_STOP_WINDOW)
+            .map(|t| t.elapsed() >= stop_window)
             .unwrap_or(false);
         if stale_stop {
             handle
@@ -6115,32 +7896,16 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Cancel any in-flight task before spawning a new one.
-        // [MOB-1850] The result is deliberately ignored HERE: a start proceeds either way, as it
-        // always has (a same-handle restart is safe). Only the stop-then-mutate callers act on the
-        // flag, and they reach it through `zcashlc_slipstream_stop` — but a pass this start could
-        // not wait out STAYS on record, so the next stop still answers for it. The borrow is split
-        // in its own scope so the rest of the function keeps the plain `&mut handle.inner` it had.
-        let _ = {
-            let SlipstreamHandle {
-                inner,
-                unfinished_passes,
-                ..
-            } = &mut *handle;
-            settle_engine_passes(
-                &mut inner.task,
-                unfinished_passes,
-                std::time::Duration::from_secs(10),
-            )
-        };
-
         let h = &mut handle.inner;
-        // [B4-16 drain] The aborted pass's write-behind commit may still be running
-        // (`spawn_blocking` — uncancellable); wait it out BEFORE spawning the new
-        // session, so the new pass's first writes never collide with an orphan
-        // ("database is locked" at pass start) and no orphan Scanned-mark can land
-        // after this point. Kills the B4-12 orphan-overlap class at the root.
-        let _ = drain_slipstream_wallet_writers(&h.progress);
+        // Cancel any in-flight task, and wait out its write-behind commit, before spawning the new
+        // session. [B4-16 drain] The commit runs in `spawn_blocking` and cannot be cancelled; the
+        // new pass's first writes must never collide with an orphan ("database is locked" at pass
+        // start), and no orphan Scanned-mark may land after this point.
+        // [MOB-1850] The engine's report is deliberately ignored HERE: a start proceeds either way,
+        // as it always has (a same-handle restart is safe). Only the stop-then-mutate callers act
+        // on a verdict, which they get from a stop, and a pass this start could not wait out stays
+        // on the engine's record, so the next stop still answers for it.
+        let _ = h.quiesce_before_start(SLIPSTREAM_STOP_BUDGET);
         *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Syncing;
 
         let ufvk_str: Option<String> = if ufvk.is_null() || ufvk_len == 0 {
@@ -6182,18 +7947,16 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         // without it the engine retains no anchor checkpoints and every scheduled
         // migration transfer's drawn boundary is pruned before proving time.
         //
-        // The grid is the one this crate configures on the wallet itself (see
-        // `anchor_retention_interval`), NOT a value chosen here. The engine runs its
-        // own tree-update path rather than calling `ll::wallet::put_blocks`, so it
-        // does not see the wallet's setting: passing the same interval is what keeps
-        // the two from retaining different grids, which on a test network would
-        // otherwise leave every transfer anchored to a boundary the engine drops.
-        cfg.anchor_retention = slipstream_anchor_retention_floor(&h.network).map(|floor| {
-            slipstream_core::AnchorRetention::new(
-                BlockHeight::from(floor),
-                anchor_retention_interval(NetworkParams::Standard(h.network)),
-            )
-        });
+        // The policy is the one this crate builds for the wallet itself (see
+        // `anchor_retention_policy`), NOT one chosen here. The engine runs its own
+        // tree-update path rather than calling `ll::wallet::put_blocks`, so it does
+        // not see the wallet's setting: building it from the same function is what
+        // keeps the two from retaining different grids. A coarser interval would
+        // drop anchors a transfer is drawn to; the spacing only places the
+        // boundaries (from NU7 activation each reference block spans three
+        // blocks), and a uniform one would retain a superset of them, costing
+        // storage and no anchor.
+        cfg.anchor_retention = anchor_retention_policy(NetworkParams::Standard(h.network));
 
         // v0.3 : GPU Orchard subtree offload. Compiled only with `--features gpu`;
         // opt in at runtime via the ZCASH_GPU_SUBTREE env var (the dev A/B for the device
@@ -6273,13 +8036,10 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         // ufvk was null) — no multi-account surface added upward.
         let accounts: Vec<(UnifiedFullViewingKey, BlockHeight)> = match ufvk_str {
             Some(ufvk_str) => {
-                let ufvk = UnifiedFullViewingKey::decode(&h.network, &ufvk_str).map_err(|e| {
-                    anyhow!(
-                        "Value \"{}\" did not decode as a valid UFVK: {}",
-                        ufvk_str,
-                        e
-                    )
-                })?;
+                // The message is fixed on purpose: the value is a viewing key, and neither it nor
+                // the decoder's description of it may reach error text that ends up in app logs.
+                let ufvk = UnifiedFullViewingKey::decode(&h.network, &ufvk_str)
+                    .map_err(|_| anyhow!("The value did not decode as a valid UFVK"))?;
                 let birthday = BlockHeight::try_from(birthday_height)
                     .map_err(|e| anyhow!("invalid birthday_height {}: {}", birthday_height, e))?;
                 vec![(ufvk, birthday)]
@@ -6325,13 +8085,19 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
 
 /// Stops any in-flight Slipstream sync and waits, bounded, for the wallet file to fall quiet.
 ///
-/// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the aborted pass finished
-/// unwinding AND no wallet writer was still in flight by the time the ten-second budget ran out,
-/// `false` when either outlived it. A `false` answer does not mean the stop failed — the engine
-/// is Idle either way — it means the wallet file was never proved free of the engine's own
-/// writers, so a caller about to mutate that file (import, delete, truncate) should refuse rather
-/// than write on top of one. The handle remains live; poll [`zcashlc_slipstream_snapshot`] to
-/// confirm state transitions to idle.
+/// [MOB-1850] Returns what the stop found, by value: `settled` is 1 when every pass the engine had
+/// aborted finished unwinding within the ten-second budget, `drained` is 1 when no wallet writer
+/// was still in flight within its own ten seconds, and `settle_ms` and `drain_ms` say how long each
+/// wait took. The stop was QUIESCENT only when both verdicts are 1. One that is not does not mean
+/// the stop failed — the engine is Idle either way — it means the wallet file was never proved free
+/// of the engine's own writers, so a caller about to mutate that file (import, delete, truncate)
+/// should refuse rather than write on top of one. A stop that cannot run, on a null handle for
+/// instance, returns all zeros, which is not quiescent. The handle remains live; poll
+/// [`zcashlc_slipstream_snapshot`] to confirm state transitions to idle.
+///
+/// This is the plain stop (backgrounding, shutdown): a scan call in progress runs to its end, by
+/// default the end of its chunk, before the abort reaches it. Right before changing the wallet,
+/// stop with [`zcashlc_slipstream_stop_for_wallet_change`] instead.
 ///
 /// # Safety
 ///
@@ -6339,46 +8105,78 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
 ///   has not previously been freed.
 /// - `handle` must not be passed to two FFI calls at the same time.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) -> bool {
+pub unsafe extern "C" fn zcashlc_slipstream_stop(
+    handle: *mut SlipstreamHandle,
+) -> FfiSlipstreamStopReport {
+    // SAFETY: this function's contract is the helper's.
+    unsafe { stop_slipstream(handle, slipstream_core::ffi_handle::SlipstreamHandle::stop) }
+}
+
+/// Stops any in-flight Slipstream sync for a wallet change: asks the running session to end its
+/// scan at the next block, then stops exactly as [`zcashlc_slipstream_stop`] does and returns the
+/// same report.
+///
+/// [MOB-2184] Call this, not [`zcashlc_slipstream_stop`], right before changing the wallet (adding
+/// or removing an account, a rewind, a wipe, or reopening a handle on the same wallet), and refuse
+/// the change unless `settled` and `drained` are both 1. A plain stop lets a scan call in progress
+/// run to the end of its chunk first, which can outlast the ten-second budget when accounts are
+/// added in quick succession. This one ends the scan at its next block, without writing anything
+/// for the scan call it interrupted, and the next session scans those blocks again.
+///
+/// # Safety
+///
+/// - `handle` must be a non-null pointer returned by [`zcashlc_slipstream_open`] that
+///   has not previously been freed.
+/// - `handle` must not be passed to two FFI calls at the same time.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_stop_for_wallet_change(
+    handle: *mut SlipstreamHandle,
+) -> FfiSlipstreamStopReport {
+    // SAFETY: this function's contract is the helper's.
+    unsafe {
+        stop_slipstream(
+            handle,
+            slipstream_core::ffi_handle::SlipstreamHandle::stop_for_wallet_change,
+        )
+    }
+}
+
+/// The body the two C stops share: the tip-freshness stamp, then `stop` on the engine handle with
+/// the stop budget, its report in its C form. A null handle, or a panic, answers all zeros.
+///
+/// # Safety
+///
+/// `handle` must be null, or a pointer returned by [`zcashlc_slipstream_open`] that has not been
+/// freed and that no other FFI call is using at the same time.
+unsafe fn stop_slipstream(
+    handle: *mut SlipstreamHandle,
+    stop: fn(
+        &mut slipstream_core::ffi_handle::SlipstreamHandle,
+        std::time::Duration,
+    ) -> slipstream_core::ffi_handle::StopReport,
+) -> FfiSlipstreamStopReport {
     let handle = AssertUnwindSafe(handle);
     let res = catch_panic(|| {
         let handle = unsafe { handle.as_mut() }.ok_or_else(|| anyhow!("null handle"))?;
-        // [API v2.1 E-2] Stamp the stop: a start() within 120 s keeps tip freshness
-        // (quick background hop, SDKFlags parity); a longer gap re-masks.
+        // [API v2.1 E-2] Stamp the stop: a start() within `tip_fresh_stop_window` keeps tip
+        // freshness (quick background hop; parity with `SDKFlags.sdkStarted()` before NU7, which
+        // keeps a flat 120 s window); a longer gap re-masks.
         *handle
             .last_stop_at
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
-        // [MOB-1850] Every pass this handle has aborted and not yet watched finish is settled
-        // here, not just the one in the slot: a previous stop that gave up waiting TOOK that
-        // slot's handle, and the pass it gave up on is exactly the writer this stop must not
-        // report away. Split borrow so `unfinished_passes` and `inner` are held at once.
-        let settled = {
-            let SlipstreamHandle {
-                inner,
-                unfinished_passes,
-                ..
-            } = &mut *handle;
-            settle_engine_passes(
-                &mut inner.task,
-                unfinished_passes,
-                std::time::Duration::from_secs(10),
-            )
-        };
-        let h = &mut handle.inner;
-        // [B4-16 drain] abort() cannot cancel an in-flight write-behind commit
-        // (`spawn_blocking`) — drain it so a returned stop means the wallet file is
-        // QUIESCENT: the host's next write (deleteAccount / importAccount / rewind
-        // truncate) can no longer interleave with an orphan commit. Swift hops this
-        // call off the cooperative pool (the drain is a real, bounded wait).
-        let drained = drain_slipstream_wallet_writers(&h.progress);
-        *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Idle;
-        // [MOB-1850] The pass is stopped either way — the state goes Idle above regardless. What
-        // the answer reports is whether the wallet file was PROVED quiescent, which is the only
-        // thing a caller about to mutate it can act on.
-        Ok(settled && drained)
+        // [MOB-1850] The engine settles every pass this handle has aborted and not yet watched
+        // finish (not just the one in the slot), then drains its write-behind commit, which
+        // abort() cannot cancel ([B4-16]), then goes Idle. Swift hops this call off the
+        // cooperative pool, because both waits are real, bounded waits. The pass is stopped
+        // either way; what the report says is whether the wallet file was PROVED quiescent,
+        // which is the only thing a caller about to mutate it can act on.
+        Ok(FfiSlipstreamStopReport::from(stop(
+            &mut handle.inner,
+            SLIPSTREAM_STOP_BUDGET,
+        )))
     });
-    unwrap_exc_or(res, false)
+    unwrap_exc_or(res, FfiSlipstreamStopReport::default())
 }
 
 /// [MOB-1852] The freshness rule behind `SlipstreamHandle::tip_fresh_now`, kept free of the
@@ -6398,84 +8196,6 @@ fn fresh_tip_decision(
         return true;
     }
     state == 3 || (refresh_advanced && spendable_hint == 1)
-}
-
-/// Aborts the running pass (if any), keeps every pass that has not finished yet on record, and
-/// waits within `budget` for all of them to finish. Returns whether the engine is quiescent with
-/// respect to its passes. A pass that outlives the budget STAYS on record, so a later stop cannot
-/// claim quiescence merely because the most recent handle has already been taken.
-///
-/// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
-/// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
-/// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
-/// window failed its read→write lock upgrade, "error + try again") can land AFTER
-/// `abort()` returns. Wait (bounded) for the task to finish unwinding. Combined with
-/// `drain_slipstream_wallet_writers` (the persist lane's `spawn_blocking` commit — the
-/// engine's ONLY detached writer), a stop/start-abort that returns `true` means the wallet
-/// file is FULLY quiescent; `false` means it could not be proved so within the budget.
-fn settle_engine_passes(
-    task_slot: &mut Option<tokio::task::AbortHandle>,
-    unfinished: &mut Vec<tokio::task::AbortHandle>,
-    budget: std::time::Duration,
-) -> bool {
-    if let Some(task) = task_slot.take() {
-        task.abort();
-        unfinished.push(task);
-    }
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        unfinished.retain(|task| !task.is_finished());
-        if unfinished.is_empty() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "slipstream stop/start: {} aborted pass(es) still unwinding at the deadline — reporting a non-quiescent stop",
-                unfinished.len()
-            );
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-/// [B4-16 drain] Bounded wait for the engine's in-flight wallet-file writer — the
-/// write-behind lane's deferred commit, a `spawn_blocking` closure `task.abort()` cannot
-/// cancel. Field evidence (2026-07-04): an orphan commit outlived an `importAccount`
-/// restart, collided with the new pass's first writes ("database is locked" →
-/// non-transient failure, absorbed by the revival loop) and — worse — landed its
-/// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
-/// account's scan scope. Called by stop() and start() right after settling the passes.
-/// 10 s cap ≫ the worst observed device commit (a few seconds, A10). [MOB-1850] A timeout
-/// is REPORTED (`false`) rather than logged away: a caller that is about to mutate the wallet
-/// needs to know the file was never proved quiescent, and can refuse instead of writing on top
-/// of a live writer. The busy_timeouts remain the backstop for the callers that proceed anyway.
-fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) -> bool {
-    drain_slipstream_wallet_writers_until(progress, std::time::Duration::from_secs(10))
-}
-
-/// The bounded body of [`drain_slipstream_wallet_writers`], with the budget as a parameter so a
-/// test can exercise the deadline branch without waiting ten seconds for it.
-fn drain_slipstream_wallet_writers_until(
-    progress: &slipstream_core::ProgressArc,
-    budget: std::time::Duration,
-) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-    let mut waited = false;
-    while progress.wallet_writers() > 0 {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                "slipstream stop/start: in-flight wallet commit still running at the deadline — reporting a non-quiescent stop"
-            );
-            return false;
-        }
-        waited = true;
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if waited {
-        tracing::info!("slipstream stop/start: drained in-flight wallet commit");
-    }
-    true
 }
 
 /// Reads a snapshot of current Slipstream progress atomics (non-blocking, poll-based — D8).
@@ -6525,7 +8245,8 @@ impl SlipstreamHandle {
     /// [API v2.1 E-2] Lazily evaluates + latches tip freshness — the `shouldMarkChainTipUpdated`
     /// semantics the SDK derived host-side, tightened by [MOB-1852]; the rule itself is
     /// `fresh_tip_decision`:
-    /// - already fresh → stays fresh (until a >120 s stop→start gap re-masks in `start()`);
+    /// - already fresh → stays fresh (until a stop→start gap of `tip_fresh_stop_window` or more
+    ///   re-masks in `start()`);
     /// - the refresh counter advanced past its `start()` baseline AND this pass has completed a
     ///   ChainTip-priority range (`spendable_hint == 1`) → fresh. The engine bumps the counter
     ///   only AFTER `session.update_chain_tip` succeeds, so an advance proves THIS run refreshed
@@ -6588,6 +8309,9 @@ pub unsafe extern "C" fn zcashlc_slipstream_notify_tx_change(
 /// - `intent` = 0 (NEW wallet): `height` + serialized `TreeState` protobuf = the reorg-safe
 ///   recent tree state (`tip − 100`, floored at Sapling activation); offline ⇒ `height` 0 +
 ///   null `treestate` (the host keeps its bundled checkpoint defaults).
+///
+/// A server tip or tree-state height above `i32::MAX` resolves as offline, so `height` is above
+/// `i32::MAX` only when `birthday` or `fallback_checkpoint_height` is.
 ///
 /// Handle-less by design: provisioning happens BEFORE [`zcashlc_slipstream_open`] in the
 /// host init flow, and `importAccount` must not serialize against the live handle. Creates
@@ -7945,5 +9669,350 @@ mod legacy_wallet_migration_tests {
         base64::engine::general_purpose::STANDARD
             .decode("9VDVOZZZOWWHpZtq1Ebridp3Qeux5C+HwiRR0g7Oi7HgnMs8Gfln83+/Q1NnvClcaSwM4ADFL1uZHxypEWlWXg==")
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod block_spacing_ffi_tests {
+    use super::*;
+
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    #[test]
+    fn the_ffi_reports_the_testnet_nu7_boundary() {
+        let (mut start, mut end, mut spacing) = (0u32, 0i64, 0u32);
+        assert!(unsafe {
+            zcashlc_pow_target_spacing_era(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7 - 1,
+                &mut start,
+                &mut end,
+                &mut spacing,
+            )
+        });
+        assert_eq!((start, end, spacing), (584_000, i64::from(TESTNET_NU7), 75));
+        assert!(unsafe {
+            zcashlc_pow_target_spacing_era(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7,
+                &mut start,
+                &mut end,
+                &mut spacing,
+            )
+        });
+        assert_eq!((start, end, spacing), (TESTNET_NU7, -1, 25));
+        let mut seconds = 0i64;
+        assert!(unsafe {
+            zcashlc_target_seconds_between(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7 - 1,
+                TESTNET_NU7,
+                &mut seconds,
+            )
+        });
+        assert_eq!(seconds, 25);
+        assert!(unsafe {
+            zcashlc_target_seconds_between(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7,
+                TESTNET_NU7 - 2,
+                &mut seconds,
+            )
+        });
+        assert_eq!(seconds, -100);
+        let mut height = 0u32;
+        assert!(unsafe {
+            zcashlc_height_after_target_seconds(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7 - 2,
+                100,
+                &mut height,
+            )
+        });
+        assert_eq!(height, TESTNET_NU7);
+        assert!(unsafe {
+            zcashlc_height_after_target_seconds(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7 + 1,
+                -50,
+                &mut height,
+            )
+        });
+        assert_eq!(height, TESTNET_NU7 - 1);
+        let mut target = 0u32;
+        assert!(unsafe {
+            zcashlc_default_tx_target_height_for_expiry(
+                NETWORK_ID_TESTNET,
+                TESTNET_NU7 + 119,
+                &mut target,
+            )
+        });
+        assert_eq!(target, TESTNET_NU7 - 1);
+        assert!(unsafe {
+            zcashlc_default_tx_target_height_for_expiry(NETWORK_ID_MAINNET, 3_000_040, &mut target)
+        });
+        assert_eq!(target, 3_000_000);
+    }
+
+    #[test]
+    fn a_registered_custom_network_answers_with_its_own_heights() {
+        let _custom_network = lock_custom_network();
+        zcashlc_set_custom_network(NETWORK_ID_REGTEST, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 300);
+        let (mut start, mut end, mut spacing) = (0u32, 0i64, 0u32);
+        assert!(unsafe {
+            zcashlc_pow_target_spacing_era(
+                NETWORK_ID_REGTEST,
+                299,
+                &mut start,
+                &mut end,
+                &mut spacing,
+            )
+        });
+        assert_eq!((start, end, spacing), (1, 300, 75));
+        assert!(unsafe {
+            zcashlc_pow_target_spacing_era(
+                NETWORK_ID_REGTEST,
+                300,
+                &mut start,
+                &mut end,
+                &mut spacing,
+            )
+        });
+        assert_eq!((start, end, spacing), (300, -1, 25));
+    }
+
+    #[test]
+    fn an_unregistered_custom_network_is_an_error_and_writes_nothing() {
+        let _custom_network = lock_custom_network();
+        *CUSTOM_PARAMS.write().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut seconds = 7i64;
+        assert!(!unsafe { zcashlc_target_seconds_between(NETWORK_ID_REGTEST, 1, 2, &mut seconds) });
+        assert_eq!(seconds, 7);
+    }
+
+    #[test]
+    fn a_null_output_pointer_or_unknown_network_is_an_error_not_a_crash() {
+        assert!(!unsafe {
+            zcashlc_height_after_target_seconds(NETWORK_ID_TESTNET, 1, 75, std::ptr::null_mut())
+        });
+        let (mut start, mut spacing) = (0u32, 0u32);
+        assert!(!unsafe {
+            zcashlc_pow_target_spacing_era(
+                NETWORK_ID_TESTNET,
+                1,
+                &mut start,
+                std::ptr::null_mut(),
+                &mut spacing,
+            )
+        });
+        assert_eq!((start, spacing), (0, 0));
+        let mut target = 0u32;
+        assert!(!unsafe { zcashlc_default_tx_target_height_for_expiry(7, 1_000, &mut target) });
+    }
+}
+
+#[cfg(test)]
+mod explicit_expiry_height_tests {
+    use super::explicit_expiry_height;
+    use zcash_primitives::transaction::builder::{
+        BLOSSOM_DEFAULT_TX_EXPIRY_DELTA, default_tx_expiry_delta,
+    };
+    use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
+
+    const MAINNET_NU7: u32 = 3_543_405;
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    fn h(height: u32) -> BlockHeight {
+        BlockHeight::from_u32(height)
+    }
+
+    #[test]
+    fn before_nu7_the_builder_default_applies() {
+        assert_eq!(
+            explicit_expiry_height(&Network::MainNetwork, h(3_000_000), false),
+            None
+        );
+        assert_eq!(
+            explicit_expiry_height(&Network::MainNetwork, h(MAINNET_NU7 - 1), false),
+            None
+        );
+        assert_eq!(
+            explicit_expiry_height(&Network::TestNetwork, h(TESTNET_NU7 - 1), false),
+            None
+        );
+    }
+
+    #[test]
+    fn from_nu7_a_transaction_expires_120_blocks_after_its_target() {
+        assert_eq!(
+            explicit_expiry_height(&Network::MainNetwork, h(MAINNET_NU7), false),
+            Some(h(MAINNET_NU7 + 120))
+        );
+        assert_eq!(
+            explicit_expiry_height(&Network::TestNetwork, h(TESTNET_NU7), false),
+            Some(h(TESTNET_NU7 + 120))
+        );
+        assert_eq!(
+            explicit_expiry_height(&Network::TestNetwork, h(TESTNET_NU7 + 1_000), false),
+            Some(h(TESTNET_NU7 + 1_120))
+        );
+    }
+
+    /// The explicit expiry repeats the builder's own default, which is what makes it redundant and
+    /// what keeps a send unchanged if it goes: wherever the rule names a height, it is the one the
+    /// builder would have chosen, and where it names none the builder's delta is the 40 blocks that
+    /// apply from Blossom until NU7.
+    #[test]
+    fn the_explicit_expiry_is_the_builders_own_default() {
+        for (network, nu7) in [
+            (Network::MainNetwork, MAINNET_NU7),
+            (Network::TestNetwork, TESTNET_NU7),
+        ] {
+            for target in [nu7 - 1, nu7, nu7 + 1, nu7 + 1_000].map(h) {
+                let builder_delta = default_tx_expiry_delta(BranchId::for_height(&network, target));
+                match explicit_expiry_height(&network, target, false) {
+                    Some(expiry) => {
+                        assert_eq!(expiry, target + builder_delta, "{network:?} at {target}")
+                    }
+                    None => assert_eq!(
+                        builder_delta, BLOSSOM_DEFAULT_TX_EXPIRY_DELTA,
+                        "{network:?} at {target}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// librustzcash refuses an explicit expiry on a canonical crossing
+    /// (`ExpiryHeightConflictsWithCanonicalCrossing`), so the send would fail.
+    #[test]
+    fn a_canonical_crossing_keeps_its_zip_318_expiry() {
+        assert_eq!(
+            explicit_expiry_height(&Network::TestNetwork, h(TESTNET_NU7 + 1_000), true),
+            None
+        );
+        assert_eq!(
+            explicit_expiry_height(&Network::MainNetwork, h(3_000_000), true),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tip_fresh_stop_window_tests {
+    use super::{TIP_FRESH_STOP_WINDOW_WITHOUT_TIP, tip_fresh_stop_window};
+    use std::time::Duration;
+    use zcash_protocol::consensus::Network;
+
+    const TESTNET_NU7: u64 = 4_465_026;
+
+    #[test]
+    fn the_window_follows_the_spacing_of_the_next_block() {
+        assert_eq!(
+            tip_fresh_stop_window(&Network::MainNetwork, 3_000_000),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, TESTNET_NU7 - 2),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, TESTNET_NU7 - 1),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, TESTNET_NU7 + 10_000),
+            Duration::from_secs(40)
+        );
+    }
+
+    #[test]
+    fn a_handle_that_knows_no_tip_keeps_120_seconds() {
+        assert_eq!(TIP_FRESH_STOP_WINDOW_WITHOUT_TIP, Duration::from_secs(120));
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, 0),
+            TIP_FRESH_STOP_WINDOW_WITHOUT_TIP
+        );
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, u64::from(u32::MAX) + 1),
+            TIP_FRESH_STOP_WINDOW_WITHOUT_TIP
+        );
+    }
+
+    /// `BlockHeight` addition saturates, so the highest tip a `u32` holds still resolves to the
+    /// spacing of its saturated successor instead of overflowing.
+    #[test]
+    fn the_highest_representable_tip_does_not_overflow() {
+        assert_eq!(
+            tip_fresh_stop_window(&Network::TestNetwork, u64::from(u32::MAX)),
+            Duration::from_secs(40)
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_use_taddr_timing_tests {
+    use super::{single_use_taddr_check_offset_seconds, single_use_taddr_exposure_depth};
+    use zcash_protocol::consensus::{BlockHeight, Network};
+
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    fn h(height: u32) -> BlockHeight {
+        BlockHeight::from_u32(height)
+    }
+
+    #[test]
+    fn the_look_back_is_one_day_of_target_time() {
+        assert_eq!(
+            single_use_taddr_exposure_depth(&Network::MainNetwork, h(3_000_000)),
+            1_152
+        );
+        assert_eq!(
+            single_use_taddr_exposure_depth(&Network::TestNetwork, h(TESTNET_NU7 - 1)),
+            1_152
+        );
+        assert_eq!(
+            single_use_taddr_exposure_depth(&Network::TestNetwork, h(TESTNET_NU7 + 5_000)),
+            3_456
+        );
+        // 1,001 blocks of 25 s and 818 of 75 s fill 86,375 of the 86,400 s.
+        assert_eq!(
+            single_use_taddr_exposure_depth(&Network::TestNetwork, h(TESTNET_NU7 + 1_000)),
+            1_819
+        );
+        assert_eq!(
+            single_use_taddr_exposure_depth(&Network::MainNetwork, h(100)),
+            100
+        );
+    }
+
+    /// log2(10) blocks: 249 s at 75-second blocks, 83 s at 25-second ones.
+    #[test]
+    fn the_recheck_delay_uses_the_spacing_of_the_next_block() {
+        let offset_blocks = 10f64.log2();
+        assert_eq!(
+            single_use_taddr_check_offset_seconds(
+                &Network::MainNetwork,
+                h(3_000_000),
+                offset_blocks
+            ),
+            249
+        );
+        assert_eq!(
+            single_use_taddr_check_offset_seconds(
+                &Network::TestNetwork,
+                h(TESTNET_NU7 - 2),
+                offset_blocks
+            ),
+            249
+        );
+        assert_eq!(
+            single_use_taddr_check_offset_seconds(
+                &Network::TestNetwork,
+                h(TESTNET_NU7 - 1),
+                offset_blocks
+            ),
+            83
+        );
     }
 }

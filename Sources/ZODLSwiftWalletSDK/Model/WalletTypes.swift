@@ -12,6 +12,8 @@ public protocol StringEncoded {
 
 public struct Account: Equatable, Hashable, Codable, Identifiable {
     public let id: AccountUUID
+    /// The account's human-readable name. It is a label to show, which `Synchronizer.renameAccount(_:name:)` can change
+    /// at any time, not an identity: never derive keys, file names or other identifiers from it.
     public let name: String?
     public let keySource: String?
     public let seedFingerprint: [UInt8]?
@@ -31,6 +33,10 @@ extension Account {
     /// because the Ledger Zcash app signs only one; its migration runs keep the default sizing,
     /// since no batch signing round bounds them.
     public static let ledgerKeySource = "ledger"
+
+    /// The `keySource` an app passes when it imports a unified full viewing key as a view-only account
+    /// (`AccountPurpose.viewOnly`).
+    public static let viewOnlyKeySource = "view_only"
 }
 
 public struct UnifiedSpendingKey: Equatable, Undescribable {

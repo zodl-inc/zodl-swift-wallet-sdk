@@ -4,6 +4,7 @@
 //
 
 import Combine
+import os
 import XCTest
 @testable import TestUtils
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
@@ -723,11 +724,11 @@ final class MigrationLogicTests: ZcashTestCase {
         let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
 
         let first = Task {
-            try await broadcaster.broadcast(rawTransaction: Data([0x01]), to: endpoint, useTor: true, onWillSubmit: { })
+            try await broadcaster.broadcast(to: endpoint, useTor: true, onWillSubmit: { }, prepareTransaction: { _ in Data([0x01]) })
         }
         await factory.awaitCallsStarted(1)
         let second = Task {
-            try await broadcaster.broadcast(rawTransaction: Data([0x02]), to: endpoint, useTor: true, onWillSubmit: { })
+            try await broadcaster.broadcast(to: endpoint, useTor: true, onWillSubmit: { }, prepareTransaction: { _ in Data([0x02]) })
         }
         for _ in 0..<50 {
             await Task.yield()
@@ -741,7 +742,7 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(callCountAfterFailure, 1, "the failing bootstrap must be shared by both concurrent callers")
 
         do {
-            _ = try await broadcaster.broadcast(rawTransaction: Data([0x03]), to: endpoint, useTor: true, onWillSubmit: { })
+            _ = try await broadcaster.broadcast(to: endpoint, useTor: true, onWillSubmit: { }, prepareTransaction: { _ in Data([0x03]) })
             XCTFail("Expected migrationTorUnavailable to be thrown")
         } catch ZcashError.migrationTorUnavailable {
             // expected
@@ -751,6 +752,141 @@ final class MigrationLogicTests: ZcashTestCase {
 
         let callCountAfterRetry = await factory.callCount
         XCTAssertEqual(callCountAfterRetry, 2, "a later broadcast must retry with a fresh bootstrap, not replay the cached failure")
+    }
+
+    // MARK: - Broadcaster order (direct transport)
+    //
+    // The broadcaster reads the server's height on the connection it submits over BEFORE it asks
+    // for the transaction, so the caller can check the transaction against the server that will
+    // judge it. The direct transport opens an ephemeral service for the endpoint; the factory seam
+    // hands these tests a mock in its place. (The Tor transport needs a real isolated connection to
+    // reach the same steps, which an offline test cannot make.)
+
+    private func makeDirectBroadcaster(service: LightWalletServiceMock) -> MigrationBroadcaster {
+        MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory,
+            logger: logger,
+            torClientFactory: { _ in throw StubTorBootstrapError() },
+            directServiceFactory: { _ in service }
+        )
+    }
+
+    /// THE ORDER on the direct path: the server's height is read, the transaction is prepared with
+    /// it, the pre-submit hook fires, the prepared bytes are submitted, and the service is closed.
+    func testDirectBroadcastReadsTheHeightThenPreparesThenSubmitsAndCloses() async throws {
+        let events = BroadcastEventLog()
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeClosure = { mode in
+            XCTAssertEqual(mode, ServiceMode.direct)
+            events.record("height")
+            return 3_543_404
+        }
+        service.submitSpendTransactionModeClosure = { transaction, mode in
+            XCTAssertEqual(mode, ServiceMode.direct)
+            events.record("submit:\(transaction.count)")
+            return LightWalletServiceMockResponse.submitAnswer(errorCode: 0)
+        }
+        service.closeConnectionsClosure = { events.record("close") }
+        let broadcaster = makeDirectBroadcaster(service: service)
+
+        let outcome = try await broadcaster.broadcast(
+            to: LightWalletEndpoint(address: "default.example", port: 9067),
+            useTor: false,
+            onWillSubmit: { events.record("hook") },
+            prepareTransaction: { serverHeight in
+                events.record("prepare:\(serverHeight)")
+                return Data([0x01, 0x02, 0x03])
+            }
+        )
+
+        XCTAssertEqual(outcome, MigrationBroadcastOutcome.submitted)
+        XCTAssertEqual(events.events, ["height", "prepare:3543404", "hook", "submit:3", "close"])
+        XCTAssertEqual(service.submitSpendTransactionModeReceivedArguments?.spendTransaction, Data([0x01, 0x02, 0x03]))
+    }
+
+    /// A height that cannot be read ends the attempt with a transport error before anything is
+    /// prepared: the caller is never asked for a transaction, nothing is submitted, and the hook
+    /// never fires. The service is still closed.
+    func testDirectBroadcastWithAnUnreadableHeightPreparesAndSubmitsNothing() async throws {
+        let events = BroadcastEventLog()
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeThrowableError = ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+        service.closeConnectionsClosure = { events.record("close") }
+        let broadcaster = makeDirectBroadcaster(service: service)
+
+        let outcome = try await broadcaster.broadcast(
+            to: LightWalletEndpoint(address: "default.example", port: 9067),
+            useTor: false,
+            onWillSubmit: { events.record("hook") },
+            prepareTransaction: { _ in
+                events.record("prepare")
+                return Data([0x01])
+            }
+        )
+
+        XCTAssertEqual(outcome, MigrationBroadcastOutcome.transportError)
+        XCTAssertEqual(events.events, ["close"], "no preparation, no hook, no submit")
+        XCTAssertFalse(service.submitSpendTransactionModeCalled)
+    }
+
+    /// An error the preparation throws (the caller refusing the transaction) propagates as it was
+    /// thrown, with nothing submitted and the hook never fired. The service is closed.
+    func testDirectBroadcastPropagatesAPreparationErrorWithoutSubmitting() async throws {
+        let events = BroadcastEventLog()
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeReturnValue = 3_543_404
+        service.closeConnectionsClosure = { events.record("close") }
+        let broadcaster = makeDirectBroadcaster(service: service)
+
+        do {
+            _ = try await broadcaster.broadcast(
+                to: LightWalletEndpoint(address: "default.example", port: 9067),
+                useTor: false,
+                onWillSubmit: { events.record("hook") },
+                prepareTransaction: { _ in throw ZcashError.migrationSubmissionRefused(.wrongConsensusBranch) }
+            )
+            XCTFail("Expected the refusal to propagate")
+        } catch ZcashError.migrationSubmissionRefused(let refusal) {
+            XCTAssertEqual(refusal, .wrongConsensusBranch)
+        } catch {
+            XCTFail("Expected migrationSubmissionRefused but got \(error)")
+        }
+
+        XCTAssertEqual(events.events, ["close"], "no hook and no submit for a refused transaction")
+        XCTAssertFalse(service.submitSpendTransactionModeCalled)
+    }
+
+    /// Once the transaction is prepared, a failed submit is a transport error and a server
+    /// rejection is returned as one: neither throws, and the service is closed either way.
+    func testDirectBroadcastReturnsATransportErrorOrARejectionAfterPreparing() async throws {
+        let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
+
+        let failingService = LightWalletServiceMock()
+        failingService.latestBlockHeightModeReturnValue = 3_600_000
+        failingService.submitSpendTransactionModeThrowableError = ZcashError.serviceSubmitFailed(LightWalletServiceError.timeOut)
+        failingService.closeConnectionsClosure = { }
+        let transportOutcome = try await makeDirectBroadcaster(service: failingService).broadcast(
+            to: endpoint,
+            useTor: false,
+            onWillSubmit: { },
+            prepareTransaction: { _ in Data([0x01]) }
+        )
+        XCTAssertEqual(transportOutcome, MigrationBroadcastOutcome.transportError)
+        XCTAssertEqual(failingService.closeConnectionsCallsCount, 1)
+
+        let rejectingService = LightWalletServiceMock()
+        rejectingService.latestBlockHeightModeReturnValue = 3_600_000
+        rejectingService.submitSpendTransactionModeReturnValue =
+            LightWalletServiceMockResponse.submitAnswer(errorCode: -26, errorMessage: "tx-expiring-soon")
+        rejectingService.closeConnectionsClosure = { }
+        let rejectedOutcome = try await makeDirectBroadcaster(service: rejectingService).broadcast(
+            to: endpoint,
+            useTor: false,
+            onWillSubmit: { },
+            prepareTransaction: { _ in Data([0x01]) }
+        )
+        XCTAssertEqual(rejectedOutcome, MigrationBroadcastOutcome.rejected(errorCode: -26, message: "tx-expiring-soon"))
+        XCTAssertEqual(rejectingService.closeConnectionsCallsCount, 1)
     }
 
     private func assertThrowsMigrationTorUnavailable(_ task: Task<MigrationBroadcastOutcome, Error>) async {
@@ -1107,7 +1243,7 @@ final class MigrationLogicTests: ZcashTestCase {
             pczt: Data([0x01, 0x02])
         )
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         // A no-op closure: if the fail-closed guard regresses and this ends up called anyway, it
         // completes instead of crashing the process, so the call-count assertion below fails cleanly
         // rather than taking the whole test run down with it.
@@ -1121,7 +1257,8 @@ final class MigrationLogicTests: ZcashTestCase {
             accountUUID: accountA,
             broadcaster: fakeBroadcaster,
             syncGate: gate,
-            logger: logger
+            logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet)
         )
 
         do {
@@ -1175,7 +1312,8 @@ final class MigrationLogicTests: ZcashTestCase {
             accountUUID: account,
             broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
             syncGate: makeGate(account: account, clock: TestClock(referenceDate)),
-            logger: logger
+            logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet)
         )
     }
 
@@ -1290,3 +1428,17 @@ private final class CountingClock: @unchecked Sendable {
 // `GatedTorClientFactory` and `StubTorBootstrapError` were promoted to
 // `Tests/TestUtils/MigrationTestDoubles.swift` so `OrchardMigrationHostTests` can reuse them for the
 // shared-broadcaster single-bootstrap canary.
+
+/// Records, in order, what a broadcaster test's collaborators did, from closures that may run off the
+/// test's own task.
+private final class BroadcastEventLog: @unchecked Sendable {
+    private let recorded = OSAllocatedUnfairLock<[String]>(initialState: [])
+
+    var events: [String] {
+        recorded.withLock { $0 }
+    }
+
+    func record(_ event: String) {
+        recorded.withLock { $0.append(event) }
+    }
+}

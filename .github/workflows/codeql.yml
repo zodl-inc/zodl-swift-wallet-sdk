@@ -124,13 +124,20 @@ jobs:
         path: BuildSupport/products/libzcashlc.xcframework
         key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
+    # The same Rust setup as swift.yml's build job, whose comment explains it.
     - name: Setup Rust
       id: toolchain
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-      with:
-        toolchain: stable
-        targets: aarch64-apple-darwin
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+        rustup default stable
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        rustc_version="$(rustc +stable --version --verbose)"
+        echo "$rustc_version"
+        commit_date="$(sed -n 's/^commit-date: //p' <<< "$rustc_version" | tr -d -)"
+        commit_hash="$(sed -n 's/^commit-hash: //p' <<< "$rustc_version")"
+        echo "cachekey=${commit_date}${commit_hash:0:4}" >> "$GITHUB_OUTPUT"
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'

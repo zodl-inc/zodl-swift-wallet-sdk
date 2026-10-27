@@ -530,8 +530,9 @@ extension CompactBlockProcessor {
             for try await rawTransaction in stream {
                 let mempoolTransactions = try await resolveMempools(rawTransaction: rawTransaction)
 
-                if !mempoolTransactions.isEmpty {
-                    let height = BlockHeight(rawTransaction.height)
+                // The transactions are stored whatever the height is. The event carries it as a `BlockHeight`, so it is only
+                // sent for a height the SDK can use.
+                if !mempoolTransactions.isEmpty, let height = BlockHeight(serverHeight: rawTransaction.height) {
                     await send(event: .foundTransactions(mempoolTransactions, .init(uncheckedBounds: (lower: height, upper: height))))
                 }
             }
@@ -542,8 +543,7 @@ extension CompactBlockProcessor {
     // the trailing find only reads back the own write. Stays serialized.
     @DBActor
     func resolveMempools(rawTransaction: RawTransaction) async throws -> [ZcashTransaction.Overview] {
-        let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)
-        ? nil : UInt32(rawTransaction.height)
+        let minedHeight = BlockHeight(minedServerHeight: rawTransaction.height).map { UInt32($0) }
 
         let txIdData = try await rustBackend.decryptAndStoreTransaction(
             txBytes: rawTransaction.data.bytes,

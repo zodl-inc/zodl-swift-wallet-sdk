@@ -94,6 +94,12 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     let networkType: NetworkType
     let sdkFlags: SDKFlags
 
+    /// The host's opt-out of the NU7 network-upgrade gate, read on every gated FFI call. The holder
+    /// is shared by reference with whoever else was given it (the migration host hands one to every
+    /// per-account backend it builds), so a switch made there reaches this backend's next call; a
+    /// backend nobody shares one with keeps its own, which stays off.
+    let migrationUpgradeGateBypass: MigrationUpgradeGateBypass
+
     /// Guards the one-time Rust initialization (`initializeRust(logLevel:)` / `zcashlc_init_on_load`)
     /// against concurrent first construction. The underlying FFI call panics if invoked more than
     /// once (tracing's `.init()` plus rayon's `build_global().expect`), and an unwind across the FFI
@@ -124,6 +130,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     ///     **Important note:** this will enable the tracing **for all instances** of ZcashRustBackend, not only for this one.
     ///     This is ignored after the first ZcashRustBackend instance is created -- first caller wins the log
     ///     level, even when two instances are constructed concurrently from different call sites.
+    ///   - sdkFlags: the SDK feature flags.
+    ///   - migrationUpgradeGateBypass: the holder this backend reads the NU7 network-upgrade gate's bypass from
+    ///     on every gated FFI call. Pass the one the other backends of the same host share; the default is a holder of
+    ///     its own, which is never turned on.
     init(
         dbData: URL,
         fsBlockDbRoot: URL,
@@ -131,7 +141,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         outputParamsPath: URL,
         networkType: NetworkType,
         logLevel: RustLogging = RustLogging.off,
-        sdkFlags: SDKFlags
+        sdkFlags: SDKFlags,
+        migrationUpgradeGateBypass: MigrationUpgradeGateBypass = MigrationUpgradeGateBypass()
     ) {
         self.dbData = dbData.osStr()
         self.fsBlockDbRoot = fsBlockDbRoot.osPathStr()
@@ -140,6 +151,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         self.networkType = networkType
         self.keyDeriving = ZcashKeyDerivationBackend(networkType: networkType)
         self.sdkFlags = sdkFlags
+        self.migrationUpgradeGateBypass = migrationUpgradeGateBypass
 
         Self.rustInitLock.lock()
         defer { Self.rustInitLock.unlock() }
@@ -289,6 +301,24 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         defer { zcashlc_free_ffi_uuid(uuidPtr) }
 
         return uuidPtr.pointee.unsafeToAccountUUID()
+    }
+
+    // DB-READ (audited 2026-10-14): read-only wallet database connection.
+    func findAccountKeyOverlap(ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        let overlapPtr = zcashlc_find_account_key_overlap(
+            dbData.0,
+            dbData.1,
+            [CChar](ufvk.stringEncoded.utf8CString),
+            networkType.networkId
+        )
+
+        guard let overlapPtr else {
+            throw ZcashError.rustFindAccountKeyOverlap(lastErrorMessage(fallback: "`findAccountKeyOverlap` failed with unknown error"))
+        }
+
+        defer { zcashlc_free_account_key_overlap(overlapPtr) }
+
+        return try overlapPtr.pointee.unsafeToAccountKeyOverlap()
     }
 
     @DBActor
@@ -708,6 +738,43 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
 
         return Data(contiguousTxidBytes)
+    }
+
+    // DB-READ (audited 2026-10-23): zcashlc_check_transaction_submittable — the FFI opens the wallet
+    // through `wallet_db_read_only` (SQLITE_OPEN_READ_ONLY on its one connection), so the only thing
+    // it can do to the database is read the chain tip (`SELECT MAX(block_range_end) FROM
+    // scan_queue`); the transaction is parsed in memory, and a write anywhere down the path would
+    // fail SQLITE_READONLY.
+    func checkTransactionSubmittable(
+        _ rawTransaction: Data,
+        submissionServerHeight: BlockHeight
+    ) async throws -> TransactionSubmissionRefusal? {
+        let txBytes = [UInt8](rawTransaction)
+
+        // The FFI answers 0 for a transaction that can be valid in the next block, 1 for one built
+        // for another consensus branch, 2 for an expired one and -1 for an error. Anything else is
+        // as little to be trusted as an error: the transaction stays unsubmitted.
+        let result = zcashlc_check_transaction_submittable(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            txBytes,
+            UInt(txBytes.count),
+            Int64(submissionServerHeight)
+        )
+
+        switch result {
+        case 0:
+            return nil
+        case 1:
+            return TransactionSubmissionRefusal.wrongConsensusBranch
+        case 2:
+            return TransactionSubmissionRefusal.expired
+        default:
+            throw ZcashError.rustCheckTransactionSubmittable(
+                lastErrorMessage(fallback: "`checkTransactionSubmittable` failed with unknown error")
+            )
+        }
     }
 
     // DB-READ (audited 2026-08-03): get_last_generated_address_matching — SELECT on
@@ -1654,6 +1721,28 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
     }
 
+    @DBActor
+    func setAccountName(_ accountUUID: AccountUUID, name: String) async throws {
+        // The rust layer reads the name up to its first null character, so it would store less than it was given.
+        guard !name.containsCStringNullBytesBeforeStringEnding() else {
+            throw ZcashError.rustSetAccountName("The name contains a null character.")
+        }
+
+        let success = zcashlc_set_account_name(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            accountUUID.id,
+            [CChar](name.utf8CString)
+        )
+
+        guard success else {
+            throw ZcashError.rustSetAccountName(
+                lastErrorMessage(fallback: "`setAccountName` failed with unknown error")
+            )
+        }
+    }
+
     // MARK: - Ironwood migration
 
     @DBActor
@@ -1676,7 +1765,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             dbData.1,
             account.id,
             networkType.networkId,
-            estimatedTip.map(Int64.init) ?? -1
+            estimatedTip.map(Int64.init) ?? -1,
+            migrationUpgradeGateBypass.isBypassed
         )
 
         // NULL with no recorded error is the benign "no migration run is stored" answer (the
@@ -1769,6 +1859,35 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         }
 
         return samples
+    }
+
+    // DB-READ (audited 2026-10-23): zcashlc_migration_availability — account-free; it opens the
+    // wallet through the FFI's read-only context (SQLITE_OPEN_READ_ONLY on its one connection), so
+    // the only thing it can do to the database is read the chain tip, and a write anywhere down the
+    // path would fail SQLITE_READONLY.
+    func migrationAvailability(upgradeGateBypass: Bool) async throws -> MigrationAvailability {
+        let availabilityPtr = zcashlc_migration_availability(
+            dbData.0,
+            dbData.1,
+            networkType.networkId,
+            upgradeGateBypass
+        )
+
+        guard let availabilityPtr else {
+            throw ZcashError.rustMigrationAvailability(
+                lastErrorMessage(fallback: "`migrationAvailability` failed with unknown error")
+            )
+        }
+
+        defer { zcashlc_free_migration_availability(availabilityPtr) }
+
+        guard let availability = availabilityPtr.pointee.unsafeToMigrationAvailability() else {
+            throw ZcashError.rustMigrationAvailability(
+                lastErrorMessage(fallback: "`migrationAvailability` returned a malformed answer")
+            )
+        }
+
+        return availability
     }
 
 
@@ -1954,12 +2073,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let proposalPtr else {
-            throw ZcashError.rustMigrationPrepareNoteSplit(
-                lastErrorMessage(fallback: "`migrationPrepareNoteSplit` failed with unknown error")
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationPrepareNoteSplit` failed with unknown error"),
+                fallback: ZcashError.rustMigrationPrepareNoteSplit
             )
         }
 
@@ -1971,9 +2092,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     /// Routes the rust layer's stable error prefixes to their dedicated `ZcashError` cases:
     /// `MIGRATION_PLAN_STALE` -> `.migrationPlanStale` (re-propose),
     /// `MIGRATION_PROVING_UNAVAILABLE` -> `.migrationProvingUnavailable` (proving failed hard),
-    /// and `MIGRATION_WAKEUP_INFEASIBLE:<id>` -> `.migrationWakeupInfeasible(id)` (an
-    /// inconsistent stored schedule; the id names the offending transfer). Anything else —
-    /// including a `MIGRATION_WAKEUP_INFEASIBLE` whose id does not parse — falls back to the
+    /// `MIGRATION_WAKEUP_INFEASIBLE:<id>` -> `.migrationWakeupInfeasible(id)` (an
+    /// inconsistent stored schedule; the id names the offending transfer), and
+    /// `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` ->
+    /// `.migrationPausedUntilNetworkUpgrade(height)` (the scheduled lane is closed until the NU7
+    /// network upgrade activates), and `MIGRATION_SUBMISSION_REFUSED:<code>` ->
+    /// `.migrationSubmissionRefused(refusal)` (a transaction about to be submitted cannot be valid
+    /// in the next block; the code is `wrong_branch` or `expired`). Anything else —
+    /// including a `MIGRATION_WAKEUP_INFEASIBLE` whose id, a `MIGRATION_PAUSED_UNTIL_UPGRADE` whose
+    /// height or a `MIGRATION_SUBMISSION_REFUSED` whose code does not parse — falls back to the
     /// member's own case.
     ///
     /// Internal (not `private`) so the parse/degrade branches are pinned by unit tests directly —
@@ -1993,6 +2120,23 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 return .migrationWakeupInfeasible(transferId)
             }
         }
+        if message.hasPrefix("MIGRATION_PAUSED_UNTIL_UPGRADE:") {
+            // The rust side emits exactly `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>`; as
+            // above, a height that does not parse degrades to the generic fallback.
+            let rawHeight = message.dropFirst("MIGRATION_PAUSED_UNTIL_UPGRADE:".count)
+            if let activationHeight = UInt32(rawHeight) {
+                return .migrationPausedUntilNetworkUpgrade(BlockHeight(activationHeight))
+            }
+        }
+        if message.hasPrefix("MIGRATION_SUBMISSION_REFUSED:") {
+            // The rust side emits exactly `MIGRATION_SUBMISSION_REFUSED:<code>`; a code this SDK
+            // does not know (a contract drift) degrades to the generic fallback rather than
+            // inventing a refusal.
+            let rawCode = message.dropFirst("MIGRATION_SUBMISSION_REFUSED:".count)
+            if let refusal = TransactionSubmissionRefusal(rustCode: String(rawCode)) {
+                return .migrationSubmissionRefused(refusal)
+            }
+        }
         return fallback(message)
     }
 
@@ -2000,6 +2144,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     func migrationSignNoteSplit(
         proposal: NoteSplitProposal,
         usk: UnifiedSpendingKey,
+        submissionServerHeight: BlockHeight,
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer {
         let preparedPtr = zcashlc_migration_sign_note_split(
@@ -2009,7 +2154,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             networkType.networkId,
             proposal.proposalHandle,
             usk.bytes,
-            UInt(usk.bytes.count)
+            UInt(usk.bytes.count),
+            Int64(submissionServerHeight),
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let preparedPtr else {
@@ -2128,12 +2275,14 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             dbData.0,
             dbData.1,
             account.id,
-            networkType.networkId
+            networkType.networkId,
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let schedulePtr else {
-            throw ZcashError.rustMigrationProposeTransfers(
-                lastErrorMessage(fallback: "`migrationProposeTransfers` failed with unknown error")
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationProposeTransfers` failed with unknown error"),
+                fallback: ZcashError.rustMigrationProposeTransfers
             )
         }
 
@@ -2178,7 +2327,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             networkType.networkId,
             schedule.proposalHandle,
             usk.bytes,
-            UInt(usk.bytes.count)
+            UInt(usk.bytes.count),
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard success else {
@@ -2267,7 +2417,11 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     // the transaction in the wallet's own tables in the same database transaction that hands the
     // bytes back. Stays serialized.
     @DBActor
-    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+    func migrationTakePreparation(
+        txid: Data,
+        submissionServerHeight: BlockHeight,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer {
         guard txid.count == TxId.byteLength else {
             throw ZcashError.rustMigrationTakePreparation(
                 "`migrationTakePreparation` was given a \(txid.count)-byte txid; it must be \(TxId.byteLength) bytes"
@@ -2284,7 +2438,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 dbData.1,
                 account.id,
                 networkType.networkId,
-                bufferPtr
+                bufferPtr,
+                Int64(submissionServerHeight),
+                migrationUpgradeGateBypass.isBypassed
             )
         }
 
@@ -2309,13 +2465,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     // DB-AUDIT (2026-08-03): WRITE — the broadcast seam records the transaction in the wallet's
     // own tables in the same database transaction that hands the bytes back. Stays serialized.
     @DBActor
-    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer {
+    func migrationTakeBroadcastTransaction(
+        id: UInt32,
+        submissionServerHeight: BlockHeight,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer {
         let preparedPtr = zcashlc_migration_take_broadcast_transaction(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId,
-            id
+            id,
+            Int64(submissionServerHeight),
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let preparedPtr else {
@@ -2411,25 +2573,51 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     }
 
     @DBActor
-    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule {
-        let schedulePtr = zcashlc_migration_restart_step(
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationRestartOutcome {
+        let outcomePtr = zcashlc_migration_restart_step(
+            dbData.0,
+            dbData.1,
+            account.id,
+            networkType.networkId,
+            migrationUpgradeGateBypass.isBypassed
+        )
+
+        // NULL is the error sentinel: a restart that waits for the network upgrade is a success
+        // whose outcome carries no schedule.
+        guard let outcomePtr else {
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationRestartStep` failed with unknown error"),
+                fallback: ZcashError.rustMigrationRestartStep
+            )
+        }
+
+        defer { zcashlc_free_migration_restart_outcome(outcomePtr) }
+
+        guard let outcome = outcomePtr.pointee.unsafeToMigrationRestartOutcome() else {
+            throw ZcashError.rustMigrationRestartStep(
+                lastErrorMessage(fallback: "`migrationRestartStep` returned a malformed outcome")
+            )
+        }
+
+        return outcome
+    }
+
+    @DBActor
+    func migrationCancelRun(for account: AccountUUID) async throws {
+        // Never gated, so no bypass is passed; `false` is an unambiguous error here, since a
+        // cancel with no run pending succeeds.
+        let success = zcashlc_migration_cancel_run(
             dbData.0,
             dbData.1,
             account.id,
             networkType.networkId
         )
 
-        guard let schedulePtr else {
-            throw ZcashError.rustMigrationRestartStep(lastErrorMessage(fallback: "`migrationRestartStep` failed with unknown error"))
+        guard success else {
+            throw ZcashError.rustMigrationCancelRun(
+                lastErrorMessage(fallback: "`migrationCancelRun` failed with unknown error")
+            )
         }
-
-        defer { zcashlc_free_migration_schedule(schedulePtr) }
-
-        guard let schedule = schedulePtr.pointee.unsafeToMigrationSchedule() else {
-            throw ZcashError.rustMigrationRestartStep(lastErrorMessage(fallback: "`migrationRestartStep` returned a malformed schedule"))
-        }
-
-        return schedule
     }
 
     @DBActor
@@ -2447,7 +2635,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 account.id,
                 networkType.networkId,
                 usk.bytes,
-                UInt(usk.bytes.count)
+                UInt(usk.bytes.count),
+                migrationUpgradeGateBypass.isBypassed
             )
         } else {
             schedulePtr = zcashlc_migration_refresh_stale_transfers(
@@ -2456,16 +2645,20 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 account.id,
                 networkType.networkId,
                 nil,
-                0
+                0,
+                migrationUpgradeGateBypass.isBypassed
             )
         }
 
         // NULL is an unambiguous error sentinel here: every legitimate outcome — nothing stored,
         // a terminal run, nothing expired, or a completed rebuild — returns a schedule (possibly
-        // empty), mirroring `migrationRestartStep`.
+        // empty), and a refusal by the network-upgrade gate is an error like any other. Unlike
+        // `migrationRestartStep`, whose successful outcome can carry no schedule, there is no
+        // success without one.
         guard let schedulePtr else {
-            throw ZcashError.rustMigrationRefreshStaleTransfers(
-                lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` failed with unknown error")
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationRefreshStaleTransfers` failed with unknown error"),
+                fallback: ZcashError.rustMigrationRefreshStaleTransfers
             )
         }
 
@@ -2490,7 +2683,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             dbData.1,
             account.id,
             networkType.networkId,
-            schedule.proposalHandle
+            schedule.proposalHandle,
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let pcztsPtr else {
@@ -2547,15 +2741,17 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                         idsPtr.baseAddress,
                         UInt(idsPtr.count),
                         pcztsPtr.baseAddress,
-                        lensPtr.baseAddress
+                        lensPtr.baseAddress,
+                        migrationUpgradeGateBypass.isBypassed
                     )
                 }
             }
         }
 
         guard let preparedPtr else {
-            throw ZcashError.rustMigrationStoreSignedNoteSplitPczt(
-                lastErrorMessage(fallback: "`migrationStoreSignedNoteSplitPczts` failed with unknown error")
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationStoreSignedNoteSplitPczts` failed with unknown error"),
+                fallback: ZcashError.rustMigrationStoreSignedNoteSplitPczt
             )
         }
 
@@ -2580,7 +2776,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             dbData.1,
             account.id,
             networkType.networkId,
-            schedule.proposalHandle
+            schedule.proposalHandle,
+            migrationUpgradeGateBypass.isBypassed
         )
 
         guard let pcztsPtr else {
@@ -2638,15 +2835,17 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                         idsPtr.baseAddress,
                         UInt(idsPtr.count),
                         pcztsPtr.baseAddress,
-                        lensPtr.baseAddress
+                        lensPtr.baseAddress,
+                        migrationUpgradeGateBypass.isBypassed
                     )
                 }
             }
         }
 
         guard success else {
-            throw ZcashError.rustMigrationStoreSignedSchedulePczts(
-                lastErrorMessage(fallback: "`migrationStoreSignedSchedulePczts` failed with unknown error")
+            throw migrationRoutedError(
+                lastErrorMessage(fallback: "`migrationStoreSignedSchedulePczts` failed with unknown error"),
+                fallback: ZcashError.rustMigrationStoreSignedSchedulePczts
             )
         }
     }
@@ -2976,30 +3175,32 @@ extension FfiAccount {
 
     /// converts an [`FfiAccount`] into a [`Account`]
     /// - Note: This does not check that the converted value actually holds a valid Account
+    /// - Note: An account imported without derivation data, such as a view-only or a hardware-wallet account, has no seed fingerprint
+    ///   or ZIP 32 account index. It carries the viewing keys it was imported with, as every other account does.
     func unsafeToAccount() -> Account? {
         // Invalid UUID check
         guard uuidArray != [UInt8](repeating: 0, count: 16) else {
             return nil
         }
 
-        // Invalid ZIP 32 account index
+        let ufvkTyped = ufvk.map { UnifiedFullViewingKey(validatedEncoding: String(cString: $0)) }
+        let uivkTyped = uivk.map { UnifiedIncomingViewingKey(validatedEncoding: String(cString: $0)) }
+
+        // Invalid ZIP 32 account index: the account was imported without derivation data, but its viewing keys are stored all the same.
         if hd_account_index == UInt32.max {
-            return .init(
+            return Account(
                 id: AccountUUID(id: uuidArray),
                 name: account_name != nil ? String(cString: account_name) : nil,
                 keySource: key_source != nil ? String(cString: key_source) : nil,
                 seedFingerprint: nil,
                 hdAccountIndex: nil,
-                ufvk: nil,
-                uivk: nil
+                ufvk: ufvkTyped,
+                uivk: uivkTyped
             )
         }
 
-        let ufvkTyped = ufvk.map { UnifiedFullViewingKey(validatedEncoding: String(cString: $0)) }
-        let uivkTyped = uivk.map { UnifiedIncomingViewingKey(validatedEncoding: String(cString: $0)) }
-
         // Valid ZIP32 account index
-        return .init(
+        return Account(
             id: AccountUUID(id: uuidArray),
             name: account_name != nil ? String(cString: account_name) : nil,
             keySource: key_source != nil ? String(cString: key_source) : nil,
@@ -3008,6 +3209,43 @@ extension FfiAccount {
             ufvk: ufvkTyped,
             uivk: uivkTyped
         )
+    }
+}
+
+extension FfiAccountKeyOverlap {
+    /// Converts what `zcashlc_find_account_key_overlap` reported into the answer of
+    /// `ZcashRustBackendWelding.findAccountKeyOverlap(ufvk:)`. Call it before the struct is freed, because it reads the
+    /// strings of the account.
+    /// - Returns: `nil` when importing the key would add an account.
+    /// - Throws:
+    ///     - `accountKeyOverlapMultipleAccounts` when the components of the key match more than one account.
+    ///     - `rustFindAccountKeyOverlap` for a kind this version of the SDK does not know, or when no account is reported
+    ///       for a kind that needs one.
+    func unsafeToAccountKeyOverlap() throws -> AccountKeyOverlap? {
+        let overlapKind: AccountKeyOverlap.Kind
+
+        switch kind {
+        case FfiAccountKeyOverlapKind_None:
+            return nil
+        case FfiAccountKeyOverlapKind_MultipleAccounts:
+            throw ZcashError.accountKeyOverlapMultipleAccounts
+        case FfiAccountKeyOverlapKind_AlreadyImported:
+            overlapKind = .alreadyImported
+        case FfiAccountKeyOverlapKind_WouldUpgrade:
+            overlapKind = .wouldUpgrade
+        case FfiAccountKeyOverlapKind_Conflicting:
+            overlapKind = .conflicting
+        default:
+            // The rust layer returned a value, so it set no error. Reading the last error here would pick up one that an
+            // earlier, unread failure on this thread left behind.
+            throw ZcashError.rustFindAccountKeyOverlap("`findAccountKeyOverlap` reported an unknown kind")
+        }
+
+        guard let overlappingAccount = account.unsafeToAccount() else {
+            throw ZcashError.rustFindAccountKeyOverlap("`findAccountKeyOverlap` reported no account")
+        }
+
+        return AccountKeyOverlap(account: overlappingAccount, kind: overlapKind)
     }
 }
 
@@ -3282,7 +3520,8 @@ extension FfiMigrationAdvanceStep {
     /// Converts an [`FfiMigrationAdvanceStep`] into a [`MigrationAdvance`], or `nil` for an
     /// unrecognized step discriminant (should not happen; defensive only), an EMPTY Prove batch
     /// (`prove_targets_len == 0` — upstream documents the batch never empty, so this is a
-    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`), or an
+    /// malformed step, not the ordinary "nothing to prove" answer, which is `.waiting`), a
+    /// network-upgrade step without a non-negative `network_upgrade_height`, or an
     /// unrecognized `next_kind` while `next_height >= 0` (a malformed outlook — same defensive
     /// contract as the step discriminant). The per-kind payload fields
     /// (`kind_layer`/`kind_index`/`kind_crossing`) live on each `FfiProveTarget` row rather than on
@@ -3327,6 +3566,14 @@ extension FfiMigrationAdvanceStep {
             step = .replan
         case ZCASHLC_ADVANCE_STEP_REEVALUATE:
             step = .reevaluate
+        case ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE:
+            // Both network-upgrade steps carry the activation height they wait on, so the `-1`
+            // "none" sentinel in its place is a malformed step.
+            guard network_upgrade_height >= 0 else { return nil }
+            step = .pausedForNetworkUpgrade(activationHeight: BlockHeight(network_upgrade_height))
+        case ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE:
+            guard network_upgrade_height >= 0 else { return nil }
+            step = .interruptedByNetworkUpgrade(activationHeight: BlockHeight(network_upgrade_height))
         default:
             return nil
         }
@@ -3474,6 +3721,50 @@ extension FfiMigrationSchedule {
             estimatedDurationHours: Int(estimated_duration_hours),
             proposalHandle: proposal_handle,
             preparations: preparationSteps
+        )
+    }
+}
+
+extension FfiMigrationRestartOutcome {
+    /// Converts an [`FfiMigrationRestartOutcome`] into a [`MigrationRestartOutcome`]: a schedule is
+    /// the fresh plan to re-confirm, and no schedule is the restart that waits for the NU7 network
+    /// upgrade, whose activation height `replan_after_height` carries. `nil` when it carries
+    /// neither a schedule that decodes nor an activation height (should not happen; defensive
+    /// only). The caller still frees the outcome, which owns the schedule.
+    func unsafeToMigrationRestartOutcome() -> MigrationRestartOutcome? {
+        if let schedule {
+            return schedule.pointee.unsafeToMigrationSchedule().map(MigrationRestartOutcome.replanned)
+        }
+
+        guard replan_after_height >= 0 else {
+            return nil
+        }
+
+        return .cancelledUntilNetworkUpgrade(activationHeight: BlockHeight(replan_after_height))
+    }
+}
+
+extension FfiMigrationAvailability {
+    /// Converts an [`FfiMigrationAvailability`] into a [`MigrationAvailability`], or `nil` for an
+    /// unrecognized phase (should not happen; defensive only). The phase is matched against the
+    /// header's exported `ZCASHLC_MIGRATION_*` constants, so this marshal and the rust side share one
+    /// set of names; the `-1` "none" sentinel of `activation_height` is a network with no NU7
+    /// activation height.
+    func unsafeToMigrationAvailability() -> MigrationAvailability? {
+        let migrationPhase: MigrationAvailability.Phase
+        switch Int32(bitPattern: phase) {
+        case ZCASHLC_MIGRATION_AVAILABLE:
+            migrationPhase = .available
+        case ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE:
+            migrationPhase = .pausedUntilNetworkUpgrade
+        default:
+            return nil
+        }
+
+        return MigrationAvailability(
+            phase: migrationPhase,
+            activationHeight: activation_height >= 0 ? BlockHeight(activation_height) : nil,
+            isImmediateLaneAvailable: immediate_available
         )
     }
 }

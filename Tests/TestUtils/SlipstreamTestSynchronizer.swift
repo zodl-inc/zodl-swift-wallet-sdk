@@ -34,13 +34,17 @@ extension ZcashTestCase {
     ///   - network: the Zcash network. Testnet by default, as every offline Slipstream test uses.
     ///   - alternateEndpoints: recorded on the synchronizer; the engine's own alternates are the
     ///     caller's business, since the caller built the engine.
+    ///   - restoreAnchor: the anchor resolver `prepare` and `importAccount` ask. `nil` keeps the
+    ///     shipped one, the engine's `restore_anchor`, which dials `endpoint`; a test that must not
+    ///     depend on a server passes its own.
     func makeSlipstreamSynchronizer(
         engine: any SlipstreamEngineControlling,
         container: DIContainer? = nil,
         welding: ZcashRustBackendWeldingMock? = nil,
         endpoint: LightWalletEndpoint = LightWalletEndpointBuilder.default,
         network: ZcashNetwork = ZcashNetworkBuilder.network(for: .testnet),
-        alternateEndpoints: [LightWalletEndpoint] = []
+        alternateEndpoints: [LightWalletEndpoint] = [],
+        restoreAnchor: SlipstreamAnchorResolver? = nil
     ) throws -> SlipstreamSynchronizer {
         let container = container ?? mockContainer!
         let welding = welding ?? ZcashRustBackendWeldingMock()
@@ -76,6 +80,14 @@ extension ZcashTestCase {
             isExchangeRateEnabled: false
         )
 
+        if let restoreAnchor {
+            return SlipstreamSynchronizer(
+                initializer: initializer,
+                alternateEndpoints: alternateEndpoints,
+                engine: engine,
+                restoreAnchor: restoreAnchor
+            )
+        }
         return SlipstreamSynchronizer(
             initializer: initializer,
             alternateEndpoints: alternateEndpoints,

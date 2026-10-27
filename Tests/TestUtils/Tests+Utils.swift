@@ -40,6 +40,15 @@ enum Environment {
     }
 }
 
+/// Runs `body` with a new, empty directory, and removes the directory afterwards.
+func withTemporaryDirectory(_ body: (URL) async throws -> Void) async throws {
+    let directory = Environment.uniqueTestTempDirectory
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    try await body(directory)
+}
+
 public enum Constants {
     static let address: String = ProcessInfo.processInfo.environment[Environment.lightwalletdKey] ?? "localhost"
 }
@@ -167,7 +176,8 @@ extension ZcashRustBackend {
         fsBlockDbRoot: URL,
         spendParamsPath: URL = SaplingParamsSourceURL.default.spendParamFileURL,
         outputParamsPath: URL = SaplingParamsSourceURL.default.outputParamFileURL,
-        networkType: NetworkType
+        networkType: NetworkType,
+        migrationUpgradeGateBypass: MigrationUpgradeGateBypass = MigrationUpgradeGateBypass()
     ) -> ZcashRustBackend {
         ZcashRustBackend(
             dbData: dbData,
@@ -175,7 +185,8 @@ extension ZcashRustBackend {
             spendParamsPath: spendParamsPath,
             outputParamsPath: outputParamsPath,
             networkType: networkType,
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            migrationUpgradeGateBypass: migrationUpgradeGateBypass
         )
     }
 }
