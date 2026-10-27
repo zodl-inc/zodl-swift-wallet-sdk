@@ -1238,7 +1238,7 @@ impl Address {
         address: UnifiedAddress,
         diversifier_index: DiversifierIndex,
     ) -> Self {
-        let address_str = address.encode_receiver_preserving(network);
+        let address_str = address.encode(network);
         Self {
             address: CString::new(address_str).unwrap().into_raw(),
             diversifier_index_bytes: *diversifier_index.as_bytes(),

@@ -527,9 +527,10 @@ public class Initializer {
                     isRestore: walletBirthday != nil
                 )
                 chainTip = resolved.chainTip
-                if let serverTreeState = resolved.treeState {
+                // A tree state at a height the SDK can't use is treated as missing: the bundled checkpoint stays.
+                if let serverTreeState = resolved.treeState, let serverBirthday = BlockHeight(serverHeight: serverTreeState.height) {
                     accountTreeState = serverTreeState
-                    self.walletBirthday = BlockHeight(serverTreeState.height)
+                    self.walletBirthday = serverBirthday
                 }
             } else {
                 // LEGACY (`SDKSynchronizer`) — host-side fetch policy, frozen verbatim.
@@ -537,9 +538,12 @@ public class Initializer {
 
                 if walletBirthday != nil {
                     // RESTORE — recover_until = current chain tip.
-                    if let latestBlockHeight = try? await lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor)) {
-                        chainTip = UInt32(latestBlockHeight)
+                    if let latestBlockHeight = try? await lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor)),
+                       let latestTip = UInt32(exactly: latestBlockHeight) {
+                        chainTip = latestTip
                     } else {
+                        // A tip that doesn't fit `UInt32`, which only a broken or hostile server reports, takes this branch too.
+                        //
                         // [#1755] Server unreachable at restore time: recover_until MUST still be a valid recent
                         // height. A NULL recover_until makes the restore look like a NEW wallet — recovery_progress
                         // reads complete ⇒ isRecovering=false ⇒ NO "Restoring" UI, the recovery gate never engages,
@@ -562,12 +566,14 @@ public class Initializer {
                             network.saplingActivationHeight
                         )
                         let blockID = BlockID(height: UInt64(birthdayTreeStateHeight))
-                        if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)) {
+                        // A tree state at a height the SDK can't use is treated as missing: the bundled checkpoint stays.
+                        if let serverTreeState = try? await lightWalletService.getTreeState(blockID, mode: await sdkFlags.ifTor(.uniqueTor)),
+                           let serverBirthday = BlockHeight(serverHeight: serverTreeState.height) {
                             accountTreeState = serverTreeState
                             // Not using birthdayTreeStateHeight directly just in case that something is wrong and server returns different height for
                             // tree state. At 99.9999999% of cases `birthdayTreeStateHeight` and `serverTreeState.height` will be the same. In those
                             // other cases this makes sure that there is no inconsistency between rust and `self.walletBirthday`.
-                            self.walletBirthday = BlockHeight(serverTreeState.height)
+                            self.walletBirthday = serverBirthday
                         }
                     }
                 }
@@ -625,10 +631,14 @@ public class Initializer {
     }
 
     /// [v2.1 E-6] Resolve the slipstream provisioning anchor. RESTORE ⇒ `chainTip` = the
-    /// recover_until height (always present by the engine's policy: live tip, or offline
-    /// max(bundled checkpoint, birthday+1) — never NULL, the syncLogsMac9 rule). NEW ⇒
-    /// `treeState` = the reorg-safe recent server tree state, or nil offline (the caller
-    /// keeps the bundled checkpoint defaults).
+    /// recover_until height: the engine's live tip, or offline max(bundled checkpoint,
+    /// birthday+1) (the syncLogsMac9 rule), which is also what a server tip above Int32.max
+    /// gets. There is NO anchor only when it can't be resolved at all, or carries a height the
+    /// SDK can't use (see `SlipstreamRestoreAnchor.init(serverHeight:treeState:)`). `chainTip`
+    /// is then nil and the account is created without a recovery height: the restore looks
+    /// like a new wallet, and `isRecovering` stays false while it catches up. NEW ⇒
+    /// `treeState` = the reorg-safe recent server tree state, or nil offline or without an
+    /// anchor (the caller keeps the bundled checkpoint defaults).
     private func resolveSlipstreamAnchor(
         _ anchorSource: (Bool, BlockHeight, BlockHeight) async -> SlipstreamRestoreAnchor?,
         checkpointSource: CheckpointSource,

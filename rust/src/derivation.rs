@@ -22,6 +22,9 @@ use zcash_client_backend::{
         UnifiedSpendingKey,
     },
 };
+use zcash_keys::constants::{
+    hrp_sapling_extended_full_viewing_key, hrp_sapling_extended_spending_key,
+};
 use zcash_protocol::consensus::{NetworkConstants, NetworkType, Parameters};
 use zip32::{ChainCode, ChildIndex, DiversifierIndex, arbitrary, registered::PathElement};
 
@@ -247,10 +250,11 @@ pub unsafe extern "C" fn zcashlc_is_valid_sapling_extended_spending_key(
         let network = parse_network(network_id)?;
         let extsk = unsafe { CStr::from_ptr(extsk).to_str()? };
 
-        Ok(
-            decode_extended_spending_key(network.hrp_sapling_extended_spending_key(), extsk)
-                .is_ok(),
+        Ok(decode_extended_spending_key(
+            hrp_sapling_extended_spending_key(network.network_type()),
+            extsk,
         )
+        .is_ok())
     });
     unwrap_exc_or(res, false)
 }
@@ -264,17 +268,16 @@ pub unsafe extern "C" fn zcashlc_is_valid_sapling_extended_spending_key(
 /// - The memory referenced by `key` must not be mutated for the duration of the function call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_is_valid_viewing_key(key: *const c_char, network_id: u32) -> bool {
-    let res =
-        catch_panic(|| {
-            let network = parse_network(network_id)?;
-            let vkstr = unsafe { CStr::from_ptr(key).to_str()? };
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let vkstr = unsafe { CStr::from_ptr(key).to_str()? };
 
-            Ok(decode_extended_full_viewing_key(
-                network.hrp_sapling_extended_full_viewing_key(),
-                vkstr,
-            )
-            .is_ok())
-        });
+        Ok(decode_extended_full_viewing_key(
+            hrp_sapling_extended_full_viewing_key(network.network_type()),
+            vkstr,
+        )
+        .is_ok())
+    });
     unwrap_exc_or(res, false)
 }
 
@@ -1027,7 +1030,7 @@ mod tests {
 
         let ufvk_str = ufvk.encode(network).unwrap();
         let uivk_str = uivk.encode(network).unwrap();
-        let ua_str = ua.encode_receiver_preserving(network);
+        let ua_str = ua.encode(network);
 
         assert!(
             ufvk_str.starts_with(ufvk_prefix),
@@ -1058,7 +1061,7 @@ mod tests {
             "the transparent receiver must survive: {ua_str}"
         );
         let decoded_ua = UnifiedAddress::try_from(raw_ua).expect("converts to a UnifiedAddress");
-        assert_eq!(decoded_ua.encode_receiver_preserving(network), ua_str);
+        assert_eq!(decoded_ua.encode(network), ua_str);
     }
 
     #[test]
@@ -1119,7 +1122,7 @@ mod tests {
                 "upstream vector must be revision 0"
             );
             let ua = UnifiedAddress::try_from(raw).expect("converts to a UnifiedAddress");
-            let re_encoded = ua.encode_receiver_preserving(&MAIN_NETWORK);
+            let re_encoded = ua.encode(&MAIN_NETWORK);
             assert_eq!(
                 re_encoded, vector,
                 "must reproduce the upstream vector exactly"
@@ -1188,7 +1191,7 @@ mod tests {
         let transparent_only_ua =
             UnifiedAddress::try_from(raw_ua).expect("converts to a UnifiedAddress");
 
-        let encoded_ua = transparent_only_ua.encode_receiver_preserving(&MAIN_NETWORK);
+        let encoded_ua = transparent_only_ua.encode(&MAIN_NETWORK);
         assert_eq!(
             encoded_ua, transparent_only_ua_str,
             "a transparent-only address must encode at revision 2"
@@ -1228,7 +1231,7 @@ mod tests {
         let (_, _, raw_ua) = unified::Address::decode(&input).expect("the fixture string decodes");
         let decoded = UnifiedAddress::try_from(raw_ua).expect("converts to a UnifiedAddress");
 
-        assert_eq!(decoded.encode_receiver_preserving(&MAIN_NETWORK), input);
+        assert_eq!(decoded.encode(&MAIN_NETWORK), input);
     }
 
     /// A data item of a typecode this crate does not interpret keeps its place at revision 0.
@@ -1378,7 +1381,7 @@ mod tests {
             UnifiedAddress::try_from(raw_ua).expect("converts to a UnifiedAddress");
 
         assert_eq!(
-            ua_with_expiry.encode_receiver_preserving(&MAIN_NETWORK),
+            ua_with_expiry.encode(&MAIN_NETWORK),
             with_expiry_str,
             "an address with expiry metadata must encode at revision 2"
         );

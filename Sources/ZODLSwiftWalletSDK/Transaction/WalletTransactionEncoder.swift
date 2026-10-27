@@ -182,12 +182,19 @@ class WalletTransactionEncoder: TransactionEncoder {
     func submit(
         transaction: EncodedTransaction
     ) async throws {
-        let response = try await self.lightWalletService.submit(
-            spendTransaction: transaction.raw,
-            mode: await sdkFlags.torEnabled
+        let mode = await sdkFlags.torEnabled
             ? ServiceMode.txIdGroup(prefix: "submit", txId: transaction.transactionId)
             : ServiceMode.direct
-        )
+
+        // Nothing is submitted that cannot be valid in the next block, which is the one after the higher of the wallet's chain tip
+        // and the height of the server this goes to. That height is read from the service, and in the mode, that submit the
+        // transaction, and a height that cannot be read fails the submission, as does a transaction that cannot be judged.
+        if let refusal = try await lightWalletService.submissionRefusal(for: transaction.raw, mode: mode, using: rustBackend) {
+            logger.warn("Transaction \(transaction.transactionId.toHexStringTxId()) is not submitted: \(refusal.description)")
+            throw TransactionEncoderError.notSubmittable(refusal)
+        }
+
+        let response = try await lightWalletService.submit(spendTransaction: transaction.raw, mode: mode)
 
         guard response.errorCode >= 0 else {
             throw TransactionEncoderError.submitError(code: Int(response.errorCode), message: response.errorMessage)

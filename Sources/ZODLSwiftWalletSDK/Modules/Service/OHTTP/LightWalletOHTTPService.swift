@@ -17,6 +17,23 @@ import Foundation
 // swiftlint:disable:next type_body_length
 final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     private let clients = OHTTPClientPool()
+    /// The range RPC stays injectable so returned wire blocks can be validated offline.
+    var blockRangeRPC: (OHTTPGRPCClient, BlockRange) async throws -> [CompactBlock] = { client, range in
+        try await client.serverStreaming(
+            path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+            request: range
+        )
+    }
+
+    var latestBlockRPC: (OHTTPGRPCClient, ChainSpec) async throws -> BlockID = { client, spec in
+        try await client.unary(path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock", request: spec)
+    }
+    var transactionRPC: (OHTTPGRPCClient, TxFilter) async throws -> RawTransaction = { client, filter in
+        try await client.unary(path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction", request: filter)
+    }
+    var utxosRPC: (OHTTPGRPCClient, GetAddressUtxosArg) async throws -> [GetAddressUtxosReply] = { client, args in
+        try await client.serverStreaming(path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream", request: args)
+    }
     private let torClient: TorClient
     private let gatewayHost: String?
     private let gatewayRelayURL: String?
@@ -194,10 +211,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             return try await fetchHalves(client, from: start, to: end)
         }
         do {
-            return try await client.serverStreaming(
-                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
-                request: BlockRange(startHeight: start, endHeight: end)
-            )
+            return try await blockRangeRPC(client, BlockRange(startHeight: start, endHeight: end))
         } catch LightWalletServiceError.failed(let code, _) where code == OHTTPGRPCStatus.invalidArgument && end - start >= Self.minimumSplitSpan {
             return try await fetchHalves(client, from: start, to: end)
         }
@@ -235,10 +249,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
 
         do {
-            return try await client.unary(
-                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
-                request: ChainSpec()
-            )
+            return try await latestBlockRPC(client, ChainSpec())
         } catch {
             let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
             throw ZcashError.serviceLatestBlockFailed(serviceError)
@@ -246,11 +257,15 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     }
 
     override func latestBlockHeight(mode: ServiceMode) async throws -> BlockHeight {
-        let blockID = try await latestBlock(mode: mode)
-        guard let height = Int(exactly: blockID.height) else {
-            throw LightWalletServiceError.generalError(message: "error creating blockheight from BlockID \(blockID)")
+        do {
+            let blockID = try await latestBlock(mode: mode)
+            guard let height = BlockHeight(serverHeight: blockID.height) else {
+                throw LightWalletServiceError.generalError(message: "The server reported a latest block with a height the SDK can't use.")
+            }
+            return height
+        } catch {
+            throw ZcashError.serviceLatestBlockHeightFailed(error.mapToServiceError())
         }
-        return height
     }
 
     override func blockRange(_ range: CompactBlockRange, mode: ServiceMode) throws -> AsyncThrowingStream<ZcashCompactBlock, Error> {
@@ -269,7 +284,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     let blocks = try await self.fetchBlocks(client, from: range.lowerBound, to: range.upperBound)
 
                     for block in blocks {
-                        continuation.yield(ZcashCompactBlock(compactBlock: block))
+                        continuation.yield(try ZcashCompactBlock(compactBlock: block))
                     }
                     continuation.finish()
                 } catch {
@@ -309,21 +324,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         txFilter.hash = txId
 
         do {
-            let rawTx: RawTransaction = try await client.unary(
-                path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction",
-                request: txFilter
-            )
+            let rawTx = try await transactionRPC(client, txFilter)
 
-            let isNotMined = rawTx.height == 0 || rawTx.height > UInt32.max
-
-            return (
-                tx: ZcashTransaction.Fetched(
-                    rawID: txId,
-                    minedHeight: isNotMined ? nil : UInt32(rawTx.height),
-                    raw: rawTx.data
-                ),
-                status: isNotMined ? .notInMainChain : .mined(Int(rawTx.height))
-            )
+            return ZcashTransaction.Fetched.returned(rawID: txId, raw: rawTx.data, atServerHeight: rawTx.height)
         } catch let error as LightWalletServiceError {
             // Map specific error messages to txidNotRecognized
             if case .failed(let code, let message) = error {
@@ -370,20 +373,10 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     args.addresses = tAddresses
                     args.startHeight = UInt64(height)
 
-                    let replies: [GetAddressUtxosReply] = try await client.serverStreaming(
-                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream",
-                        request: args
-                    )
+                    let replies = try await self.utxosRPC(client, args)
 
                     for reply in replies {
-                        let utxo = UTXO(
-                            address: reply.address,
-                            prevoutTxId: reply.txid,
-                            prevoutIndex: Int(reply.index),
-                            script: reply.script,
-                            valueZat: Int(reply.valueZat),
-                            height: Int(reply.height)
-                        )
+                        let utxo = try UTXO(reply: reply)
                         continuation.yield(utxo)
                     }
                     continuation.finish()
@@ -416,7 +409,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                     let blocks = try await self.fetchBlocks(client, from: startHeight, to: endHeight)
 
                     for block in blocks {
-                        continuation.yield(ZcashCompactBlock(compactBlock: block))
+                        continuation.yield(try ZcashCompactBlock(compactBlock: block))
                     }
                     continuation.finish()
                 } catch {

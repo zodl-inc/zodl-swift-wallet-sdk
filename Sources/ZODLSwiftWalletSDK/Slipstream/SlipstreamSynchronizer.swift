@@ -625,9 +625,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         passGeneration += 1
         let birthday = BlockHeight(initializer.walletBirthday)
         // [v2.1 Phase 2] Tip freshness ([#1591]) is ENGINE-OWNED (snapshot.tipFresh, E-2):
-        // the FFI start() captures the refresh baseline and keeps freshness across a <120 s
-        // stop→start hop — the SDKFlags.sdkStarted()/chainTipAtRunStart parity machinery
-        // this block used to carry is deleted.
+        // the FFI start() captures the refresh baseline and keeps freshness across a stop→start
+        // hop shorter than 1.6 target block intervals (120 s before NU7, 40 s from it) — the
+        // SDKFlags.sdkStarted()/chainTipAtRunStart parity machinery this block used to carry is
+        // deleted.
         // B4: a new run starts with a fresh stall-watchdog window. [MOB-1850] The recovery
         // BUDGET only resets when the app is starting a run of its own: the stall recovery
         // restarts the pass by calling this very method, and letting that call clear the
@@ -733,7 +734,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             ))
         }
         // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
-        // moment, and a start() more than 120 s later re-masks via snapshot.tipFresh (E-2).
+        // moment, and a start() more than 1.6 target block intervals later (120 s before NU7,
+        // 40 s from it) re-masks via snapshot.tipFresh (E-2).
         // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
         // non-quiescent one changes nothing here beyond what a reader of the logs should know:
         // the pass is stopped either way, and an engine writer that outlives it has only the
@@ -1662,9 +1664,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // re-scan as a genuine 0→100% climb (the `forceCounterProgressUntilDone` host bypass
         // is deleted). One host job remains: RESTART the pass — the follow loop only
         // re-syncs when the server tip advances (`session.rs` `should_resync`), so without a
-        // restart the re-scan would wait for the next block (≤ ~75 s). A restart hiccup must
-        // never fail an otherwise-successful import, so it is not rethrown here — but it must
-        // not go unreported either, so `publishStoppedWithError` puts it on the state stream.
+        // restart the re-scan would wait for the next block (about 75 s before NU7, 25 s from it).
+        // A restart hiccup must never fail an otherwise-successful import, so it is not rethrown
+        // here — but it must not go unreported either, so `publishStoppedWithError` puts it on the
+        // state stream.
         initializer.logger.debug(
             "[#1755] importAccount: wasRunning=\(wasRunning) "
             + (wasRunning ? "→ restarting sync pass now to surface the re-scan" : "→ next start() will re-scan")
@@ -2408,6 +2411,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
+    public func setMigrationNetworkUpgradeGateBypass(_ isBypassed: Bool) async {
+        // Wallet-scoped: the host's one holder is shared by every account's migration.
+        await migrationHost.setUpgradeGateBypass(isBypassed)
+    }
+
+    public func migrationAvailability() async throws -> MigrationAvailability {
+        // Wallet-scoped (the gate depends on the chain alone), so this lives on the host, which
+        // passes its own bypass holder's value, not on a per-account actor.
+        try await migrationHost.migrationAvailability()
+    }
+
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
     }
@@ -2525,8 +2539,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationRestartOutcome {
         try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+    }
+
+    public func cancelMigrationRun(accountUUID: AccountUUID) async throws {
+        try await migrationHost.migration(for: accountUUID).cancelMigrationRun()
     }
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
@@ -2882,12 +2900,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
-    /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral connections built by
-    /// `SDKSynchronizer.makeService`: OHTTP gateways get `LightWalletOHTTPService` (a plain gRPC
-    /// probe to a gateway is refused with 426, so a healthy gateway would never rank), and with
-    /// Tor enabled every probe rides a Tor circuit — a benchmark of clearnet fallbacks must not
-    /// leak the device IP to servers the user has not chosen.
+    /// and the loose synced-height check. A custom-parameter network may reach servers that
+    /// identify with a different base chain and report a nonstandard consensus branch id, so
+    /// only the chain-name and branch-id checks are skipped for it, mirroring
+    /// `ValidateServerAction`; the synced-height check runs for every network. Delegates to
+    /// ephemeral connections from `SDKSynchronizer.makeService`, retaining OHTTP gateway routing
+    /// and Tor privacy for every probe.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
@@ -2915,9 +2933,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
 
             let isCustomNetwork = initializer.network.customActivationHeights != nil
+            let spacing = TargetBlockSpacing(network: initializer.network)
 
             for await result in group {
                 guard let (endpoint, elapsed, info) = result, elapsed > 0 else { continue }
+
+                // Rule out servers that report a tip the SDK can't use. This comes before anything converts or adds to the
+                // height, and it applies to custom networks too, which skip the branch id check below.
+                guard let tipHeight = BlockHeight(serverHeight: info.blockHeight) else { continue }
 
                 if !isCustomNetwork {
                     guard (info.chainName == "main" && network == .mainnet)
@@ -2928,7 +2951,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
                     guard
                         let localBranchID = try? initializer.rustBackend.consensusBranchIdFor(
-                            height: Int32(info.blockHeight)
+                            height: Int32(tipHeight)
                         ),
                         let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID),
                         remoteBranchID == localBranchID
@@ -2938,8 +2961,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 }
 
                 // Rule out servers that are syncing, stuck, or probably on the wrong fork.
-                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate.
-                guard info.blockHeight + ZcashSDK.syncedThresholdBlocks >= info.estimatedHeight else {
+                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate; see `ServerSyncCheck`.
+                guard ServerSyncCheck.isSynced(blockHeight: info.blockHeight, estimatedHeight: info.estimatedHeight, spacing: spacing) else {
                     continue
                 }
 
@@ -3262,6 +3285,7 @@ private extension SlipstreamSynchronizer {
                     Task { await self.engine.notifyTxChange() }
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
+                    // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
@@ -3271,6 +3295,11 @@ private extension SlipstreamSynchronizer {
                     }
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
+                } catch TransactionEncoderError.notSubmittable(let refusal) {
+                    // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
+                    // network, so there is no server to ask whether it knows the transaction.
+                    submitFailed = true
+                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
                 }
             }
         })

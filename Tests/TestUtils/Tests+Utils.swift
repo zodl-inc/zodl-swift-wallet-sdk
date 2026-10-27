@@ -176,7 +176,8 @@ extension ZcashRustBackend {
         fsBlockDbRoot: URL,
         spendParamsPath: URL = SaplingParamsSourceURL.default.spendParamFileURL,
         outputParamsPath: URL = SaplingParamsSourceURL.default.outputParamFileURL,
-        networkType: NetworkType
+        networkType: NetworkType,
+        migrationUpgradeGateBypass: MigrationUpgradeGateBypass = MigrationUpgradeGateBypass()
     ) -> ZcashRustBackend {
         ZcashRustBackend(
             dbData: dbData,
@@ -184,7 +185,8 @@ extension ZcashRustBackend {
             spendParamsPath: spendParamsPath,
             outputParamsPath: outputParamsPath,
             networkType: networkType,
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            migrationUpgradeGateBypass: migrationUpgradeGateBypass
         )
     }
 }

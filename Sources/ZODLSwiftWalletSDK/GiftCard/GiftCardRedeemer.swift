@@ -18,8 +18,9 @@ public struct GiftCardStatus: Equatable {
         /// confirmations.
         ///
         /// Card funds come from another wallet, so they are untrusted in the sense of
-        /// [ZIP 315](https://zips.z.cash/zip-0315) and need 10 confirmations (roughly 12 minutes)
-        /// before they can be spent. Call ``GiftCardRedeemer/check()`` again later.
+        /// [ZIP 315](https://zips.z.cash/zip-0315) and need 10 confirmations (roughly 12 minutes at
+        /// 75-second blocks, 4 minutes from NU7) before they can be spent. Call
+        /// ``GiftCardRedeemer/check()`` again later.
         case pending
         /// The card's spendable funds do not exceed the fee of the transaction that would sweep
         /// them, and nothing else is on its way: redeeming it would leave nothing for the

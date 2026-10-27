@@ -345,6 +345,8 @@ struct GiftCardCancellationFixture {
         let service = LightWalletServiceMock()
         service.closeConnectionsClosure = {}
         service.getTreeStateModeClosure = { _, _ in throw LightWalletServiceError.timeOut }
+        // The submission is judged at the height of the server it goes to, which stands where the card wallet's chain tip does.
+        service.latestBlockHeightModeReturnValue = 3_000_010
         service.submitSpendTransactionModeReturnValue = SendResponse()
         let repository = TransactionRepositoryMock()
         repository.closeDBConnectionClosure = {}

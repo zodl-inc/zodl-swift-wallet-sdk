@@ -50,8 +50,9 @@ public struct SlipstreamSnapshot {
     public let stalledSeconds: UInt32
     // ── Engine API v2.1 fields ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]
-    /// stale-tip fact, engine-owned; survives stop→start hops under 120 s). While 0, the
-    /// host masks spendable balances (`WalletSummary.withSpendableMasked()`).
+    /// stale-tip fact, engine-owned; survives stop→start hops under 1.6 target block
+    /// intervals: 120 s before NU7, 40 s from it). While 0, the host masks spendable balances
+    /// (`WalletSummary.withSpendableMasked()`).
     public let tipFresh: UInt8
     /// [E-4] Monotonic version of the wallet's stored transaction set (enhancement writes,
     /// mempool hits, boundary reconcile-linkage transitions, submit pokes). Host rule:

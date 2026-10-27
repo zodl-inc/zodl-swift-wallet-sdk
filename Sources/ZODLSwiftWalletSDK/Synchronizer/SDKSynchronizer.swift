@@ -438,11 +438,11 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         }
 
         // called when a new account is imported
-        let chainTip = try? await UInt32(
-            initializer.lightWalletService.latestBlockHeight(
-                mode: await sdkFlags.ifTor(.uniqueTor)
-            )
+        let latestBlockHeight = try? await initializer.lightWalletService.latestBlockHeight(
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
+        // A tip that doesn't fit `UInt32` is treated like a tip that couldn't be fetched.
+        let chainTip = latestBlockHeight.flatMap { UInt32(exactly: $0) }
 
         let checkpointSource = initializer.container.resolve(CheckpointSource.self)
 
@@ -570,6 +570,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                     try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
+                    // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
@@ -582,6 +583,11 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                     }
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
+                } catch TransactionEncoderError.notSubmittable(let refusal) {
+                    // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
+                    // network, so there is no server to ask whether it knows the transaction.
+                    submitFailed = true
+                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
                 }
             }
         })
@@ -1084,10 +1090,17 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             // ValidateServerAction. Without the skip every candidate would be ruled out and this API
             // would always return an empty list for custom networks.
             let isCustomNetwork = initializer.network.customActivationHeights != nil
+            let spacing = TargetBlockSpacing(network: initializer.network)
 
             for await result in group {
                 // rule out results where calls failed
                 guard let info = result.info, result.latestBlockHeight != nil else {
+                    continue
+                }
+
+                // Rule out servers that report a tip the SDK can't use. This comes before anything converts or adds to the
+                // height, and it applies to custom networks too, which skip the branch id check below.
+                guard let tipHeight = BlockHeight(serverHeight: info.blockHeight) else {
                     continue
                 }
 
@@ -1100,7 +1113,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                     }
 
                     // rule out mismatch of consensus branch IDs
-                    guard let localBranchID = await blockProcessor.consensusBranchIdFor(Int32(info.blockHeight)) else {
+                    guard let localBranchID = await blockProcessor.consensusBranchIdFor(Int32(tipHeight)) else {
                         continue
                     }
 
@@ -1113,11 +1126,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                     }
                 }
 
-                // Rule out servers that are syncing, stuck, or probably on the wrong fork.
-                // To avoid falsely ruling out all servers this can only be a very loose check
-                // (i.e. `ZcashSDK.syncedThresholdBlocks` should not be too small),
-                // because `info.estimatedHeight` may be quite inaccurate.
-                guard info.blockHeight + ZcashSDK.syncedThresholdBlocks >= info.estimatedHeight else {
+                // Rule out servers that are syncing, stuck, or probably on the wrong fork. This can only be a
+                // very loose check, because `info.estimatedHeight` may be quite inaccurate; see `ServerSyncCheck`.
+                guard ServerSyncCheck.isSynced(blockHeight: info.blockHeight, estimatedHeight: info.estimatedHeight, spacing: spacing) else {
                     continue
                 }
 
@@ -1165,15 +1176,20 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
             let service = serviceDict.value.service
 
-            guard info.blockHeight >= nBlocksToFetch else {
+            // The early guard on the tip already ruled out a height the SDK can't use; the two bindings are defence in depth.
+            guard
+                info.blockHeight >= nBlocksToFetch,
+                let startHeight = BlockHeight(serverHeight: info.blockHeight - nBlocksToFetch),
+                let endHeight = BlockHeight(serverHeight: info.blockHeight)
+            else {
                 continue
             }
 
             do {
                 // Fetched the same way as in `BlockDownloader`.
                 let stream = try service.service.blockStream(
-                    startHeight: BlockHeight(info.blockHeight - nBlocksToFetch),
-                    endHeight: BlockHeight(info.blockHeight),
+                    startHeight: startHeight,
+                    endHeight: endHeight,
                     mode: .direct
                 )
 
@@ -1616,6 +1632,17 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         try await migrationHost.migration(for: accountUUID).advanceStep()
     }
 
+    public func setMigrationNetworkUpgradeGateBypass(_ isBypassed: Bool) async {
+        // Wallet-scoped: the host's one holder is shared by every account's migration.
+        await migrationHost.setUpgradeGateBypass(isBypassed)
+    }
+
+    public func migrationAvailability() async throws -> MigrationAvailability {
+        // Wallet-scoped (the gate depends on the chain alone), so this lives on the host, which
+        // passes its own bypass holder's value, not on a per-account actor.
+        try await migrationHost.migrationAvailability()
+    }
+
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
         try await migrationHost.migration(for: accountUUID).migrationProgress()
     }
@@ -1737,8 +1764,12 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationRestartOutcome {
         try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+    }
+
+    public func cancelMigrationRun(accountUUID: AccountUUID) async throws {
+        try await migrationHost.migration(for: accountUUID).cancelMigrationRun()
     }
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
