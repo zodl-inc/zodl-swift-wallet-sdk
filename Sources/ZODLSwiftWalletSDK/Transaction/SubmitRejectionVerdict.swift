@@ -22,6 +22,20 @@ enum EndpointSubmission: Equatable {
         self != .failed
     }
 
+    /// Whether the endpoint holds the transaction: it accepted it, or refused it because it
+    /// already holds it (``SubmitRefusal/acceptedMarkers``). The submitters record the latter as
+    /// `.accepted`; this reads a recorded refusal the same way.
+    var isAcceptance: Bool {
+        switch self {
+        case .accepted:
+            return true
+        case let .refused(code, message):
+            return SubmitRefusal.meansAccepted(code: code, message: message)
+        case .failed:
+            return false
+        }
+    }
+
     /// The terminal refusal this answer is, if any.
     var rejection: SubmitRejection? {
         guard case let .refused(code, message) = self else { return nil }
@@ -47,8 +61,9 @@ func endpointKey(_ endpoint: LightWalletEndpoint) -> String {
 /// A node that explicitly refuses a transaction for good (a ``SubmitRejection``) has rejected it,
 /// and that is reported as an error rather than left pending, but only once nothing else can still
 /// take it. So it is rejected only when every endpoint in `planEndpoints` gave an explicit server
-/// answer (accepted or refused), none of `outcomes` accepted it, and at least one is a terminal
-/// refusal; a transient refusal beside it does not prevent the verdict.
+/// answer (accepted or refused), none of `outcomes` accepted it (an endpoint that already holds
+/// it counts as accepting it), and at least one is a terminal refusal; an inconclusive refusal
+/// beside it does not prevent the verdict.
 ///
 /// A transport failure (`.failed`: a connection lost, a timeout, any thrown error) is not an
 /// answer: the request may have reached the server and been accepted, with only the reply lost.
@@ -63,7 +78,7 @@ func submitRejectionVerdict(
     outcomes: [String: EndpointSubmission],
     previous: StoredRejection?
 ) -> StoredRejection? {
-    guard !outcomes.values.contains(.accepted) else { return nil }
+    guard !outcomes.values.contains(where: \.isAcceptance) else { return nil }
     guard planEndpoints.allSatisfy({ outcomes[endpointKey($0)]?.isServerAnswer == true }) else { return previous }
     let ordered = planEndpoints.compactMap { outcomes[endpointKey($0)] }
         + outcomes.keys.sorted().filter { key in !planEndpoints.contains { endpointKey($0) == key } }.compactMap { outcomes[$0] }

@@ -196,6 +196,10 @@ actor SubmissionRace {
         do {
             try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
             submissionSucceeded(at: endpoint)
+        } catch let TransactionEncoderError.submitError(code, message) where SubmitRefusal.meansAccepted(code: code, message: message) {
+            // The server already holds the transaction: that is its acceptance.
+            logger.debug("Transaction \(transaction.txId.toHexStringTxId()) is already held by \(endpoint.host):\(endpoint.port): \(code) \(message)")
+            submissionSucceeded(at: endpoint)
         } catch let TransactionEncoderError.submitError(code, message) {
             submissionRejected(at: endpoint, code: code, message: message)
         } catch is CancellationError {

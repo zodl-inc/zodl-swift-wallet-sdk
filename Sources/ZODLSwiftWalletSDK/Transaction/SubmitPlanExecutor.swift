@@ -57,6 +57,11 @@ final class SubmitPlanExecutor {
                 logger.debug("Transaction \(txId) background retry accepted by \(endpoint.host):\(endpoint.port).")
                 answers[endpointKey(endpoint)] = .accepted
                 return SubmitPlanAttempt(accepted: endpoint, answers: answers, lastError: nil)
+            } catch let TransactionEncoderError.submitError(code, message) where SubmitRefusal.meansAccepted(code: code, message: message) {
+                // The server already holds the transaction: that is its acceptance.
+                logger.debug("Transaction \(txId) background retry: \(endpoint.host):\(endpoint.port) already holds it: \(code) \(message)")
+                answers[endpointKey(endpoint)] = .accepted
+                return SubmitPlanAttempt(accepted: endpoint, answers: answers, lastError: nil)
             } catch let TransactionEncoderError.submitError(code, message) {
                 logger.warn("Transaction \(txId) background retry to \(endpoint.host):\(endpoint.port) refused: \(code) \(message)")
                 answers[endpointKey(endpoint)] = .refused(code: code, message: message)

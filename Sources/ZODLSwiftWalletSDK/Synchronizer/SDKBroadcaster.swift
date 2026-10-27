@@ -336,7 +336,7 @@ extension SDKBroadcaster {
     ) async {
         await settlements.run { [self] in
             let answers = await result.settledEndpointOutcomes()
-            if let accepting = endpoints.first(where: { answers[endpointKey($0)] == .accepted }) {
+            if let accepting = endpoints.first(where: { answers[endpointKey($0)]?.isAcceptance == true }) {
                 logger.info("Transaction \(txId.toHexStringTxId()) accepted by \(endpointKey(accepting)) after the caller was released.")
                 await submitPlanStore.markAccepted(txId: txId, host: endpointKey(accepting), lifecycle: lifecycle)
             } else {

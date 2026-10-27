@@ -120,7 +120,7 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
         XCTAssertNil(unplanned, "the mark does not create a plan")
 
         await reopened.recordPlan(txId: txId, endpoints: [endpointA])
-        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vin-empty", lifecycle: await reopened.currentLifecycle())
+        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vout-negative", lifecycle: await reopened.currentLifecycle())
         let plan = await reopened.plan(for: txId)
         XCTAssertEqual(plan, .ready([endpointA], acceptedBy: nil))
     }

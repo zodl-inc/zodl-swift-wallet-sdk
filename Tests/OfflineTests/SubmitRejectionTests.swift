@@ -11,72 +11,136 @@ final class SubmitRejectionTests: XCTestCase {
     private let zakuraTooLarge = "transaction is 260001 bytes, exceeding the configured mempool maximum of 250000"
     private let zebraTooLarge = "transaction has 90 actions, exceeding the next block's ZIP 218 limit of 75"
 
-    // MARK: - Classifier (the same table as the Android SDK)
+    // MARK: - Classifier (the same lists as the Android SDK)
 
-    func testAMempoolMaximumOrZip218RefusalOnMinus25IsTooLarge() {
+    func testASizeLimitRefusalUnderAVerificationCodeIsTooLarge() {
         XCTAssertEqual(SubmitRejection(code: -25, message: zakuraTooLarge), .tooLarge)
         XCTAssertEqual(SubmitRejection(code: -25, message: zebraTooLarge), .tooLarge)
         XCTAssertEqual(SubmitRejection(code: -25, message: zakuraTooLarge.uppercased()), .tooLarge)
+        XCTAssertEqual(SubmitRejection(code: -26, message: zebraTooLarge), .tooLarge)
+        XCTAssertEqual(SubmitRejection(code: -26, message: "16: bad-txns-oversize"), .tooLarge, "too large before invalid")
     }
 
-    func testTheSizeTextsUnderAVerificationCodeAreTooLarge() {
+    func testASizeLimitTextUnderAnotherCodeIsInconclusive() {
         XCTAssertNil(SubmitRejection(code: -1, message: zakuraTooLarge))
         XCTAssertNil(SubmitRejection(code: -1, message: zebraTooLarge))
-        XCTAssertEqual(SubmitRejection(code: -26, message: zebraTooLarge), .tooLarge)
-        XCTAssertEqual(SubmitRejection(code: -26, message: "64: tx-size"), .tooLarge)
-        XCTAssertEqual(SubmitRejection(code: -26, message: "16: bad-txns-oversize"), .tooLarge)
-        XCTAssertEqual(SubmitRejection(code: -25, message: "transaction is too large"), .tooLarge)
     }
 
-    func testAnExpiryRefusalOnAVerificationCodeIsExpired() {
-        XCTAssertEqual(SubmitRejection(code: -26, message: "tx-overwinter-expired"), .expired)
+    func testTextsOnNoNodesListAreInconclusive() {
+        // Not a zcashd or Zebra message: dropped from the lists.
+        XCTAssertNil(SubmitRejection(code: -26, message: "64: tx-size"))
+        XCTAssertNil(SubmitRejection(code: -25, message: "transaction is too large"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "16: bad-txns-vin-empty"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "bad-txns-sapling-binding-signature-invalid"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "transaction is invalid"), "a bare \"invalid\" is not terminal")
+    }
+
+    func testAnExpiryRefusalUnderAVerificationCodeIsExpired() {
+        XCTAssertEqual(SubmitRejection(code: -26, message: "16: tx-overwinter-expired"), .expired)
         XCTAssertEqual(SubmitRejection(code: -25, message: "tx-expiring-soon"), .expired)
-        XCTAssertEqual(SubmitRejection(code: -25, message: "block height 100 is greater than its expiry height 90"), .expired)
+        XCTAssertEqual(SubmitRejection(code: -25, message: "transaction has expired"), .expired)
+        XCTAssertEqual(
+            SubmitRejection(code: -25, message: "transaction must not be mined at a block Height(100) greater than its expiry Height(90)"),
+            .expired
+        )
     }
 
-    func testAnExpiryTextUnderAnotherCodeIsTransient() {
+    func testAnExpiryTextUnderAnotherCodeIsInconclusive() {
         XCTAssertNil(SubmitRejection(code: -1, message: "tx-overwinter-expired"))
         XCTAssertNil(SubmitRejection(code: 0, message: "greater than its expiry"))
     }
 
-    func testOnlyKnownPermanentMinus26RefusalsAreInvalid() {
-        XCTAssertEqual(SubmitRejection(code: -26, message: "bad-txns-sapling-binding-signature-invalid"), .invalid)
-        XCTAssertEqual(SubmitRejection(code: -26, message: "16: bad-txns-vin-empty"), .invalid)
-        XCTAssertEqual(SubmitRejection(code: -26, message: "transaction is invalid"), .invalid)
-        XCTAssertEqual(SubmitRejection(code: -26, message: "64: non-final"), .invalid)
-        XCTAssertEqual(
-            SubmitRejection(code: -26, message: "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)"),
-            .invalid
-        )
+    func testSignatureProofAndStructuralRefusalsAreInvalid() {
+        let invalid = [
+            "16: bad-txns-invalid-joinsplit-signature",
+            "16: bad-txns-joinsplit-verification-failed",
+            "16: bad-txns-sapling-bundle-invalid",
+            "16: bad-sapling-bundle-authorization",
+            "16: bad-orchard-bundle-authorization",
+            "16: bad-txns-vout-negative",
+            "16: bad-txns-vout-toolarge",
+            "16: bad-txns-txouttotal-toolarge",
+            "16: bad-txns-txintotal-toolarge",
+            "16: mandatory-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
+            "16: bad-txns-no-source-of-funds",
+            "16: bad-txns-no-sink-of-funds",
+            "16: bad-tx-version-group-id",
+            "16: bad-nu5-tx-version-group-id",
+            "16: bad-tx-expiry-height-too-high",
+            "16: bad-tx-too-many-orchard-actions",
+            "Sapling bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: x",
+            "Orchard bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: x",
+            "spend proof MUST be valid given a primary input formed from the other fields except spendAuthSig: x",
+            "Groth16 proof is malformed: x",
+            "Sapling proof or signature verification failed",
+            "Orchard or Ironwood Halo2 proof verification failed",
+            "Orchard proof has a non-canonical size"
+        ]
+        for message in invalid {
+            XCTAssertEqual(SubmitRejection(code: -26, message: message), .invalid, message)
+            XCTAssertEqual(SubmitRejection(code: -25, message: message), .invalid, "Zebra refuses under -25: \(message)")
+            XCTAssertNil(SubmitRejection(code: -1, message: message), "only under a verification code: \(message)")
+        }
     }
 
-    func testAnUnrecognizedMinus26RefusalIsTransient() {
-        XCTAssertNil(SubmitRejection(code: -26, message: ""))
-        XCTAssertNil(SubmitRejection(code: -26, message: "bad"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "something new"))
-        XCTAssertNil(SubmitRejection(code: -25, message: "bad-txns-vin-empty"), "-25 is never invalid")
+    /// The reproduced refusal: a server that has not reached the wallet's anchor yet can accept the
+    /// same transaction once it catches up, so it never stops resubmission.
+    func testAnUnknownAnchorRefusalIsInconclusive() {
+        XCTAssertNil(SubmitRejection(code: -26, message: "16: bad-txns-orchard-unknown-anchor"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "16: bad-txns-sapling-unknown-anchor"))
+        XCTAssertNil(SubmitRejection(code: -26, message: "16: bad-txns-sprout-unknown-anchor"))
+        XCTAssertNil(SubmitRejection(code: -25, message: "bad-txns-orchard-unknown-anchor"))
+        XCTAssertEqual(SubmitRefusal(code: -26, message: "16: bad-txns-orchard-unknown-anchor"), .inconclusive)
     }
 
-    func testTransientMinus26RefusalsAreNotTerminal() {
-        XCTAssertNil(SubmitRejection(code: -26, message: "mempool full"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "66: min relay fee not met"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "66: insufficient fee"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "66: mempool min fee not met"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "64: too-long-mempool-chain"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "txn-already-known"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "txn-already-in-mempool"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "18: txn-mempool-conflict"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "transaction already in chain"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "transaction is already in the mempool"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "bad-txns-inputs-missingorspent"), "missing inputs, though under bad-txns-")
-        XCTAssertNil(SubmitRejection(code: -26, message: "18: bad-txns-inputs-spent"))
-        XCTAssertNil(SubmitRejection(code: -26, message: "Missing inputs"))
+    func testStateDependentRefusalsAreInconclusive() {
+        let inconclusive = [
+            "18: bad-txns-orchard-duplicate-nullifier",
+            "18: bad-txns-sapling-duplicate-nullifier",
+            "18: bad-txns-inputs-spent",
+            "16: bad-txns-inputs-missingorspent",
+            "18: txn-mempool-conflict",
+            "Missing inputs",
+            "66: min relay fee not met",
+            "66: insufficient fee",
+            "66: mempool min fee not met",
+            "mempool full",
+            "64: too-long-mempool-chain",
+            "64: non-final",
+            "16: bad-txns-nonfinal",
+            "16: bad-txns-fee-negative",
+            "bad",
+            "something new",
+            ""
+        ]
+        for message in inconclusive {
+            XCTAssertNil(SubmitRejection(code: -26, message: message), message)
+            XCTAssertNil(SubmitRejection(code: -25, message: message), message)
+            XCTAssertNotEqual(SubmitRefusal(code: -26, message: message), .accepted, message)
+        }
     }
 
-    func testOtherRefusalsAreTransient() {
+    func testARefusalSayingTheServerHoldsTheTransactionIsAnAcceptance() {
+        let held = [
+            (-26, "18: txn-already-in-mempool"),
+            (-26, "txn-already-known"),
+            (-27, "transaction already in block chain"),
+            (-1, "transaction already exists in mempool"),
+            (-25, "Transaction ALREADY EXISTS IN MEMPOOL")
+        ]
+        for (code, message) in held {
+            XCTAssertEqual(SubmitRefusal(code: code, message: message), .accepted, message)
+            XCTAssertTrue(SubmitRefusal.meansAccepted(code: code, message: message), message)
+            XCTAssertNil(SubmitRejection(code: code, message: message), message)
+            XCTAssertTrue(EndpointSubmission.refused(code: code, message: message).isAcceptance, message)
+        }
+    }
+
+    func testOtherRefusalsAreInconclusive() {
         XCTAssertNil(SubmitRejection(code: -25, message: "Missing inputs"))
         XCTAssertNil(SubmitRejection(code: -1, message: "connection reset"))
         XCTAssertNil(SubmitRejection(code: 0, message: ""))
+        XCTAssertEqual(SubmitRefusal(code: -1, message: "connection reset"), .inconclusive)
     }
 
     func testASubmitResultReportsItsRejection() {
@@ -88,14 +152,14 @@ final class SubmitRejectionTests: XCTestCase {
     }
 
     func testASubmissionOutcomeReportsItsRejection() {
-        XCTAssertEqual(TransactionSubmissionOutcome.rejected(code: -26, message: "bad-txns-vin-empty").rejection, .invalid)
+        XCTAssertEqual(TransactionSubmissionOutcome.rejected(code: -26, message: "bad-txns-vout-negative").rejection, .invalid)
         XCTAssertNil(TransactionSubmissionOutcome.unreachable.rejection)
         XCTAssertNil(TransactionSubmissionOutcome.timedOut.rejection)
     }
 
     func testARejectedPlanReportsItsKindAsTheSubmissionStatus() {
         XCTAssertEqual(StoredSubmitPlan.rejected(code: -25, reason: zakuraTooLarge).submissionStatus, .rejected(.tooLarge))
-        XCTAssertEqual(StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vin-empty").submissionStatus, .rejected(.invalid))
+        XCTAssertEqual(StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative").submissionStatus, .rejected(.invalid))
         XCTAssertEqual(StoredSubmitPlan.rejected(code: 0, reason: "").submissionStatus, .rejected(.invalid))
     }
 
@@ -103,7 +167,7 @@ final class SubmitRejectionTests: XCTestCase {
 
     private let endpointA = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
     private let endpointB = LightWalletEndpoint(address: "b.example.com", port: 9067, secure: true)
-    private var terminal: EndpointSubmission { .refused(code: -26, message: "bad-txns-vin-empty") }
+    private var terminal: EndpointSubmission { .refused(code: -26, message: "bad-txns-vout-negative") }
     private var transient: EndpointSubmission { .refused(code: -25, message: "Missing inputs") }
 
     func testEveryPlanEndpointRefusingTerminallyIsRejected() {
@@ -112,7 +176,7 @@ final class SubmitRejectionTests: XCTestCase {
             outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .refused(code: -25, message: zakuraTooLarge)],
             previous: nil
         )
-        XCTAssertEqual(verdict, StoredRejection(code: -26, reason: "bad-txns-vin-empty"), "the first refusal in plan order is recorded")
+        XCTAssertEqual(verdict, StoredRejection(code: -26, reason: "bad-txns-vout-negative"), "the first refusal in plan order is recorded")
     }
 
     func testOneExplicitRejectionWithAnUnansweredEndpointStaysPending() {
@@ -135,7 +199,7 @@ final class SubmitRejectionTests: XCTestCase {
                 outcomes: [endpointKey(endpointA): transient, endpointKey(endpointB): terminal],
                 previous: nil
             ),
-            StoredRejection(code: -26, reason: "bad-txns-vin-empty")
+            StoredRejection(code: -26, reason: "bad-txns-vout-negative")
         )
     }
 
@@ -175,7 +239,7 @@ final class SubmitRejectionTests: XCTestCase {
                 outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .refused(code: -25, message: zakuraTooLarge)],
                 previous: nil
             ),
-            StoredRejection(code: -26, reason: "bad-txns-vin-empty"),
+            StoredRejection(code: -26, reason: "bad-txns-vout-negative"),
             "a later explicit refusal by the inconclusive endpoint completes the verdict"
         )
     }
@@ -189,11 +253,33 @@ final class SubmitRejectionTests: XCTestCase {
         XCTAssertNil(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [:], previous: nil))
     }
 
+    func testAnEndpointThatAlreadyHoldsTheTransactionIsAnAcceptance() {
+        let held = EndpointSubmission.refused(code: -26, message: "18: txn-already-in-mempool")
+        XCTAssertNil(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): held, endpointKey(endpointB): terminal],
+                previous: StoredRejection(code: -26, reason: "bad-txns-vout-negative")
+            ),
+            "an endpoint holding the transaction clears any rejection"
+        )
+    }
+
+    func testAnUnknownAnchorRefusalNeverRejects() {
+        let anchor = EndpointSubmission.refused(code: -26, message: "16: bad-txns-orchard-unknown-anchor")
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [endpointKey(endpointA): anchor], previous: nil))
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): anchor, endpointKey(endpointB): .refused(code: -26, message: "16: bad-txns-sapling-unknown-anchor")],
+            previous: nil
+        ))
+    }
+
     func testARejectionWithAnAcceptanceIsNeverRejected() {
         XCTAssertNil(submitRejectionVerdict(
             planEndpoints: [endpointA, endpointB],
             outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .accepted],
-            previous: StoredRejection(code: -26, reason: "bad-txns-vin-empty")
+            previous: StoredRejection(code: -26, reason: "bad-txns-vout-negative")
         ))
     }
 
@@ -202,7 +288,7 @@ final class SubmitRejectionTests: XCTestCase {
         XCTAssertEqual(submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [endpointKey(endpointA): .failed], previous: previous), previous)
         XCTAssertEqual(
             submitRejectionVerdict(planEndpoints: [endpointA], outcomes: [endpointKey(endpointA): terminal], previous: previous),
-            StoredRejection(code: -26, reason: "bad-txns-vin-empty"),
+            StoredRejection(code: -26, reason: "bad-txns-vout-negative"),
             "the latest explicit rejection is recorded"
         )
     }
@@ -210,7 +296,7 @@ final class SubmitRejectionTests: XCTestCase {
     func testARefusalFromAnEndpointOutsideThePlanStillCounts() {
         XCTAssertEqual(
             submitRejectionVerdict(planEndpoints: [], outcomes: [endpointKey(endpointA): terminal], previous: nil),
-            StoredRejection(code: -26, reason: "bad-txns-vin-empty")
+            StoredRejection(code: -26, reason: "bad-txns-vout-negative")
         )
     }
 }

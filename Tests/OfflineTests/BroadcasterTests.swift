@@ -777,7 +777,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmitRejectedTerminallyByEveryEndpointIsRecordedAsRejected() async throws {
-        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? first.stop() }
         let second = try RecordingCompactTxStreamerService(
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "tx size exceeding the configured mempool maximum")
@@ -801,7 +801,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testOneExplicitRejectionBesideATransientRefusalIsRecordedAsRejected() async throws {
-        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? terminal.stop() }
         let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
         defer { try? transient.stop() }
@@ -845,7 +845,7 @@ final class BroadcasterTests: ZcashTestCase {
 
     // MARK: - The outcome agrees with the stored plan
 
-    private let invalidMessage = "bad-txns-sapling-binding-signature-invalid"
+    private let invalidMessage = "16: bad-txns-sapling-bundle-invalid"
 
     /// A server accepted the transaction, then refuses it with `-26` on a later submission: the
     /// plan stays accepted and resubmitted, so the outcome reports the acceptance, not a rejection.
@@ -1127,7 +1127,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testARejectionBesideAnAcceptanceIsNotRejected() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
         let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }
@@ -1147,7 +1147,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testLegacySubmitWithoutAPlanRecordsNoRejection() async throws {
         let rawID = Data(repeating: 0xE1, count: 32)
         let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
-        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns-vin-empty")
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns-vout-negative")
         let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
         await synchronizer.updateStatus(.stopped)
 
@@ -1216,7 +1216,7 @@ final class BroadcasterTests: ZcashTestCase {
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "exceeding the next block's ZIP 218 limit")
         )
         defer { try? first.stop() }
-        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? second.stop() }
 
         let transactions = try await synchronizer.broadcaster.createProposedTransactions(
@@ -1236,7 +1236,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testAMigrationPreparationRejectedByEveryEndpointStaysSubmitted() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
@@ -1250,7 +1250,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testALaterAcceptanceClearsARejection() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vin-empty"))
+        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
         let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }
@@ -1403,6 +1403,53 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "Legacy path must not register submit plans")
     }
 
+    // MARK: - Refusal classes
+
+    /// An endpoint that refuses the transaction because it already holds it has accepted it: a
+    /// terminal refusal from another endpoint does not reject it, and it is recorded as accepted.
+    func testARefusalSayingTheServerHoldsTheTransactionIsItsAcceptance() async throws {
+        let holding = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let refusing = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "18: txn-already-in-mempool"), for: holding)
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "16: bad-txns-sapling-bundle-invalid"), for: refusing)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [refusing, holding])
+
+        XCTAssertEqual(outcome, .accepted(by: holding))
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(holding)))
+    }
+
+    /// The reproduced refusal: a server that has not reached the wallet's Orchard or Sapling anchor
+    /// refuses the transaction, and may accept it once it catches up. It is never rejected, and
+    /// resubmission keeps retrying it.
+    func testAnUnknownAnchorRefusalKeepsTheTransactionPending() async throws {
+        let endpoint = LightWalletEndpoint(address: "custom.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        for (seed, message) in [(UInt8(0xA1), "16: bad-txns-orchard-unknown-anchor"), (UInt8(0xA2), "16: bad-txns-sapling-unknown-anchor")] {
+            endpointSubmitter.set(behavior: .reject(code: -26, message: message), for: endpoint)
+            let transaction = makeCreatedTransaction(seed: seed)
+
+            let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+
+            XCTAssertEqual(outcome, .rejected(code: -26, message: message), "the refusal is still reported")
+            XCTAssertNil(outcome.rejection, message)
+            let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+            XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it: \(message)")
+        }
+    }
+
     // MARK: - Migration sweeps are never rejected
 
     /// An immediate migration sweep created through the broadcaster from a migration proposal
@@ -1411,7 +1458,7 @@ final class BroadcasterTests: ZcashTestCase {
         let rawID = Data(repeating: 0xE7, count: 32)
         let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
         let endpointSubmitter = EndpointSubmitterMock()
-        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpoint)
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint)
         let synchronizer = try makeSynchronizer(
             transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)]),
             endpointSubmitter: endpointSubmitter

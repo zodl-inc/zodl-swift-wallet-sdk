@@ -135,14 +135,14 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let action = setupAction(candidates: [candidate])
         let endpointB = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
-        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpointA)
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
         endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpointB)
         transactionRepository.findRawIDClosure = { _ in candidate }
 
         _ = try await action.run(with: makeContext()) { _ in }
 
         let plan = await submitPlanStore.plan(for: rawID)
-        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vin-empty"))
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
     }
 
     /// Characterization: as on main, a migration preparation is resubmitted on every pass until it
@@ -153,7 +153,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let action = setupAction(candidates: [candidate])
         await submitPlanStore.markMigrationPreparation(txId: rawID)
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
-        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpointA)
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
         transactionRepository.findRawIDClosure = { _ in candidate }
 
         _ = try await action.run(with: makeContext()) { _ in }
@@ -174,7 +174,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
             let candidate = makeOverview(rawID: rawID)
             let action = setupAction(candidates: [candidate])
             await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
-            endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vin-empty"), for: endpointA)
+            endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
             endpointSubmitter.set(behavior: .failTransport, for: endpointB)
             transactionRepository.findRawIDClosure = { _ in candidate }
 
@@ -201,7 +201,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpointB)
         _ = try await action.run(with: makeContext()) { _ in }
         plan = await submitPlanStore.plan(for: refusedID)
-        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vin-empty"))
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
     }
 
     func testBackgroundRetryWithOnlyTransientFailuresStaysReady() async throws {

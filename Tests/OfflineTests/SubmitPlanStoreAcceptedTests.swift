@@ -70,7 +70,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let reopened = makeStore()
         let plan = await reopened.plan(for: txId)
         XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "a.example.com:443"))
-        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vin-empty", lifecycle: await reopened.currentLifecycle())
+        await reopened.markRejected(txId: txId, code: -26, reason: "bad-txns-vout-negative", lifecycle: await reopened.currentLifecycle())
         let afterRefusal = await makeStore().plan(for: txId)
         XCTAssertEqual(afterRefusal, .ready([endpointA], acceptedBy: "a.example.com:443"))
     }
