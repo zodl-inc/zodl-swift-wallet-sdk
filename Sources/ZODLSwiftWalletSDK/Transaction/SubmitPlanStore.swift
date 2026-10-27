@@ -94,8 +94,10 @@ protocol SubmitPlanStoring {
     /// transaction id and persisted at once, before the transaction has a plan or even exists (a
     /// PCZT's id is known from its creation), so it survives a restart and the PCZT's
     /// serialization; it is also set on the plan's row once the plan is recorded. Pruning a plan
-    /// removes its mark, and so does `clear()` or `wipe()`.
-    func markMigrationPreparation(txId: Data) async
+    /// removes its mark, and so does `clear()` or `wipe()`. Dropped, like `markAwaitingSubmission`,
+    /// when `lifecycle` belongs to an epoch the store has since wiped, so work begun for a deleted
+    /// wallet never recreates its store.
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) async
     /// Whether `txId` was marked by `markMigrationPreparation(txId:)`.
     func isMigrationPreparation(txId: Data) async -> Bool
     /// `nil` means the store was read successfully and has no row — a legacy
@@ -499,7 +501,13 @@ extension SubmitPlanStore {
             .eraseToAnyPublisher()
     }
 
-    func markMigrationPreparation(txId: Data) {
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) {
+        // The same stale-epoch guard as `markAwaitingSubmission`: a mark for a transaction whose
+        // creation began before a wipe must not recreate the store the wipe deleted.
+        guard lifecycle.generation == lifecycleGeneration else {
+            logger.info("SubmitPlanStore ignored a migration mark from a previous wallet lifecycle.")
+            return
+        }
         migrationPreparations.insert(txId)
         guard let connection = connection() else { return }
         do {
@@ -606,22 +614,26 @@ private struct StoredEndpoint: Codable, Equatable {
     }
 }
 
-/// Marks the transaction `pczt` commits to as an Orchard migration in `store` when `proposal` is a
-/// migration proposal, so its submission keeps main's resubmission until expiry whichever path
-/// later builds and submits it. The mark is keyed by the transaction id the PCZT commits to, which
-/// is known at creation and survives the PCZT's serialization, proving and signing, and is
-/// persisted at once, so it also survives a restart before the transaction is built.
-func markMigrationPCZT(
-    _ pczt: Pczt,
-    of proposal: Proposal,
-    rustBackend: ZcashRustBackendWelding,
-    in store: SubmitPlanStoring,
-    logger: Logger
-) async {
-    guard proposal.isMigration else { return }
-    guard let txId = await rustBackend.pcztTxid(pczt: pczt) else {
-        logger.error("Could not read the transaction id of a migration PCZT; it is not marked as a migration.")
-        return
+extension SubmitPlanStoring {
+    /// Marks the transaction `pczt` commits to as an Orchard migration when `proposal` is a
+    /// migration proposal, so its submission keeps main's resubmission until expiry whichever path
+    /// later builds and submits it. The mark is keyed by the transaction id the PCZT commits to,
+    /// which is known at creation and survives the PCZT's serialization, proving and signing, and
+    /// is persisted at once, so it also survives a restart before the transaction is built.
+    /// `lifecycle` is the store's token captured before the PCZT was created: a wipe since then
+    /// drops the mark.
+    func markMigrationPCZT(
+        _ pczt: Pczt,
+        of proposal: Proposal,
+        rustBackend: ZcashRustBackendWelding,
+        lifecycle: SubmitPlanLifecycle,
+        logger: Logger
+    ) async {
+        guard proposal.isMigration else { return }
+        guard let txId = await rustBackend.pcztTxid(pczt: pczt) else {
+            logger.error("Could not read the transaction id of a migration PCZT; it is not marked as a migration.")
+            return
+        }
+        await markMigrationPreparation(txId: txId, lifecycle: lifecycle)
     }
-    await store.markMigrationPreparation(txId: txId)
 }

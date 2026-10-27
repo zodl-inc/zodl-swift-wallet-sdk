@@ -714,6 +714,66 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "A wipe landing during creation must not be undone by a stale awaiting-mark")
     }
 
+    /// The same race for a migration proposal: the migration mark written after creation carries
+    /// the lifecycle captured before it, so a wipe meanwhile drops it and the store stays deleted.
+    func testMigrationCreationDropsItsMarkWhenWipedDuringCreation() async throws {
+        let rawID = Data(repeating: 0xFB, count: 32)
+        let overviews = [makeTransaction(raw: Data([0x01, 0x02, 0x03]), rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plansDatabaseURL = submitPlanDatabaseURL(for: synchronizer)
+        transactionEncoder.onCreateProposedTransactions = {
+            await store.wipe()
+        }
+        var proposal = Proposal.testOnlyFakeProposal(totalFee: 10)
+        proposal.isMigration = true
+
+        let created = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: proposal,
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        XCTAssertEqual(created.map(\.txId), [rawID])
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: plansDatabaseURL.path),
+            "a migration mark for a transaction created before wipe() must not recreate the store file"
+        )
+        let plan = await store.plan(for: rawID)
+        XCTAssertNil(plan)
+        let marked = await store.isMigrationPreparation(txId: rawID)
+        XCTAssertFalse(marked, "the wiped wallet's migration mark is not recorded")
+    }
+
+    /// The same race through the PCZT path: a wipe while a migration PCZT is created drops its mark.
+    func testMigrationPCZTCreationDropsItsMarkWhenWipedDuringCreation() async throws {
+        let rawID = Data(repeating: 0xFC, count: 32)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.pcztTxidPcztReturnValue = rawID
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []), rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plansDatabaseURL = submitPlanDatabaseURL(for: synchronizer)
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundClosure = { _, _, _ in
+            await store.wipe()
+            return Pczt([0x01])
+        }
+        var proposal = Proposal.testOnlyFakeProposal(totalFee: 10)
+        proposal.isMigration = true
+
+        _ = try await synchronizer.createPCZTFromProposal(accountUUID: TestsData.mockedAccountUUID, proposal: proposal)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: plansDatabaseURL.path),
+            "a migration PCZT's mark from before wipe() must not recreate the store file"
+        )
+        let marked = await store.isMigrationPreparation(txId: rawID)
+        XCTAssertFalse(marked, "the wiped wallet's migration mark is not recorded")
+    }
+
     // MARK: - Submission status reported to the host
 
     func testSubmissionStatusIsAwaitingBeforeTheAppSubmits() async throws {
@@ -1084,7 +1144,7 @@ final class BroadcasterTests: ZcashTestCase {
         let store = mockContainer.resolve(SubmitPlanStoring.self)
 
         let mixed = makeCreatedTransaction(seed: 0x61)
-        await store.markMigrationPreparation(txId: mixed.txId)
+        await store.markMigrationPreparation(txId: mixed.txId, lifecycle: await store.currentLifecycle())
         let mixedTask = Task {
             await synchronizer.broadcaster.submit(transaction: mixed, to: [transient, terminal])
         }
@@ -1098,7 +1158,7 @@ final class BroadcasterTests: ZcashTestCase {
 
         gate.close()
         let timedOut = makeCreatedTransaction(seed: 0x62)
-        await store.markMigrationPreparation(txId: timedOut.txId)
+        await store.markMigrationPreparation(txId: timedOut.txId, lifecycle: await store.currentLifecycle())
         let timedOutOutcome = await synchronizer.broadcaster.submit(transaction: timedOut, to: [transient, terminal], timing: deadline)
         XCTAssertEqual(timedOutOutcome, .timedOut)
         gate.open()
@@ -1240,7 +1300,8 @@ final class BroadcasterTests: ZcashTestCase {
         defer { try? rejecting.stop() }
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
-        await mockContainer.resolve(SubmitPlanStoring.self).markMigrationPreparation(txId: transaction.txId)
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.markMigrationPreparation(txId: transaction.txId, lifecycle: await store.currentLifecycle())
 
         let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
 

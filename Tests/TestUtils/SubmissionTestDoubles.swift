@@ -463,7 +463,9 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
 
     private(set) var migrationPreparations: Set<Data> = []
 
-    func markMigrationPreparation(txId: Data) async {
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: a mark carrying a token from before the most recent `wipe()` is dropped.
+        guard lifecycle.generation == lifecycleGeneration else { return }
         migrationPreparations.insert(txId)
     }
 

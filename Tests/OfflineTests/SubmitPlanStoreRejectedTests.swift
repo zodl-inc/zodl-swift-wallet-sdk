@@ -91,7 +91,7 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
     func testAMigrationPreparationIsNeverRecordedAsRejected() async {
         let txId = Data(repeating: 0x4A, count: 32)
         let store = makeStore()
-        await store.markMigrationPreparation(txId: txId)
+        await store.markMigrationPreparation(txId: txId, lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: txId, endpoints: [endpointA])
 
         await store.markRejected(txId: txId, code: -26, reason: "bad", lifecycle: await store.currentLifecycle())
@@ -111,7 +111,8 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
     /// known when it is created), is persisted at once and holds across a restart.
     func testAMigrationMarkWithoutAPlanSurvivesARestart() async {
         let txId = Data(repeating: 0x4B, count: 32)
-        await makeStore().markMigrationPreparation(txId: txId)
+        let first = makeStore()
+        await first.markMigrationPreparation(txId: txId, lifecycle: await first.currentLifecycle())
 
         let reopened = makeStore()
         let marked = await reopened.isMigrationPreparation(txId: txId)
@@ -128,7 +129,7 @@ final class SubmitPlanStoreRejectedTests: ZcashTestCase {
     func testPruningAPlanRemovesItsMigrationMark() async {
         let txId = Data(repeating: 0x4C, count: 32)
         let store = makeStore()
-        await store.markMigrationPreparation(txId: txId)
+        await store.markMigrationPreparation(txId: txId, lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: txId, endpoints: [endpointA])
 
         await store.deletePlans(txIds: [txId])

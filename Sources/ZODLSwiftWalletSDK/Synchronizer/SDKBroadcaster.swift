@@ -219,9 +219,9 @@ final class SDKBroadcaster: Broadcaster {
         )
         if recordingPlans && proposal.isMigration {
             // A migration sweep keeps main's resubmission until expiry, even if every server
-            // rejects it.
+            // rejects it. The lifecycle captured before creation drops the mark after a wipe.
             for transaction in createdTransactions {
-                await submitPlanStore.markMigrationPreparation(txId: transaction.txId)
+                await submitPlanStore.markMigrationPreparation(txId: transaction.txId, lifecycle: lifecycle)
             }
         }
         let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))

@@ -151,7 +151,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let rawID = Data(repeating: 0x11, count: 32)
         let candidate = makeOverview(rawID: rawID)
         let action = setupAction(candidates: [candidate])
-        await submitPlanStore.markMigrationPreparation(txId: rawID)
+        await submitPlanStore.markMigrationPreparation(txId: rawID, lifecycle: await submitPlanStore.currentLifecycle())
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
         endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
         transactionRepository.findRawIDClosure = { _ in candidate }

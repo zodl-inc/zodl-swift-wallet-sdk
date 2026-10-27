@@ -1866,12 +1866,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
+        // Captured before creation, so a `wipe()` meanwhile drops the migration mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
         let pczt = try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
             proposal: proposal.inner,
             sizeBound: sizeBound
         )
-        await markMigrationPCZT(pczt, of: proposal, rustBackend: initializer.rustBackend, in: submitPlanStore, logger: initializer.logger)
+        await submitPlanStore.markMigrationPCZT(
+            pczt,
+            of: proposal,
+            rustBackend: initializer.rustBackend,
+            lifecycle: lifecycle,
+            logger: initializer.logger
+        )
         return pczt
     }
 
@@ -2388,9 +2396,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
+        // Captured before the preparation is taken, so a `wipe()` meanwhile drops the mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
         let prepared = try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
         // Its submission keeps main's resubmission until expiry, even if every server rejects it.
-        await submitPlanStore.markMigrationPreparation(txId: prepared.txid)
+        await submitPlanStore.markMigrationPreparation(txId: prepared.txid, lifecycle: lifecycle)
         return prepared
     }
 
