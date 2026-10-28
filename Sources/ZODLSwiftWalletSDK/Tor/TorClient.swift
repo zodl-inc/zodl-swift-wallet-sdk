@@ -338,6 +338,33 @@ public actor TorClient {
         }
     }
 
+    /// Parameter downloads preserve lazy Tor preparation within the same request deadline.
+    /// While bootstrap owns this actor, cancellation/expiry can complete the waiting caller.
+    /// The admission task retains the actor until native creation returns, then checks its
+    /// context before isolation or GET. The root runtime remains actor-owned throughout.
+    nonisolated func httpGetPreparingRuntime(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: timeoutMilliseconds,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        let context = TorHTTPRequestContext(deadlineUptime: deadline)
+        return try await context.run { context in
+            try await self.prepareHTTPRuntime(for: request, context: context)
+            return try await self.httpGet(for: request, retryLimit: retryLimit, context: context)
+        }
+    }
+
+    private func prepareHTTPRuntime(for request: URLRequest, context: TorHTTPRequestContext) throws {
+        try context.checkCancellation()
+        _ = try TorHTTPGetRequest.validate(request)
+        _ = try resolveRuntime()
+        try context.checkCancellation()
+    }
+
     nonisolated func httpGet(
         for request: URLRequest,
         retryLimit: UInt8,

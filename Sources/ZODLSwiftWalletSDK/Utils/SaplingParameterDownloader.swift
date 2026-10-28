@@ -214,7 +214,7 @@ private extension SaplingParameterDownloader {
 
 extension SaplingParameterDownloader {
     /// Download a file over Tor using TorClient.
-    /// The async GET shares one 30-minute budget across admission, retries, and body collection.
+    /// The async GET shares one 30-minute budget across lazy Tor preparation, admission, retries, and body collection.
     static func downloadFileWithTor(
         _ sourceURL: URL,
         at destination: URL,
@@ -226,7 +226,7 @@ extension SaplingParameterDownloader {
 
         let request = URLRequest(url: sourceURL)
         // The async GET retains the native 257 MiB success / 64 KiB error-body bounds.
-        let (data, response) = try await torClient.httpGet(for: request, retryLimit: 2, timeoutMilliseconds: 1_800_000)
+        let (data, response) = try await torClient.httpGetPreparingRuntime(for: request, retryLimit: 2, timeoutMilliseconds: 1_800_000)
         try Task.checkCancellation()
 
         guard response.statusCode == 200 else {
@@ -281,7 +281,11 @@ private extension SaplingParameterDownloader {
 
 /// The HTTP operation needed by parameter downloads.
 protocol SaplingParameterHTTPClient {
-    func httpGet(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse)
+    func httpGetPreparingRuntime(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse)
 }
 
 extension TorClient: SaplingParameterHTTPClient {}
