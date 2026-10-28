@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "5.0.0"
+version = "7.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -150,8 +150,7 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The `[patch.crates-io]` entry below pins the 0.4.0 release until registry publication.
-slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
+slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -199,11 +198,6 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# Pin the signed zodl_slipstream-0.4.0 release tag by immutable commit hash.
-# Keep the Git patch until 0.4.0 is published to crates.io. This release uses the same
-# librustzcash generation as the versions above, keeping a single family instance.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "8591b758ca0919058035a2453b41e035f84b2402" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress

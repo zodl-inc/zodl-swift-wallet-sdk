@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "5.0.0"
+version = "7.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -8728,8 +8728,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-slipstream"
-version = "0.4.0"
-source = "git+https://github.com/zodl-inc/slipstream.git?rev=8591b758ca0919058035a2453b41e035f84b2402#8591b758ca0919058035a2453b41e035f84b2402"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5000f54bfa0ceaa30589342f32ef0a7a4993b8461c37a0281436d4d1141a0016"
 dependencies = [
  "ff 0.14.0",
  "futures-util",
@@ -8769,7 +8770,8 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream.git?rev=8591b758ca0919058035a2453b41e035f84b2402#8591b758ca0919058035a2453b41e035f84b2402"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63bcac7954dcad1500be8464182edc6ed1b4a64a1b6dd630bb34bd32e0bdd18e"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",
