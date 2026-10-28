@@ -4816,25 +4816,22 @@ unsafe fn tor_http_get_impl(
         };
 
         let client = tor_runtime.client();
-        let response = tor_runtime.runtime().block_on(async {
-            let operation =
-                tor_http_with_body_guard(max_response_bytes, retry_filter, |guard| async move {
-                    client
-                        .http_get(
-                            url,
-                            request_headers,
-                            |body| guard.collect(body),
-                            retry_limit,
-                            |res| guard.filter(res),
-                        )
-                        .await
-                });
-
-            match timeout_ms {
-                Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
-                None => operation.await,
-            }
-        })?;
+        let response = tor_runtime.runtime().block_on(tor_http_get_response(
+            max_response_bytes,
+            timeout_ms,
+            retry_filter,
+            |guard, explicit_deadline| async move {
+                client
+                    .http_get(
+                        url,
+                        request_headers,
+                        |body| guard.parse_get(body, explicit_deadline),
+                        retry_limit,
+                        |res| guard.filter(res),
+                    )
+                    .await
+            },
+        ))?;
 
         ffi::HttpResponseBytes::from_rust(response)
     });
@@ -4911,6 +4908,79 @@ where
         HttpError: From<B::Error>,
     {
         collect_http_response_body_limited(body, self.status.body_limit(self.max_bytes))
+    }
+}
+
+enum TorHttpGetBody<B> {
+    Incoming(B),
+    Collected(Option<bytes::Bytes>),
+}
+
+impl<R> TorHttpBodyGuard<R>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+{
+    async fn parse_get<B>(
+        &self,
+        body: B,
+        explicit_deadline: bool,
+    ) -> Result<TorHttpGetBody<B>, zcash_client_backend::tor::Error>
+    where
+        B: BodyExt<Data = bytes::Bytes> + Unpin,
+        HttpError: From<B::Error>,
+    {
+        if explicit_deadline {
+            // Return immediately from the backend's parser: its 60s timer must not own
+            // a body whose caller supplied a longer total deadline.
+            Ok(TorHttpGetBody::Incoming(body))
+        } else {
+            self.collect(body).await.map(TorHttpGetBody::Collected)
+        }
+    }
+}
+
+/// GET's parser boundary and total timer, shared by the native entry point and local transport tests.
+async fn tor_http_get_response<R, Fut, B>(
+    max_bytes: usize,
+    timeout_ms: Option<u64>,
+    retry_filter: R,
+    request: impl FnOnce(TorHttpBodyGuard<R>, bool) -> Fut,
+) -> anyhow::Result<http::Response<bytes::Bytes>>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+    Fut: std::future::Future<
+            Output = Result<http::Response<TorHttpGetBody<B>>, zcash_client_backend::tor::Error>,
+        >,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
+{
+    let operation = async {
+        let guard = TorHttpBodyGuard {
+            status: SeenStatus::default(),
+            max_bytes,
+            retry_filter,
+        };
+        let (parts, body) = request(guard, timeout_ms.is_some()).await?.into_parts();
+        let body = match body {
+            TorHttpGetBody::Collected(body) => body,
+            TorHttpGetBody::Incoming(body) => {
+                let limit = if parts.status.is_success() {
+                    max_bytes
+                } else {
+                    TOR_HTTP_MAX_ERROR_BODY_BYTES
+                };
+                collect_http_response_body_limited(body, limit).await?
+            }
+        };
+        within_response_limit(http::Response::from_parts(parts, body))
+    };
+    match timeout_ms {
+        Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
+        None => operation.await,
     }
 }
 

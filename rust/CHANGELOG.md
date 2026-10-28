@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_tor_http_get_with_timeout` collects response bodies under the caller's total
+  deadline after returning from the backend parser, so its default 60-second body timer
+  cannot truncate a longer explicit budget. Untimed GET behavior, retry policy, body-size
+  guards, and all exported signatures are unchanged.
+
 - `zcashlc_single_use_taddr_to_check` and `zcashlc_schedule_single_use_taddr_check` follow the network's
   target-spacing schedule, including custom NU7 activation heights. The OHTTP wallet path retains a
   24-hour exposure window and uses 25-second blocks for recheck delays after NU7, matching the Tor path.

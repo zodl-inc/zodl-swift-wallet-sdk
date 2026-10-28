@@ -44,6 +44,54 @@ final class TorHTTPGetTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 
+    func testPreparingGETExpiryIncludesBlockedBootstrapAndCleansLateRuntime() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entered = expectation(description: "native preparation entered")
+        let expired = expectation(description: "shared deadline expires during preparation")
+        let freed = expectation(description: "late runtime closed")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let runtimes = TorTestRuntimes()
+        defer { if runtimes.isAlive(runtimes.parent) { runtimes.free(runtimes.parent) } }
+        let native = TorHTTPGetNative(
+            get: { _, _, _, _, _, _ in
+                XCTFail("Expired preparation must not GET")
+                return nil
+            },
+            isolateRuntime: { _ in
+                XCTFail("Expired preparation must not isolate")
+                return nil
+            },
+            freeRuntime: { runtime in
+                runtimes.free(runtime)
+                freed.fulfill()
+            },
+            createRuntime: { _, _ in
+                entered.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                return runtimes.parent
+            }
+        )
+        let client = TorClient(torDir: directory, httpGetNative: native)
+        let task = Task {
+            do {
+                _ = try await client.httpGetPreparingRuntime(
+                    for: URLRequest(url: URL(string: "https://example.com/test")!), retryLimit: 2, timeoutMilliseconds: 100
+                )
+                XCTFail("Preparation must use the request's original deadline")
+            } catch {
+                XCTAssertEqual((error as? URLError)?.code, .timedOut)
+                expired.fulfill()
+            }
+        }
+        await fulfillment(of: [entered, expired], timeout: 1)
+        release.signal()
+        await task.value
+        try await client.close()
+        await fulfillment(of: [freed], timeout: 1)
+    }
+
     func testCopiesResponseBeforeFreeingAndForwardsNativeArgumentsOnWorker() async throws {
         let queue = DispatchQueue(label: "test.tor.native", attributes: .concurrent)
         let key = DispatchSpecificKey<String>()

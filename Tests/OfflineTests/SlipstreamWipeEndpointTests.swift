@@ -55,6 +55,8 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
         XCTAssertTrue(switchCalls.isEmpty, "a switch after a wipe must leave the engine closed until prepare: \(switchCalls)")
         let recorded = await fixture.synchronizer.currentEndpointForTesting()
         XCTAssertEqual(recorded, nextWalletServer, "and record the server for the next prepare")
+        let tree = try TreeState(serializedBytes: await fixture.synchronizer.getTreeState(height: 10))
+        XCTAssertEqual(tree.hash, nextWalletServer.host, "Swift RPCs follow the selection while the engine stays closed")
     }
 
     /// The reset as a host performs it: the wallet was on one server, the wipe ends it, the host names another, and
@@ -77,6 +79,8 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
             [constructionServer, nextWalletServer],
             "the reset wallet's provisioning request goes to the server named after the wipe, not to the one before it"
         )
+        let tree = try TreeState(serializedBytes: await fixture.synchronizer.getTreeState(height: 10))
+        XCTAssertEqual(tree.hash, nextWalletServer.host, "prepare keeps the selected Swift RPC route")
         let resetCalls = await engineCalls(of: fixture, since: callsBeforeTheReset)
         XCTAssertEqual(
             Self.engineOpens(resetCalls),
@@ -386,7 +390,8 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
         let storage = CompactBlockRepositoryMock()
         storage.createClosure = {}
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in backend }
-        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
+        let service = RebindingLightWalletService(service: Self.recordingService(at: constructionServer))
+        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in repository }
         mockContainer.mock(type: CompactBlockRepository.self, isSingleton: true) { _ in storage }
 
@@ -412,11 +417,24 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
             initializer: initializer,
             alternateEndpoints: [],
             engine: engine,
+            makeEndpointService: { endpoint, _, _, _ in Self.recordingService(at: endpoint) },
             restoreAnchor: { _, _, _, server, _, _ in
                 await anchor.record(server)
             }
         )
         return Fixture(synchronizer: synchronizer, engine: engine, backend: backend, anchor: anchor)
+    }
+
+    private static func recordingService(at endpoint: LightWalletEndpoint) -> LightWalletService {
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        service.getTreeStateModeClosure = { block, _ in
+            var tree = TreeState()
+            tree.height = block.height
+            tree.hash = endpoint.host
+            return tree
+        }
+        return service
     }
 
     /// Prepares the wallet with a seed: a new wallet for a nil birthday, a restore otherwise.

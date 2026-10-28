@@ -8,6 +8,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Sapling parameter downloads over Tor preserve on-demand runtime preparation and use one
+  30-minute total GET budget across preparation, admission, retries, and body collection. A slow
+  valid body can complete after the backend's default 60-second body timeout. Downloads still
+  validate before atomic installation, retain their response-size limits, and discard temporary
+  files on failure or cancellation.
+
+- `SlipstreamSynchronizer.switchTo(endpoint:)` and `restartSync(at:)` now move retained Swift
+  RPC consumers to the selected endpoint along with the sync engine, including public server ↔ OHTTP
+  gateway transitions. Selecting a server after a wipe also updates RPC routing while leaving the
+  wallet database closed until `prepare`. Broadcasters keep their existing identity and no caller
+  API changes are required.
+
 - OHTTP gateway connections keep checking single-use transparent addresses exposed within the previous
   24 hours of target time across NU7, and recheck unfunded addresses using the next block's target
   spacing. After activation they previously checked only eight hours of exposure and delayed rechecks
