@@ -269,7 +269,7 @@ public protocol Synchronizer: AnyObject {
     ///
     /// `proposeTransfer(accountUUID:recipient:amount:memo:)` is this call with
     /// ``TransactionSizeBound/consensus``. A proposal that exceeds `sizeBound` throws
-    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`), as one too large for a block does.
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`), as one too large for a block does.
     /// A conformer that does not override this throws for any bound other than
     /// ``TransactionSizeBound/consensus`` rather than ignore it.
     func proposeTransfer(
@@ -320,7 +320,7 @@ public protocol Synchronizer: AnyObject {
     /// `proposeSendMax(accountUUID:recipient:memo:mode:)` is this call with
     /// ``TransactionSizeBound/consensus``. The proposal is never cut down to what fits: a send-max
     /// whose transaction exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
-    /// (`ZRUST0159`), as one too large for a block does. A conformer that does not override this
+    /// (`ZRUST0174`), as one too large for a block does. A conformer that does not override this
     /// throws for any bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
     func proposeSendMax(
         accountUUID: AccountUUID,
@@ -411,7 +411,7 @@ public protocol Synchronizer: AnyObject {
     /// proposal against `sizeBound`.
     ///
     /// A proposal that exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
-    /// (`ZRUST0159`) before anything is proven, stored or broadcast. Pass the bound the proposal was
+    /// (`ZRUST0174`) before anything is proven, stored or broadcast. Pass the bound the proposal was
     /// made under, so that a proposal held across a change of bound is checked again. A conformer
     /// that does not override this throws for any bound other than
     /// ``TransactionSizeBound/consensus`` rather than ignore it.
@@ -438,7 +438,7 @@ public protocol Synchronizer: AnyObject {
     ///
     /// `proposefulfillingPaymentURI(_:accountUUID:)` is this call with
     /// ``TransactionSizeBound/consensus``. A proposal that exceeds `sizeBound` throws
-    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`). A conformer that does not override
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`). A conformer that does not override
     /// this throws for any bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
     func proposefulfillingPaymentURI(
         _ uri: String,

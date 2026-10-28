@@ -370,7 +370,7 @@ Changes are relative to `5.2.2`.
   `createPCZTFromProposal`, as do `ClosureSynchronizer` and `CombineSynchronizer` (their
   `createProposedTransactions` overload uses `OvkPolicy.sender`), and `Broadcaster` in a new
   overload of `createProposedTransactions(proposal:spendingKey:ovkPolicy:)`. A proposal exceeding
-  the bound throws `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`), the error a
+  the bound throws `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`), the error a
   transaction too large for a block throws, from every one of them; any other failure of a bounded
   `createPCZTFromProposal` throws `rustCreatePCZTFromProposal` with a redacted message, while the
   overload without `sizeBound:` reports its failures exactly as before. The
