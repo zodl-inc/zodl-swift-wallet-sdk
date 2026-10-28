@@ -370,7 +370,7 @@ final class TransactionSubmittabilityTests: ZcashTestCase {
     /// `WalletTransactionEncoder` over the test's stubbed service and check. The server is asked nothing it could answer, so that
     /// a probe the SDK should not make is counted by the test instead of crashing it on the mock's unstubbed answer.
     private func makeSlipstreamSynchronizer(creating transactions: [CreatedTransaction]) throws -> SlipstreamSynchronizer {
-        backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = transactions.map(\.txId)
+        backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = transactions.map(\.txId)
         backend.getTransactionTxIdClosure = { txId in
             TransactionData(txId: txId, raw: transactions.first { $0.txId == txId }?.raw ?? Data(), expiryHeight: 3_600_000)
         }
