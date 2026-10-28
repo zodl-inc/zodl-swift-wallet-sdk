@@ -1,17 +1,20 @@
 //! Durable persistence of ZIP 318 anchor-retention marks into the wallet's sqlite store.
 //!
 //! Slipstream retains anchor checkpoints on its IN-MEMORY substitution trees (its `[B6]`
-//! `ensure_retained` calls protect the batch build), but its flush writes checkpoints to the
-//! wallet database WITHOUT those marks — the sqlite `*_tree_retained_checkpoints` tables stay
-//! empty. The engine's open-time deep-history heal then reads the retained set from the SQLITE
-//! store and dooms every checkpoint deeper than its margin (10,000 blocks below each pool's
-//! max) that the empty set fails to spare — which, on any migration whose privacy schedule
-//! outlives the margin, is exactly the drawn boundary anchors: `prove_transfer` would defer on
-//! `AnchorNotFound` forever. Field evidence (2026-08-02, testnet device): retention policy
-//! configured, 216 grid checkpoints present, retained tables EMPTY in every pool.
+//! `ensure_retained` calls protect the batch build), and its flush persists those marks to the
+//! wallet database alongside the checkpoints it writes, in the same transaction and in all
+//! three pools, so the sqlite `*_tree_retained_checkpoints` tables carry them. An older
+//! engine's flush wrote checkpoints WITHOUT the marks, and a database it wrote keeps them that
+//! way: its retained tables stay empty. The engine's open-time deep-history heal reads the
+//! retained set from the SQLITE store and dooms every checkpoint deeper than its margin
+//! (10,000 blocks below each pool's max) that the missing marks fail to spare — which, on any
+//! migration whose privacy schedule outlives the margin, is exactly the drawn boundary
+//! anchors: `prove_transfer` would defer on `AnchorNotFound` forever. Field evidence
+//! (2026-08-02, testnet device, written by an older engine): retention policy configured, 216
+//! grid checkpoints present, retained tables EMPTY in every pool.
 //!
-//! [`reconcile_retained_anchor_marks`] closes the gap from the SDK side: at wallet open —
-//! before any engine session, and therefore before any heal, exists — it marks every height
+//! [`reconcile_retained_anchor_marks`] backfills such a database from the SDK side: at wallet
+//! open — before any engine session, and therefore before any heal, exists — it marks every height
 //! the network's retention policy retains, from the NU6.3 activation floor to the wallet's
 //! chain tip, as a durable anchor in ALL THREE pools' stores. It goes through the public
 //! `WalletCommitmentTrees` + `ShardTree::ensure_retained` seam, whose sqlite store persists
@@ -20,18 +23,17 @@
 //! contract and harmless to the heal ("bloat, not breakage" — its own words): the retained
 //! set only ever SPARES ids.
 //!
-//! This is the COMPENSATOR, not the root fix: the root fix is slipstream's flush persisting
-//! its in-memory retained set alongside the checkpoints it writes. Once that lands, this
-//! reconcile degrades to a no-op re-assertion of marks the flush already wrote.
+//! The root fix is in the engine: Slipstream's flush persists its in-memory retained set
+//! alongside the checkpoints it writes, as above. This reconcile is the BACKFILL for databases
+//! an older engine wrote, whose checkpoints were flushed without marks. Where the flush has
+//! written the marks, it only re-asserts them.
 
 use anyhow::anyhow;
-use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead};
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
-use zcash_protocol::consensus::BlockHeight;
 
-use crate::{NetworkParams, anchor_retention_interval, slipstream_anchor_retention_floor};
+use crate::{NetworkParams, anchor_retention_policy};
 
 /// Ensure every anchor-retention mark the network's policy calls for, from the NU6.3
 /// activation floor to the wallet's current chain tip, in all three pools' stores.
@@ -49,14 +51,13 @@ pub(crate) fn reconcile_retained_anchor_marks(
     else {
         return Ok(0);
     };
-    let Some(floor) = slipstream_anchor_retention_floor(network) else {
+    let Some(retention) = anchor_retention_policy(*network) else {
         return Ok(0);
     };
-    let floor = BlockHeight::from(floor);
+    let floor = retention.from_height();
     if tip < floor {
         return Ok(0);
     }
-    let retention = AnchorRetention::new(floor, anchor_retention_interval(*network));
     let heights = retention.retained_in_range(floor..=tip);
     if heights.is_empty() {
         return Ok(0);
@@ -106,6 +107,10 @@ mod tests {
     /// `Network::TestNetwork.activation_height(NetworkUpgrade::Nu6_3)`.
     const FLOOR: u32 = 4_134_000;
 
+    /// NU7 testnet activation — must match
+    /// `Network::TestNetwork.activation_height(NetworkUpgrade::Nu7)`.
+    const NU7: u32 = 4_465_026;
+
     fn fresh_wallet(
         dir: &std::path::Path,
     ) -> WalletDb<rusqlite::Connection, NetworkParams, SystemClock, crate::SystemRng> {
@@ -131,8 +136,9 @@ mod tests {
     }
 
     /// The reconcile marks every policy-retained grid height in [floor ..= tip], in all
-    /// three pools, and reports the total. Grid: testnet retains every 12th block from the
-    /// NU6.3 activation floor (itself on the grid), so tip = floor + 120 yields 11 heights.
+    /// three pools, and reports the total. Grid: below NU7, testnet retains every 12th block
+    /// from the NU6.3 activation floor (itself on the grid), so tip = floor + 120 yields 11
+    /// heights.
     #[test]
     fn marks_every_grid_height_up_to_the_chain_tip_in_all_pools() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -147,6 +153,45 @@ mod tests {
 
         let expected: Vec<u32> = (0..=10).map(|k| FLOOR + 12 * k).collect();
         assert_eq!(ensured, 33, "11 grid heights × 3 pools");
+        for table in [
+            "sapling_tree_retained_checkpoints",
+            "orchard_tree_retained_checkpoints",
+            "ironwood_tree_retained_checkpoints",
+        ] {
+            assert_eq!(
+                retained_rows(dir.path(), table),
+                expected,
+                "{table} holds exactly the policy-retained grid heights"
+            );
+        }
+    }
+
+    /// From NU7 activation each reference block spans three blocks, and the grid's boundaries
+    /// follow: testnet retains every 12th block below the activation and every 36th from it.
+    /// Marking the plain multiples of 12 past the activation would mark heights no transfer
+    /// anchors to, and differ from the grid the engine and the wallet's own scan retain.
+    #[test]
+    fn marks_the_spaced_grid_from_the_nu7_activation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut wallet = fresh_wallet(dir.path());
+        let network = NetworkParams::Standard(Network::TestNetwork);
+        wallet
+            .update_chain_tip(BlockHeight::from_u32(NU7 + 100))
+            .expect("sets the chain tip");
+
+        let ensured = reconcile_retained_anchor_marks(&mut wallet, &network).expect("reconciles");
+        drop(wallet);
+
+        let expected: Vec<u32> = (FLOOR..NU7)
+            .step_by(12)
+            .chain((NU7..=NU7 + 100).filter(|height| height % 36 == 0))
+            .collect();
+        assert_eq!(
+            expected.iter().rev().take(4).copied().collect::<Vec<_>>(),
+            [4_465_116, 4_465_080, 4_465_044, 4_465_020],
+            "the last multiple of 12 below the activation, then the multiples of 36"
+        );
+        assert_eq!(ensured, 3 * expected.len() as u64);
         for table in [
             "sapling_tree_retained_checkpoints",
             "orchard_tree_retained_checkpoints",

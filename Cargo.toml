@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "5.0.0"
+version = "7.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -9,22 +9,25 @@ authors = [
 ]
 license = "AGPL-3.0-only"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.97"
 build = "rust/build.rs"
 
 [dependencies]
 
 # Zcash
 orchard = { version = "0.16" }
-pasta_curves = "0.6"
+# `asm` selects the assembly field arithmetic, where most of 0.6.1's speedup is; without it every
+# target gets the portable arithmetic. pasta_curves picks the backend per target itself and has
+# none for Apple's x86-64 targets, so the x86_64 slices stay portable. 0.6.0 has no such feature.
+pasta_curves = { version = "0.6.1", features = ["asm"] }
 ff = "0.14"
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 # The scalar types in the Sapling prover traits, named by `rust/src/sapling_prover.rs`.
 bls12_381 = "0.9"
 jubjub = "0.11"
-transparent = { package = "zcash_transparent", version = "=0.11.0-pre.1", default-features = false }
-zcash_address = { version = "=0.14.0-pre.1" }
-zcash_client_backend = { version = "=0.25.0-pre.1", features = [
+transparent = { package = "zcash_transparent", version = "=0.11.0", default-features = false }
+zcash_address = { version = "=0.14.0" }
+zcash_client_backend = { version = "=0.25.0", features = [
   "lightwalletd-tonic-tls-webpki-roots",
   "orchard",
   "pczt",
@@ -32,15 +35,15 @@ zcash_client_backend = { version = "=0.25.0-pre.1", features = [
   "transparent-inputs",
   "unstable",
 ] }
-zcash_client_sqlite = { version = "=0.23.0-pre.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "=0.23.0", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_note_encryption = "0.5.1"
-zcash_primitives = "=0.31.0-pre.1"
-zcash_proofs = "=0.31.0-pre.1"
-zcash_protocol = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
-zcash_pool_migration = { version = "=0.2.0-pre.1", features = ["wallet"] }
+zcash_primitives = "=0.31.0"
+zcash_proofs = "=0.31.0"
+zcash_protocol = { version = "=0.11.0", features = ["local-consensus"] }
+zcash_pool_migration = { version = "=0.2.0", features = ["wallet"] }
 zcash_script = "0.6"
 zip32 = "0.3"
-pczt = { version = "=0.10.0-pre.1", features = ["prover", "orchard", "sapling", "signer"] }
+pczt = { version = "=0.10.0", features = ["prover", "orchard", "sapling", "signer"] }
 shardtree = "0.8"
 
 # Keystone hardware-wallet batch signing for the Orchard migration flow.
@@ -70,7 +73,10 @@ pczt_ledger = "=0.1.0-pre.0"
 # TODO: temporary git-rev pin -- switch to a published crates.io release once payment_uri ships
 # one. Pinned to the zcash/librustzcash#2989 merge commit specifically (not main's moving tip),
 # so this doesn't pick up unrelated later changes; that merge commit is a permanent part of
-# main's history now, so it stays reachable even as main moves on. Same rev as the Android SDK.
+# main's history now, so it stays reachable even as main moves on. iOS keeps 330e4c0a on purpose:
+# moving payment_uri would also move eip681, whose parsing changed in later revisions (a stricter
+# address-length check, and `from_parts` constructors in place of `from_native_request_parts` and
+# `from_erc20_request_parts`), and this SDK's payment-URI parsing would change with it.
 eip681 = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9" }
 payment_uri = { git = "https://github.com/zcash/librustzcash.git", rev = "330e4c0aa9e25199acdb93a56bf70126d0d3f2b9", features = ["json"] }
 
@@ -84,8 +90,8 @@ percent-encoding = "2"
 # Infrastructure
 prost = "0.14"
 rusqlite = "0.37"
-schemerz = "0.2"
-schemerz-rusqlite = "0.370"
+schemerz = "0.3"
+schemerz-rusqlite = "0.371"
 secrecy = "0.8"
 rand = "0.10"
 nonempty = "0.11"
@@ -119,8 +125,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Tor
-fs-mistrust = "0.12"
-tor-rtcompat = "0.35"
+fs-mistrust = "0.14"
+tor-rtcompat = "0.43"
 rust_decimal = { version = "1", default-features = false, features = ["c-repr"] }
 # - The "static" feature is required for the "compression" default feature of arti-client.
 xz2 = { version = "0.1", features = ["static"] }
@@ -133,21 +139,18 @@ xz2 = { version = "0.1", features = ["static"] }
 # Pinned exactly, like every voting release this package has taken: the sidecar
 # schema and the wire views move with the crate, so an upgrade is a reviewed change.
 #
-# 5.1.1-rc.3 here is not the crates.io release: `[patch.crates-io]` below takes it from the head
-# of valargroup/zcash_voting#373, which moves the `lrz` backend to the NU7 pre-release crates.
-zcash_voting = { version = "=5.1.1-rc.3", default-features = false, features = ["lrz"] }
+# 5.2.0-rc.2 is the crates.io release built on the librustzcash release. With `lrz` it shares
+# this package's librustzcash crates, so the graph keeps a single copy of each.
+zcash_voting = { version = "=5.2.0-rc.2", default-features = false, features = ["lrz"] }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
-zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard"] }
+zcash_keys = { version = "=0.17.0", features = ["orchard"] }
 incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# 0.4.0-pre.1 is built against the NU7 pre-release crates, the same
-# librustzcash generation as this package, so the graph stays a single
-# family instance.
-slipstream-core = { version = "=0.4.0-pre.1", package = "zodl-slipstream" }
+slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -182,36 +185,19 @@ crate-type = ["staticlib"]
 [profile.release]
 lto = true
 
+# Build scripts and proc macros, which run on the build machine, stay unstripped. A release build
+# strips them by default, and on macOS rustc does that with its bundled rust-objcopy, which writes
+# the Mach-O string table straight after the indirect symbol table without padding it to 8 bytes,
+# so the string table is misaligned whenever the indirect symbol table has an odd number of
+# entries. macOS 27's dyld refuses to load such a proc macro, and the build fails with "mis-aligned
+# LINKEDIT string pool" or "can't find crate". BuildSupport/Makefile's MACOSX_DEPLOYMENT_TARGET
+# reaches them too, and linked for macOS 14 every one of them came out misaligned. The linker's own
+# output is aligned. The static libraries the SDK ships were never stripped, so this setting does
+# not apply to them.
+[profile.release.build-override]
+strip = false
+
 [patch.crates-io]
-# To build against an unreleased slipstream revision, patch it in here by COMMIT HASH rather than a
-# branch: a branch pin silently follows a force-push, so a build can pick up code nobody reviewed,
-# whereas a stale hash fails loudly. The revision must be built against the librustzcash generation
-# the versions above declare.
-#zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "09737bc9560e06dbb142ed02ab132f831f2938a8" }
-
-# Coinholder voting on the NU7 pre-release crates.
-#
-# No `zcash_voting` release is built on the NU7 crates yet, and the crate is not ours to publish,
-# so it and the crates under it come from the heads of the pull requests that move them there.
-# A `[patch]` table in a dependency's own workspace does not reach its consumers, so this repeats
-# the entries of the table valargroup/zcash_voting#373 carries that this package's graph uses, at
-# the same revisions. That table also patches the Zakura crates (zakura-core/common#538); they
-# are optional dependencies only the `zakura` backend enables, so with `lrz` they never enter
-# this lockfile and need no entry here. Replace each entry with the release that contains its
-# pull request, and drop the table once all of them are out.
-#
-# valargroup/zcash_voting#373
-zcash_voting = { git = "https://github.com/zodl-inc/zcash_voting", rev = "9bb376295431a3c73a260ed6bbbcc870284f2db3" }
-# valargroup/voting-circuits#135
-voting-circuits = { git = "https://github.com/zodl-inc/voting-circuits", rev = "6a399f9260ebbb278cc180a23c89dc73323ee5f5" }
-voting-crypto-deps = { git = "https://github.com/zodl-inc/voting-circuits", rev = "6a399f9260ebbb278cc180a23c89dc73323ee5f5" }
-imt-tree = { git = "https://github.com/zodl-inc/voting-circuits", rev = "6a399f9260ebbb278cc180a23c89dc73323ee5f5" }
-# valargroup/vote-nullifier-pir#173
-pir-types = { git = "https://github.com/zodl-inc/vote-nullifier-pir", rev = "74327f9073e310b2b915d30f2a3c4d7918db7778" }
-pir-client = { git = "https://github.com/zodl-inc/vote-nullifier-pir", rev = "74327f9073e310b2b915d30f2a3c4d7918db7778" }
-# zakura-core/wallet-libraries#83
-zakura-wallet-lib = { git = "https://github.com/zodl-inc/zakura-wallet-libraries", rev = "29fa15e0ca839d8a6807721ea7275f0994f09b72" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress

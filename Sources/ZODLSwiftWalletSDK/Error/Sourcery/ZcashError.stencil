@@ -27,14 +27,19 @@ public enum ZcashError: Equatable, Error {
 
     /// The redacted detail carried by this error, if any.
     ///
-    /// Only a `RedactedRustError` payload is rendered here. That is the whole point of the type:
-    /// a raw `String` from `lastErrorMessage(fallback:)` may still hold an amount or an address,
-    /// so it must not reach `errorDescription` and from there an error report. Widening this to
+    /// Only payloads that cannot carry raw input are rendered here. A `RedactedRustError` is
+    /// redacted at the rust boundary, and that is the whole point of the type: a raw `String` from
+    /// `lastErrorMessage(fallback:)` may still hold an amount or an address, so it must not reach
+    /// `errorDescription` and from there an error report. A `SlipstreamStopReport` holds two
+    /// verdicts and two durations and renders as which of its waits ran out. Widening this to
     /// other payload types means redacting them at the rust boundary first.
     public var detail: String? {
         switch self {
         {% for case in type.cases %}{% for value in case.associatedValues where value.typeName.name == "RedactedRustError" %}
         case .{{ case.name }}({% for av in case.associatedValues %}{% if av.typeName.name == "RedactedRustError" %}let rustError{% else %}_{% endif %}{% if not forloop.last %}, {% endif %}{% endfor %}): return rustError.message
+        {% endfor %}{% endfor %}
+        {% for case in type.cases %}{% for value in case.associatedValues where value.typeName.name == "SlipstreamStopReport" %}
+        case .{{ case.name }}({% for av in case.associatedValues %}{% if av.typeName.name == "SlipstreamStopReport" %}let report{% else %}_{% endif %}{% if not forloop.last %}, {% endif %}{% endfor %}): return report.refusalReason
         {% endfor %}{% endfor %}
         default: return nil
         }

@@ -12,6 +12,17 @@ MACOS_ARCHS = x86_64-apple-darwin aarch64-apple-darwin
 IOS_SIM_ARCHS = $(IOS_SIM_ARCHS_STABLE)
 ALL_ARCHS = $(IOS_DEVICE_ARCHS) $(IOS_SIM_ARCHS) $(MACOS_ARCHS)
 
+# The minimum OS versions every slice is built for; keep them equal to
+# Package.swift's platforms. rustc and the cc crate both read these variables.
+# Without them, C that a dependency's build script compiles (lzma-sys, zstd-sys,
+# ring) took the Xcode SDK's own version as its minimum, so an Xcode 27 build
+# claimed macOS and iOS 27. IPHONEOS_DEPLOYMENT_TARGET also covers the
+# simulator slices. rustc applies MACOSX_DEPLOYMENT_TARGET to the build scripts
+# and proc macros it builds for this Mac as well; ../Cargo.toml's
+# [profile.release.build-override] explains why those stay unstripped.
+MACOSX_DEPLOYMENT_TARGET = 14.0
+IPHONEOS_DEPLOYMENT_TARGET = 16.0
+
 # Cargo serialises concurrent invocations behind a lock on the shared host
 # artifact directory (../target/release), so running one `cargo build --target X`
 # per architecture cannot overlap them — `make -j` does not help. That matters
@@ -20,7 +31,7 @@ ALL_ARCHS = $(IOS_DEVICE_ARCHS) $(IOS_SIM_ARCHS) $(MACOS_ARCHS)
 #
 # Passing several `--target` flags to one invocation puts every architecture in a
 # single job graph, letting those passes run concurrently.
-CARGO_BUILD = RUSTUP_TOOLCHAIN=stable cargo build --manifest-path ../Cargo.toml --release
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --locked --manifest-path ../Cargo.toml --release
 cargo_targets = $(addprefix --target ,$(1))
 
 RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml

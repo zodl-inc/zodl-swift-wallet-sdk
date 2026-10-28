@@ -20,6 +20,12 @@ import Foundation
 /// re-plans, and a proven, due transaction broadcasts ahead of any new proving work (its
 /// broadcast window is the scarcer resource; proving can happen on any later wake-up).
 ///
+/// The NU7 network-upgrade gate answers around that order, judged at the wallet's own chain tip
+/// alone: ``interruptedByNetworkUpgrade(activationHeight:)`` once the upgrade has stranded the run
+/// (``reevaluate`` while the wallet's scan cannot yet say whether it has), and
+/// ``pausedForNetworkUpgrade(activationHeight:)`` in place of a step the gate holds back. Neither
+/// carries an outlook.
+///
 /// Evaluated with both the wallet's fully-scanned target and its wall-clock tip estimate. Upstream
 /// uses the estimate only for reversible scheduling/withholding; persisted or destructive
 /// judgments remain anchored to scanned data. It is also memoryless about sessions: it reports
@@ -56,6 +62,11 @@ import Foundation
 /// - ``waiting`` → nothing is actionable now: register OS wake-ups at the heights
 ///   `migrationSyncWakeups(accountUUID:)` returns, plus each status row's
 ///   ``MigrationTransactionStatus/scheduledHeight`` for the broadcast windows.
+/// - ``pausedForNetworkUpgrade(activationHeight:)`` → do nothing now: no broadcast, proof,
+///   rebuild or re-plan, and no retry loop. Sync as usual, show the run as paused for the network
+///   upgrade, and crank again as the wallet's chain tip advances.
+/// - ``interruptedByNetworkUpgrade(activationHeight:)`` → the run cannot complete: cancel it with
+///   `cancelMigrationRun(accountUUID:)` and offer the user a new migration.
 ///
 /// ``complete`` is terminal for the STORED run — including a CANCELLED one, which the engine also
 /// reports as complete rather than ever driving it further — and means "stop polling this run".
@@ -97,7 +108,35 @@ public enum MigrationAdvanceStep: Equatable, Sendable {
     /// wallet's scan, and the engine will not adjudicate on stale data. Names no transaction and
     /// asks for nothing but a sync; the engine keeps answering this until the scan reaches the
     /// tip the rejecting node reported. See the type doc's discharge mapping.
+    ///
+    /// It is also the answer around the NU7 network upgrade while the wallet's scan has not
+    /// reached the last block before the activation, and every transaction of the run that is
+    /// built for the consensus branch before it and not yet mined may already have been sent: the
+    /// wallet cannot yet tell a finished run from a stranded one. Sync and ask again; the answer
+    /// becomes ``interruptedByNetworkUpgrade(activationHeight:)`` once the scan has passed that
+    /// block without finding them.
     case reevaluate
+    /// New scheduled work is PAUSED for the NU7 upgrade, which activates at `activationHeight`.
+    /// Do not rebuild or re-plan now.
+    ///
+    /// The gate holds back steps that build new scheduled work before activation, because those
+    /// transactions would be built for the branch the upgrade ends. Valid committed transactions
+    /// may still be proved and broadcast until activation.
+    ///
+    /// The step names no transaction and carries no outlook (``MigrationAdvance/next`` is `nil`):
+    /// there is no executor to hand it to. Show the run as paused for the network upgrade, sync as
+    /// usual, and crank again as the wallet's chain tip advances. See the type doc's discharge
+    /// mapping.
+    case pausedForNetworkUpgrade(activationHeight: BlockHeight)
+    /// The run was INTERRUPTED by the NU7 network upgrade at `activationHeight`: the wallet's tip
+    /// plus one has reached activation, so the next candidate block uses the new consensus branch.
+    /// An unmined transaction of the run uses the old branch, so the run cannot complete. Other
+    /// transactions may already have mined or may still mine; not every input becomes available at once.
+    ///
+    /// Cancel the run with `cancelMigrationRun(accountUUID:)` and offer the user a new migration,
+    /// which is built for the branch the chain is on. The step names no transaction and carries no
+    /// outlook (``MigrationAdvance/next`` is `nil`). See the type doc's discharge mapping.
+    case interruptedByNetworkUpgrade(activationHeight: BlockHeight)
 }
 
 /// The drive's instruction to broadcast one transaction — the payload of
@@ -671,6 +710,66 @@ public struct MigrationSchedule: Equatable, Sendable, Codable {
     }
 }
 
+/// What `Synchronizer.restartCurrentMigrationStep(accountUUID:)` came to.
+///
+/// A restart always cancels the account's stored run. Whether it then plans a new one depends on
+/// the NU7 network upgrade: a scheduled run spreads its transactions over many blocks and each is
+/// built for the consensus branch of the block it is built under. While the wallet's tip plus one
+/// is below activation no new scheduled run is planned, built, signed or stored.
+public enum MigrationRestartOutcome: Equatable, Sendable {
+    /// The run was cancelled and a fresh plan was previewed against the live balance. Re-confirm
+    /// it with the user and commit it as for any other proposal; its
+    /// ``MigrationSchedule/proposalHandle`` identifies it. An empty schedule means no eligible
+    /// migration can be planned from the currently available balance. Recorded spends may still
+    /// restrict selection until the wallet's expiry and scan rules allow it.
+    case replanned(MigrationSchedule)
+    /// The run was cancelled and no new plan was made, because the wallet's next block is before
+    /// NU7. The upgrade activates at `activationHeight`: offer the user a new migration once the
+    /// wallet's tip plus one reaches that height. Until then the calls that plan, build, sign or store a
+    /// scheduled run throw ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)``, and a plan
+    /// proposed before the restart can no longer be committed.
+    case cancelledUntilNetworkUpgrade(activationHeight: BlockHeight)
+}
+
+/// What the migration may start at the wallet's next height, as
+/// `Synchronizer.migrationAvailability()` reports it, for deciding which options to offer before
+/// anything is planned.
+///
+/// A transaction commits to the consensus branch it was built for, and a block accepts only
+/// transactions of the branch its own height is under. The scheduled lane builds a whole run ahead
+/// of time and sends it over many blocks, so a run started before the NU7 network upgrade activates
+/// would be stranded by it. The immediate lane is one transaction, sent at once. The phase follows
+/// from that, judged at the wallet's own chain tip alone.
+public struct MigrationAvailability: Equatable, Sendable {
+    /// Where the wallet's next height stands against the NU7 network upgrade.
+    public enum Phase: Equatable, Sendable {
+        /// Both lanes may start: the network has no NU7 activation height, the wallet's next block
+        /// is under NU7 already, or the host turned the upgrade gate's bypass on (internal builds
+        /// only).
+        case available
+        /// The next block is before activation. The scheduled lane may not start, and the calls
+        /// that plan, build, sign, store or rebuild a scheduled run throw
+        /// ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)``. The immediate lane is open.
+        case pausedUntilNetworkUpgrade
+    }
+
+    /// Where the wallet's next height stands against the NU7 network upgrade.
+    public let phase: Phase
+    /// The NU7 activation height of the wallet's network, in every phase, or `nil` when the
+    /// network has none (and then the phase is always ``Phase/available``).
+    public let activationHeight: BlockHeight?
+    /// Whether the immediate lane, one transaction that migrates the whole balance, may start.
+    /// Always `true` under the migration policy. Retained for compatibility.
+    public let isImmediateLaneAvailable: Bool
+
+    /// Creates an availability.
+    public init(phase: Phase, activationHeight: BlockHeight?, isImmediateLaneAvailable: Bool) {
+        self.phase = phase
+        self.activationHeight = activationHeight
+        self.isImmediateLaneAvailable = isImmediateLaneAvailable
+    }
+}
+
 /// An estimate of migrating the account's whole spendable Orchard balance across successive
 /// migration RUNS ("rounds"), as returned by
 /// `ZcashRustBackendWelding.estimateMigrationRuns(accountUUID:)`.
@@ -839,12 +938,13 @@ public struct ImmediateMigrationProposal: Equatable {
 /// A migration transaction handed to the platform.
 ///
 /// WHAT ``pczt`` CARRIES depends on the producer: the delivery executor
-/// (`migrationTakeBroadcastTransaction(id:for:)`) and the note-split ceremony
-/// (`migrationSignNoteSplit`) both serve through the store's atomic broadcast seam, so theirs is
-/// the FINALIZED CONSENSUS TRANSACTION — submittable as-is. The storage receipt
+/// (`migrationTakeBroadcastTransaction(id:submissionServerHeight:for:)`) and the note-split
+/// ceremony (`migrationSignNoteSplit`) both serve through the store's atomic broadcast seam, so
+/// theirs is the FINALIZED CONSENSUS TRANSACTION — submittable as-is. The storage receipt
 /// `migrationStoreSignedNoteSplitPczts` returns is a serialized PCZT, not submittable until the
-/// engine has proved it and a later `migrationTakeBroadcastTransaction(id:for:)` serves the
-/// broadcastable, proven value once a crank names it.
+/// engine has proved it and a later
+/// `migrationTakeBroadcastTransaction(id:submissionServerHeight:for:)` serves the broadcastable,
+/// proven value once a crank names it.
 public struct PreparedMigrationTransfer: Equatable, Sendable {
     /// The transfer's engine-issued id.
     public let id: UInt32

@@ -547,6 +547,21 @@ public protocol Synchronizer: AnyObject {
     /// Returns a list of the accounts in the wallet.
     func listAccounts() async throws -> [Account]
 
+    /// Finds the account in the wallet that shares a viewing key component (Orchard, Sapling or transparent P2PKH) with
+    /// `ufvk`, and reports what importing `ufvk` with
+    /// ``importAccount(ufvk:seedFingerprint:zip32AccountIndex:purpose:name:keySource:birthday:)`` would do to it.
+    ///
+    /// The answer is a snapshot: the lookup and an import run in separate transactions, so an account imported, changed or
+    /// deleted in between can make the import do something else. The lookup reads the wallet database without changing
+    /// it, and does not stop synchronization.
+    ///
+    /// - Parameter ufvk: the key to look up. No part of it is put in an error.
+    /// - Returns: `nil` when importing `ufvk` would add a new account; otherwise the account that shares a component with
+    ///   `ufvk`, and what importing `ufvk` would do to it.
+    /// - Throws: `ZcashError.accountKeyOverlapMultipleAccounts` when several accounts share a component with `ufvk`, which
+    ///   also makes importing it fail, and `ZcashError.rustFindAccountKeyOverlap` when the lookup itself fails.
+    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap?
+
     /// Imports a new account with UnifiedFullViewingKey.
     /// - Parameters:
     ///   - ufvk: unified full viewing key
@@ -684,8 +699,9 @@ public protocol Synchronizer: AnyObject {
         network: NetworkType
     ) async -> LightWalletEndpoint?
 
-    /// Takes a given date and finds out the closes checkpoint's height for it.
-    /// Each checkpoint has a timestamp stored so it can be used for the calculations.
+    /// The height of the newest bundled checkpoint whose time is strictly before `date`, a safe birthday for a
+    /// wallet created then; the newest checkpoint for a date at or after its time, and Sapling activation when
+    /// no checkpoint precedes `date`.
     func estimateBirthdayHeight(for date: Date) -> BlockHeight
 
     /// Takes a given height and finds out the closes checkpoint's timestamp for it.
@@ -844,6 +860,19 @@ public protocol Synchronizer: AnyObject {
     /// - Throws rustDeleteAccount as a common indicator of the operation failure
     func deleteAccount(_ accountUUID: AccountUUID) async throws -> Void
 
+    /// Sets the human-readable name of an account, replacing any name it had. The account's keys and all other state are
+    /// unchanged, and ``listAccounts()`` returns the new name afterwards. The rename does not stop synchronization.
+    ///
+    /// A name is a label to show, not an identity: it can change at any time, so never derive keys, file names or other
+    /// identifiers from it.
+    ///
+    /// - Parameters:
+    ///   - accountUUID: the account to rename.
+    ///   - name: the new name. It is stored as given, except that an empty name is refused.
+    /// - Throws: `ZcashError.rustSetAccountName` when the name cannot be stored, for example when no account has
+    ///   `accountUUID`, or when `name` is empty or contains a null character.
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws
+
     /// Provides access to transaction creation and submission operations
     /// that are decoupled from the synchronizer's built-in submission flow.
     ///
@@ -875,17 +904,38 @@ public protocol Synchronizer: AnyObject {
     // broadcast a migration transfer from a background session without ever starting sync.
     //
     // The action surface is exactly three things: the conduit (`migrationAdvanceStep(accountUUID:)`),
-    // the instruction executors (`proveMigrationTransactions`, `performMigrationBroadcast`,
-    // `refreshStaleMigrationTransfers`), and reads. The app has no semantic goal except to advance
-    // the migration and perform the advancement's dictates, and no member decides for itself what
-    // the migration needs: `MigrationBroadcastInstruction` and `MigrationProveTarget` have no
-    // public initializers, so the advance marshaling is their only producer and un-instructed
-    // proving or broadcasting does not compile. This is a Swift-surface property, not a security
-    // boundary — the Rust executors' per-row state gating remains the safety backstop.
+    // the executors of its steps (`proveMigrationTransactions` and `performMigrationBroadcast`,
+    // which take the instruction their step carries, and `refreshStaleMigrationTransfers` and
+    // `cancelMigrationRun`, which take no instruction), and reads. The app has no semantic goal
+    // except to advance the migration and perform the advancement's dictates, and no member
+    // decides for itself what the migration needs: `MigrationBroadcastInstruction` and
+    // `MigrationProveTarget` have no public initializers, so the advance marshaling is their only
+    // producer and un-instructed proving or broadcasting does not compile. This is a
+    // Swift-surface property, not a security boundary — the Rust executors' per-row state gating
+    // remains the safety backstop.
     //
     // The ceremony/consent lane is deliberately untouched by this: `prepareNoteSplit` /
     // `submitNoteSplit` and the propose/sign/store family are pre-drive consent flows — a user
     // approving a plan that does not exist yet — so there is no instruction for them to carry.
+    //
+    // While the wallet's tip plus one is below NU7 activation, that lane starts nothing: each member that
+    // plans, builds, signs, stores or rebuilds a scheduled run (`prepareNoteSplit`,
+    // `submitNoteSplit`, `proposeMigrationTransfers`, `signAndStoreMigrationSchedule`,
+    // `refreshStaleMigrationTransfers`, and the PCZT create/store members) throws
+    // `ZcashError.migrationPausedUntilNetworkUpgrade(_:)`, and `restartCurrentMigrationStep`
+    // cancels the run without planning a new one. The reads, the proving and broadcast executors
+    // and `cancelMigrationRun` (it ends a run and starts nothing) are not refused by it.
+    // `migrationAvailability` reports what the gate allows at the wallet's next height, so an app
+    // can decide which options to offer before it calls any of them.
+    //
+    // In every phase, the members that hand a transaction to the network (`submitNoteSplit`,
+    // `performMigrationBroadcast`) and `takeMigrationPreparation`, which hands one to the app, check
+    // it first against the block it would be mined in: the one after the higher of the wallet's
+    // chain tip and the latest block height of the server it is going to (for `takeMigrationPreparation`,
+    // the synchronizer's own). A transaction that is not built for that block's consensus branch,
+    // or that has expired by it is not recorded in the wallet and not submitted, and the member
+    // throws `ZcashError.migrationSubmissionRefused(_:)`. Valid committed work can continue before
+    // activation; the scheduling bypass never bypasses these branch, expiry or height checks.
 
     /// The migration engine's next step to advance `accountUUID`'s stored run, paired with its
     /// advisory outlook — a verbatim conduit of the engine's own `advance_migration`: the
@@ -916,7 +966,9 @@ public protocol Synchronizer: AnyObject {
     ///     _ = try await synchronizer.performMigrationBroadcast(accountUUID: account, instruction, options: options)
     /// case .rebuild:
     ///     _ = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: account, usk: usk)
-    /// case .replan, .reevaluate, .waiting, .complete, nil:
+    /// case .interruptedByNetworkUpgrade:
+    ///     try await synchronizer.cancelMigrationRun(accountUUID: account) // then offer a new migration
+    /// case .replan, .reevaluate, .waiting, .complete, .pausedForNetworkUpgrade, nil:
     ///     break // nothing to perform; see the per-step notes below
     /// }
     /// ```
@@ -925,6 +977,9 @@ public protocol Synchronizer: AnyObject {
     /// - `.reevaluate` — surfaced first, before any actionable step, while a broadcast-rejection
     ///   report is open → sync and call this again so the engine can adjudicate against the newly
     ///   scanned data; it keeps answering this until the scan reaches the rejecting node's tip.
+    ///   Around the NU7 activation it is also the answer while the wallet's scan has not reached
+    ///   the last block before it, and the run's unmined transactions built for the branch before
+    ///   it may already have been sent → sync and call this again.
     /// - `.replan` — the run's plan was undercut past the committed threshold and the verdict is
     ///   already persisted (no sync changes it) → surface the re-plan UX over the
     ///   ``MigrationTransactionStatus/State/invalid(reason:)`` row(s), then
@@ -948,8 +1003,65 @@ public protocol Synchronizer: AnyObject {
     ///   "stop polling" (its outlook is always `nil`). It is per-run, never "nothing left to
     ///   migrate": whether a migratable balance remains is answered by
     ///   ``proposeMigrationTransfers(accountUUID:)`` (an empty schedule means no).
+    /// - `.pausedForNetworkUpgrade` — the engine's step is one the NU7 network-upgrade gate holds
+    ///   back at the wallet's chain tip plus one → do nothing now: no broadcast, proof, rebuild or re-plan,
+    ///   and no retry loop. Show the run as paused for the upgrade, sync as usual, and call this
+    ///   again as the chain tip advances. The step carries the activation height and no outlook.
+    /// - `.interruptedByNetworkUpgrade` — the wallet's tip plus one has reached activation and
+    ///   an unmined transaction uses the old branch, so the next candidate block cannot include
+    ///   it → cancel the run with ``cancelMigrationRun(accountUUID:)`` and offer a new migration.
+    ///   The step carries the activation height and no outlook. Once the run is cancelled this
+    ///   member answers `.complete` for it.
     /// - Parameter accountUUID: the account whose next step is of interest.
     func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance?
+
+    /// For INTERNAL builds only: turns the NU7 network-upgrade gate's bypass on or off, so the
+    /// migration can be exercised on a network before the upgrade activates. A production build
+    /// must never turn it on.
+    ///
+    /// Off by default. The switch belongs to this synchronizer and applies to every account's
+    /// migration it drives, from the next call on. With the bypass on,
+    /// ``migrationAdvanceStep(accountUUID:)`` never answers
+    /// ``MigrationAdvanceStep/pausedForNetworkUpgrade(activationHeight:)``, and otherwise returns
+    /// the engine's own step, unless the run is interrupted or the wallet's scan has not reached
+    /// the block before the activation (see below). The calls that plan, build, sign, store or
+    /// rebuild a scheduled run are not refused with
+    /// ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)``, and
+    /// ``restartCurrentMigrationStep(accountUUID:)`` plans at every height. A run committed that
+    /// way is built for the consensus branch of the block it is committed under, so one still
+    /// unmined when the upgrade activates is stranded by it.
+    ///
+    /// The bypass does not lift the check that keeps a transaction the next block cannot include
+    /// from being submitted, nor the detection of such a stranded run: the drive still answers
+    /// ``MigrationAdvanceStep/interruptedByNetworkUpgrade(activationHeight:)`` for it, or
+    /// ``MigrationAdvanceStep/reevaluate`` while the wallet's scan cannot yet tell.
+    ///
+    /// A conformer without migration support ignores the call.
+    /// - Parameter isBypassed: `true` to bypass the gate, `false` to enforce it again.
+    func setMigrationNetworkUpgradeGateBypass(_ isBypassed: Bool) async
+
+    /// What the migration may start at the wallet's next height, to decide which options to offer
+    /// before anything is planned. See ``MigrationAvailability`` for the phases:
+    /// ``MigrationAvailability/Phase/available`` offers both the scheduled and the immediate
+    /// migration, and ``MigrationAvailability/Phase/pausedUntilNetworkUpgrade`` only the immediate one.
+    ///
+    /// WALLET-scoped, so it takes no account: the NU7 network-upgrade gate depends on the chain
+    /// alone. It is judged at the wallet's own chain tip, plus one, and never at the sync server's
+    /// height or a wall-clock estimate, and it makes no network request, so it can be asked as
+    /// often as the interface needs. It is the same judgment the calls that plan, build, sign,
+    /// store or rebuild a scheduled run are refused by (``ZcashError/migrationPausedUntilNetworkUpgrade(_:)``),
+    /// so a scheduled migration it reports as closed is one the SDK refuses. The immediate
+    /// migration remains available at every height, as do proof and broadcast of valid committed
+    /// work. Every submission still checks the consensus branch, expiry and submission server's
+    /// height. With the bypass on (``setMigrationNetworkUpgradeGateBypass(_:)``, internal builds
+    /// only) the phase is ``MigrationAvailability/Phase/available`` at every height.
+    ///
+    /// A network with no NU7 activation height is always available, with a `nil`
+    /// ``MigrationAvailability/activationHeight``.
+    /// - Throws: ``ZcashError/rustMigrationAvailability(_:)`` if the rust layer returns an error,
+    ///   notably when the wallet has no chain tip yet (sync at least once first) on a network that
+    ///   has an NU7 activation height and the bypass is off.
+    func migrationAvailability() async throws -> MigrationAvailability
 
     /// Live migration progress for `accountUUID`, or `nil` when no snapshot is reportable:
     /// present only while an engine run is ACTIVE (not terminal) or a recorded immediate sweep is
@@ -1015,15 +1127,32 @@ public protocol Synchronizer: AnyObject {
     /// ZIP 318 schedule and are served by ``performMigrationBroadcast(accountUUID:_:options:)``
     /// alone. This call does not broadcast, so it carries no privacy options and is not guarded
     /// against sync.
+    ///
+    /// The preparation is checked before the wallet records it: it must be built for the
+    /// consensus branch of the next block and must not have expired by it. Valid committed work
+    /// can continue before activation; these validity checks cannot be bypassed. The next block is
+    /// the one after the higher of the wallet's chain tip and the latest block height of the
+    /// synchronizer's own lightwalletd server, which this call therefore reads, with one network request of its own. With Tor
+    /// enabled that request goes over a Tor group named after `txid`: never over the default
+    /// circuit the sync uses, and shared with no other transaction. It is not necessarily the
+    /// circuit the app submits the bytes over. Without Tor it is a direct request. A preparation
+    /// that fails the check is not recorded in the wallet, and a height that cannot be read fails
+    /// the call without taking anything. An app that submits the bytes to other servers than the
+    /// synchronizer's, or to several, should judge them against each of those servers' own
+    /// heights as well.
     /// - Parameters:
     ///   - accountUUID: the account whose preparation is being retrieved.
     ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
     ///     raw/internal byte order.
-    /// - Throws: ``ZcashError/migrationProvingUnavailable(_:)`` when the stored artifact cannot be
-    ///   turned into servable bytes; ``ZcashError/rustMigrationTakePreparation(_:)`` for a
-    ///   transfer's txid, for a txid the stored run does not carry, and for the readiness refusal
-    ///   of a preparation that is not proved — which an app discharges by proving again rather
-    ///   than retrying this.
+    /// - Throws: ``ZcashError/migrationSubmissionRefused(_:)`` when the preparation cannot be valid
+    ///   in the next block, with the reason; ``ZcashError/migrationProvingUnavailable(_:)`` when the
+    ///   stored artifact cannot be turned into servable bytes;
+    ///   ``ZcashError/rustMigrationTakePreparation(_:)`` for a transfer's txid, for a txid the
+    ///   stored run does not carry, for a run that has ended, and for the readiness refusal of a
+    ///   preparation that is not proved — which an app discharges by proving again rather than
+    ///   retrying this; and the error of the height read, for instance
+    ///   ``ZcashError/serviceLatestBlockHeightFailed(_:)``, when the synchronizer's server cannot be
+    ///   asked.
     func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer
 
     /// Closes the seam: records the engine-side outcome of a preparation the app retrieved with
@@ -1093,7 +1222,9 @@ public protocol Synchronizer: AnyObject {
     func nextMigrationWake(accountUUID: AccountUUID) async -> MigrationNextWork?
 
     /// The wall-clock ESTIMATED chain tip, projected from the most recently scanned blocks'
-    /// header times (the measured-block-rate estimator behind `useEstimatedTip`). Falls back to
+    /// header times (the measured-block-rate estimator behind `useEstimatedTip`). A projection
+    /// that reaches a target spacing change, such as NU7 activation, counts the blocks past it at
+    /// their own spacing, keeping the speed the chain showed relative to its target. Falls back to
     /// the wallet's max SCANNED height when no samples exist. WALLET-scoped, like the batching
     /// group: the projection reads the shared blocks table, so it takes no account — one answer
     /// serves every account.
@@ -1101,12 +1232,16 @@ public protocol Synchronizer: AnyObject {
     ///   block, so no tip exists to estimate from.
     func estimatedMigrationChainTip() async throws -> BlockHeight
 
-    /// The measured seconds-per-block over the most recently scanned blocks: the mean of the last
-    /// up-to-100 consecutive header-time deltas, clamped to [5, 150] s, falling back to 75 s (the
-    /// target spacing) when fewer than two samples exist. Use it to convert
-    /// ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers. WALLET-scoped
-    /// like ``estimatedMigrationChainTip()`` — the measurement reads the shared blocks table, so
-    /// it takes no account.
+    /// The measured seconds-per-block: the chain's speed relative to the target time of up to the
+    /// last 1000 scanned blocks, expressed in the target spacing of the block after
+    /// ``estimatedMigrationChainTip()`` and clamped to [5, 150] s scaled by that spacing over 75 s
+    /// ([5/3, 50] s at NU7's 25 s). When no rate can be measured it is that block's target
+    /// spacing (25 s from NU7 activation), or 75 s for a wallet that has never scanned. Use it to
+    /// convert ``migrationSyncWakeups(accountUUID:)`` heights into wall-clock OS timers.
+    /// ``TargetBlockSpacing/estimatedSeconds(from:to:secondsPerBlock:)`` does so from
+    /// ``estimatedMigrationChainTip()``, across a spacing change too. WALLET-scoped like
+    /// ``estimatedMigrationChainTip()`` — the measurement reads the shared blocks table, so it
+    /// takes no account.
     func estimatedMigrationSecondsPerBlock() async throws -> Double
 
     /// The LIVE status of every committed migration transaction for `accountUUID`, keyed by its
@@ -1136,10 +1271,19 @@ public protocol Synchronizer: AnyObject {
     /// Any subsequent propose/prepare call for the same account supersedes previously returned
     /// proposal handles — commit calls carrying an older handle throw `ZcashError.migrationPlanStale`.
     /// - Parameter accountUUID: the account to prepare a note split for.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is planned.
     func prepareNoteSplit(accountUUID: AccountUUID) async throws -> NoteSplitProposal
 
     /// Signs, extracts, broadcasts, and records `accountUUID`'s note-split transaction, returning the
     /// broadcast outcome.
+    ///
+    /// The SDK connects to the submission server first and reads its latest block height on that
+    /// connection, then signs and checks the transaction against the next block (the one after the
+    /// higher of that height and the wallet's chain tip) before the wallet records it, then
+    /// submits it. A transaction that cannot be valid in the next block is refused, not recorded
+    /// and not submitted, and a server whose height cannot be read gets nothing: the result is
+    /// ``MigrationTransferResult/networkError(retryable:)`` and nothing was signed or recorded.
     ///
     /// - Parameters:
     ///   - accountUUID: the account whose note split is being submitted.
@@ -1148,8 +1292,17 @@ public protocol Synchronizer: AnyObject {
     ///   - options: network-privacy options (Tor, submission endpoint) for this broadcast.
     /// - Throws: ``ZcashError/migrationBroadcastDuringSync`` if the synchronizer is actively syncing —
     ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
-    ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
-    ///   was broadcast); a failure to record a broadcast that did land throws
+    ///   this call, so stop sync first. ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)``
+    ///   before the NU7 network upgrade has activated: nothing is signed or broadcast. That
+    ///   refusal comes after the connection to the submission server and the read of its height,
+    ///   so the call contacts the server even then, and a server that cannot be reached
+    ///   (``ZcashError/migrationTorUnavailable``, or the
+    ///   ``MigrationTransferResult/networkError(retryable:)`` result) is reported in its place.
+    ///   Ask ``migrationAvailability()``, which makes no network request, before calling.
+    ///   ``ZcashError/migrationSubmissionRefused(_:)`` when the signed transaction cannot be valid
+    ///   in the next block: it was not submitted and the wallet did not record it, while the
+    ///   committed run stays. Otherwise, a pre-broadcast failure throws untouched (nothing was
+    ///   broadcast); a failure to record a broadcast that did land throws
     ///   ``ZcashError/migrationRecordFailedAfterBroadcast(_:)`` — the broadcast is real and a
     ///   later attempt self-heals.
     /// - Note: A completed submission leaves no timed hold behind — the migration gate blocks
@@ -1176,6 +1329,8 @@ public protocol Synchronizer: AnyObject {
     /// `ZcashError.migrationPlanStale`. An EMPTY schedule means there is nothing to migrate; after a
     /// completed run this is the "does anything remain" answer of the sequential-runs contract.
     /// - Parameter accountUUID: the account to propose a migration schedule for.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is planned or cached.
     /// - Note: The run is sized per account — see ``estimateMigrationRuns(accountUUID:)``.
     func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule
 
@@ -1190,6 +1345,10 @@ public protocol Synchronizer: AnyObject {
     /// ``createPCZTFromProposal(accountUUID:proposal:)``. Executing it is the caller's job exactly
     /// like any other transfer; call ``recordImmediateMigration(accountUUID:txid:)`` after a
     /// successful broadcast so the platform migration state machine reports it.
+    ///
+    /// The NU7 gate pauses only new scheduled work, so the immediate migration remains available
+    /// at every height. Its submission still requires a valid consensus branch and expiry for the
+    /// next block, judged against the higher of the wallet's tip and the submission server's height.
     /// - Parameter accountUUID: the account to propose the immediate migration for.
     /// - Throws: the rust layer's `InsufficientFunds` (mapped) when the fee would consume the whole
     ///   balance.
@@ -1288,9 +1447,11 @@ public protocol Synchronizer: AnyObject {
     ///     ``ImmediateMigrationProposal``, executed via ``createProposedTransactions(proposal:spendingKey:)``
     ///     / ``createPCZTFromProposal(accountUUID:proposal:)`` like any other transfer.
     ///   - usk: the account's unified spending key.
-    /// - Throws: `ZcashError.migrationPlanStale` when nothing is committed and the identified plan
-    ///   is missing (process restart between propose and confirm) or superseded by a later
-    ///   propose/prepare call — re-propose and re-display; rust-layer errors otherwise.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is signed or stored. `ZcashError.migrationPlanStale` when
+    ///   nothing is committed and the identified plan is missing (process restart between propose
+    ///   and confirm) or superseded by a later propose/prepare call — re-propose and re-display;
+    ///   rust-layer errors otherwise.
     func signAndStoreMigrationSchedule(accountUUID: AccountUUID, _ schedule: MigrationSchedule, usk: UnifiedSpendingKey) async throws
 
     /// The broadcast executor: submits the already-proven migration transaction `instruction`
@@ -1305,11 +1466,21 @@ public protocol Synchronizer: AnyObject {
     /// never proves, either: a due row still awaiting its proof is never named by a `.broadcast`
     /// step; the crank reports it inside the `.prove` batch.
     ///
-    /// It wraps exactly what an app cannot do for itself: serving the transaction's finalized
-    /// bytes through the store's atomic broadcast seam, submitting them under the given privacy
-    /// options — always over the dedicated migration Tor runtime when `options.useTor` is set,
-    /// independent of the global `tor(enabled:)` toggle and fail-closed — bracketing the submit
-    /// in the sync gate's in-flight marker, and recording the result.
+    /// It wraps exactly what an app cannot do for itself: connecting to the submission server and
+    /// reading its latest block height there, serving the transaction's finalized bytes through the
+    /// store's atomic broadcast seam, submitting them under the given privacy options — always over
+    /// the dedicated migration Tor runtime when `options.useTor` is set, independent of the global
+    /// `tor(enabled:)` toggle and fail-closed — bracketing the submit in the sync gate's in-flight
+    /// marker, and recording the result.
+    ///
+    /// The transaction is checked before the wallet records it. The next block is the one after
+    /// the higher of the wallet's chain tip and the height the submission server reported, and the
+    /// transaction must be built for that block's consensus branch and must not have expired by it.
+    /// Valid committed work can continue before activation; these validity checks cannot be bypassed.
+    /// One that fails is neither recorded in the wallet nor submitted. A server whose height cannot
+    /// be read gets nothing either: no transaction is taken, and the result is
+    /// ``MigrationTransferResult/networkError(retryable:)``, so the next crank offers the
+    /// instruction again.
     ///
     /// - Parameters:
     ///   - accountUUID: the account the instruction belongs to.
@@ -1319,6 +1490,12 @@ public protocol Synchronizer: AnyObject {
     ///   sync and migration broadcasts must never share a session; this is enforced by the SDK on
     ///   this call, so stop sync first. Otherwise, a pre-broadcast failure throws untouched (nothing
     ///   was broadcast) — including
+    ///   ``ZcashError/migrationSubmissionRefused(_:)`` when the transaction cannot be valid in the
+    ///   next block, with the reason (sync, then crank ``migrationAdvanceStep(accountUUID:)``
+    ///   again to learn what becomes of the run: the crank judges the run at the wallet's own
+    ///   chain tip, and the check at the higher of that and the submission server's height, so a
+    ///   wallet that is behind the server is offered the same broadcast again until it has
+    ///   synced), and
     ///   ``ZcashError/rustMigrationTakeBroadcastTransaction(_:)`` when the instruction has gone
     ///   STALE (its row is no longer proved-and-servable, typically because it was already
     ///   broadcast). Discharge a staleness throw by cranking
@@ -1395,14 +1572,47 @@ public protocol Synchronizer: AnyObject {
     /// - Parameter accountUUID: the account to check.
     func hasInvalidMigrationTransfers(accountUUID: AccountUUID) async throws -> Bool
 
-    /// Re-evaluates `accountUUID`'s remaining spendable Orchard balance and returns a fresh schedule.
+    /// Cancels `accountUUID`'s stored run and re-evaluates its remaining spendable Orchard balance
+    /// into a fresh schedule.
     ///
     /// The old plan is no longer valid: the engine discards it and derives a new one, which a
     /// follow-up ``signAndStoreMigrationSchedule(accountUUID:_:usk:)`` (or PCZT store) then signs and
     /// persists. The fresh plan is sized the way the account is sized NOW, which is also how a run
     /// committed under an earlier sizing moves onto the current one.
+    ///
+    /// Before the NU7 network upgrade has activated, judged at the wallet's own chain tip, no new
+    /// scheduled run is planned: the run is cancelled all the same and the call succeeds with
+    /// ``MigrationRestartOutcome/cancelledUntilNetworkUpgrade(activationHeight:)``, carrying the
+    /// activation height to wait for. A plan proposed before the restart can no longer be committed
+    /// then.
+    ///
+    /// To end a run without planning anything, use ``cancelMigrationRun(accountUUID:)``.
     /// - Parameter accountUUID: the account to restart.
-    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule
+    /// - Returns: ``MigrationRestartOutcome/replanned(_:)`` with the fresh schedule to re-confirm, or
+    ///   ``MigrationRestartOutcome/cancelledUntilNetworkUpgrade(activationHeight:)``.
+    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationRestartOutcome
+
+    /// Cancels `accountUUID`'s pending run and nothing more: no fresh plan is made.
+    ///
+    /// This is how a host ends a run the NU7 network upgrade interrupted
+    /// (``MigrationAdvanceStep/interruptedByNetworkUpgrade(activationHeight:)``): cancel it, then
+    /// offer the user a new migration, which is built for the consensus branch the chain is on. The
+    /// run is persisted as cancelled and eligible advisory note reservations are released. Recorded
+    /// spends remain subject to the wallet's expiry and scan rules, even if network submission failed
+    /// or was never attempted. Its pre-signed transactions are abandoned; transactions already
+    /// broadcast are unaffected on-chain and may still be mined. Interruption does not mean every
+    /// transaction failed or every input becomes available at once.
+    /// A plan proposed before the call can no longer be committed, and afterwards
+    /// ``migrationAdvanceStep(accountUUID:)`` answers ``MigrationAdvanceStep/complete`` for the run:
+    /// stop polling it.
+    ///
+    /// ``restartCurrentMigrationStep(accountUUID:)`` cancels the same way and then plans. This call
+    /// plans nothing, so the NU7 network-upgrade gate never refuses it, at any height. With no run
+    /// pending it succeeds and changes no stored run, so a host may retry it. (A terminal run keeps
+    /// its status, though a reservation it still holds is released.)
+    /// - Parameter accountUUID: the account whose run to cancel.
+    /// - Throws: ``ZcashError/rustMigrationCancelRun(_:)`` if the rust layer returns an error.
+    func cancelMigrationRun(accountUUID: AccountUUID) async throws
 
     /// Rebuilds every EXPIRED transfer of `accountUUID`'s stored migration run in place through the
     /// engine and returns the run's FULL transfer schedule as stored AFTER the refresh.
@@ -1431,7 +1641,13 @@ public protocol Synchronizer: AnyObject {
     ///     ``createUnsignedMigrationTransferPCZTs(accountUUID:for:)`` /
     ///     ``storeSignedMigrationSchedulePCZTs(accountUUID:_:)`` ceremony re-serves and completes
     ///     them.
-    /// - Throws: notably, a `FundingNoteUnavailable`-class failure when an expired transfer's exact
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is rebuilt. That gate is judged first, at the wallet's
+    ///   chain tip, so on a network that has an NU7 activation height, and unless the bypass is
+    ///   on, a wallet that has no chain tip yet throws
+    ///   ``ZcashError/rustMigrationRefreshStaleTransfers(_:)`` (sync first) even where there is
+    ///   nothing to refresh (no stored run, or a terminal one). Notably otherwise, a
+    ///   `FundingNoteUnavailable`-class failure when an expired transfer's exact
     ///   funding note was spent outside the migration — the underlying message names
     ///   ``restartCurrentMigrationStep(accountUUID:)`` (cancel and re-plan the remaining balance) as
     ///   the remedy. Rebuilds are persisted ALL-OR-NOTHING: a mid-refresh throw (including this one)
@@ -1452,9 +1668,11 @@ public protocol Synchronizer: AnyObject {
     ///     native side, and only when this call is the one creating the run (no stored run, or a
     ///     terminal one) — the display fields are never echoed back, and the ordinary resume case
     ///     does not consult the handle at all.
-    /// - Throws: `ZcashError.migrationPlanStale` when this call is creating the run and the
-    ///   identified plan is missing (process restart between propose and confirm) or superseded by
-    ///   a later propose/prepare call — re-propose and re-display before retrying.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is built. `ZcashError.migrationPlanStale` when this call
+    ///   is creating the run and the identified plan is missing (process restart between propose
+    ///   and confirm) or superseded by a later propose/prepare call — re-propose and re-display
+    ///   before retrying.
     func createUnsignedNoteSplitPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt]
 
     /// Applies the ceremony's signatures to `accountUUID`'s preparation (note-split) transactions,
@@ -1464,6 +1682,8 @@ public protocol Synchronizer: AnyObject {
     /// - Parameters:
     ///   - accountUUID: the account the PCZTs belong to.
     ///   - signed: the externally signed preparation PCZTs, each paired with its engine id.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is stored.
     func storeSignedNoteSplitPCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws -> PreparedMigrationTransfer
 
     /// Builds one unsigned, proven PCZT per transfer of `schedule` for `accountUUID`, for an external
@@ -1478,9 +1698,11 @@ public protocol Synchronizer: AnyObject {
     ///     case where this call is the one creating the run (no stored run, or a terminal one) —
     ///     the display fields are never echoed back, and the ordinary resume case does not consult
     ///     the handle at all.
-    /// - Throws: `ZcashError.migrationPlanStale` when this call is creating the run and the
-    ///   identified plan is missing (process restart) or superseded by a later propose/prepare
-    ///   call — re-propose and re-display; rust-layer errors otherwise.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is built. `ZcashError.migrationPlanStale` when this call
+    ///   is creating the run and the identified plan is missing (process restart) or superseded
+    ///   by a later propose/prepare call — re-propose and re-display; rust-layer errors
+    ///   otherwise.
     func createUnsignedMigrationTransferPCZTs(accountUUID: AccountUUID, for schedule: MigrationSchedule) async throws -> [MigrationUnsignedTransferPczt]
 
     /// Accepts the full set of `accountUUID`'s externally signed transfer PCZTs (all-or-nothing),
@@ -1491,6 +1713,8 @@ public protocol Synchronizer: AnyObject {
     /// - Parameters:
     ///   - accountUUID: the account the PCZTs belong to.
     ///   - signed: the full set of externally signed transfer PCZTs.
+    /// - Throws: ``ZcashError/migrationPausedUntilNetworkUpgrade(_:)`` before the NU7 network
+    ///   upgrade has activated: nothing is stored.
     func storeSignedMigrationSchedulePCZTs(accountUUID: AccountUUID, _ signed: [MigrationSignedTransferPczt]) async throws
 
     // MARK: - Migration Keystone batch-signing (external signer ceremony)
@@ -1610,6 +1834,26 @@ private struct GetTreeStateUnimplemented: LocalizedError {
 private struct RestartSyncUnimplemented: LocalizedError {
     var errorDescription: String? {
         "Synchronizer.restartSync(at:) has no default implementation. Override it in your conformer to rebuild and restart the engine."
+    }
+}
+
+/// Error thrown by the default `Synchronizer.findAccountSharingKeyComponents(_:)` implementation.
+private struct AccountSharingKeyComponentsUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        """
+        Synchronizer.findAccountSharingKeyComponents(_:) has no default implementation. \
+        Override this method in your Synchronizer conformer to look up the account that shares a viewing key component.
+        """
+    }
+}
+
+/// Error thrown by the default `Synchronizer.renameAccount(_:name:)` implementation.
+private struct RenameAccountUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        """
+        Synchronizer.renameAccount(_:name:) has no default implementation. \
+        Override this method in your Synchronizer conformer to store a new name for an account.
+        """
     }
 }
 
@@ -1798,6 +2042,20 @@ public extension Synchronizer {
         throw RestartSyncUnimplemented()
     }
 
+    /// Default implementation so adding `findAccountSharingKeyComponents(_:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Both shipped synchronizers override it; the
+    /// rest report the capability as unavailable.
+    func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        throw AccountSharingKeyComponentsUnimplemented()
+    }
+
+    /// Default implementation so adding `renameAccount(_:name:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Both shipped synchronizers override it; the
+    /// rest report the capability as unavailable.
+    func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        throw RenameAccountUnimplemented()
+    }
+
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall
@@ -1812,11 +2070,19 @@ public extension Synchronizer {
     // source-breaking change for downstream/stacked conformers (in particular the
     // `SlipstreamSynchronizer` stack, until it carries its own implementations). Conformers with
     // migration support (`SDKSynchronizer`) override every one of these; conformers that don't fall
-    // through here. The throwing members all throw `MigrationUnimplemented`; the four non-throwing
+    // through here. The throwing members all throw `MigrationUnimplemented`; the five non-throwing
     // members get inert defaults instead, documented below — conformers must override them to offer
     // real migration behavior.
 
     func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    /// Inert default: a conformer without migration support has no gate to opt out of. Conformers
+    /// with migration support must override it.
+    func setMigrationNetworkUpgradeGateBypass(_ isBypassed: Bool) async { }
+
+    func migrationAvailability() async throws -> MigrationAvailability {
         throw MigrationUnimplemented(member: #function)
     }
 
@@ -1947,7 +2213,11 @@ public extension Synchronizer {
         throw MigrationUnimplemented(member: #function)
     }
 
-    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+    func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationRestartOutcome {
+        throw MigrationUnimplemented(member: #function)
+    }
+
+    func cancelMigrationRun(accountUUID: AccountUUID) async throws {
         throw MigrationUnimplemented(member: #function)
     }
 
@@ -2229,9 +2499,21 @@ public enum RewindPolicy {
 /// The result of submitting a transaction to the network.
 ///
 /// - success: the transaction was successfully submitted to the mempool.
-/// - grpcFailure: the transaction failed to reach the lightwalletd server.
-/// - submitFailure: the transaction reached the lightwalletd server but failed to enter the mempool.
+/// - grpcFailure: the transaction failed to reach the lightwalletd server. The first request of a submission reads the latest
+///   block height of that server, so a server that cannot be asked for it is reported here too, and nothing was submitted.
+/// - submitFailure: the transaction reached the lightwalletd server but failed to enter the mempool, or the SDK refused to
+///   submit it because it cannot be valid in the next block (see ``TransactionSubmissionRefusal``). A refusal is reported
+///   under the local `code` of the refusal, `-9101` for a transaction built for another consensus branch than the next
+///   block's and `-9102` for an expired one, with its stable `description`. No server sends these codes, and nothing reached
+///   the network. Sync, then create the transaction again: a wallet that is behind the server would build one that is refused
+///   again, and the refused transaction, stored in the wallet when it was created, returns its inputs to the spendable balance
+///   only at its expiry height.
 /// - notAttempted: the transaction was created and is in the local wallet, but was not submitted to the network.
+///
+/// Before it submits a transaction, the SDK reads the latest block height of the server the transaction goes to. If that
+/// height cannot be read, nothing is submitted, and the transaction is reported as `grpcFailure` like one that could not reach
+/// the server, with the ones after it `notAttempted`. A transaction the SDK cannot judge at all (it does not parse, or the wallet
+/// database is missing) is not submitted either, and the stream throws ``ZcashError/rustCheckTransactionSubmittable(_:)``.
 public enum TransactionSubmitResult: Equatable {
     case success(txId: Data)
     case grpcFailure(txId: Data, error: LightWalletServiceError)

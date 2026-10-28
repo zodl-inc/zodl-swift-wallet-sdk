@@ -126,7 +126,16 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
             return try await super.latestBlockHeight(mode: mode)
         }
 
-        return BlockHeight(try await latestBlock(mode: mode).height)
+        let blockID = try await latestBlock(mode: mode)
+
+        // The same bound as the direct path applies: a height above `Int32.max` is not one the SDK can use.
+        guard let blockHeight = BlockHeight(serverHeight: blockID.height) else {
+            throw ZcashError.serviceLatestBlockHeightFailed(
+                LightWalletServiceError.generalError(message: "The server reported a latest block with a height the SDK can't use.")
+            )
+        }
+
+        return blockHeight
     }
 
     override func latestBlock(mode: ServiceMode) async throws -> BlockID {
@@ -173,8 +182,14 @@ class LightWalletGRPCServiceOverTor: LightWalletGRPCService {
             return try await super.getTreeState(id, mode: mode)
         }
 
+        // The height is checked before a connection is asked for: a height the SDK can't use says nothing about the
+        // connection, and failing on it must not drop a healthy one.
+        guard let height = BlockHeight(serverHeight: id.height) else {
+            throw ZcashError.rustTorLwdGetTreeState("The tree state was requested for a block height the SDK can't use.")
+        }
+
         do {
-            return try await serviceConnections.connectToLightwalletd(mode).getTreeState(height: BlockHeight(id.height))
+            return try await serviceConnections.connectToLightwalletd(mode).getTreeState(height: height)
         } catch {
             await serviceConnections.responseToTorFailure(mode)
             throw error

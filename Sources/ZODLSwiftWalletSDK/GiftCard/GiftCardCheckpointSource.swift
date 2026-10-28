@@ -30,16 +30,17 @@ final class GiftCardCheckpointSource: CheckpointSource {
     /// The state is only used when its height is exactly `birthday - 1`, the height it was
     /// requested for. A server that answers with another height, by mistake or on purpose, would
     /// otherwise move the start of the scan: past the card's funds, making a funded card look
-    /// empty, or far before them. Such a state is ignored and the bundled checkpoint applies.
+    /// empty, or far before them. Such a state is ignored and the bundled checkpoint applies. So is a
+    /// state at a height the SDK can't use.
     ///
     /// - Returns: whether the state was used.
     @discardableResult
     func use(_ treeState: TreeState, forBirthday birthday: BlockHeight) -> Bool {
-        guard birthday > 0, treeState.height == UInt64(birthday - 1) else {
+        guard birthday > 0, treeState.height == UInt64(birthday - 1), let checkpoint = Checkpoint(treeState: treeState) else {
             return false
         }
         lock.lock()
-        exact = Checkpoint(treeState: treeState)
+        exact = checkpoint
         lock.unlock()
         return true
     }
@@ -74,10 +75,13 @@ final class GiftCardCheckpointSource: CheckpointSource {
 
 extension Checkpoint {
     /// A checkpoint from a server tree state; the optional trees are absent when the server
-    /// sends them empty.
-    init(treeState: TreeState) {
+    /// sends them empty. `nil` if the state's height is one the SDK can't use.
+    init?(treeState: TreeState) {
+        guard let height = BlockHeight(serverHeight: treeState.height) else {
+            return nil
+        }
         self.init(
-            height: BlockHeight(treeState.height),
+            height: height,
             hash: treeState.hash,
             time: treeState.time,
             saplingTree: treeState.saplingTree,

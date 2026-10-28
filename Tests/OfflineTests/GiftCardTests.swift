@@ -745,6 +745,44 @@ final class GiftCardTests: ZcashTestCase {
         }
     }
 
+    /// A checkpoint is built from whatever tree state the server answers with, and a server can put
+    /// any `UInt64` in its height. One the SDK cannot use gives no checkpoint, instead of a trap.
+    func testCheckpointFromATreeStateAtAnUnusableHeightIsNil() {
+        for height in [UInt64(Int32.max) + 1, UInt64(UInt32.max), UInt64(Int64.max) + 1, UInt64.max] {
+            var treeState = Self.treeState(height: 1)
+            treeState.height = height
+
+            XCTAssertNil(Checkpoint(treeState: treeState), "\(height)")
+        }
+    }
+
+    func testCheckpointFromATreeStateAtTheLargestUsableHeightKeepsTheTreeState() {
+        var treeState = Self.treeState(height: 1)
+        treeState.height = UInt64(Int32.max)
+
+        let checkpoint = Checkpoint(treeState: treeState)
+
+        XCTAssertEqual(checkpoint?.height, BlockHeight(Int32.max))
+        XCTAssertEqual(checkpoint?.hash, treeState.hash)
+        XCTAssertEqual(checkpoint?.saplingTree, treeState.saplingTree)
+        XCTAssertEqual(checkpoint?.orchardTree, treeState.orchardTree)
+        XCTAssertNil(checkpoint?.ironwoodTree)
+    }
+
+    /// The tree state is only used at exactly `birthday - 1`. When that height is one the SDK cannot
+    /// use, the state is ignored like any other state for the wrong height, and the bundled
+    /// checkpoint applies.
+    func testCheckpointSourceIgnoresATreeStateAtAnUnusableHeight() {
+        let bundled = CheckpointSourceFactory.fromBundle(for: .testnet)
+        let source = GiftCardCheckpointSource(bundled: bundled)
+        let birthday = BlockHeight(Int32.max) + 2
+        var treeState = Self.treeState(height: 1)
+        treeState.height = UInt64(birthday - 1)
+
+        XCTAssertFalse(source.use(treeState, forBirthday: birthday))
+        XCTAssertEqual(source.birthday(for: birthday).height, bundled.birthday(for: birthday - 1).height)
+    }
+
     private static func treeState(height: BlockHeight) -> TreeState {
         var treeState = TreeState()
         treeState.height = UInt64(height)

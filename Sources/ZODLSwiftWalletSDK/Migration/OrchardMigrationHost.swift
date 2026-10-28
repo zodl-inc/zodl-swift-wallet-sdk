@@ -18,20 +18,33 @@ import Foundation
 /// (see ``OrchardMigration``); the host itself borrows the synchronizer's welding
 /// (`Initializer.rustBackend`) only for the WALLET-scope members — the sync-blocked predicate
 /// (enumerating every account and reading each account's persisted gate file directly, so a
-/// dormant account whose actor has never been created this launch still counts) and the
+/// dormant account whose actor has never been created this launch still counts), the
 /// account-free chain-tip estimation pair (``estimatedChainTip()`` /
-/// ``estimatedSecondsPerBlock()``, which read the shared blocks table).
+/// ``estimatedSecondsPerBlock()``, which read the shared blocks table) and the account-free
+/// ``migrationAvailability()`` (which reads the wallet's chain tip). The one other thing it borrows
+/// is the synchronizer's lightwalletd service, as the source of the latest block height a
+/// preparation retrieved with ``OrchardMigration/takePreparation(byTxid:)`` is checked against.
 actor OrchardMigrationHost {
     private let welding: ZcashRustBackendWelding
     private let sharedBroadcaster: any MigrationBroadcasting
     private let generalStorageURL: URL
     private let now: @Sendable () -> Date
     private let logger: Logger
+    /// The network's target spacing schedule, which the wallet-scope estimates project on.
+    private let spacing: TargetBlockSpacing
 
-    /// Builds a per-account ``OrchardMigration`` bound to `accountUUID`, wired to the given shared
-    /// broadcaster. Injected so tests can substitute mock-welded actors; production builds each from
-    /// the initializer's config via ``OrchardMigration/init(config:sharedBroadcaster:)``.
-    private let actorFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration
+    /// Builds a per-account ``OrchardMigration`` bound to the given account, wired to the given shared
+    /// broadcaster and to the host's one NU7 gate bypass holder.
+    typealias ActorFactory = (AccountUUID, any MigrationBroadcasting, MigrationUpgradeGateBypass) -> OrchardMigration
+
+    /// Injected so tests can substitute mock-welded actors; production builds each from the
+    /// initializer's config via ``OrchardMigration/init(config:sharedBroadcaster:)``.
+    private let actorFactory: ActorFactory
+
+    /// The host's NU7 network-upgrade gate bypass, handed to every migration it builds. One holder
+    /// for the host's lifetime, so a switch made through ``setUpgradeGateBypass(_:)`` reaches the
+    /// migrations that already exist and those built later. Off until a host turns it on.
+    private let upgradeGateBypass = MigrationUpgradeGateBypass()
 
     /// The wallet-scope reactive stream machinery. A separate, self-synchronized object (like
     /// ``MigrationSyncGate``) so ``syncBlockedStream`` can be `nonisolated`.
@@ -65,7 +78,30 @@ actor OrchardMigrationHost {
         let generalStorageURL = initializer.generalStorageURL
         let logger = initializer.logger
 
-        let factory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { accountUUID, broadcaster in
+        // The synchronizer's own lightwalletd server's latest block height, which a preparation's
+        // submission check is judged against (see ``OrchardMigration/takePreparation(byTxid:)``).
+        // With Tor on it is read over a Tor group named after the preparation's txid
+        // (`submit-<txid>`, not necessarily the one the host submits it in), like the SDK's other
+        // requests that name a transaction, each of which
+        // gets a circuit of that transaction's own so that nothing the server sees ties one
+        // transaction to another or to the wallet's sync identity. It is never read over the default
+        // circuit the sync keeps for the wallet: a request there moments before every preparation is
+        // submitted would tie each of those submissions to the sync. Without Tor it is a direct
+        // request, which is what the sync's own are. The service is looked up when the height is
+        // read and not held: `switchTo(endpoint:)` replaces the initializer's service, and holding
+        // the current one would read a server the wallet no longer syncs from. The initializer is
+        // held weakly, as the container registration of this host does, so that initializer ->
+        // container -> host -> this closure -> initializer is not a cycle.
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let submissionHeight: @Sendable (Data) async throws -> BlockHeight = { [weak initializer] txid in
+            guard let initializer else {
+                throw ZcashError.synchronizerNotPrepared
+            }
+            let mode = await sdkFlags.ifTor(ServiceMode.txIdGroup(prefix: "submit", txId: txid))
+            return try await initializer.lightWalletService.latestBlockHeight(mode: mode)
+        }
+
+        let factory: ActorFactory = { accountUUID, broadcaster, upgradeGateBypass in
             OrchardMigration(
                 config: OrchardMigration.Config(
                     dataDbURL: dataDbURL,
@@ -76,6 +112,8 @@ actor OrchardMigrationHost {
                     accountUUID: accountUUID,
                     torDirURL: torDirURL,
                     generalStorageURL: generalStorageURL,
+                    upgradeGateBypass: upgradeGateBypass,
+                    submissionHeight: submissionHeight,
                     loggingPolicy: Initializer.LoggingPolicy.custom(logger)
                 ),
                 sharedBroadcaster: broadcaster
@@ -89,13 +127,16 @@ actor OrchardMigrationHost {
             tickInterval: 15,
             now: { Date() },
             logger: logger,
+            spacing: TargetBlockSpacing(network: network),
             actorFactory: factory
         )
     }
 
     /// Injecting initializer for tests: supply the welding, the shared broadcaster, the storage
-    /// directory the gate files live in, the ticker interval and clock, the logger, and the
-    /// per-account actor factory directly — mirroring ``OrchardMigration``'s own injecting init.
+    /// directory the gate files live in, the ticker interval and clock, the logger, the network's
+    /// target spacing schedule, and the per-account actor factory directly — mirroring
+    /// ``OrchardMigration``'s own injecting init. The factory is handed the host's gate bypass
+    /// holder along with the shared broadcaster, for the migration it builds to share.
     init(
         welding: ZcashRustBackendWelding,
         sharedBroadcaster: any MigrationBroadcasting,
@@ -103,13 +144,15 @@ actor OrchardMigrationHost {
         tickInterval: TimeInterval,
         now: @escaping @Sendable () -> Date,
         logger: Logger,
-        actorFactory: @escaping (AccountUUID, any MigrationBroadcasting) -> OrchardMigration
+        spacing: TargetBlockSpacing,
+        actorFactory: @escaping ActorFactory
     ) {
         self.welding = welding
         self.sharedBroadcaster = sharedBroadcaster
         self.generalStorageURL = generalStorageURL
         self.now = now
         self.logger = logger
+        self.spacing = spacing
         self.actorFactory = actorFactory
 
         let liveGateRegistry = MigrationLiveGateRegistry()
@@ -144,11 +187,32 @@ actor OrchardMigrationHost {
             return existing
         }
 
-        let migration = actorFactory(accountUUID, sharedBroadcaster)
+        let migration = actorFactory(accountUUID, sharedBroadcaster, upgradeGateBypass)
         migrations[accountUUID] = migration
         blockedPublisher.watchBroadcastSignal(migration.syncBlockedStream)
         liveGateRegistry.register(accountUUID) { migration.liveInFlightUntil() }
         return migration
+    }
+
+    /// Turns the NU7 network-upgrade gate's bypass on or off for every migration this host builds
+    /// or has built, from their next gated call on. For internal builds only; a production build
+    /// never turns it on. See ``MigrationUpgradeGateBypass``.
+    func setUpgradeGateBypass(_ isBypassed: Bool) {
+        upgradeGateBypass.setBypassed(isBypassed)
+    }
+
+    /// What the migration may start at the wallet's next height. WALLET-scoped, like the
+    /// chain-tip estimation pair: the NU7 network-upgrade gate depends on the chain alone, so the
+    /// read takes no account and is served by the host's own welding (`Initializer.rustBackend`)
+    /// rather than by a per-account actor.
+    ///
+    /// The host's bypass holder is read here and passed to the welding explicitly. The welding the
+    /// host borrows is the synchronizer's own backend, whose holder is a default one that nothing
+    /// sets, not the one the host shares with the per-account backends. Passing the host's value is
+    /// what keeps this answer in step with the calls the gate refuses, which those backends judge
+    /// with it.
+    func migrationAvailability() async throws -> MigrationAvailability {
+        try await welding.migrationAvailability(upgradeGateBypass: upgradeGateBypass.isBypassed)
     }
 
     /// Whether ordinary wallet sync should currently be paused for *any* migrating account.
@@ -178,7 +242,7 @@ actor OrchardMigrationHost {
     /// ``ZcashError/migrationChainTipUnavailable`` when even that is unknown because the wallet
     /// has never scanned.
     func estimatedChainTip() async throws -> BlockHeight {
-        let projection = try await MigrationTipEstimation.project(welding: welding, now: now())
+        let projection = try await MigrationTipEstimation.project(welding: welding, spacing: spacing, now: now())
         if let estimated = projection.estimatedTip {
             return estimated
         }
@@ -188,13 +252,15 @@ actor OrchardMigrationHost {
         return scannedTip
     }
 
-    /// The measured seconds-per-block over the most recently scanned blocks (see
-    /// ``ChainTipEstimator/secondsPerBlock()``): the mean of the last up-to-100 consecutive
-    /// header-time deltas, clamped to [5, 150] s, falling back to 75 s (the target spacing) when
-    /// fewer than two samples exist. WALLET-scoped like ``estimatedChainTip()``. A host uses it
-    /// to convert wake-up heights into wall-clock OS timers.
+    /// The measured seconds-per-block (see ``ChainTipEstimator/secondsPerBlock(atEstimatedTip:)``):
+    /// the chain's speed relative to the target time of up to the last 1000 scanned blocks,
+    /// expressed in the target spacing of the block after the ``estimatedChainTip()`` projection
+    /// and clamped to [5, 150] s scaled by that spacing over 75 s ([5/3, 50] s at NU7's 25 s).
+    /// That block's target spacing when no rate can be measured, and 75 s for a wallet that has
+    /// never scanned. WALLET-scoped like ``estimatedChainTip()``. A host uses it to convert
+    /// wake-up heights into wall-clock OS timers.
     func estimatedSecondsPerBlock() async throws -> Double {
-        try await MigrationTipEstimation.project(welding: welding, now: now()).secondsPerBlock
+        try await MigrationTipEstimation.project(welding: welding, spacing: spacing, now: now()).secondsPerBlock
     }
 
     /// A stream of ``isSyncBlocked()`` at wallet scope: emits the current value on subscribe,
@@ -323,8 +389,7 @@ private final class HostSyncBlockedPublisher: @unchecked Sendable {
     private let blockedSubject: CurrentValueSubject<Bool, Never>
 
     /// Guards the send-generation counters and serializes `blockedSubject.send(_:)`. See
-    /// ``MigrationSyncGate``'s `emissionLock` for why `NSLock` here rather than `OSAllocatedUnfairLock`
-    /// (the package deployment target predates the latter's availability floor).
+    /// ``MigrationSyncGate``'s `emissionLock` for why `NSLock` here rather than `OSAllocatedUnfairLock`.
     private let emissionLock = NSLock()
     private var nextGeneration: UInt64 = 0
     private var lastPublishedGeneration: UInt64 = 0

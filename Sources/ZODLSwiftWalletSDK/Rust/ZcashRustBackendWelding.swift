@@ -59,6 +59,18 @@ protocol ZcashRustBackendWelding {
         keySource: String?
     ) async throws -> AccountUUID
 
+    /// Finds the account in the wallet that shares an incoming viewing key component (Orchard, Sapling or transparent P2PKH)
+    /// with `ufvk`, and reports what importing `ufvk` with `importAccount` would do to it. The wallet database is opened
+    /// read-only, so the lookup never changes it.
+    ///
+    /// - Parameter ufvk: the key to look up. The rust layer never puts any part of it in the error it reports.
+    /// - Returns: `nil` when importing `ufvk` would add an account; otherwise the account that shares a component with `ufvk`,
+    ///   and what importing `ufvk` would do to it.
+    /// - Throws:
+    ///     - `accountKeyOverlapMultipleAccounts` if the components of `ufvk` match more than one account.
+    ///     - `rustFindAccountKeyOverlap` if the rust layer fails to look `ufvk` up.
+    func findAccountKeyOverlap(ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap?
+
     /// Adds the next available account-level spend authority, given the current set of [ZIP 316]
     /// account identifiers known, to the wallet database.
     ///
@@ -97,6 +109,30 @@ protocol ZcashRustBackendWelding {
     /// - Returns: The transaction's ID.
     /// - Throws: `rustDecryptAndStoreTransaction`.
     func decryptAndStoreTransaction(txBytes: [UInt8], minedHeight: UInt32?) async throws -> Data
+
+    /// Checks whether a raw transaction can be valid in the next block, so that nothing is submitted that no block can
+    /// include.
+    ///
+    /// A block accepts only a transaction built for the consensus branch its own height is under, and only one that has
+    /// not expired by then. The transaction is judged against the next block, the one after the higher of the wallet's
+    /// chain tip and `submissionServerHeight`, the latest block height of the server the transaction is about to be
+    /// submitted to: the wallet lags every block it has not synced yet, and the server may lag the wallet. A wallet that
+    /// has no chain tip yet is judged by the server's height alone. The branch is compared only for a transaction whose
+    /// encoding commits to one (v5 and later). These validity checks apply at every height.
+    ///
+    /// The wallet is opened read-only. Nothing is written to it.
+    /// - Parameters:
+    ///   - rawTransaction: the serialized transaction, as it would be submitted.
+    ///   - submissionServerHeight: the latest block height the submission server reported, read on the service and in
+    ///     the mode the transaction will be submitted over, just before this call.
+    /// - Returns: `nil` when the transaction can be valid in the next block, otherwise why it cannot.
+    /// - Throws: `rustCheckTransactionSubmittable` when the transaction cannot be judged: the server height is not a
+    ///   height, the wallet database cannot be read, or `rawTransaction` is no transaction. Such a transaction must not
+    ///   be submitted.
+    func checkTransactionSubmittable(
+        _ rawTransaction: Data,
+        submissionServerHeight: BlockHeight
+    ) async throws -> TransactionSubmissionRefusal?
 
     /// Returns the most-recently-generated unified payment address for the specified account.
     /// - parameter account: index of the given account
@@ -477,6 +513,12 @@ protocol ZcashRustBackendWelding {
     /// Attempts to delete an account defined by UUID
     func deleteAccount(_ accountUUID: AccountUUID) async throws
 
+    /// Sets the human-readable name of the account `accountUUID` to `name`, replacing any name it had. The account's keys
+    /// and all other state are unchanged.
+    /// - Throws: `rustSetAccountName` if the name cannot be stored, including when no account has `accountUUID` and when
+    ///   `name` contains a null character, which would cut it short at the FFI boundary.
+    func setAccountName(_ accountUUID: AccountUUID, name: String) async throws
+
     // MARK: - Ironwood migration
 
     /// The engine's next step to advance `account`'s stored migration run, wrapped with its
@@ -525,6 +567,23 @@ protocol ZcashRustBackendWelding {
     /// an error. Wallet-scoped, not account-scoped — the blocks table is shared.
     /// - Throws: `rustMigrationBlockRateSamples` if the rust layer returns an error.
     func migrationBlockRateSamples(window: UInt32) async throws -> [MigrationBlockRateSample]
+
+    /// What the migration may start at the wallet's next height, the NU7 network-upgrade gate's
+    /// phase for the app to decide which options to offer (see ``MigrationAvailability``).
+    /// Wallet-scoped, not account-scoped: the gate depends on the chain alone, so the read takes no
+    /// account and opens the wallet read-only. It is judged at the wallet's own chain tip, plus
+    /// one, and never at a server's height or a wall-clock estimate.
+    ///
+    /// `upgradeGateBypass` is the host's opt-out (internal builds only): with it the gate is open
+    /// at every height, as it is for the calls the gate refuses, and the answer needs no chain tip.
+    /// It is passed explicitly, not read from the backend's own holder, because the read is
+    /// wallet-scoped: the migration host serves it through the synchronizer's backend, which is not
+    /// one of the per-account backends the host's shared holder reaches, and passes that holder's
+    /// value.
+    /// - Throws: `rustMigrationAvailability` if the rust layer returns an error, notably when the
+    ///   wallet has no chain tip yet (sync first) on a network that has an NU7 activation height
+    ///   and the bypass is off.
+    func migrationAvailability(upgradeGateBypass: Bool) async throws -> MigrationAvailability
 
 
     /// Splits an ORDERED list of transaction action-weights (`MigrationUnsignedTransferPczt.actions`)
@@ -590,20 +649,36 @@ protocol ZcashRustBackendWelding {
     ///
     /// Any subsequent propose/prepare call for the same account supersedes previously returned
     /// proposal handles — commit calls carrying an older handle throw `migrationPlanStale`.
-    /// - Throws: `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is planned or cached) unless the backend's upgrade-gate bypass is on;
+    ///   `rustMigrationPrepareNoteSplit` if the rust layer returns an error.
     func migrationPrepareNoteSplit(for account: AccountUUID) async throws -> NoteSplitProposal
 
     /// Builds, signs, and persists the note-split transaction; returns the broadcastable prepared
     /// transfer. Only `proposal.proposalHandle` crosses to the native side — it identifies the
     /// exact cached plan the user was shown, and the native side refuses to sign any other plan,
     /// so a stale display cannot sign different values than the ones the user approved.
-    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart
-    ///   between propose and confirm) or superseded by a later propose/prepare call, and no
-    ///   resumable run is stored — re-propose and re-display; `rustMigrationSignNoteSplit` for
-    ///   other rust-layer errors.
+    ///
+    /// The returned transaction is checked, before the store's broadcast seam records it in the
+    /// wallet, against the next block: the one after the higher of the wallet's chain tip and
+    /// `submissionServerHeight`, the latest block height the server the transaction is about to be
+    /// submitted to reports. It must be built for that block's consensus branch and not have expired
+    /// by it. Valid committed work can continue before activation; the scheduling bypass never
+    /// bypasses branch, expiry or height checks. A transaction that fails is not recorded;
+    /// the committed run and the proof stay.
+    /// - Parameter submissionServerHeight: the latest block height the submission server reported,
+    ///   read on the connection the transaction will go over.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is signed) unless the backend's upgrade-gate bypass is on; `migrationPlanStale`
+    ///   when the identified plan is missing (process restart between propose and confirm) or
+    ///   superseded by a later propose/prepare call, and no resumable run is stored — re-propose
+    ///   and re-display; `migrationSubmissionRefused` when the transaction cannot be valid in the
+    ///   next block; `rustMigrationSignNoteSplit` for other rust-layer errors, among them a
+    ///   negative `submissionServerHeight`.
     func migrationSignNoteSplit(
         proposal: NoteSplitProposal,
         usk: UnifiedSpendingKey,
+        submissionServerHeight: BlockHeight,
         for account: AccountUUID
     ) async throws -> PreparedMigrationTransfer
 
@@ -649,7 +724,9 @@ protocol ZcashRustBackendWelding {
     func estimateMigrationRuns(accountUUID: AccountUUID) async throws -> MigrationRunEstimate
 
     /// The full migration schedule for the spendable Orchard balance.
-    /// - Throws: `rustMigrationProposeTransfers` if the rust layer returns an error.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is planned or cached) unless the backend's upgrade-gate bypass is on;
+    ///   `rustMigrationProposeTransfers` if the rust layer returns an error.
     func migrationProposeTransfers(for account: AccountUUID) async throws -> MigrationSchedule
 
     /// Proposes a "send everything" transaction that sweeps the account's whole spendable balance
@@ -681,10 +758,12 @@ protocol ZcashRustBackendWelding {
     /// `migrationPlanStale`. A fresh commit signs exactly the cached plan the handle identifies;
     /// the resume/no-op case does not consult the handle (the stored run is durable, already
     /// handle-verified state).
-    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
-    ///   missing (process restart) or superseded by a later propose/prepare call — re-propose
-    ///   and re-display the new schedule before retrying; `rustMigrationSignAndStoreSchedule`
-    ///   for other rust-layer errors.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is signed or stored) unless the backend's upgrade-gate bypass is on;
+    ///   `migrationPlanStale` when nothing is committed and the identified plan is missing
+    ///   (process restart) or superseded by a later propose/prepare call — re-propose and
+    ///   re-display the new schedule before retrying; `rustMigrationSignAndStoreSchedule` for
+    ///   other rust-layer errors.
     func migrationSignAndStoreSchedule(
         _ schedule: MigrationSchedule,
         usk: UnifiedSpendingKey,
@@ -697,7 +776,7 @@ protocol ZcashRustBackendWelding {
     /// ``MigrationProveOutcome``: how many were proved (`0` is the ordinary "nothing left to prove
     /// right now" answer) and THE TXIDS OF THE PREPARATIONS it proved.
     ///
-    /// The txids are the handoff to ``migrationTakePreparation(txid:for:)``: a proved preparation
+    /// The txids are the handoff to ``migrationTakePreparation(txid:submissionServerHeight:for:)``: a proved preparation
     /// is submitted through the caller's ordinary raw-transaction machinery. Transfers are never
     /// named — they are delivered by the drive's broadcast instruction alone.
     ///
@@ -748,14 +827,30 @@ protocol ZcashRustBackendWelding {
     /// Retrieved-but-never-submitted is therefore a bounded, engine-modelled state: the record is
     /// idempotent, the preparation carries a ZIP 203 expiry, and an unsubmitted row surfaces
     /// through the ordinary attention path once it expires.
-    /// - Parameter txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's
-    ///   raw/internal byte order.
+    ///
+    /// THE PREPARATION IS CHECKED BEFORE THE SEAM, so a preparation that cannot be valid in the next
+    /// block is never recorded in the wallet. The next block is the one after the higher of the
+    /// wallet's chain tip and `submissionServerHeight`, the latest block height of the server the
+    /// caller reads it from; the preparation must be built for that block's consensus branch and not
+    /// have expired by it. Valid committed work can continue before activation; the scheduling
+    /// bypass never bypasses branch, expiry or height checks. A run that has ended serves nothing.
+    /// - Parameters:
+    ///   - txid: a txid ``MigrationProveOutcome/preparationTxids`` named, in the SDK's raw/internal
+    ///     byte order.
+    ///   - submissionServerHeight: the latest block height the server the preparation will be
+    ///     submitted to reported, read just before this call.
     /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
-    ///   servable bytes; `rustMigrationTakePreparation` otherwise — for a txid naming a TRANSFER
+    ///   servable bytes; `migrationSubmissionRefused` when the preparation cannot be valid in the
+    ///   next block; `rustMigrationTakePreparation` otherwise — for a txid naming a TRANSFER
     ///   (transfers are served by the drive's broadcast instruction alone), for a txid the stored
-    ///   run does not carry, and for the readiness refusal of a preparation that is not proved,
-    ///   which a caller discharges by proving again rather than retrying this.
-    func migrationTakePreparation(txid: Data, for account: AccountUUID) async throws -> PreparedMigrationTransfer
+    ///   run does not carry, for a run that has ended, for a negative `submissionServerHeight`, and
+    ///   for the readiness refusal of a preparation that is not proved, which a caller discharges by
+    ///   proving again rather than retrying this.
+    func migrationTakePreparation(
+        txid: Data,
+        submissionServerHeight: BlockHeight,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer
 
     /// Serves the transaction `id` for broadcast — the instruction a prior
     /// ``migrationAdvanceStep(for:estimatedTip:)`` call returned as its
@@ -772,11 +867,28 @@ protocol ZcashRustBackendWelding {
     /// ``PreparedMigrationTransfer/pczt`` is therefore the FINALIZED CONSENSUS TRANSACTION,
     /// submittable as-is. Retrying a failed submission re-serves the same transaction over the
     /// same record.
+    ///
+    /// THE TRANSACTION IS CHECKED BEFORE THE SEAM, so a transaction that cannot be valid in the next
+    /// block is never recorded in the wallet. The next block is the one after the higher of the
+    /// wallet's chain tip and `submissionServerHeight`, the latest block height of the server the
+    /// transaction is about to be submitted to; it must be built for that block's consensus branch
+    /// and not have expired by it. Valid committed work can continue before activation; the scheduling
+    /// bypass never bypasses branch, expiry or height checks. A run that has ended serves nothing.
+    /// - Parameters:
+    ///   - id: the transaction the instruction named.
+    ///   - submissionServerHeight: the latest block height the submission server reported, read on
+    ///     the connection the transaction will go over, just before this call.
     /// - Throws: `migrationProvingUnavailable` when the stored artifact cannot be turned into
-    ///   servable bytes; `rustMigrationTakeBroadcastTransaction` for other rust-layer errors —
+    ///   servable bytes; `migrationSubmissionRefused` when the transaction cannot be valid in the
+    ///   next block; `rustMigrationTakeBroadcastTransaction` for other rust-layer errors —
     ///   including the STALENESS refusal of a row that is no longer proved-and-servable, which a
-    ///   caller discharges by advancing again rather than retrying the executor.
-    func migrationTakeBroadcastTransaction(id: UInt32, for account: AccountUUID) async throws -> PreparedMigrationTransfer
+    ///   caller discharges by advancing again rather than retrying the executor, the refusal of a
+    ///   run that has ended, and a negative `submissionServerHeight`.
+    func migrationTakeBroadcastTransaction(
+        id: UInt32,
+        submissionServerHeight: BlockHeight,
+        for account: AccountUUID
+    ) async throws -> PreparedMigrationTransfer
 
     /// Records the platform's broadcast outcome for `transferId`, advancing the engine's state.
     /// - Throws: `rustMigrationRecordTransferResult` if the rust layer returns an error;
@@ -805,8 +917,27 @@ protocol ZcashRustBackendWelding {
     /// are unaffected on-chain), clears the invalid marks, and previews a fresh schedule against
     /// the live balance for the re-confirm lane, sized the way the account is sized now — which is
     /// also how a run planned under an earlier sizing moves onto the current one.
+    ///
+    /// Before the NU7 network upgrade has activated (judged at the wallet's own next height, and
+    /// unless the backend's upgrade-gate bypass is on) nothing is planned: the run is cancelled and
+    /// the answer is ``MigrationRestartOutcome/cancelledUntilNetworkUpgrade(activationHeight:)``,
+    /// a success. Otherwise it is ``MigrationRestartOutcome/replanned(_:)`` with the fresh
+    /// schedule.
     /// - Throws: `rustMigrationRestartStep` if the rust layer returns an error.
-    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationSchedule
+    func migrationRestartStep(for account: AccountUUID) async throws -> MigrationRestartOutcome
+
+    /// Cancels `account`'s pending run and nothing more: the stored run is persisted as cancelled
+    /// and eligible advisory note reservations are released. Recorded spends still follow the wallet's
+    /// expiry and scan rules, even if network submission failed or was never attempted. Its pre-signed
+    /// transactions are abandoned; already-broadcast ones are unaffected on-chain and may still be
+    /// mined. A plan proposed earlier can no longer be committed. Unlike ``migrationRestartStep(for:)``, which cancels the same way, no new plan
+    /// is made.
+    ///
+    /// Never gated by the NU7 network-upgrade gate (it ends a run, it starts nothing), so the
+    /// backend's upgrade-gate bypass plays no part. With no run pending the call succeeds and
+    /// changes no stored run.
+    /// - Throws: `rustMigrationCancelRun` if the rust layer returns an error.
+    func migrationCancelRun(for account: AccountUUID) async throws
 
     /// Rebuilds every EXPIRED transfer of the stored migration run in place through the engine:
     /// each rebuilt transfer re-spends the SAME funding note (recovered from the expired PCZT by
@@ -817,18 +948,20 @@ protocol ZcashRustBackendWelding {
     /// device) leaves it awaiting its signature, so the `migrationCreateUnsignedTransferPczts` /
     /// `migrationStoreSignedSchedulePczts` ceremony re-serves and completes it.
     ///
-    /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape
-    /// `migrationRestartStep` returns, here read from the persisted run (its `proposalHandle` is
-    /// `0`: a stored run is durable, already handle-verified state that commit-shaped calls
-    /// resume without consulting a handle). The rebuilt state persists all-or-nothing, and the
-    /// returned schedule is that atomically-persisted truth for the host to re-display (a
-    /// rebuilt transfer's fresh scheduled/expiry heights exist nowhere else). With nothing
-    /// expired the current stored schedule comes back unchanged; with no stored run, or a
-    /// terminal (completed or cancelled) one, the schedule is empty.
-    /// - Throws: `rustMigrationRefreshStaleTransfers` if the rust layer returns an error —
-    ///   notably when an expired transfer's funding note was spent outside the migration, where
-    ///   the message names `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On
-    ///   any throw nothing was persisted.
+    /// Returns the run's FULL transfer schedule as stored AFTER the refresh — the same shape a
+    /// restart's ``MigrationRestartOutcome/replanned(_:)`` carries, here read from the persisted
+    /// run (its `proposalHandle` is `0`: a stored run is durable, already handle-verified state
+    /// that commit-shaped calls resume without consulting a handle). The rebuilt state persists
+    /// all-or-nothing, and the returned schedule is that atomically-persisted truth for the host
+    /// to re-display (a rebuilt transfer's fresh scheduled/expiry heights exist nowhere else).
+    /// With nothing expired the current stored schedule comes back unchanged; with no stored run,
+    /// or a terminal (completed or cancelled) one, the schedule is empty.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is rebuilt) unless the backend's upgrade-gate bypass is on;
+    ///   `rustMigrationRefreshStaleTransfers` if the rust layer returns an error — notably when an
+    ///   expired transfer's funding note was spent outside the migration, where the message names
+    ///   `restartCurrentMigrationStep` (cancel and re-plan) as the remedy. On any throw nothing
+    ///   was persisted.
     func migrationRefreshStaleTransfers(
         usk: UnifiedSpendingKey?,
         for account: AccountUUID
@@ -841,8 +974,10 @@ protocol ZcashRustBackendWelding {
     /// non-terminal run; replaces a terminal one (the sequential-runs path). Only
     /// `schedule.proposalHandle` crosses to the native side: the run is built from exactly the
     /// cached plan the user-reviewed schedule identifies.
-    /// - Throws: `migrationPlanStale` when the identified plan is missing (process restart) or
-    ///   superseded by a later propose/prepare call — re-propose and re-display;
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is built) unless the backend's upgrade-gate bypass is on; `migrationPlanStale`
+    ///   when the identified plan is missing (process restart) or superseded by a later
+    ///   propose/prepare call — re-propose and re-display;
     ///   `rustMigrationCreateUnsignedNoteSplitPczt` for other rust-layer errors.
     func migrationCreateUnsignedNoteSplitPczts(
         for schedule: MigrationSchedule,
@@ -853,7 +988,9 @@ protocol ZcashRustBackendWelding {
     /// all-or-nothing: every element must match a stored transaction awaiting its signature or
     /// nothing is persisted. Returns a STORAGE RECEIPT for the first preparation transaction (its
     /// `txid` is zeroed — the broadcastable, proven value is served by the delivery lane).
-    /// - Throws: `rustMigrationStoreSignedNoteSplitPczt` if the rust layer returns an error.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is stored) unless the backend's upgrade-gate bypass is on;
+    ///   `rustMigrationStoreSignedNoteSplitPczt` if the rust layer returns an error.
     func migrationStoreSignedNoteSplitPczts(
         _ signed: [MigrationSignedTransferPczt],
         for account: AccountUUID
@@ -864,9 +1001,10 @@ protocol ZcashRustBackendWelding {
     /// exist, so the normal path here is the handle-free resume of the stored run;
     /// `schedule.proposalHandle` only gates the fresh-build case where this call is the one
     /// creating the run).
-    /// - Throws: `migrationPlanStale` when nothing is committed and the identified plan is
-    ///   missing or superseded — re-propose and re-display;
-    ///   `rustMigrationCreateUnsignedTransferPczts` for other rust-layer errors.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is built) unless the backend's upgrade-gate bypass is on; `migrationPlanStale`
+    ///   when nothing is committed and the identified plan is missing or superseded — re-propose
+    ///   and re-display; `rustMigrationCreateUnsignedTransferPczts` for other rust-layer errors.
     func migrationCreateUnsignedTransferPczts(
         for schedule: MigrationSchedule,
         for account: AccountUUID
@@ -874,7 +1012,9 @@ protocol ZcashRustBackendWelding {
 
     /// Accepts the full set of externally signed transfer PCZTs (all-or-nothing) and, if every
     /// staged transfer is matched exactly, persists the committed schedule.
-    /// - Throws: `rustMigrationStoreSignedSchedulePczts` if the rust layer returns an error.
+    /// - Throws: `migrationPausedUntilNetworkUpgrade` before the NU7 network upgrade has activated
+    ///   (nothing is stored) unless the backend's upgrade-gate bypass is on;
+    ///   `rustMigrationStoreSignedSchedulePczts` if the rust layer returns an error.
     func migrationStoreSignedSchedulePczts(_ signed: [MigrationSignedTransferPczt], for account: AccountUUID) async throws
 
     // MARK: - Ironwood migration: Keystone batch-signing UR bridge

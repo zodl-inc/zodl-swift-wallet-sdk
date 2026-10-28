@@ -291,6 +291,14 @@ public enum ZcashErrorCode: String {
     case rustProposalRequiresSaplingParams = "ZRUST0157"
     /// Error from rust layer when calling ZcashRustBackend.setTransactionTrust
     case rustSetTransactionTrust = "ZRUST0158"
+    /// Error from rust layer when calling ZcashRustBackend.findAccountKeyOverlap
+    case rustFindAccountKeyOverlap = "ZRUST0170"
+    /// More than one account in the wallet shares a viewing key component with the given key.
+    case accountKeyOverlapMultipleAccounts = "ZRUST0171"
+    /// Error from rust layer when calling ZcashKeyDerivationBackend.describeUnifiedFullViewingKey
+    case rustDescribeUnifiedFullViewingKey = "ZRUST0172"
+    /// Error from rust layer when calling ZcashRustBackend.setAccountName
+    case rustSetAccountName = "ZRUST0173"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
     case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded
@@ -377,6 +385,16 @@ public enum ZcashErrorCode: String {
     case rustMigrationBatchPcztsByActions = "ZRUST0146"
     /// No chain tip is available to estimate from: the wallet has never scanned a block.
     case migrationChainTipUnavailable = "ZRUST0147"
+    /// Scheduled migration is paused until the network upgrade activates.
+    case migrationPausedUntilNetworkUpgrade = "ZRUST0159"
+    /// Error from rust layer when calling ZcashRustBackend.migrationAvailability
+    case rustMigrationAvailability = "ZRUST0160"
+    /// Error from rust layer when calling ZcashRustBackend.migrationCancelRun
+    case rustMigrationCancelRun = "ZRUST0161"
+    /// The migration transaction cannot be valid in the next block, so it was not submitted.
+    case migrationSubmissionRefused = "ZRUST0162"
+    /// Error from rust layer when calling ZcashRustBackend.checkTransactionSubmittable
+    case rustCheckTransactionSubmittable = "ZRUST0163"
     /// SQLite query failed when fetching all accounts from the database.
     case accountDAOGetAll = "ZADAO0001"
     /// Fetched accounts from SQLite but can't decode them.
@@ -541,6 +559,8 @@ public enum ZcashErrorCode: String {
     case compactBlockProcessorPutIronwoodSubtreeRoots = "ZCBPEO0023"
     /// The chain is past the Ironwood (NU6.3) activation but the connected server does not serve Ironwood data, which the wallet needs in order to detect its shielded transactions by scanning.
     case compactBlockProcessorServerMissingIronwoodSupport = "ZCBPEO0024"
+    /// The connected server reported a block height that is too large for the SDK to use. Only a broken or malicious server does that.
+    case compactBlockProcessorServerBlockHeightOutOfRange = "ZCBPEO0025"
     /// The synchronizer is unprepared.
     case synchronizerNotPrepared = "ZSYNCO0001"
     /// Memos can't be sent to transparent addresses.
