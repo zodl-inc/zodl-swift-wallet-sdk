@@ -29,7 +29,14 @@ final class UpdateChainTipAction {
         let latestBlockHeight = try await service.latestBlockHeight(mode: await sdkFlags.ifTor(.defaultTor))
 
         logger.debug("Latest block height is \(latestBlockHeight)")
-        try await rustBackend.updateChainTip(height: Int32(latestBlockHeight))
+
+        // The gRPC services refuse a height above `Int32.max` themselves, but other `LightWalletService` implementations
+        // might not, and the rust backend takes the chain tip as an `Int32`.
+        guard let chainTip = Int32(exactly: latestBlockHeight) else {
+            throw ZcashError.compactBlockProcessorServerBlockHeightOutOfRange
+        }
+
+        try await rustBackend.updateChainTip(height: chainTip)
         await context.update(lastChainTipUpdateTime: time)
         await latestBlocksDataProvider.update(latestBlockHeight)
     }

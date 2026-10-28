@@ -21,8 +21,8 @@ import Foundation
 /// is the caller's: close a gate only while no call is inside it, and then wait on an OBSERVABLE
 /// (`onCall`, or the recorded call log) rather than on elapsed time before assuming a call arrived.
 ///
-/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor — the same
-/// reason `LifecycleQueue` uses one.
+/// `NSLock`, not `OSAllocatedUnfairLock`, dates from the package's iOS 13 / macOS 12 floor, below
+/// that lock's iOS 16 / macOS 13, like the lock in `LifecycleQueue`.
 final class Gate: @unchecked Sendable {
     private let lock = NSLock()
     private var isOpen = false
@@ -79,14 +79,16 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     ///
     /// An entry is appended on ENTRY, before the call's gate: a test holding the engine inside
     /// `stop()` can therefore see that the stop arrived while it is still suspended, which is the
-    /// observation most interleaving assertions are built on.
+    /// observation most interleaving assertions are built on. The two stops record different names,
+    /// `"stop"` for the plain one and `"stopForWalletChange"` for the stop before a wallet change, so
+    /// a trace says which one each operation made; `isStop(_:)` matches both.
     ///
-    /// The three pass-owning calls also append a `":done"` entry when they RETURN (`"start:done"`,
-    /// `"stop:done"`, `"reopen:done"`). Entry order alone cannot express "a start was still in
-    /// flight when a teardown began", which is exactly the ordering invariant [MOB-1850] depends
-    /// on; with both edges recorded, the trace answers it directly. The un-gated calls keep a
-    /// single entry — a `snapshot:done` on every poll tick would bury the lifecycle in noise for
-    /// no gain.
+    /// The four pass-owning calls also append a `":done"` entry when they RETURN (`"start:done"`,
+    /// `"stop:done"`, `"stopForWalletChange:done"`, `"reopen:done"`). Entry order alone cannot
+    /// express "a start was still in flight when a teardown began", which is exactly the ordering
+    /// invariant [MOB-1850] depends on; with both edges recorded, the trace answers it directly. The
+    /// un-gated calls keep a single entry — a `snapshot:done` on every poll tick would bury the
+    /// lifecycle in noise for no gain.
     private(set) var calls: [String] = []
 
     /// One-shot hooks keyed by call name, fired by `record(_:)` the next time that call arrives and
@@ -116,33 +118,38 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     /// When set, `start` throws it once its gate has been passed.
     var startError: Error?
 
-    /// [MOB-1850] What `stop()` reports: `true` (the default) is a QUIESCENT stop — the engine
-    /// confirmed its aborted pass and its wallet writer had both finished — and `false` is the
-    /// timeout the real FFI now surfaces, on which every wallet mutation refuses to write.
+    /// [MOB-1850] What both stops report. The default, `.quiescent`, is a stop that had nothing to
+    /// wait for — the engine confirmed its aborted pass and its wallet writer had both finished —
+    /// and a report whose `isQuiescent` is false is the timeout the real FFI surfaces, on which
+    /// every wallet mutation refuses to write. `.passStillRunning` and `.writeStillRunning` (below)
+    /// are the two such reports a test usually wants.
     ///
     /// `nonisolated` and lock-guarded rather than actor-isolated like `reopenError` and
     /// `startError`, because a stop can arrive from a `nonisolated` teardown at any time and a test
-    /// sets this while the synchronizer is running; the lock is `NSLock` for the package's
-    /// iOS 13 / macOS 12 floor, like `Gate`'s.
-    nonisolated var stopQuiescent: Bool {
+    /// sets this while the synchronizer is running; like `Gate`'s, the lock is `NSLock`. That
+    /// choice dates from the package's iOS 13 / macOS 12 floor, below `OSAllocatedUnfairLock`'s
+    /// iOS 16 / macOS 13.
+    nonisolated var stopReport: SlipstreamStopReport {
         get {
-            stopQuiescentLock.lock()
-            defer { stopQuiescentLock.unlock() }
-            return stopQuiescentStorage
+            stopReportLock.lock()
+            defer { stopReportLock.unlock() }
+            return stopReportStorage
         }
         set {
-            stopQuiescentLock.lock()
-            stopQuiescentStorage = newValue
-            stopQuiescentLock.unlock()
+            stopReportLock.lock()
+            stopReportStorage = newValue
+            stopReportLock.unlock()
         }
     }
 
-    private nonisolated let stopQuiescentLock = NSLock()
-    private nonisolated(unsafe) var stopQuiescentStorage = true
+    private nonisolated let stopReportLock = NSLock()
+    private nonisolated(unsafe) var stopReportStorage = SlipstreamStopReport.quiescent
 
     // `nonisolated` is load-bearing, not decoration: an actor's `let` is implicitly nonisolated only
     // inside its own module, and every test that uses these lives in a test target rather than in
     // `TestUtils`. Without it `engine.stopGate.open()` does not compile from a test at all.
+    // `stopGate` holds both stops: to the engine they are one stop, and a test that holds "the
+    // engine's stop" holds whichever one the operation under test makes.
     nonisolated let stopGate = Gate()
     nonisolated let reopenGate = Gate()
     nonisolated let startGate = Gate()
@@ -254,11 +261,28 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         if let snapshotOnStart { nextSnapshot = snapshotOnStart }
     }
 
-    func stop() async -> Bool {
+    func stop() async -> SlipstreamStopReport {
         record("stop")
         await stopGate.wait()
         record("stop:done")
-        return stopQuiescent
+        return stopReport
+    }
+
+    /// [MOB-2184] Recorded under its own name, so a trace tells it from the plain stop, but held by
+    /// the same `stopGate` and answered from the same `stopReport`: the request to end the scan at
+    /// its next block is the only difference, and the fake has no scan to apply it to.
+    func stopForWalletChange() async -> SlipstreamStopReport {
+        record("stopForWalletChange")
+        await stopGate.wait()
+        record("stopForWalletChange:done")
+        return stopReport
+    }
+
+    /// Whether `call` is the entry a stop of either kind records when it arrives: `"stop"` for the
+    /// plain stop, `"stopForWalletChange"` for the stop before a wallet change. A test claiming the
+    /// engine was not stopped at all checks for both.
+    static func isStop(_ call: String) -> Bool {
+        call == "stop" || call == "stopForWalletChange"
     }
 
     func notifyTxChange() {
@@ -303,4 +327,24 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         record("drainEvents")
         return []
     }
+}
+
+extension SlipstreamStopReport {
+    /// A stop whose wait for the aborted sync pass ran out at the ten-second budget, while the
+    /// engine's wallet writes had finished: what a scan that outlasts the budget produces.
+    static let passStillRunning = SlipstreamStopReport(
+        settled: false,
+        drained: true,
+        settleWait: .seconds(10),
+        drainWait: .zero
+    )
+
+    /// A stop whose aborted passes had all finished, but whose wait for the engine's wallet writes
+    /// ran out at the ten-second budget.
+    static let writeStillRunning = SlipstreamStopReport(
+        settled: true,
+        drained: false,
+        settleWait: .zero,
+        drainWait: .seconds(10)
+    )
 }

@@ -25,8 +25,8 @@ class SimpleConnectionProvider: ConnectionProvider {
     /// `connection()` from arbitrary threads concurrently, so the lazy init below must be
     /// single-flight — two racing first-touches used to construct two `Connection`s (one
     /// silently dropped, its serial queue with it). `NSLock` rather than
-    /// `OSAllocatedUnfairLock` because the package floor (iOS 13 / macOS 12) predates the
-    /// latter's availability.
+    /// `OSAllocatedUnfairLock`, a choice that dates from the package's iOS 13 / macOS 12 floor,
+    /// below the latter's iOS 16 / macOS 13.
     private let dbLock = NSLock()
     private var db: Connection?
 

@@ -463,7 +463,8 @@ class TransactionRepositoryTests: XCTestCase {
 
 /// Collects what the DAO reports through its trace hook. SQLite invokes the hook synchronously on
 /// whichever thread runs the statement, so the collection is locked. `NSLock` rather than
-/// `OSAllocatedUnfairLock` because the package's platform floor predates the latter.
+/// `OSAllocatedUnfairLock`, a choice that dates from the package's iOS 13 / macOS 12 floor, below
+/// the latter's iOS 16 / macOS 13.
 private final class TraceRecorder {
     private let lock = NSLock()
     private var collected: [String] = []

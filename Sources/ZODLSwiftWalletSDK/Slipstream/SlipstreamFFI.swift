@@ -50,8 +50,9 @@ public struct SlipstreamSnapshot {
     public let stalledSeconds: UInt32
     // ── Engine API v2.1 fields ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]
-    /// stale-tip fact, engine-owned; survives stop→start hops under 120 s). While 0, the
-    /// host masks spendable balances (`WalletSummary.withSpendableMasked()`).
+    /// stale-tip fact, engine-owned; survives stop→start hops under 1.6 target block
+    /// intervals: 120 s before NU7, 40 s from it). While 0, the host masks spendable balances
+    /// (`WalletSummary.withSpendableMasked()`).
     public let tipFresh: UInt8
     /// [E-4] Monotonic version of the wallet's stored transaction set (enhancement writes,
     /// mempool hits, boundary reconcile-linkage transitions, submit pokes). Host rule:
@@ -116,4 +117,85 @@ public struct SlipstreamEngineEvent {
     public let tag: UInt8
     /// For SyncDone: transactions stored. For SyncError: error code. Others: 0.
     public let value: UInt64
+}
+
+/// What a stop of the Slipstream engine found: whether each of its two bounded waits finished
+/// within its budget, and how long each took. Returned by `SlipstreamEngine.stop()` and
+/// `SlipstreamEngine.stopForWalletChange()`.
+///
+/// A stop aborts the running sync pass, then waits for every pass the engine has aborted to finish
+/// unwinding, then for the engine's own wallet writes to drain, giving each wait ten seconds of its
+/// own. The pass is stopped either way. What the report adds is whether the stop also PROVED the
+/// wallet file quiescent (`isQuiescent`), which is the only thing a caller about to change the
+/// wallet can act on.
+public struct SlipstreamStopReport: Equatable, Sendable {
+    /// Every sync pass the engine had aborted finished unwinding within the budget.
+    public let settled: Bool
+    /// No engine wallet write was still running within the budget.
+    public let drained: Bool
+    /// How long the wait for the aborted sync passes took: at least the budget when it ran out,
+    /// close to zero when there was no pass left to wait for.
+    public let settleWait: Swift.Duration
+    /// How long the wait for the engine's wallet writes took, measured the same way.
+    public let drainWait: Swift.Duration
+
+    /// Whether the stop proved the wallet file quiescent: both waits finished. A caller about to
+    /// change the wallet refuses when this is `false` rather than writing on top of an engine
+    /// writer.
+    public var isQuiescent: Bool {
+        settled && drained
+    }
+
+    /// Which of the stop's waits ran out, and after how long, as the end of a sentence — for
+    /// instance `a sync pass was still running after 10.0 s` — or `nil` for a quiescent report,
+    /// which refuses nothing. `ZcashError.slipstreamEngineNotQuiescent` shows it in its
+    /// `errorDescription`. It is built from the two verdicts and the two waits alone, so it names
+    /// no account, key or address.
+    public var refusalReason: String? {
+        let settle = Self.seconds(settleWait)
+        let drain = Self.seconds(drainWait)
+        switch (settled, drained) {
+        case (true, true):
+            return nil
+        case (false, true):
+            return "a sync pass was still running after \(settle)"
+        case (true, false):
+            return "a wallet write was still running after \(drain)"
+        case (false, false) where settleWait == .zero && drainWait == .zero:
+            // A wait that ran out took at least its budget, so two failed verdicts without any wait
+            // are the FFI's answer for a stop that could not run at all, not a timeout.
+            return "the engine's stop failed before it could wait"
+        case (false, false):
+            return "a sync pass was still running after \(settle), and a wallet write after a further \(drain)"
+        }
+    }
+
+    /// `duration` in seconds to one decimal place, with the unit: `10.0 s`.
+    private static func seconds(_ duration: Swift.Duration) -> String {
+        let (seconds, attoseconds) = duration.components
+        let value = Double(seconds) + Double(attoseconds) / 1e18
+        return "\(String(format: "%.1f", value)) s"
+    }
+
+    /// The report of a stop that had nothing to wait for. A stop answers it when the engine has no
+    /// open handle, because then nothing can be writing.
+    static let quiescent = SlipstreamStopReport(settled: true, drained: true, settleWait: .zero, drainWait: .zero)
+
+    public init(settled: Bool, drained: Bool, settleWait: Swift.Duration, drainWait: Swift.Duration) {
+        self.settled = settled
+        self.drained = drained
+        self.settleWait = settleWait
+        self.drainWait = drainWait
+    }
+
+    /// The C report `zcashlc_slipstream_stop` and `zcashlc_slipstream_stop_for_wallet_change`
+    /// return by value: each verdict as 1 or 0, each wait in whole milliseconds.
+    init(_ cReport: FfiSlipstreamStopReport) {
+        self.init(
+            settled: cReport.settled != 0,
+            drained: cReport.drained != 0,
+            settleWait: .milliseconds(cReport.settle_ms),
+            drainWait: .milliseconds(cReport.drain_ms)
+        )
+    }
 }

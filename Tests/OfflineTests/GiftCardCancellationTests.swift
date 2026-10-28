@@ -229,13 +229,13 @@ final class GiftCardCancellationTests: ZcashTestCase {
         let cleanup = Task { try await fixture.redeemer.cleanup() }
         await fulfillment(of: [deadline], timeout: 5)
         let beforeCompletion = await fixture.engine.calls
-        XCTAssertFalse(beforeCompletion.contains("stop"))
+        XCTAssertFalse(beforeCompletion.contains(where: GatedFakeSlipstreamEngine.isStop))
         await gate.open()
         let result = try await redemption.value
         XCTAssertEqual(result.results, [.success(txId: Data(repeating: 0xA1, count: 32))])
         try await cleanup.value
         let afterCompletion = await fixture.engine.calls
-        XCTAssertTrue(afterCompletion.contains("stop"))
+        XCTAssertTrue(afterCompletion.contains("stopForWalletChange"))
         let root = testTempDirectory.appendingPathComponent(fixture.card.synchronizerAlias.description)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
@@ -345,6 +345,8 @@ struct GiftCardCancellationFixture {
         let service = LightWalletServiceMock()
         service.closeConnectionsClosure = {}
         service.getTreeStateModeClosure = { _, _ in throw LightWalletServiceError.timeOut }
+        // The submission is judged at the height of the server it goes to, which stands where the card wallet's chain tip does.
+        service.latestBlockHeightModeReturnValue = 3_000_010
         service.submitSpendTransactionModeReturnValue = SendResponse()
         let repository = TransactionRepositoryMock()
         repository.closeDBConnectionClosure = {}

@@ -305,6 +305,11 @@ mod tests {
         }
     }
 
+    /// A mainnet height at which NU6.3 is the newest upgrade: past its activation at 3,428,143 and
+    /// short of NU7's at 3,543,405. The cases that move NU6.3 stand here, because from NU7 on
+    /// mainnet's branch is NU7's whatever NU6.3 does.
+    const MAINNET_NU6_3_ERA: u64 = 3_500_000;
+
     /// The voting identity a custom network with `base` resolves to, which is
     /// what `voting_network` hands the crate.
     fn voting_identity(base: NetworkType) -> voting::Network {
@@ -401,7 +406,7 @@ mod tests {
     #[test]
     fn a_custom_upgrade_later_than_the_standard_one_is_refused_too() {
         let params = custom_with_nu6_3(NetworkType::Main, 10_000_000);
-        let err = require_branch_agreement(&params, voting::Network::Mainnet, 4_200_000)
+        let err = require_branch_agreement(&params, voting::Network::Mainnet, MAINNET_NU6_3_ERA)
             .expect_err("a not-yet-activated NU6.3 must be refused where mainnet has activated it");
         let message = invalid_input_message(&err);
         assert!(message.contains("Nu6_2"), "{message}");
@@ -416,13 +421,13 @@ mod tests {
         // Mainnet's own schedule, re-registered by a host that mirrors the node
         // it connects to.
         let mirrored = custom_with_nu6_3(NetworkType::Main, 3_428_143);
-        require_branch_agreement(&mirrored, voting::Network::Mainnet, 4_200_000)
+        require_branch_agreement(&mirrored, voting::Network::Mainnet, MAINNET_NU6_3_ERA)
             .expect("a mirrored mainnet schedule agrees");
 
         // NU6.3 moved, but still the newest upgrade at the snapshot height: the
         // branch is the same one, so the delegation the crate builds is valid.
         let moved = custom_with_nu6_3(NetworkType::Main, 3_400_000);
-        require_branch_agreement(&moved, voting::Network::Mainnet, 4_200_000)
+        require_branch_agreement(&moved, voting::Network::Mainnet, MAINNET_NU6_3_ERA)
             .expect("a different schedule that selects the same branch agrees");
     }
 

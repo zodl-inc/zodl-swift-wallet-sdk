@@ -108,7 +108,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         } catch ZcashError.giftCardCleanupTimedOut { }
         let calls = await fixture.engine.calls
         XCTAssertFalse(calls.contains("close"))
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
         fixture.engine.startGate.open()
         try await fixture.redeemer.cleanup()
@@ -117,7 +117,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testReadinessRejectsUnknownTipIncompleteCoverageAndMissingAccount() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.states.send(state(tip: 0, scanned: 0, value: 50_000))
         harness.states.send(state(tip: 100, scanned: 99, value: 50_000))
         harness.states.send(state(tip: 100, scanned: 100, value: nil))
@@ -131,7 +131,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         for balance in [balance(value: 50_000), balance(value: 1), balance(value: 0, pending: 10_000)] {
             let harness = Harness()
             defer { harness.clock.dispose() }
-            let caller = await begin(harness)
+            let caller = try await begin(harness)
             var snapshot = state(tip: 100, scanned: 100, value: 0)
             snapshot.accountsBalances[TestsData.mockedAccountUUID] = balance
             harness.states.send(snapshot)
@@ -145,7 +145,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         for tor in [false, true] {
             let harness = Harness(tor: tor)
             defer { harness.clock.dispose() }
-            let caller = await begin(harness)
+            let caller = try await begin(harness)
             harness.states.send(state(tip: 100, scanned: 100, value: 0))
             let deadline = tor ? UInt64(30_000_000_000) : UInt64(15_000_000_000)
             await fulfillment(of: [harness.clock.expectSleep(at: deadline)], timeout: 5)
@@ -177,7 +177,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         for snapshot in invalid {
             let harness = Harness()
             defer { harness.clock.dispose() }
-            let caller = await begin(harness)
+            let caller = try await begin(harness)
             harness.states.send(state(tip: 100, scanned: 100, value: 0))
             await fulfillment(of: [harness.clock.expectSleep(at: 15_000_000_000)], timeout: 5)
             harness.clock.advance(to: 10_000_000_000)
@@ -194,7 +194,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         for tor in [false, true] {
             let harness = Harness(tor: tor)
             defer { harness.clock.dispose() }
-            let caller = await begin(harness)
+            let caller = try await begin(harness)
             harness.states.send(disconnected())
             let grace = harness.policy.disconnectGraceNanoseconds
             await fulfillment(of: [harness.clock.expectSleep(at: grace)], timeout: 5)
@@ -209,7 +209,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testContinuousDisconnectExpires() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.states.send(disconnected())
         await fulfillment(of: [harness.clock.expectSleep(at: 60_000_000_000)], timeout: 5)
         harness.clock.advance(to: 60_000_000_000)
@@ -219,7 +219,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testExpiredGraceWinsOverLateHealthyWithTimerDeliveryWithheld() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.states.send(disconnected())
         await fulfillment(of: [harness.clock.expectSleep(at: 60_000_000_000)], timeout: 5)
         harness.clock.advance(to: 60_000_000_000, deliveringSleeps: false)
@@ -230,7 +230,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testHealthyResetsGraceForLaterDisconnect() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.states.send(disconnected())
         await fulfillment(of: [harness.clock.expectSleep(at: 60_000_000_000)], timeout: 5)
         harness.clock.advance(to: 40_000_000_000)
@@ -244,7 +244,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testSubstantiveErrorPropagates() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         var snapshot = SynchronizerState.zero
         snapshot.syncStatus = .error(ZcashError.giftCardRedeemerNotReady)
         harness.states.send(snapshot)
@@ -254,7 +254,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     func testRecoverableStallPreservesWaitAndTerminalStallFails() async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.events.send(.syncStalled(attempt: 1, gaveUp: false))
         harness.states.send(state(tip: 100, scanned: 100, value: 0))
         await fulfillment(of: [harness.clock.expectSleep(at: 15_000_000_000)], timeout: 5)
@@ -491,7 +491,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
                 start: { registered.fulfill() }
             )
         }
-        await fulfillment(of: [registered], timeout: 5)
+        try await awaitRegistration(registered, of: caller)
         harness.states.send(state(tip: 100, scanned: 100, value: 0))
         await fulfillment(of: [harness.clock.expectSleep(at: 15_000_000_000)], timeout: 5)
         caller.cancel()
@@ -501,7 +501,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         } catch is CancellationError { }
         await fulfillment(of: [stateCancelled, eventCancelled, harness.clock.expectNoPendingSleeps()], timeout: 5)
         let next = Harness(clock: harness.clock)
-        let nextCaller = await begin(next)
+        let nextCaller = try await begin(next)
         harness.events.send(.syncStalled(attempt: 9, gaveUp: true))
         harness.clock.advance(to: 15_000_000_000)
         next.states.send(state(tip: 100, scanned: 100, value: 90_000))
@@ -535,7 +535,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
     private func fundedArrival(at instant: UInt64) async throws {
         let harness = Harness()
         defer { harness.clock.dispose() }
-        let caller = await begin(harness)
+        let caller = try await begin(harness)
         harness.states.send(state(tip: 100, scanned: 100, value: 0))
         await fulfillment(of: [harness.clock.expectSleep(at: 15_000_000_000)], timeout: 5)
         harness.clock.advance(to: instant, deliveringSleeps: false)
@@ -544,7 +544,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         XCTAssertEqual(accepted.shieldedSpendableValue, Zatoshi(80_000))
     }
 
-    private func begin(_ harness: Harness) async -> Task<AccountBalance, Error> {
+    private func begin(_ harness: Harness) async throws -> Task<AccountBalance, Error> {
         let registered = XCTestExpectation(description: "both observers registered before start")
         let caller = Task {
             try await harness.waiter.wait(
@@ -553,8 +553,27 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
                 start: { registered.fulfill() }
             )
         }
-        await fulfillment(of: [registered], timeout: 5)
+        try await awaitRegistration(registered, of: caller)
         return caller
+    }
+
+    /// Waits until the attempt has subscribed and entered `start`, and stops the test if it never
+    /// does. Every state the test sends afterwards relies on that subscription: a state sent
+    /// earlier lands in the subject first, the attempt then receives it as the subscription replay,
+    /// which the waiter deliberately suppresses, and no later input completes the attempt. A
+    /// timed-out `fulfillment` only records a failure and lets the test continue into exactly that
+    /// wait, so a stalled runner turned a late registration into a hang. Registration takes
+    /// milliseconds; the generous bound only absorbs a stalled runner.
+    private func awaitRegistration<T>(
+        _ registered: XCTestExpectation,
+        of caller: Task<T, Error>,
+        seconds: TimeInterval = 30
+    ) async throws {
+        guard await XCTWaiter.fulfillment(of: [registered], timeout: seconds) == .completed else {
+            caller.cancel()
+            XCTFail("attempt did not register its observers within \(Int(seconds)) s")
+            throw CancellationError()
+        }
     }
 
     private func state(tip: BlockHeight, scanned: BlockHeight, value: Int64?) -> SynchronizerState {

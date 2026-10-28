@@ -7,7 +7,7 @@ The project uses GitHub Actions for CI. Workflows are defined in `.github/workfl
 When a PR is opened, the following checks run automatically:
 
 - **SwiftLint** (`swiftlint.yml`) — checks Swift code style
-- **Build and Run Offline Tests** (`swift.yml`) — builds the FFI from source (with caching), builds the Swift package, and runs the `OfflineTests` suite
+- **Build and Run Offline Tests** (`swift.yml`) — builds the FFI from source (with caching), builds the Swift package, and runs the `OfflineTests` suite. It also runs on every push to `main`, which keeps warm the caches every pull request restores
 
 ## FFI Build Workflow
 

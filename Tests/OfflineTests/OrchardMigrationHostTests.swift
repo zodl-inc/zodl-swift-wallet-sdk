@@ -12,6 +12,7 @@
 //
 
 import Combine
+import os
 import XCTest
 @testable import TestUtils
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
@@ -78,21 +79,18 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
         )
-        // Fulfilled from account B's own actor, right before it hands off to the shared broadcaster
-        // (its next step, `syncGate.markBroadcastInFlight()`, is synchronous, so this fires at most
-        // one actor-hop before B's `dedicatedTorClient()` cache check) -- a much tighter, and
-        // therefore far less flaky, synchronization point than counting `Task.yield()`s from B's
-        // Task start, which has to cross B's own mocked advance/serve calls first too.
+        // Fulfilled once account B's own actor has armed its in-flight marker, which is the step
+        // right before it hands off to the shared broadcaster (the arm is synchronous, so this is
+        // at most one actor-hop before B's `dedicatedTorClient()` cache check) -- a much tighter,
+        // and therefore far less flaky, synchronization point than counting `Task.yield()`s from
+        // B's Task start. The transaction is taken from the wallet only once the broadcaster has
+        // connected, so no welding call precedes the broadcaster for the test to observe.
         let accountBReachedTheBroadcaster = expectation(description: "account B's actor reached the point just before calling the shared broadcaster")
         // A fresh mock per account keeps the two concurrent broadcast flows off a shared mutable mock.
-        let perAccountFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { [testGeneralStorageDirectory, clock, accountB] accountUUID, broadcaster in
+        let perAccountFactory: OrchardMigrationHost.ActorFactory = { [testGeneralStorageDirectory, clock] accountUUID, broadcaster, _ in
             let accountWelding = ZcashRustBackendWeldingMock()
-            accountWelding.migrationTakeBroadcastTransactionIdForClosure = { _, _ in
-                if accountUUID == accountB {
-                    accountBReachedTheBroadcaster.fulfill()
-                }
-                return prepared
-            }
+            // Never reached: the shared Tor bootstrap fails before the broadcaster connects.
+            accountWelding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
             return OrchardMigration(
                 welding: accountWelding,
                 accountUUID: accountUUID,
@@ -104,7 +102,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                     now: { clock!.now },
                     logger: logger
                 ),
-                logger: logger
+                logger: logger,
+                spacing: TargetBlockSpacing(networkType: .testnet)
             )
         }
 
@@ -116,19 +115,25 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             tickInterval: 3600,
             now: { clockValue.now },
             logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet),
             actorFactory: perAccountFactory
         )
 
         let migrationA = await host.migration(for: accountA)
         let migrationB = await host.migration(for: accountB)
         let options = MigrationNetworkPrivacyOptions(useTor: true, submissionEndpoint: submissionEndpoint)
+        let accountBMarkerSubscription = migrationB.syncBlockedStream.sink { isBlocked in
+            if isBlocked {
+                accountBReachedTheBroadcaster.fulfill()
+            }
+        }
 
         let taskA = Task { try await migrationA.performBroadcast(MigrationBroadcastInstruction(id: prepared.id), options: options) }
         // Wait for account A's broadcast to have started the (single) bootstrap.
         await factory.awaitCallsStarted(1)
         let taskB = Task { try await migrationB.performBroadcast(MigrationBroadcastInstruction(id: prepared.id), options: options) }
-        // Deterministic: B has reached its own extract step, one short hop from the shared
-        // broadcaster's cache check.
+        // Deterministic: B has armed its marker, one short hop from the shared broadcaster's cache
+        // check.
         await fulfillment(of: [accountBReachedTheBroadcaster], timeout: 5)
         // The one remaining hop is NOT purely cooperative: `MigrationSyncGate.markBroadcastInFlight()`
         // -- B's very next step -- does a real synchronous, atomic file write (finding 14's
@@ -148,6 +153,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
 
         let finalCount = await factory.callCount
         XCTAssertEqual(finalCount, 1, "the failing bootstrap was shared by both accounts, not driven twice")
+        accountBMarkerSubscription.cancel()
     }
 
     // MARK: - Wallet-scope isSyncBlocked (dormant enumeration + degrade-open)
@@ -221,7 +227,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let directory = testGeneralStorageDirectory!
         let clockValue = clock!
         var capturedGates: [MigrationSyncGate] = []
-        let capturingFactory: (AccountUUID, any MigrationBroadcasting) -> OrchardMigration = { accountUUID, broadcaster in
+        let capturingFactory: OrchardMigrationHost.ActorFactory = { accountUUID, broadcaster, _ in
             let gate = MigrationSyncGate(
                 directory: directory,
                 accountUUID: accountUUID,
@@ -236,6 +242,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                 broadcaster: broadcaster,
                 syncGate: gate,
                 logger: logger,
+                spacing: TargetBlockSpacing(networkType: .testnet),
                 now: { clockValue.now }
             )
         }
@@ -246,6 +253,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             tickInterval: 3600,
             now: { clockValue.now },
             logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet),
             actorFactory: capturingFactory
         )
 
@@ -299,7 +307,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     func testSyncBlockedStreamEmitsTrueWhileAHostedActorsSubmitIsInFlight() async throws {
         let welding = ZcashRustBackendWeldingMock()
         welding.listAccountsReturnValue = [makeAccount(accountA)]
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = PreparedMigrationTransfer(
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = PreparedMigrationTransfer(
             id: 0,
             txid: Data(repeating: 0xAB, count: 32),
             pczt: Data([0x01, 0x02])
@@ -485,13 +493,255 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         XCTAssertEqual(fallback, ChainTipEstimator.fallbackSecondsPerBlock)
     }
 
+    /// With no samples, the fallback is the target spacing of the block after the max scanned
+    /// height, on the host's network: testnet NU7 + 10 is in NU7's 25 s era. The mock decouples
+    /// the two reads; in a wallet both read the `blocks` table, so no samples with a scanned height
+    /// takes a concurrent scan racing or blocking the samples read, and the fallback is 75 s in
+    /// practice.
+    func testEstimatedSecondsPerBlockFallsBackToTheSpacingAtTheScannedHeight() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationBlockRateSamplesWindowReturnValue = []
+        welding.maxScannedHeightReturnValue = 4_465_036
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+        let fallback = try await host.estimatedSecondsPerBlock()
+        XCTAssertEqual(fallback, 25)
+    }
+
+    /// The public pair stays consistent across NU7: 60 s a block, 0.8 of the 75 s target, projects
+    /// 1200 s from nu7 - 10 to nu7 + 32, and the rate reported with that tip is the one after it,
+    /// 0.8 of NU7's 25 s, not the 60 s measured before activation.
+    func testEstimatedSecondsPerBlockIsTheRateAfterTheProjectedTipAcrossNU7() async throws {
+        let nu7: BlockHeight = 4_465_026
+        let welding = ZcashRustBackendWeldingMock()
+        let base = Int64(referenceDate.timeIntervalSince1970)
+        welding.migrationBlockRateSamplesWindowReturnValue = [
+            MigrationBlockRateSample(height: nu7 - 11, unixTime: base - 60),
+            MigrationBlockRateSample(height: nu7 - 10, unixTime: base)
+        ]
+        clock.now = referenceDate.addingTimeInterval(1_200)
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        let tip = try await host.estimatedChainTip()
+        let secondsPerBlock = try await host.estimatedSecondsPerBlock()
+
+        XCTAssertEqual(tip, nu7 + 32)
+        XCTAssertEqual(secondsPerBlock, 20)
+    }
+
+    // MARK: - Wallet-scope migration availability
+
+    /// The availability read is wallet-scoped: the host serves it through its own welding and
+    /// builds no per-account migration for it. It passes the value of its own bypass holder, since
+    /// that welding is the synchronizer's backend and holds no bypass the host sets: off by default,
+    /// and following the host's setter in both directions. The answer comes back untouched.
+    func testMigrationAvailabilityPassesTheHostsBypassToTheWelding() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let expected = MigrationAvailability(
+            phase: .pausedUntilNetworkUpgrade,
+            activationHeight: 3_543_405,
+            isImmediateLaneAvailable: true
+        )
+        welding.migrationAvailabilityUpgradeGateBypassReturnValue = expected
+        let accountsBuilt = OSAllocatedUnfairLock<[AccountUUID]>(initialState: [])
+        let makeActor = makeActorFactory(welding: welding, gateTickInterval: 3600)
+        let host = OrchardMigrationHost(
+            welding: welding,
+            sharedBroadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
+            generalStorageURL: testGeneralStorageDirectory,
+            tickInterval: 3600,
+            now: { Date() },
+            logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet),
+            actorFactory: { accountUUID, broadcaster, upgradeGateBypass in
+                accountsBuilt.withLock { $0.append(accountUUID) }
+                return makeActor(accountUUID, broadcaster, upgradeGateBypass)
+            }
+        )
+
+        let withoutTheBypass = try await host.migrationAvailability()
+        XCTAssertEqual(withoutTheBypass, expected)
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass, false)
+
+        await host.setUpgradeGateBypass(true)
+        _ = try await host.migrationAvailability()
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass, true)
+
+        await host.setUpgradeGateBypass(false)
+        _ = try await host.migrationAvailability()
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass, false)
+
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassCallsCount, 3)
+        XCTAssertEqual(accountsBuilt.withLock { $0 }, [], "the read takes no account, so no migration is built for it")
+    }
+
+    /// An availability failure reaches the caller as the welding threw it.
+    func testMigrationAvailabilityPropagatesTheWeldingError() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationAvailabilityUpgradeGateBypassThrowableError = ZcashError.rustMigrationAvailability("boom")
+        let host = makeHost(welding: welding, broadcaster: ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)))
+
+        do {
+            _ = try await host.migrationAvailability()
+            XCTFail("expected rustMigrationAvailability")
+        } catch ZcashError.rustMigrationAvailability(let message) {
+            XCTAssertEqual(message, "boom")
+        } catch {
+            XCTFail("expected rustMigrationAvailability, got \(error)")
+        }
+    }
+
+    // MARK: - The preparation height provider (production wiring)
+
+    /// The production host reads a preparation's submission height from the synchronizer's own
+    /// lightwalletd service, directly when Tor is off and over the preparation's own Tor group when
+    /// it is on (see the Tor test below), and looks the service up when the read is made:
+    /// `switchTo(endpoint:)` replaces the initializer's service, and the read must follow it rather
+    /// than keep asking the server the wallet no longer syncs from.
+    ///
+    /// Driven through the real host and the real per-account actor: the wallet database does not
+    /// exist, so the take fails in rust, AFTER the height was read, which is how the test sees that
+    /// the read happened and that the take went on.
+    func testProductionHostReadsThePreparationHeightFromTheInitializersCurrentService() async throws {
+        let first = LightWalletServiceMock()
+        first.latestBlockHeightModeReturnValue = 4_000_001
+        let initializer = try makeProductionInitializer(service: first, torEnabled: false)
+        let host = OrchardMigrationHost(initializer: initializer)
+        let migration = await host.migration(for: accountA)
+
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration)
+
+        XCTAssertEqual(first.latestBlockHeightModeCallsCount, 1)
+        XCTAssertEqual(first.latestBlockHeightModeReceivedMode, ServiceMode.direct)
+
+        // A switch to another server replaces the initializer's service: the next read follows it.
+        let second = LightWalletServiceMock()
+        second.latestBlockHeightModeReturnValue = 4_000_002
+        initializer.lightWalletService = second
+
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration)
+
+        XCTAssertEqual(second.latestBlockHeightModeCallsCount, 1)
+        XCTAssertEqual(first.latestBlockHeightModeCallsCount, 1, "the replaced service is not asked again")
+    }
+
+    /// With Tor on, the height is read over the Tor group the SDK submits that same transaction in
+    /// (`submit-<txid>`), never over the default circuit the sync keeps for the wallet. Every
+    /// preparation request the SDK makes for one transaction rides a circuit of that transaction's
+    /// own, so that nothing the server sees links the transaction to the wallet's sync identity or
+    /// to another transaction; a read on the default circuit would put a request tied to the txid on
+    /// the sync's circuit, once per preparation, right before its submit.
+    ///
+    /// The mode is derived from the txid being taken, so two preparations get two groups.
+    func testProductionHostReadsThePreparationHeightOnThePreparationsOwnSubmitGroupWhenTorIsOn() async throws {
+        let service = LightWalletServiceMock()
+        let modesRead = OSAllocatedUnfairLock<[ServiceMode]>(initialState: [])
+        service.latestBlockHeightModeClosure = { mode in
+            modesRead.withLock { $0.append(mode) }
+            return 4_000_001
+        }
+        let initializer = try makeProductionInitializer(service: service, torEnabled: true)
+        let host = OrchardMigrationHost(initializer: initializer)
+        let migration = await host.migration(for: accountA)
+        let firstTxid = Data(repeating: 0x5A, count: 32)
+        let secondTxid = Data(repeating: 0xA5, count: 32)
+
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration, txid: firstTxid)
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration, txid: secondTxid)
+
+        XCTAssertEqual(
+            modesRead.withLock { $0 },
+            [
+                ServiceMode.txIdGroup(prefix: "submit", txId: firstTxid),
+                ServiceMode.txIdGroup(prefix: "submit", txId: secondTxid)
+            ],
+            "each read is on the submit group of the txid being taken: not the sync's default circuit, not shared between preparations"
+        )
+        XCTAssertFalse(
+            modesRead.withLock { $0.contains(ServiceMode.defaultTor) },
+            "the sync's default circuit is never used for a read that is tied to a txid"
+        )
+    }
+
+    /// Without Tor there are no circuits to keep apart: the read is a direct request, whichever
+    /// preparation it is for.
+    func testProductionHostReadsThePreparationHeightDirectlyWhenTorIsOffForAnyTxid() async throws {
+        let service = LightWalletServiceMock()
+        let modesRead = OSAllocatedUnfairLock<[ServiceMode]>(initialState: [])
+        service.latestBlockHeightModeClosure = { mode in
+            modesRead.withLock { $0.append(mode) }
+            return 4_000_001
+        }
+        let initializer = try makeProductionInitializer(service: service, torEnabled: false)
+        let host = OrchardMigrationHost(initializer: initializer)
+        let migration = await host.migration(for: accountA)
+
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration, txid: Data(repeating: 0x5A, count: 32))
+        await assertTakePreparationFailsInRustAfterReadingTheHeight(migration, txid: Data(repeating: 0xA5, count: 32))
+
+        XCTAssertEqual(modesRead.withLock { $0 }, [ServiceMode.direct, ServiceMode.direct])
+    }
+
+    /// An unreadable server height fails the production retrieval closed: the service's error
+    /// reaches the caller, and the engine is never reached (a take that got there would fail in rust
+    /// with the missing database).
+    func testProductionHostFailsThePreparationClosedWhenTheServerHeightIsUnreadable() async throws {
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeThrowableError = ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+        let initializer = try makeProductionInitializer(service: service, torEnabled: false)
+        let host = OrchardMigrationHost(initializer: initializer)
+        let migration = await host.migration(for: accountA)
+
+        do {
+            _ = try await migration.takePreparation(byTxid: Data(repeating: 0x5A, count: 32))
+            XCTFail("an unreadable height must fail the retrieval closed")
+        } catch ZcashError.serviceLatestBlockHeightFailed {
+            // expected
+        } catch {
+            XCTFail("Expected serviceLatestBlockHeightFailed but got \(error)")
+        }
+    }
+
+    private func makeProductionInitializer(service: LightWalletServiceMock, torEnabled: Bool) throws -> Initializer {
+        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
+        return Initializer(
+            container: mockContainer,
+            cacheDbURL: nil,
+            fsBlockDbRoot: testTempDirectory,
+            generalStorageURL: testGeneralStorageDirectory,
+            dataDbURL: try __dataDbURL(),
+            torDirURL: try __torDirURL(),
+            endpoint: LightWalletEndpointBuilder.default,
+            network: ZcashNetworkBuilder.network(for: .testnet),
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: torEnabled,
+            isExchangeRateEnabled: false
+        )
+    }
+
+    private func assertTakePreparationFailsInRustAfterReadingTheHeight(
+        _ migration: OrchardMigration,
+        txid: Data = Data(repeating: 0x5A, count: 32)
+    ) async {
+        do {
+            _ = try await migration.takePreparation(byTxid: txid)
+            XCTFail("a wallet with no database has no preparation to serve")
+        } catch ZcashError.rustMigrationTakePreparation {
+            // expected: the take reached the engine, so the height read succeeded
+        } catch {
+            XCTFail("Expected rustMigrationTakePreparation but got \(error)")
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeHost(
         welding: ZcashRustBackendWeldingMock,
         broadcaster: any MigrationBroadcasting,
         tickInterval: TimeInterval = 3600,
-        gateTickInterval: TimeInterval = 3600
+        gateTickInterval: TimeInterval = 3600,
+        spacing: TargetBlockSpacing = TargetBlockSpacing(networkType: .testnet)
     ) -> OrchardMigrationHost {
         // `isSyncBlocked()`/`syncBlockedStream` unconditionally read `migrationBlockRateSamples`
         // (`ChainTipEstimator`'s raw input) while computing the wallet-scope predicate; default it
@@ -509,6 +759,7 @@ final class OrchardMigrationHostTests: ZcashTestCase {
             tickInterval: tickInterval,
             now: { clockValue.now },
             logger: logger,
+            spacing: spacing,
             actorFactory: makeActorFactory(welding: welding, gateTickInterval: gateTickInterval)
         )
     }
@@ -516,10 +767,10 @@ final class OrchardMigrationHostTests: ZcashTestCase {
     private func makeActorFactory(
         welding: ZcashRustBackendWeldingMock,
         gateTickInterval: TimeInterval
-    ) -> (AccountUUID, any MigrationBroadcasting) -> OrchardMigration {
+    ) -> OrchardMigrationHost.ActorFactory {
         let storage = testGeneralStorageDirectory!
         let clockValue = clock!
-        return { accountUUID, broadcaster in
+        return { accountUUID, broadcaster, _ in
             OrchardMigration(
                 welding: welding,
                 accountUUID: accountUUID,
@@ -531,7 +782,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
                     now: { clockValue.now },
                     logger: logger
                 ),
-                logger: logger
+                logger: logger,
+                spacing: TargetBlockSpacing(networkType: .testnet)
             )
         }
     }

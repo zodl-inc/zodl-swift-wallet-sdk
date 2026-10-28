@@ -17,7 +17,8 @@ struct GiftCardCheckPolicy: Sendable {
 
 /// Detaches the caller on timeout or cancellation without joining non-cooperative wallet work.
 /// The work itself remains owned by the redeemer's serialized queue until it actually drains.
-/// NSLock preserves the SDK's iOS 13 / macOS 12 deployment floors.
+/// NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
+/// iOS 16 / macOS 13.
 final class GiftCardCheckOperation: @unchecked Sendable {
     private struct Delivery {
         let continuation: CheckedContinuation<GiftCardStatus, Error>?

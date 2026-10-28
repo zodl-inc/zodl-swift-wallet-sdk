@@ -43,8 +43,8 @@ class LiveLatestBlockHeightProvider: LatestBlockHeightProvider {
     func latestBlockHeight(streamer: CompactTxStreamerAsyncClient) async throws -> BlockHeight {
         do {
             let blockID = try await streamer.getLatestBlock(ChainSpec())
-            guard let blockHeight = Int(exactly: blockID.height) else {
-                throw LightWalletServiceError.generalError(message: "error creating blockheight from BlockID \(blockID)")
+            guard let blockHeight = BlockHeight(serverHeight: blockID.height) else {
+                throw LightWalletServiceError.generalError(message: "The server reported a latest block with a height the SDK can't use.")
             }
             return blockHeight
         } catch {
@@ -246,7 +246,7 @@ class LightWalletGRPCService: LightWalletService {
         return AsyncThrowingStream() {
             do {
                 guard let block = try await iterator.next() else { return nil }
-                return ZcashCompactBlock(compactBlock: block)
+                return try ZcashCompactBlock(compactBlock: block)
             } catch {
                 let serviceError = error.mapToServiceError()
                 throw ZcashError.serviceBlockRangeFailed(serviceError)
@@ -279,17 +279,7 @@ class LightWalletGRPCService: LightWalletService {
         do {
             let rawTx = try await compactTxStreamer.getTransaction(txFilter)
 
-            let isNotMined = rawTx.height == 0 || rawTx.height > UInt32.max
-
-            return (
-                tx:
-                    ZcashTransaction.Fetched(
-                        rawID: txId,
-                        minedHeight: isNotMined ? nil : UInt32(rawTx.height),
-                        raw: rawTx.data
-                    ),
-                status: isNotMined ? .notInMainChain : .mined(Int(rawTx.height))
-            )
+            return ZcashTransaction.Fetched.returned(rawID: txId, raw: rawTx.data, atServerHeight: rawTx.height)
         } catch let error as GRPCStatus {
             let noMempoolMsg = "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
 
@@ -345,14 +335,7 @@ class LightWalletGRPCService: LightWalletService {
         return AsyncThrowingStream() {
             do {
                 guard let reply = try await iterator.next() else { return nil }
-                return UTXO(
-                    address: reply.address,
-                    prevoutTxId: reply.txid,
-                    prevoutIndex: Int(reply.index),
-                    script: reply.script,
-                    valueZat: Int(reply.valueZat),
-                    height: Int(reply.height)
-                )
+                return try UTXO(reply: reply)
             } catch {
                 let serviceError = error.mapToServiceError()
                 throw ZcashError.serviceFetchUTXOsFailed(serviceError)
@@ -381,7 +364,7 @@ class LightWalletGRPCService: LightWalletService {
         return AsyncThrowingStream() {
             do {
                 guard let compactBlock = try await iterator.next() else { return nil }
-                return ZcashCompactBlock(compactBlock: compactBlock)
+                return try ZcashCompactBlock(compactBlock: compactBlock)
             } catch {
                 let serviceError = error.mapToServiceError()
                 throw ZcashError.serviceBlockStreamFailed(serviceError)

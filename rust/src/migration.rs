@@ -23,6 +23,32 @@
 //!   PER-RUN — "the stored run is fully mined (or terminal)", never "nothing left to migrate".
 //!   After completion the platform asks `zcashlc_migration_propose_transfers` whether anything
 //!   remains (an empty schedule means no).
+//! - The one answer the engine does not give is the NU7 network-upgrade gate's
+//!   ([`crate::migration_gate`]): where the gate says the migration may not act,
+//!   [`zcashlc_migration_advance_step`] answers
+//!   [`ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE`] in place of the engine's step, and for a
+//!   run the upgrade has stranded [`ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`]. The
+//!   engine's own determinations are persisted either way. The gate also keeps a scheduled run
+//!   from being started before the activation: the entry points that would plan, build, sign,
+//!   store or rebuild one refuse with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>`
+//!   ([`refuse_while_upgrade_gate_closed`]), and [`zcashlc_migration_restart_step`] cancels the
+//!   run but plans nothing, reporting the activation height in its outcome. Each of them takes
+//!   the host's `upgrade_gate_bypass`, for internal builds only. Two more entry points are never
+//!   refused by the gate: [`zcashlc_migration_cancel_run`] ends a run, the interrupted one
+//!   included, without planning a new one, and [`zcashlc_migration_availability`] reports the
+//!   gate's phase at the wallet's next height (with the same bypass), so that the platform can
+//!   choose what to offer before it calls anything the gate would refuse.
+//! - A transaction about to be submitted is checked once more, in whatever phase the gate is: the
+//!   calls that hand one to the platform ([`zcashlc_migration_take_broadcast_transaction`],
+//!   [`zcashlc_migration_take_preparation_by_txid`] and the handback of
+//!   [`zcashlc_migration_sign_note_split`]) take the height the server it goes to reports, and
+//!   refuse a transaction that cannot be valid in the next block, which is the one after the higher
+//!   of that height and the wallet's chain tip ([`refuse_unsubmittable`]). It must be built for that
+//!   block's consensus branch and must not have expired by then. The check runs before the store's
+//!   broadcast seam, so a refused transaction is never recorded in the wallet. For an active
+//!   Proved row it first persists testimony at that higher tip, withholding the broadcast until
+//!   scanning can adjudicate it through `advance_migration`. The same calls refuse to serve a
+//!   run that has already ended.
 //! - Mined-ness is DERIVED, never reported: this layer never marks a transaction mined. The
 //!   engine promotes every in-flight transaction its scan has seen mine, inside
 //!   `advance_migration` — including one whose broadcast THIS process failed to record, which it
@@ -52,13 +78,16 @@
 //! preview DTO; the handle identifies the plan object itself, covering every field (including
 //! ones the DTO never displayed) with none of the echo path's reproduce-exactly bookkeeping.
 //!
-//! Error channel: failures land in the thread-local last-error message. Three stable prefixes let
+//! Error channel: failures land in the thread-local last-error message. Five stable prefixes let
 //! the Swift layer surface dedicated errors: `MIGRATION_PLAN_STALE:` (commit whose handle does
 //! not identify the currently cached proposal — re-propose), `MIGRATION_PROVING_UNAVAILABLE:`
-//! (proving failed hard), and `MIGRATION_WAKEUP_INFEASIBLE:<id>` (a stored transfer admits no
-//! valid sync wake-up height — see [`zcashlc_migration_sync_wakeups`]). Pointer-returning
-//! functions yield NULL on error, `bool`-returning functions `false`, and the `i64` sentinels are
-//! documented per function.
+//! (proving failed hard), `MIGRATION_WAKEUP_INFEASIBLE:<id>` (a stored transfer admits no valid
+//! sync wake-up height — see [`zcashlc_migration_sync_wakeups`]),
+//! `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` (the scheduled lane is closed until the
+//! NU7 upgrade activates — see [`refuse_while_upgrade_gate_closed`]), and
+//! `MIGRATION_SUBMISSION_REFUSED:<code>` (a transaction about to be submitted cannot be valid in
+//! the next block — see [`refuse_unsubmittable`]). Pointer-returning functions yield NULL on error,
+//! `bool`-returning functions `false`, and the `i64` sentinels are documented per function.
 //!
 //! Heap ownership: every function that returns a `*mut Ffi*` (or a [`crate::ffi::BoxedSlice`])
 //! transfers ownership to the caller, who must free it with the matching
@@ -68,7 +97,7 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr;
 use std::slice;
 
@@ -86,9 +115,7 @@ use zcash_client_backend::wallet::{LockOwner, OutputRef};
 use zcash_client_sqlite::AccountUuid;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::pool_migration::orchard_ironwood::Error as PoolMigrationStoreError;
-use zcash_protocol::consensus::{
-    BLOCKS_PER_HOUR, BlockHeight, Network, NetworkUpgrade, Parameters,
-};
+use zcash_protocol::consensus::{BlockHeight, Network, NetworkUpgrade, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
@@ -101,7 +128,9 @@ use zcash_pool_migration::satisfiability::{
     Advance, AdvanceConfig, DuenessTargets, ReorgSettleDepth, ReplanThreshold, UnsatisfiableKind,
     advance_migration,
 };
-use zcash_pool_migration::scheduling::{WakeupParams, WakeupScheduleError};
+use zcash_pool_migration::scheduling::{
+    BlockSpacing, PROVABLE_ANCHOR_DEPTH, WakeupParams, WakeupScheduleError,
+};
 use zcash_pool_migration::signing_rounds::{
     NextFit, PREPARATION_ACTIONS, PlannedTx, SigningRoundBudget, SigningRoundStrategy,
     TRANSFER_ACTIONS, action_weight,
@@ -117,6 +146,10 @@ use crate::migration_engine::{
     planning_inputs, stored_orchard_fvk,
 };
 use crate::migration_finalize;
+use crate::migration_gate::{
+    GatePhase, SubmissionRefusal, UpgradeVerdict, check_submittable, gate_phase, nu7_activation,
+    pczt_consensus_branch_id, upgrade_verdict,
+};
 use crate::migration_plan_cache;
 use crate::{
     NETWORK_ID_MAINNET, NETWORK_ID_TESTNET, NetworkParams, account_uuid_from_bytes,
@@ -186,6 +219,30 @@ fn wakeup_infeasible(id: MigrationTransferId) -> anyhow::Error {
     anyhow!("{WAKEUP_INFEASIBLE_PREFIX}:{}", u32::from(id))
 }
 
+/// The stable prefix the Swift layer maps to a typed "scheduled migration is paused until the
+/// network upgrade" error carrying the NU7 activation height. As with the wake-up prefix, the
+/// height follows the colon DIRECTLY (no space, no prose) so the Swift side can parse it back out:
+/// `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>`.
+const PAUSED_UNTIL_UPGRADE_PREFIX: &str = "MIGRATION_PAUSED_UNTIL_UPGRADE";
+
+/// The scheduled lane is closed until the network upgrade that activates at `activation`: the
+/// refusal [`refuse_while_upgrade_gate_closed`] raises.
+fn paused_until_upgrade(activation: BlockHeight) -> anyhow::Error {
+    anyhow!("{PAUSED_UNTIL_UPGRADE_PREFIX}:{}", u32::from(activation))
+}
+
+/// The stable prefix the Swift layer maps to `ZcashError.migrationSubmissionRefused` (ZRUST0162).
+/// The refusal's code follows the colon DIRECTLY (no space, no prose), so the Swift side can parse
+/// it back out: `MIGRATION_SUBMISSION_REFUSED:<code>`, with `<code>` one of the values of
+/// [`SubmissionRefusal::code`] (`wrong_branch`, `expired`).
+const SUBMISSION_REFUSED_PREFIX: &str = "MIGRATION_SUBMISSION_REFUSED";
+
+/// The submission check ([`refuse_unsubmittable`]) found that the transaction cannot be valid in the
+/// next block, for the reason `refusal` gives.
+fn submission_refused(refusal: SubmissionRefusal) -> anyhow::Error {
+    anyhow!("{SUBMISSION_REFUSED_PREFIX}:{}", refusal.code())
+}
+
 /// A spendable-value amount as a signed 64-bit integer (zatoshi). Every migration amount is a
 /// valid [`Zatoshis`] (`<= MAX_MONEY`, ~2.1e15), well within `i64`.
 fn zat_to_i64(z: Zatoshis) -> i64 {
@@ -244,38 +301,13 @@ struct CallCtx {
     account_bytes: [u8; 16],
 }
 
-/// Refuses a wallet-database path where no database exists, before any connection that could
-/// create it is opened.
-///
-/// Only `zcashlc_init_data_database` creates the wallet database, so a migration call must not
-/// let a read-write open make SQLite create an empty file at a path for a wallet that was never
-/// initialized. The path the platform passes may be a SQLite `file:` URI, which only SQLite
-/// resolves, so asking the filesystem whether it exists would refuse every real wallet. SQLite is
-/// asked instead, with a read-only open: that cannot create the file, and it fails with
-/// `SQLITE_CANTOPEN` when there is none. SQLite reports that code for a file that exists but
-/// cannot be opened too, for example on a permissions or data-protection failure, so the refusal
-/// says "does not exist or cannot be opened". Its own message for that failure carries the
-/// database path, so it is replaced by one that names no path, the same for both contexts.
-fn require_wallet_db(db_path: &Path) -> anyhow::Result<()> {
-    match crate::wallet_db_connection(db_path, crate::WalletDbAccess::ReadOnly) {
-        Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::CannotOpen => {
-            Err(anyhow!(
-                "the wallet database does not exist or cannot be opened; initialize it with \
-                 zcashlc_init_data_database before using the migration surface"
-            ))
-        }
-        Err(e) => Err(anyhow!("Error checking for the wallet database: {e}")),
-    }
-}
-
 /// Open the per-call context from the common FFI arguments. Every entry point calls this fresh and
 /// drops it at the end (no persistent handle).
 ///
 /// `open()` creates neither the wallet database nor any of its schema: only
 /// `zcashlc_init_data_database` does, through `zcash_client_sqlite`'s own migrations and the SDK's
 /// external ones in [`crate::ext_schema`]. A path where no database exists is therefore refused,
-/// by [`require_wallet_db`], before the call's own connections are opened. That check asks SQLite
+/// by [`crate::require_wallet_db`], before the call's own connections are opened. That check asks SQLite
 /// through a read-only open, which cannot create the file.
 ///
 /// # Safety
@@ -292,7 +324,7 @@ unsafe fn open(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    require_wallet_db(&db_path)?;
+    crate::require_wallet_db(&db_path, "using the migration surface")?;
     let wallet = unsafe { crate::wallet_db(rng, db_data, db_data_len, network.clone())? };
     let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadWrite)
         .map_err(|e| anyhow!("Error opening migration store connection: {e}"))?;
@@ -310,7 +342,7 @@ unsafe fn open(
 }
 
 /// Read-only twin of [`open`]: both connections are opened read-only. A path where no database
-/// exists is refused by the same [`require_wallet_db`] check. The pure read entry points open
+/// exists is refused by the same [`crate::require_wallet_db`] check. The pure read entry points open
 /// through this; a read-only connection fails any write with `SQLITE_READONLY`, so an accidental
 /// write anywhere down their call graph fails loudly instead of silently reclassifying the call.
 ///
@@ -327,7 +359,7 @@ unsafe fn open_read(
     let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
         slice::from_raw_parts(db_data, db_data_len)
     }));
-    require_wallet_db(&db_path)?;
+    crate::require_wallet_db(&db_path, "using the migration surface")?;
     let wallet = unsafe { crate::wallet_db_read_only(rng, db_data, db_data_len, network.clone())? };
     let store_conn = crate::wallet_db_connection(&db_path, crate::WalletDbAccess::ReadOnly)
         .map_err(|e| anyhow!("Error opening read-only migration store connection: {e}"))?;
@@ -344,13 +376,37 @@ unsafe fn open_read(
     })
 }
 
+/// The wallet's current chain tip, or `None` when it has none yet. A lookup that fails is worded the
+/// same for the migration surface ([`wallet_chain_tip`]) and for the submission check of a raw
+/// transaction, which can do without a tip.
+pub(crate) fn known_chain_tip(wallet: &MigrationWallet) -> anyhow::Result<Option<BlockHeight>> {
+    wallet
+        .chain_height()
+        .map_err(|e| anyhow!("chain height lookup failed: {e}"))
+}
+
+/// The wallet's current chain tip, or an error telling the caller to sync first when it has none.
+/// The one place the migration surface reads the tip, so every call that needs one fails the same
+/// way on a wallet that has not synced.
+fn wallet_chain_tip(wallet: &MigrationWallet) -> anyhow::Result<BlockHeight> {
+    known_chain_tip(wallet)?.ok_or_else(|| anyhow!("the wallet has no chain tip yet; sync first"))
+}
+
 impl CallCtx {
     /// The wallet's current chain tip.
     fn tip(&self) -> anyhow::Result<BlockHeight> {
-        self.wallet
-            .chain_height()
-            .map_err(|e| anyhow!("chain height lookup failed: {e}"))?
-            .ok_or_else(|| anyhow!("the wallet has no chain tip yet; sync first"))
+        wallet_chain_tip(&self.wallet)
+    }
+
+    /// The height the wallet has scanned every block up to, or `None` before it has scanned
+    /// contiguously from its birthday. The wallet reports it from the metadata it recorded for the
+    /// block at that height, as `zcashlc_fully_scanned_height` does.
+    fn fully_scanned_height(&self) -> anyhow::Result<Option<BlockHeight>> {
+        Ok(self
+            .wallet
+            .block_fully_scanned()
+            .map_err(|e| anyhow!("fully-scanned height lookup failed: {e}"))?
+            .map(|meta| meta.block_height()))
     }
 
     /// The engine's target height (`tip + 1`; see [`target_from_tip`]): a transaction may be
@@ -365,6 +421,148 @@ impl CallCtx {
     fn target(&self) -> anyhow::Result<BlockHeight> {
         Ok(target_from_tip(self.tip()?))
     }
+}
+
+/// The phase of the network-upgrade gate ([`crate::migration_gate`]) at the wallet's next height,
+/// `tip + 1`, with the tip read through `tip` only when the answer needs it.
+///
+/// The gate is judged at the wallet's own next height and never at a server's or a wall-clock
+/// estimate. It is open at every height, without reading the tip, when `bypass` is set (internal
+/// builds only) or the network has no NU7 activation height, so a wallet that has no chain tip yet
+/// still answers for those. This is the one judgment both the calls the gate refuses
+/// ([`upgrade_gate_closed_until`]) and the availability read
+/// ([`zcashlc_migration_availability`]) make, so the platform is never offered what the gate then
+/// refuses.
+fn current_gate_phase(
+    params: &impl Parameters,
+    bypass: bool,
+    tip: impl FnOnce() -> anyhow::Result<BlockHeight>,
+) -> anyhow::Result<GatePhase> {
+    if bypass || nu7_activation(params).is_none() {
+        return Ok(GatePhase::Open);
+    }
+    Ok(gate_phase(params, target_from_tip(tip()?), false))
+}
+
+/// The NU7 activation height the scheduled lane is closed until at the wallet's next height, or
+/// `None` when the network-upgrade gate ([`crate::migration_gate`]) lets it through. See
+/// [`current_gate_phase`] for how the gate is judged.
+fn upgrade_gate_closed_until(ctx: &CallCtx, bypass: bool) -> anyhow::Result<Option<BlockHeight>> {
+    Ok(
+        match current_gate_phase(&ctx.network, bypass, || ctx.tip())? {
+            GatePhase::Open => None,
+            GatePhase::PausedUntil { activation } => Some(activation),
+        },
+    )
+}
+
+/// Refuses a call that would plan, build, sign, store or rebuild a scheduled run while the
+/// network-upgrade gate is closed, with the `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>`
+/// error ([`PAUSED_UNTIL_UPGRADE_PREFIX`]).
+///
+/// A run spreads its transactions over many blocks, and every one of them is built for the
+/// consensus branch of the block it is built under, so one built before the activation is stranded
+/// by it. Hence new scheduled work waits until the wallet's tip plus one reaches activation. The
+/// entry points that open a wallet for such work call this right after [`open`], before they read
+/// or change anything, so a refusal leaves no run, no cached plan and no signature behind.
+///
+/// `bypass` is the host's opt-out, for internal builds only. A wallet that has no chain tip fails
+/// with the error of [`CallCtx::tip`], like every other read that needs one.
+fn refuse_while_upgrade_gate_closed(ctx: &CallCtx, bypass: bool) -> anyhow::Result<()> {
+    match upgrade_gate_closed_until(ctx, bypass)? {
+        Some(activation) => Err(paused_until_upgrade(activation)),
+        None => Ok(()),
+    }
+}
+
+/// The height the submission server reported, from the FFI's `i64`. A negative value is the FFI's
+/// "unknown" (the caller could not read it), and a value no block height can have is as unusable:
+/// the submission check fails closed on either rather than judge a transaction against a guess.
+pub(crate) fn known_submission_server_height(height: i64) -> anyhow::Result<BlockHeight> {
+    u32::try_from(height)
+        .map(BlockHeight::from_u32)
+        .map_err(|_| anyhow!("the submission server's height is unknown"))
+}
+
+/// The height of the next block as a submission is judged at it: one past the higher of the
+/// wallet's chain tip and the height the server the transaction is about to go to reports. Either
+/// can lead. The wallet may lag the server by every block it has not synced, and the server may lag
+/// the wallet, so the block a transaction would be mined in is never earlier than the later of the
+/// two.
+pub(crate) fn submission_target(
+    tip: BlockHeight,
+    server_height: BlockHeight,
+) -> anyhow::Result<BlockHeight> {
+    u32::from(tip.max(server_height))
+        .checked_add(1)
+        .map(BlockHeight::from_u32)
+        .ok_or_else(|| anyhow!("no block can follow the submission server's height"))
+}
+
+/// The transaction `id` names in `state`, or the error every caller that was handed an id the run
+/// does not carry gives.
+fn transaction_by_id(
+    state: &MigrationState,
+    id: MigrationTransferId,
+) -> anyhow::Result<&MigrationTransaction> {
+    state
+        .transactions()
+        .iter()
+        .find(|t| t.id() == id)
+        .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))
+}
+
+/// Refuses a migration transaction that cannot be valid in the next block, so that it is never
+/// handed to the network.
+///
+/// A block accepts only transactions built for its own consensus branch and that have not expired,
+/// and the migration builds a whole run ahead of time and sends it over many blocks, so a
+/// transaction taken for submission may have been overtaken by the chain: by the NU7 activation
+/// that changes the branch, or by its own expiry height. This is the check every submission of a
+/// migration transaction passes. It runs BEFORE the store's broadcast seam
+/// ([`serve_for_broadcast`]), which records the transaction in the wallet, so a refused transaction
+/// is not recorded either.
+///
+/// The next block is judged at the higher of the wallet's chain tip and `server_height`, the height
+/// of the server the transaction is about to go to ([`submission_target`]). The transaction must be
+/// built for that block's branch and must not have expired by it ([`check_submittable`], which
+/// reports the branch first), and a PCZT that does not parse has no branch to read, which is a
+/// failure to turn the stored artifact into servable bytes
+/// ([`PROVING_UNAVAILABLE_PREFIX`]). Submission validity is never bypassed.
+///
+/// A refusal of an active Proved row first persists testimony at the higher observed tip, so
+/// advance withholds that broadcast until scanning can adjudicate it. Only a successful write
+/// returns `MIGRATION_SUBMISSION_REFUSED:<code>` ([`SUBMISSION_REFUSED_PREFIX`]).
+fn refuse_unsubmittable(
+    ctx: &mut CallCtx,
+    state: &MigrationState,
+    id: MigrationTransferId,
+    server_height: BlockHeight,
+    _bypass: bool,
+) -> anyhow::Result<()> {
+    let row = transaction_by_id(state, id)?;
+    let observed_tip = ctx.tip()?.max(server_height);
+    let target = submission_target(observed_tip, server_height)?;
+    let Some(branch) = pczt_consensus_branch_id(row.pczt()) else {
+        return Err(proving_unavailable(format!(
+            "the PCZT of migration transaction {} does not parse, so the consensus branch it is \
+             built for cannot be read",
+            u32::from(row.id())
+        )));
+    };
+    if let Err(refusal) = check_submittable(&ctx.network, Some(branch), row.expiry_height(), target)
+    {
+        if !state.is_terminal() && matches!(row.state(), MigrationTxState::Proved) {
+            let mut state = state.clone();
+            state.report_broadcast_failure(id, observed_tip);
+            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+            store
+                .replace_migration(&state)
+                .map_err(|e| anyhow!("migration store write failed: {e}"))?;
+        }
+        return Err(submission_refused(refusal));
+    }
+    Ok(())
 }
 
 // ----- SDK-owned immediate-migration-run record -----
@@ -694,17 +892,27 @@ fn schedule_rows(
 /// The schedule's duration in hours, measured from `now` — the same reference height the
 /// encoder stamps into each row's `anchor_height` (`now_reference`) — to the LAST scheduled
 /// broadcast (#1806: was the first-to-last broadcast span, which structurally excluded the wait
-/// until the first transfer fires). Empty schedule, or every height at/behind `now`, is `0`
-/// (saturating, never underflows).
-fn estimated_duration_hours(
+/// until the first transfer fires), in the target time of the blocks between them. Empty
+/// schedule, or every height at/behind `now`, is `0` (saturating, never underflows).
+fn estimated_duration_hours<P: Parameters>(
+    params: &P,
     broadcast_heights: impl Iterator<Item = BlockHeight>,
     now: BlockHeight,
 ) -> u32 {
-    let now = u32::from(now);
-    broadcast_heights
-        .map(u32::from)
-        .max()
-        .map_or(0, |max| max.saturating_sub(now) / BLOCKS_PER_HOUR)
+    target_hours_until(params, broadcast_heights.max(), now)
+}
+
+/// The whole hours of target time from `now` to `last`, `0` when absent or not after `now`. At
+/// 75-second blocks this is exactly the old 48 blocks to the hour.
+fn target_hours_until<P: Parameters>(
+    params: &P,
+    last: Option<BlockHeight>,
+    now: BlockHeight,
+) -> u32 {
+    last.map_or(0, |last| {
+        let seconds = crate::block_spacing::target_seconds_between(params, now, last).max(0);
+        u32::try_from(seconds / 3_600).unwrap_or(u32::MAX)
+    })
 }
 
 /// The number of preparation transactions a plan commits (across all layers). Delegates to the
@@ -812,7 +1020,8 @@ fn preparation_steps_from_state(state: &MigrationState) -> Vec<FfiMigrationPrepa
 /// the DTO's `anchor_height` field: with ZIP 374 the real anchor is drawn per transfer and
 /// installed at proving time, so the field now carries the "now" height the platform's duration
 /// math measures waits from — it is NOT a commitment-tree anchor.
-fn encode_schedule_from_plan(
+fn encode_schedule_from_plan<P: Parameters>(
+    params: &P,
     plan: &MigrationPlan,
     now_reference: BlockHeight,
     plan_handle: migration_plan_cache::PlanHandle,
@@ -835,6 +1044,7 @@ fn encode_schedule_from_plan(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let estimated = estimated_duration_hours(
+        params,
         plan.schedule().iter().map(|e| e.broadcast_height()),
         now_reference,
     );
@@ -885,17 +1095,20 @@ fn stored_transfers(state: &MigrationState) -> Vec<&MigrationTransaction> {
 }
 
 /// The schedule-duration estimate derived from STORED transfer rows, in hours, measured from
-/// `now` to the LATEST stored `scheduled_height` — the state-side counterpart of
-/// [`estimated_duration_hours`], used by the state-encoded schedule DTO
-/// ([`encode_schedule_from_state`]) to compute the value the platform displays. Empty, or every
-/// height at/behind `now`, is `0` (saturating, never underflows).
-fn stored_duration_hours(transfers: &[&MigrationTransaction], now: BlockHeight) -> u32 {
-    let now = u32::from(now);
-    transfers
-        .iter()
-        .map(|t| u32::from(t.scheduled_height()))
-        .max()
-        .map_or(0, |max| max.saturating_sub(now) / BLOCKS_PER_HOUR)
+/// `now` to the LATEST stored `scheduled_height`, in the target time of the blocks between them —
+/// the state-side counterpart of [`estimated_duration_hours`], used by the state-encoded schedule
+/// DTO ([`encode_schedule_from_state`]) to compute the value the platform displays. Empty, or
+/// every height at/behind `now`, is `0` (saturating, never underflows).
+fn stored_duration_hours<P: Parameters>(
+    params: &P,
+    transfers: &[&MigrationTransaction],
+    now: BlockHeight,
+) -> u32 {
+    target_hours_until(
+        params,
+        transfers.iter().map(|t| t.scheduled_height()).max(),
+        now,
+    )
 }
 
 /// Marshal the STORED run's full transfer subset into the platform's schedule DTO — the
@@ -908,12 +1121,13 @@ fn stored_duration_hours(transfers: &[&MigrationTransaction], now: BlockHeight) 
 /// [`stored_duration_hours`]'s doc). The DTO carries the `0` "no plan" handle: this schedule is
 /// backed by durable, already-committed state, not by a cached proposal, and the commit-shaped
 /// calls resume that stored state without consulting a handle.
-fn encode_schedule_from_state(
+fn encode_schedule_from_state<P: Parameters>(
+    params: &P,
     state: &MigrationState,
     now_reference: BlockHeight,
 ) -> anyhow::Result<*mut FfiMigrationSchedule> {
     let mut transfers = stored_transfers(state);
-    let estimated = stored_duration_hours(&transfers, now_reference);
+    let estimated = stored_duration_hours(params, &transfers, now_reference);
     transfers.sort_by_key(|t| t.scheduled_height());
     let rows = transfers
         .into_iter()
@@ -1076,18 +1290,16 @@ fn map_rebuild_err(e: engine::RebuildError<AdapterError>) -> anyhow::Error {
 /// The seam's own refusal of a non-`Proved` row is the STALENESS GUARD for both callers: neither
 /// re-asks the engine what to serve, so an instruction that has gone stale between the advance
 /// that issued it and the serve that discharges it is refused here rather than acted on.
+///
+/// This is the serve alone. A transaction that is about to be submitted is served through
+/// [`serve_for_submission`], which checks it can be valid in the next block first.
 fn serve_for_broadcast(
     rng: impl CryptoRng,
     ctx: &mut CallCtx,
     state: &MigrationState,
     id: MigrationTransferId,
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-    let txid = state
-        .transactions()
-        .iter()
-        .find(|t| t.id() == id)
-        .map(|t| <[u8; 32]>::from(t.txid()))
-        .ok_or_else(|| anyhow!("no migration transaction with id {}", u32::from(id)))?;
+    let txid = <[u8; 32]>::from(transaction_by_id(state, id)?.txid());
     let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     let tx = store
         .take_transaction_for_broadcast(rng, state, id)
@@ -1096,6 +1308,27 @@ fn serve_for_broadcast(
     tx.write(&mut raw)
         .map_err(|e| anyhow!("encoding the broadcastable transaction failed: {e}"))?;
     Ok((raw, txid))
+}
+
+/// [`serve_for_broadcast`] for a transaction that is about to be submitted: the same serve, but
+/// only once the transaction has passed [`refuse_unsubmittable`] against the block it would be
+/// mined in. The check comes first on purpose. The seam records the transaction in the wallet's own
+/// tables, and a transaction that cannot be valid in the next block must leave no such record
+/// behind, nor mark its notes as spent.
+///
+/// `server_height` is the height of the server the transaction is about to go to. The retained
+/// `bypass` argument preserves the calling interface and never bypasses submission validity. Every
+/// migration submission (delivery, preparation and note-split ceremony) serves through this.
+fn serve_for_submission(
+    rng: impl CryptoRng,
+    ctx: &mut CallCtx,
+    state: &MigrationState,
+    id: MigrationTransferId,
+    server_height: BlockHeight,
+    bypass: bool,
+) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+    refuse_unsubmittable(ctx, state, id, server_height, bypass)?;
+    serve_for_broadcast(rng, ctx, state, id)
 }
 
 /// Proves ONE `Signed` row through the upstream engine prover
@@ -1473,12 +1706,6 @@ fn ceremony_preparation_pick(
 
 // ----- progress derivation (pure; unit-tested) -----
 
-/// The fallback bound (blocks past `recorded_at_height`) an unmined immediate run is treated as
-/// pending until, when the wallet database does not know (or no longer knows) the transaction's
-/// real expiry height: the typical wallet transaction-expiry delta, so a run that the wallet's own
-/// history never corroborates does not linger forever before the banner re-offers.
-const IMMEDIATE_RUN_FALLBACK_EXPIRY_DELTA: u32 = 40;
-
 /// An immediate-run row resolved against the wallet database (see [`resolve_immediate_run`]),
 /// pre-computed by the caller so [`immediate_run_pending`] stays pure and unit-testable without a
 /// wallet database.
@@ -1494,13 +1721,13 @@ struct ImmediateRunLookup {
 }
 
 impl ImmediateRunLookup {
-    /// The height beyond which this run, if still unmined, is treated as expired: the wallet's own
-    /// recorded expiry when known, otherwise the fallback delta past the record height.
-    fn expiry_bound(&self) -> BlockHeight {
+    /// The wallet's recorded expiry when known, otherwise the record height plus the default expiry
+    /// delta of a transaction targeting the block after it (40, or 120 once NU7 is active there),
+    /// so an uncorroborated run does not linger forever before the banner re-offers.
+    fn expiry_bound<P: Parameters>(&self, params: &P) -> BlockHeight {
         self.expiry_height.unwrap_or_else(|| {
-            BlockHeight::from(
-                u32::from(self.recorded_at_height) + IMMEDIATE_RUN_FALLBACK_EXPIRY_DELTA,
-            )
+            self.recorded_at_height
+                + crate::block_spacing::default_tx_expiry_delta(params, self.recorded_at_height + 1)
         })
     }
 }
@@ -1542,12 +1769,16 @@ fn active_run_progress(state: &MigrationState) -> (u32, u32, Option<BlockHeight>
 }
 
 /// Whether an immediate-run row still counts as PENDING at `tip`: unmined and not past its expiry
-/// bound (the wallet's own recorded expiry when known, otherwise the fallback delta past the
+/// bound (the wallet's own recorded expiry when known, otherwise the default expiry delta past the
 /// record height — see [`ImmediateRunLookup::expiry_bound`]). A mined run is CONSUMED (the sweep
 /// zeroed the balance; nothing to report) and an expired unmined one is ignored (the banner
 /// re-offers) — both report NO progress.
-fn immediate_run_pending(run: &ImmediateRunLookup, tip: BlockHeight) -> bool {
-    run.mined_height.is_none() && tip <= run.expiry_bound()
+fn immediate_run_pending<P: Parameters>(
+    params: &P,
+    run: &ImmediateRunLookup,
+    tip: BlockHeight,
+) -> bool {
+    run.mined_height.is_none() && tip <= run.expiry_bound(params)
 }
 
 /// The amount a stored transfer CROSSES into Ironwood, or `None` for a preparation transaction
@@ -1617,6 +1848,15 @@ pub const ZCASHLC_ADVANCE_STEP_COMPLETE: u32 = 4;
 // it would let a stale header decode one vocabulary as the other.
 pub const ZCASHLC_ADVANCE_STEP_REPLAN: u32 = 6;
 pub const ZCASHLC_ADVANCE_STEP_REEVALUATE: u32 = 7;
+/// The migration is paused for the NU7 network upgrade: the engine's step is one the gate holds
+/// back, so the platform is to do nothing now and wait. The step names no transaction and carries
+/// no outlook; [`FfiMigrationAdvanceStep::network_upgrade_height`] is the activation height.
+pub const ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE: u32 = 8;
+/// The run was interrupted by the NU7 network upgrade: a transaction of it that is not mined was
+/// built for the branch before the activation, so it never can be. The platform cancels the run
+/// and offers a new migration. The step names no transaction and carries no outlook;
+/// [`FfiMigrationAdvanceStep::network_upgrade_height`] is the activation height.
+pub const ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE: u32 = 9;
 
 /// The step-kind discriminants of [`FfiMigrationAdvanceStep::next_kind`], a verbatim export of
 /// upstream `state::StepKind` (the outlook's kind — WHICH transaction a wake-up serves is decided
@@ -1697,7 +1937,7 @@ pub struct FfiMigrationAdvanceStep {
     /// The step discriminant (see the `ZCASHLC_ADVANCE_STEP_*` constants).
     pub step: u32,
     /// The engine's raw transaction id for Broadcast/Rebuild/Attend; `0` for Prove (the batch
-    /// entries carry their own ids) and for Waiting/Complete.
+    /// entries carry their own ids), for Waiting/Complete, and for the network-upgrade steps.
     pub id: u32,
     /// Heap array of `prove_targets_len` batch entries when `step == 0` (Prove) — the WHOLE
     /// provable set, earliest-ready first, never empty for a served Prove; null/0 otherwise.
@@ -1713,6 +1953,10 @@ pub struct FfiMigrationAdvanceStep {
     /// The kind of that upcoming work (see the `ZCASHLC_STEP_KIND_*` constants); meaningful only
     /// when `next_height >= 0`.
     pub next_kind: u32,
+    /// The NU7 activation height the network-upgrade gate is waiting on, for
+    /// [`ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE`] and
+    /// [`ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`]; `-1` for every other step.
+    pub network_upgrade_height: i64,
 }
 
 impl FfiMigrationAdvanceStep {
@@ -1730,6 +1974,7 @@ impl FfiMigrationAdvanceStep {
             prove_targets_len: 0,
             next_height,
             next_kind,
+            network_upgrade_height: -1,
         }))
     }
 
@@ -1743,6 +1988,24 @@ impl FfiMigrationAdvanceStep {
             prove_targets_len: 0,
             next_height,
             next_kind,
+            network_upgrade_height: -1,
+        }))
+    }
+
+    /// A step the network-upgrade gate answers in place of the engine's own: `step` is
+    /// [`ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE`] or
+    /// [`ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`], and `activation` the NU7 height
+    /// the gate is waiting on. It names no transaction and carries no outlook: the engine's own
+    /// outlook describes work the platform is not to do.
+    fn network_upgrade(step: u32, activation: BlockHeight) -> *mut Self {
+        Box::into_raw(Box::new(FfiMigrationAdvanceStep {
+            step,
+            id: 0,
+            prove_targets: ptr::null_mut(),
+            prove_targets_len: 0,
+            next_height: -1,
+            next_kind: 0,
+            network_upgrade_height: i64::from(u32::from(activation)),
         }))
     }
 
@@ -1795,6 +2058,7 @@ impl FfiMigrationAdvanceStep {
             prove_targets_len,
             next_height,
             next_kind,
+            network_upgrade_height: -1,
         }))
     }
 }
@@ -1994,6 +2258,61 @@ pub struct FfiMigrationSchedule {
     /// at propose time, stored rows on re-serve; see [`FfiMigrationPreparationStep`]).
     pub preparations: *mut FfiMigrationPreparationStep,
     pub preparations_len: usize,
+}
+
+/// What [`zcashlc_migration_restart_step`] came to: a fresh plan to re-confirm, or the NU7
+/// activation height a new scheduled plan has to wait for.
+#[repr(C)]
+pub struct FfiMigrationRestartOutcome {
+    /// The fresh plan to re-confirm, owned by this outcome and freed with it; null when the
+    /// restart cancelled the run without planning.
+    pub schedule: *mut FfiMigrationSchedule,
+    /// `-1` when `schedule` is set; otherwise the NU7 activation height a new scheduled plan waits
+    /// for.
+    pub replan_after_height: i64,
+}
+
+/// The phase discriminants of [`FfiMigrationAvailability::phase`], exported into the generated
+/// header so the Swift layer and the marshal share one set of names. They are the phases of the
+/// NU7 network-upgrade gate ([`GatePhase`]) from the platform's side.
+///
+/// Phase 0: both the scheduled and the immediate lane may start. The network has no NU7 activation
+/// height, the wallet's next block is under NU7, or the host's bypass is on.
+pub const ZCASHLC_MIGRATION_AVAILABLE: u32 = 0;
+/// The scheduled lane is paused until the NU7 upgrade has activated and the immediate lane is open:
+/// the wallet's next height is before the activation.
+pub const ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE: u32 = 1;
+
+/// What the migration may start at the wallet's next height (returned by
+/// [`zcashlc_migration_availability`]): the NU7 network-upgrade gate's phase, for the platform to
+/// decide which options to offer.
+#[repr(C)]
+pub struct FfiMigrationAvailability {
+    /// The gate's phase (see the `ZCASHLC_MIGRATION_*` constants).
+    pub phase: u32,
+    /// The NU7 activation height of the wallet's network, in every phase; `-1` when the network
+    /// has none, and then the phase is always [`ZCASHLC_MIGRATION_AVAILABLE`].
+    pub activation_height: i64,
+    /// Whether the immediate lane (one transaction that migrates the whole balance) is open.
+    /// Always `true`: this gate pauses only new scheduled work. Retained for FFI compatibility.
+    pub immediate_available: bool,
+}
+
+impl FfiMigrationAvailability {
+    /// The availability for the gate's `phase` on a network whose NU7 activation height is
+    /// `activation`. Exhaustive over the phases (no wildcard arm): a new phase must be assigned an
+    /// explicit number and an answer for the immediate lane here, not fall into the last arm.
+    fn new(phase: GatePhase, activation: Option<BlockHeight>) -> Self {
+        let (phase, immediate_available) = match phase {
+            GatePhase::Open => (ZCASHLC_MIGRATION_AVAILABLE, true),
+            GatePhase::PausedUntil { .. } => (ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, true),
+        };
+        FfiMigrationAvailability {
+            phase,
+            activation_height: height_opt_to_i64(activation),
+            immediate_available,
+        }
+    }
 }
 
 /// A single run's estimate (element of [`FfiMigrationRunEstimate`]): what one migration run
@@ -2375,6 +2694,35 @@ pub unsafe extern "C" fn zcashlc_free_migration_schedule(ptr: *mut FfiMigrationS
     }
 }
 
+/// Frees a [`FfiMigrationRestartOutcome`], including the schedule it carries, if any.
+///
+/// # Safety
+/// `ptr` must be null or point to a [`FfiMigrationRestartOutcome`] handed out by this module. Do
+/// not free its `schedule` separately: it is freed here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_restart_outcome(
+    ptr: *mut FfiMigrationRestartOutcome,
+) {
+    if !ptr.is_null() {
+        let boxed = unsafe { Box::from_raw(ptr) };
+        // A null `schedule` is the restart that planned nothing, which the schedule's own free
+        // function accepts.
+        unsafe { zcashlc_free_migration_schedule(boxed.schedule) };
+        drop(boxed);
+    }
+}
+
+/// Frees a [`FfiMigrationAvailability`].
+///
+/// # Safety
+/// `ptr` must be null or point to a [`FfiMigrationAvailability`] handed out by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_migration_availability(ptr: *mut FfiMigrationAvailability) {
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
+
 /// Frees a [`FfiMigrationRunEstimate`], including its runs array.
 ///
 /// # Safety
@@ -2487,6 +2835,45 @@ fn remaining_orchard(ctx: &mut CallCtx) -> anyhow::Result<Zatoshis> {
         .ok_or_else(|| anyhow!("spendable Orchard balance overflows"))
 }
 
+/// The drive-level policy for [`advance_migration`] on the network of `params`, at the chain tip
+/// `tip`.
+///
+/// ZIP 318 states the schedule's durations in reference blocks, blocks at the 75-second target
+/// spacing. The block spacing is how the drive turns them into blocks: from the network's NU7
+/// activation height each reference block spans three blocks, so a duration keeps its length in
+/// time on either side of the activation.
+///
+/// The reorg settle depth is how many blocks the scanned chain must stand past a displaced step's
+/// anchor before the displacement counts as permanent: [`PROVABLE_ANCHOR_DEPTH`] reference blocks,
+/// 10, about 12.5 minutes. Upstream leaves the depth to the caller and says it should track the
+/// block spacing. The depth is a plain block count, so it is converted at one height only, the
+/// tip: 10 blocks below the network's NU7 activation and 30 from it. The stretch of chain the
+/// depth measures lasts longer than 12.5 minutes where it reaches back over blocks from before
+/// the activation, 75 seconds each: for the first 30 blocks after the activation, and while the
+/// scan trails the tip across it. So the depth errs long, never short.
+pub(crate) fn advance_config<P: Parameters>(params: &P, tip: BlockHeight) -> AdvanceConfig {
+    let spacing = BlockSpacing::for_network(params);
+    AdvanceConfig::new(
+        ReorgSettleDepth::new(PROVABLE_ANCHOR_DEPTH * spacing.blocks_per_reference_block(tip)),
+        spacing,
+    )
+}
+
+/// The NU7 activation height the network-upgrade gate pauses the engine's `step` until in `phase`,
+/// or `None` when the gate lets the step through.
+///
+/// Before activation ([`GatePhase::PausedUntil`]), new scheduled work is held back: a rebuild
+/// signs a replacement and a re-plan starts a new run. Valid committed transactions may still be
+/// proved and broadcast. Sync, wait and terminal steps are never held back.
+fn paused_until(phase: GatePhase, step: &AdvanceStep) -> Option<BlockHeight> {
+    match phase {
+        GatePhase::Open => None,
+        GatePhase::PausedUntil { activation } => {
+            matches!(step, AdvanceStep::Rebuild { .. } | AdvanceStep::Replan).then_some(activation)
+        }
+    }
+}
+
 /// One verified crank of the engine's drive: builds the store adapter, judges dueness at the
 /// scanned target plus the FFI's optional `estimated_tip` (`-1` = none), and returns the
 /// engine's `Advance` with every determination it made already persisted.
@@ -2511,15 +2898,14 @@ fn drive_advance(
     state: &mut MigrationState,
     estimated_tip: i64,
 ) -> anyhow::Result<Advance> {
-    let targets = dueness_targets(ctx.tip()?, estimated_tip);
+    let tip = ctx.tip()?;
+    let targets = dueness_targets(tip, estimated_tip);
     let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
     advance_migration(
         &mut store,
         state,
         targets,
-        &AdvanceConfig::new(ReorgSettleDepth::new(
-            zcash_pool_migration::scheduling::PROVABLE_ANCHOR_DEPTH,
-        )),
+        &advance_config(&ctx.network, tip),
         // librustzcash #2910: re-spreading a missed broadcast schedule draws fresh
         // inter-broadcast gaps, so advancing needs entropy.
         rng,
@@ -2528,9 +2914,9 @@ fn drive_advance(
 }
 
 /// Advances the stored run with upstream's public satisfiability API, using scanned and estimated
-/// targets plus the provable-anchor reorg-settle depth. Every upstream step marshals onto its own
-/// discriminant — Reevaluate and Replan included (bare, as upstream carries them; the collapsed
-/// Attend projection is retired).
+/// targets plus the reorg settle depth that [`advance_config`] derives from the chain tip. Every
+/// upstream step marshals onto its own discriminant — Reevaluate and Replan included (bare, as
+/// upstream carries them; the collapsed Attend projection is retired).
 ///
 /// Returns NULL **with no error recorded** when `get_migration()` returns `None` — no run is
 /// stored, so there is nothing to advance and no step to report. Distinguish that benign NULL
@@ -2542,6 +2928,29 @@ fn drive_advance(
 /// chain-tip lookup — the same answer `next_step` would give, available on a wallet that never
 /// saw a chain tip.)
 ///
+/// # The network-upgrade gate
+///
+/// The engine's answer then passes through the NU7 network-upgrade gate
+/// ([`crate::migration_gate`]), after the drive has persisted every determination it makes. The
+/// gate is judged at the wallet's own next height, `tip + 1`, and never at `estimated_tip`, which
+/// only brings scheduled work forward. On a network with no NU7 height it never applies.
+///
+/// - A run the upgrade has stranded — once the next block is under NU7, an unmined transaction of
+///   it is built for another consensus branch — answers
+///   [`ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`]. When every such transaction was
+///   already sent, it may have been mined before the activation at a block the wallet's scan has
+///   not reached; the answer is then [`ZCASHLC_ADVANCE_STEP_REEVALUATE`], to sync and ask again,
+///   until the scan has reached the block before the activation.
+/// - Otherwise a step the gate holds back answers
+///   [`ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE`]: Rebuild and Replan before activation.
+///   Valid committed transactions may still be proved and broadcast.
+///
+/// Both answers carry the activation height in
+/// [`FfiMigrationAdvanceStep::network_upgrade_height`], name no transaction and carry no outlook.
+///
+/// `upgrade_gate_bypass` is for internal builds: it lifts the scheduled-work pause, and leaves the
+/// interruption in force, since a stranded run cannot complete however the host asks.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_advance_step`].
 #[unsafe(no_mangle)]
@@ -2551,6 +2960,7 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
     account_uuid_bytes: *const u8,
     network_id: u32,
     estimated_tip: i64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiMigrationAdvanceStep {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -2589,12 +2999,63 @@ pub unsafe extern "C" fn zcashlc_migration_advance_step(
                 None,
             ));
         }
-        let targets = dueness_targets(ctx.tip()?, estimated_tip);
+        let tip = ctx.tip()?;
+        let next_height = target_from_tip(tip);
+        let targets = dueness_targets(tip, estimated_tip);
         // librustzcash #2936: the advance returns the verified step plus a next-wake OUTLOOK
         // (`Advance::next`) — this conduit marshals both, the step via the borrow `.step()`
         // returns and the outlook via `.next()`, onto every arm below.
         let advance = drive_advance(&mut system_rng(), &mut ctx, &mut state, estimated_tip)?;
         let next = advance.next();
+        // THE NETWORK-UPGRADE GATE (`crate::migration_gate`), applied to the engine's answer once
+        // the drive has made, and persisted, every determination it makes. It is judged at the
+        // WALLET's next height and never at the wall-clock estimate, which only feeds `targets`
+        // above: a guess must not pause work that is valid at the tip, nor declare over a run the
+        // chain has not yet stranded.
+        //
+        // First, whether the upgrade has stranded the run. The drive has already promoted every
+        // transaction the scan has seen mined, so the rows judged are the unmined remainder. The
+        // bypass does not apply: it opts out of the pause, not out of noticing that a run can no
+        // longer complete.
+        match upgrade_verdict(
+            &ctx.network,
+            state
+                .transactions()
+                .iter()
+                .map(|row| (row.state(), row.pczt().as_slice())),
+            next_height,
+            ctx.fully_scanned_height()?,
+        ) {
+            UpgradeVerdict::Clear => {}
+            // A transaction of the old branch may have been mined before the activation without
+            // the scan having seen its block: the platform is to sync, as for a rejected
+            // broadcast, and ask again.
+            UpgradeVerdict::AwaitScan => {
+                return Ok(FfiMigrationAdvanceStep::bare(
+                    ZCASHLC_ADVANCE_STEP_REEVALUATE,
+                    None,
+                ));
+            }
+            UpgradeVerdict::Interrupted => {
+                let activation = nu7_activation(&ctx.network).ok_or_else(|| {
+                    anyhow!("the upgrade gate interrupted a run on a network with no NU7 height")
+                })?;
+                return Ok(FfiMigrationAdvanceStep::network_upgrade(
+                    ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+                    activation,
+                ));
+            }
+        }
+        // Then the phase: what the migration may do at the next height, which the bypass opens.
+        if let Some(activation) = paused_until(
+            gate_phase(&ctx.network, next_height, upgrade_gate_bypass),
+            advance.step(),
+        ) {
+            return Ok(FfiMigrationAdvanceStep::network_upgrade(
+                ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE,
+                activation,
+            ));
+        }
         Ok(match advance.step() {
             // Both are BARE: neither upstream step names a transaction — Replan is a verdict
             // about the RUN (its unsatisfiable share passed the committed threshold), Reevaluate
@@ -2689,7 +3150,7 @@ pub unsafe extern "C" fn zcashlc_migration_progress(
         let tip = ctx.tip()?;
         let run = resolve_immediate_run(&ctx.wallet, row)
             .map_err(|e| anyhow!("wallet transaction lookup failed: {e}"))?;
-        let value = if immediate_run_pending(&run, tip) {
+        let value = if immediate_run_pending(&ctx.network, &run, tip) {
             FfiMigrationProgress {
                 is_present: true,
                 completed_transfers: 0,
@@ -2858,6 +3319,51 @@ pub unsafe extern "C" fn zcashlc_migration_block_rate_samples(
             });
         let (rows, len) = ptr_from_vec(samples);
         Ok(Box::into_raw(Box::new(FfiBlockRateSamples { rows, len })))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// What the migration may start at the wallet's next height, for the platform to decide which
+/// options to offer before anything is planned: the phase of the NU7 network-upgrade gate
+/// ([`crate::migration_gate`]) as [`FfiMigrationAvailability::phase`], the network's NU7 activation
+/// height, and whether the immediate lane is open.
+///
+/// The read is judged at the wallet's own next height, `tip + 1`, exactly as the calls the gate
+/// refuses are, and never at a server's height or a wall-clock estimate. It opens the wallet
+/// read-only, the way the read entry points do, and takes no account: the gate depends on the chain
+/// alone. A wallet with no chain tip, on a network that has an NU7 activation height, fails with the
+/// usual "sync first" error and returns NULL: the gate cannot be judged. The answer needs no tip
+/// when `upgrade_gate_bypass` is set or the network has no NU7 height, and then the phase is
+/// [`ZCASHLC_MIGRATION_AVAILABLE`] at every height.
+///
+/// `upgrade_gate_bypass` is for internal builds: it opens the gate at every height, as it does for
+/// the calls the gate refuses.
+///
+/// # Safety
+/// - `db_data` must be valid for reads of `db_data_len` bytes and encode a filesystem path.
+///
+/// Free the returned pointer with [`zcashlc_free_migration_availability`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_availability(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    upgrade_gate_bypass: bool,
+) -> *mut FfiMigrationAvailability {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_path = PathBuf::from(OsStr::from_bytes(unsafe {
+            slice::from_raw_parts(db_data, db_data_len)
+        }));
+        crate::require_wallet_db(&db_path, "using the migration surface")?;
+        let wallet =
+            unsafe { crate::wallet_db_read_only(system_rng(), db_data, db_data_len, network)? };
+        let phase =
+            current_gate_phase(&network, upgrade_gate_bypass, || wallet_chain_tip(&wallet))?;
+        Ok(Box::into_raw(Box::new(FfiMigrationAvailability::new(
+            phase,
+            nu7_activation(&network),
+        ))))
     });
     unwrap_exc_or_null(res)
 }
@@ -3196,6 +3702,11 @@ pub unsafe extern "C" fn zcashlc_migration_has_invalid_transfers(
 /// preparation fees. Plans fresh (and caches the preview for the later commit). An empty proposal
 /// (zero outputs) means there is nothing to migrate.
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_note_split_proposal`].
 #[unsafe(no_mangle)]
@@ -3204,6 +3715,7 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiNoteSplitProposal {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3215,6 +3727,7 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let (values, fee, proposal_handle) =
             match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
                 Some((plan, _, handle)) => {
@@ -3250,6 +3763,22 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
 /// exactly what the user reviewed; the resume path does not consult the handle (see
 /// [`commit_or_resume`]).
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
+/// `submission_server_height` is the height the server the returned transaction will be submitted
+/// to reports as its latest block, which the platform reads on its connection to that server just
+/// before it calls this. The transaction is checked against the next block, the one after the higher
+/// of that height and the wallet's chain tip, and refused with
+/// `MIGRATION_SUBMISSION_REFUSED:<code>` when it cannot be valid there (see
+/// [`refuse_unsubmittable`]; submission validity is never bypassed). The check runs after the
+/// transaction is proved and before the store's broadcast
+/// seam records it, so a refused transaction is not recorded in the wallet, while the committed run
+/// and the stored proof stay. A negative `submission_server_height` is "unknown" and fails closed,
+/// before the run is committed.
+///
 /// # Safety
 /// See [`open`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
 /// Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
@@ -3262,6 +3791,8 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
     proposal_handle: u64,
     usk_ptr: *const u8,
     usk_len: usize,
+    submission_server_height: i64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3273,6 +3804,10 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
+        // Validated before the run is committed or anything is proved: an unknown height is a
+        // caller bug to refuse up front, not a reason to leave a signed run behind.
+        let server_height = known_submission_server_height(submission_server_height)?;
         // The decoded spending key is handed straight to the engine's signing entry point, which
         // derives its own full viewing key and checks it against the account's before building
         // anything. It never reaches the adapter: no migration type holds spend authority, so the
@@ -3316,8 +3851,17 @@ pub unsafe extern "C" fn zcashlc_migration_sign_note_split(
         // the commit persists the run, the prove above stores the wallet record of the proof, and
         // the platform records the broadcast — which is why it hands a transaction back at all
         // instead of deferring to the drive, whose window for this preparation opens a few blocks
-        // ahead.
-        let (raw, txid) = serve_for_broadcast(system_rng(), &mut ctx, &state, first_prep)?;
+        // ahead. Like every submission it is checked first, here against the proven PCZT, so a
+        // preparation that cannot be valid in the next block is not recorded; the committed run
+        // and the stored proof stay, for the drive to carry on from.
+        let (raw, txid) = serve_for_submission(
+            system_rng(),
+            &mut ctx,
+            &state,
+            first_prep,
+            server_height,
+            upgrade_gate_bypass,
+        )?;
         FfiPreparedTransfer::from_parts(first_prep, txid, raw)
     });
     unwrap_exc_or_null(res)
@@ -3566,6 +4110,11 @@ pub unsafe extern "C" fn zcashlc_migration_estimate_runs(
 /// signs exactly this plan. An EMPTY schedule means there is nothing to migrate: after a
 /// completed run this is the "does anything remain" answer.
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
 #[unsafe(no_mangle)]
@@ -3574,6 +4123,7 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3585,9 +4135,10 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
-                encode_schedule_from_plan(&plan, reference_height, handle)
+                encode_schedule_from_plan(&ctx.network, &plan, reference_height, handle)
             }
             None => Ok(encode_empty_schedule()),
         }
@@ -3606,6 +4157,11 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
 /// resume/no-op case does not consult the handle — the stored run is durable, already
 /// handle-verified state (see [`commit_or_resume`]).
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]; `usk_ptr` must be valid for reads of `usk_len` bytes.
 #[unsafe(no_mangle)]
@@ -3617,6 +4173,7 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
     proposal_handle: u64,
     usk_ptr: *const u8,
     usk_len: usize,
+    upgrade_gate_bypass: bool,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3628,6 +4185,7 @@ pub unsafe extern "C" fn zcashlc_migration_sign_and_store_schedule(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let usk = unsafe { crate::decode_usk(usk_ptr, usk_len)? };
         commit_or_resume(
             &mut system_rng(),
@@ -3752,6 +4310,22 @@ pub unsafe extern "C" fn zcashlc_migration_prove_transactions(
 /// artifact is the FINALIZED CONSENSUS TRANSACTION, submittable as-is, paired with the row's
 /// stored txid to submit-and-record under.
 ///
+/// THE TRANSACTION IS CHECKED BEFORE THE SEAM. `submission_server_height` is the height the server
+/// the transaction will be submitted to reports as its latest block, which the platform reads on
+/// its connection to that server just before it calls this. The next block is the one after the
+/// higher of that height and the wallet's chain tip, and a transaction that is not built for that
+/// block's consensus branch or that has expired by it is refused with
+/// `MIGRATION_SUBMISSION_REFUSED:<code>` (`wrong_branch` or `expired`; see [`refuse_unsubmittable`])
+/// and returns NULL. For an active Proved row the refusal first persists testimony at the higher
+/// observed tip; advance answers Reevaluate until scanning can adjudicate it. The seam is never
+/// reached then, so the refused transaction is not recorded in the wallet. `upgrade_gate_bypass`
+/// is retained for ABI compatibility and never bypasses validity.
+/// A negative `submission_server_height` is "unknown", which fails closed.
+///
+/// A run that has ended (completed, failed, superseded or cancelled) serves nothing: an instruction
+/// issued before a cancel can arrive after it, and serving it would record the transaction and mark
+/// the notes the cancel released as spent again. That refusal is bare, and is made before any check.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_prepared_transfer`].
 #[unsafe(no_mangle)]
@@ -3761,6 +4335,8 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
     account_uuid_bytes: *const u8,
     network_id: u32,
     id: u32,
+    submission_server_height: i64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3787,7 +4363,25 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
                 u32::from(id)
             ));
         };
-        let (raw, txid) = serve_for_broadcast(system_rng(), &mut ctx, &state, id)?;
+        // A run that has ended serves nothing: the instruction may have been issued before the
+        // cancel that ended it, and serving it now would record the transaction in the wallet and
+        // mark the notes the cancel released as spent again. Refused before anything is checked.
+        if state.is_terminal() {
+            return Err(anyhow!(
+                "the stored migration run is already over, so transaction {} cannot be served for \
+                 broadcast",
+                u32::from(id)
+            ));
+        }
+        let server_height = known_submission_server_height(submission_server_height)?;
+        let (raw, txid) = serve_for_submission(
+            system_rng(),
+            &mut ctx,
+            &state,
+            id,
+            server_height,
+            upgrade_gate_bypass,
+        )?;
         FfiPreparedTransfer::from_parts(id, txid, raw)
     });
     unwrap_exc_or_null(res)
@@ -3829,6 +4423,15 @@ pub unsafe extern "C" fn zcashlc_migration_take_broadcast_transaction(
 /// the row's stored txid, so the platform records the submission's outcome through the standard
 /// record path with no identity of its own to keep.
 ///
+/// THE PREPARATION IS CHECKED BEFORE THE SEAM, as on [`zcashlc_migration_take_broadcast_transaction`]
+/// and under the same terms: `submission_server_height` is the latest block height of a server the
+/// platform reads it from (the platform submits the preparation by its own means, possibly to
+/// several servers, so it is not necessarily the one it submits to), a transaction that cannot be
+/// valid in the block after the higher of that height and the wallet's chain tip is refused with
+/// `MIGRATION_SUBMISSION_REFUSED:<code>` and not recorded in the wallet. The retained
+/// `upgrade_gate_bypass` never bypasses validity, and a negative height fails closed. A run that has ended
+/// serves nothing, with a bare refusal made before any check.
+///
 /// # Safety
 /// See [`open`]; `txid_ptr` must be non-null and valid for reads of 32 bytes (a null pointer is
 /// refused rather than read). Free the returned pointer with
@@ -3840,6 +4443,8 @@ pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
     account_uuid_bytes: *const u8,
     network_id: u32,
     txid_ptr: *const u8,
+    submission_server_height: i64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -3877,6 +4482,15 @@ pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
                 TxId::from_bytes(txid)
             ));
         };
+        // As on the delivery executor: a run that has ended serves nothing, whatever was
+        // retrieved from it before.
+        if state.is_terminal() {
+            return Err(anyhow!(
+                "the stored migration run is already over, so no preparation with txid {} can be \
+                 served",
+                TxId::from_bytes(txid)
+            ));
+        }
         let row = state
             .transactions()
             .iter()
@@ -3895,7 +4509,15 @@ pub unsafe extern "C" fn zcashlc_migration_take_preparation_by_txid(
                 u32::from(id)
             ));
         }
-        let (raw, served_txid) = serve_for_broadcast(system_rng(), &mut ctx, &state, id)?;
+        let server_height = known_submission_server_height(submission_server_height)?;
+        let (raw, served_txid) = serve_for_submission(
+            system_rng(),
+            &mut ctx,
+            &state,
+            id,
+            server_height,
+            upgrade_gate_bypass,
+        )?;
         FfiPreparedTransfer::from_parts(id, served_txid, raw)
     });
     unwrap_exc_or_null(res)
@@ -4038,10 +4660,26 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
     unwrap_exc_or(res, false)
 }
 
+/// Cancels the account's pending run through the store's own cancel: it releases eligible advisory
+/// note reservations and records the terminal `Cancelled` status in one store transaction. Recorded
+/// spends still follow the wallet's expiry and scan rules. Hand-writing `Failed` (the pre-locking
+/// behavior) would leave those advisory reservations standing. With no run pending it only repairs
+/// the advisory reservations a terminal run still holds, so it succeeds. The restart
+/// ([`zcashlc_migration_restart_step`]) and the cancel-only entry point
+/// ([`zcashlc_migration_cancel_run`]) both end a run with this.
+fn cancel_pending_run(ctx: &mut CallCtx) -> anyhow::Result<()> {
+    let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
+    store
+        .cancel_migration()
+        .map(|_outcome| ())
+        .map_err(|e| anyhow!("cancelling the migration failed: {e}"))
+}
+
 /// Cancels the stored run through the engine's own cancel (persisting it as `Cancelled` and
-/// releasing every note reservation its never-broadcast transactions hold — its pre-signed
-/// transactions are abandoned; already-broadcast ones are unaffected on-chain) and previews a
-/// fresh plan against the live balance for the platform's re-confirm lane.
+/// releasing eligible advisory note reservations; recorded spends retain the wallet's expiry and
+/// scan restrictions). Its pre-signed transactions are abandoned; already-broadcast ones may still
+/// mine. Where the network-upgrade gate allows a scheduled run, it previews a fresh plan against
+/// the live balance for the platform's re-confirm lane.
 ///
 /// Cancelling is also what clears the attention state: a terminal run surfaces neither
 /// `AdvanceStep::Attend` (upstream `next_step` answers `Complete` for it) nor
@@ -4049,15 +4687,30 @@ pub unsafe extern "C" fn zcashlc_migration_record_immediate_run(
 /// `Invalid` rows the run carried simply retire with it — no separate clearing step exists or is
 /// needed.
 ///
+/// # The network-upgrade gate
+///
+/// The cancel always happens. What follows depends on the gate ([`crate::migration_gate`]), judged
+/// at the wallet's own next height. Where it is open, the call plans as it always did, and the
+/// returned [`FfiMigrationRestartOutcome`] carries the fresh plan in `schedule` and `-1` in
+/// `replan_after_height`. Where it is closed — before the NU7 activation — a plan made now would be
+/// built for the consensus branch the activation ends, so none is made: `schedule` is NULL and
+/// `replan_after_height` is the activation height a new scheduled plan waits for. That is a
+/// success, not an error, and records no last error. The plan cache is dropped as well, so a
+/// proposal previewed before the cancel cannot be committed afterwards.
+///
+/// `upgrade_gate_bypass` is for internal builds: it opens the gate at every height.
+///
 /// # Safety
-/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_schedule`].
+/// See [`open`]. Free the returned pointer with [`zcashlc_free_migration_restart_outcome`], which
+/// also frees the schedule it carries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_migration_restart_step(
     db_data: *const u8,
     db_data_len: usize,
     account_uuid_bytes: *const u8,
     network_id: u32,
-) -> *mut FfiMigrationSchedule {
+    upgrade_gate_bypass: bool,
+) -> *mut FfiMigrationRestartOutcome {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
             open(
@@ -4068,26 +4721,77 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                 network_id,
             )?
         };
-        {
-            let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
-            // The engine's own cancel: releases every note reservation the pending run's
-            // never-broadcast transactions hold and records the terminal `Cancelled` status, in
-            // one store transaction. Hand-writing `Failed` (the pre-locking behavior) would
-            // leave those reservations standing, and the fresh plan below would select around
-            // notes the abandoned run still holds.
-            store
-                .cancel_migration()
-                .map(|_outcome| ())
-                .map_err(|e| anyhow!("cancelling the migration failed: {e}"))?;
+        // The fresh plan below would select around notes the abandoned run still holds, so the
+        // run is cancelled the engine's way first.
+        cancel_pending_run(&mut ctx)?;
+        // Judged after the cancel, which stands whatever the gate says: a restart is how a run the
+        // upgrade is about to strand is retired, so it may not fail where only the new plan has to
+        // wait.
+        if let Some(activation) = upgrade_gate_closed_until(&ctx, upgrade_gate_bypass)? {
+            migration_plan_cache::clear(&ctx.db_path, ctx.account_bytes);
+            return Ok(Box::into_raw(Box::new(FfiMigrationRestartOutcome {
+                schedule: ptr::null_mut(),
+                replan_after_height: height_opt_to_i64(Some(activation)),
+            })));
         }
-        match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
+        let schedule = match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
             Some((plan, reference_height, handle)) => {
-                encode_schedule_from_plan(&plan, reference_height, handle)
+                encode_schedule_from_plan(&ctx.network, &plan, reference_height, handle)?
             }
-            None => Ok(encode_empty_schedule()),
-        }
+            None => encode_empty_schedule(),
+        };
+        Ok(Box::into_raw(Box::new(FfiMigrationRestartOutcome {
+            schedule,
+            replan_after_height: -1,
+        })))
     });
     unwrap_exc_or_null(res)
+}
+
+/// Cancels the account's pending run and nothing more: the engine's own cancel persists it as
+/// `Cancelled` and releases eligible advisory note reservations. Recorded spends remain subject to
+/// the wallet's expiry and scan rules, even if network submission failed or was never attempted.
+/// The run's pre-signed transactions are abandoned; already-broadcast ones may still mine.
+/// Interruption does not mean every transaction failed or every input becomes available at once.
+/// The cached proposal is dropped, so a plan previewed before the cancel cannot be committed
+/// after it. Unlike [`zcashlc_migration_restart_step`], which cancels the same way, nothing is
+/// planned afterwards.
+///
+/// This is how the platform ends a run the NU7 upgrade interrupted
+/// ([`ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE`]) before it offers the user a new
+/// migration. The stored run is terminal afterwards, so [`zcashlc_migration_advance_step`] answers
+/// [`ZCASHLC_ADVANCE_STEP_COMPLETE`] for it, and a later restart or commit starts over. With no run
+/// pending the call is a no-op success; with only a terminal run it repairs any reservation that
+/// run still holds, and leaves its status as it was.
+///
+/// The call is never gated: the network-upgrade gate stops what starts a run, not what ends one,
+/// so it takes no `upgrade_gate_bypass`, and it needs no chain tip. Returns `true` on success and
+/// `false` with the last error set otherwise.
+///
+/// # Safety
+/// See [`open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_migration_cancel_run(
+    db_data: *const u8,
+    db_data_len: usize,
+    account_uuid_bytes: *const u8,
+    network_id: u32,
+) -> bool {
+    let res = catch_panic(|| {
+        let mut ctx = unsafe {
+            open(
+                system_rng(),
+                db_data,
+                db_data_len,
+                account_uuid_bytes,
+                network_id,
+            )?
+        };
+        cancel_pending_run(&mut ctx)?;
+        migration_plan_cache::clear(&ctx.db_path, ctx.account_bytes);
+        Ok(true)
+    });
+    unwrap_exc_or(res, false)
 }
 
 /// Rebuilds every EXPIRED migration transfer of the stored run in place through the engine
@@ -4108,12 +4812,12 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
 /// an originally committed transfer.
 ///
 /// Returns the stored run's FULL, freshly persisted transfer schedule (the same DTO
-/// `zcashlc_migration_restart_step` returns, here encoded from the post-refresh STORED state):
-/// after a rebuild the host has no other way to learn the fresh scheduled/expiry values, and its
-/// stale copy would fail the state-side consent echo forever — the returned schedule is the
-/// atomically-persisted truth to re-display and echo. With nothing rebuilt the CURRENT stored
-/// schedule is returned unchanged; with no stored migration, or a terminal stored run (a
-/// completed or cancelled run has nothing to refresh and nothing the echo lane compares
+/// `zcashlc_migration_restart_step` carries in its outcome, here encoded from the post-refresh
+/// STORED state): after a rebuild the host has no other way to learn the fresh scheduled/expiry
+/// values, and its stale copy would fail the state-side consent echo forever — the returned
+/// schedule is the atomically-persisted truth to re-display and echo. With nothing rebuilt the
+/// CURRENT stored schedule is returned unchanged; with no stored migration, or a terminal stored
+/// run (a completed or cancelled run has nothing to refresh and nothing the echo lane compares
 /// against), the EMPTY schedule. The rebuilt state persists once, all-or-nothing: on any rebuild
 /// error nothing is persisted and NULL is returned (see `zcashlc_last_error_message`). A gone
 /// funding note (spent outside the migration) is a hard error naming
@@ -4122,6 +4826,15 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
 /// hard error: the engine rebuilds only transfers (leaves of the dependency graph; an expired
 /// preparation invalidates its dependents' pre-signatures), and its remediation is the same
 /// restart.
+///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
+/// Like the other gated calls it needs the wallet's chain tip for the gate, so on a network that
+/// has an NU7 activation height, and without `upgrade_gate_bypass`, a wallet that has none fails
+/// even where there is nothing to refresh.
 ///
 /// # Safety
 /// See [`open`]; `usk_ptr` must be null (with `usk_len == 0`) or valid for reads of `usk_len`
@@ -4134,6 +4847,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
     network_id: u32,
     usk_ptr: *const u8,
     usk_len: usize,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiMigrationSchedule {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -4145,6 +4859,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         // As on the commit lane: the decoded key is handed to the engine's signing entry point
         // here and nowhere else, and `None` is the external-signer lane that never had one.
         let usk = if usk_ptr.is_null() {
@@ -4158,8 +4873,9 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 
         // Reconcile before judging expiry: a Broadcast transfer the wallet has since observed
         // on-chain must count as Mined here, or it would look expired and be rebuilt into a
-        // double spend of its own mined copy. The no-run and terminal answers come before any
-        // tip lookup, so they hold even before the wallet ever saw a chain tip.
+        // double spend of its own mined copy. The no-run and terminal answers come before this
+        // call's own tip lookup, so they hold even before the wallet ever saw a chain tip wherever
+        // the gate above reads none: with the bypass on, or on a network with no NU7 height.
         let Some(mut state) = reconcile_mined(&mut ctx)? else {
             return Ok(encode_empty_schedule());
         };
@@ -4171,7 +4887,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
         let expired = state.expired_transactions(DuenessTargets::at(target));
         if expired.is_empty() {
             // Nothing to rebuild: the stored schedule IS current — serve it for re-display.
-            return encode_schedule_from_state(&state, tip);
+            return encode_schedule_from_state(&ctx.network, &state, tip);
         }
 
         let mut rng = system_rng();
@@ -4204,7 +4920,7 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
         backend
             .replace_migration(&state)
             .map_err(|e| anyhow!("migration store write failed: {e}"))?;
-        encode_schedule_from_state(&state, tip)
+        encode_schedule_from_state(&ctx.network, &state, tip)
     });
     unwrap_exc_or_null(res)
 }
@@ -4224,6 +4940,11 @@ pub unsafe extern "C" fn zcashlc_migration_refresh_stale_transfers(
 /// it during the build (see [`crate::migration_keystone`]'s module doc), on the freshly built and
 /// the resumed (already-committed) run alike.
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
 /// [`zcashlc_free_migration_unsigned_transfer_pczts`].
@@ -4234,6 +4955,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
     account_uuid_bytes: *const u8,
     network_id: u32,
     proposal_handle: u64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiUnsignedTransferPczts {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -4245,6 +4967,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let (state, unsigned) =
             commit_or_resume(&mut system_rng(), &mut ctx, None, true, proposal_handle)?;
         let prep_ids: HashSet<MigrationTransferId> = state
@@ -4268,6 +4991,11 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_note_split_pczts(
 /// transaction (its id and signed bytes; the txid is zeroed — the broadcastable, proven value is
 /// served by the delivery lane).
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]; `ids`/`pczts`/`pczt_lens` must be valid for reads of `ids_len` elements, and
 /// each `pczts[i]` for `pczt_lens[i]` bytes. Free the returned pointer with
@@ -4282,6 +5010,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiPreparedTransfer {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -4293,6 +5022,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
         let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         let mut state = store
@@ -4331,6 +5061,11 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_note_split_pczts(
 /// Every returned PCZT already carries the account's ZIP 32 spend derivation, stamped by the
 /// engine during the build — see `zcashlc_migration_create_unsigned_note_split_pczts`'s doc.
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]. Free the returned pointer with
 /// [`zcashlc_free_migration_unsigned_transfer_pczts`].
@@ -4341,6 +5076,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
     account_uuid_bytes: *const u8,
     network_id: u32,
     proposal_handle: u64,
+    upgrade_gate_bypass: bool,
 ) -> *mut FfiUnsignedTransferPczts {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -4352,6 +5088,7 @@ pub unsafe extern "C" fn zcashlc_migration_create_unsigned_transfer_pczts(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let (state, unsigned) =
             commit_or_resume(&mut system_rng(), &mut ctx, None, true, proposal_handle)?;
         let transfer_ids: HashSet<MigrationTransferId> = state
@@ -4448,6 +5185,11 @@ pub unsafe extern "C" fn zcashlc_migration_batch_pczts_by_actions(
 /// Applies the ceremony's signatures to the run's transfer transactions, all-or-nothing (see
 /// `zcashlc_migration_store_signed_note_split_pczts`).
 ///
+/// Refused with `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7
+/// network-upgrade gate is closed (see the module doc and [`refuse_while_upgrade_gate_closed`]):
+/// nothing is planned, built, signed, stored or rebuilt then. `upgrade_gate_bypass` is for internal
+/// builds and opens the gate.
+///
 /// # Safety
 /// See [`open`]; `ids`/`pczts`/`pczt_lens` must be valid for reads of `ids_len` elements, and
 /// each `pczts[i]` for `pczt_lens[i]` bytes.
@@ -4461,6 +5203,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
     ids_len: usize,
     pczts: *const *const u8,
     pczt_lens: *const usize,
+    upgrade_gate_bypass: bool,
 ) -> bool {
     let res = catch_panic(|| {
         let mut ctx = unsafe {
@@ -4472,6 +5215,7 @@ pub unsafe extern "C" fn zcashlc_migration_store_signed_schedule_pczts(
                 network_id,
             )?
         };
+        refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
         let signed = unsafe { decode_signed_pairs(ids, ids_len, pczts, pczt_lens)? };
         let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)?;
         let mut state = store
@@ -5248,7 +5992,7 @@ mod tests {
     #[test]
     fn immediate_run_unmined_within_expiry_is_pending() {
         let run = immediate_lookup(100, None, Some(500));
-        assert!(immediate_run_pending(&run, h(300)));
+        assert!(immediate_run_pending(&Network::MainNetwork, &run, h(300)));
     }
 
     #[test]
@@ -5256,22 +6000,86 @@ mod tests {
         // A mined immediate sweep is CONSUMED — the swept balance is zero and there is nothing
         // for the app to acknowledge, so it reports no progress at all.
         let run = immediate_lookup(100, Some(250), Some(500));
-        assert!(!immediate_run_pending(&run, h(300)));
+        assert!(!immediate_run_pending(&Network::MainNetwork, &run, h(300)));
     }
 
     #[test]
     fn immediate_run_expired_unmined_is_not_pending() {
         let run = immediate_lookup(100, None, Some(200));
-        assert!(!immediate_run_pending(&run, h(300)));
+        assert!(!immediate_run_pending(&Network::MainNetwork, &run, h(300)));
     }
 
     #[test]
     fn immediate_run_unknown_expiry_uses_fallback_bound() {
         let run = immediate_lookup(100, None, None);
         // Still within the fallback bound (100 + 40 = 140).
-        assert!(immediate_run_pending(&run, h(140)));
+        assert!(immediate_run_pending(&Network::MainNetwork, &run, h(140)));
         // Past the fallback bound: expired.
-        assert!(!immediate_run_pending(&run, h(141)));
+        assert!(!immediate_run_pending(&Network::MainNetwork, &run, h(141)));
+    }
+
+    #[test]
+    fn immediate_run_fallback_bound_is_the_default_expiry_delta_after_the_record_height() {
+        let run = immediate_lookup(TESTNET_NU7 + 10, None, None);
+        assert!(immediate_run_pending(
+            &Network::TestNetwork,
+            &run,
+            h(TESTNET_NU7 + 130)
+        ));
+        assert!(!immediate_run_pending(
+            &Network::TestNetwork,
+            &run,
+            h(TESTNET_NU7 + 131)
+        ));
+        // Recorded one block before activation: its target is the activation block, so 120.
+        let at_activation = immediate_lookup(TESTNET_NU7 - 1, None, None);
+        assert!(immediate_run_pending(
+            &Network::TestNetwork,
+            &at_activation,
+            h(TESTNET_NU7 + 119)
+        ));
+        assert!(!immediate_run_pending(
+            &Network::TestNetwork,
+            &at_activation,
+            h(TESTNET_NU7 + 120)
+        ));
+        // Two blocks before: the target precedes activation, so 40.
+        let before = immediate_lookup(TESTNET_NU7 - 2, None, None);
+        assert!(immediate_run_pending(
+            &Network::TestNetwork,
+            &before,
+            h(TESTNET_NU7 + 38)
+        ));
+        assert!(!immediate_run_pending(
+            &Network::TestNetwork,
+            &before,
+            h(TESTNET_NU7 + 39)
+        ));
+    }
+
+    // ----- characterization at mainnet heights (75 s blocks from Blossom until NU7 activates at
+    // 3,543,405, 25 s blocks from it); each goes through one helper. -----
+
+    fn mainnet_immediate_run_pending(recorded_at: u32, tip: u32) -> bool {
+        immediate_run_pending(
+            &Network::MainNetwork,
+            &immediate_lookup(recorded_at, None, None),
+            h(tip),
+        )
+    }
+
+    #[test]
+    fn mainnet_immediate_run_without_a_known_expiry_is_pending_for_40_blocks() {
+        assert!(mainnet_immediate_run_pending(3_000_000, 3_000_040));
+        assert!(!mainnet_immediate_run_pending(3_000_000, 3_000_041));
+    }
+
+    #[test]
+    fn mainnet_immediate_run_without_a_known_expiry_is_pending_for_120_blocks_from_nu7() {
+        // Recorded one block before mainnet's NU7 activation at 3,543,405: the transaction's target
+        // is the activation block, so it gets the 120-block default expiry delta.
+        assert!(mainnet_immediate_run_pending(3_543_404, 3_543_524));
+        assert!(!mainnet_immediate_run_pending(3_543_404, 3_543_525));
     }
 
     #[test]
@@ -5320,7 +6128,13 @@ mod tests {
     #[test]
     fn schedule_rows_sort_chronologically_with_prep_offset() {
         let mut rng = StdRng::seed_from_u64(7);
-        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng);
+        let schedule = scheduling::schedule(
+            &SchedulingParams::ZIP_318,
+            &BlockSpacing::UNIFORM,
+            h(1_000),
+            5,
+            &mut rng,
+        );
         // The engine hands the crossing values straight over; they are already net of the fee
         // buffer that pays each transfer's own fee.
         let crossing_values: Vec<Zatoshis> = (1..=5).map(|i| zat(i * 100_000_000)).collect();
@@ -5356,7 +6170,13 @@ mod tests {
         let expected_total: u64 = crossing_values.iter().map(|z| u64::from(*z)).sum();
 
         let mut rng_a = StdRng::seed_from_u64(1);
-        let schedule_a = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_a);
+        let schedule_a = scheduling::schedule(
+            &SchedulingParams::ZIP_318,
+            &BlockSpacing::UNIFORM,
+            h(1_000),
+            5,
+            &mut rng_a,
+        );
         let rows_a = schedule_rows(
             &planned_transfers(0, &schedule_a),
             &crossing_values,
@@ -5365,7 +6185,13 @@ mod tests {
         .unwrap();
 
         let mut rng_b = StdRng::seed_from_u64(99);
-        let schedule_b = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 5, &mut rng_b);
+        let schedule_b = scheduling::schedule(
+            &SchedulingParams::ZIP_318,
+            &BlockSpacing::UNIFORM,
+            h(1_000),
+            5,
+            &mut rng_b,
+        );
         let rows_b = schedule_rows(
             &planned_transfers(0, &schedule_b),
             &crossing_values,
@@ -5400,7 +6226,13 @@ mod tests {
     #[test]
     fn schedule_rows_reject_length_mismatch() {
         let mut rng = StdRng::seed_from_u64(7);
-        let schedule = scheduling::schedule(&SchedulingParams::ZIP_318, h(1_000), 3, &mut rng);
+        let schedule = scheduling::schedule(
+            &SchedulingParams::ZIP_318,
+            &BlockSpacing::UNIFORM,
+            h(1_000),
+            3,
+            &mut rng,
+        );
         let crossing_values = vec![zat(100)];
         assert!(
             schedule_rows(
@@ -5432,6 +6264,7 @@ mod tests {
         .unwrap();
         let schedule = scheduling::schedule(
             &SchedulingParams::ZIP_318,
+            &BlockSpacing::UNIFORM,
             h(1_000),
             crossing_values.len(),
             &mut rng,
@@ -5464,7 +6297,7 @@ mod tests {
     fn estimated_duration_hours_is_measured_from_now_to_the_last_broadcast() {
         let heights = [h(1_000_336), h(1_000_432)];
         assert_eq!(
-            estimated_duration_hours(heights.into_iter(), h(1_000_000)),
+            estimated_duration_hours(&Network::MainNetwork, heights.into_iter(), h(1_000_000)),
             9
         );
     }
@@ -5472,7 +6305,7 @@ mod tests {
     #[test]
     fn estimated_duration_hours_empty_schedule_is_zero() {
         assert_eq!(
-            estimated_duration_hours(std::iter::empty(), h(1_000_000)),
+            estimated_duration_hours(&Network::MainNetwork, std::iter::empty(), h(1_000_000)),
             0
         );
     }
@@ -5483,7 +6316,7 @@ mod tests {
         // `0` rather than underflowing.
         let heights = [h(900_000), h(950_000), h(1_000_000)];
         assert_eq!(
-            estimated_duration_hours(heights.into_iter(), h(1_000_000)),
+            estimated_duration_hours(&Network::MainNetwork, heights.into_iter(), h(1_000_000)),
             0
         );
     }
@@ -5509,19 +6342,86 @@ mod tests {
     fn stored_duration_hours_is_measured_from_now_to_the_last_scheduled_height() {
         let a = transfer_at(0, 1_000_336);
         let b = transfer_at(1, 1_000_432);
-        assert_eq!(stored_duration_hours(&[&a, &b], h(1_000_000)), 9);
+        assert_eq!(
+            stored_duration_hours(&Network::MainNetwork, &[&a, &b], h(1_000_000)),
+            9
+        );
     }
 
     #[test]
     fn stored_duration_hours_empty_is_zero() {
-        assert_eq!(stored_duration_hours(&[], h(1_000_000)), 0);
+        assert_eq!(
+            stored_duration_hours(&Network::MainNetwork, &[], h(1_000_000)),
+            0
+        );
     }
 
     #[test]
     fn stored_duration_hours_all_overdue_is_zero() {
         let a = transfer_at(0, 900_000);
         let b = transfer_at(1, 950_000);
-        assert_eq!(stored_duration_hours(&[&a, &b], h(1_000_000)), 0);
+        assert_eq!(
+            stored_duration_hours(&Network::MainNetwork, &[&a, &b], h(1_000_000)),
+            0
+        );
+    }
+
+    fn mainnet_duration_hours(broadcast_heights: &[u32], now: u32) -> u32 {
+        estimated_duration_hours(
+            &Network::MainNetwork,
+            broadcast_heights.iter().copied().map(h),
+            h(now),
+        )
+    }
+
+    fn mainnet_stored_duration_hours(scheduled_heights: &[u32], now: u32) -> u32 {
+        let owned: Vec<MigrationTransaction> = scheduled_heights
+            .iter()
+            .enumerate()
+            .map(|(id, &height)| transfer_at(u32::try_from(id).unwrap(), height))
+            .collect();
+        let refs: Vec<&MigrationTransaction> = owned.iter().collect();
+        stored_duration_hours(&Network::MainNetwork, &refs, h(now))
+    }
+
+    #[test]
+    fn mainnet_duration_hours_count_48_blocks_an_hour() {
+        for hours in [mainnet_duration_hours, mainnet_stored_duration_hours] {
+            assert_eq!(hours(&[3_000_047], 3_000_000), 0);
+            assert_eq!(hours(&[3_000_048], 3_000_000), 1);
+            assert_eq!(hours(&[3_000_100, 3_001_000], 3_000_000), 20);
+            assert_eq!(hours(&[3_034_560], 3_000_000), 720);
+            assert_eq!(hours(&[2_999_000], 3_000_000), 0);
+        }
+    }
+
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    #[test]
+    fn duration_hours_count_each_block_at_its_own_spacing() {
+        // From NU7 an hour is 144 blocks, not 48.
+        assert_eq!(
+            estimated_duration_hours(
+                &Network::TestNetwork,
+                [h(TESTNET_NU7 + 144)].into_iter(),
+                h(TESTNET_NU7)
+            ),
+            1
+        );
+        let transfer = transfer_at(0, TESTNET_NU7 + 287);
+        assert_eq!(
+            stored_duration_hours(&Network::TestNetwork, &[&transfer], h(TESTNET_NU7)),
+            1
+        );
+        // 48 blocks of 75 s plus 144 of 25 s are two hours (the old math said four).
+        assert_eq!(
+            estimated_duration_hours(
+                &Network::TestNetwork,
+                [h(TESTNET_NU7 + 143)].into_iter(),
+                h(TESTNET_NU7 - 49)
+            ),
+            2
+        );
     }
 
     /// The DTO-constructing encode path end to end: `encode_schedule_from_state` must thread its
@@ -5569,14 +6469,35 @@ mod tests {
             AnchorBucketInterval::ZIP_318,
         );
 
-        let schedule_ptr =
-            encode_schedule_from_state(&state, h(1_000_000)).expect("encoding must succeed");
+        let schedule_ptr = encode_schedule_from_state(&Network::MainNetwork, &state, h(1_000_000))
+            .expect("encoding must succeed");
         let schedule = unsafe { &*schedule_ptr };
         assert_eq!(schedule.estimated_duration_hours, 9);
         assert_eq!(
             schedule.preparations_len, 0,
             "no preparation-kind transaction is stored in this fixture"
         );
+        unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
+    }
+
+    /// The testnet twin of the test above, at a post-NU7 height: `encode_schedule_from_state` must
+    /// pass its `params` through to the duration math. A transfer 287 blocks after `now` is 7,175 s
+    /// of 25-second blocks, one hour; at 48 blocks to the hour it would be five.
+    #[test]
+    fn encode_schedule_from_state_counts_post_nu7_blocks_at_their_own_spacing() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            TESTNET_NU7 + 287,
+            TESTNET_NU7 + 10_000,
+        );
+
+        let schedule_ptr =
+            encode_schedule_from_state(&Network::TestNetwork, &state, h(TESTNET_NU7))
+                .expect("encoding must succeed");
+        let schedule = unsafe { &*schedule_ptr };
+        assert_eq!(schedule.estimated_duration_hours, 1);
         unsafe { zcashlc_free_migration_schedule(schedule_ptr) };
     }
 
@@ -5657,6 +6578,7 @@ mod tests {
                 path_bytes.len(),
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
+                false,
             )
         };
         assert!(
@@ -5686,6 +6608,7 @@ mod tests {
                 handle,
                 usk_bytes.as_ptr(),
                 usk_bytes.len(),
+                false,
             )
         };
         assert!(committed, "committing the previewed plan must succeed");
@@ -5702,6 +6625,7 @@ mod tests {
                 NETWORK_ID_MAINNET,
                 std::ptr::null(),
                 0,
+                false,
             )
         };
         assert!(
@@ -6619,6 +7543,7 @@ mod tests {
                 path_bytes.len(),
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
+                false,
             )
         };
         assert!(
@@ -6636,6 +7561,7 @@ mod tests {
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
                 handle,
+                false,
             )
         };
         assert!(!preps_ptr.is_null(), "the CREATE commit must succeed");
@@ -6660,6 +7586,7 @@ mod tests {
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
                 handle,
+                false,
             )
         };
         assert!(!transfers_ptr.is_null(), "the re-serve read must succeed");
@@ -7602,6 +8529,7 @@ mod tests {
                 path_bytes.len(),
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
+                false,
             )
         };
         assert!(
@@ -7842,6 +8770,7 @@ mod tests {
                 path_bytes.len(),
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
+                false,
             )
         };
         assert!(
@@ -7910,14 +8839,20 @@ mod tests {
                 path_bytes.len(),
                 account_bytes.as_ptr(),
                 NETWORK_ID_MAINNET,
+                false,
             )
         };
         assert!(
             !ptr.is_null(),
+            "restarting a funded Keystone account must yield an outcome"
+        );
+        let outcome = unsafe { &*ptr };
+        assert!(
+            !outcome.schedule.is_null(),
             "restarting a funded Keystone account must yield a schedule"
         );
-        let transfers = unsafe { &*ptr }.transfers_len;
-        unsafe { zcashlc_free_migration_schedule(ptr) };
+        let transfers = unsafe { &*outcome.schedule }.transfers_len;
+        unsafe { zcashlc_free_migration_restart_outcome(ptr) };
         assert_eq!(
             transfers as u32, runs[0].1,
             "the restarted schedule must carry exactly the crossings the estimate previews for run one"
@@ -8530,6 +9465,7 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 -1,
+                false,
             )
         };
         assert!(
@@ -8653,6 +9589,7 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 -1,
+                false,
             )
         };
         assert!(
@@ -8674,6 +9611,11 @@ mod tests {
     /// Initializes a wallet database at a unique temp path (removing any leftover), returning the
     /// path. The refresh fixtures all start here, mirroring a real caller's `init_data_db`.
     fn init_fixture_db(prefix: &str) -> PathBuf {
+        init_fixture_db_on(prefix, NETWORK_ID_MAINNET)
+    }
+
+    /// [`init_fixture_db`] for the network `network_id` names.
+    fn init_fixture_db_on(prefix: &str, network_id: u32) -> PathBuf {
         let path = std::env::temp_dir().join(format!("{prefix}_{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let path_bytes = path.to_str().unwrap().as_bytes();
@@ -8683,7 +9625,7 @@ mod tests {
                 path_bytes.len(),
                 std::ptr::null(),
                 0,
-                NETWORK_ID_MAINNET,
+                network_id,
             )
         };
         assert!(init >= 0, "wallet-db initialization must succeed");
@@ -8789,6 +9731,8 @@ mod tests {
                 NETWORK_ID_MAINNET,
                 std::ptr::null(),
                 0,
+                // No chain tip yet: the bypass keeps the call on the engine's own answer.
+                true,
             )
         };
         assert!(
@@ -8823,6 +9767,8 @@ mod tests {
                 NETWORK_ID_MAINNET,
                 std::ptr::null(),
                 0,
+                // No chain tip yet: the bypass keeps the call on the engine's own answer.
+                true,
             )
         };
         assert!(!schedule_ptr.is_null(), "a terminal run is not an error");
@@ -8873,6 +9819,7 @@ mod tests {
                 NETWORK_ID_MAINNET,
                 usk.as_ptr(),
                 usk.len(),
+                false,
             )
         };
         assert!(
@@ -8986,6 +9933,7 @@ mod tests {
                 NETWORK_ID_MAINNET,
                 std::ptr::null(),
                 0,
+                false,
             )
         };
         assert!(
@@ -9231,6 +10179,18 @@ mod tests {
     fn minimal_pczt_bytes() -> Vec<u8> {
         pczt::roles::creator::Creator::new(u32::from(BranchId::Nu6_3), 10_000, 133, None, None)
             .expect("an NU6.3 PCZT creator")
+            .build()
+            .expect("an empty v6 PCZT builds")
+            .serialize()
+            .expect("an empty v6 PCZT serializes")
+    }
+
+    /// [`minimal_pczt_bytes`] built for NU7: a stored run's PCZTs, for a wallet whose tip is past
+    /// the activation. The advance step reads each unmined row's branch, and a row of NU6.3 there
+    /// is a run the upgrade has stranded.
+    fn minimal_nu7_pczt_bytes() -> Vec<u8> {
+        pczt::roles::creator::Creator::new(u32::from(BranchId::Nu7), 10_000, 133, None, None)
+            .expect("an NU7 PCZT creator")
             .build()
             .expect("an empty v6 PCZT builds")
             .serialize()
@@ -9622,19 +10582,7 @@ mod tests {
 
     /// Re-reads the stored migration for `account`, for asserting what the sweep persisted.
     fn read_fixture_state(path: &std::path::Path, account: &[u8; 16]) -> MigrationState {
-        let mut conn = Connection::open(path).expect("the verification connection opens");
-        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
-        let store = PoolMigrations::for_account(
-            NetworkParams::Standard(Network::TestNetwork),
-            SystemClock,
-            &mut conn,
-            account_id,
-        )
-        .expect("the account-keyed store resolves the fixture account");
-        store
-            .latest_migration()
-            .expect("the store reads")
-            .expect("a migration is stored")
+        stored_fixture_run(path, account).expect("a migration is stored")
     }
 
     /// The ids a `Prove` INSTRUCTION over `state` would name: every `Signed` row, in stored order.
@@ -11102,6 +12050,66 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ----- the drive's configuration (`advance_config`) -----
+
+    /// The drive converts the schedule's durations into blocks with the spacing of the network it
+    /// runs on, which changes at that network's NU7 activation.
+    #[test]
+    fn advance_config_spaces_blocks_by_the_networks_nu7_activation() {
+        assert_eq!(
+            advance_config(&Network::MainNetwork, h(3_543_405)).block_spacing(),
+            BlockSpacing::with_nu7_activation(BlockHeight::from_u32(3_543_405))
+        );
+        assert_eq!(
+            advance_config(&Network::TestNetwork, h(4_465_026)).block_spacing(),
+            BlockSpacing::with_nu7_activation(BlockHeight::from_u32(4_465_026))
+        );
+    }
+
+    /// A chain that follows mainnet, except that NU7 never activates on it.
+    #[derive(Clone)]
+    struct NoNu7;
+
+    impl Parameters for NoNu7 {
+        fn network_type(&self) -> zcash_protocol::consensus::NetworkType {
+            Network::MainNetwork.network_type()
+        }
+
+        fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+            match nu {
+                NetworkUpgrade::Nu7 => None,
+                nu => Network::MainNetwork.activation_height(nu),
+            }
+        }
+    }
+
+    /// The reorg settle depth is 10 reference blocks, converted to blocks at the chain tip: 10
+    /// blocks below the network's NU7 activation and 30 from it, the same 12.5 minutes. A chain
+    /// on which NU7 never activates keeps 10 blocks at every height.
+    #[test]
+    fn advance_config_scales_the_settle_depth_at_the_networks_nu7_activation() {
+        assert_eq!(
+            advance_config(&Network::MainNetwork, h(3_543_404)).reorg_settle_depth(),
+            ReorgSettleDepth::new(10)
+        );
+        assert_eq!(
+            advance_config(&Network::MainNetwork, h(3_543_405)).reorg_settle_depth(),
+            ReorgSettleDepth::new(30)
+        );
+        assert_eq!(
+            advance_config(&Network::TestNetwork, h(4_465_025)).reorg_settle_depth(),
+            ReorgSettleDepth::new(10)
+        );
+        assert_eq!(
+            advance_config(&Network::TestNetwork, h(4_465_026)).reorg_settle_depth(),
+            ReorgSettleDepth::new(30)
+        );
+        assert_eq!(
+            advance_config(&NoNu7, h(5_000_000)).reorg_settle_depth(),
+            ReorgSettleDepth::new(10)
+        );
+    }
+
     // ----- advance step (`zcashlc_migration_advance_step`, the verbatim next_step conduit) -----
 
     /// Sets the fixture chain tip to the file's usual 3,600,000.
@@ -11148,6 +12156,7 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 estimated_tip,
+                false,
             )
         };
         assert!(
@@ -11494,6 +12503,1865 @@ mod tests {
             "mining is chain-derived: nothing is height-schedulable"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The step [`zcashlc_migration_advance_step`] serves over a run whose one transaction is a
+    /// BROADCAST transfer anchored at `boundary`, on a wallet whose chain tip is `chain_tip` and
+    /// which has scanned through `scanned`: `Ok(step)`, or `Err(message)` with the error the call
+    /// recorded when it returns NULL.
+    ///
+    /// The answer reads the drive's reorg settle depth. Upstream judges a broadcast's anchor
+    /// displaced only once `scanned - boundary` reaches that depth, and judging parses the stored
+    /// PCZT. This fixture's placeholder bytes fail the parse (see
+    /// [`advance_step_outlook_reports_next_work`]), so a judged row errors where an unjudged one
+    /// yields `Waiting`: a boundary one block either side of the depth tells the depth exactly,
+    /// with no real proven PCZT. [`assert_anchor_judged`] checks the errored side.
+    fn advance_step_for_a_broadcast_anchored_at(
+        chain_tip: u32,
+        scanned: u32,
+        boundary: u32,
+    ) -> Result<u32, String> {
+        // A database per scenario: the tests run in parallel, and the prefix names the file.
+        let path = init_fixture_db(&format!(
+            "zcashlc_advance_step_settle_{chain_tip}_{scanned}_{boundary}"
+        ));
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        // The scanned range goes first: `mark_fixture_scanned_through` replaces the whole scan
+        // queue, so a tip set before it would collapse to the scanned height. Set after, the tip
+        // extends the queue past the scanned range.
+        mark_fixture_scanned_through(&path, scanned);
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    chain_tip as i32,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                &[],
+                3_100_000,
+                4_000_000,
+                Some(boundary),
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes([9u8; 32]),
+                },
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        // Cleared first, so that the message read after a NULL is this call's own.
+        ffi_helpers::error_handling::clear_last_error();
+        let ptr = unsafe {
+            zcashlc_migration_advance_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                -1,
+                false,
+            )
+        };
+        let outcome = if ptr.is_null() {
+            Err(ffi_helpers::error_handling::error_message()
+                .unwrap_or_else(|| "NULL with no error recorded".to_owned()))
+        } else {
+            let step = unsafe { &*ptr }.step;
+            unsafe { zcashlc_free_migration_advance_step(ptr) };
+            Ok(step)
+        };
+        let _ = std::fs::remove_file(&path);
+        outcome
+    }
+
+    /// Asserts that `outcome` is the failure to read this fixture's placeholder PCZT, which the
+    /// call reaches only once upstream judges the broadcast's anchor. The error names the stored
+    /// PCZT (upstream words it "corrupt stored value for pczt"), which tells that failure from
+    /// any other reason the call can return NULL, and from a step.
+    #[track_caller]
+    fn assert_anchor_judged(outcome: Result<u32, String>, what: &str) {
+        assert!(
+            matches!(&outcome, Err(error) if error.contains("pczt")),
+            "{what}: expected the stored-PCZT failure, got {outcome:?}"
+        );
+    }
+
+    /// From NU7 a block is a third of a reference block, so the drive treats a displacement of a
+    /// broadcast's anchor as permanent only once the scanned chain stands 30 blocks past it: the
+    /// same 12.5 minutes as the 10 blocks below the activation. Mainnet activates NU7 at 3,543,405.
+    #[test]
+    fn advance_step_settles_a_displacement_after_30_blocks_from_nu7() {
+        assert_eq!(
+            advance_step_for_a_broadcast_anchored_at(3_600_000, 3_600_000, 3_599_971),
+            Ok(ZCASHLC_ADVANCE_STEP_WAITING),
+            "an anchor 29 blocks back has not settled"
+        );
+        assert_anchor_judged(
+            advance_step_for_a_broadcast_anchored_at(3_600_000, 3_600_000, 3_599_970),
+            "an anchor 30 blocks back is judged, which reads the placeholder PCZT and errors",
+        );
+    }
+
+    /// Below the activation a reference block is one block, so the depth stays at 10 blocks.
+    #[test]
+    fn advance_step_settles_a_displacement_after_10_blocks_below_nu7() {
+        assert_eq!(
+            advance_step_for_a_broadcast_anchored_at(3_543_000, 3_543_000, 3_542_991),
+            Ok(ZCASHLC_ADVANCE_STEP_WAITING),
+            "an anchor 9 blocks back has not settled"
+        );
+        assert_anchor_judged(
+            advance_step_for_a_broadcast_anchored_at(3_543_000, 3_543_000, 3_542_990),
+            "an anchor 10 blocks back is judged, which reads the placeholder PCZT and errors",
+        );
+    }
+
+    /// The depth is converted at the chain tip, not at the scanned height: a wallet still
+    /// scanning below the activation, whose chain tip is already past it, settles after exactly
+    /// 30 blocks, not 10 and not more.
+    #[test]
+    fn advance_step_scales_the_settle_depth_by_the_chain_tip() {
+        assert_eq!(
+            advance_step_for_a_broadcast_anchored_at(3_600_000, 3_543_000, 3_542_971),
+            Ok(ZCASHLC_ADVANCE_STEP_WAITING),
+            "an anchor 29 blocks back has not settled while the tip is past the activation"
+        );
+        assert_anchor_judged(
+            advance_step_for_a_broadcast_anchored_at(3_600_000, 3_543_000, 3_542_970),
+            "an anchor 30 blocks back is judged while the tip is past the activation",
+        );
+    }
+
+    // ----- advance step: the NU7 network-upgrade gate -----
+    //
+    // `zcashlc_migration_advance_step` answers PAUSED_FOR_NETWORK_UPGRADE or
+    // INTERRUPTED_BY_NETWORK_UPGRADE in place of the engine's own step where `crate::migration_gate`
+    // says the migration may not act, judged at the WALLET's tip alone. Mainnet fixtures: NU7
+    // activates at 3,543,405. New scheduled work pauses through tip 3,543,403; tip 3,543,404
+    // opens it because the next block activates NU7. Valid committed work continues before then.
+
+    /// Everything one advance-step read hands back, copied out of the DTO before it is freed.
+    #[derive(Debug)]
+    struct GatedStep {
+        step: u32,
+        id: u32,
+        batch_len: usize,
+        next_height: i64,
+        network_upgrade_height: i64,
+    }
+
+    /// Reads one advance step over the FFI at `estimated_tip` and `bypass`, asserting success, and
+    /// frees the DTO after copying it out.
+    fn read_gated_step(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        estimated_tip: i64,
+        bypass: bool,
+    ) -> GatedStep {
+        let ptr = unsafe {
+            zcashlc_migration_advance_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                estimated_tip,
+                bypass,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "a stored run must yield a step, not NULL: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let dto = unsafe { &*ptr };
+        let read = GatedStep {
+            step: dto.step,
+            id: dto.id,
+            batch_len: dto.prove_targets_len,
+            next_height: dto.next_height,
+            network_upgrade_height: dto.network_upgrade_height,
+        };
+        unsafe { zcashlc_free_migration_advance_step(ptr) };
+        read
+    }
+
+    /// Moves the fixture wallet's chain tip to `tip`.
+    fn set_fixture_tip_at(path_bytes: &[u8], tip: u32) {
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    tip as i32,
+                    NETWORK_ID_MAINNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+    }
+
+    /// Records the block at `height` in the wallet's `blocks` table, which is where
+    /// `WalletRead::block_fully_scanned` finds the metadata of the fully scanned height. Scanning
+    /// writes the row; [`mark_fixture_scanned_through`] only writes the scan queue the store's
+    /// oracle reads, so a fixture that needs the wallet to REPORT its scanned height adds the row.
+    fn record_fixture_block(path: &std::path::Path, height: u32) {
+        let conn = Connection::open(path).expect("the wallet connection opens");
+        conn.execute(
+            "INSERT OR REPLACE INTO blocks (height, hash, time, sapling_tree, \
+             sapling_commitment_tree_size) VALUES (?1, ?2, 0, x'00', 0)",
+            rusqlite::params![height, &[0x11u8; 32][..]],
+        )
+        .expect("the scanned block records");
+    }
+
+    /// A mainnet fixture wallet whose chain tip and scanned height are both `tip`, and whose
+    /// oracle can vouch for the placeholder spend nullifier every [`tx_row`] carries: what the
+    /// engine needs before it offers a prove, a broadcast or a rebuild.
+    fn gate_fixture(prefix: &str, tip: u32) -> (PathBuf, [u8; 16]) {
+        let path = init_fixture_db(prefix);
+        let account = create_fixture_account(&path);
+        mark_fixture_scanned_through(&path, tip);
+        set_fixture_tip_at(path.to_str().unwrap().as_bytes(), tip);
+        seed_placeholder_received_note(&path, [0u8; 32]);
+        (path, account)
+    }
+
+    /// A stored run that makes the engine answer a given step at a given wallet tip.
+    #[derive(Clone, Copy, Debug)]
+    enum GateRun {
+        Rebuild,
+        Replan,
+        Broadcast,
+        Prove,
+        Waiting,
+        Complete,
+    }
+
+    impl GateRun {
+        /// The discriminant the engine's answer to [`Self::state`] marshals onto.
+        fn engine_step(self) -> u32 {
+            match self {
+                GateRun::Rebuild => ZCASHLC_ADVANCE_STEP_REBUILD,
+                GateRun::Replan => ZCASHLC_ADVANCE_STEP_REPLAN,
+                GateRun::Broadcast => ZCASHLC_ADVANCE_STEP_BROADCAST,
+                GateRun::Prove => ZCASHLC_ADVANCE_STEP_PROVE,
+                GateRun::Waiting => ZCASHLC_ADVANCE_STEP_WAITING,
+                GateRun::Complete => ZCASHLC_ADVANCE_STEP_COMPLETE,
+            }
+        }
+
+        /// The stored run, for a wallet whose chain tip and scanned height are `tip`. Every row
+        /// carries the one-byte placeholder PCZT, from which no branch can be read, so the run is
+        /// gated by its phase alone. The transfer is id 7, which tells a step that names it from
+        /// one that names nothing.
+        fn state(self, tip: u32) -> MigrationState {
+            let transfer = |scheduled: u32, expiry: u32, boundary: u32, state: MigrationTxState| {
+                tx_row(
+                    7,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    &[],
+                    scheduled,
+                    expiry,
+                    Some(boundary),
+                    state,
+                )
+            };
+            let rows = match self {
+                // Signed, and expired before the next block: its remedy is the rebuild.
+                GateRun::Rebuild => {
+                    vec![transfer(
+                        tip - 200,
+                        tip - 10,
+                        tip - 300,
+                        MigrationTxState::Signed,
+                    )]
+                }
+                // The preparation expired before the next block, and the transfer that waits on
+                // it can never mine either: no live work is left, so the run is to be re-planned.
+                GateRun::Replan => vec![
+                    tx_row(
+                        0,
+                        MigrationTxKind::Preparation { layer: 0, index: 0 },
+                        &[],
+                        tip - 200,
+                        tip - 10,
+                        None,
+                        MigrationTxState::Signed,
+                    ),
+                    tx_row(
+                        7,
+                        MigrationTxKind::Transfer { crossing: 0 },
+                        &[0],
+                        tip - 100,
+                        4_000_000,
+                        Some(tip - 300),
+                        MigrationTxState::Signed,
+                    ),
+                ],
+                // Proved, and due at the next block.
+                GateRun::Broadcast => {
+                    vec![transfer(
+                        tip + 1,
+                        4_000_000,
+                        tip - 100,
+                        MigrationTxState::Proved,
+                    )]
+                }
+                // Signed with its boundary settled and its broadcast far off: only its proof is
+                // due.
+                GateRun::Prove => vec![transfer(
+                    tip + 1_000,
+                    4_000_000,
+                    tip - 100,
+                    MigrationTxState::Signed,
+                )],
+                // Signed with its boundary still to settle: nothing is actionable, but the
+                // engine can say when something will be.
+                GateRun::Waiting => vec![transfer(
+                    tip + 1_000,
+                    4_000_000,
+                    tip + 900,
+                    MigrationTxState::Signed,
+                )],
+                GateRun::Complete => vec![transfer(tip - 200, 4_000_000, tip - 300, MINED)],
+            };
+            custom_state(MigrationStatus::InProgress, rows)
+        }
+    }
+
+    /// The step read from a fresh wallet at `tip` whose stored run is `run`. `tag` keeps the
+    /// database apart from the other tests', which run in parallel.
+    fn gated_step(tag: &str, run: GateRun, tip: u32, bypass: bool) -> GatedStep {
+        let (path, account) =
+            gate_fixture(&format!("zcashlc_gate_{tag}_{run:?}_{tip}_{bypass}"), tip);
+        store_fixture_state(&path, &account, &run.state(tip));
+        let read = read_gated_step(path.to_str().unwrap().as_bytes(), &account, -1, bypass);
+        let _ = std::fs::remove_file(&path);
+        read
+    }
+
+    /// A funded fixture wallet holding a REAL run, committed at the wallet tip `commit_tip`: the
+    /// pattern of [`commit_or_resume_succeeds_with_the_cached_plans_own_handle`], which calls
+    /// `commit_or_resume` directly and so passes through no gate. Every transaction of the run is
+    /// built for the consensus branch of the block after `commit_tip`.
+    fn committed_run_fixture(tag: &str, commit_tip: u32) -> (PathBuf, [u8; 16]) {
+        let (path, account, _plan) = committed_run_and_plan_fixture(tag, commit_tip);
+        (path, account)
+    }
+
+    /// [`committed_run_fixture`], and the plan the run was committed from. Committing drops the
+    /// plan from the cache, so a test that wants a proposal under review beside the run puts the
+    /// plan back with [`migration_plan_cache::set`].
+    fn committed_run_and_plan_fixture(
+        tag: &str,
+        commit_tip: u32,
+    ) -> (PathBuf, [u8; 16], MigrationPlan) {
+        let path = init_fixture_db(&format!("zcashlc_gate_run_{tag}"));
+        let (account, usk_bytes) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk_bytes, GATE_FIXTURE_FUNDING);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        set_fixture_tip_at(path_bytes, commit_tip);
+
+        let mut ctx = unsafe {
+            open(
+                system_rng(),
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+            .expect("planning must succeed")
+            .expect("the funded account has a real migration plan");
+        let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
+            .expect("the fixture usk decodes");
+        commit_or_resume(
+            &mut system_rng(),
+            &mut ctx,
+            Some(usk.orchard()),
+            false,
+            handle,
+        )
+        .expect("the fixture run commits");
+        (path, account, plan)
+    }
+
+    /// The step discriminants are an ABI hosts may match on by number: 8 and 9 are new, and 5 is
+    /// the retired Attend hole that stays unused.
+    #[test]
+    fn advance_step_discriminants_are_stable() {
+        assert_eq!(ZCASHLC_ADVANCE_STEP_PROVE, 0);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_BROADCAST, 1);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_REBUILD, 2);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_WAITING, 3);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_COMPLETE, 4);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_REPLAN, 6);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_REEVALUATE, 7);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE, 8);
+        assert_eq!(ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE, 9);
+    }
+
+    /// Every constructor of an engine step sets the new field to its `-1` "none" sentinel, so a
+    /// host never reads an activation height off a step the gate did not answer.
+    #[test]
+    fn engine_steps_carry_no_network_upgrade_height() {
+        let state = test_state(
+            MigrationStatus::InProgress,
+            &[],
+            &[MigrationTxState::Signed],
+            50,
+            10_000,
+        );
+        let steps = [
+            FfiMigrationAdvanceStep::bare(ZCASHLC_ADVANCE_STEP_WAITING, None),
+            FfiMigrationAdvanceStep::with_id(
+                ZCASHLC_ADVANCE_STEP_BROADCAST,
+                MigrationTransferId::new(3),
+                None,
+            ),
+            FfiMigrationAdvanceStep::prove(&state, &[], DuenessTargets::at(h(100)), None),
+        ];
+        for ptr in steps {
+            assert_eq!(unsafe { &*ptr }.network_upgrade_height, -1);
+            unsafe { zcashlc_free_migration_advance_step(ptr) };
+        }
+    }
+
+    /// Only steps that build new scheduled work wait for activation.
+    #[test]
+    fn the_upgrade_gate_withholds_exactly_the_steps_it_names() {
+        let activation = h(3_543_405);
+        let id = MigrationTransferId::new(1);
+        let steps = [
+            (
+                AdvanceStep::Prove {
+                    transactions: Vec::new(),
+                },
+                false,
+            ),
+            (AdvanceStep::Broadcast { id }, false),
+            (AdvanceStep::Rebuild { id }, true),
+            (AdvanceStep::Replan, true),
+            (AdvanceStep::Reevaluate, false),
+            (AdvanceStep::Waiting, false),
+            (AdvanceStep::Complete, false),
+        ];
+        for (step, withheld) in steps {
+            assert_eq!(
+                paused_until(GatePhase::PausedUntil { activation }, &step),
+                withheld.then_some(activation),
+                "before activation: {step:?}"
+            );
+            assert_eq!(
+                paused_until(GatePhase::Open, &step),
+                None,
+                "with the gate open: {step:?}"
+            );
+        }
+    }
+
+    /// Before activation, work that BUILDS something new is held back: a rebuild signs a
+    /// replacement for the branch of the next block, so throughout the preactivation pause the
+    /// platform is told to wait, with the activation height to wait for. The pause carries no
+    /// outlook: it ends when the chain reaches the upgrade, at no height the drive can name.
+    #[test]
+    fn advance_step_pauses_a_rebuild_before_activation() {
+        let paused = gated_step("pauses", GateRun::Rebuild, 3_543_000, false);
+        assert_eq!(
+            paused.step, ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE,
+            "{paused:?}"
+        );
+        assert_eq!(paused.network_upgrade_height, 3_543_405);
+        assert_eq!(paused.next_height, -1, "a paused step carries no outlook");
+        assert_eq!(paused.id, 0, "a paused step names no transaction");
+
+        // The bypass hands the engine's own answer back.
+        let bypassed = gated_step("pauses", GateRun::Rebuild, 3_543_000, true);
+        assert_eq!(bypassed.step, ZCASHLC_ADVANCE_STEP_REBUILD, "{bypassed:?}");
+        assert_eq!(bypassed.id, 7, "the engine names the expired transfer");
+        assert_eq!(bypassed.network_upgrade_height, -1);
+    }
+
+    /// A re-plan builds a new run, so it is held back before activation as a rebuild is.
+    #[test]
+    fn advance_step_pauses_a_replan_before_activation() {
+        let paused = gated_step("pauses", GateRun::Replan, 3_543_000, false);
+        assert_eq!(
+            paused.step, ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE,
+            "{paused:?}"
+        );
+        assert_eq!(paused.network_upgrade_height, 3_543_405);
+        assert_eq!(paused.next_height, -1);
+
+        let bypassed = gated_step("pauses", GateRun::Replan, 3_543_000, true);
+        assert_eq!(bypassed.step, ZCASHLC_ADVANCE_STEP_REPLAN, "{bypassed:?}");
+        assert_eq!(bypassed.network_upgrade_height, -1);
+    }
+
+    /// Transactions already built keep moving before activation: valid work is proved and broadcast.
+    #[test]
+    fn advance_step_passes_broadcast_and_prove_through_before_activation() {
+        // A committed run remains valid at the next height 3,543,356.
+        for tip in [3_543_000, 3_543_355] {
+            let broadcast = gated_step("passes", GateRun::Broadcast, tip, false);
+            assert_eq!(
+                broadcast.step, ZCASHLC_ADVANCE_STEP_BROADCAST,
+                "tip {tip}: {broadcast:?}"
+            );
+            assert_eq!(broadcast.id, 7);
+            assert_eq!(broadcast.network_upgrade_height, -1);
+
+            let prove = gated_step("passes", GateRun::Prove, tip, false);
+            assert_eq!(
+                prove.step, ZCASHLC_ADVANCE_STEP_PROVE,
+                "tip {tip}: {prove:?}"
+            );
+            assert_eq!(prove.batch_len, 1);
+            assert_eq!(prove.network_upgrade_height, -1);
+        }
+    }
+
+    /// Committed transactions can still be proved and broadcast up to the activation.
+    #[test]
+    fn advance_step_passes_valid_broadcast_and_prove_until_activation() {
+        for tip in [3_543_355, 3_543_356, 3_543_403] {
+            for run in [GateRun::Broadcast, GateRun::Prove] {
+                let step = gated_step("preactivation", run, tip, false);
+                assert_eq!(step.step, run.engine_step(), "tip {tip}, {run:?}: {step:?}");
+                assert_eq!(step.network_upgrade_height, -1);
+                if matches!(run, GateRun::Prove) {
+                    assert_eq!(
+                        step.batch_len, 1,
+                        "the executor receives the committed proof batch"
+                    );
+                } else {
+                    assert_eq!(step.id, 7, "the executor receives the committed transfer");
+                }
+            }
+        }
+    }
+
+    /// The preactivation pause holds new build steps back, whatever is left of the run.
+    #[test]
+    fn advance_step_pauses_a_rebuild_and_a_replan_near_activation() {
+        for tip in [3_543_356, 3_543_403] {
+            for run in [GateRun::Rebuild, GateRun::Replan] {
+                let paused = gated_step("window", run, tip, false);
+                assert_eq!(
+                    paused.step, ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE,
+                    "tip {tip}, {run:?}: {paused:?}"
+                );
+                assert_eq!(paused.network_upgrade_height, 3_543_405);
+            }
+        }
+    }
+
+    /// A step that asks nothing of the platform is the engine's own in every phase, outlook
+    /// included: the gate names what it holds back, and waiting or being done is neither.
+    #[test]
+    fn advance_step_leaves_waiting_and_complete_alone_near_activation() {
+        for run in [GateRun::Waiting, GateRun::Complete] {
+            let in_window = gated_step("alone", run, 3_543_380, false);
+            let bypassed = gated_step("alone", run, 3_543_380, true);
+            assert_eq!(in_window.step, run.engine_step(), "{run:?}: {in_window:?}");
+            assert_eq!(in_window.network_upgrade_height, -1);
+            assert_eq!(
+                in_window.next_height, bypassed.next_height,
+                "{run:?}: the outlook is the engine's"
+            );
+        }
+        assert!(
+            gated_step("alone", GateRun::Waiting, 3_543_380, false).next_height >= 0,
+            "a waiting run has an outlook for the gate to leave in place"
+        );
+    }
+
+    /// A run built before the activation is built for the old branch, so once the next block is the
+    /// activation block no transaction of it that is not mined can be mined any more: the run is
+    /// over. The run here is REAL, committed at 3,543,000 and so built for NU6.3, with every
+    /// transaction of it still unmined. The block before the activation is still under NU6.3 and
+    /// can hold them, so the run stands until the wallet's tip is that block.
+    #[test]
+    fn advance_step_interrupts_an_nu6_3_built_run_at_activation() {
+        let (path, account) = committed_run_fixture("interrupts", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        // The next block, 3,543,404, is still under NU6.3.
+        set_fixture_tip_at(path_bytes, 3_543_403);
+        let before = read_gated_step(path_bytes, &account, -1, false);
+        assert_ne!(
+            before.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+            "{before:?}"
+        );
+
+        // The next block is the activation block.
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        let interrupted = read_gated_step(path_bytes, &account, -1, false);
+        assert_eq!(
+            interrupted.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+            "{interrupted:?}"
+        );
+        assert_eq!(interrupted.network_upgrade_height, 3_543_405);
+        assert_eq!(interrupted.next_height, -1);
+        assert_eq!(interrupted.id, 0);
+
+        // The bypass lifts the scheduled-work pause, never interruption.
+        let bypassed = read_gated_step(path_bytes, &account, -1, true);
+        assert_eq!(
+            bypassed.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+            "{bypassed:?}"
+        );
+        assert_eq!(bypassed.network_upgrade_height, 3_543_405);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A run committed under NU7 is for the branch the chain is on, so the upgrade strands nothing
+    /// of it, from the activation block on.
+    #[test]
+    fn advance_step_does_not_interrupt_an_nu7_built_run() {
+        for commit_tip in [3_543_404, 3_600_000] {
+            let (path, account) =
+                committed_run_fixture(&format!("nu7_built_{commit_tip}"), commit_tip);
+            let path_bytes = path.to_str().unwrap().as_bytes();
+
+            let step = read_gated_step(path_bytes, &account, -1, false);
+            assert!(
+                ![
+                    ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE,
+                    ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+                    ZCASHLC_ADVANCE_STEP_REEVALUATE,
+                ]
+                .contains(&step.step),
+                "committed at {commit_tip}: {step:?}"
+            );
+            assert_eq!(step.network_upgrade_height, -1);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A `Proved` transaction of the old branch may already have been mined before the activation,
+    /// at a block the wallet's scan has not reached yet: the wallet cannot tell a stranded run from
+    /// a finished one until it has scanned the block before the activation. Until then the drive
+    /// asks for a sync, and only then declares the run over. The bypass changes neither.
+    #[test]
+    fn advance_step_waits_for_the_scan_before_interrupting_a_proved_old_branch_row() {
+        let path = init_fixture_db("zcashlc_gate_await_scan");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        // A hand-built Proved row of NU6.3 (`minimal_pczt_bytes`), not due for long after the
+        // activation, so the engine itself has nothing to say.
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                7,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        // The chain is one block short of the activation, but the scan stands at 3,543,000.
+        mark_fixture_scanned_through(&path, 3_543_000);
+        record_fixture_block(&path, 3_543_000);
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        for bypass in [false, true] {
+            let waiting = read_gated_step(path_bytes, &account, -1, bypass);
+            assert_eq!(
+                waiting.step, ZCASHLC_ADVANCE_STEP_REEVALUATE,
+                "bypass {bypass}: {waiting:?}"
+            );
+            assert_eq!(waiting.next_height, -1);
+            assert_eq!(waiting.network_upgrade_height, -1);
+        }
+
+        // The scan reaches the block before the activation, and the row is not in it.
+        mark_fixture_scanned_through(&path, 3_543_404);
+        record_fixture_block(&path, 3_543_404);
+        for bypass in [false, true] {
+            let interrupted = read_gated_step(path_bytes, &account, -1, bypass);
+            assert_eq!(
+                interrupted.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+                "bypass {bypass}: {interrupted:?}"
+            );
+            assert_eq!(interrupted.network_upgrade_height, 3_543_405);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The verdict judges what the drive leaves of the run. A transaction of the old branch that the
+    /// wallet's scan has seen mined is promoted by the drive first, and a mined transaction is
+    /// settled whichever branch it was built for, so a run whose old-branch transactions have all
+    /// mined is complete, not interrupted. Until the scan reaches the block that holds it, the same
+    /// row is still in flight.
+    #[test]
+    fn advance_step_does_not_interrupt_a_run_whose_old_branch_rows_have_mined() {
+        let path = init_fixture_db("zcashlc_gate_mined_old_branch");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let account = create_fixture_account(&path);
+        let txid = [3u8; 32];
+        let mined_at = 3_543_100u32;
+        // The wallet's own view: this txid mined at `mined_at`, which the engine acts on only
+        // once the scan has passed that block.
+        {
+            let conn = Connection::open(&path).expect("the wallet connection opens");
+            conn.execute(
+                "INSERT INTO transactions (txid, mined_height, min_observed_height) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![&txid[..], mined_at, mined_at],
+            )
+            .expect("the fixture mined-transaction row inserts");
+        }
+        // A Broadcast row of NU6.3 (`minimal_pczt_bytes`) with no anchor boundary, which would
+        // send the drive's own reorg check through the stored empty PCZT.
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                7,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_100_000,
+                4_000_000,
+                None,
+                MigrationTxState::Broadcast {
+                    txid: TxId::from_bytes(txid),
+                },
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        // The scan stops short of the block that holds the transaction, so as far as the wallet
+        // knows it is still in flight, and may have been mined where the scan has not been.
+        mark_fixture_scanned_through(&path, 3_543_000);
+        record_fixture_block(&path, 3_543_000);
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        let in_flight = read_gated_step(path_bytes, &account, -1, false);
+        assert_eq!(
+            in_flight.step, ZCASHLC_ADVANCE_STEP_REEVALUATE,
+            "{in_flight:?}"
+        );
+
+        // The scan passes the block: the drive promotes the row, and nothing of the run is left
+        // for the upgrade to strand.
+        mark_fixture_scanned_through(&path, 3_543_404);
+        record_fixture_block(&path, 3_543_404);
+        let settled = read_gated_step(path_bytes, &account, -1, false);
+        assert_eq!(
+            settled.step, ZCASHLC_ADVANCE_STEP_COMPLETE,
+            "a mined row is settled whichever branch it was built for: {settled:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The wall-clock estimate only ever brings scheduled work forward; the gate is judged at the
+    /// wallet's own chain tip. An estimate near activation does not pause a broadcast
+    /// that is valid at the tip, and one past the activation does not declare a run over that the
+    /// chain has not yet stranded.
+    #[test]
+    fn advance_step_judges_the_phase_at_the_wallet_tip_not_the_estimate() {
+        let (path, account) = gate_fixture("zcashlc_gate_estimate_broadcast", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        store_fixture_state(&path, &account, &GateRun::Broadcast.state(3_543_000));
+        let broadcast = read_gated_step(path_bytes, &account, 3_543_400, false);
+        assert_eq!(
+            broadcast.step, ZCASHLC_ADVANCE_STEP_BROADCAST,
+            "an estimate near activation must not pause a broadcast: {broadcast:?}"
+        );
+        assert_eq!(broadcast.id, 7);
+        let _ = std::fs::remove_file(&path);
+
+        let (path, account) = committed_run_fixture("estimate", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let run = read_gated_step(path_bytes, &account, 3_600_000, false);
+        assert_ne!(
+            run.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+            "an estimate past the activation must not interrupt a run: {run:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the scheduled lane's refusals before NU7 -----
+    //
+    // The entry points that plan, build, sign, store or rebuild a scheduled run refuse with
+    // `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` while the NU7 gate is closed at the
+    // WALLET's next height, and `zcashlc_migration_restart_step` reports the upgrade it waits for
+    // instead of planning. Mainnet fixtures: NU7 activates at 3,543,405, so every tip through
+    // 3,543,403 leaves new scheduled work paused; 3,543,404, whose next block is the activation, opens it.
+
+    /// What the mainnet refusal says, exactly: the Swift layer parses the height off the end of it.
+    const MAINNET_PAUSED_ERROR: &str = "MIGRATION_PAUSED_UNTIL_UPGRADE:3543405";
+
+    /// The value [`pre_activation_fixture`] funds the wallet with, and [`committed_run_fixture`]
+    /// before it: the figure a cancelled run must hand back to the spendable balance.
+    const GATE_FIXTURE_FUNDING: u64 = 1_234_567_890;
+
+    /// A mainnet fixture wallet holding one spendable Orchard note of [`GATE_FIXTURE_FUNDING`], with
+    /// chain tip `tip` and no stored run: where every scheduled-lane entry point starts. Returns the
+    /// database path, the account uuid and the account's spending key.
+    fn pre_activation_fixture(tag: &str, tip: u32) -> (PathBuf, [u8; 16], Vec<u8>) {
+        let path = init_fixture_db(&format!("zcashlc_gate_entry_{tag}"));
+        let (account, usk) = create_fixture_account_with_usk(&path);
+        fund_fixture_account_with_orchard_note(&path, &usk, GATE_FIXTURE_FUNDING);
+        set_fixture_tip_at(path.to_str().unwrap().as_bytes(), tip);
+        (path, account, usk)
+    }
+
+    /// The height the note-split ceremony is told its submission server is at. The gate is judged
+    /// before it is read, so what matters is only that it is a height (not the "unknown" -1).
+    const GATED_ENTRY_SERVER_HEIGHT: i64 = 3_543_000;
+
+    /// The nine entry points the upgrade gate guards.
+    #[derive(Clone, Copy, Debug)]
+    enum GatedEntry {
+        ProposeTransfers,
+        PrepareNoteSplit,
+        SignNoteSplit,
+        SignAndStoreSchedule,
+        CreateUnsignedNoteSplitPczts,
+        CreateUnsignedTransferPczts,
+        StoreSignedNoteSplitPczts,
+        StoreSignedSchedulePczts,
+        RefreshStaleTransfers,
+    }
+
+    const GATED_ENTRIES: [GatedEntry; 9] = [
+        GatedEntry::ProposeTransfers,
+        GatedEntry::PrepareNoteSplit,
+        GatedEntry::SignNoteSplit,
+        GatedEntry::SignAndStoreSchedule,
+        GatedEntry::CreateUnsignedNoteSplitPczts,
+        GatedEntry::CreateUnsignedTransferPczts,
+        GatedEntry::StoreSignedNoteSplitPczts,
+        GatedEntry::StoreSignedSchedulePczts,
+        GatedEntry::RefreshStaleTransfers,
+    ];
+
+    /// Calls `entry` over the FFI on the fixture wallet, and answers `Ok` when it returned its
+    /// success value (a non-NULL pointer, or `true`) and the last error it recorded otherwise. What
+    /// a success returns is freed.
+    ///
+    /// Past the wallet and account, the arguments are ones that make a call fail wherever it goes
+    /// past the gate: a proposal handle nothing is cached under, and no signed PCZTs. The calls
+    /// that take neither succeed once they are through: a proposal, a note-split preview, and a
+    /// refresh with no stored run to refresh.
+    fn call_gated_entry(
+        entry: GatedEntry,
+        path: &std::path::Path,
+        account: &[u8; 16],
+        usk: &[u8],
+        bypass: bool,
+    ) -> Result<(), String> {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let no_handle = 0u64;
+        crate::zcashlc_clear_last_error();
+        let succeeded = unsafe {
+            match entry {
+                GatedEntry::ProposeTransfers => {
+                    let ptr = zcashlc_migration_propose_transfers(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_schedule(ptr);
+                    succeeded
+                }
+                GatedEntry::PrepareNoteSplit => {
+                    let ptr = zcashlc_migration_prepare_note_split(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_note_split_proposal(ptr);
+                    succeeded
+                }
+                GatedEntry::SignNoteSplit => {
+                    let ptr = zcashlc_migration_sign_note_split(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        no_handle,
+                        usk.as_ptr(),
+                        usk.len(),
+                        GATED_ENTRY_SERVER_HEIGHT,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_prepared_transfer(ptr);
+                    succeeded
+                }
+                GatedEntry::SignAndStoreSchedule => zcashlc_migration_sign_and_store_schedule(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    account.as_ptr(),
+                    NETWORK_ID_MAINNET,
+                    no_handle,
+                    usk.as_ptr(),
+                    usk.len(),
+                    bypass,
+                ),
+                GatedEntry::CreateUnsignedNoteSplitPczts => {
+                    let ptr = zcashlc_migration_create_unsigned_note_split_pczts(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        no_handle,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_unsigned_transfer_pczts(ptr);
+                    succeeded
+                }
+                GatedEntry::CreateUnsignedTransferPczts => {
+                    let ptr = zcashlc_migration_create_unsigned_transfer_pczts(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        no_handle,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_unsigned_transfer_pczts(ptr);
+                    succeeded
+                }
+                GatedEntry::StoreSignedNoteSplitPczts => {
+                    let ptr = zcashlc_migration_store_signed_note_split_pczts(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_prepared_transfer(ptr);
+                    succeeded
+                }
+                GatedEntry::StoreSignedSchedulePczts => {
+                    zcashlc_migration_store_signed_schedule_pczts(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        bypass,
+                    )
+                }
+                GatedEntry::RefreshStaleTransfers => {
+                    let ptr = zcashlc_migration_refresh_stale_transfers(
+                        path_bytes.as_ptr(),
+                        path_bytes.len(),
+                        account.as_ptr(),
+                        NETWORK_ID_MAINNET,
+                        std::ptr::null(),
+                        0,
+                        bypass,
+                    );
+                    let succeeded = !ptr.is_null();
+                    zcashlc_free_migration_schedule(ptr);
+                    succeeded
+                }
+            }
+        };
+        if succeeded {
+            Ok(())
+        } else {
+            Err(ffi_helpers::error_handling::error_message()
+                .expect("a call that returns its failure value records an error"))
+        }
+    }
+
+    /// The account's stored run, or `None` when none was ever stored.
+    fn stored_fixture_run(path: &std::path::Path, account: &[u8; 16]) -> Option<MigrationState> {
+        let mut conn = Connection::open(path).expect("the verification connection opens");
+        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        let store = PoolMigrations::for_account(
+            NetworkParams::Standard(Network::TestNetwork),
+            SystemClock,
+            &mut conn,
+            account_id,
+        )
+        .expect("the account-keyed store resolves the fixture account");
+        store.latest_migration().expect("the store reads")
+    }
+
+    /// What the account can spend of Orchard right now: the value no run holds.
+    fn spendable_fixture_orchard(path: &std::path::Path, account: &[u8; 16]) -> u64 {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                system_rng(),
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        u64::from(remaining_orchard(&mut ctx).expect("the spendable Orchard value reads"))
+    }
+
+    /// Restarts the fixture wallet's run over the FFI, asserting that the call succeeds, and
+    /// returns what it reported: whether it carried a fresh plan (with the plan's transfer count
+    /// and handle) and the activation height it waits for. Frees the outcome.
+    fn restart_fixture_run(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        bypass: bool,
+    ) -> (Option<(usize, u64)>, i64) {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        crate::zcashlc_clear_last_error();
+        let ptr = unsafe {
+            zcashlc_migration_restart_step(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                bypass,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "a restart must yield an outcome: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        let outcome = unsafe { &*ptr };
+        let plan = (!outcome.schedule.is_null()).then(|| {
+            let schedule = unsafe { &*outcome.schedule };
+            (schedule.transfers_len, schedule.proposal_handle)
+        });
+        let replan_after_height = outcome.replan_after_height;
+        unsafe { zcashlc_free_migration_restart_outcome(ptr) };
+        (plan, replan_after_height)
+    }
+
+    /// Before the activation every entry point that plans, builds, signs, stores or rebuilds a
+    /// scheduled run is refused, with the activation height in the error: under the pause (the
+    /// next height is 3,543,001) and close to activation (3,543,357) alike.
+    #[test]
+    fn gated_entry_points_refuse_before_activation() {
+        let (path, account, usk) = pre_activation_fixture("refuse", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        for tip in [3_543_000, 3_543_356] {
+            set_fixture_tip_at(path_bytes, tip);
+            for entry in GATED_ENTRIES {
+                let refusal = call_gated_entry(entry, &path, &account, &usk, false)
+                    .expect_err(&format!("{entry:?} at tip {tip} must be refused"));
+                assert_eq!(refusal, MAINNET_PAUSED_ERROR, "{entry:?} at tip {tip}");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bypass opens the gate at the same height: a proposal comes back with a real schedule,
+    /// and every other entry point gets past the gate to whatever the fixture makes it do next
+    /// (the commit-shaped calls have no plan under their handle; the store calls have no run), never
+    /// to the refusal.
+    #[test]
+    fn gated_entry_points_pass_the_gate_with_the_bypass() {
+        let (path, account, usk) = pre_activation_fixture("bypass", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let ptr = unsafe {
+            zcashlc_migration_propose_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                true,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "the bypass must let a proposal through: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        assert!(
+            unsafe { &*ptr }.transfers_len > 0,
+            "a funded account must propose a real schedule"
+        );
+        unsafe { zcashlc_free_migration_schedule(ptr) };
+
+        for entry in GATED_ENTRIES {
+            if let Err(error) = call_gated_entry(entry, &path, &account, &usk, true) {
+                assert!(
+                    !error.starts_with(PAUSED_UNTIL_UPGRADE_PREFIX),
+                    "{entry:?} with the bypass was refused: {error}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// From the activation block on, the gate is open without the bypass: the last tip before it,
+    /// 3,543,404, makes the next block the activation block.
+    #[test]
+    fn gated_entry_points_pass_the_gate_at_activation() {
+        let (path, account, usk) = pre_activation_fixture("activation", 3_543_404);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let ptr = unsafe {
+            zcashlc_migration_propose_transfers(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+                false,
+            )
+        };
+        assert!(
+            !ptr.is_null(),
+            "a proposal at the activation block must not be refused: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        assert!(
+            unsafe { &*ptr }.transfers_len > 0,
+            "a funded account must propose a real schedule"
+        );
+        unsafe { zcashlc_free_migration_schedule(ptr) };
+
+        for entry in GATED_ENTRIES {
+            if let Err(error) = call_gated_entry(entry, &path, &account, &usk, false) {
+                assert!(
+                    !error.starts_with(PAUSED_UNTIL_UPGRADE_PREFIX),
+                    "{entry:?} at the activation block was refused: {error}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refusal happens before anything is planned: no run is stored and no plan is cached to
+    /// commit later, from any of the nine entry points. The same proposal with the bypass does
+    /// cache one, so the check discriminates.
+    #[test]
+    fn refusal_before_activation_builds_and_caches_nothing() {
+        let (path, account, usk) = pre_activation_fixture("nothing", 3_543_000);
+        for entry in GATED_ENTRIES {
+            call_gated_entry(entry, &path, &account, &usk, false)
+                .expect_err(&format!("{entry:?} must be refused"));
+        }
+        assert!(
+            stored_fixture_run(&path, &account).is_none(),
+            "a refusal must not store a run"
+        );
+        assert!(
+            matches!(
+                migration_plan_cache::get(&path, account, 0),
+                Err(migration_plan_cache::PlanLookupError::Missing)
+            ),
+            "a refusal must not cache a plan"
+        );
+
+        call_gated_entry(GatedEntry::ProposeTransfers, &path, &account, &usk, true)
+            .expect("the same proposal with the bypass succeeds");
+        assert!(
+            matches!(
+                migration_plan_cache::get(&path, account, 0),
+                Err(migration_plan_cache::PlanLookupError::Superseded)
+            ),
+            "the proposal that passed the gate caches its plan"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A custom network on which every upgrade up to NU6.3 activates at height 1 and NU7 never
+    /// does.
+    fn network_without_nu7() -> NetworkParams {
+        use zcash_protocol::consensus::NetworkType;
+        use zcash_protocol::local_consensus::LocalNetwork;
+
+        let one = Some(h(1));
+        NetworkParams::Custom {
+            base: NetworkType::Main,
+            local: LocalNetwork {
+                overwinter: one,
+                sapling: one,
+                blossom: one,
+                heartwood: one,
+                canopy: one,
+                nu5: one,
+                nu6: one,
+                nu6_1: one,
+                nu6_2: one,
+                nu6_3: one,
+                nu7: None,
+            },
+        }
+    }
+
+    /// Without the bypass, and on a network that has an NU7 height, the gate needs the wallet's
+    /// tip, and fails the way every tip read does when there is none. The bypass, and a network
+    /// with no NU7 height, are answered without reading it.
+    #[test]
+    fn the_gate_reads_no_tip_with_the_bypass_or_on_a_network_without_nu7() {
+        let path = init_fixture_db("zcashlc_gate_entry_no_tip");
+        let account = create_fixture_account(&path);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                system_rng(),
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        assert!(ctx.tip().is_err(), "the fixture wallet has no chain tip");
+
+        refuse_while_upgrade_gate_closed(&ctx, true).expect("the bypass opens the gate");
+        let error = refuse_while_upgrade_gate_closed(&ctx, false)
+            .expect_err("the gate cannot be judged without a tip");
+        assert!(
+            error.to_string().contains("sync first"),
+            "unexpected error: {error}"
+        );
+
+        ctx.network = network_without_nu7();
+        refuse_while_upgrade_gate_closed(&ctx, false)
+            .expect("a network with no NU7 height is never gated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A restart before the activation is not an error: it cancels the run, as it always does,
+    /// plans nothing, and reports the activation height a new plan waits for. It is judged at the
+    /// wallet's own tip, throughout the preactivation pause, and the cancelled
+    /// run leaves the funded balance spendable for the plan that follows the upgrade.
+    #[test]
+    fn restart_before_activation_cancels_and_reports_the_upgrade() {
+        for tip in [3_543_000, 3_543_356] {
+            let (path, account) = committed_run_fixture(&format!("restart_closed_{tip}"), tip);
+
+            let (plan, replan_after_height) = restart_fixture_run(&path, &account, false);
+
+            assert_eq!(
+                plan, None,
+                "tip {tip}: a restart before the upgrade plans nothing"
+            );
+            assert_eq!(replan_after_height, 3_543_405, "tip {tip}");
+            assert_eq!(
+                crate::zcashlc_last_error_length(),
+                0,
+                "tip {tip}: waiting for the upgrade is a success, not an error"
+            );
+            assert_eq!(
+                stored_fixture_run(&path, &account)
+                    .expect("the cancelled run stays stored")
+                    .status(),
+                MigrationStatus::Cancelled,
+                "tip {tip}"
+            );
+            assert_eq!(
+                spendable_fixture_orchard(&path, &account),
+                GATE_FIXTURE_FUNDING,
+                "tip {tip}: the cancelled run leaves the funded balance spendable"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The proposal under review does not survive a restart that plans nothing: the plan cache is
+    /// emptied, so a plan previewed before the cancel cannot be signed once the upgrade has
+    /// activated.
+    #[test]
+    fn restart_before_activation_discards_the_plan_under_review() {
+        let (path, account, usk) = pre_activation_fixture("restart_discard", 3_543_000);
+        call_gated_entry(GatedEntry::ProposeTransfers, &path, &account, &usk, true)
+            .expect("the proposal with the bypass succeeds");
+        assert!(
+            matches!(
+                migration_plan_cache::get(&path, account, 0),
+                Err(migration_plan_cache::PlanLookupError::Superseded)
+            ),
+            "the proposal caches its plan"
+        );
+
+        let (plan, replan_after_height) = restart_fixture_run(&path, &account, false);
+
+        assert_eq!(plan, None);
+        assert_eq!(replan_after_height, 3_543_405);
+        assert!(
+            matches!(
+                migration_plan_cache::get(&path, account, 0),
+                Err(migration_plan_cache::PlanLookupError::Missing)
+            ),
+            "the restart must drop the cached plan"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With the bypass, at the activation block, or after it, a restart plans anew, as it did
+    /// before the gate existed: the outcome carries the fresh plan and no height to wait for, the
+    /// plan is cached under its handle, and the old run is cancelled.
+    #[test]
+    fn restart_with_the_bypass_or_after_activation_replans() {
+        for (tag, tip, bypass) in [
+            ("bypass", 3_543_000, true),
+            ("activation", 3_543_404, false),
+            ("after", 3_600_000, false),
+        ] {
+            let (path, account) = committed_run_fixture(&format!("restart_open_{tag}"), tip);
+
+            let (plan, replan_after_height) = restart_fixture_run(&path, &account, bypass);
+
+            let (transfers, handle) =
+                plan.unwrap_or_else(|| panic!("{tag}: a restart must carry the fresh plan"));
+            assert_eq!(replan_after_height, -1, "{tag}");
+            assert!(transfers > 0, "{tag}: the fresh plan has transfers");
+            assert_ne!(handle, 0, "{tag}: the fresh plan is cached under a handle");
+            assert!(
+                migration_plan_cache::get(&path, account, handle).is_ok(),
+                "{tag}: the plan the outcome carries must be the cached one"
+            );
+            assert_eq!(
+                stored_fixture_run(&path, &account)
+                    .expect("the cancelled run stays stored")
+                    .status(),
+                MigrationStatus::Cancelled,
+                "{tag}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // ----- the cancel-only entry point -----
+    //
+    // `zcashlc_migration_cancel_run` ends the account's pending run and nothing more: where a
+    // restart goes on to plan a fresh one, it plans none, and it is never refused by the NU7
+    // network-upgrade gate, which stops what starts a run, not what ends one. Mainnet fixtures.
+
+    /// Cancels the fixture wallet's run over the FFI and answers what the call returned. The last
+    /// error is cleared first and left for the caller to read.
+    fn cancel_fixture_run(path: &std::path::Path, account: &[u8; 16]) -> bool {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        crate::zcashlc_clear_last_error();
+        unsafe {
+            zcashlc_migration_cancel_run(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+    }
+
+    /// How many runs the account has stored, a cancelled one included.
+    fn fixture_run_count(path: &std::path::Path, account: &[u8; 16]) -> usize {
+        let mut conn = Connection::open(path).expect("the verification connection opens");
+        let account_id = account_uuid_from_bytes(account.as_ptr()).expect("16 uuid bytes");
+        PoolMigrations::for_account(
+            NetworkParams::Standard(Network::TestNetwork),
+            SystemClock,
+            &mut conn,
+            account_id,
+        )
+        .expect("the account-keyed store resolves the fixture account")
+        .list_migrations()
+        .expect("the store lists the account's runs")
+        .len()
+    }
+
+    /// Models what proving does to a committed run, without the proofs: the notes its transactions
+    /// spend are locked under a token, and every transaction of the stored run becomes `Proved`
+    /// and records that token, which is how a cancel finds the locks to release. Committing alone
+    /// reserves nothing; the prover takes the locks.
+    fn reserve_fixture_funding_for_the_run(path: &std::path::Path, account: &[u8; 16]) {
+        let token = [0x5A; 32];
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let mut ctx = unsafe {
+            open(
+                system_rng(),
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+
+        let target = TargetHeight::from(u32::from(ctx.tip().expect("the fixture has a tip")) + 1);
+        let received = ctx
+            .wallet
+            .select_unspent_notes(
+                ctx.account,
+                &[ShieldedPool::Orchard],
+                target,
+                &[],
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
+            )
+            .expect("the funded note selects");
+        let refs: Vec<OutputRef> = received
+            .orchard()
+            .iter()
+            .map(|rn| {
+                OutputRef::new(
+                    *rn.txid(),
+                    PoolType::Shielded(ShieldedPool::Orchard),
+                    u32::from(rn.output_index()),
+                )
+            })
+            .collect();
+        assert!(!refs.is_empty(), "the fixture holds a spendable note");
+        ctx.wallet
+            .lock_outputs(&refs, LockOwner::new(token), BlockHeight::from(u32::MAX))
+            .expect("the funded note locks");
+
+        let mut store = account_store(&ctx.wallet, ctx.account, &mut ctx.store_conn)
+            .expect("the account-keyed store resolves the fixture account");
+        let mut state = store
+            .latest_migration()
+            .expect("the store reads")
+            .expect("the fixture run is stored");
+        let pczts: Vec<(MigrationTransferId, Vec<u8>)> = state
+            .transactions()
+            .iter()
+            .map(|tx| (tx.id(), tx.pczt().clone()))
+            .collect();
+        for (id, pczt) in pczts {
+            state.set_transaction_proved(id, pczt, Some(MigrationLockOwner::from_bytes(token)));
+        }
+        store
+            .replace_migration(&state)
+            .expect("the proved run stores");
+    }
+
+    /// A cancel ends the run and hands back everything it held: the notes its never-broadcast
+    /// transactions reserved are spendable at once, with no replacement run planned, so the stored
+    /// run is the cancelled one, and the proposal under review is dropped with it (a restart that
+    /// planned would have replaced it with a new one). A second cancel finds nothing pending and
+    /// changes nothing, which is what lets a host retry.
+    #[test]
+    fn cancel_run_releases_never_broadcast_transactions_without_replanning() {
+        let (path, account, plan) = committed_run_and_plan_fixture("cancel_run", 3_600_000);
+        reserve_fixture_funding_for_the_run(&path, &account);
+        assert!(
+            !stored_fixture_run(&path, &account)
+                .expect("the committed run is stored")
+                .is_terminal(),
+            "the fixture run is pending"
+        );
+        assert_eq!(
+            spendable_fixture_orchard(&path, &account),
+            0,
+            "the run holds the funded note"
+        );
+        // A proposal under review beside the run: the commit emptied the cache, so put it back.
+        let handle =
+            migration_plan_cache::set(&mut system_rng(), path.clone(), account, plan, false);
+        assert!(
+            migration_plan_cache::get(&path, account, handle).is_ok(),
+            "the proposal is cached"
+        );
+
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "a cancel must succeed: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+
+        assert_eq!(crate::zcashlc_last_error_length(), 0);
+        assert_eq!(
+            stored_fixture_run(&path, &account)
+                .expect("the cancelled run stays stored")
+                .status(),
+            MigrationStatus::Cancelled
+        );
+        assert_eq!(
+            fixture_run_count(&path, &account),
+            1,
+            "a cancel plans and stores no new run"
+        );
+        assert_eq!(
+            spendable_fixture_orchard(&path, &account),
+            GATE_FIXTURE_FUNDING,
+            "the cancelled run gives the funded note back"
+        );
+        assert!(
+            matches!(
+                migration_plan_cache::get(&path, account, handle),
+                Err(migration_plan_cache::PlanLookupError::Missing)
+            ),
+            "a cancel drops the cached proposal and caches no new one"
+        );
+
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "a second cancel is a no-op"
+        );
+        assert_eq!(crate::zcashlc_last_error_length(), 0);
+        assert_eq!(
+            stored_fixture_run(&path, &account)
+                .expect("the cancelled run stays stored")
+                .status(),
+            MigrationStatus::Cancelled
+        );
+        assert_eq!(fixture_run_count(&path, &account), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With no run pending there is nothing to end: the call succeeds, records no error, and
+    /// stores nothing.
+    #[test]
+    fn cancel_run_without_a_pending_run_is_a_no_op_success() {
+        let (path, account, _usk) = pre_activation_fixture("cancel_no_run", 3_600_000);
+
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "cancelling nothing must succeed: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+
+        assert_eq!(crate::zcashlc_last_error_length(), 0);
+        assert!(
+            stored_fixture_run(&path, &account).is_none(),
+            "cancelling nothing stores nothing"
+        );
+        assert_eq!(
+            spendable_fixture_orchard(&path, &account),
+            GATE_FIXTURE_FUNDING
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The upgrade gate stops what starts a run, never what ends one, so a cancel works under the
+    /// pause (at next heights 3,543,001 and 3,543,357 alike), with
+    /// no bypass to lift it.
+    #[test]
+    fn cancel_run_is_not_gated_by_the_network_upgrade() {
+        for tip in [3_543_000, 3_543_356] {
+            let (path, account) = committed_run_fixture(&format!("cancel_gate_{tip}"), tip);
+
+            assert!(
+                cancel_fixture_run(&path, &account),
+                "tip {tip}: a cancel must not be refused: {:?}",
+                ffi_helpers::error_handling::error_message()
+            );
+
+            assert_eq!(crate::zcashlc_last_error_length(), 0, "tip {tip}");
+            assert_eq!(
+                stored_fixture_run(&path, &account)
+                    .expect("the cancelled run stays stored")
+                    .status(),
+                MigrationStatus::Cancelled,
+                "tip {tip}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// The host's flow for a run the upgrade interrupted is to cancel it and crank again. The
+    /// cancelled run is terminal, and the terminal check comes before the upgrade's verdict, so the
+    /// crank after the cancel answers COMPLETE and not INTERRUPTED once more: a host that cancelled
+    /// has nothing left to be told, and the bypass changes neither answer. The run is REAL,
+    /// committed at 3,543,000 and so built for NU6.3, with every transaction of it unmined.
+    #[test]
+    fn advance_step_reports_complete_for_a_run_cancelled_after_activation() {
+        let (path, account) = committed_run_fixture("cancelled_after_activation", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        // The next block is the activation block, which the run was not built for.
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        let interrupted = read_gated_step(path_bytes, &account, -1, false);
+        assert_eq!(
+            interrupted.step, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE,
+            "{interrupted:?}"
+        );
+
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "the interrupted run cancels: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+
+        for bypass in [false, true] {
+            let cancelled = read_gated_step(path_bytes, &account, -1, bypass);
+            assert_eq!(
+                cancelled.step, ZCASHLC_ADVANCE_STEP_COMPLETE,
+                "bypass {bypass}: {cancelled:?}"
+            );
+            assert_eq!(cancelled.network_upgrade_height, -1, "bypass {bypass}");
+            assert_eq!(cancelled.next_height, -1, "bypass {bypass}");
+            assert_eq!(cancelled.id, 0, "bypass {bypass}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the availability read -----
+    //
+    // `zcashlc_migration_availability` reports the NU7 gate's phase at the wallet's next height to
+    // the platform, which decides from it what to offer. It takes no account, opens the wallet
+    // read-only, and judges the wallet's own chain tip alone. Mainnet fixtures: NU7 activates at
+    // 3,543,405, so new scheduled work pauses through tip 3,543,403. Tip 3,543,404, whose next
+    // block is the activation, opens the gate. Testnet activates NU7 at 4,465,026.
+
+    /// What one availability read hands back, copied out of the DTO before it is freed.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadAvailability {
+        phase: u32,
+        activation_height: i64,
+        immediate_available: bool,
+    }
+
+    /// Reads the availability over the FFI, and answers the last error it recorded when it
+    /// returned NULL. Frees the DTO after copying it out.
+    fn read_availability(
+        path_bytes: &[u8],
+        network_id: u32,
+        bypass: bool,
+    ) -> Result<ReadAvailability, String> {
+        crate::zcashlc_clear_last_error();
+        let ptr = unsafe {
+            zcashlc_migration_availability(
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                network_id,
+                bypass,
+            )
+        };
+        if ptr.is_null() {
+            return Err(ffi_helpers::error_handling::error_message()
+                .expect("a read that returns NULL records an error"));
+        }
+        let dto = unsafe { &*ptr };
+        let read = ReadAvailability {
+            phase: dto.phase,
+            activation_height: dto.activation_height,
+            immediate_available: dto.immediate_available,
+        };
+        unsafe { zcashlc_free_migration_availability(ptr) };
+        Ok(read)
+    }
+
+    /// The availability follows the wallet's tip through the gate's phases, on a wallet that has
+    /// no account at all: the immediate lane stays open, while new scheduled work waits for
+    /// the activation block. The activation height is the network's, in every
+    /// phase.
+    #[test]
+    fn availability_reports_each_phase_at_the_wallet_tip() {
+        let path = init_fixture_db("zcashlc_availability_phases");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        for (tip, phase, immediate_available) in [
+            (3_543_000, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, true),
+            (3_543_355, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, true),
+            (3_543_356, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, true),
+            (3_543_403, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, true),
+            (3_543_404, ZCASHLC_MIGRATION_AVAILABLE, true),
+            (3_600_000, ZCASHLC_MIGRATION_AVAILABLE, true),
+        ] {
+            set_fixture_tip_at(path_bytes, tip);
+
+            let availability = read_availability(path_bytes, NETWORK_ID_MAINNET, false)
+                .unwrap_or_else(|e| panic!("tip {tip}: the read must succeed: {e}"));
+
+            assert_eq!(
+                availability,
+                ReadAvailability {
+                    phase,
+                    activation_height: 3_543_405,
+                    immediate_available,
+                },
+                "tip {tip}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The host's bypass opens scheduled work throughout the preactivation pause.
+    #[test]
+    fn availability_is_open_with_the_bypass() {
+        let path = init_fixture_db("zcashlc_availability_bypass");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        for (tip, phase_without_the_bypass) in [
+            (3_543_000, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE),
+            (3_543_356, ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE),
+        ] {
+            set_fixture_tip_at(path_bytes, tip);
+
+            assert_eq!(
+                read_availability(path_bytes, NETWORK_ID_MAINNET, false)
+                    .expect("the read must succeed")
+                    .phase,
+                phase_without_the_bypass,
+                "tip {tip}"
+            );
+            assert_eq!(
+                read_availability(path_bytes, NETWORK_ID_MAINNET, true),
+                Ok(ReadAvailability {
+                    phase: ZCASHLC_MIGRATION_AVAILABLE,
+                    activation_height: 3_543_405,
+                    immediate_available: true,
+                }),
+                "tip {tip}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The gate takes the network's own activation height: testnet is past its NU7 at 4,500,000,
+    /// so everything is open there, and the height reported is testnet's.
+    #[test]
+    fn availability_is_open_on_testnet_after_activation() {
+        let path = init_fixture_db_on("zcashlc_availability_testnet", NETWORK_ID_TESTNET);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        assert!(
+            unsafe {
+                crate::zcashlc_update_chain_tip(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    4_500_000,
+                    NETWORK_ID_TESTNET,
+                )
+            },
+            "chain-tip update must succeed"
+        );
+
+        assert_eq!(
+            read_availability(path_bytes, NETWORK_ID_TESTNET, false),
+            Ok(ReadAvailability {
+                phase: ZCASHLC_MIGRATION_AVAILABLE,
+                activation_height: 4_465_026,
+                immediate_available: true,
+            })
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The gate cannot be judged without a chain tip, so a wallet that has none fails the way
+    /// every tip read does. With the bypass the gate is open at every height and the answer needs
+    /// no tip.
+    #[test]
+    fn availability_without_a_chain_tip_is_an_error() {
+        let path = init_fixture_db("zcashlc_availability_no_tip");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let error = read_availability(path_bytes, NETWORK_ID_MAINNET, false)
+            .expect_err("a wallet with no chain tip has no phase");
+        assert!(error.contains("sync first"), "unexpected error: {error}");
+
+        assert_eq!(
+            read_availability(path_bytes, NETWORK_ID_MAINNET, true),
+            Ok(ReadAvailability {
+                phase: ZCASHLC_MIGRATION_AVAILABLE,
+                activation_height: 3_543_405,
+                immediate_available: true,
+            })
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The read opens the wallet database itself, so it keeps the refusals every migration call
+    /// has: a path with no database is an error that neither creates the file nor carries the
+    /// path, and a `file:` URI, the form the Swift SDK passes, names a wallet like any other.
+    #[test]
+    fn availability_refuses_a_missing_wallet_database_and_reads_one_named_by_a_file_uri() {
+        let missing = std::env::temp_dir().join(format!(
+            "zcashlc_availability_missing_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let error = read_availability(
+            missing.to_str().unwrap().as_bytes(),
+            NETWORK_ID_MAINNET,
+            false,
+        )
+        .expect_err("a missing wallet database has no availability");
+        assert!(
+            error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains(missing.to_str().unwrap()),
+            "the refusal must not leak the database path: {error}"
+        );
+        assert!(!missing.exists(), "the read must not create the database");
+
+        let path = init_fixture_db("zcashlc_availability_file_uri");
+        set_fixture_tip_at(path.to_str().unwrap().as_bytes(), 3_543_000);
+        // The temp path is absolute, so this is `file:///...`.
+        let uri = format!("file://{}", path.display());
+        assert_eq!(
+            read_availability(uri.as_bytes(), NETWORK_ID_MAINNET, false)
+                .expect("a wallet named by a file URI reads")
+                .phase,
+            ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A network with no NU7 activation height is never gated, so its availability needs no chain
+    /// tip, is open, and reports `-1` where it would name the activation height. No network id the
+    /// FFI takes names such a network without registering a custom one process-wide, so this is
+    /// asserted on the two pieces the read is made of.
+    #[test]
+    fn availability_of_a_network_without_nu7_needs_no_tip_and_names_no_activation() {
+        let network = network_without_nu7();
+
+        let phase = current_gate_phase(&network, false, || Err(anyhow!("the wallet has no tip")))
+            .expect("a network with no NU7 height needs no tip");
+        let availability = FfiMigrationAvailability::new(phase, nu7_activation(&network));
+
+        assert_eq!(availability.phase, ZCASHLC_MIGRATION_AVAILABLE);
+        assert_eq!(availability.activation_height, -1);
+        assert!(availability.immediate_available);
+    }
+
+    /// The tip is read only when the phase needs it, and the phase is the gate's at the height
+    /// after it: the same answer the calls the gate refuses are judged by.
+    #[test]
+    fn current_gate_phase_reads_the_tip_only_when_it_has_to() {
+        use zcash_protocol::consensus::MAIN_NETWORK;
+
+        let activation = h(3_543_405);
+        let no_tip = || -> anyhow::Result<BlockHeight> { Err(anyhow!("the wallet has no tip")) };
+
+        assert_eq!(
+            current_gate_phase(&MAIN_NETWORK, true, no_tip).expect("the bypass needs no tip"),
+            GatePhase::Open
+        );
+        assert!(
+            current_gate_phase(&MAIN_NETWORK, false, no_tip).is_err(),
+            "without the bypass a network with an NU7 height needs the tip"
+        );
+        for (tip, expected) in [
+            (3_543_355, GatePhase::PausedUntil { activation }),
+            (3_543_356, GatePhase::PausedUntil { activation }),
+            (3_543_403, GatePhase::PausedUntil { activation }),
+            (3_543_404, GatePhase::Open),
+        ] {
+            assert_eq!(
+                current_gate_phase(&MAIN_NETWORK, false, || Ok(h(tip))).expect("the tip reads"),
+                expected,
+                "tip {tip}"
+            );
+        }
     }
 
     // ----- progress (`zcashlc_migration_progress` — the standalone derivation) -----
@@ -12199,10 +15067,54 @@ mod tests {
         anchor_boundary: Option<u32>,
         state: MigrationTxState,
     ) -> MigrationTransaction {
+        provable_tx_row_with(
+            minimal_pczt_bytes(),
+            id,
+            kind,
+            scheduled,
+            expiry,
+            anchor_boundary,
+            state,
+        )
+    }
+
+    /// [`provable_tx_row`] built for NU7, the branch the next block is under at the delivery
+    /// fixtures' tip ([`init_delivery_fixture`]): what the submission check lets through to the
+    /// seam. A row of NU6.3 there is a transaction the upgrade has overtaken, which the check
+    /// refuses before the seam is reached.
+    fn provable_nu7_tx_row(
+        id: u32,
+        kind: MigrationTxKind,
+        scheduled: u32,
+        expiry: u32,
+        anchor_boundary: Option<u32>,
+        state: MigrationTxState,
+    ) -> MigrationTransaction {
+        provable_tx_row_with(
+            minimal_nu7_pczt_bytes(),
+            id,
+            kind,
+            scheduled,
+            expiry,
+            anchor_boundary,
+            state,
+        )
+    }
+
+    /// The row both [`provable_tx_row`] and [`provable_nu7_tx_row`] build, carrying `pczt`.
+    fn provable_tx_row_with(
+        pczt: Vec<u8>,
+        id: u32,
+        kind: MigrationTxKind,
+        scheduled: u32,
+        expiry: u32,
+        anchor_boundary: Option<u32>,
+        state: MigrationTxState,
+    ) -> MigrationTransaction {
         test_transaction_from_parts(
             MigrationTransferId::new(id),
             kind,
-            minimal_pczt_bytes(),
+            pczt,
             Vec::new(),
             h(scheduled),
             h(expiry),
@@ -12224,6 +15136,11 @@ mod tests {
         (path, account)
     }
 
+    /// The height the delivery fixtures tell the executor its submission server is at: the tip
+    /// they all sit at ([`set_fixture_tip`]), so the next block is the one every check is judged at
+    /// when no test says otherwise.
+    const FIXTURE_SERVER_HEIGHT: i64 = 3_600_000;
+
     /// One run of the delivery executor over the FFI, with the DTO copied out and freed: the
     /// named id, the served txid, and the served (finalized transaction) bytes. Asserts success —
     /// the executor has no benign empty answer, so a NULL here is an error to be read with
@@ -12240,6 +15157,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 id,
+                FIXTURE_SERVER_HEIGHT,
+                false,
             )
         };
         assert!(
@@ -12259,6 +15178,18 @@ mod tests {
 
     /// The delivery executor's refusal message: asserts the NULL return and takes the last error.
     fn take_broadcast_error(path_bytes: &[u8], account: &[u8; 16], id: u32) -> String {
+        take_broadcast_error_at(path_bytes, account, id, FIXTURE_SERVER_HEIGHT, false)
+    }
+
+    /// [`take_broadcast_error`] for a submission server at `server_height` and the given
+    /// `bypass`.
+    fn take_broadcast_error_at(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        id: u32,
+        server_height: i64,
+        bypass: bool,
+    ) -> String {
         let ptr = unsafe {
             zcashlc_migration_take_broadcast_transaction(
                 path_bytes.as_ptr(),
@@ -12266,6 +15197,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 id,
+                server_height,
+                bypass,
             )
         };
         assert!(
@@ -12411,7 +15344,7 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
         let state = custom_state(
             MigrationStatus::InProgress,
-            vec![provable_tx_row(
+            vec![provable_nu7_tx_row(
                 0,
                 MigrationTxKind::Transfer { crossing: 0 },
                 3_600_000,
@@ -12467,7 +15400,7 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
         let unproved = custom_state(
             MigrationStatus::InProgress,
-            vec![provable_tx_row(
+            vec![provable_nu7_tx_row(
                 0,
                 MigrationTxKind::Transfer { crossing: 0 },
                 3_600_000,
@@ -12512,7 +15445,8 @@ mod tests {
     /// One advance over a three-transfer backlog: the released row lands at the SCANNED target
     /// (release means executable — a proof rests on scanned chain data), and it is the only row
     /// servable there afterwards; the other two moved later by the same lag, so the gap between
-    /// them survives unchanged.
+    /// them survives unchanged. The lag spans mainnet's NU7 activation, so "unchanged" is in
+    /// time: the gaps keep their reference blocks, and each of those now spans three blocks.
     ///
     /// The backlog is `Signed`, so the released row comes back as a schedule-due `Prove` target
     /// rather than a BROADCAST instruction. The trigger, the release and the deferral are the
@@ -12525,17 +15459,23 @@ mod tests {
         let (path, account) = init_delivery_fixture("zcashlc_next_due_respread");
         let path_bytes = path.to_str().unwrap().as_bytes();
         // Three transfers, all scheduled far below the scanned target (3,600,001) — the wallet
-        // slept through the whole window. Their drawn gaps are 100 and 200 blocks.
+        // slept through the whole window. Their drawn gaps are 100 and 200 blocks, which below
+        // mainnet's NU7 activation at 3,543,405 are also 100 and 200 reference blocks.
+        // Built for NU7, the branch the wallet's tip is under: a run still built for NU6.3 here
+        // is one the upgrade has stranded, and the drive would interrupt it instead.
         let transfer = |id: u32, scheduled: u32| {
-            provable_tx_row(
-                id,
+            test_transaction_from_parts(
+                MigrationTransferId::new(id),
                 MigrationTxKind::Transfer {
                     crossing: id as usize,
                 },
-                scheduled,
-                4_000_000,
-                Some(3_400_000),
+                minimal_nu7_pczt_bytes(),
+                Vec::new(),
+                h(scheduled),
+                h(4_000_000),
+                Some(h(3_400_000)),
                 MigrationTxState::Signed,
+                None,
             )
         };
         let state = custom_state(
@@ -12589,21 +15529,24 @@ mod tests {
             3_600_001,
             "the release lands at the scanned target, where the wallet can execute it"
         );
-        // The lag is 3,600,001 - 3,500,000 = 100,001 blocks; every deferred row moves by it.
+        // Every deferred row moves by the lag, the time from 3,500,000 to 3,600,001. NU7 activates
+        // inside that span, so the rows keep their gaps in time, not in blocks: the released row
+        // is followed after 100 and after 300 reference blocks, and each of those spans three
+        // blocks past the activation.
         assert_eq!(
             stored_scheduled_height(&stored, 1),
-            3_600_101,
+            3_600_301,
             "the first deferred row moves later by the full lag"
         );
         assert_eq!(
             stored_scheduled_height(&stored, 2),
-            3_600_301,
+            3_600_901,
             "the second deferred row moves later by the same lag"
         );
         assert_eq!(
             stored_scheduled_height(&stored, 2) - stored_scheduled_height(&stored, 1),
-            200,
-            "the drawn inter-broadcast gap survives the wallet's absence unchanged"
+            600,
+            "the drawn inter-broadcast gap, 200 reference blocks, survives the wallet's absence"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -12633,6 +15576,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 txid.as_ptr(),
+                FIXTURE_SERVER_HEIGHT,
+                false,
             )
         };
         assert!(
@@ -12653,6 +15598,18 @@ mod tests {
     /// The preparation accessor's refusal message: asserts the NULL return and takes the last
     /// error.
     fn take_preparation_error(path_bytes: &[u8], account: &[u8; 16], txid: [u8; 32]) -> String {
+        take_preparation_error_at(path_bytes, account, txid, FIXTURE_SERVER_HEIGHT, false)
+    }
+
+    /// [`take_preparation_error`] for a submission server at `server_height` and the given
+    /// `bypass`.
+    fn take_preparation_error_at(
+        path_bytes: &[u8],
+        account: &[u8; 16],
+        txid: [u8; 32],
+        server_height: i64,
+        bypass: bool,
+    ) -> String {
         let ptr = unsafe {
             zcashlc_migration_take_preparation_by_txid(
                 path_bytes.as_ptr(),
@@ -12660,6 +15617,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 txid.as_ptr(),
+                server_height,
+                bypass,
             )
         };
         assert!(
@@ -12831,7 +15790,7 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
         let state = custom_state(
             MigrationStatus::InProgress,
-            vec![provable_tx_row(
+            vec![provable_nu7_tx_row(
                 0,
                 MigrationTxKind::Preparation { layer: 0, index: 0 },
                 3_600_000,
@@ -12877,7 +15836,7 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
         let state = custom_state(
             MigrationStatus::InProgress,
-            vec![provable_tx_row(
+            vec![provable_nu7_tx_row(
                 0,
                 MigrationTxKind::Transfer { crossing: 0 },
                 3_600_000,
@@ -12915,7 +15874,7 @@ mod tests {
         let path_bytes = path.to_str().unwrap().as_bytes();
         let state = custom_state(
             MigrationStatus::InProgress,
-            vec![provable_tx_row(
+            vec![provable_nu7_tx_row(
                 0,
                 MigrationTxKind::Preparation { layer: 0, index: 0 },
                 3_600_000,
@@ -12946,6 +15905,8 @@ mod tests {
                 account.as_ptr(),
                 NETWORK_ID_MAINNET,
                 std::ptr::null(),
+                FIXTURE_SERVER_HEIGHT,
+                false,
             )
         };
         assert!(ptr.is_null(), "a null txid pointer must be refused");
@@ -12974,6 +15935,709 @@ mod tests {
             wallet_transaction_records(&path),
             0,
             "neither refusal leaves a wallet record behind"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- the submission check before the broadcast seam -----
+    //
+    // The take executors, and the note-split ceremony's handback, check the transaction they are
+    // about to serve against the block it would be mined in, before the store's seam records it in
+    // the wallet: it must be built for that block's consensus branch, it must not have expired by
+    // then. Valid work may be submitted throughout the preactivation interval. The
+    // block is the one after the HIGHER of the wallet's chain tip and the submission server's
+    // height, and a server height that is unknown fails closed.
+    //
+    // The fixtures are REAL runs, committed by [`committed_run_fixture`] at 3,543,000 (every row
+    // built for NU6.3) or at 3,600,000 (NU7), so a row's branch and expiry are the engine's own. Their
+    // rows are `Signed`, which the seam itself refuses as not proved: a refusal of any other kind can
+    // only have come from the check before it, and one that is the seam's shows the check let the
+    // row through. Mainnet activates NU7 at 3,543,405.
+
+    /// What the seam says of a row that is not `Proved`.
+    const SEAM_NOT_PROVED: &str = "is not proved";
+
+    /// What the check says of a row built for another branch than the next block's.
+    const WRONG_BRANCH_ERROR: &str = "MIGRATION_SUBMISSION_REFUSED:wrong_branch";
+
+    /// A row of the stored fixture run, as the submission-check tests address it.
+    struct FixtureRow {
+        id: u32,
+        txid: [u8; 32],
+        expiry: u32,
+    }
+
+    /// The first preparation (with `preparation` set) or the first transfer of the stored fixture
+    /// run.
+    fn fixture_run_row(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        preparation: bool,
+    ) -> FixtureRow {
+        let state = read_fixture_state(path, account);
+        let row = state
+            .transactions()
+            .iter()
+            .find(|t| matches!(t.kind(), MigrationTxKind::Preparation { .. }) == preparation)
+            .expect("the fixture run has a row of the kind");
+        FixtureRow {
+            id: u32::from(row.id()),
+            txid: <[u8; 32]>::from(row.txid()),
+            expiry: u32::from(row.expiry_height()),
+        }
+    }
+
+    /// Whether the wallet holds a record of the transaction with `txid`, which is what the
+    /// broadcast seam writes when it serves one.
+    fn wallet_holds_transaction(
+        path: &std::path::Path,
+        account: &[u8; 16],
+        txid: [u8; 32],
+    ) -> bool {
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let ctx = unsafe {
+            open(
+                system_rng(),
+                path_bytes.as_ptr(),
+                path_bytes.len(),
+                account.as_ptr(),
+                NETWORK_ID_MAINNET,
+            )
+        }
+        .expect("the fixture context opens");
+        ctx.wallet
+            .get_transaction(TxId::from_bytes(txid))
+            .expect("the wallet reads its transactions")
+            .is_some()
+    }
+
+    /// A refusal must survive reopening and stop offering the same stale broadcast until sync
+    /// can adjudicate it, without recording a wallet transaction or consuming its inputs.
+    #[test]
+    fn take_refusal_reopens_as_reevaluate_until_scan_catches_up() {
+        let (path, account) = gate_fixture("take_refusal_reopens", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        record_fixture_block(&path, 3_543_000);
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![
+                provable_tx_row(
+                    7,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    3_543_001,
+                    4_000_000,
+                    Some(3_542_900),
+                    MigrationTxState::Proved,
+                ),
+                provable_tx_row(
+                    8,
+                    MigrationTxKind::Transfer { crossing: 1 },
+                    3_542_901,
+                    4_000_000,
+                    None,
+                    MigrationTxState::Broadcast {
+                        txid: TxId::from_bytes([8u8; 32]),
+                    },
+                ),
+                provable_tx_row(
+                    9,
+                    MigrationTxKind::Transfer { crossing: 2 },
+                    3_542_901,
+                    4_000_000,
+                    None,
+                    MigrationTxState::Mined {
+                        txid: TxId::from_bytes([9u8; 32]),
+                        height: h(3_542_999),
+                    },
+                ),
+            ],
+        );
+        store_fixture_state(&path, &account, &state);
+        Connection::open(&path).unwrap().execute(
+            "INSERT INTO transactions (txid, mined_height, min_observed_height) VALUES (?1, ?2, ?2)",
+            rusqlite::params![&[9u8; 32][..], 3_542_999],
+        ).unwrap();
+        let records_before = wallet_transaction_records(&path);
+        let spendable_before = spendable_fixture_orchard(&path, &account);
+        assert_eq!(
+            read_gated_step(path_bytes, &account, -1, false).step,
+            ZCASHLC_ADVANCE_STEP_BROADCAST
+        );
+
+        let error = take_broadcast_error_at(path_bytes, &account, 7, 3_543_404, false);
+        assert_eq!(error, WRONG_BRANCH_ERROR);
+        assert_eq!(
+            read_gated_step(path_bytes, &account, -1, false).step,
+            ZCASHLC_ADVANCE_STEP_REEVALUATE
+        );
+        assert_eq!(wallet_transaction_records(&path), records_before);
+        assert_eq!(spendable_fixture_orchard(&path, &account), spendable_before);
+        let stored = read_fixture_state(&path, &account);
+        let row = transaction_by_id(&stored, MigrationTransferId::new(7)).unwrap();
+        assert_eq!(row.broadcast_failure_at(), Some(h(3_543_404)));
+        assert_eq!(row.state(), MigrationTxState::Proved);
+        assert_eq!(&stored.transactions()[1..], &state.transactions()[1..]);
+
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        mark_fixture_scanned_through(&path, 3_543_404);
+        record_fixture_block(&path, 3_543_404);
+        assert_eq!(
+            read_gated_step(path_bytes, &account, -1, false).step,
+            ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE
+        );
+        assert_eq!(wallet_transaction_records(&path), records_before);
+        let settled = read_fixture_state(&path, &account);
+        assert_eq!(&settled.transactions()[1..], &state.transactions()[1..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Expiry testimony uses the later observed tip and remains pending until that scan arrives.
+    #[test]
+    fn refusal_persists_the_observed_tip_for_expiry_and_wallet_ahead() {
+        for (wallet_tip, server_tip, observed_tip) in [
+            (3_600_000, 3_600_010, 3_600_010),
+            (3_600_020, 3_600_010, 3_600_020),
+        ] {
+            let (path, account) = gate_fixture("refusal_expiry_tip", 3_600_000);
+            let path_bytes = path.to_str().unwrap().as_bytes();
+            record_fixture_block(&path, 3_600_000);
+            set_fixture_tip_at(path_bytes, wallet_tip);
+            let state = custom_state(
+                MigrationStatus::InProgress,
+                vec![provable_nu7_tx_row(
+                    7,
+                    MigrationTxKind::Transfer { crossing: 0 },
+                    3_600_001,
+                    3_600_010,
+                    Some(3_599_900),
+                    MigrationTxState::Proved,
+                )],
+            );
+            store_fixture_state(&path, &account, &state);
+            let records_before = wallet_transaction_records(&path);
+            let spendable_before = spendable_fixture_orchard(&path, &account);
+            assert_eq!(
+                take_broadcast_error_at(path_bytes, &account, 7, server_tip, false),
+                "MIGRATION_SUBMISSION_REFUSED:expired"
+            );
+            let stored = read_fixture_state(&path, &account);
+            let row = transaction_by_id(&stored, MigrationTransferId::new(7)).unwrap();
+            assert_eq!(row.broadcast_failure_at(), Some(h(observed_tip)));
+            assert_eq!(row.state(), MigrationTxState::Proved);
+            assert_eq!(wallet_transaction_records(&path), records_before);
+            assert_eq!(spendable_fixture_orchard(&path, &account), spendable_before);
+            assert_eq!(
+                read_gated_step(path_bytes, &account, -1, false).step,
+                ZCASHLC_ADVANCE_STEP_REEVALUATE
+            );
+            set_fixture_tip_at(path_bytes, observed_tip);
+            mark_fixture_scanned_through(&path, observed_tip - 1);
+            record_fixture_block(&path, observed_tip - 1);
+            assert_eq!(
+                read_gated_step(path_bytes, &account, -1, false).step,
+                ZCASHLC_ADVANCE_STEP_REEVALUATE
+            );
+            mark_fixture_scanned_through(&path, observed_tip);
+            record_fixture_block(&path, observed_tip);
+            assert_eq!(
+                read_gated_step(path_bytes, &account, -1, false).step,
+                ZCASHLC_ADVANCE_STEP_REBUILD
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Only an active, readable Proved transaction can acquire refusal testimony.
+    #[test]
+    fn refusal_does_not_report_nonproved_or_invalid_requests() {
+        for case in [
+            "signed",
+            "mined",
+            "terminal",
+            "unknown",
+            "malformed",
+            "unknown_height",
+            "overflow_height",
+            "overflow_target",
+            "expiry_boundary",
+        ] {
+            let (path, account) = gate_fixture("refusal_invalid", 3_600_000);
+            let path_bytes = path.to_str().unwrap().as_bytes();
+            let lifecycle = match case {
+                "signed" => MigrationTxState::Signed,
+                "mined" => MigrationTxState::Mined {
+                    txid: TxId::from_bytes([7u8; 32]),
+                    height: h(3_599_999),
+                },
+                _ => MigrationTxState::Proved,
+            };
+            let row = provable_tx_row_with(
+                if case == "malformed" {
+                    vec![0u8]
+                } else {
+                    minimal_nu7_pczt_bytes()
+                },
+                7,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_600_001,
+                3_600_010,
+                Some(3_599_900),
+                lifecycle,
+            );
+            let state = custom_state(
+                if case == "terminal" {
+                    MigrationStatus::Cancelled
+                } else {
+                    MigrationStatus::InProgress
+                },
+                vec![row],
+            );
+            store_fixture_state(&path, &account, &state);
+            let before = read_fixture_state(&path, &account);
+            let records_before = wallet_transaction_records(&path);
+            let server_tip = match case {
+                "unknown_height" => -1,
+                "overflow_height" => i64::from(u32::MAX) + 1,
+                "overflow_target" => i64::from(u32::MAX),
+                "expiry_boundary" => 3_600_009,
+                _ => 3_600_010,
+            };
+            let error = take_broadcast_error_at(
+                path_bytes,
+                &account,
+                if case == "unknown" { 99 } else { 7 },
+                server_tip,
+                false,
+            );
+            if case == "expiry_boundary" {
+                assert!(!error.starts_with(SUBMISSION_REFUSED_PREFIX), "{error}");
+            }
+            assert_eq!(
+                read_fixture_state(&path, &account),
+                before,
+                "{case}: {error}"
+            );
+            assert_eq!(wallet_transaction_records(&path), records_before, "{case}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A failed durable write must surface an error rather than imply recovery was recorded.
+    #[test]
+    fn refusal_persistence_failure_leaves_the_wallet_and_state_unchanged() {
+        let (path, account) = gate_fixture("refusal_write_failure", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                7,
+                MigrationTxKind::Transfer { crossing: 0 },
+                3_543_001,
+                4_000_000,
+                Some(3_542_900),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+        let before = read_fixture_state(&path, &account);
+        let records_before = wallet_transaction_records(&path);
+        Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_migration_refusal BEFORE UPDATE ON orchard_ironwood_migrations
+             BEGIN SELECT RAISE(ABORT, 'fixture migration persistence rejected'); END;"
+        ).unwrap();
+        let error = take_broadcast_error_at(path_bytes, &account, 7, 3_543_404, false);
+        assert!(error.contains("migration store write failed"), "{error}");
+        assert!(
+            error.contains("fixture migration persistence rejected"),
+            "{error}"
+        );
+        assert_eq!(read_fixture_state(&path, &account), before);
+        assert_eq!(wallet_transaction_records(&path), records_before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Preparation retrieval shares the delivery guard's durable sync recovery.
+    #[test]
+    fn preparation_refusal_persists_testimony_before_returning() {
+        let (path, account) = gate_fixture("refusal_preparation", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![provable_tx_row(
+                7,
+                MigrationTxKind::Preparation { layer: 0, index: 0 },
+                3_543_001,
+                4_000_000,
+                None,
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+        let records_before = wallet_transaction_records(&path);
+        let txid = <[u8; 32]>::from(state.transactions()[0].txid());
+        assert_eq!(
+            take_preparation_error_at(path_bytes, &account, txid, 3_543_404, false),
+            WRONG_BRANCH_ERROR
+        );
+        let stored = read_fixture_state(&path, &account);
+        assert_eq!(
+            stored.transactions()[0].broadcast_failure_at(),
+            Some(h(3_543_404))
+        );
+        assert_eq!(stored.transactions()[0].state(), MigrationTxState::Proved);
+        assert_eq!(wallet_transaction_records(&path), records_before);
+        assert_eq!(
+            read_gated_step(path_bytes, &account, -1, false).step,
+            ZCASHLC_ADVANCE_STEP_REEVALUATE
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A row built for the branch before the activation is refused once the next block is the
+    /// activation block, before the seam can record it, and the scheduling bypass never
+    /// lifts this.
+    #[test]
+    fn take_broadcast_refuses_an_old_branch_transaction_before_the_seam() {
+        let (path, account) = committed_run_fixture("take_old_branch", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+        let spendable = spendable_fixture_orchard(&path, &account);
+        // The wallet has scanned up to the last block under NU6.3: the next block is the
+        // activation block.
+        set_fixture_tip_at(path_bytes, 3_543_404);
+
+        for bypass in [false, true] {
+            let error = take_broadcast_error_at(path_bytes, &account, row.id, 3_543_404, bypass);
+            assert_eq!(error, WRONG_BRANCH_ERROR, "bypass {bypass}");
+        }
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, row.txid),
+            "a refused transaction is never recorded in the wallet"
+        );
+        assert_eq!(
+            spendable_fixture_orchard(&path, &account),
+            spendable,
+            "a refusal leaves the spendable value as it was"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The next block is judged at the higher of the wallet's tip and the server's height, whichever
+    /// of the two leads: either alone reaches the activation here, and neither does when both are
+    /// short of it. (A wallet's tip only moves forward, so the cases run in that order.)
+    #[test]
+    fn take_broadcast_uses_the_higher_of_wallet_and_server_heights() {
+        let (path, account) = committed_run_fixture("take_higher_height", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+
+        // Neither reaches the activation: the check lets the row through to the seam.
+        let error = take_broadcast_error_at(path_bytes, &account, row.id, 3_543_000, false);
+        assert!(error.contains(SEAM_NOT_PROVED), "{error}");
+
+        // The server leads the wallet, whose tip is 3,543,000.
+        assert_eq!(
+            take_broadcast_error_at(path_bytes, &account, row.id, 3_543_404, false),
+            WRONG_BRANCH_ERROR,
+            "the wallet's tip is 3,543,000, the server's height is 3,543,404"
+        );
+
+        // The wallet leads the server.
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        assert_eq!(
+            take_broadcast_error_at(path_bytes, &account, row.id, 3_543_000, false),
+            WRONG_BRANCH_ERROR,
+            "the wallet's tip is 3,543,404, the server's height is 3,543,000"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transaction can still be mined in the block at its expiry height, so a server that stands
+    /// on the block before is fine and one that stands on the expiry height itself is not, whether
+    /// or not the bypass is on.
+    #[test]
+    fn take_broadcast_refuses_an_expired_transaction() {
+        let (path, account) = committed_run_fixture("take_expired", 3_600_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+        let expiry = i64::from(row.expiry);
+
+        let error = take_broadcast_error_at(path_bytes, &account, row.id, expiry - 1, false);
+        assert!(
+            error.contains(SEAM_NOT_PROVED),
+            "the next block is the one at the expiry height, which can still mine it: {error}"
+        );
+        for bypass in [false, true] {
+            let error = take_broadcast_error_at(path_bytes, &account, row.id, expiry, bypass);
+            assert_eq!(
+                error, "MIGRATION_SUBMISSION_REFUSED:expired",
+                "bypass {bypass}"
+            );
+        }
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, row.txid),
+            "a refused transaction is never recorded in the wallet"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Valid committed work reaches the broadcast executor throughout the preactivation interval.
+    #[test]
+    fn take_broadcast_passes_valid_work_until_activation() {
+        let (path, account) = committed_run_fixture("take_preactivation", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+
+        for server in [3_543_355, 3_543_356, 3_543_403] {
+            for bypass in [false, true] {
+                let error = take_broadcast_error_at(path_bytes, &account, row.id, server, bypass);
+                assert!(
+                    error.contains(SEAM_NOT_PROVED),
+                    "server at {server}, bypass {bypass}: the executor must receive the row: {error}"
+                );
+            }
+        }
+        assert!(
+            !wallet_holds_transaction(&path, &account, row.txid),
+            "the executor cannot record a transaction until its proof is available"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transaction built for the next block's branch and unexpired reaches the seam.
+    #[test]
+    fn take_broadcast_passes_a_valid_transaction_to_the_seam() {
+        let (path, account) = committed_run_fixture("take_valid", 3_600_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+
+        let error = take_broadcast_error_at(path_bytes, &account, row.id, 3_600_000, false);
+
+        assert!(
+            !error.starts_with(SUBMISSION_REFUSED_PREFIX),
+            "a valid transaction is not refused by the check: {error}"
+        );
+        assert!(
+            error.contains(SEAM_NOT_PROVED),
+            "the seam, which is reached, refuses the row that is not proved: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stored PCZT that does not parse has no branch to read, so the check cannot judge the
+    /// transaction. That is a failure to turn the stored artifact into servable bytes, reported
+    /// under the proving-unavailable prefix in the check's own words rather than as a refusal, and
+    /// the seam is not reached, so nothing is recorded.
+    #[test]
+    fn take_broadcast_reports_an_unreadable_pczt_as_proving_unavailable_before_the_seam() {
+        let (path, account) = init_delivery_fixture("zcashlc_take_unreadable_pczt");
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        // `tx_row` carries the one-byte placeholder PCZT, which does not parse.
+        let state = custom_state(
+            MigrationStatus::InProgress,
+            vec![tx_row(
+                0,
+                MigrationTxKind::Transfer { crossing: 0 },
+                &[],
+                3_600_000,
+                4_000_000,
+                Some(3_500_000),
+                MigrationTxState::Proved,
+            )],
+        );
+        store_fixture_state(&path, &account, &state);
+
+        let error = take_broadcast_error(path_bytes, &account, 0);
+
+        assert!(error.starts_with(PROVING_UNAVAILABLE_PREFIX), "{error}");
+        assert!(
+            error.contains("does not parse"),
+            "the check says so itself, the seam is not reached: {error}"
+        );
+        assert!(!error.contains(SUBMISSION_REFUSED_PREFIX), "{error}");
+        assert_eq!(
+            wallet_transaction_records(&path),
+            0,
+            "nothing is recorded for a transaction that could not be judged"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A server height that is not a height (the FFI's "unknown", or one no block has) fails
+    /// closed, with and without the bypass: nothing is checked against a guess, and nothing is
+    /// recorded.
+    #[test]
+    fn take_broadcast_fails_closed_without_a_server_height() {
+        let (path, account) = committed_run_fixture("take_no_height", 3_600_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let row = fixture_run_row(&path, &account, false);
+
+        for height in [-1, i64::MIN, i64::from(u32::MAX) + 1] {
+            for bypass in [false, true] {
+                let error = take_broadcast_error_at(path_bytes, &account, row.id, height, bypass);
+                assert!(
+                    error.contains("the submission server's height is unknown"),
+                    "height {height}, bypass {bypass}: {error}"
+                );
+            }
+        }
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, row.txid),
+            "an unchecked transaction is never recorded in the wallet"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The preparation accessor allows valid preactivation work through to its seam, while a
+    /// wrong branch and an unknown server height are refused for a preparation's txid.
+    #[test]
+    fn take_preparation_checks_before_the_seam() {
+        let (path, account) = committed_run_fixture("take_prep_check", 3_543_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        let preparation = fixture_run_row(&path, &account, true);
+
+        for bypass in [false, true] {
+            let error = take_preparation_error_at(
+                path_bytes,
+                &account,
+                preparation.txid,
+                3_543_356,
+                bypass,
+            );
+            assert!(
+                error.contains(SEAM_NOT_PROVED),
+                "the executor receives valid preparation, bypass {bypass}: {error}"
+            );
+        }
+
+        let error = take_preparation_error_at(path_bytes, &account, preparation.txid, -1, false);
+        assert!(
+            error.contains("the submission server's height is unknown"),
+            "{error}"
+        );
+
+        // The wallet has scanned up to the last block under NU6.3: the next block is the
+        // activation block.
+        set_fixture_tip_at(path_bytes, 3_543_404);
+        assert_eq!(
+            take_preparation_error_at(path_bytes, &account, preparation.txid, 3_543_404, false),
+            WRONG_BRANCH_ERROR
+        );
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, preparation.txid),
+            "a refused preparation is never recorded in the wallet"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The submission server's height is a height or it is unknown, and the next block is one past
+    /// the higher of it and the wallet's tip.
+    #[test]
+    fn the_submission_target_is_one_past_the_higher_height() {
+        assert!(known_submission_server_height(-1).is_err());
+        assert!(known_submission_server_height(i64::MIN).is_err());
+        assert!(known_submission_server_height(i64::from(u32::MAX) + 1).is_err());
+        assert_eq!(known_submission_server_height(0).unwrap(), h(0));
+        assert_eq!(
+            known_submission_server_height(3_543_404).unwrap(),
+            h(3_543_404)
+        );
+
+        assert_eq!(
+            submission_target(h(3_543_000), h(3_543_404)).unwrap(),
+            h(3_543_405)
+        );
+        assert_eq!(
+            submission_target(h(3_543_404), h(3_543_000)).unwrap(),
+            h(3_543_405)
+        );
+        assert_eq!(
+            submission_target(h(3_600_000), h(3_600_000)).unwrap(),
+            h(3_600_001)
+        );
+        // No height follows the highest one a `BlockHeight` holds.
+        assert!(submission_target(h(1), h(u32::MAX)).is_err());
+    }
+
+    /// The run a cancel has ended serves nothing. An instruction issued before the cancel can
+    /// still arrive after it, and serving it would record the transaction in the wallet and mark
+    /// the notes the cancel just released as spent again. The refusal is bare, and it comes before
+    /// the check and before the seam: an expiring height and a valid one are answered alike.
+    ///
+    /// The rows are proved, as they are in a run that has been proving, so that the seam would be
+    /// reached were it not for the guard.
+    #[test]
+    fn take_broadcast_refuses_a_cancelled_run() {
+        let (path, account) = committed_run_fixture("take_cancelled", 3_600_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        reserve_fixture_funding_for_the_run(&path, &account);
+        let row = fixture_run_row(&path, &account, false);
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "the cancel must succeed: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+        assert_eq!(
+            stored_fixture_run(&path, &account)
+                .expect("the cancelled run stays stored")
+                .status(),
+            MigrationStatus::Cancelled
+        );
+
+        for height in [FIXTURE_SERVER_HEIGHT, i64::from(row.expiry)] {
+            let error = take_broadcast_error_at(path_bytes, &account, row.id, height, false);
+            assert!(
+                error.contains("already over"),
+                "server at {height}: {error}"
+            );
+            assert!(
+                !error.starts_with(SUBMISSION_REFUSED_PREFIX)
+                    && !error.starts_with(PROVING_UNAVAILABLE_PREFIX),
+                "the refusal is bare, server at {height}: {error}"
+            );
+        }
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, row.txid),
+            "a cancelled run's transaction is never recorded in the wallet"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`take_broadcast_refuses_a_cancelled_run`] for the preparation accessor.
+    #[test]
+    fn take_preparation_refuses_a_cancelled_run() {
+        let (path, account) = committed_run_fixture("take_prep_cancelled", 3_600_000);
+        let path_bytes = path.to_str().unwrap().as_bytes();
+        reserve_fixture_funding_for_the_run(&path, &account);
+        let preparation = fixture_run_row(&path, &account, true);
+        assert!(
+            cancel_fixture_run(&path, &account),
+            "the cancel must succeed: {:?}",
+            ffi_helpers::error_handling::error_message()
+        );
+
+        for height in [FIXTURE_SERVER_HEIGHT, i64::from(preparation.expiry)] {
+            let error =
+                take_preparation_error_at(path_bytes, &account, preparation.txid, height, false);
+            assert!(
+                error.contains("already over"),
+                "server at {height}: {error}"
+            );
+            assert!(
+                !error.starts_with(SUBMISSION_REFUSED_PREFIX)
+                    && !error.starts_with(PROVING_UNAVAILABLE_PREFIX),
+                "the refusal is bare, server at {height}: {error}"
+            );
+        }
+
+        assert!(
+            !wallet_holds_transaction(&path, &account, preparation.txid),
+            "a cancelled run's preparation is never recorded in the wallet"
         );
         let _ = std::fs::remove_file(&path);
     }

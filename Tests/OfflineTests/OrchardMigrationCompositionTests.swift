@@ -12,6 +12,7 @@
 //  logic).
 //
 
+import os
 import XCTest
 @testable import TestUtils
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
@@ -42,18 +43,21 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
     // MARK: - submitNoteSplit composition
 
-    /// Proves the full `sign -> broadcast -> record` order for the success path, and that the
-    /// mapped result is returned. There is no extract step any more: the ceremony's handback comes
-    /// through the store's broadcast seam already finalized, so what reaches the broadcaster is
-    /// `prepared.pczt` verbatim. The `record` closure additionally asserts the in-flight marker is
-    /// still armed at the moment it runs, pinning "the submit-to-record window stays bracketed
-    /// until the record lands"; the marker is released only afterwards.
-    func testSubmitNoteSplitOrdersSignBroadcastThenRecordsOnSuccess() async throws {
+    /// Proves the full `broadcast (connect) -> sign -> record` order for the success path, and that
+    /// the mapped result is returned: the broadcaster connects first, and the signing step is run
+    /// from within it once the server's height is known (see the height tests below for the whole
+    /// order, with the height read and the submit). There is no extract step any more: the
+    /// ceremony's handback comes through the store's broadcast seam already finalized, so what
+    /// reaches the broadcaster is `prepared.pczt` verbatim. The `record` closure additionally
+    /// asserts the in-flight marker is still armed at the moment it runs, pinning "the
+    /// submit-to-record window stays bracketed until the record lands"; the marker is released only
+    /// afterwards.
+    func testSubmitNoteSplitOrdersConnectSignThenRecordsOnSuccess() async throws {
         let recorder = CompositionOrderRecorder()
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
 
-        welding.migrationSignNoteSplitProposalUskForClosure = { receivedProposal, receivedUsk, receivedAccount in
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForClosure = { receivedProposal, receivedUsk, _, receivedAccount in
             recorder.record("sign")
             XCTAssertEqual(receivedProposal, proposal)
             XCTAssertEqual(receivedUsk, self.usk)
@@ -79,7 +83,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         )
 
         XCTAssertEqual(result, MigrationTransferResult.success(txId: prepared.txid.toHexStringTxId()))
-        XCTAssertEqual(recorder.events, ["sign", "broadcast", "record"])
+        XCTAssertEqual(recorder.events, ["broadcast", "sign", "record"])
         XCTAssertEqual(broadcaster.receivedCalls.count, 1)
         XCTAssertEqual(
             broadcaster.receivedCalls.first?.rawTransaction,
@@ -96,7 +100,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testSubmitNoteSplitOnTransportFailureRecordsNetworkErrorAndReleasesTheGate() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
-        welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -125,7 +129,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     func testSubmitNoteSplitFailsClosedOnTorUnavailableWithoutRecordingOrGating() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
         let prepared = makePreparedTransfer(id: 0)
-        welding.migrationSignNoteSplitProposalUskForReturnValue = prepared
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -156,7 +160,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// removal of the old lane's internal advance observable rather than a refactoring detail.
     func testPerformBroadcastServesTheInstructedIdWithoutCrankingTheDrive() async throws {
         let prepared = makePreparedTransfer(id: 7)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationTransactionStatusesForReturnValue = []
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .outcome(.submitted)))
@@ -166,7 +170,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
         )
 
-        XCTAssertEqual(welding.migrationTakeBroadcastTransactionIdForReceivedArguments?.id, 7)
+        XCTAssertEqual(welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReceivedArguments?.id, 7)
         XCTAssertFalse(
             welding.migrationAdvanceStepForEstimatedTipCalled,
             "the executor discharges the instruction it was given; it never asks the engine what to serve"
@@ -178,10 +182,12 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     }
 
     /// A STALE instruction is refused by the seam, not silently re-interpreted: the executor lets
-    /// the refusal through untouched (nothing broadcast, nothing recorded, gate untouched), which
-    /// is the caller's signal to crank again rather than retry.
+    /// the refusal through untouched (nothing submitted, nothing recorded, gate left open), which
+    /// is the caller's signal to crank again rather than retry. The broadcaster is reached, since
+    /// the take runs from within it once it has connected and read the server's height, but it
+    /// submits nothing.
     func testPerformBroadcastPropagatesTheSeamsStalenessRefusalWithoutBroadcasting() async throws {
-        welding.migrationTakeBroadcastTransactionIdForThrowableError =
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForThrowableError =
             ZcashError.rustMigrationTakeBroadcastTransaction("transaction 7 is not proved-and-servable")
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -196,14 +202,15 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             // expected
         }
 
-        XCTAssertEqual(broadcaster.receivedCalls.count, 0)
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty)
+        XCTAssertEqual(broadcaster.onWillSubmitCallCount, 0)
         XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
-        XCTAssertNil(gate.currentInFlightUntil(), "a serve that never reached the network arms no marker")
+        XCTAssertNil(gate.currentInFlightUntil(), "a serve that never reached the network leaves no marker")
     }
 
     func testPerformBroadcastSuccessPathRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -226,7 +233,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// composition level -- not just the pure `map` table already covered by MigrationLogicTests.
     func testPerformBroadcastInvalidNoteRejectionRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -25, message: "missing inputs")))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -248,7 +255,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// M5: seam-based coverage of the rejection branch's expiry message, at the composition level.
     func testPerformBroadcastExpiredRejectionRecordsAndReleasesTheGate() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.rejected(errorCode: -26, message: "tx-expiring-soon")))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -271,7 +278,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// submission endpoint.
     func testBroadcasterReceivesExactlyOneCallToTheResolvedEndpoint() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let overrideEndpoint = LightWalletEndpoint(address: "override.example", port: 443)
         XCTAssertNotEqual(overrideEndpoint, defaultEndpoint)
@@ -285,6 +292,371 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         XCTAssertEqual(broadcaster.receivedCalls.count, 1)
         XCTAssertEqual(broadcaster.receivedCalls.first?.endpoint, overrideEndpoint)
+    }
+
+    // MARK: - The submission server's height and the check before the seam
+    //
+    // A migration transaction is checked, before the wallet records it, against the block it would
+    // be mined in, and that is judged at the height of the server it is about to go to. So the
+    // broadcaster connects first and reads that height on its connection, the transaction is taken
+    // from the seam with it, and only then is it submitted. The fake keeps that order, so these
+    // tests read it off the events.
+
+    /// THE ORDER: connect, read the server's height, take from the seam with that height, submit,
+    /// record. The take receives the height the broadcaster read (100 here, so a default or a
+    /// forwarded constant cannot pass), for the instructed transaction and the actor's account.
+    func testBroadcastReadsTheServerHeightBeforeTakingFromTheSeam() async throws {
+        let recorder = CompositionOrderRecorder()
+        let prepared = makePreparedTransfer(id: 7)
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForClosure = { _, serverHeight, _ in
+            recorder.record("take:\(serverHeight)")
+            return prepared
+        }
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in recorder.record("record") }
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted), serverHeight: 100)
+        broadcaster.onBroadcast = { recorder.record("connect") }
+        broadcaster.onHeightRead = { recorder.record("height") }
+        broadcaster.onWillSubmitObserver = { recorder.record("submit") }
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        let result = try await migration.performBroadcast(
+            MigrationBroadcastInstruction(id: 7),
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(result, .success(txId: prepared.txid.toHexStringTxId()))
+        XCTAssertEqual(recorder.events, ["connect", "height", "take:100", "submit", "record"])
+        let received = try XCTUnwrap(welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReceivedArguments)
+        XCTAssertEqual(received.id, 7)
+        XCTAssertEqual(received.submissionServerHeight, 100)
+        XCTAssertEqual(received.account, accountA)
+        XCTAssertEqual(broadcaster.preparedServerHeights, [100])
+        XCTAssertEqual(broadcaster.submittedTransactions, [prepared.pczt], "what the seam served is what was submitted")
+    }
+
+    /// The same order for the note-split ceremony, whose signing is the take: the server's height
+    /// is read first and handed to the signing step, which hands the finalized transaction back for
+    /// the submit.
+    func testSubmitNoteSplitReadsTheServerHeightBeforeSigning() async throws {
+        let recorder = CompositionOrderRecorder()
+        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
+        let prepared = makePreparedTransfer(id: 0)
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForClosure = { _, _, serverHeight, _ in
+            recorder.record("sign:\(serverHeight)")
+            return prepared
+        }
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in recorder.record("record") }
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted), serverHeight: 4_321)
+        broadcaster.onBroadcast = { recorder.record("connect") }
+        broadcaster.onHeightRead = { recorder.record("height") }
+        broadcaster.onWillSubmitObserver = { recorder.record("submit") }
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        _ = try await migration.submitNoteSplit(
+            proposal: proposal,
+            usk: usk,
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(recorder.events, ["connect", "height", "sign:4321", "submit", "record"])
+        XCTAssertEqual(
+            welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForReceivedArguments?.submissionServerHeight,
+            4_321
+        )
+        XCTAssertEqual(broadcaster.submittedTransactions, [prepared.pczt])
+    }
+
+    /// A server whose height cannot be read ends the flow with nothing done: no transaction is
+    /// taken (so none is recorded in the wallet), none is submitted, and no result is recorded,
+    /// since there is no transfer to record one for. The caller is told it is a retryable network
+    /// error, and the sync gate is left open.
+    func testBroadcastWithAnUnreadableHeightTakesAndRecordsNothing() async throws {
+        // Stubbed so that a regression that takes or records anyway fails the assertions below
+        // instead of crashing the process on the mock's un-stubbed return value.
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = makePreparedTransfer(id: 7)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let broadcaster = ScriptedBroadcaster(script: .unreadableHeight)
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        let result = try await migration.performBroadcast(
+            MigrationBroadcastInstruction(id: 7),
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(result, MigrationTransferResult.networkError(retryable: true))
+        XCTAssertFalse(welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForCalled, "nothing is taken from the seam")
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled, "nothing is recorded")
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty)
+        XCTAssertEqual(broadcaster.onWillSubmitCallCount, 0)
+        XCTAssertNil(gate.currentInFlightUntil(), "nothing reached the network, so no marker stays behind")
+        XCTAssertFalse(gate.currentlyBlocked())
+    }
+
+    /// The ceremony with an unreadable height signs nothing and records nothing either.
+    func testSubmitNoteSplitWithAnUnreadableHeightSignsAndRecordsNothing() async throws {
+        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
+        // Stubbed so that a regression fails the assertions below instead of crashing the process.
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForReturnValue = makePreparedTransfer(id: 0)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let broadcaster = ScriptedBroadcaster(script: .unreadableHeight)
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        let result = try await migration.submitNoteSplit(
+            proposal: proposal,
+            usk: usk,
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(result, MigrationTransferResult.networkError(retryable: true))
+        XCTAssertFalse(welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForCalled, "nothing is signed")
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
+        XCTAssertNil(gate.currentInFlightUntil())
+    }
+
+    /// A transaction the seam refuses as unable to be valid in the next block is neither submitted
+    /// nor recorded: the refusal comes out of the take, through the broadcaster, to the caller as it
+    /// was thrown, and the sync gate is left open.
+    func testBroadcastRefusedAtTheSeamSubmitsNothing() async throws {
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForThrowableError =
+            ZcashError.migrationSubmissionRefused(.wrongConsensusBranch)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        do {
+            _ = try await migration.performBroadcast(
+                MigrationBroadcastInstruction(id: 7),
+                options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+            )
+            XCTFail("Expected the refusal to propagate")
+        } catch ZcashError.migrationSubmissionRefused(let refusal) {
+            XCTAssertEqual(refusal, .wrongConsensusBranch)
+        } catch {
+            XCTFail("Expected migrationSubmissionRefused but got \(error)")
+        }
+
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty, "a refused transaction is never submitted")
+        XCTAssertEqual(broadcaster.onWillSubmitCallCount, 0, "and the submit hook never fires for it")
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled, "and nothing is recorded")
+        XCTAssertNil(gate.currentInFlightUntil(), "the marker armed as a belt is cleared when nothing reached the network")
+        XCTAssertFalse(gate.currentlyBlocked())
+    }
+
+    /// The ceremony's refusal behaves the same: its signing step is where the check runs.
+    func testSubmitNoteSplitRefusedAtTheSeamSubmitsNothing() async throws {
+        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForThrowableError =
+            ZcashError.migrationSubmissionRefused(.expired)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        do {
+            _ = try await migration.submitNoteSplit(
+                proposal: proposal,
+                usk: usk,
+                options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+            )
+            XCTFail("Expected the refusal to propagate")
+        } catch ZcashError.migrationSubmissionRefused(let refusal) {
+            XCTAssertEqual(refusal, .expired)
+        } catch {
+            XCTFail("Expected migrationSubmissionRefused but got \(error)")
+        }
+
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty)
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
+        XCTAssertNil(gate.currentInFlightUntil())
+    }
+
+    /// A preparation the host retrieves is checked against the synchronizer's own server, since the
+    /// host submits it by itself, possibly to several servers: the height comes from the injected
+    /// provider, which is asked about the txid being taken (so that it can read over a connection
+    /// that belongs to that transaction alone), and reaches the take, for the txid asked for and the
+    /// actor's account. The provider is the only thing asked, and the broadcaster plays no part.
+    func testTakePreparationUsesTheSubmissionHeightProvider() async throws {
+        let txid = Data(repeating: 0xCD, count: 32)
+        let prepared = PreparedMigrationTransfer(id: 3, txid: txid, pczt: Data([0x0A, 0x0B]))
+        welding.migrationTakePreparationTxidSubmissionServerHeightForReturnValue = prepared
+        let broadcaster = ScriptedBroadcaster(script: .throwing(StubEngineError()))
+        let heightReadFor = OSAllocatedUnfairLock<[Data]>(initialState: [])
+        let migration = makeMigration(broadcaster: broadcaster) { readFor in
+            heightReadFor.withLock { $0.append(readFor) }
+            return 4_242
+        }
+
+        let taken = try await migration.takePreparation(byTxid: txid)
+
+        XCTAssertEqual(taken, prepared)
+        let received = try XCTUnwrap(welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments)
+        XCTAssertEqual(received.txid, txid)
+        XCTAssertEqual(received.submissionServerHeight, 4_242)
+        XCTAssertEqual(received.account, accountA)
+        XCTAssertEqual(heightReadFor.withLock { $0 }, [txid], "one request for the height per take, for the txid being taken")
+        XCTAssertTrue(broadcaster.receivedCalls.isEmpty, "a retrieval never touches the migration broadcaster")
+    }
+
+    /// Every take asks the provider again, about its own txid, and hands the take the height that
+    /// answer gave: nothing is cached across preparations, which would put one preparation's read
+    /// on another's connection or judge it at a height read for a different moment.
+    func testTakePreparationAsksTheSubmissionHeightProviderForEachTxidTaken() async throws {
+        let firstTxid = Data(repeating: 0xC1, count: 32)
+        let secondTxid = Data(repeating: 0xC2, count: 32)
+        welding.migrationTakePreparationTxidSubmissionServerHeightForClosure = { txid, _, _ in
+            PreparedMigrationTransfer(id: 3, txid: txid, pczt: Data([0x0A]))
+        }
+        let heightReadFor = OSAllocatedUnfairLock<[Data]>(initialState: [])
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError()))) { readFor in
+            heightReadFor.withLock { reads in
+                reads.append(readFor)
+                return BlockHeight(4_000 + reads.count)
+            }
+        }
+
+        _ = try await migration.takePreparation(byTxid: firstTxid)
+        let afterTheFirst = try XCTUnwrap(welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments)
+        _ = try await migration.takePreparation(byTxid: secondTxid)
+        let afterTheSecond = try XCTUnwrap(welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments)
+
+        XCTAssertEqual(heightReadFor.withLock { $0 }, [firstTxid, secondTxid])
+        XCTAssertEqual(afterTheFirst.txid, firstTxid)
+        XCTAssertEqual(afterTheFirst.submissionServerHeight, 4_001)
+        XCTAssertEqual(afterTheSecond.txid, secondTxid)
+        XCTAssertEqual(afterTheSecond.submissionServerHeight, 4_002)
+    }
+
+    /// A height that cannot be read fails the retrieval closed: the provider's error reaches the
+    /// caller and nothing is taken, so nothing is recorded in the wallet.
+    func testTakePreparationFailsClosedWhenTheHeightIsUnreadable() async throws {
+        // Stubbed so that a regression that takes anyway fails the assertion below instead of
+        // crashing the process on the mock's un-stubbed return value.
+        welding.migrationTakePreparationTxidSubmissionServerHeightForReturnValue = makePreparedTransfer(id: 3)
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError()))) { _ in
+            throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+        }
+
+        do {
+            _ = try await migration.takePreparation(byTxid: Data(repeating: 0xCD, count: 32))
+            XCTFail("Expected the failed height read to propagate")
+        } catch ZcashError.serviceLatestBlockHeightFailed {
+            // expected
+        } catch {
+            XCTFail("Expected serviceLatestBlockHeightFailed but got \(error)")
+        }
+
+        XCTAssertFalse(
+            welding.migrationTakePreparationTxidSubmissionServerHeightForCalled,
+            "an unknown height takes nothing from the seam"
+        )
+    }
+
+    /// The seam's own refusal of a preparation reaches the caller as it was thrown.
+    func testTakePreparationPropagatesTheSeamsRefusal() async throws {
+        welding.migrationTakePreparationTxidSubmissionServerHeightForThrowableError =
+            ZcashError.migrationSubmissionRefused(.expired)
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError()))) { _ in 100 }
+
+        do {
+            _ = try await migration.takePreparation(byTxid: Data(repeating: 0xCD, count: 32))
+            XCTFail("Expected the refusal to propagate")
+        } catch ZcashError.migrationSubmissionRefused(let refusal) {
+            XCTAssertEqual(refusal, .expired)
+        } catch {
+            XCTFail("Expected migrationSubmissionRefused but got \(error)")
+        }
+    }
+
+    // MARK: - Through the production broadcaster
+    //
+    // The tests above run the actor against a fake broadcaster that keeps the production order. These
+    // run it against the real `MigrationBroadcaster` over its direct transport, with a mock
+    // lightwalletd service in place of the network, so that the two are shown to compose.
+
+    private func makeProductionBroadcaster(service: LightWalletServiceMock) -> MigrationBroadcaster {
+        MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory,
+            logger: logger,
+            torClientFactory: { _ in throw StubTorBootstrapError() },
+            directServiceFactory: { _ in service }
+        )
+    }
+
+    /// The server's height, read by the production broadcaster, is the one the take receives, and
+    /// what the take returned is what the server is sent and what is recorded.
+    func testPerformBroadcastTakesWithTheHeightTheProductionBroadcasterReadFromTheServer() async throws {
+        let prepared = makePreparedTransfer(id: 7)
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeReturnValue = 3_543_404
+        service.submitSpendTransactionModeReturnValue = LightWalletServiceMockResponse.submitAnswer(errorCode: 0)
+        service.closeConnectionsClosure = { }
+        let migration = makeMigration(broadcaster: makeProductionBroadcaster(service: service))
+
+        let result = try await migration.performBroadcast(
+            MigrationBroadcastInstruction(id: 7),
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(result, .success(txId: prepared.txid.toHexStringTxId()))
+        XCTAssertEqual(
+            welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReceivedArguments?.submissionServerHeight,
+            3_543_404
+        )
+        XCTAssertEqual(service.submitSpendTransactionModeReceivedArguments?.spendTransaction, prepared.pczt)
+        XCTAssertEqual(service.closeConnectionsCallsCount, 1)
+        XCTAssertEqual(welding.migrationRecordTransferResultTransferIdResultForReceivedArguments?.transferId, prepared.id)
+    }
+
+    /// A server whose height cannot be read: nothing is taken, nothing reaches the server, nothing is
+    /// recorded, and the caller is told to try again.
+    func testPerformBroadcastWithTheProductionBroadcasterAndAnUnreadableHeightDoesNothing() async throws {
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = makePreparedTransfer(id: 7)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeThrowableError = ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+        service.closeConnectionsClosure = { }
+        let migration = makeMigration(broadcaster: makeProductionBroadcaster(service: service))
+
+        let result = try await migration.performBroadcast(
+            MigrationBroadcastInstruction(id: 7),
+            options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+        )
+
+        XCTAssertEqual(result, MigrationTransferResult.networkError(retryable: true))
+        XCTAssertFalse(welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForCalled)
+        XCTAssertFalse(service.submitSpendTransactionModeCalled)
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
+        XCTAssertNil(gate.currentInFlightUntil())
+    }
+
+    /// A transaction the seam refuses never reaches the server: the refusal comes out of the real
+    /// broadcaster as it was thrown, the connection is closed, and the sync gate is left open.
+    func testPerformBroadcastRefusedAtTheSeamNeverReachesTheServerThroughTheProductionBroadcaster() async throws {
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForThrowableError =
+            ZcashError.migrationSubmissionRefused(.expired)
+        welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeReturnValue = 3_732_480
+        service.closeConnectionsClosure = { }
+        let migration = makeMigration(broadcaster: makeProductionBroadcaster(service: service))
+
+        do {
+            _ = try await migration.performBroadcast(
+                MigrationBroadcastInstruction(id: 7),
+                options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+            )
+            XCTFail("Expected the refusal to propagate")
+        } catch ZcashError.migrationSubmissionRefused(let refusal) {
+            XCTAssertEqual(refusal, .expired)
+        } catch {
+            XCTFail("Expected migrationSubmissionRefused but got \(error)")
+        }
+
+        XCTAssertFalse(service.submitSpendTransactionModeCalled, "a refused transaction is never sent")
+        XCTAssertEqual(service.closeConnectionsCallsCount, 1)
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
+        XCTAssertNil(gate.currentInFlightUntil())
     }
 
     // MARK: - Estimated-tip wiring
@@ -372,7 +744,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let rawTxId: [UInt8] = (0..<32).map { UInt8($0) }
         let expectedDisplayTxId = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
         let prepared = PreparedMigrationTransfer(id: 1, txid: Data(rawTxId), pczt: Data([0x01, 0x02]))
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -398,7 +770,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// reconciles later.
     func testPerformBroadcastRecordThrowAfterSuccessfulBroadcastRetainsMarkerAndThrowsWrapped() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -425,7 +797,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// The sibling of the test above for the other public broadcast flow.
     func testSubmitNoteSplitRecordThrowAfterSuccessfulBroadcastRetainsMarkerAndThrowsWrapped() async throws {
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
-        welding.migrationSignNoteSplitProposalUskForReturnValue = makePreparedTransfer(id: 0)
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForReturnValue = makePreparedTransfer(id: 0)
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -456,7 +828,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// not land, exactly the submit-to-record ambiguity the marker exists for (it self-expires).
     func testPerformBroadcastRecordThrowOnTransportErrorPropagatesRawAndLeavesGateUntouched() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -491,7 +863,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
 
         for (script, expected) in rejections {
             let prepared = makePreparedTransfer(id: 1)
-            welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+            welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
             welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
             let broadcaster = ScriptedBroadcaster(script: .outcome(script))
             let migration = makeMigration(broadcaster: broadcaster)
@@ -521,7 +893,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// cleared (the outcome is durably recorded, so the submit-to-record window is closed).
     func testPerformBroadcastRecordSuccessOnNetworkErrorClearsInFlightMarker() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .outcome(.transportError)))
 
@@ -543,7 +915,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// hook equals the hook-time clock + guard, not the (earlier) flow-start arm.
     func testPerformBroadcastReArmsTheInFlightMarkerAtSubmitTimeViaTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         welding.migrationRecordTransferResultTransferIdResultForThrowableError = StubEngineError()
         let broadcaster = ScriptedBroadcaster(script: .outcome(.transportError))
 
@@ -584,7 +956,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// never fired and the flow's early belt marker is cleared — nothing is in flight.
     func testPerformBroadcastFailClosedThrowNeverFiresTheHook() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepared
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepared
         let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
         let migration = makeMigration(broadcaster: broadcaster)
 
@@ -774,7 +1146,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
     /// once the first flow's result is recorded.
     func testConcurrentPerformBroadcastBroadcastsExactlyOnce() async throws {
         let prepared = makePreparedTransfer(id: 1)
-        welding.migrationTakeBroadcastTransactionIdForClosure = { [welding] _, _ in
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForClosure = { [welding] _, _, _ in
             // The engine contract: the row stays servable until its result is recorded, and the
             // seam refuses it thereafter.
             if welding?.migrationRecordTransferResultTransferIdResultForCalled == true {
@@ -813,14 +1185,20 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         }
 
         let broadcastsStarted = await broadcaster.startedCount
-        XCTAssertEqual(broadcastsStarted, 1, "the same due transfer must be broadcast exactly once")
+        let broadcastsSubmitted = await broadcaster.submittedCount
+        XCTAssertEqual(
+            broadcastsStarted,
+            2,
+            "the waiter reaches the broadcaster too, which connects before the seam is asked"
+        )
+        XCTAssertEqual(broadcastsSubmitted, 1, "the same due transfer must be broadcast exactly once")
         XCTAssertEqual(firstResult, .success(txId: prepared.txid.toHexStringTxId()))
         XCTAssertFalse(
             welding.migrationAdvanceStepForEstimatedTipCalled,
             "neither caller advances: the executor is not a lane with a mind of its own"
         )
         XCTAssertEqual(
-            welding.migrationTakeBroadcastTransactionIdForCallsCount,
+            welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForCallsCount,
             2,
             "the waiter does serve — strictly after the in-flight flow, where the seam refuses it"
         )
@@ -836,8 +1214,8 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         let dueTransfer = makePreparedTransfer(id: 1)
         let splitTransfer = makePreparedTransfer(id: 0)
         let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = dueTransfer
-        welding.migrationSignNoteSplitProposalUskForClosure = { _, _, _ in
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = dueTransfer
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForClosure = { _, _, _, _ in
             recorder.record("sign")
             return splitTransfer
         }
@@ -895,7 +1273,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             step: .broadcast(MigrationBroadcastInstruction(id: prepTransfer.id)),
             next: nil
         )
-        welding.migrationTakeBroadcastTransactionIdForReturnValue = prepTransfer
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForReturnValue = prepTransfer
         welding.migrationRecordTransferResultTransferIdResultForClosure = { _, _, _ in }
         let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = makeMigration(broadcaster: broadcaster)
@@ -1016,9 +1394,108 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
         XCTAssertNil(retainedAfterSecond, "a crank with no outlook must clear the previous one, not preserve it")
     }
 
+    // MARK: - Restart and the NU7 network upgrade
+
+    /// `restartCurrentMigrationStep` hands the welding's outcome back untouched, whichever it is,
+    /// having asked for the actor's own account.
+    func testRestartCurrentMigrationStepReturnsTheWeldingsOutcome() async throws {
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 2, proposalHandle: 9, preparations: [])
+        let outcomes: [MigrationRestartOutcome] = [
+            .replanned(schedule),
+            .cancelledUntilNetworkUpgrade(activationHeight: 3_543_405)
+        ]
+
+        for expected in outcomes {
+            welding.migrationRestartStepForReturnValue = expected
+
+            let outcome = try await migration.restartCurrentMigrationStep()
+
+            XCTAssertEqual(outcome, expected)
+            XCTAssertEqual(welding.migrationRestartStepForReceivedAccount, accountA)
+        }
+    }
+
+    /// A restart failure reaches the caller as the welding threw it: the outcome type carries the
+    /// upgrade case, so nothing about it is turned into an error on the way.
+    func testRestartCurrentMigrationStepPropagatesTheWeldingError() async throws {
+        welding.migrationRestartStepForThrowableError = ZcashError.rustMigrationRestartStep("boom")
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        do {
+            _ = try await migration.restartCurrentMigrationStep()
+            XCTFail("Expected rustMigrationRestartStep to be thrown")
+        } catch ZcashError.rustMigrationRestartStep(let message) {
+            XCTAssertEqual(message, "boom")
+        } catch {
+            XCTFail("Expected rustMigrationRestartStep but got \(error)")
+        }
+    }
+
+    /// `cancelMigrationRun` asks the welding to cancel the run of the actor's own account, and does
+    /// nothing else: no fresh plan is asked for, which is what sets it apart from a restart.
+    func testCancelMigrationRunCancelsTheActorsAccountAndPlansNothing() async throws {
+        var cancelled: [AccountUUID] = []
+        welding.migrationCancelRunForClosure = { cancelled.append($0) }
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        try await migration.cancelMigrationRun()
+
+        XCTAssertEqual(cancelled, [accountA])
+        XCTAssertFalse(welding.migrationRestartStepForCalled, "a cancel plans nothing")
+        XCTAssertFalse(welding.migrationProposeTransfersForCalled, "a cancel plans nothing")
+    }
+
+    /// A cancel failure reaches the caller as the welding threw it.
+    func testCancelMigrationRunPropagatesTheWeldingError() async throws {
+        welding.migrationCancelRunForThrowableError = ZcashError.rustMigrationCancelRun("boom")
+        let migration = makeMigration(broadcaster: ScriptedBroadcaster(script: .throwing(StubEngineError())))
+
+        do {
+            try await migration.cancelMigrationRun()
+            XCTFail("Expected rustMigrationCancelRun to be thrown")
+        } catch ZcashError.rustMigrationCancelRun(let message) {
+            XCTAssertEqual(message, "boom")
+        } catch {
+            XCTFail("Expected rustMigrationCancelRun but got \(error)")
+        }
+    }
+
+    /// Before the upgrade the signing step refuses, and the refusal reaches the caller of
+    /// `submitNoteSplit` as it was thrown. The composition goes no further: nothing is submitted,
+    /// nothing is recorded, and the sync gate's in-flight marker, armed as a belt before the
+    /// broadcaster connects, is cleared again.
+    func testSubmitNoteSplitSurfacesTheNetworkUpgradeRefusalWithoutBroadcastingOrRecording() async throws {
+        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForThrowableError = ZcashError.migrationPausedUntilNetworkUpgrade(3_543_405)
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
+        let migration = makeMigration(broadcaster: broadcaster)
+
+        do {
+            _ = try await migration.submitNoteSplit(
+                proposal: proposal,
+                usk: usk,
+                options: MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: defaultEndpoint)
+            )
+            XCTFail("Expected migrationPausedUntilNetworkUpgrade to be thrown")
+        } catch ZcashError.migrationPausedUntilNetworkUpgrade(let activationHeight) {
+            XCTAssertEqual(activationHeight, 3_543_405)
+        } catch {
+            XCTFail("Expected migrationPausedUntilNetworkUpgrade but got \(error)")
+        }
+
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty, "a refused signing step broadcasts nothing")
+        XCTAssertFalse(welding.migrationRecordTransferResultTransferIdResultForCalled)
+        XCTAssertNil(gate.currentInFlightUntil(), "a refusal before the submit leaves no marker behind")
+        XCTAssertFalse(gate.currentlyBlocked())
+    }
+
     // MARK: - Helpers
 
-    private func makeMigration(broadcaster: any MigrationBroadcasting) -> OrchardMigration {
+    private func makeMigration(
+        broadcaster: any MigrationBroadcasting,
+        submissionHeight: @escaping @Sendable (Data) async throws -> BlockHeight = OrchardMigration.unreadableSubmissionHeight
+    ) -> OrchardMigration {
         // `isSyncBlocked()` and the `useEstimatedTip: true` paths unconditionally read
         // `migrationBlockRateSamples` (`ChainTipEstimator`'s raw input); default it to "no samples"
         // so a test that never cares about the estimate does not crash on the mock's un-stubbed,
@@ -1034,9 +1511,11 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             broadcaster: broadcaster,
             syncGate: gate,
             logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet),
             // The actor's estimate-consulting paths read the injected clock (U7), so the
             // fake-clock projection tests are deterministic.
-            now: { clockValue.now }
+            now: { clockValue.now },
+            submissionHeight: submissionHeight
         )
     }
 

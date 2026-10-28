@@ -10,7 +10,8 @@
 # Layout
 # ------
 # The Rust FFI build graph lives in BuildSupport/Makefile; the ffi-* targets
-# here delegate to it and then assemble the XCFramework exactly as CI does.
+# here delegate to it and then assemble the XCFramework, and ffi-ci does so
+# exactly as CI does.
 # The Swift package itself is built with SwiftPM from the repo root.
 #
 # Portability
@@ -64,10 +65,14 @@ info: ## Print the resolved toolchain and FFI state
 		else echo "absent (not macOS)"; fi
 	@printf "XCFramework:  "; \
 		if [ -d "$(XCFRAMEWORK)" ]; then echo "$(XCFRAMEWORK)"; \
-		else echo "<not built; run make ffi-macos>"; fi
+		else echo "<not built; run make ffi-ci>"; fi
 	@printf "LocalPackages:"; \
 		if [ -d LocalPackages ]; then echo " present (local FFI in use)"; \
 		else echo " absent (Package.swift uses the released FFI)"; fi
+
+.PHONY: print-swift-version
+print-swift-version: ## Print the complete version of the selected Swift compiler
+	@$(SWIFT) --version
 
 # The FFI targets produce an Apple XCFramework, which only Xcode can do.
 .PHONY: require-macos
@@ -145,7 +150,7 @@ test-all: ## Run the whole test suite, including networked tests
 # they are not reached by any `swift test` filter and need their own target.
 .PHONY: test-rust
 test-rust: ## Run the Rust unit tests
-	cargo test
+	cargo test --locked
 
 .PHONY: format-rust
 format-rust: ## Format the Rust sources with rustfmt
@@ -198,9 +203,9 @@ clean-rust: ## Clean the Cargo build artifacts (target/)
 # Rust FFI (BuildSupport/)
 # ---------------------------------------------------------------------------
 #
-# ffi-macos reproduces the CI "Build FFI for macOS" step exactly: build the
-# macOS slice, then assemble the XCFramework around it. macOS alone is enough
-# to build and test the Swift package.
+# ffi-macos builds the universal macOS slice (arm64 and x86_64) with the
+# release profile, then assembles the XCFramework around it. macOS alone is
+# enough to build and test the Swift package.
 
 .PHONY: ffi-macos
 ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
@@ -214,6 +219,20 @@ ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
 	cd $(BUILD_SUPPORT) && cp -R products/macos/frameworks \
 		products/libzcashlc.xcframework/macos-arm64_x86_64
 	cd $(BUILD_SUPPORT) && cp Info.plist products/libzcashlc.xcframework
+
+# ffi-ci reproduces the CI "Build FFI for macOS" step exactly: the arm64 macOS
+# slice alone, built without the release profile's whole-program LTO, a
+# single-threaded pass per architecture. That is all the Swift build and the
+# offline tests need on an Apple Silicon runner; releases (ffi-all) still build
+# every slice with LTO. The previous macOS products go first, because the lipo
+# step bundles every static library it finds there, a stale x86_64 one
+# included.
+# Keep the rm on a line of its own: make -n still executes any line that runs
+# $(MAKE), and the script tests dry-run this target.
+.PHONY: ffi-ci
+ffi-ci: require-macos ## Build the FFI the way CI does: arm64 macOS only, without fat LTO
+	rm -rf $(BUILD_SUPPORT)/products/macos
+	CARGO_PROFILE_RELEASE_LTO=false $(MAKE) ffi-macos MACOS_ARCHS=aarch64-apple-darwin
 
 .PHONY: ffi-all
 ffi-all: require-macos ## Build the full XCFramework for every platform

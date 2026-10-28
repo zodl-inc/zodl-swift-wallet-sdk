@@ -144,8 +144,9 @@ actor TorHTTPRequestExecutor {
     }
 }
 
-/// NSLock supports the SDK's iOS 13/macOS 12 minimums. The flag is shared only
-/// between the synchronous cancellation handler, admission, and native entry.
+/// NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
+/// iOS 16 / macOS 13. The flag is shared only between the synchronous cancellation
+/// handler, admission, and native entry.
 private final class TorHTTPRequestCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
