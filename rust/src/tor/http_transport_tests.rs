@@ -1018,3 +1018,204 @@ async fn a_2xx_body_past_the_callers_ceiling_is_an_error() {
         "the collector cannot consume more than the body"
     );
 }
+
+// The dependency's http_request is private and needs bootstrapped Tor. This fixture replaces
+// only its socket and its source-verified 60s parse_response timer, and uses GET's production
+// parser, total deadline, response bounds, and status handling unchanged.
+struct ParsedGetOutcome {
+    response: anyhow::Result<http::Response<Bytes>>,
+    elapsed: Duration,
+    client_eof: bool,
+}
+
+async fn parsed_get(
+    timeout_ms: Option<u64>,
+    body_delay: Duration,
+    status: u16,
+    data: Bytes,
+    max_bytes: usize,
+) -> ParsedGetOutcome {
+    let (client_io, mut server_io) = tokio::io::duplex(1024);
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(client_io))
+            .await
+            .unwrap();
+    let driver = tokio::spawn(connection);
+    let server = tokio::spawn(async move {
+        let mut request = [0; 1024];
+        server_io.read(&mut request).await.unwrap();
+        server_io
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status} Scripted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        server_io.write_all(&data[..1]).await.unwrap();
+        let mut eof = [0; 1];
+        tokio::select! {
+            _ = tokio::time::sleep(body_delay) => {
+                // Cutting an oversized body may close the socket during the write.
+                if server_io.write_all(&data[1..]).await.is_err() { return true; }
+                let _ = server_io.shutdown().await;
+                matches!(server_io.read(&mut eof).await, Ok(0) | Err(_))
+            }
+            result = server_io.read(&mut eof) => matches!(result, Ok(0) | Err(_)),
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let response = crate::tor_http_get_response(
+        max_bytes,
+        timeout_ms,
+        |_| None,
+        |guard, explicit_deadline| async move {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("http://local/params")
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .map_err(HttpError::from)?;
+            guard.filter(Ok(response.status()));
+            let (parts, body) = response.into_parts();
+            let parsed = timeout(
+                Duration::from_secs(60),
+                guard.parse_get(body, explicit_deadline),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(
+                    HttpError::Timeout(zcash_client_backend::tor::http::TimeoutPhase::ResponseBody)
+                        .into(),
+                )
+            })?;
+            Ok(http::Response::from_parts(parts, parsed))
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    // Do not abort these tasks: the body/socket must be released by the production path.
+    timeout(Duration::from_secs(1), driver)
+        .await
+        .expect("body release must stop the connection driver")
+        .expect("driver must not panic")
+        .expect("driver must close cleanly");
+    let client_eof = timeout(Duration::from_secs(1), server)
+        .await
+        .expect("the server must observe client closure")
+        .expect("server must not panic");
+    ParsedGetOutcome {
+        response,
+        elapsed,
+        client_eof,
+    }
+}
+
+async fn slow_body_get(timeout_ms: Option<u64>, delay: Duration) -> ParsedGetOutcome {
+    parsed_get(
+        timeout_ms,
+        delay,
+        200,
+        Bytes::from_static(b"test"),
+        crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+    )
+    .await
+}
+
+// Break caught: collecting inside the backend parser silently overrides a 30-minute budget.
+#[tokio::test(start_paused = true)]
+async fn explicit_get_body_can_complete_after_backend_sixty_seconds() {
+    let outcome = slow_body_get(Some(1_800_000), Duration::from_secs(61)).await;
+    let response = outcome
+        .response
+        .expect("the explicit GET deadline permits a body longer than 60 seconds");
+    assert_eq!(response.body(), b"test".as_slice());
+    assert_eq!(outcome.elapsed, Duration::from_secs(61));
+    assert!(outcome.client_eof);
+}
+
+#[tokio::test(start_paused = true)]
+async fn untimed_get_retains_backend_sixty_second_body_timeout() {
+    let outcome = slow_body_get(None, Duration::from_secs(61)).await;
+    let error = outcome
+        .response
+        .expect_err("legacy GET keeps its backend timer");
+    assert!(
+        error.to_string().contains("reading the response body"),
+        "{error}"
+    );
+    assert_eq!(outcome.elapsed, Duration::from_secs(60));
+    assert!(outcome.client_eof);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_get_body_expiry_drops_connection_at_total_deadline() {
+    for (deadline_ms, expected) in [
+        (1_800_000, Duration::from_secs(1800)),
+        (7, Duration::from_millis(7)),
+    ] {
+        let outcome = slow_body_get(Some(deadline_ms), Duration::from_secs(1801)).await;
+        assert_eq!(
+            outcome
+                .response
+                .expect_err("pending body must expire")
+                .to_string(),
+            "Tor HTTP request timed out"
+        );
+        assert_eq!(outcome.elapsed, expected);
+        assert!(
+            outcome.client_eof,
+            "the pending Incoming must release its socket"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_get_preserves_response_size_and_status_guards() {
+    // The same production collector is parameterized: small bounds prove both sides of
+    // the success ceiling without allocating a 257 MiB response in a unit test.
+    assert_eq!(crate::TOR_HTTP_MAX_RESPONSE_BYTES, 269_484_032);
+    for (limit, succeeds) in [(4, true), (3, false)] {
+        let outcome = parsed_get(
+            Some(1000),
+            Duration::ZERO,
+            200,
+            Bytes::from_static(b"test"),
+            limit,
+        )
+        .await;
+        if succeeds {
+            assert_eq!(outcome.response.unwrap().body(), b"test".as_slice());
+        } else {
+            assert!(
+                outcome
+                    .response
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds")
+            );
+        }
+        assert!(outcome.client_eof);
+    }
+    for (length, expected_len) in [(65_536, 65_536), (65_537, 0)] {
+        let outcome = parsed_get(
+            Some(1000),
+            Duration::ZERO,
+            503,
+            Bytes::from(vec![b'e'; length]),
+            3,
+        )
+        .await;
+        let response = outcome
+            .response
+            .expect("error pages preserve their status even when cut");
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.body().len(), expected_len);
+        assert!(outcome.client_eof);
+    }
+}

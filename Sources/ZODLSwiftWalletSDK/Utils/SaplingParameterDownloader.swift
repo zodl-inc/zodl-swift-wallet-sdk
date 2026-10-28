@@ -210,21 +210,24 @@ private extension SaplingParameterDownloader {
 
         task.resume()
     }
+}
 
+extension SaplingParameterDownloader {
     /// Download a file over Tor using TorClient.
-    /// Note: TorClient.httpRequest returns Data in memory (~47 MB for Sapling params).
+    /// The async GET shares one 30-minute budget across admission, retries, and body collection.
     static func downloadFileWithTor(
         _ sourceURL: URL,
         at destination: URL,
         logger: Logger,
-        torClient: TorClient,
+        torClient: any SaplingParameterHTTPClient,
         validator: @escaping (URL) throws -> Void
     ) async throws -> URL {
         logger.debug("Downloading sapling file from \(sourceURL) via Tor")
 
         let request = URLRequest(url: sourceURL)
-        // Sapling parameters are ~48 MB, well under the 256 MiB Tor HTTP limit
-        let (data, response) = try await torClient.httpRequest(for: request, maxBytes: (256 * 1024 * 1024) + (1024 * 1024), retryLimit: 2)
+        // The async GET retains the native 257 MiB success / 64 KiB error-body bounds.
+        let (data, response) = try await torClient.httpGet(for: request, retryLimit: 2, timeoutMilliseconds: 1_800_000)
+        try Task.checkCancellation()
 
         guard response.statusCode == 200 else {
             throw ZcashError.saplingParamsDownload(
@@ -243,18 +246,21 @@ private extension SaplingParameterDownloader {
             try data.write(to: tempFile, options: .atomic)
             // Validate BEFORE moving to destination (atomic: download → validate → move)
             try validator(tempFile)
+            try Task.checkCancellation()
             try safelyMoveItem(from: tempFile, to: destination)
             return destination
         } catch {
             try? FileManager.default.removeItem(at: tempFile)
-            if error is ZcashError {
+            if error is ZcashError || error is CancellationError {
                 throw error
             } else {
                 throw ZcashError.saplingParamsCantMoveDownloadedFile(error, sourceURL, destination)
             }
         }
     }
+}
 
+private extension SaplingParameterDownloader {
     /// Safely moves an item to a destination, handling both first-install (destination doesn't exist)
     /// and update (destination exists) scenarios atomically.
     static func safelyMoveItem(from source: URL, to destination: URL) throws {
@@ -272,3 +278,10 @@ private extension SaplingParameterDownloader {
         }
     }
 }
+
+/// The HTTP operation needed by parameter downloads.
+protocol SaplingParameterHTTPClient {
+    func httpGet(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse)
+}
+
+extension TorClient: SaplingParameterHTTPClient {}

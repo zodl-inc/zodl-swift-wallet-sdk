@@ -39,46 +39,135 @@ final class SaplingParameterDownloaderTests: XCTestCase {
         XCTAssertTrue(outputString.contains("raw.githubusercontent.com/zodl-inc/zcash-sapling-params"))
     }
 
-    /// Test that Tor download creates parent directory before writing temp file (Finding C)
-    func testTorDownloadCreatesParentDirectory() async throws {
-        // Create a temp directory for this test
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let nonExistentSubdir = tempDir.appendingPathComponent("missing")
-        let destination = nonExistentSubdir.appendingPathComponent("test.params")
-
-        // Ensure the parent does NOT exist before the test
-        XCTAssertFalse(FileManager.default.fileExists(atPath: nonExistentSubdir.path),
-                       "Test directory should not exist before download")
-
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
+    // Break caught: selecting the legacy synchronous GET drops the explicit per-file budget.
+    func testTorDownloadUsesOneThirtyMinuteGETAndValidatesBeforeInstall() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("missing/test.params")
+        let source = URL(string: "https://example.com/test.params")!
+        let client = SaplingHTTPFixture { request, retry, timeout in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url, source)
+            XCTAssertEqual(retry, 2)
+            XCTAssertEqual(timeout, 1_800_000)
+            return (Data([4, 2]), HTTPURLResponse(url: source, statusCode: 200, httpVersion: nil, headerFields: nil)!)
         }
+        var validated = false
+        let result = try await SaplingParameterDownloader.downloadFileWithTor(
+            source, at: destination, logger: NullLogger(), torClient: client,
+            validator: { temporary in
+                XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+                XCTAssertEqual(try Data(contentsOf: temporary), Data([4, 2]))
+                validated = true
+            }
+        )
+        XCTAssertTrue(validated)
+        XCTAssertEqual(result, destination)
+        XCTAssertEqual(try Data(contentsOf: destination), Data([4, 2]))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destination.deletingLastPathComponent().path), ["test.params"])
+    }
 
-        // Mock a TorClient that returns test data
-        let mockData = Data([0x42, 0x43, 0x44])
-        let mockResponse = HTTPURLResponse(
-            url: URL(string: "https://example.com/test.params")!,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: nil
-        )!
+    func testCancellationAfterHTTPCompletionDoesNotInstall() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("test.params")
+        let source = URL(string: "https://example.com/test.params")!
+        let client = SaplingHTTPFixture { _, _, _ in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return (Data([4, 2]), HTTPURLResponse(url: source, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let task = Task {
+            try await SaplingParameterDownloader.downloadFileWithTor(
+                source, at: destination, logger: NullLogger(), torClient: client,
+                validator: { _ in XCTFail("Cancelled data must not reach the validator") }
+            )
+        }
+        do {
+            _ = try await task.value
+            XCTFail("A cancelled download must not install")
+        } catch is CancellationError {
+            // Expected cancellation propagates without creating a file.
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
 
-        // The actual SaplingParameterDownloader.downloadViaTor method creates the directory
-        // This test verifies the fix is in place by checking the code path
-        // Real integration test would require a full Tor client mock
+    func testCancellationDuringValidationRemovesTemporaryFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("test.params")
+        let source = URL(string: "https://example.com/test.params")!
+        let client = SaplingHTTPFixture { _, _, _ in
+            (Data([4, 2]), HTTPURLResponse(url: source, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let task = Task {
+            try await SaplingParameterDownloader.downloadFileWithTor(
+                source, at: destination, logger: NullLogger(), torClient: client,
+                validator: { temporary in
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.path))
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            )
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Cancellation during validation must prevent installation")
+        } catch is CancellationError {
+            // Cancellation stays recognizable after temporary-file cleanup.
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
 
-        // Simulate the fixed code path: create directory, write temp file, validate, move
-        let parentDir = destination.deletingLastPathComponent()
-        let tempFile = parentDir.appendingPathComponent(UUID().uuidString)
+    func testValidationFailurePreservesExistingFileAndRemovesTemporaryFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("test.params")
+        try Data([9]).write(to: destination)
+        let source = URL(string: "https://example.com/test.params")!
+        let client = SaplingHTTPFixture { _, _, _ in
+            (Data([4, 2]), HTTPURLResponse(url: source, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        do {
+            _ = try await SaplingParameterDownloader.downloadFileWithTor(
+                source, at: destination, logger: NullLogger(), torClient: client,
+                validator: { _ in throw ZcashError.saplingParamsInvalidSpendParams }
+            )
+            XCTFail("Invalid data must not install")
+        } catch ZcashError.saplingParamsInvalidSpendParams {
+            // The production validator's error is preserved.
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), Data([9]))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["test.params"])
+    }
 
-        // This should succeed now that createDirectory is in the code
-        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-        try mockData.write(to: tempFile, options: .atomic)
+    func testTransportAndHTTPFailuresDoNotCreateFiles() async throws {
+        for status in [nil, 503] as [Int?] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let source = URL(string: "https://example.com/test.params")!
+            let client = SaplingHTTPFixture { _, _, _ in
+                guard let status else { throw URLError(.networkConnectionLost) }
+                return (Data([4, 2]), HTTPURLResponse(url: source, statusCode: status, httpVersion: nil, headerFields: nil)!)
+            }
+            do {
+                _ = try await SaplingParameterDownloader.downloadFileWithTor(
+                    source, at: directory.appendingPathComponent("test.params"), logger: NullLogger(), torClient: client,
+                    validator: { _ in XCTFail("Failed responses must not reach validation") }
+                )
+                XCTFail("Failed responses must not install")
+            } catch {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+            }
+        }
+    }
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: tempFile.path),
-                      "Temp file should be written after directory is created")
+}
 
-        // Cleanup
-        try? FileManager.default.removeItem(at: tempFile)
+private struct SaplingHTTPFixture: SaplingParameterHTTPClient {
+    var get: (URLRequest, UInt8, UInt64) async throws -> (data: Data, response: HTTPURLResponse)
+
+    func httpGet(for request: URLRequest, retryLimit: UInt8, timeoutMilliseconds: UInt64) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await get(request, retryLimit, timeoutMilliseconds)
     }
 }

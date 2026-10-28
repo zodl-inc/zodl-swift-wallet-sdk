@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Sapling parameter downloads over Tor use one 30-minute total GET budget across admission,
+  retries, and body collection. A slow valid body can complete after the backend's default
+  60-second body timeout. Downloads still validate before atomic installation, retain their
+  response-size limits, and discard temporary files on failure or cancellation.
+
 - `SlipstreamSynchronizer.switchTo(endpoint:)` and `restartSync(at:)` now move retained Swift
   RPC consumers to the selected endpoint along with the sync engine, including public server ↔ OHTTP
   gateway transitions. Selecting a server after a wipe also updates RPC routing while leaving the
