@@ -80,6 +80,39 @@ impl Account {
             uivk,
         })
     }
+
+    /// Frees the strings this value owns. A null string is skipped, so this does nothing for
+    /// [`Account::NOT_FOUND`].
+    ///
+    /// # Safety
+    ///
+    /// - Each non-null string of `self` must have come from [`Account::from_account`] and must
+    ///   not have been freed yet.
+    unsafe fn free_strings(self) {
+        for string in [self.account_name, self.key_source, self.ufvk, self.uivk] {
+            if !string.is_null() {
+                unsafe { zcashlc_string_free(string) }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Account {
+    /// The account's uuid, all zero for [`Account::NOT_FOUND`].
+    pub(crate) fn uuid_bytes(&self) -> [u8; 16] {
+        self.uuid_bytes
+    }
+
+    /// The account's name, or `None` when it has none.
+    pub(crate) fn account_name(&self) -> Option<String> {
+        (!self.account_name.is_null()).then(|| {
+            unsafe { std::ffi::CStr::from_ptr(self.account_name) }
+                .to_str()
+                .expect("the name is UTF-8")
+                .to_owned()
+        })
+    }
 }
 
 /// Frees an [`Account`] value
@@ -91,19 +124,57 @@ impl Account {
 pub unsafe extern "C" fn zcashlc_free_account(ptr: *mut Account) {
     if !ptr.is_null() {
         let account: Box<Account> = unsafe { Box::from_raw(ptr) };
-        if !(account.account_name.is_null()) {
-            unsafe { zcashlc_string_free(account.account_name) }
-        }
-        if !(account.key_source.is_null()) {
-            unsafe { zcashlc_string_free(account.key_source) }
-        }
-        if !(account.ufvk.is_null()) {
-            unsafe { zcashlc_string_free(account.ufvk) }
-        }
-        if !(account.uivk.is_null()) {
-            unsafe { zcashlc_string_free(account.uivk) }
-        }
-        drop(account);
+        unsafe { account.free_strings() }
+    }
+}
+
+/// What importing a unified full viewing key would do, given the account in the wallet that
+/// shares an incoming viewing key component (Orchard, Sapling or transparent P2PKH) with it. The
+/// values are part of the C contract.
+///
+/// cbindgen:prefix-with-name
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountKeyOverlapKind {
+    /// No account shares a component with the key. Importing it adds an account.
+    None = 0,
+    /// The account's viewing key already covers every item of the key: the key is identical to
+    /// it, or carries a subset of its items. Importing the key fails.
+    AlreadyImported = 1,
+    /// The key carries every incoming viewing key item of the account, and something the
+    /// account's viewing key does not cover: another item, or an item with a different outgoing
+    /// viewing key. Importing the key adds no account: it replaces the account's viewing key
+    /// with the key.
+    WouldUpgrade = 2,
+    /// The key shares at least one component with the account, but lacks or changes another.
+    /// Importing the key fails.
+    Conflicting = 3,
+    /// The key's components match more than one account. Importing the key fails.
+    MultipleAccounts = 4,
+}
+
+/// The account in the wallet that shares an incoming viewing key component with a unified full
+/// viewing key, with what importing the key would do to it.
+///
+/// `account` is [`Account::NOT_FOUND`] when `kind` is [`AccountKeyOverlapKind::None`] or
+/// [`AccountKeyOverlapKind::MultipleAccounts`].
+#[repr(C)]
+pub struct AccountKeyOverlap {
+    pub(crate) kind: AccountKeyOverlapKind,
+    pub(crate) account: Account,
+}
+
+/// Frees an [`AccountKeyOverlap`] value, with the strings of its account.
+///
+/// # Safety
+///
+/// - `ptr` must be null, or must point to a struct having the layout of [`AccountKeyOverlap`]
+///   that `zcashlc_find_account_key_overlap` returned and that has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_account_key_overlap(ptr: *mut AccountKeyOverlap) {
+    if !ptr.is_null() {
+        let overlap: Box<AccountKeyOverlap> = unsafe { Box::from_raw(ptr) };
+        unsafe { overlap.account.free_strings() }
     }
 }
 
@@ -1167,7 +1238,7 @@ impl Address {
         address: UnifiedAddress,
         diversifier_index: DiversifierIndex,
     ) -> Self {
-        let address_str = address.encode_receiver_preserving(network);
+        let address_str = address.encode(network);
         Self {
             address: CString::new(address_str).unwrap().into_raw(),
             diversifier_index_bytes: *diversifier_index.as_bytes(),

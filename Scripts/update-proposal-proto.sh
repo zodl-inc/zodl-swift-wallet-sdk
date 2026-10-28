@@ -48,51 +48,91 @@ usage() {
     exit "${1:-1}"
 }
 
-# Prints "<version><TAB><source>" for CRATE's entry in Cargo.lock. Cargo.lock
-# separates [[package]] blocks with a blank line, which is what delimits a
-# record here.
+# Prints version, source, and archive checksum from the exact lock entry.
 read_lock_entry() {
     awk -v want="${CRATE}" '
-        /^\[\[package\]\]$/ { name = ""; version = ""; source = ""; next }
+        function emit() {
+            if (name == want) { print version "\t" source "\t" checksum; found = 1 }
+        }
+        /^\[\[package\]\]$/ {
+            emit()
+            if (found) exit
+            name = ""; version = ""; source = ""; checksum = ""; next
+        }
         /^name = / { gsub(/^name = "|"$/, ""); name = $0; next }
         /^version = / { gsub(/^version = "|"$/, ""); version = $0; next }
         /^source = / { gsub(/^source = "|"$/, ""); source = $0; next }
-        /^$/ { if (name == want) { print version "\t" source; exit } }
-        END { if (name == want) print version "\t" source }
+        /^checksum = / { gsub(/^checksum = "|"$/, ""); checksum = $0; next }
+        END { if (!found) emit() }
     ' "${LOCK}"
 }
 
-# The git ref carrying the proto for the pinned dependency. A crates.io release
-# is tagged `<crate>-<version>`; a git dependency pins an exact revision, which
-# Cargo.lock records as the fragment of the source URL. Resolving the ref from
-# the lockfile rather than from Cargo.toml keeps this correct while a
-# librustzcash git override is in use.
-upstream_ref() {
-    local entry version source
+# Registry tags need not exist. The checksum-verified published archive records
+# the source commit and crate directory in .cargo_vcs_info.json. Read only that
+# member rather than extracting an untrusted archive onto the filesystem.
+upstream_location() {
+    local entry version source checksum archive
     entry="$(read_lock_entry)"
-
     if [ -z "${entry}" ]; then
         echo "error: no ${CRATE} entry in ${LOCK}." >&2
-        exit 1
+        return 1
     fi
-
-    version="${entry%%$'\t'*}"
-    source="${entry#*$'\t'}"
+    IFS=$'\t' read -r version source checksum <<< "${entry}"
 
     case "${source}" in
-        registry+*)
-            echo "${CRATE}-${version}"
+        registry+https://github.com/rust-lang/crates.io-index)
+            if [[ ! "${version}" =~ ^[0-9A-Za-z.+-]+$ ]] ||
+               [[ ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "error: invalid registry version or checksum for ${CRATE}." >&2
+                return 1
+            fi
+            archive="${WORK_DIR}/crate.tar.gz"
+            if ! curl -fsSL "https://static.crates.io/crates/${CRATE}/${CRATE}-${version}.crate" -o "${archive}"; then
+                echo "error: could not fetch ${CRATE} ${version} archive." >&2
+                return 1
+            fi
+            python3 - "${archive}" "${checksum}" "${CRATE}-${version}" <<'PYTHON'
+import hashlib
+import json
+import re
+import sys
+import tarfile
+
+archive, checksum, crate = sys.argv[1:]
+try:
+    with open(archive, "rb") as source:
+        if hashlib.sha256(source.read()).hexdigest() != checksum:
+            raise ValueError("crate checksum mismatch")
+    with tarfile.open(archive, "r:gz") as source:
+        name = crate + "/.cargo_vcs_info.json"
+        members = [member for member in source.getmembers() if member.name == name]
+        if len(members) != 1 or not members[0].isfile() or members[0].size > 65536:
+            raise ValueError("missing or invalid crate provenance")
+        with source.extractfile(members[0]) as metadata_file:
+            metadata = json.load(metadata_file)
+    revision = metadata["git"]["sha1"]
+    path = metadata["path_in_vcs"]
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        raise ValueError("invalid source revision")
+    if (not isinstance(path, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", path)
+            or any(part in (".", "..") for part in path.split("/"))):
+        raise ValueError("invalid crate source path")
+    print(revision + "\t" + path + "/proto/proposal.proto")
+except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
+    sys.exit("error: invalid crate provenance: " + str(error))
+PYTHON
             ;;
         git+*)
-            if [ "${source}" = "${source#*#}" ]; then
-                echo "error: git source for ${CRATE} pins no revision: ${source}" >&2
-                exit 1
+            local revision="${source##*#}"
+            if [[ "${source}" != *'#'* ]] || [[ ! "${revision}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                echo "error: git source for ${CRATE} pins no valid revision." >&2
+                return 1
             fi
-            echo "${source##*#}"
+            printf '%s\t%s\n' "${revision}" "${UPSTREAM_PATH}"
             ;;
         *)
             echo "error: unrecognized source for ${CRATE}: '${source}'." >&2
-            exit 1
+            return 1
             ;;
     esac
 }
@@ -100,11 +140,10 @@ upstream_ref() {
 # Writes the derived proto for the given upstream ref to stdout.
 derive() {
     local ref="$1"
-    local url="https://raw.githubusercontent.com/${UPSTREAM_REPO}/${ref}/${UPSTREAM_PATH}"
+    local path="$2"
+    local url="https://raw.githubusercontent.com/${UPSTREAM_REPO}/${ref}/${path}"
     local upstream
-    upstream="$(mktemp)"
-    # shellcheck disable=SC2064 # expand the path now, while it is still in scope
-    trap "rm -f '${upstream}'" RETURN
+    upstream="${WORK_DIR}/upstream.proto"
 
     if ! curl -fsSL "${url}" -o "${upstream}"; then
         echo "error: could not fetch ${url}" >&2
@@ -146,12 +185,28 @@ EOF
 
 main() {
     local mode="${1:-update}"
-    local ref
-    ref="$(upstream_ref)"
+    local location ref path
+    WORK_DIR="$(mktemp -d)"
+    readonly WORK_DIR
+    trap 'rm -rf "${WORK_DIR}"' EXIT
+    location="$(upstream_location)"
+    IFS=$'\t' read -r ref path <<< "${location}"
+    # Stage beside the destination so the final rename is atomic even when the
+    # system temporary directory is on a different filesystem.
+    if [ "${mode}" = update ]; then
+        DERIVED_FILE="$(mktemp "${DEST}.XXXXXX")"
+    else
+        DERIVED_FILE="${WORK_DIR}/derived.proto"
+    fi
+    trap 'rm -rf "${WORK_DIR}"; rm -f "${DERIVED_FILE}"' EXIT
+    if [ "${mode}" = update ] && [ -e "${DEST}" ]; then
+        cp -p "${DEST}" "${DERIVED_FILE}"
+    fi
+    derive "${ref}" "${path}" > "${DERIVED_FILE}"
 
     case "${mode}" in
         update)
-            derive "${ref}" > "${DEST}"
+            mv "${DERIVED_FILE}" "${DEST}"
             echo "Derived ${DEST} from ${UPSTREAM_REPO}@${ref}."
             echo
             echo "proposal.pb.swift is committed and is NOT regenerated by this"
@@ -161,13 +216,7 @@ main() {
             echo "builds that plugin."
             ;;
         check)
-            local derived
-            derived="$(mktemp)"
-            # shellcheck disable=SC2064 # expand the path now, while it is in scope
-            trap "rm -f '${derived}'" EXIT
-            derive "${ref}" > "${derived}"
-
-            if diff -u "${DEST}" "${derived}"; then
+            if diff -u "${DEST}" "${DERIVED_FILE}"; then
                 echo "${DEST} matches ${UPSTREAM_REPO}@${ref}."
             else
                 echo >&2

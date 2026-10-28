@@ -148,14 +148,23 @@ public enum ZcashSDK {
     /// silently at the next network upgrade the way a copied literal does.
     public static let nu63ConsensusBranchID: ConsensusBranchID = 0x37a5_165b
 
+    /// The consensus branch ID of NU7, published for the same reason as ``nu63ConsensusBranchID``: a
+    /// host that names the active consensus era reads it from the SDK instead of copying a literal.
+    public static let nu7ConsensusBranchID: ConsensusBranchID = 0x7719_0ad9
+
     /// The number of zatoshi that equal 1 ZEC.
     public static let zatoshiPerZEC: BlockHeight = 100_000_000
 
     /// The theoretical maximum number of blocks in a reorg, due to other bottlenecks in the protocol design.
     public static let maxReorgSize = 100
 
-    /// The amount of blocks ahead of the current height where new transactions are set to expire. This value is controlled
-    /// by the rust backend but it is helpful to know what it is set to and should be kept in sync.
+    /// A fixed offset that does not match the expiry of SDK-built transactions (40 blocks after the target height
+    /// before NU7, 120 from NU7).
+    @available(
+        *,
+        deprecated,
+        message: "Not the expiry delta of SDK-built transactions (40 blocks before NU7, 120 from NU7); read a transaction's expiryHeight instead."
+    )
     public static let expiryOffset = 20
 
     // MARK: Defaults
@@ -221,7 +230,12 @@ public enum ZcashSDK {
     // swiftlint:disable:next force_unwrapping
     public static let outputParamFileURL = URL(string: cloudParameterURL)!.appendingPathComponent(outputParamFilename)
 
-    /// A constant that helps determine if a server’s chain tip is so far away from the estimated height that we consider the server out of sync
+    /// The most blocks a server's tip could trail its estimate before the SDK ruled it out; the SDK now allows six hours of target block time.
+    @available(
+        *,
+        deprecated,
+        message: "Measure a server's lag with TargetBlockSpacing.seconds(from:to:); 288 blocks are six hours only at 75-second blocks."
+    )
     public static let syncedThresholdBlocks = UInt64(288)
 }
 

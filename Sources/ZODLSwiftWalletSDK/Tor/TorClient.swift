@@ -412,19 +412,13 @@ public class TorLwdConn {
 
         defer { zcashlc_free_boxed_slice(txPtr) }
 
-        let isNotMined = height == 0 || height > UInt32.max
-
-        return (
-            tx:
-                ZcashTransaction.Fetched(
-                    rawID: txId,
-                    minedHeight: isNotMined ? nil : UInt32(height),
-                    raw: Data(
-                        bytes: txPtr.pointee.ptr,
-                        count: Int(txPtr.pointee.len)
-                    )
-                ),
-            status: isNotMined ? .notInMainChain : .mined(Int(height))
+        return ZcashTransaction.Fetched.returned(
+            rawID: txId,
+            raw: Data(
+                bytes: txPtr.pointee.ptr,
+                count: Int(txPtr.pointee.len)
+            ),
+            atServerHeight: height
         )
     }
 

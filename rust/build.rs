@@ -67,6 +67,8 @@ fn main() {
         .rename_item("GiftCardLink", "FfiGiftCardLink")
         .rename_item("GiftCardOrigin", "FfiGiftCardOrigin")
         .rename_item("GiftCardLinkError", "FfiGiftCardLinkError")
+        .rename_item("AccountKeyOverlap", "FfiAccountKeyOverlap")
+        .rename_item("AccountKeyOverlapKind", "FfiAccountKeyOverlapKind")
         .generate()
     {
         b.write_to_file("target/Headers/zcashlc.h");

@@ -35,6 +35,9 @@ Usage: ./Scripts/release.sh [--dry-run] <remote> <version>
 Tag and publish a release whose pull request has already merged into
 release/X.Y.Z. Run it from that branch.
 
+Build metadata (+suffix) is unsupported in requested release versions, including
+dry runs and resumed builds. Stable and prerelease versions are supported.
+
 Options:
   --dry-run  print what would happen and change nothing
 EOF
@@ -60,6 +63,7 @@ main() {
     fi
     remote="$1"
     version="${2#v}"
+    require_supported_release_version "$version"
     release_branch="release/${version}"
     # Every `gh release edit` below carries this, including the ones quoted in
     # the recovery instructions, so a hand-finished release ends up with the

@@ -55,7 +55,7 @@ Scripts:
 
 For FFI work, open `ZcashSDK.xcworkspace` (not `Package.swift`) so `FFIBuilder` auto-runs. After switching modes or if headers look stale, in Xcode: Cmd+Shift+K, then File > Packages > Reset Package Caches. When modifying the Rust/Swift FFI boundary, run the full `init-local-ffi.sh` before PRing — `rebuild-local-ffi.sh` only covers one arch.
 
-The `Makefile` wraps these (`make ffi-macos`, `make ffi-all`, `make init-ffi`, `make rebuild-ffi`, `make reset-ffi`, `make configure-local-ffi`); CI calls the targets, so prefer them over the scripts directly. `make help` lists everything.
+The `Makefile` wraps these (`make ffi-ci`, `make ffi-macos`, `make ffi-all`, `make init-ffi`, `make rebuild-ffi`, `make reset-ffi`, `make configure-local-ffi`); CI calls the targets, so prefer them over the scripts directly. `make help` lists everything.
 
 See `docs/LOCAL_DEVELOPMENT.md` for the full reference.
 
@@ -198,7 +198,7 @@ rather than a second table reader.
 ## Pre-push validation
 
 Before opening a PR or pushing to an existing PR branch, run the checks CI runs.
-On a cache miss CI builds the Rust FFI from source (30-minute timeout) before it
+On a cache miss CI builds the Rust FFI from source (60-minute timeout) before it
 compiles a line of Swift, so a mistake that a local build would have caught in a
 minute can cost most of an hour to surface.
 
@@ -208,13 +208,14 @@ hand-written `swift` command:
 
 | Workflow | Trigger | Local equivalent |
 |---|---|---|
-| `swift.yml` | any PR outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
+| `swift.yml` | any PR, and any push to `main`, outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
 | `swiftlint.yml` | any PR touching `**/*.swift` or `.swiftlint.yml` | `make lint` |
 | `proto-sync.yml` | any PR outside its `paths-ignore` list | `./Scripts/update-proposal-proto.sh --check` |
 | `zizmor.yml` | every PR | matters when you change a workflow file |
 
 `codeql.yml` does **not** run per PR — only on merges to `main` and weekly,
-because its Swift matrix entry needs `build-mode: manual` and a full FFI build.
+because its Swift matrix entry needs `build-mode: manual` and an FFI build
+(`make ffi-ci`).
 
 The `paths-ignore` list is specific: `README.md`, `CHANGELOG.md`,
 `CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `SECURITY.md`,
@@ -231,11 +232,13 @@ enforces and cannot pass locally and fail there.
 The package cannot build without an `libzcashlc` XCFramework. On a fresh
 checkout `swift build` downloads the published binary named in `Package.swift`;
 that binary is stale the moment your branch changes anything under `rust/`.
-`make ffi-macos` reproduces the CI "Build FFI for macOS" step exactly, and the
-macOS slice alone is enough to build and test the Swift package:
+`make ffi-ci` reproduces the CI "Build FFI for macOS" step exactly: the arm64
+macOS slice alone, built without the release profile's whole-program LTO. That
+is enough to build and test the Swift package on Apple Silicon; `make ffi-macos`
+builds the universal macOS slice with release settings instead.
 
 ```bash
-make ffi-macos           # once per branch, and after each Rust edit
+make ffi-ci              # once per branch, and after each Rust edit
 make configure-local-ffi # point Package.swift at the local build
 make check               # build, the offline suite, then the Rust tests
 ```
@@ -252,14 +255,14 @@ says nothing about them; `swift.yml` runs both.
 | Any other doc, including this one | `make check` — the build runs regardless |
 | Swift style or rename | `make lint` |
 | Swift logic or refactor | `make check`, then `make lint` |
-| Rust internals | `make ffi-macos`, then `make check` (which runs `make test-rust`) |
+| Rust internals | `make ffi-ci`, then `make check` (which runs `make test-rust`) |
 | Any change to an FFI signature or a new FFI function | `make ffi-all` (all five architectures) before PRing |
 | Bumping the pinned `zcash_client_backend` | `./Scripts/update-proposal-proto.sh --check` |
 
-`make ffi-macos` and `make rebuild-ffi` cover one architecture. A mismatch
-between the generated `zcashlc.h` and the Swift call site compiles cleanly on
-both sides and fails at *runtime*, so a change to the Swift↔Rust boundary needs
-a real build and the offline suite — never a lint pass alone.
+`make ffi-ci`, `make ffi-macos` and `make rebuild-ffi` cover a single platform.
+A mismatch between the generated `zcashlc.h` and the Swift call site compiles
+cleanly on both sides and fails at *runtime*, so a change to the Swift↔Rust
+boundary needs a real build and the offline suite — never a lint pass alone.
 
 ## Worktree layout
 

@@ -111,3 +111,21 @@ test_artifacts_help_restricts_overwrite_to_drafts() {
         sh -c "'$REPO_ROOT/Scripts/prepare-release.sh' artifacts --help |
                grep -A1 -- --force-overwrite-existing-release | grep -q DRAFT"
 }
+
+test_native_sdk_build_record_suite() {
+    assert_succeeds "native artifacts source and build evidence" \
+        python3 -m unittest discover -s "$REPO_ROOT/Scripts/tests" -p test_sdk_build_record.py
+}
+
+# Release requests must reject metadata even in dry runs with evidence disabled.
+test_native_metadata_policy() {
+    assert_succeeds "native release metadata requests stop before effects" \
+        python3 -B -m unittest discover -s "$REPO_ROOT/Scripts/tests" -p test_sdk_build_record.py -k metadata
+}
+
+test_native_request_policy_preserves_prereleases() {
+    local version
+    for version in 5.0.0 5.0.0-rc.1 5.0.0-alpha.7; do
+        assert_succeeds "supported request $version" require_supported_release_version "$version"
+    done
+}

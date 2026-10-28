@@ -99,6 +99,25 @@ final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
         try await fixture.redeemer.cleanup()
     }
 
+    // The server's height is the first request of a submission, so a server that cannot be asked for it is a claim that did not reach
+    // the server. It is returned the way any other failure to reach it is, as a result, and does not throw away the redemption.
+    func testUnreadableServerHeightIsReturnedAsAGrpcFailureWithoutDestinationRecording() async throws {
+        let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)
+        let destination = try GiftCardDestinationFixture.make(storageDirectory: testTempDirectory, slipstream: true)
+        _ = try await fixture.redeemer.check()
+        fixture.service.latestBlockHeightModeClosure = { _ in
+            throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+        }
+        let result = try await fixture.redeemer.redeem(
+            to: fixture.card.fundingAddress, memo: nil, recordIn: destination.synchronizer
+        )
+        XCTAssertEqual(result.results, [.grpcFailure(txId: Data(repeating: 0xA1, count: 32), error: .timeOut)])
+        XCTAssertFalse(result.recordedInDestination)
+        XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 0)
+        XCTAssertEqual(destination.backend.decryptAndStoreTransactionTxBytesMinedHeightCallsCount, 0)
+        try await fixture.redeemer.cleanup()
+    }
+
     private func assertConcreteDestination(slipstream: Bool) async throws {
         let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)
         let destination = try GiftCardDestinationFixture.make(storageDirectory: testTempDirectory, slipstream: slipstream)

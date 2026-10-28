@@ -20,10 +20,17 @@ No manual `Package.swift` edits are needed.
 
 ## Prerequisites
 
-1. **Rust toolchain** — Install via [rustup](https://rustup.rs/):
+1. **Rust toolchain** — Rust 1.97 or newer is required, matching `rust-version` in `Cargo.toml`. Install via [rustup](https://rustup.rs/):
    ```bash
    curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh
    ```
+
+   If you already have Rust installed (for example, Rust 1.91), update the stable toolchain and verify the compiler version before building:
+   ```bash
+   rustup update stable
+   rustc --version
+   ```
+   The reported version must be 1.97 or newer.
 
 2. **Apple platform targets** — Install the required Rust targets:
    ```bash

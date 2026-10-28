@@ -40,6 +40,15 @@ enum Environment {
     }
 }
 
+/// Runs `body` with a new, empty directory, and removes the directory afterwards.
+func withTemporaryDirectory(_ body: (URL) async throws -> Void) async throws {
+    let directory = Environment.uniqueTestTempDirectory
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    try await body(directory)
+}
+
 public enum Constants {
     static let address: String = ProcessInfo.processInfo.environment[Environment.lightwalletdKey] ?? "localhost"
 }
@@ -94,11 +103,21 @@ enum MockDbInit {
 /// `TestCoordinator` (`data_db_<ts>.db`, `fs_cache_<ts>`) were never cleaned up —
 /// hundreds of them accumulated in the maintainer's Documents folder. The OS purges
 /// `temporaryDirectory` periodically, so leaked per-run artifacts are self-cleaning.
+///
+/// Each test process gets a directory of its own. `temporaryDirectory` is one folder per
+/// user, shared by every process (on macOS, Foundation ignores `TMPDIR`), and the helpers
+/// below hand out fixed names such as `data.db` and `tor`: two test runs at once, from
+/// another worktree or from Xcode next to `swift test`, deleted and re-created each other's
+/// wallet database mid-test.
 func __documentsDirectory() throws -> URL {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("ZcashSDKTests", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    try FileManager.default.createDirectory(at: testProcessDirectory, withIntermediateDirectories: true)
+    return testProcessDirectory
 }
+
+/// Chosen once per test process; see `__documentsDirectory()`.
+private let testProcessDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ZcashSDKTests", isDirectory: true)
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
 func __dataDbURL() throws -> URL {
     try __documentsDirectory().appendingPathComponent("data.db", isDirectory: false)
@@ -157,7 +176,8 @@ extension ZcashRustBackend {
         fsBlockDbRoot: URL,
         spendParamsPath: URL = SaplingParamsSourceURL.default.spendParamFileURL,
         outputParamsPath: URL = SaplingParamsSourceURL.default.outputParamFileURL,
-        networkType: NetworkType
+        networkType: NetworkType,
+        migrationUpgradeGateBypass: MigrationUpgradeGateBypass = MigrationUpgradeGateBypass()
     ) -> ZcashRustBackend {
         ZcashRustBackend(
             dbData: dbData,
@@ -165,7 +185,8 @@ extension ZcashRustBackend {
             spendParamsPath: spendParamsPath,
             outputParamsPath: outputParamsPath,
             networkType: networkType,
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            migrationUpgradeGateBypass: migrationUpgradeGateBypass
         )
     }
 }

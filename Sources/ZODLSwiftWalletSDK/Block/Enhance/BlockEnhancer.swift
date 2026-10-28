@@ -223,8 +223,7 @@ extension BlockEnhancerImpl: BlockEnhancer {
                             let stream = try service.getTaddressTransactions(filter, mode: .direct)
 
                             for try await rawTransaction in stream {
-                                let minedHeight = (rawTransaction.height == 0 || rawTransaction.height > UInt32.max)
-                                ? nil : UInt32(rawTransaction.height)
+                                let minedHeight = BlockHeight(minedServerHeight: rawTransaction.height).map { UInt32($0) }
 
                                 // Ignore transactions that don't match the status filter.
                                 if (tia.txStatusFilter == .mined && minedHeight == nil) || (tia.txStatusFilter == .mempool && minedHeight != nil) {

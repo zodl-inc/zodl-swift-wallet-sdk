@@ -77,6 +77,12 @@ public protocol Broadcaster: AnyObject {
     /// endpoint list returns `.unreachable` immediately and records no retry
     /// plan — the transaction stays awaiting.
     ///
+    /// Before the transaction goes to an endpoint, the SDK reads that
+    /// endpoint's latest block height and refuses to submit a transaction that
+    /// cannot be valid in the next block, which is the one after the higher of
+    /// that height and the wallet's chain tip. Each endpoint is judged at its
+    /// own height. See ``TransactionSubmissionOutcome/rejected(code:message:)``.
+    ///
     /// If the surrounding task is cancelled, the call returns `.cancelled`
     /// promptly while in-flight submissions wind down in the background.
     func submit(
@@ -226,6 +232,14 @@ public enum TransactionSubmissionOutcome: Equatable {
     case accepted(by: LightWalletEndpoint)
     /// Every endpoint responded and none accepted. Carries the first
     /// lightwalletd rejection (error code + message) that was observed.
+    ///
+    /// Before it submits the transaction to an endpoint, the SDK reads that
+    /// endpoint's latest block height and refuses to submit a transaction that
+    /// cannot be valid in the next block (see ``TransactionSubmissionRefusal``).
+    /// An endpoint that was refused counts as a rejection, under the refusal's
+    /// local code, `-9101` or `-9102`, and its stable description, which no
+    /// server sends; nothing reached that endpoint. An endpoint whose height
+    /// cannot be read counts as unreachable.
     case rejected(code: Int, message: String)
     /// Every endpoint failed at the transport level (gRPC/connection error);
     /// no server-level rejection was observed.

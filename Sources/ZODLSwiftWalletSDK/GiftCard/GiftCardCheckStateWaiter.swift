@@ -2,7 +2,8 @@ import Combine
 import Foundation
 
 /// One attempt observes coherent balances and host recovery without changing sync policy.
-/// NSLock supports the SDK's iOS 13 / macOS 12 floors. Disposal runs outside the lock.
+/// NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
+/// iOS 16 / macOS 13. Disposal runs outside the lock.
 final class GiftCardCheckStateWaiter: @unchecked Sendable {
     private struct EmptyCandidate {
         let tip: BlockHeight

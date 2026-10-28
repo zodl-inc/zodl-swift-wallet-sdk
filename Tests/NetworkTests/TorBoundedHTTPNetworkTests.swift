@@ -247,7 +247,8 @@ private final class TorNetworkFixture: @unchecked Sendable {
     }
 }
 
-/// NSLock supports the SDK's macOS 12 / iOS 13 deployment floors.
+/// NSLock dates from the SDK's macOS 12 / iOS 13 floor, below OSAllocatedUnfairLock's
+/// macOS 13 / iOS 16.
 /// Only records real native outcomes. In particular, get never calls lastErrorMessage.
 private final class TorNativeObserver: @unchecked Sendable {
     private let lock = NSLock()

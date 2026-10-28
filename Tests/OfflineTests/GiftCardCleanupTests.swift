@@ -48,7 +48,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         try Data([1]).write(to: marker)
         let stopEntered = XCTestExpectation(description: "gift cleanup reached engine stop")
         if phase == .syncing {
-            await fixture.engine.onCall("stop") { stopEntered.fulfill() }
+            await fixture.engine.onCall("stopForWalletChange") { stopEntered.fulfill() }
         }
         let deadline = clock.expectSleep(at: 30_000_000_000)
         let cleanup = startCleanup(fixture.redeemer)
@@ -67,9 +67,9 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let callsBeforeRelease = await fixture.engine.calls
         XCTAssertFalse(callsBeforeRelease.contains("close"))
         if phase == .starting {
-            XCTAssertFalse(callsBeforeRelease.contains("stop"))
+            XCTAssertFalse(callsBeforeRelease.contains(where: GatedFakeSlipstreamEngine.isStop))
         } else {
-            XCTAssertFalse(callsBeforeRelease.contains("stop:done"))
+            XCTAssertFalse(callsBeforeRelease.contains { $0 == "stop:done" || $0 == "stopForWalletChange:done" })
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         assertAlreadyActive(card: fixture.card)
@@ -81,7 +81,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         try await waitForRelease(card: fixture.card)
         try await fixture.redeemer.cleanup()
         let calls = await fixture.engine.calls
-        XCTAssertEqual(calls.filter { $0 == "stop" }.count, 1)
+        XCTAssertEqual(calls.filter { $0 == "stopForWalletChange" }.count, 1)
         XCTAssertEqual(calls.filter { $0 == "close" }.count, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         let replacement = try makeReplacement(card: fixture.card)
@@ -125,7 +125,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
             }
 
             let callsDuringRead = await fixture.engine.calls
-            XCTAssertFalse(callsDuringRead.contains("stop"))
+            XCTAssertFalse(callsDuringRead.contains(where: GatedFakeSlipstreamEngine.isStop))
             XCTAssertFalse(callsDuringRead.contains("close"))
             XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
             assertAlreadyActive(card: fixture.card)
@@ -135,7 +135,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
             try await waitForRelease(card: fixture.card)
             try await fixture.redeemer.cleanup()
             let calls = await fixture.engine.calls
-            XCTAssertEqual(calls.filter { $0 == "stop" }.count, 1)
+            XCTAssertEqual(calls.filter { $0 == "stopForWalletChange" }.count, 1)
             XCTAssertEqual(calls.filter { $0 == "close" }.count, 1)
             XCTAssertEqual(fixture.repository.findForResubmissionUpToCallsCount, 1)
             XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
@@ -153,12 +153,12 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let root = testTempDirectory.appendingPathComponent(fixture.card.synchronizerAlias.description)
         let marker = root.appendingPathComponent("wallet-marker")
         try Data([1]).write(to: marker)
-        fixture.engine.stopQuiescent = false
+        fixture.engine.stopReport = .passStillRunning
         do {
             try await fixture.redeemer.cleanup()
             XCTFail("A refused wipe must propagate its error")
         } catch {
-            XCTAssertEqual(error as? ZcashError, .slipstreamEngineNotQuiescent)
+            XCTAssertEqual((error as? ZcashError)?.code, .slipstreamEngineNotQuiescent)
         }
         let isOpen = await fixture.engine.isOpen
         XCTAssertTrue(isOpen)
@@ -167,7 +167,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
             XCTAssertEqual(error as? ZcashError, .giftCardRedeemerAlreadyActive)
         }
         XCTAssertEqual(try GiftCardRedeemer.removeLeftoverWallets(in: testTempDirectory), 0)
-        fixture.engine.stopQuiescent = true
+        fixture.engine.stopReport = .quiescent
         try await fixture.redeemer.cleanup()
     }
 
@@ -186,7 +186,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         try Data([1]).write(to: marker)
         engine.stopGate.close()
         let entered = XCTestExpectation(description: "wipe reached stop")
-        await engine.onCall("stop") { entered.fulfill() }
+        await engine.onCall("stopForWalletChange") { entered.fulfill() }
         let cleanup = startCleanup(try XCTUnwrap(fixture).redeemer)
         await fulfillment(of: [entered], timeout: 5)
         cleanup.cancel()
@@ -246,7 +246,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         try Data([1]).write(to: marker)
         engine.stopGate.close()
         let entered = XCTestExpectation(description: "unused wallet wipe reached stop")
-        await engine.onCall("stop") { entered.fulfill() }
+        await engine.onCall("stopForWalletChange") { entered.fulfill() }
         let cleanup = startCleanup(try XCTUnwrap(fixture).redeemer)
         await fulfillment(of: [entered], timeout: 5)
         cleanup.cancel()
@@ -383,7 +383,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let engine = try XCTUnwrap(fixture).engine
         engine.stopGate.close()
         let entered = XCTestExpectation(description: "owned wipe entered stop")
-        await engine.onCall("stop") { entered.fulfill() }
+        await engine.onCall("stopForWalletChange") { entered.fulfill() }
         let first = startCleanup(try XCTUnwrap(fixture).redeemer)
         await fulfillment(of: [entered], timeout: 5)
         let second = startCleanup(try XCTUnwrap(fixture).redeemer)
@@ -416,7 +416,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let card = try XCTUnwrap(fixture).card
         _ = try await fixture?.redeemer.check()
         let engine = try XCTUnwrap(fixture).engine
-        engine.stopQuiescent = false
+        engine.stopReport = .passStillRunning
         weak var old = fixture?.redeemer
         fixture = nil
         XCTAssertNil(old)
@@ -424,7 +424,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         assertAlreadyActive(card: card)
         let open = await engine.isOpen
         XCTAssertTrue(open)
-        engine.stopQuiescent = true
+        engine.stopReport = .quiescent
         clock.advance(to: 1_000_000_000)
         try await waitForRelease(card: card)
         let calls = await engine.calls
@@ -518,18 +518,18 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let engine = fixture.engine
         fixture.service.closeConnectionsClosure = {
             let calls = await engine.calls
-            XCTAssertTrue(calls.contains("stop:done"))
+            XCTAssertTrue(calls.contains("stopForWalletChange:done"))
             XCTAssertTrue(calls.contains("close"))
             serviceEntered.fulfill()
             await serviceGate.wait()
         }
         _ = try await fixture.redeemer.check()
         try Data([1]).write(to: marker)
-        fixture.engine.stopQuiescent = false
+        fixture.engine.stopReport = .passStillRunning
         do { try await fixture.redeemer.cleanup() } catch {}
         XCTAssertEqual(fixture.service.closeConnectionsCallsCount, 0, "Refused wipe must preserve service connections")
         XCTAssertTrue(runtimes.isAlive(runtimes.parent), "Refused wipe must preserve the host runtime")
-        fixture.engine.stopQuiescent = true
+        fixture.engine.stopReport = .quiescent
         let cleanup = startCleanup(fixture.redeemer)
         await fulfillment(of: [serviceEntered, clock.expectSleep(at: 30_000_000_000)], timeout: 5)
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
@@ -626,12 +626,12 @@ final class GiftCardCleanupTests: ZcashTestCase {
         XCTAssertEqual(events.events, ["connect:default", "connect:group"])
         await fixture.engine.onCall("close") { events.append("engine:close") }
 
-        fixture.engine.stopQuiescent = false
+        fixture.engine.stopReport = .passStillRunning
         do {
             try await fixture.redeemer.cleanup()
             XCTFail("Refused wipe must retain the cached native owners")
         } catch {
-            XCTAssertEqual(error as? ZcashError, .slipstreamEngineNotQuiescent)
+            XCTAssertEqual((error as? ZcashError)?.code, .slipstreamEngineNotQuiescent)
         }
         XCTAssertEqual(events.events, ["connect:default", "connect:group"])
         XCTAssertTrue(runtimes.isAlive(runtimes.parent))
@@ -639,10 +639,10 @@ final class GiftCardCleanupTests: ZcashTestCase {
         assertAlreadyActive(card: card)
         XCTAssertEqual(try GiftCardRedeemer.removeLeftoverWallets(in: testTempDirectory), 0)
 
-        fixture.engine.stopQuiescent = true
+        fixture.engine.stopReport = .quiescent
         fixture.engine.stopGate.close()
         let stopEntered = XCTestExpectation(description: "safe cleanup attempt reached engine stop")
-        await fixture.engine.onCall("stop") { stopEntered.fulfill() }
+        await fixture.engine.onCall("stopForWalletChange") { stopEntered.fulfill() }
         let cleanup = startCleanup(fixture.redeemer)
         await fulfillment(of: [stopEntered], timeout: 5)
         cleanup.cancel()

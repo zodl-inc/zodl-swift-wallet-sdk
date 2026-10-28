@@ -1,4 +1,4 @@
-// swift-tools-version:5.6
+// swift-tools-version:5.9
 import PackageDescription
 import Foundation
 
@@ -99,8 +99,8 @@ targets.append(contentsOf: [
 let package = Package(
     name: "zodl-swift-wallet-sdk",
     platforms: [
-        .iOS(.v13),
-        .macOS(.v12)
+        .iOS(.v16),
+        .macOS(.v14)
     ],
     products: [
         .library(
