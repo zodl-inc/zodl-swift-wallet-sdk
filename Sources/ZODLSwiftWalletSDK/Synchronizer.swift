@@ -272,10 +272,10 @@ public protocol Synchronizer: AnyObject {
     /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), carrying both amounts;
     /// a wallet still catching up throws `ZcashError.rustProposalScanRequired` (`ZRUST0153`). A balance spread
     /// over more notes than one transaction can spend within the block size limit throws
-    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`) here rather than when the transaction is
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`) here rather than when the transaction is
     /// created; a memo for a transparent or TEX recipient throws `ZcashError.rustProposalTransparentMemo`
-    /// (`ZRUST0160`); and a recipient with no receiver this wallet can pay throws
-    /// `ZcashError.rustProposalUnsupportedAddress` (`ZRUST0161`). Anything else the rust layer returns
+    /// (`ZRUST0175`); and a recipient with no receiver this wallet can pay throws
+    /// `ZcashError.rustProposalUnsupportedAddress` (`ZRUST0176`). Anything else the rust layer returns
     /// surfaces as `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload
     /// names the condition without carrying an amount or an address.
     ///

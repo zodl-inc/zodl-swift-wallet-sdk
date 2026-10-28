@@ -85,9 +85,9 @@ final class SendMaxProposalErrorTests: XCTestCase {
 
     func testNewCasesHaveTheirOwnCodesAndNoDetail() {
         let cases: [(ZcashError, String)] = [
-            (.rustProposalTransactionTooLarge, "ZRUST0159"),
-            (.rustProposalTransparentMemo, "ZRUST0160"),
-            (.rustProposalUnsupportedAddress, "ZRUST0161")
+            (.rustProposalTransactionTooLarge, "ZRUST0174"),
+            (.rustProposalTransparentMemo, "ZRUST0175"),
+            (.rustProposalUnsupportedAddress, "ZRUST0176")
         ]
 
         for (error, code) in cases {
