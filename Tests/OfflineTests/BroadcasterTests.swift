@@ -491,9 +491,9 @@ final class BroadcasterTests: ZcashTestCase {
     // MARK: - Submit (single, via real local gRPC servers)
 
     func testSubmitRecordsPlanAndDeliversToEndpoint() async throws {
-        let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         let outcome = await synchronizer.broadcaster.submit(
@@ -728,9 +728,9 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmissionStatusIsAcceptedWithTheServerThatTookTheTransaction() async throws {
-        let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [acceptingService.endpoint])
@@ -741,9 +741,9 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmissionStatusIsSubmittedWhenNoServerAccepted() async throws {
-        let rejectingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
+        let rejectingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
         defer { try? rejectingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejectingService.endpoint])
@@ -760,9 +760,9 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmitToRejectingEndpointIsRejected() async throws {
-        let rejectingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
+        let rejectingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
         defer { try? rejectingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
 
         let outcome = await synchronizer.broadcaster.submit(
             transaction: makeCreatedTransaction(),
@@ -773,11 +773,11 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {
-        let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
-        let rejectingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
+        let rejectingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
         defer { try? rejectingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         let outcome = await synchronizer.broadcaster.submit(
@@ -811,9 +811,9 @@ final class BroadcasterTests: ZcashTestCase {
     // MARK: - Submit (batch)
 
     func testBatchSubmitStopsAfterFirstFailureAndMarksRestNotAttempted() async throws {
-        let rejectingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
+        let rejectingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "rejected"))
         defer { try? rejectingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let first = makeCreatedTransaction(seed: 0x01)
         let second = makeCreatedTransaction(seed: 0x02)
 
@@ -835,9 +835,9 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testBatchSubmitAllAccepted() async throws {
-        let acceptingService = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let first = makeCreatedTransaction(seed: 0x03)
         let second = makeCreatedTransaction(seed: 0x04)
 
@@ -910,6 +910,16 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     // MARK: - Helpers
+
+    /// A synchronizer for the tests that submit to the local servers. Its rust backend is a double that lets every transaction through,
+    /// because what these tests are about is the outcome of the submission; the check that comes before it has suites of its own
+    /// (`TransactionSubmittabilityTests`, `EndpointSubmitterTests`).
+    private func makeSubmittingSynchronizer() throws -> SDKSynchronizer {
+        try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            rustBackend: ZcashRustBackendWeldingMock()
+        )
+    }
 
     private func makeSynchronizer(
         transactionEncoder: TransactionEncoder,

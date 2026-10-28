@@ -16,6 +16,11 @@ public enum TransactionEncoderError: Error {
     case spendingKeyWrongNetwork
     case couldNotExpand(txId: Data)
     case submitError(code: Int, message: String)
+    /// The SDK did not submit the transaction because it cannot be valid in the next block: it is built for another
+    /// consensus branch than the next block is under, or it has expired by then, and the refusal says which. Nothing
+    /// reached the network. The next block is the one after the higher of the wallet's chain tip and the latest block
+    /// height of the server the transaction was about to go to.
+    case notSubmittable(TransactionSubmissionRefusal)
 }
 
 protocol TransactionEncoder {
@@ -131,7 +136,18 @@ protocol TransactionEncoder {
     ) async throws -> Proposal
 
     /// submits a transaction to the Zcash peer-to-peer network.
+    ///
+    /// Nothing is submitted that cannot be valid in the next block. The next block is the one after the higher of the
+    /// wallet's chain tip and the latest block height of the server the transaction goes to, which is read from the
+    /// service that submits it, in the mode it submits in.
     /// - Parameter transaction: a transaction overview
+    /// - Throws:
+    ///     - `TransactionEncoderError.notSubmittable` if the transaction is built for another consensus branch than the
+    ///       next block is under, or has expired by then. Nothing was submitted.
+    ///     - `TransactionEncoderError.submitError` if the server rejects the transaction.
+    ///     - `ZcashError.serviceSubmitFailed` if the server cannot be reached, which includes its height not being
+    ///       readable. Nothing was submitted.
+    ///     - `ZcashError.rustCheckTransactionSubmittable` if the transaction cannot be judged. Nothing was submitted.
     func submit(transaction: EncodedTransaction) async throws
 
     /// Asks the connected lightwalletd backend whether it has the given txid in mempool or chain.
@@ -143,6 +159,43 @@ protocol TransactionEncoder {
     func fetchTransactionsForTxIds(_ txIds: [Data]) async throws -> [ZcashTransaction.Overview]
 
     func closeDBConnection()
+}
+
+extension LightWalletService {
+    /// Why `rawTransaction` cannot be submitted through this service, or `nil` when it can be valid in the next block.
+    ///
+    /// The next block is judged at the higher of the wallet's chain tip and this service's own latest block height, so
+    /// the height is read here, from this very service and in the very `mode` the transaction is about to be submitted
+    /// in. A server other than the one that will receive the transaction, or another Tor circuit, may stand on another
+    /// block. When the check cannot be made this throws, and the transaction stays unsubmitted: the check fails closed.
+    /// There are two ways it cannot, and they are told apart.
+    ///
+    /// The height is the first request of a submission, so a read that fails is a submission that could not reach the
+    /// server, and it fails the way the submit after it would have: as ``ZcashError/serviceSubmitFailed(_:)``, carrying the
+    /// failure of the read. Over Tor the read throws the error of the Tor connection, where the submit wraps all of
+    /// them in a generic service error, and so does this. A cancellation during the read is reported as a failed submit
+    /// too, as the services' own submit reports one, not as a `CancellationError`. A caller that reports a failed submit as
+    /// a failure to reach the server reports this as one too.
+    ///
+    /// A transaction the check cannot judge (it does not parse, or the wallet database is missing) is another thing: no
+    /// retry fixes it. It fails with ``ZcashError/rustCheckTransactionSubmittable(_:)``.
+    /// - Throws: `serviceSubmitFailed` for a height that cannot be read, or `rustCheckTransactionSubmittable`.
+    func submissionRefusal(
+        for rawTransaction: Data,
+        mode: ServiceMode,
+        using rustBackend: ZcashRustBackendWelding
+    ) async throws -> TransactionSubmissionRefusal? {
+        let serverHeight: BlockHeight
+        do {
+            serverHeight = try await latestBlockHeight(mode: mode)
+        } catch ZcashError.serviceLatestBlockHeightFailed(let error) {
+            throw ZcashError.serviceSubmitFailed(error)
+        } catch {
+            throw ZcashError.serviceSubmitFailed(LightWalletServiceError.genericError(error: error))
+        }
+
+        return try await rustBackend.checkTransactionSubmittable(rawTransaction, submissionServerHeight: serverHeight)
+    }
 }
 
 extension TransactionEncoder {

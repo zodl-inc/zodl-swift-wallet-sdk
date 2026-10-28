@@ -9,7 +9,7 @@ import NIO
 import NIOTransportServices
 @testable import ZODLSwiftWalletSDK
 
-final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
+class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     var interceptors: CompactTxStreamerServerInterceptorFactoryProtocol? { nil }
 
     private(set) var endpoint: LightWalletEndpoint!
@@ -21,7 +21,9 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
     private var submittedTransactions: [Data] = []
     private var server: Server?
 
-    init(sendResponse: SendResponse, fetchedTransaction: RawTransaction? = nil) throws {
+    /// - Parameter callTimeoutInMillis: the timeout of the calls made through `endpoint`. The submission tests keep it short, so
+    ///   that a hang fails them quickly; a test that has to survive a stall of a few seconds on a loaded machine can give it room.
+    init(sendResponse: SendResponse, fetchedTransaction: RawTransaction? = nil, callTimeoutInMillis: Int64 = 5_000) throws {
         self.sendResponse = sendResponse
         self.fetchedTransaction = fetchedTransaction
         self.endpoint = LightWalletEndpoint(address: "127.0.0.1", port: 0, secure: false)
@@ -36,8 +38,8 @@ final class RecordingCompactTxStreamerService: CompactTxStreamerProvider {
             address: "127.0.0.1",
             port: server.channel.localAddress?.port ?? 0,
             secure: false,
-            singleCallTimeoutInMillis: 5_000,
-            streamingCallTimeoutInMillis: 5_000
+            singleCallTimeoutInMillis: callTimeoutInMillis,
+            streamingCallTimeoutInMillis: callTimeoutInMillis
         )
     }
 
@@ -150,6 +152,9 @@ final class EndpointSubmitterMock: EndpointSubmitter {
         case succeed
         case succeedAfter(TimeInterval)
         case reject(code: Int, message: String)
+        /// Refuses the transaction as one that cannot be valid in the next block, which is what the real
+        /// submitter does before it submits, when its check says so.
+        case refuse(TransactionSubmissionRefusal)
         /// Rejects after the delay; an early cancellation shortens the delay
         /// but the rejection is still thrown (a response already in flight).
         case rejectAfter(TimeInterval, code: Int, message: String)
@@ -231,6 +236,9 @@ final class EndpointSubmitterMock: EndpointSubmitter {
 
         case let .reject(code, message):
             throw TransactionEncoderError.submitError(code: code, message: message)
+
+        case let .refuse(refusal):
+            throw TransactionEncoderError.notSubmittable(refusal)
 
         case let .rejectAfter(delay, code, message):
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))

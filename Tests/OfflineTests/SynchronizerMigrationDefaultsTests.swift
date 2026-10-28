@@ -38,6 +38,10 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationAdvanceStep(accountUUID: self.accountUUID) }
     }
 
+    func testMigrationAvailabilityDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationAvailability() }
+    }
+
     func testMigrationProgressDefaultThrowsUnimplemented() async {
         await assertThrowsMigrationUnimplemented { _ = try await self.synchronizer.migrationProgress(accountUUID: self.accountUUID) }
     }
@@ -162,6 +166,12 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         }
     }
 
+    func testCancelMigrationRunDefaultThrowsUnimplemented() async {
+        await assertThrowsMigrationUnimplemented {
+            try await self.synchronizer.cancelMigrationRun(accountUUID: self.accountUUID)
+        }
+    }
+
     func testRefreshStaleMigrationTransfersDefaultThrowsUnimplemented() async {
         let usk = TestsData(networkType: .testnet).spendingKey
         await assertThrowsMigrationUnimplemented {
@@ -246,6 +256,16 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
     func testNextMigrationWakeDefaultReturnsNil() async {
         let outlook = await synchronizer.nextMigrationWake(accountUUID: accountUUID)
         XCTAssertNil(outlook, "the inert default must report no retained outlook")
+    }
+
+    /// The bypass setter is non-throwing and has no state to hold on a conformer without
+    /// migration support, so the inert default simply returns; nothing else it exposes changes.
+    func testSetMigrationNetworkUpgradeGateBypassDefaultIsANoOp() async {
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(true)
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(false)
+
+        let blocked = await synchronizer.isMigrationSyncBlocked()
+        XCTAssertFalse(blocked, "the no-op default must leave the other inert defaults alone")
     }
 
     func testIsMigrationSyncBlockedDefaultReturnsFalse() async {

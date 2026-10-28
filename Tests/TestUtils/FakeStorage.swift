@@ -69,7 +69,7 @@ struct SandblastSimulator {
 
         let sandblastedBlock = try CompactBlock(jsonUTF8Data: fileHandle.availableData)
 
-        return [CompactBlock](repeating: sandblastedBlock, count: range.count)
+        return try [CompactBlock](repeating: sandblastedBlock, count: range.count)
             .enumerated()
             .map { sandblastedBlock in
                 let height = range.lowerBound + sandblastedBlock.offset

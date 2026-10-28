@@ -18,6 +18,22 @@ class ZcashErrorLocalizedTests: XCTestCase {
         XCTAssertTrue(Mirror(reflecting: error).children.isEmpty)
     }
 
+    /// The error carries no payload, so the height the server reported can't end up in a log or a support report.
+    func testServerBlockHeightOutOfRangeCarriesNoServerValue() {
+        let error = ZcashError.compactBlockProcessorServerBlockHeightOutOfRange
+        XCTAssertEqual(error.code, ZcashErrorCode.compactBlockProcessorServerBlockHeightOutOfRange)
+        XCTAssertEqual(error.code.rawValue, "ZCBPEO0025")
+        XCTAssertEqual(
+            error.localizedDescription,
+            """
+            ZCBPEO0025: The connected server reported a block height that is too large for the SDK to use. \
+            Only a broken or malicious server does that.
+            """
+        )
+        XCTAssertNil(error.detail)
+        XCTAssertTrue(Mirror(reflecting: error).children.isEmpty)
+    }
+
     // MARK: - LocalizedError conformance
 
     func testLocalizedDescriptionContainsErrorCode() {

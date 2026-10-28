@@ -18,8 +18,9 @@ public struct GiftCardStatus: Equatable {
         /// confirmations.
         ///
         /// Card funds come from another wallet, so they are untrusted in the sense of
-        /// [ZIP 315](https://zips.z.cash/zip-0315) and need 10 confirmations (roughly 12 minutes)
-        /// before they can be spent. Call ``GiftCardRedeemer/check()`` again later.
+        /// [ZIP 315](https://zips.z.cash/zip-0315) and need 10 confirmations (roughly 12 minutes at
+        /// 75-second blocks, 4 minutes from NU7) before they can be spent. Call
+        /// ``GiftCardRedeemer/check()`` again later.
         case pending
         /// The card's spendable funds do not exceed the fee of the transaction that would sweep
         /// them, and nothing else is on its way: redeeming it would leave nothing for the
@@ -229,7 +230,8 @@ public actor GiftCardRedeemer {
             storageDirectory: storageDirectory,
             loggingPolicy: loggingPolicy,
             container: DIContainer(),
-            makeSynchronizer: { SlipstreamSynchronizer(initializer: $0) }
+            makeSynchronizer: { SlipstreamSynchronizer(initializer: $0) },
+            saplingParamsSourceURL: .default
         )
     }
 
@@ -244,7 +246,8 @@ public actor GiftCardRedeemer {
         makeSynchronizer: (Initializer) -> SlipstreamSynchronizer,
         cleanupTiming: GiftCardCleanupTiming = .live,
         checkTiming: GiftCardCleanupTiming = .live,
-        checkPolicy: GiftCardCheckPolicy? = nil
+        checkPolicy: GiftCardCheckPolicy? = nil,
+        saplingParamsSourceURL: SaplingParamsSourceURL
     ) throws {
         guard card.network == network.networkType else {
             throw ZcashError.giftCardNetworkMismatch
@@ -274,7 +277,7 @@ public actor GiftCardRedeemer {
             network: network,
             spendParamsURL: rootDirectory.appendingPathComponent("sapling-spend.params"),
             outputParamsURL: rootDirectory.appendingPathComponent("sapling-output.params"),
-            saplingParamsSourceURL: .default,
+            saplingParamsSourceURL: saplingParamsSourceURL,
             alias: alias,
             loggingPolicy: loggingPolicy,
             isTorEnabled: isTorEnabled,

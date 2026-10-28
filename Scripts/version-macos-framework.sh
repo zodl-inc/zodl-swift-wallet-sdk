@@ -73,7 +73,7 @@ cat > "$FW/Versions/A/Resources/Info.plist" <<PLIST
 		<string>MacOSX</string>
 	</array>
 	<key>LSMinimumSystemVersion</key>
-	<string>12.0</string>
+	<string>14.0</string>
 </dict>
 </plist>
 PLIST

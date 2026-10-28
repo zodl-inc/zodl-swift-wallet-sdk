@@ -582,9 +582,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         passGeneration += 1
         let birthday = BlockHeight(initializer.walletBirthday)
         // [v2.1 Phase 2] Tip freshness ([#1591]) is ENGINE-OWNED (snapshot.tipFresh, E-2):
-        // the FFI start() captures the refresh baseline and keeps freshness across a <120 s
-        // stop→start hop — the SDKFlags.sdkStarted()/chainTipAtRunStart parity machinery
-        // this block used to carry is deleted.
+        // the FFI start() captures the refresh baseline and keeps freshness across a stop→start
+        // hop shorter than 1.6 target block intervals (120 s before NU7, 40 s from it) — the
+        // SDKFlags.sdkStarted()/chainTipAtRunStart parity machinery this block used to carry is
+        // deleted.
         // B4: a new run starts with a fresh stall-watchdog window. [MOB-1850] The recovery
         // BUDGET only resets when the app is starting a run of its own: the stall recovery
         // restarts the pass by calling this very method, and letting that call clear the
@@ -690,15 +691,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             ))
         }
         // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
-        // moment, and a start() more than 120 s later re-masks via snapshot.tipFresh (E-2).
+        // moment, and a start() more than 1.6 target block intervals later (120 s before NU7,
+        // 40 s from it) re-masks via snapshot.tipFresh (E-2).
         // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
         // non-quiescent one changes nothing here beyond what a reader of the logs should know:
         // the pass is stopped either way, and an engine writer that outlives it has only the
-        // engine's own file to finish with.
-        let quiescent = await engine.stop()
-        if !quiescent {
+        // engine's own file to finish with. [MOB-2184] For the same reason this is the plain stop,
+        // not `stopForWalletChange()`: nothing about the wallet changes, so a scan call in progress
+        // may run to the end of its chunk rather than leave its blocks for the next pass.
+        let report = await engine.stop()
+        if let reason = report.refusalReason {
             initializer.logger.warn(
-                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop",
+                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop: \(reason)",
                 file: #file,
                 function: #function,
                 line: #line
@@ -1121,12 +1125,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // stop it here: two handles onto a wallet the first may still be writing is the very
         // collision the recovery exists to clear. Thrown into the reopen's own failure handling,
         // so the attempt counts as spent and the host hears the give-up exactly as it would from
-        // an endpoint that could not be reopened at all.
-        let quiescent = await engine.stop()
+        // an endpoint that could not be reopened at all. [MOB-2184] Reopening a handle onto the same
+        // wallet is a wallet change to the engine, so this is its stop for one: the scan ends at its
+        // next block instead of finishing its chunk inside the budget the proof needs.
+        let report = await engine.stopForWalletChange()
 
         do {
-            guard quiescent else {
-                throw ZcashError.slipstreamEngineNotQuiescent
+            guard report.isQuiescent else {
+                throw ZcashError.slipstreamEngineNotQuiescent(report)
             }
             try await engine.reopen(server: currentEndpoint, network: initializer.network)
         } catch {
@@ -1462,6 +1468,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await initializer.rustBackend.listAccounts()
     }
 
+    public func findAccountSharingKeyComponents(_ ufvk: UnifiedFullViewingKey) async throws -> AccountKeyOverlap? {
+        try await initializer.rustBackend.findAccountKeyOverlap(ufvk: ufvk)
+    }
+
     // swiftlint:disable:next function_parameter_count
     public func importAccount(
         ufvk: String,
@@ -1477,13 +1487,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // tip; offline ⇒ the engine's max(checkpoint, birthday+1) fallback — an offline
         // import now keeps its recovery identity instead of provisioning recover_until=NULL).
         // Identifying fetches ride Tor when enabled (same engine state dir as start()).
-        let anchor = await SlipstreamEngine.restoreAnchor(
-            isRestore: true,
-            birthday: birthday ?? 0,
-            fallbackCheckpointHeight: checkpointSource.birthday(for: BlockHeight.max).height,
-            server: currentEndpoint,
-            network: initializer.network,
-            torDirPath: await slipstreamTorDirPath()
+        // [MOB-2184] Resolved through `restoreAnchor`, as `prepare` resolves its anchor: the
+        // resolver a shipped synchronizer is built with is exactly that primitive, and a test can
+        // hand in one that needs no server.
+        let fallbackCheckpoint = checkpointSource.birthday(for: BlockHeight.max).height
+        let anchor = await restoreAnchor(
+            true, // a restore: the anchor is the account's recover-until height
+            birthday ?? 0,
+            fallbackCheckpoint,
+            currentEndpoint,
+            initializer.network,
+            await slipstreamTorDirPath()
         )
         let chainTipHeight = anchor.map { UInt32($0.height) }
         let effectiveBirthday = birthday ?? (chainTipHeight.map { BlockHeight($0) } ?? initializer.walletBirthday)
@@ -1557,9 +1571,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // proceed on the assumption: an orphan commit landing after the force-re-queue is exactly
         // the silent scope loss this serialization exists to prevent. Leave the wallet untouched,
         // put the pass back the way it was found, and tell the caller.
-        guard await engine.stop() else {
+        // [MOB-2184] The stop for a wallet change, as in every operation below that changes the
+        // wallet or reopens a handle onto it: a plain stop lets the scan finish its whole chunk
+        // first, which outlasted the ten-second budget when accounts were added in quick
+        // succession, and every one of those imports was refused.
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         let uuid: AccountUUID
@@ -1596,9 +1615,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // re-scan as a genuine 0→100% climb (the `forceCounterProgressUntilDone` host bypass
         // is deleted). One host job remains: RESTART the pass — the follow loop only
         // re-syncs when the server tip advances (`session.rs` `should_resync`), so without a
-        // restart the re-scan would wait for the next block (≤ ~75 s). A restart hiccup must
-        // never fail an otherwise-successful import, so it is not rethrown here — but it must
-        // not go unreported either, so `publishStoppedWithError` puts it on the state stream.
+        // restart the re-scan would wait for the next block (about 75 s before NU7, 25 s from it).
+        // A restart hiccup must never fail an otherwise-successful import, so it is not rethrown
+        // here — but it must not go unreported either, so `publishStoppedWithError` puts it on the
+        // state stream.
         initializer.logger.debug(
             "[#1755] importAccount: wasRunning=\(wasRunning) "
             + (wasRunning ? "→ restarting sync pass now to surface the re-scan" : "→ next start() will re-scan")
@@ -1645,9 +1665,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] See `importAccountOnLifecycleQueue`: deleting an account whose key an
         // in-flight pass may still be writing notes for is what killed the wallet in the first
         // place, so a stop the engine could not prove refuses the delete rather than risking it.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         do {
@@ -1674,6 +1695,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             throw error
         }
+    }
+
+    /// Unlike `deleteAccount(_:)`, a rename neither stops nor restarts the sync pass, so it does not take the lifecycle
+    /// queue: it changes only the account's name, which the engine never reads.
+    public func renameAccount(_ accountUUID: AccountUUID, name: String) async throws {
+        try await initializer.rustBackend.setAccountName(accountUUID, name: name)
     }
 
     // ── Addresses ─────────────────────────────────────────────────────────────
@@ -2130,9 +2157,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // writer the engine could not account for is precisely what stopping first is meant to
         // rule out, so an unproved stop refuses the truncate instead of gambling on it. Reported
         // on the subject, the channel every other rewind failure uses.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent))
+            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent(report)))
             return
         }
 
@@ -2177,7 +2205,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
     /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
     ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
-    /// 2. `engine.stop()` — cancel any in-flight sync task.
+    /// 2. `engine.stopForWalletChange()` — cancel any in-flight sync task, its scan at the next block.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
     /// 5. Delete the `fsBlockDbRoot` directory (parity with old SDK's `storage.clear()` +
@@ -2246,9 +2274,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // that most needs the stop it is standing on to have been real. On an unproved stop it
         // frees nothing and deletes nothing: closing the handle under a live writer, or removing
         // the database out from under one, is worse than any wipe that did not happen.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent))
+            subject.send(completion: .failure(ZcashError.slipstreamEngineNotQuiescent(report)))
             return
         }
 
@@ -2321,6 +2350,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     public func migrationAdvanceStep(accountUUID: AccountUUID) async throws -> MigrationAdvance? {
         try await migrationHost.migration(for: accountUUID).advanceStep()
+    }
+
+    public func setMigrationNetworkUpgradeGateBypass(_ isBypassed: Bool) async {
+        // Wallet-scoped: the host's one holder is shared by every account's migration.
+        await migrationHost.setUpgradeGateBypass(isBypassed)
+    }
+
+    public func migrationAvailability() async throws -> MigrationAvailability {
+        // Wallet-scoped (the gate depends on the chain alone), so this lives on the host, which
+        // passes its own bypass holder's value, not on a per-account actor.
+        try await migrationHost.migrationAvailability()
     }
 
     public func migrationProgress(accountUUID: AccountUUID) async throws -> MigrationProgress? {
@@ -2440,8 +2480,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await migrationHost.migration(for: accountUUID).hasInvalidTransfers()
     }
 
-    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationSchedule {
+    public func restartCurrentMigrationStep(accountUUID: AccountUUID) async throws -> MigrationRestartOutcome {
         try await migrationHost.migration(for: accountUUID).restartCurrentMigrationStep()
+    }
+
+    public func cancelMigrationRun(accountUUID: AccountUUID) async throws {
+        try await migrationHost.migration(for: accountUUID).cancelMigrationRun()
     }
 
     public func refreshStaleMigrationTransfers(accountUUID: AccountUUID, usk: UnifiedSpendingKey?) async throws -> MigrationSchedule {
@@ -2546,7 +2590,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 2. Snapshot whether the sync was running (to decide whether to restart).
     /// 3. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
-    /// 4. Stop polling + await `engine.stop()` — cancel any in-flight sync task.
+    /// 4. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
+    ///    scan at the next block.
     /// 5. `engine.reopen(server:network:)` — close old handle + open new one bound
     ///    to the new endpoint (frees Rust-side tokio runtime, then allocates a fresh one).
     /// 6. Store `endpoint` in `currentEndpoint`.
@@ -2599,9 +2644,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] A switch REOPENS the handle, and a second handle onto a wallet the first one
         // may still be writing is a collision no endpoint change is worth. On an unproved stop the
         // switch is refused and the pass is put back where it was found.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         // Re-open the engine handle against the new endpoint.
@@ -2666,9 +2712,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] `switchToOnLifecycleQueue`'s reasoning verbatim: this rebuilds the handle, so
         // an unproved stop must not be built on. Unlike a switch this is usually called when
         // nothing is running, in which case there is nothing to put back.
-        guard await engine.stop() else {
+        let report = await engine.stopForWalletChange()
+        guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
-            throw ZcashError.slipstreamEngineNotQuiescent
+            throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
         try await engine.reopen(server: endpoint, network: initializer.network)
@@ -2768,8 +2815,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
     /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
-    /// and the loose synced-height check — all skipped for custom networks, mirroring
-    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
+    /// and the loose synced-height check. A custom-parameter network may reach servers that
+    /// identify with a different base chain and report a nonstandard consensus branch id, so
+    /// only the chain-name and branch-id checks are skipped for it, mirroring
+    /// `ValidateServerAction`; the synced-height check runs for every network. Delegates to
+    /// ephemeral gRPC connections.
     // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
@@ -2789,9 +2839,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
 
             let isCustomNetwork = initializer.network.customActivationHeights != nil
+            let spacing = TargetBlockSpacing(network: initializer.network)
 
             for await result in group {
                 guard let (endpoint, elapsed, info) = result, elapsed > 0 else { continue }
+
+                // Rule out servers that report a tip the SDK can't use. This comes before anything converts or adds to the
+                // height, and it applies to custom networks too, which skip the branch id check below.
+                guard let tipHeight = BlockHeight(serverHeight: info.blockHeight) else { continue }
 
                 if !isCustomNetwork {
                     guard (info.chainName == "main" && network == .mainnet)
@@ -2802,7 +2857,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
                     guard
                         let localBranchID = try? initializer.rustBackend.consensusBranchIdFor(
-                            height: Int32(info.blockHeight)
+                            height: Int32(tipHeight)
                         ),
                         let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID),
                         remoteBranchID == localBranchID
@@ -2812,8 +2867,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 }
 
                 // Rule out servers that are syncing, stuck, or probably on the wrong fork.
-                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate.
-                guard info.blockHeight + ZcashSDK.syncedThresholdBlocks >= info.estimatedHeight else {
+                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate; see `ServerSyncCheck`.
+                guard ServerSyncCheck.isSynced(blockHeight: info.blockHeight, estimatedHeight: info.estimatedHeight, spacing: spacing) else {
                     continue
                 }
 
@@ -3041,6 +3096,7 @@ private extension SlipstreamSynchronizer {
                     Task { await self.engine.notifyTxChange() }
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
+                    // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
@@ -3050,6 +3106,11 @@ private extension SlipstreamSynchronizer {
                     }
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
+                } catch TransactionEncoderError.notSubmittable(let refusal) {
+                    // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
+                    // network, so there is no server to ask whether it knows the transaction.
+                    submitFailed = true
+                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
                 }
             }
         })

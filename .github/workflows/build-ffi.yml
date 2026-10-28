@@ -8,16 +8,29 @@ on:
       version:
         description: 'SDK version (e.g., 2.5.0)'
         required: true
+      expected_source_sha:
+        description: 'Optional exact source commit expected by the caller'
+        required: false
+        type: string
+      request_id:
+        description: 'Optional release request correlation (32 lowercase hex characters)'
+        required: false
+        type: string
       force:
         description: 'Replace the assets of an existing release'
         type: boolean
         default: false
 
+run-name: Build FFI ${{ inputs.version }} ${{ inputs.request_id }}
+
 permissions: {}
 
 jobs:
   build-xcframework:
-    runs-on: macos-15
+    # Xcode 27 ships only on this image, which GitHub still marks as a public
+    # preview (https://github.com/actions/runner-images/issues/14404). If it
+    # misbehaves, macos-26 with Xcode 26.6 is the fallback.
+    runs-on: xcode-27
     permissions:
       contents: write # Required for creating draft releases
     steps:
@@ -25,50 +38,65 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+      - name: Report Xcode and compute cache identity
+        id: xcode-cache-key
+        run: |
+          xcode_version_file=$(mktemp)
+          trap 'rm -f "$xcode_version_file"' EXIT
+          xcodebuild -version -skipMacroValidation -derivedDataPath "${RUNNER_TEMP}/DerivedData" > "$xcode_version_file"
+          cat "$xcode_version_file"
+          echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Authorize cargo against the private slipstream repository
-        uses: ./.github/actions/authorize-slipstream
-        with:
-          app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
-          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY }}
-
+      # The runner image already ships rustup, so no toolchain action is needed.
+      # The settings are those of swift.yml's build job, with every target a
+      # release builds.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-        with:
-          toolchain: stable
-          targets: aarch64-apple-ios, x86_64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-darwin, aarch64-apple-darwin
+        id: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update \
+            --target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin
+          rustup default stable
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+          rustc_version_file=$(mktemp)
+          trap 'rm -f "$rustc_version_file"' EXIT
+          rustc +stable --version --verbose > "$rustc_version_file"
+          cat "$rustc_version_file"
+          echo "cachekey=$(shasum -a 256 "$rustc_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
-          # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clone of
-          # the PRIVATE zodl-inc/slipstream repo. This repository is public, and GitHub lets
-          # workflow runs from forked pull requests restore caches created on the base branch — a
-          # cached clone would hand fork PRs the private source without their ever holding the App
-          # credential. Re-cloning one small repo per run is the cost of keeping it out.
+          # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clones of
+          # git dependencies. Every git dependency on main is public today (slipstream, once a
+          # private git dependency, now comes from crates.io), but a private one can return — other
+          # branches already pull some — and the public twin of this repository lets workflow runs
+          # from forked pull requests restore caches created on main. A cached clone would hand those
+          # runs the private source without their ever holding a credential for it, so the clones are
+          # fetched afresh on every run instead.
           #
-          # `registry/` is crates.io content and safe to cache. `target/` still holds
-          # slipstream-core's compiled rlib/rmeta, which is a far smaller disclosure than the source
-          # tree and too expensive to rebuild every run; dropping it too would require solving the
-          # public-repo/private-dependency problem properly instead.
+          # `registry/` is crates.io content and safe to cache. `target/` holds compiled rlib/rmeta
+          # files, never sources: a far smaller disclosure should a private dependency return, and
+          # too expensive to rebuild every run.
           path: |
             target
             ~/.cargo/bin
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v1-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Build and upload draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ github.event.inputs.version }}
           FORCE: ${{ github.event.inputs.force }}
+          ZODL_SDK_BUILD_RECORD: '1'
+          ZODL_SDK_EXPECTED_SOURCE: ${{ inputs.expected_source_sha }}
+          ZODL_SDK_REQUEST_ID: ${{ inputs.request_id }}
         run: |
           if [ "$FORCE" = "true" ]; then
             ./Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"

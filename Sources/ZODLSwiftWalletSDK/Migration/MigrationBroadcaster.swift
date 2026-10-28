@@ -14,8 +14,10 @@ enum MigrationBroadcastOutcome: Equatable {
     /// `errorCode` is the zcashd `sendrawtransaction` code lightwalletd forwards; the mapping uses
     /// it (with the message) to tell duplicate re-submissions from real rejections.
     case rejected(errorCode: Int32, message: String)
-    /// A transport-level error was thrown *after* the connection was established (a mid-submit
-    /// stream failure), as opposed to a failure to connect at all.
+    /// A transport-level error was thrown *after* the connection was established — a mid-submit
+    /// stream failure, or a failed read of the server's height, which comes back before any
+    /// transaction was prepared and so with nothing submitted — as opposed to a failure to connect
+    /// at all.
     case transportError
 }
 
@@ -25,21 +27,33 @@ enum MigrationBroadcastOutcome: Equatable {
 /// without changing how `OrchardMigration` is composed. `MigrationBroadcaster` is the only production
 /// conformer.
 protocol MigrationBroadcasting {
-    /// Submits `rawTransaction` to `endpoint` exactly once. See
-    /// ``MigrationBroadcaster/broadcast(rawTransaction:to:useTor:onWillSubmit:)`` for the full
-    /// contract (fail-closed Tor, throw-vs-return split, and when exactly `onWillSubmit` fires).
+    /// Connects to `endpoint`, reads the server's latest block height on that connection, asks
+    /// `prepareTransaction` for the transaction to submit given that height, and submits it exactly
+    /// once. See ``MigrationBroadcaster/broadcast(to:useTor:onWillSubmit:prepareTransaction:)`` for
+    /// the full contract (fail-closed Tor, throw-vs-return split, and when exactly `onWillSubmit`
+    /// fires).
+    ///
+    /// THE ORDER IS THE CONTRACT: connect, read the server's height, `prepareTransaction`,
+    /// `onWillSubmit`, submit, close. The height is read on the very connection the transaction
+    /// then goes over, so it is the height of the server that judges the transaction, and the
+    /// transaction is prepared only once it is known, which is what lets `prepareTransaction` refuse
+    /// a transaction that cannot be valid in the next block before it is recorded in the wallet or
+    /// reaches the network. A height that cannot be read ends the call with
+    /// ``MigrationBroadcastOutcome/transportError`` and `prepareTransaction` is never called: nothing
+    /// was prepared, so nothing was submitted. An error `prepareTransaction` throws propagates, and
+    /// nothing is submitted.
     ///
     /// `onWillSubmit` MUST be invoked at the last pre-submit instant — after every piece of
-    /// connection setup (Tor bootstrap, isolated-circuit/connection establishment) and
-    /// immediately before the submit RPC — and must NOT be invoked on a path that throws before
-    /// submitting anything. `OrchardMigration` uses it to (re-)arm the sync gate's 120 s
-    /// in-flight broadcast marker so the marker's window covers the actual submit-to-record span
-    /// rather than being burned by a slow Tor bootstrap (A9).
+    /// connection setup (Tor bootstrap, isolated-circuit/connection establishment), the height read
+    /// and the preparation, and immediately before the submit RPC — and must NOT be invoked on a
+    /// path that throws or returns before submitting anything. `OrchardMigration` uses it to
+    /// (re-)arm the sync gate's 120 s in-flight broadcast marker so the marker's window covers the
+    /// actual submit-to-record span rather than being burned by a slow Tor bootstrap (A9).
     func broadcast(
-        rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
         useTor: Bool,
-        onWillSubmit: @Sendable () -> Void
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome
 }
 
@@ -47,7 +61,9 @@ protocol MigrationBroadcasting {
 ///
 /// This type is deliberately minimal: it does not fetch transactions, retry, race multiple
 /// endpoints, or fall back between transports. Its one job is a single submit attempt, with two
-/// transports:
+/// transports (on either one it first reads the server's latest block height on the connection it
+/// submits over, and only then asks for the transaction to submit — see
+/// ``broadcast(to:useTor:onWillSubmit:prepareTransaction:)``):
 ///
 /// - **Tor (`useTor == true`)** is *fail-closed*. It uses its own dedicated ``TorClient`` in its own
 ///   on-disk directory (independent of the app's main Tor toggle and the synchronizer's Tor client),
@@ -59,13 +75,14 @@ protocol MigrationBroadcasting {
 /// - **Direct (`useTor == false`)** opens a fresh, ephemeral gRPC service for exactly the resolved
 ///   endpoint, submits once, and closes it.
 ///
-/// Once the connection is established, a thrown error from the submit RPC is reported as
-/// ``MigrationBroadcastOutcome/transportError`` (a retryable network error), not as a fail-closed
-/// Tor failure.
+/// Once the connection is established, a thrown error from the height read or the submit RPC is
+/// reported as ``MigrationBroadcastOutcome/transportError`` (a retryable network error), not as a
+/// fail-closed Tor failure.
 actor MigrationBroadcaster: MigrationBroadcasting {
     private let torDirURL: URL
     private let logger: Logger
     private let torClientFactory: @Sendable (URL) async throws -> TorClient
+    private let directServiceFactory: @Sendable (LightWalletEndpoint) -> any LightWalletService
 
     /// The dedicated Tor client's bootstrap, cached as a `Task` on the first `useTor` broadcast so
     /// concurrent broadcasts await the exact SAME bootstrap attempt rather than each racing its own
@@ -94,16 +111,21 @@ actor MigrationBroadcaster: MigrationBroadcasting {
 
     /// Injecting initializer for tests: substitutes the Tor-client factory ``dedicatedTorClient()``
     /// caches, so the bootstrap single-flight/clear-on-failure behavior can be pinned deterministically
-    /// without a real Arti runtime. Production always goes through the default
-    /// (``bootstrapTorClient(migrationTorDir:)``) via ``init(torDirURL:logger:)``.
+    /// without a real Arti runtime, and the factory of the ephemeral service the direct transport
+    /// opens for an endpoint, so its order of operations (height read, preparation, submit, close)
+    /// can be pinned without a network. Production always goes through the defaults
+    /// (``bootstrapTorClient(migrationTorDir:)`` and a ``LightWalletGRPCService`` for the endpoint)
+    /// via ``init(torDirURL:logger:)``.
     init(
         torDirURL: URL,
         logger: Logger,
-        torClientFactory: @escaping @Sendable (URL) async throws -> TorClient
+        torClientFactory: @escaping @Sendable (URL) async throws -> TorClient,
+        directServiceFactory: @escaping @Sendable (LightWalletEndpoint) -> any LightWalletService = { LightWalletGRPCService(endpoint: $0) }
     ) {
         self.torDirURL = torDirURL
         self.logger = logger
         self.torClientFactory = torClientFactory
+        self.directServiceFactory = directServiceFactory
     }
 
     /// The zcashd `sendrawtransaction` RPC error code for a transaction the node already knows
@@ -157,28 +179,50 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         }
     }
 
-    /// Submits `rawTransaction` to `endpoint` exactly once.
+    /// Submits the transaction `prepareTransaction` returns to `endpoint` exactly once, after
+    /// reading the server's latest block height on the connection it goes over.
+    ///
+    /// The order on one connection is: connect, read the height, `prepareTransaction(height)`,
+    /// `onWillSubmit()`, submit, close.
+    ///
+    /// `prepareTransaction` is handed the height just read and returns the bytes to submit. It is
+    /// where the caller takes the transaction from the wallet and, with the height in hand, can
+    /// refuse one that cannot be valid in the next block. It runs only once the height is known, and
+    /// at most once.
     ///
     /// `onWillSubmit` fires at the last pre-submit instant — after the Tor bootstrap and
-    /// isolated-connection setup on the Tor path (which can take many seconds), or right before
-    /// the direct submit — and never on a path that throws before submitting (the fail-closed Tor
-    /// throws happen strictly before it). See ``MigrationBroadcasting``'s requirement doc for the
-    /// contract this implements.
+    /// isolated-connection setup on the Tor path (which can take many seconds), the height read and
+    /// the preparation, or right before the direct submit — and never on a path that throws or
+    /// returns before submitting (the fail-closed Tor throws, a failed height read and a failed
+    /// preparation all happen strictly before it). See ``MigrationBroadcasting``'s requirement doc
+    /// for the contract this implements.
     ///
     /// - Throws: ``ZcashError/migrationTorUnavailable`` when `useTor` is `true` and the dedicated Tor
-    ///   runtime or connection cannot be established before the submit RPC is attempted. In that case
-    ///   nothing is broadcast (and `onWillSubmit` never fired) and the caller must record no result.
-    /// - Returns: the raw outcome (submitted / rejected / transport error) for the caller to map.
+    ///   runtime or connection cannot be established before the height is read. In that case nothing
+    ///   is broadcast (and neither `prepareTransaction` nor `onWillSubmit` ran) and the caller must
+    ///   record no result. Any error `prepareTransaction` throws, unchanged: nothing is submitted.
+    /// - Returns: the raw outcome (submitted / rejected / transport error) for the caller to map. A
+    ///   ``MigrationBroadcastOutcome/transportError`` comes back without `prepareTransaction` having
+    ///   run when the server's height could not be read, so a caller that took nothing from the
+    ///   wallet in `prepareTransaction` knows nothing was submitted.
     func broadcast(
-        rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
         useTor: Bool,
-        onWillSubmit: @Sendable () -> Void
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
         if useTor {
-            return try await broadcastOverTor(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)
+            return try await broadcastOverTor(
+                to: endpoint,
+                onWillSubmit: onWillSubmit,
+                prepareTransaction: prepareTransaction
+            )
         } else {
-            return await broadcastDirect(rawTransaction: rawTransaction, to: endpoint, onWillSubmit: onWillSubmit)
+            return try await broadcastDirect(
+                to: endpoint,
+                onWillSubmit: onWillSubmit,
+                prepareTransaction: prepareTransaction
+            )
         }
     }
 
@@ -194,7 +238,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     /// failure forever.
     ///
     /// Not `private`: exercised directly by tests pinning the caching behavior (finding 8) without
-    /// driving a real Tor connection through the full ``broadcast(rawTransaction:to:useTor:)``.
+    /// driving a real Tor connection through the full ``broadcast(to:useTor:onWillSubmit:prepareTransaction:)``.
     func dedicatedTorClient() async throws -> TorClient {
         let migrationTorDir = torDirURL.appendingPathComponent("migration_tor", isDirectory: true)
 
@@ -223,9 +267,9 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     // MARK: - Private
 
     private func broadcastOverTor(
-        rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        onWillSubmit: @Sendable () -> Void
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
         // Fail-closed: any failure to build the runtime or open the isolated connection — i.e. any
         // failure *before* the submit RPC — is reported as Tor-unavailable, and nothing is broadcast.
@@ -246,10 +290,30 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             throw ZcashError.migrationTorUnavailable
         }
 
-        // The connection is established; a thrown error here is a mid-submit transport failure.
-        // The bootstrap/connect above can take many seconds, so only NOW — at the last pre-submit
-        // instant — does the caller's hook fire (A9: it re-arms the in-flight marker so its
-        // window covers the submit, not the bootstrap).
+        // The connection is established; a thrown error from here on is a transport failure. The
+        // server's height is read on this connection, the one the transaction will go over, so it is
+        // the height of the server that will judge the transaction. A server that reports a height
+        // the SDK can't use is as unreadable as a failed read: nothing is prepared or submitted.
+        let serverHeight: BlockHeight
+        do {
+            let latestBlock = try connection.latestBlock()
+            guard let height = BlockHeight(serverHeight: latestBlock.height) else {
+                logger.error("MigrationBroadcaster: the submission server reported a latest block height the SDK can't use")
+                return MigrationBroadcastOutcome.transportError
+            }
+            serverHeight = height
+        } catch {
+            logger.error("MigrationBroadcaster: could not read the submission server's height over Tor: \(error.localizedDescription)")
+            return MigrationBroadcastOutcome.transportError
+        }
+
+        // With the height known the caller takes the transaction, and may refuse it: its error
+        // propagates, with nothing submitted.
+        let rawTransaction = try await prepareTransaction(serverHeight)
+
+        // The bootstrap/connect and the preparation above can take many seconds, so only NOW — at
+        // the last pre-submit instant — does the caller's hook fire (A9: it re-arms the in-flight
+        // marker so its window covers the submit, not the bootstrap).
         onWillSubmit()
         do {
             let response = try connection.submit(spendTransaction: rawTransaction)
@@ -261,22 +325,56 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     }
 
     private func broadcastDirect(
-        rawTransaction: Data,
         to endpoint: LightWalletEndpoint,
-        onWillSubmit: @Sendable () -> Void
-    ) async -> MigrationBroadcastOutcome {
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
+    ) async throws -> MigrationBroadcastOutcome {
         // A fresh, ephemeral gRPC service for exactly this endpoint, closed after the single attempt.
-        let service = LightWalletGRPCService(endpoint: endpoint)
+        let service = directServiceFactory(endpoint)
 
-        // The last pre-submit instant on the direct path: the ephemeral service connects lazily
-        // inside `submit`, so the hook fires immediately before it (A9).
+        let attempt: MigrationBroadcastOutcome
+        do {
+            attempt = try await connectedDirectAttempt(
+                over: service,
+                onWillSubmit: onWillSubmit,
+                prepareTransaction: prepareTransaction
+            )
+        } catch {
+            await service.closeConnections()
+            throw error
+        }
+        await service.closeConnections()
+        return attempt
+    }
+
+    /// The direct transport's attempt over `service`: read its height, prepare the transaction,
+    /// submit it. Split from ``broadcastDirect(to:onWillSubmit:prepareTransaction:)`` so that one
+    /// place closes the service whichever way the attempt ends.
+    private func connectedDirectAttempt(
+        over service: any LightWalletService,
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
+    ) async throws -> MigrationBroadcastOutcome {
+        // The service connects lazily, on this first call. The height is read on the very service
+        // the transaction goes over.
+        let serverHeight: BlockHeight
+        do {
+            serverHeight = try await service.latestBlockHeight(mode: ServiceMode.direct)
+        } catch {
+            logger.error("MigrationBroadcaster: could not read the submission server's height: \(error.localizedDescription)")
+            return MigrationBroadcastOutcome.transportError
+        }
+
+        // With the height known the caller takes the transaction, and may refuse it: its error
+        // propagates, with nothing submitted.
+        let rawTransaction = try await prepareTransaction(serverHeight)
+
+        // The last pre-submit instant on the direct path (A9).
         onWillSubmit()
         do {
             let response = try await service.submit(spendTransaction: rawTransaction, mode: ServiceMode.direct)
-            await service.closeConnections()
             return outcome(from: response)
         } catch {
-            await service.closeConnections()
             logger.error("MigrationBroadcaster: direct submit transport failure: \(error)")
             return MigrationBroadcastOutcome.transportError
         }

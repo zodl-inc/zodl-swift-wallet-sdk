@@ -39,6 +39,7 @@
 
 import Combine
 import Foundation
+import os
 @testable import TestUtils
 import XCTest
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
@@ -86,7 +87,9 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
             MigrationAdvance(step: .waiting, next: MigrationNextWork(height: 850_000, kind: .broadcast)),
             MigrationAdvance(step: .complete, next: nil),
             MigrationAdvance(step: .replan, next: nil),
-            MigrationAdvance(step: .reevaluate, next: nil)
+            MigrationAdvance(step: .reevaluate, next: nil),
+            MigrationAdvance(step: .pausedForNetworkUpgrade(activationHeight: 3_543_405), next: nil),
+            MigrationAdvance(step: .interruptedByNetworkUpgrade(activationHeight: 3_543_405), next: nil)
         ]
 
         for expectedAdvance in cases {
@@ -97,6 +100,26 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
             XCTAssertEqual(advance, expectedAdvance)
             XCTAssertEqual(welding.migrationAdvanceStepForEstimatedTipReceivedArguments?.account, accountUUID)
         }
+    }
+
+    /// The bypass setter lands on the host's one holder, which every migration the host builds
+    /// shares: a migration built before the call and the setter agree, and the switch can be
+    /// turned off again.
+    func testSetMigrationNetworkUpgradeGateBypassReachesTheHostsHolder() async throws {
+        let recorder = FactoryInvocationRecorder()
+        let synchronizer = try makeSynchronizer(
+            migrationHost: makeHost(welding: ZcashRustBackendWeldingMock(), factoryRecorder: recorder)
+        )
+
+        // Cranking the account builds its migration; the mock welding answers "no run stored".
+        _ = try await synchronizer.migrationAdvanceStep(accountUUID: accountUUID)
+        XCTAssertEqual(recorder.bypasses.map(\.isBypassed), [false], "the bypass is off by default")
+
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(true)
+        XCTAssertEqual(recorder.bypasses.map(\.isBypassed), [true])
+
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(false)
+        XCTAssertEqual(recorder.bypasses.map(\.isBypassed), [false])
     }
 
     func testMigrationTransactionStatusesForwardsToTheAccountsActor() async throws {
@@ -214,6 +237,176 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         let received = welding.migrationRefreshStaleTransfersUskForReceivedArguments
         XCTAssertEqual(received?.account, accountUUID)
         XCTAssertEqual(received?.usk, usk)
+    }
+
+    /// `restartCurrentMigrationStep` hands back the actor's outcome unchanged, whichever it is: the
+    /// fresh plan to re-confirm, or the activation height a new plan waits for. The account reaches
+    /// the welding call.
+    func testRestartCurrentMigrationStepForwardsTheOutcomeToTheAccountsActor() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 3, proposalHandle: 5, preparations: [])
+        let outcomes: [MigrationRestartOutcome] = [
+            .replanned(schedule),
+            .cancelledUntilNetworkUpgrade(activationHeight: 4_465_026)
+        ]
+
+        for expected in outcomes {
+            welding.migrationRestartStepForReturnValue = expected
+
+            let outcome = try await synchronizer.restartCurrentMigrationStep(accountUUID: accountUUID)
+
+            XCTAssertEqual(outcome, expected)
+            XCTAssertEqual(welding.migrationRestartStepForReceivedAccount, accountUUID)
+        }
+    }
+
+    /// The availability read is wallet-scoped, so it reaches the host's welding without naming an
+    /// account, and hands every answer back untouched, whichever phase it is. The bypass the welding
+    /// is asked with is the host's own: off by default, and following the setter both ways.
+    func testMigrationAvailabilityForwardsToTheHostWithItsBypass() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let answers = [
+            MigrationAvailability(phase: .available, activationHeight: 3_543_405, isImmediateLaneAvailable: true),
+            MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 3_543_405, isImmediateLaneAvailable: true),
+            MigrationAvailability(phase: .available, activationHeight: nil, isImmediateLaneAvailable: true)
+        ]
+
+        for expected in answers {
+            welding.migrationAvailabilityUpgradeGateBypassReturnValue = expected
+
+            let availability = try await synchronizer.migrationAvailability()
+
+            XCTAssertEqual(availability, expected)
+            XCTAssertEqual(
+                welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass,
+                false,
+                "the bypass is off by default"
+            )
+        }
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassCallsCount, answers.count)
+
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(true)
+        _ = try await synchronizer.migrationAvailability()
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass, true)
+
+        await synchronizer.setMigrationNetworkUpgradeGateBypass(false)
+        _ = try await synchronizer.migrationAvailability()
+        XCTAssertEqual(welding.migrationAvailabilityUpgradeGateBypassReceivedUpgradeGateBypass, false)
+    }
+
+    /// An availability failure reaches the caller as the welding threw it.
+    func testMigrationAvailabilityPropagatesTheWeldingError() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationAvailabilityUpgradeGateBypassThrowableError = ZcashError.rustMigrationAvailability("boom")
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        do {
+            _ = try await synchronizer.migrationAvailability()
+            XCTFail("Expected rustMigrationAvailability to be thrown")
+        } catch ZcashError.rustMigrationAvailability(let message) {
+            XCTAssertEqual(message, "boom")
+        } catch {
+            XCTFail("Expected rustMigrationAvailability but got \(error)")
+        }
+    }
+
+    /// `cancelMigrationRun` reaches the welding's cancel for the account, through that account's
+    /// actor. It is not a broadcast, so a sync in progress does not refuse it: a host cancels the run
+    /// the upgrade interrupted whatever else the wallet is doing.
+    func testCancelMigrationRunForwardsToTheAccountsActorEvenWhileSyncing() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationCancelRunForClosure = { _ in }
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        await synchronizer.setInternalSyncStatusForTesting(.syncing(0.5, false))
+
+        try await synchronizer.cancelMigrationRun(accountUUID: accountUUID)
+
+        XCTAssertEqual(welding.migrationCancelRunForCallsCount, 1)
+        XCTAssertEqual(welding.migrationCancelRunForReceivedAccount, accountUUID)
+    }
+
+    /// A cancel failure reaches the caller as the welding threw it.
+    func testCancelMigrationRunPropagatesTheWeldingError() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationCancelRunForThrowableError = ZcashError.rustMigrationCancelRun("boom")
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+
+        do {
+            try await synchronizer.cancelMigrationRun(accountUUID: accountUUID)
+            XCTFail("Expected rustMigrationCancelRun to be thrown")
+        } catch ZcashError.rustMigrationCancelRun(let message) {
+            XCTAssertEqual(message, "boom")
+        } catch {
+            XCTFail("Expected rustMigrationCancelRun but got \(error)")
+        }
+    }
+
+    /// Before the NU7 network upgrade, every member that plans, builds, signs, stores or rebuilds a
+    /// scheduled run throws the welding's refusal as it was thrown, activation height included.
+    func testGatedMigrationCallsPropagateTheNetworkUpgradeRefusal() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        let refusal = ZcashError.migrationPausedUntilNetworkUpgrade(4_465_026)
+        welding.migrationPrepareNoteSplitForThrowableError = refusal
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForThrowableError = refusal
+        welding.migrationProposeTransfersForThrowableError = refusal
+        welding.migrationSignAndStoreScheduleUskForThrowableError = refusal
+        welding.migrationRefreshStaleTransfersUskForThrowableError = refusal
+        welding.migrationCreateUnsignedNoteSplitPcztsForForThrowableError = refusal
+        welding.migrationStoreSignedNoteSplitPcztsForThrowableError = refusal
+        welding.migrationCreateUnsignedTransferPcztsForForThrowableError = refusal
+        welding.migrationStoreSignedSchedulePcztsForThrowableError = refusal
+        let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding))
+        let accountUUID = accountUUID
+        let usk = TestsData(networkType: .testnet).spendingKey
+        let schedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0, preparations: [])
+        let proposal = NoteSplitProposal(outputNotes: [Zatoshi(100_000)], fee: Zatoshi(5_000), proposalHandle: 1)
+        let signed = [MigrationSignedTransferPczt(id: 0, pczt: Data([0x01]))]
+        let options = MigrationNetworkPrivacyOptions(useTor: false, submissionEndpoint: submissionEndpoint)
+        let calls: [(name: String, run: () async throws -> Void)] = [
+            ("prepareNoteSplit", { _ = try await synchronizer.prepareNoteSplit(accountUUID: accountUUID) }),
+            (
+                "submitNoteSplit",
+                { _ = try await synchronizer.submitNoteSplit(accountUUID: accountUUID, proposal: proposal, usk: usk, options: options) }
+            ),
+            ("proposeMigrationTransfers", { _ = try await synchronizer.proposeMigrationTransfers(accountUUID: accountUUID) }),
+            (
+                "signAndStoreMigrationSchedule",
+                { try await synchronizer.signAndStoreMigrationSchedule(accountUUID: accountUUID, schedule, usk: usk) }
+            ),
+            (
+                "refreshStaleMigrationTransfers",
+                { _ = try await synchronizer.refreshStaleMigrationTransfers(accountUUID: accountUUID, usk: usk) }
+            ),
+            (
+                "createUnsignedNoteSplitPCZTs",
+                { _ = try await synchronizer.createUnsignedNoteSplitPCZTs(accountUUID: accountUUID, for: schedule) }
+            ),
+            (
+                "storeSignedNoteSplitPCZTs",
+                { _ = try await synchronizer.storeSignedNoteSplitPCZTs(accountUUID: accountUUID, signed) }
+            ),
+            (
+                "createUnsignedMigrationTransferPCZTs",
+                { _ = try await synchronizer.createUnsignedMigrationTransferPCZTs(accountUUID: accountUUID, for: schedule) }
+            ),
+            (
+                "storeSignedMigrationSchedulePCZTs",
+                { try await synchronizer.storeSignedMigrationSchedulePCZTs(accountUUID: accountUUID, signed) }
+            )
+        ]
+
+        for call in calls {
+            do {
+                try await call.run()
+                XCTFail("\(call.name) must surface the refusal")
+            } catch ZcashError.migrationPausedUntilNetworkUpgrade(let activationHeight) {
+                XCTAssertEqual(activationHeight, 4_465_026, call.name)
+            } catch {
+                XCTFail("\(call.name) threw \(error) instead of the refusal")
+            }
+        }
     }
 
     /// #1806: `createUnsignedNoteSplitPCZTs` gained a required `schedule` parameter with the
@@ -625,7 +818,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         }
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
-        XCTAssertFalse(welding.migrationSignNoteSplitProposalUskForCalled, "the engine must never see a during-sync submission")
+        XCTAssertFalse(welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForCalled, "the engine must never see a during-sync submission")
     }
 
     func testPerformMigrationBroadcastThrowsDuringSyncWithoutTouchingTheHost() async throws {
@@ -655,7 +848,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
 
         XCTAssertEqual(recorder.callCount, 0, "the guard must throw before the host is ever consulted")
         XCTAssertFalse(
-            welding.migrationTakeBroadcastTransactionIdForCalled,
+            welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForCalled,
             "the engine must never see a during-sync execution attempt"
         )
     }
@@ -671,7 +864,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     func testSubmitNoteSplitForwardsWhenNotSyncing() async throws {
         struct StubSigningFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationSignNoteSplitProposalUskForThrowableError = StubSigningFailure()
+        welding.migrationSignNoteSplitProposalUskSubmissionServerHeightForThrowableError = StubSigningFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
 
@@ -689,7 +882,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         }
 
         // Note: the mock's generated body checks `...ThrowableError` before bumping `...CallsCount`,
-        // so `migrationSignNoteSplitProposalUskForCalled` stays false on this path -- catching the
+        // so `migrationSignNoteSplitProposalUskSubmissionServerHeightForCalled` stays false on this path -- catching the
         // exact stub type above (which can only originate from that one call site) plus the
         // recorder count already prove the call reached the engine.
         XCTAssertEqual(recorder.callCount, 1, "the host must be consulted when the synchronizer is not syncing")
@@ -700,7 +893,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     func testPerformMigrationBroadcastForwardsWhenNotSyncing() async throws {
         struct StubNextDueTransferFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationTakeBroadcastTransactionIdForThrowableError = StubNextDueTransferFailure()
+        welding.migrationTakeBroadcastTransactionIdSubmissionServerHeightForThrowableError = StubNextDueTransferFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
 
@@ -737,7 +930,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     func testTakeMigrationPreparationForwardsWithoutABroadcastGuard() async throws {
         struct StubTakePreparationFailure: Error, Equatable {}
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationTakePreparationTxidForThrowableError = StubTakePreparationFailure()
+        welding.migrationTakePreparationTxidSubmissionServerHeightForThrowableError = StubTakePreparationFailure()
         let recorder = FactoryInvocationRecorder()
         let synchronizer = try makeSynchronizer(migrationHost: makeHost(welding: welding, factoryRecorder: recorder))
 
@@ -764,7 +957,7 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     func testTakeMigrationPreparationPassesTheTxidThroughAndReturnsTheEngineId() async throws {
         let txid = Data(repeating: 0x5A, count: 32)
         let welding = ZcashRustBackendWeldingMock()
-        welding.migrationTakePreparationTxidForReturnValue = PreparedMigrationTransfer(
+        welding.migrationTakePreparationTxidSubmissionServerHeightForReturnValue = PreparedMigrationTransfer(
             id: 11,
             txid: txid,
             pczt: Data([0xDE, 0xAD, 0xBE, 0xEF])
@@ -776,8 +969,69 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
         XCTAssertEqual(prepared.id, 11, "the engine transfer id crosses the surface")
         XCTAssertEqual(prepared.txid, txid)
         XCTAssertEqual(prepared.pczt, Data([0xDE, 0xAD, 0xBE, 0xEF]), "the finalized transaction is submittable as-is")
-        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.txid, txid)
-        XCTAssertEqual(welding.migrationTakePreparationTxidForReceivedArguments?.account, accountUUID)
+        XCTAssertEqual(welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments?.txid, txid)
+        XCTAssertEqual(welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments?.account, accountUUID)
+    }
+
+    /// The retrieval is checked against the height the host's provider reads (the synchronizer's
+    /// own server), and the height reaches the engine call: the surface adds one request for it,
+    /// made for the txid being retrieved (the production provider reads over a Tor group of that
+    /// txid's own).
+    func testTakeMigrationPreparationReadsTheSubmissionHeight() async throws {
+        let txid = Data(repeating: 0x5A, count: 32)
+        let welding = ZcashRustBackendWeldingMock()
+        welding.migrationTakePreparationTxidSubmissionServerHeightForReturnValue = PreparedMigrationTransfer(
+            id: 11,
+            txid: txid,
+            pczt: Data([0x01])
+        )
+        let heightReadFor = OSAllocatedUnfairLock<[Data]>(initialState: [])
+        let synchronizer = try makeSynchronizer(
+            migrationHost: makeHost(
+                welding: welding,
+                submissionHeight: { readFor in
+                    heightReadFor.withLock { $0.append(readFor) }
+                    return 4_321_000
+                }
+            )
+        )
+
+        _ = try await synchronizer.takeMigrationPreparation(accountUUID: accountUUID, byTxid: txid)
+
+        XCTAssertEqual(
+            welding.migrationTakePreparationTxidSubmissionServerHeightForReceivedArguments?.submissionServerHeight,
+            4_321_000
+        )
+        XCTAssertEqual(heightReadFor.withLock { $0 }, [txid], "one height read, for the txid being retrieved")
+    }
+
+    /// A height that cannot be read fails the retrieval closed, before the engine is asked.
+    func testTakeMigrationPreparationFailsClosedWhenTheSubmissionHeightIsUnreadable() async throws {
+        let welding = ZcashRustBackendWeldingMock()
+        // Stubbed so that a regression that takes anyway fails the assertion below instead of
+        // crashing the process on the mock's un-stubbed return value.
+        welding.migrationTakePreparationTxidSubmissionServerHeightForReturnValue = PreparedMigrationTransfer(
+            id: 11,
+            txid: Data(repeating: 0x5A, count: 32),
+            pczt: Data([0x01])
+        )
+        let synchronizer = try makeSynchronizer(
+            migrationHost: makeHost(
+                welding: welding,
+                submissionHeight: { _ in throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut) }
+            )
+        )
+
+        do {
+            _ = try await synchronizer.takeMigrationPreparation(accountUUID: accountUUID, byTxid: Data(repeating: 0x5A, count: 32))
+            XCTFail("an unreadable height must fail the retrieval closed")
+        } catch ZcashError.serviceLatestBlockHeightFailed {
+            // expected
+        } catch {
+            XCTFail("expected serviceLatestBlockHeightFailed, got \(error)")
+        }
+
+        XCTAssertFalse(welding.migrationTakePreparationTxidSubmissionServerHeightForCalled)
     }
 
     // MARK: - Helpers
@@ -813,10 +1067,17 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
     /// `factoryRecorder`, when supplied, counts every `actorFactory` invocation -- i.e. every time
     /// `migrationHost.migration(for:)` actually built a per-account actor, which is what the
     /// broadcast guard's "never touched the host" assertions pin.
+    ///
+    /// The default broadcaster connects and reads a height, then takes from the engine, as the
+    /// production one does: the engine call a broadcasting member makes runs from within the
+    /// broadcaster, so a broadcaster that fails closed first would never let these tests' stubbed
+    /// engine answers reach the caller. `submissionHeight` is the provider a preparation retrieval
+    /// reads its height from, given the txid being retrieved.
     private func makeHost(
         welding: ZcashRustBackendWeldingMock,
-        broadcaster: any MigrationBroadcasting = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable)),
+        broadcaster: any MigrationBroadcasting = ScriptedBroadcaster(script: .outcome(.submitted)),
         tickInterval: TimeInterval = 3600,
+        submissionHeight: @escaping @Sendable (Data) async throws -> BlockHeight = { _ in 4_000_000 },
         factoryRecorder: FactoryInvocationRecorder? = nil
     ) -> OrchardMigrationHost {
         // `isSyncBlocked()`/`syncBlockedStream`/`start()`'s privacy gate unconditionally read
@@ -835,8 +1096,9 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
             tickInterval: tickInterval,
             now: { Date() },
             logger: logger,
-            actorFactory: { accountUUID, broadcaster in
-                factoryRecorder?.recordCall()
+            spacing: TargetBlockSpacing(networkType: .testnet),
+            actorFactory: { accountUUID, broadcaster, upgradeGateBypass in
+                factoryRecorder?.recordCall(upgradeGateBypass: upgradeGateBypass)
                 return OrchardMigration(
                     welding: welding,
                     accountUUID: accountUUID,
@@ -848,7 +1110,9 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
                         now: { Date() },
                         logger: logger
                     ),
-                    logger: logger
+                    logger: logger,
+                    spacing: TargetBlockSpacing(networkType: .testnet),
+                    submissionHeight: submissionHeight
                 )
             }
         )
@@ -871,8 +1135,11 @@ final class SlipstreamSynchronizerMigrationTests: ZcashTestCase {
 /// `SDKSynchronizerMigrationTests`'s helper of the same name/purpose.
 private final class FactoryInvocationRecorder {
     private(set) var callCount = 0
+    /// The bypass holder each invocation received, in build order.
+    private(set) var bypasses: [MigrationUpgradeGateBypass] = []
 
-    func recordCall() {
+    func recordCall(upgradeGateBypass: MigrationUpgradeGateBypass) {
         callCount += 1
+        bypasses.append(upgradeGateBypass)
     }
 }

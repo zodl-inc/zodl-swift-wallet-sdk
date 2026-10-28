@@ -60,6 +60,14 @@ run() {
 
 # ----------------------------------------------------------------- versions
 
+# Requested release names must be representable by the native artifact flow.
+# Keep historical parsing and Git ref helpers independent of this request policy.
+require_supported_release_version() {
+    case "$1" in
+        *+*) die "unsupported build metadata in requested SDK release version '$1'." ;;
+    esac
+}
+
 # Semver ordering as a filter. GNU `sort -V` ranks 2.7.0-rc.1 *above* 2.7.0,
 # which is backwards: a pre-release precedes its release. Mapping '-' to '~'
 # fixes it, because sort -V treats '~' as lower than the empty string.

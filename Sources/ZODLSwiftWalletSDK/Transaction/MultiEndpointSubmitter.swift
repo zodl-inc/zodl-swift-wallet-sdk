@@ -38,7 +38,7 @@ final class MultiEndpointSubmitter {
         )
 
         // The worker is created before the cancellation handler is installed and
-        // captured immutably by both closures — no lock needed (iOS 13 safe).
+        // captured immutably by both closures — no lock needed.
         let worker = Task {
             await race.run()
         }
@@ -148,6 +148,11 @@ actor SubmissionRace {
             submissionSucceeded(at: endpoint)
         } catch let TransactionEncoderError.submitError(code, message) {
             submissionRejected(at: endpoint, code: code, message: message)
+        } catch let TransactionEncoderError.notSubmittable(refusal) {
+            // The SDK refused to submit the transaction to this endpoint: it cannot be valid in the block after the endpoint's
+            // height. That is a verdict on the transaction rather than a failure to reach the endpoint, so the race reports it as
+            // a rejection, under the refusal's local code.
+            submissionRejected(at: endpoint, code: refusal.code, message: refusal.description)
         } catch is CancellationError {
             submissionCancelled(at: endpoint)
         } catch {

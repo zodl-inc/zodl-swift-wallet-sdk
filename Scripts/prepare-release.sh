@@ -74,6 +74,9 @@ Arguments:
   <revision>  commit or branch holding the changes to release
               (default: current HEAD, which should be a maint/ branch)
 
+Build metadata (+suffix) is unsupported in requested release versions, including
+dry runs and resumed builds. Stable and prerelease versions are supported.
+
 Options:
   --issue <N>       release tracking issue; the PR body gets `Closes #N`.
                     Required: every pull request must reference an issue.
@@ -100,6 +103,9 @@ Phase two of a release, run after the draft pull request from
 Every step checks whether it has already run and skips if so, so re-running
 after a failure resumes rather than starting over. The five-architecture build
 is slow enough that this matters.
+
+Build metadata (+suffix) is unsupported in requested release versions, including
+dry runs and resumed builds. Stable and prerelease versions are supported.
 
 Options:
   --artifacts local  build the XCFramework on this machine (default)
@@ -139,6 +145,9 @@ Before uploading, it points Package.swift at the framework it just built via
 LocalPackages, builds the Swift package, and runs the OfflineTests suite. A
 mismatch across the FFI boundary compiles on both sides and fails only at link
 or run time, so this is the last point at which one can be caught cheaply.
+
+Build metadata (+suffix) is unsupported in requested release versions, including
+dry runs and resumed builds. Stable and prerelease versions are supported.
 
 Options:
   --force-overwrite-existing-release  replace the assets of an existing DRAFT
@@ -220,6 +229,7 @@ cmd_start() {
     fi
     remote="$1"
     version="${2#v}"
+    require_supported_release_version "$version"
     revision="${3:-HEAD}"
 
     if [ -z "$issue" ]; then
@@ -400,8 +410,11 @@ verify_against_local_ffi() {
 
     step "Verifying the SDK against the freshly built XCFramework"
     run make configure-local-ffi
+    check_native_record configure-local-ffi
     run make build
+    check_native_record build
     run make test-offline
+    check_native_record test-offline
 
     # Leave the tree as we found it. LocalPackages/ is gitignored, but its mere
     # presence switches Package.swift from the released binary target to the
@@ -415,6 +428,17 @@ verify_against_local_ffi() {
     fi
 }
 
+# Proof is opt-in for native CLI callers and always enabled by the release workflow.
+check_native_record() {
+    if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
+        if [ $# -gt 0 ]; then
+            python3 Scripts/ci/sdk_build_record.py check "$SDK_RECORD_CONTEXT" --command "$1"
+        else
+            python3 Scripts/ci/sdk_build_record.py check "$SDK_RECORD_CONTEXT"
+        fi
+    fi
+}
+
 # Build, archive and upload. Returns with $PRODUCTS_DIR/release.env written.
 # Callers set GH_REPO; it falls back to the repository the workflow runs in
 # (GITHUB_REPOSITORY under Actions) and then to the canonical repository, so a
@@ -424,8 +448,19 @@ produce_artifacts() {
     local version="$1" force="$2" verify="$3"
     local manifest_version checksum download_url exists
 
+    require_supported_release_version "$version"
+
     : "${GH_REPO:=${GITHUB_REPOSITORY:-$DEFAULT_REPO}}"
     export GH_REPO
+
+    if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
+        [ "$verify" = "true" ] && [ "$DRY_RUN" = "false" ] || \
+            die "native build evidence requires verification and a real build."
+        rm -f "${PRODUCTS_DIR}/release.env" "${PRODUCTS_DIR}/sdk-build-record.json"
+        SDK_RECORD_CONTEXT="$(mktemp)"
+        trap 'rm -f "${SDK_RECORD_CONTEXT:-}"' EXIT
+        python3 Scripts/ci/sdk_build_record.py begin "$SDK_RECORD_CONTEXT" --version "$version"
+    fi
 
     require_gh_auth
 
@@ -468,7 +503,9 @@ produce_artifacts() {
 
     step "Building the XCFramework for ${version} (this takes a while)"
     run make clean-ffi
+    check_native_record clean-ffi
     run make ffi-all
+    check_native_record ffi-all
 
     # Between the build and the upload, deliberately: this is the last point at
     # which a broken FFI boundary can be caught before the artifact is public.
@@ -490,19 +527,37 @@ produce_artifacts() {
     download_url="https://github.com/${GH_REPO}/releases/download/${version}/${ZIP_FILE}"
     echo "  ${ZIP_FILE}: ${checksum}"
 
+    if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
+        python3 Scripts/ci/sdk_build_record.py finish "$SDK_RECORD_CONTEXT" \
+            --archive "${PRODUCTS_DIR}/${ZIP_FILE}" \
+            --destination "${PRODUCTS_DIR}/sdk-build-record.json"
+    fi
+
     step "Uploading to ${GH_REPO} as a draft release"
+    check_native_record
     if [ "$exists" = "true" ]; then
         gh release upload "$version" "${PRODUCTS_DIR}/${ZIP_FILE}" \
             --repo "$GH_REPO" --clobber
         # `gh release upload` replaces assets, never release properties, so the
         # pre-release bit has to be set on its own. A draft cut before this
         # handling existed carries whatever it was created with.
+        check_native_record
         gh release edit "$version" --repo "$GH_REPO" "$(prerelease_flag "$version")"
     else
         gh release create "$version" "${PRODUCTS_DIR}/${ZIP_FILE}" \
             --repo "$GH_REPO" --title "$version" \
             --notes "Zcash Light Client SDK ${version}" --draft \
             "$(prerelease_flag "$version")"
+    fi
+
+    if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
+        check_native_record
+        if [ "$exists" = "true" ]; then
+            gh release upload "$version" "${PRODUCTS_DIR}/sdk-build-record.json" --repo "$GH_REPO" --clobber
+        else
+            gh release upload "$version" "${PRODUCTS_DIR}/sdk-build-record.json" --repo "$GH_REPO"
+        fi
+        check_native_record
     fi
 
     # Only write this once the upload has actually succeeded: everything it
@@ -540,6 +595,7 @@ cmd_artifacts() {
         die "artifacts needs a version."
     fi
     version="${1#v}"
+    require_supported_release_version "$version"
 
     produce_artifacts "$version" "$force" "$verify"
 }
@@ -696,6 +752,7 @@ cmd_build() {
     fi
     remote="$1"
     version="${2#v}"
+    require_supported_release_version "$version"
     candidate_branch="candidate/${version}"
 
     step "Checking preconditions"

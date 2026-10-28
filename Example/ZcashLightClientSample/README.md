@@ -13,7 +13,7 @@ It relies on [Lightwalletd](https://github.com/zcash/lightwalletd), a backend se
 - [Resources](#resources)
 
 ## Requirements
-Demo app requires a target device running iOS 12+. 
+Demo app requires a target device running iOS 16+.
 
 [Back to contents](#contents)
 
