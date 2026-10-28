@@ -42,7 +42,13 @@ pub(crate) fn pczt_txid(pczt_bytes: &[u8]) -> anyhow::Result<[u8; 32]> {
         version,
         effects.consensus_branch_id(),
         &effects.digest(TxIdDigester),
-    );
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "A {:?} transaction's id is not known before it is authorized",
+            version
+        )
+    })?;
     Ok(*txid.as_ref())
 }
 

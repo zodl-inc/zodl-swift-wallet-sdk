@@ -122,6 +122,10 @@ main          ───●───────────────●──
 
 ### Cutting a release
 
+Build metadata (+suffix) is unsupported in requested release versions, including
+dry runs and resumed builds. Use a stable version such as `5.0.0` or a prerelease
+such as `5.0.0-rc.1`; do not strip metadata from an existing release name.
+
 A release happens in two phases, with a human reading the pull request in
 between. Both are driven by `./Scripts/prepare-release.sh`; pass `--dry-run` to
 either to see what it will do without changing anything.

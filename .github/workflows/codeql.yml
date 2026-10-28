@@ -15,8 +15,8 @@ name: "CodeQL Advanced"
 #
 # Rationale:
 # - The Swift matrix entry requires `build-mode: manual` (CodeQL's Swift extractor
-#   hooks the compiler), so it has to run a full Rust FFI + Swift build on a
-#   macos-15 runner. On Cargo.lock-changing PRs this is a 30-50 min cold build,
+#   hooks the compiler), so it has to build the Rust FFI (`make ffi-ci`, the
+#   arm64 macOS slice) and the Swift package on a macOS runner; a cold build,
 #   per push, with no concurrency cancellation.
 # - The build-integration signal that matters at PR time (does Rust still link
 #   with Swift? do offline tests pass?) is already covered by `swift.yml` on
@@ -67,7 +67,7 @@ jobs:
           runner: ubuntu-latest
         - language: swift
           build-mode: manual
-          runner: macos-15
+          runner: macos-26
         # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
@@ -102,15 +102,17 @@ jobs:
     # FFI symbols. We build the Rust FFI from source and configure LocalPackages
     # so swift build resolves against the freshly-built xcframework.
 
+    # Xcode 26.6, not 27: Xcode 27 ships Swift 6.4, and CodeQL's Swift extractor
+    # supports Swift only up to 6.3. Move it to Xcode 27 once CodeQL adds 6.4.
     - name: Select Xcode version
       if: matrix.language == 'swift'
-      run: sudo xcode-select -s '/Applications/Xcode_16.0.app/Contents/Developer'
+      run: sudo xcode-select -s '/Applications/Xcode_26.6.app/Contents/Developer'
 
     - name: Generate FFI source hash
       if: matrix.language == 'swift'
       id: ffi-hash
       run: |
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
+        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
         echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
         echo "FFI source hash: $FFI_HASH"
 
@@ -120,51 +122,57 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-only-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
+        key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
-    - name: Authorize cargo against the private slipstream repository
-      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: ./.github/actions/authorize-slipstream
-      with:
-        app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
-        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY }}
-
+    # The same Rust setup as swift.yml's build job, whose comment explains it.
     - name: Setup Rust
+      id: toolchain
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
-      with:
-        toolchain: stable
-        targets: aarch64-apple-darwin, x86_64-apple-darwin
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+        rustup default stable
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        rustc_version="$(rustc +stable --version --verbose)"
+        echo "$rustc_version"
+        commit_date="$(sed -n 's/^commit-date: //p' <<< "$rustc_version" | tr -d -)"
+        commit_hash="$(sed -n 's/^commit-hash: //p' <<< "$rustc_version")"
+        echo "cachekey=${commit_date}${commit_hash:0:4}" >> "$GITHUB_OUTPUT"
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
-        # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clone of
-        # the PRIVATE zodl-inc/slipstream repo. This repository is public, and GitHub lets
-        # workflow runs from forked pull requests restore caches created on the base branch — a
-        # cached clone would hand fork PRs the private source without their ever holding the App
-        # credential. Re-cloning one small repo per run is the cost of keeping it out.
+        # Swatinem/rust-cache did): that includes `~/.cargo/git`, where cargo keeps its clones of
+        # git dependencies. Every git dependency on main is public today (slipstream, once a
+        # private git dependency, now comes from crates.io), but a private one can return — other
+        # branches already pull some — and the public twin of this repository lets workflow runs
+        # from forked pull requests restore caches created on main. A cached clone would hand those
+        # runs the private source without their ever holding a credential for it, so the clones are
+        # fetched afresh on every run instead.
         #
-        # `registry/` is crates.io content and safe to cache. `target/` still holds
-        # slipstream-core's compiled rlib/rmeta, which is a far smaller disclosure than the source
-        # tree and too expensive to rebuild every run; dropping it too would require solving the
-        # public-repo/private-dependency problem properly instead.
+        # `registry/` is crates.io content and safe to cache. `target/` holds compiled rlib/rmeta
+        # files, never sources: a far smaller disclosure should a private dependency return, and
+        # too expensive to rebuild every run. The codeql- prefix keeps these caches apart from
+        # swift.yml's, which a different Xcode builds; v2 is ffi-ci's arm64-only, LTO-off build,
+        # and the toolchain's cachekey starts a fresh cache with each stable Rust release.
         path: |
           target
           ~/.cargo/bin
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-cargo-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-v1-
+          codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-
 
+    # The arm64 macOS slice without fat LTO is all the Swift build needs for
+    # analysis; the universal LTO build used to run into the 30-minute limit.
     - name: Build FFI for macOS
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
       timeout-minutes: 30
-      run: make ffi-macos
+      run: make ffi-ci
 
     - name: Configure local FFI
       if: matrix.language == 'swift'

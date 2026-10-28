@@ -135,7 +135,8 @@ private actor CallCounter {
 
 /// A monotonic clock a test drives by hand: `sleep` advances `now` by exactly the requested amount
 /// instead of waiting, so a test asserts exact timings without running in real time. `NSLock`
-/// supports the SDK's iOS 13/macOS 12 minimums, like `LedgerAppLauncher`'s own default clock.
+/// dates from the SDK's iOS 13 / macOS 12 floor, below `OSAllocatedUnfairLock`'s iOS 16 / macOS 13,
+/// as does `LedgerAppLauncher`'s own default clock.
 private final class VirtualClock: @unchecked Sendable {
     private let lock = NSLock()
     private var elapsed: TimeInterval = 0

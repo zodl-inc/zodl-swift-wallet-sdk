@@ -1325,7 +1325,7 @@ mod tests {
         let _custom_network = crate::lock_custom_network();
 
         // Modified mainnet: mainnet's own heights, except that this deployment
-        // has not activated NU6.3 yet. Mainnet is on NU6.3 well below the
+        // has activated neither NU6.3 nor NU7 yet. Mainnet is on NU7 well below the
         // synthetic snapshot, so the two schedules disagree there.
         assert!(crate::zcashlc_set_custom_network(
             1, 347_500, 419_200, 653_600, 903_000, 1_046_400, 1_687_104, 2_726_400, 3_146_400,
@@ -1359,7 +1359,7 @@ mod tests {
         let view: zcash_voting::VotingErrorView =
             serde_json::from_str(&err.to_string()).expect("typed JSON error");
         assert!(
-            view.message.contains("Nu6_2") && view.message.contains("Nu6_3"),
+            view.message.contains("Nu6_2") && view.message.contains("Nu7"),
             "the refusal must name both branches: {}",
             view.message
         );

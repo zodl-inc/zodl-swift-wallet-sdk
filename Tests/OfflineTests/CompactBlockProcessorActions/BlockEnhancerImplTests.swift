@@ -8,6 +8,7 @@
 //  leaving wallet UIs to discover a mined transaction only by chance.
 //
 
+import os
 import XCTest
 @testable import TestUtils
 @testable import ZODLSwiftWalletSDK
@@ -23,6 +24,19 @@ private final class CallCounter: @unchecked Sendable {
         defer { lock.unlock() }
         value += 1
         return value
+    }
+}
+
+/// Collects the mined heights a mock was asked to store; the generated mock closures are not isolated.
+private final class StoredMinedHeights: Sendable {
+    private let heights = OSAllocatedUnfairLock(initialState: [UInt32?]())
+
+    func append(_ height: UInt32?) {
+        heights.withLock { $0.append(height) }
+    }
+
+    var all: [UInt32?] {
+        heights.withLock { $0 }
     }
 }
 
@@ -58,17 +72,64 @@ final class BlockEnhancerImplTests: XCTestCase {
     private func makeEnhancer(
         rustBackend: ZcashRustBackendWeldingMock,
         downloader: BlockDownloaderServiceMock,
-        repository: TransactionRepositoryMock
+        repository: TransactionRepositoryMock,
+        service: LightWalletServiceMock = LightWalletServiceMock()
     ) -> BlockEnhancerImpl {
         BlockEnhancerImpl(
             blockDownloaderService: downloader,
             rustBackend: rustBackend,
             transactionRepository: repository,
             metrics: SDKMetricsImpl(),
-            service: LightWalletServiceMock(),
+            service: service,
             logger: OSLogger(logLevel: .debug),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
         )
+    }
+
+    /// A transaction found for a transparent address is stored with the height the server reports for it,
+    /// as long as that is a height the SDK can use. The mempool's 0, the `UInt64.max` of a transaction mined
+    /// on a fork and a height only a broken or hostile server reports all leave it unmined.
+    func testTransactionsInvolvingAddressAreStoredAsMinedOnlyAtAUsableHeight() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        let downloader = BlockDownloaderServiceMock()
+        let repository = TransactionRepositoryMock()
+        let service = LightWalletServiceMock()
+
+        let reportedHeights: [UInt64] = [663_188, UInt64(Int32.max), 0, UInt64(Int32.max) + 1, UInt64(UInt32.max), UInt64.max]
+        service.getTaddressTransactionsModeClosure = { _, _ in
+            AsyncThrowingStream { continuation in
+                for height in reportedHeights {
+                    var transaction = RawTransaction()
+                    transaction.data = Data([0x04, 0x00, 0x00, 0x80])
+                    transaction.height = height
+                    continuation.yield(transaction)
+                }
+                continuation.finish()
+            }
+        }
+        rustBackend.transactionDataRequestsReturnValue = [
+            .transactionsInvolvingAddress(
+                TransactionsInvolvingAddress(
+                    address: "tmExampleTransparentAddress",
+                    blockRangeStart: 663_000,
+                    blockRangeEnd: 664_000,
+                    requestAt: nil,
+                    txStatusFilter: .all,
+                    outputStatusFilter: .all
+                )
+            )
+        ]
+        let stored = StoredMinedHeights()
+        rustBackend.decryptAndStoreTransactionTxBytesMinedHeightClosure = { _, minedHeight in
+            stored.append(minedHeight)
+            return Data()
+        }
+        repository.findInLimitKindReturnValue = []
+
+        _ = try await makeEnhancer(rustBackend: rustBackend, downloader: downloader, repository: repository, service: service)
+            .enhance(at: 663_100...663_200) { _ in }
+
+        XCTAssertEqual(stored.all, [663_188, UInt32(Int32.max), nil, nil, nil, nil])
     }
 
     /// A GetStatus request answered `.mined` must report the (by definition newly mined) sent

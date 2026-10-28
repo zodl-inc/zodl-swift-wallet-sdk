@@ -112,7 +112,7 @@ final class MigrationFFITests: XCTestCase {
     /// `migrationAdvanceStep`, never from this call.
     func testFreshWalletTakeBroadcastTransactionThrows() async throws {
         do {
-            _ = try await rustBackend.migrationTakeBroadcastTransaction(id: 0, for: account)
+            _ = try await rustBackend.migrationTakeBroadcastTransaction(id: 0, submissionServerHeight: 4_000_000, for: account)
             XCTFail("a wallet with no stored run has no transaction to serve")
         } catch let error as ZcashError {
             XCTAssertEqual(error.code.rawValue, "ZRUST0111")
@@ -138,7 +138,11 @@ final class MigrationFFITests: XCTestCase {
     /// only ever reaches it holding a txid `migrationProveTransactions` just handed out.
     func testFreshWalletTakePreparationThrows() async throws {
         do {
-            _ = try await rustBackend.migrationTakePreparation(txid: Data(repeating: 0, count: 32), for: account)
+            _ = try await rustBackend.migrationTakePreparation(
+                txid: Data(repeating: 0, count: 32),
+                submissionServerHeight: 4_000_000,
+                for: account
+            )
             XCTFail("a wallet with no stored run has no preparation to serve")
         } catch let error as ZcashError {
             XCTAssertEqual(error.code.rawValue, "ZRUST0149")
@@ -149,7 +153,11 @@ final class MigrationFFITests: XCTestCase {
     /// accessor's parameter is a raw internal-order txid, never a display-hex string.
     func testTakePreparationRejectsAMalformedTxid() async throws {
         do {
-            _ = try await rustBackend.migrationTakePreparation(txid: Data(repeating: 0, count: 31), for: account)
+            _ = try await rustBackend.migrationTakePreparation(
+                txid: Data(repeating: 0, count: 31),
+                submissionServerHeight: 4_000_000,
+                for: account
+            )
             XCTFail("a 31-byte txid must be refused")
         } catch let error as ZcashError {
             XCTAssertEqual(error.code.rawValue, "ZRUST0149")
@@ -263,6 +271,415 @@ final class MigrationFFITests: XCTestCase {
         }
     }
 
+    // MARK: - The scheduled lane before NU7 (real FFI)
+    //
+    // `rustBackend` is born at the bundled testnet checkpoint at 4,500,000, past testnet's NU7
+    // activation at 4,465,026, so the gate is open for it. These tests use a second, unfunded wallet
+    // born at the bundled checkpoint at 4,000,000, for which the scheduled lane is closed until
+    // 4,465,026 unless the backend's bypass holder is set.
+
+    /// A call the NU7 gate guards, by the welding member it goes through, and the error code it
+    /// fails with once it is through the gate on an unfunded wallet with no stored run (`nil` when
+    /// it succeeds).
+    private struct GatedWeldingCall {
+        let name: String
+        let codePastTheGate: ZcashErrorCode?
+        let run: () async throws -> Void
+    }
+
+    /// A testnet wallet that holds nothing and was born at the bundled checkpoint at height
+    /// 4,000,000, with the bypass holder its backend reads on every gated call.
+    private struct PreActivationWallet {
+        let backend: ZcashRustBackend
+        let bypass: MigrationUpgradeGateBypass
+        let account: AccountUUID
+        let usk: UnifiedSpendingKey
+    }
+
+    /// Thrown when the wallet could not be set up; the failure itself was already reported.
+    private struct PreActivationWalletUnavailable: Error {}
+
+    private func makePreActivationTestnetWallet(in directory: URL) async throws -> PreActivationWallet {
+        let bypass = MigrationUpgradeGateBypass()
+        let backend = ZcashRustBackend.makeForTests(
+            dbData: directory.appendingPathComponent("data.db"),
+            fsBlockDbRoot: directory.appendingPathComponent("fs_cache", isDirectory: true),
+            networkType: .testnet,
+            migrationUpgradeGateBypass: bypass
+        )
+        let dbInit = try await backend.initDataDb(seed: nil)
+        guard case .success = dbInit else {
+            XCTFail("Failed to initDataDb. Expected `.success`, got \(String(describing: dbInit))")
+            throw PreActivationWalletUnavailable()
+        }
+
+        let treeState = CheckpointSourceFactory.fromBundle(for: .testnet).birthday(for: 4_000_000).treeState()
+        let usk = try await backend.createAccount(
+            seed: Environment.seedBytes,
+            treeState: treeState,
+            recoverUntil: nil,
+            name: "",
+            keySource: nil
+        )
+        let accounts = try await backend.listAccounts()
+        let account = try XCTUnwrap(accounts.first?.id)
+        return PreActivationWallet(backend: backend, bypass: bypass, account: account, usk: usk)
+    }
+
+    /// The nine welding members that plan, build, sign, store or rebuild a scheduled run, called with
+    /// arguments that make each fail wherever it goes past the gate: a proposal handle no plan was
+    /// cached under, and no signed PCZTs. `migrationRefreshStaleTransfers` has a call site for each
+    /// of its two lanes (a spending key, and none for an external signer), so it appears twice.
+    private func gatedWeldingCalls(for wallet: PreActivationWallet) -> [GatedWeldingCall] {
+        let backend = wallet.backend
+        let account = wallet.account
+        let usk = wallet.usk
+        let noSchedule = MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0, preparations: [])
+        let noSplit = NoteSplitProposal(outputNotes: [], fee: Zatoshi(0), proposalHandle: 0)
+        return [
+            GatedWeldingCall(name: "migrationProposeTransfers", codePastTheGate: nil) {
+                _ = try await backend.migrationProposeTransfers(for: account)
+            },
+            GatedWeldingCall(name: "migrationPrepareNoteSplit", codePastTheGate: nil) {
+                _ = try await backend.migrationPrepareNoteSplit(for: account)
+            },
+            GatedWeldingCall(name: "migrationSignNoteSplit", codePastTheGate: .migrationPlanStale) {
+                _ = try await backend.migrationSignNoteSplit(
+                    proposal: noSplit,
+                    usk: usk,
+                    submissionServerHeight: 4_000_000,
+                    for: account
+                )
+            },
+            GatedWeldingCall(name: "migrationSignAndStoreSchedule", codePastTheGate: .migrationPlanStale) {
+                try await backend.migrationSignAndStoreSchedule(noSchedule, usk: usk, for: account)
+            },
+            GatedWeldingCall(name: "migrationCreateUnsignedNoteSplitPczts", codePastTheGate: .migrationPlanStale) {
+                _ = try await backend.migrationCreateUnsignedNoteSplitPczts(for: noSchedule, for: account)
+            },
+            GatedWeldingCall(name: "migrationCreateUnsignedTransferPczts", codePastTheGate: .migrationPlanStale) {
+                _ = try await backend.migrationCreateUnsignedTransferPczts(for: noSchedule, for: account)
+            },
+            GatedWeldingCall(name: "migrationStoreSignedNoteSplitPczts", codePastTheGate: .rustMigrationStoreSignedNoteSplitPczt) {
+                _ = try await backend.migrationStoreSignedNoteSplitPczts([], for: account)
+            },
+            GatedWeldingCall(name: "migrationStoreSignedSchedulePczts", codePastTheGate: .rustMigrationStoreSignedSchedulePczts) {
+                try await backend.migrationStoreSignedSchedulePczts([], for: account)
+            },
+            GatedWeldingCall(name: "migrationRefreshStaleTransfers with a spending key", codePastTheGate: nil) {
+                _ = try await backend.migrationRefreshStaleTransfers(usk: usk, for: account)
+            },
+            GatedWeldingCall(name: "migrationRefreshStaleTransfers without a spending key", codePastTheGate: nil) {
+                _ = try await backend.migrationRefreshStaleTransfers(usk: nil, for: account)
+            }
+        ]
+    }
+
+    /// Before testnet's NU7 activation the scheduled lane starts nothing: a proposal is refused with
+    /// the typed error that names the activation height. With the bypass the same call goes through.
+    func testProposeIsRefusedBeforeTestnetActivationUnlessBypassed() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+
+        do {
+            _ = try await wallet.backend.migrationProposeTransfers(for: wallet.account)
+            XCTFail("a proposal before NU7 activates must be refused")
+        } catch ZcashError.migrationPausedUntilNetworkUpgrade(let activationHeight) {
+            XCTAssertEqual(activationHeight, 4_465_026)
+        } catch {
+            XCTFail("Expected migrationPausedUntilNetworkUpgrade but got \(error)")
+        }
+
+        wallet.bypass.setBypassed(true)
+        let schedule = try await wallet.backend.migrationProposeTransfers(for: wallet.account)
+        XCTAssertTrue(schedule.transfers.isEmpty, "an unfunded wallet has nothing to migrate")
+        XCTAssertEqual(schedule.proposalHandle, 0, "an empty schedule carries no plan handle")
+    }
+
+    /// Every gated welding member passes the bypass holder's current value on to the FFI and routes
+    /// the refusal to the typed error: each is refused while the holder is off, and each goes through
+    /// the gate to its own answer once it is on, then is refused again when it is turned back off.
+    func testEveryGatedCallIsRefusedBeforeTestnetActivationUnlessBypassed() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+        let calls = gatedWeldingCalls(for: wallet)
+
+        func assertRefused() async {
+            for call in calls {
+                do {
+                    try await call.run()
+                    XCTFail("\(call.name) must be refused before NU7 activates")
+                } catch ZcashError.migrationPausedUntilNetworkUpgrade(let activationHeight) {
+                    XCTAssertEqual(activationHeight, 4_465_026, call.name)
+                } catch {
+                    XCTFail("\(call.name) failed with \(error) instead of the refusal")
+                }
+            }
+        }
+
+        await assertRefused()
+
+        wallet.bypass.setBypassed(true)
+        for call in calls {
+            do {
+                try await call.run()
+                XCTAssertNil(call.codePastTheGate, "\(call.name) was expected to fail past the gate")
+            } catch let error as ZcashError {
+                XCTAssertNotEqual(
+                    error.code,
+                    ZcashErrorCode.migrationPausedUntilNetworkUpgrade,
+                    "\(call.name) was refused with the bypass on"
+                )
+                XCTAssertEqual(error.code, call.codePastTheGate, "\(call.name) failed with \(error)")
+            }
+        }
+
+        wallet.bypass.setBypassed(false)
+        await assertRefused()
+    }
+
+    /// A restart before the activation is a success, not a failure: it reports the activation height
+    /// a new scheduled plan waits for instead of planning. With the bypass it plans, as it always did.
+    func testRestartBeforeTestnetActivationReportsTheUpgradeUnlessBypassed() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+
+        let waiting = try await wallet.backend.migrationRestartStep(for: wallet.account)
+        XCTAssertEqual(waiting, .cancelledUntilNetworkUpgrade(activationHeight: 4_465_026))
+
+        wallet.bypass.setBypassed(true)
+        let replanned = try await wallet.backend.migrationRestartStep(for: wallet.account)
+        XCTAssertEqual(
+            replanned,
+            .replanned(MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0, preparations: [])),
+            "an unfunded wallet plans the empty schedule"
+        )
+    }
+
+    /// Past the activation the gate is open without the bypass: the fixture wallet is born at the
+    /// 4,500,000 checkpoint, so its restart plans.
+    func testRestartAfterTestnetActivationReplansWithoutTheBypass() async throws {
+        let outcome = try await rustBackend.migrationRestartStep(for: account)
+
+        XCTAssertEqual(
+            outcome,
+            .replanned(MigrationSchedule(transfers: [], estimatedDurationHours: 0, proposalHandle: 0, preparations: []))
+        )
+    }
+
+    // MARK: - The submission check (real FFI)
+
+    /// The note-split ceremony takes the submission server's height by value over the FFI, right
+    /// after the gate. A height that is not one (the "unknown" -1) fails closed there, before any run
+    /// is committed, and the rust layer's own words come back in the member's error: past the gate
+    /// (the bypass is on) it is the height that is refused, not the upgrade, and the same call with
+    /// a real height goes on to its plan-stale answer (see
+    /// `testEveryGatedCallIsRefusedBeforeTestnetActivationUnlessBypassed`).
+    func testSignNoteSplitFailsClosedWithoutASubmissionServerHeightOverRealFFI() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+        wallet.bypass.setBypassed(true)
+        let noSplit = NoteSplitProposal(outputNotes: [], fee: Zatoshi(0), proposalHandle: 0)
+
+        do {
+            _ = try await wallet.backend.migrationSignNoteSplit(
+                proposal: noSplit,
+                usk: wallet.usk,
+                submissionServerHeight: -1,
+                for: wallet.account
+            )
+            XCTFail("an unknown submission server height must fail closed")
+        } catch ZcashError.rustMigrationSignNoteSplit(let message) {
+            XCTAssertTrue(
+                message.contains("the submission server's height is unknown"),
+                "the refusal must say why, got: \(message)"
+            )
+        } catch {
+            XCTFail("Expected rustMigrationSignNoteSplit but got \(error)")
+        }
+    }
+
+    // MARK: - The availability read and the cancel-only call (real FFI)
+
+    /// The availability follows the wallet's own chain tip through the gate's phases, with no
+    /// account involved. On testnet, NU7 activates at 4,465,026. New scheduled work stays paused
+    /// until tip 4,465,025, whose next block is the activation. The immediate lane stays available
+    /// throughout, and the activation height is testnet's in both phases.
+    func testAvailabilityDecodesEachPhase() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+
+        let expectations: [(tip: Int32, expected: MigrationAvailability)] = [
+            (
+                4_000_000,
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            ),
+            (
+                4_464_976,
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            ),
+            (
+                4_464_977,
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            ),
+            (
+                4_465_024,
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            ),
+            (
+                4_465_025,
+                MigrationAvailability(phase: .available, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            )
+        ]
+        for (tip, expected) in expectations {
+            try await wallet.backend.updateChainTip(height: tip)
+
+            let availability = try await wallet.backend.migrationAvailability(upgradeGateBypass: false)
+
+            XCTAssertEqual(availability, expected, "tip \(tip)")
+        }
+    }
+
+    /// The bypass the caller passes opens the gate at the heights that would close it, and the
+    /// answer is the one the argument decides: a holder the backend carries for its own gated calls
+    /// plays no part, because the availability read belongs to no account's backend and takes the
+    /// host's value explicitly.
+    func testAvailabilityFollowsTheBypass() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+        let open = MigrationAvailability(phase: .available, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+
+        for (tip, closed) in [
+            (
+                Int32(4_000_000),
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            ),
+            (
+                Int32(4_464_977),
+                MigrationAvailability(phase: .pausedUntilNetworkUpgrade, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+            )
+        ] {
+            try await wallet.backend.updateChainTip(height: tip)
+
+            let withTheBypass = try await wallet.backend.migrationAvailability(upgradeGateBypass: true)
+            let withoutTheBypass = try await wallet.backend.migrationAvailability(upgradeGateBypass: false)
+            XCTAssertEqual(withTheBypass, open, "tip \(tip)")
+            XCTAssertEqual(withoutTheBypass, closed, "tip \(tip)")
+
+            wallet.bypass.setBypassed(true)
+            let heldByTheBackend = try await wallet.backend.migrationAvailability(upgradeGateBypass: false)
+            wallet.bypass.setBypassed(false)
+            XCTAssertEqual(heldByTheBackend, closed, "tip \(tip): the argument decides, not the backend's own holder")
+        }
+    }
+
+    /// Past testnet's activation the gate is open without any bypass: the fixture wallet is born
+    /// at the 4,500,000 checkpoint.
+    func testAvailabilityIsOpenOnTestnetAfterActivation() async throws {
+        let availability = try await rustBackend.migrationAvailability(upgradeGateBypass: false)
+
+        XCTAssertEqual(
+            availability,
+            MigrationAvailability(phase: .available, activationHeight: 4_465_026, isImmediateLaneAvailable: true)
+        )
+    }
+
+    /// A wallet that has never learned a chain tip cannot be judged, so the read fails with the
+    /// availability error. With the bypass the gate is open at every height, and no tip is needed.
+    func testAvailabilityWithoutAChainTipThrowsUnlessBypassed() async throws {
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = ZcashRustBackend.makeForTests(
+            dbData: directory.appendingPathComponent("data.db"),
+            fsBlockDbRoot: directory.appendingPathComponent("fs_cache", isDirectory: true),
+            networkType: .testnet
+        )
+        let dbInit = try await backend.initDataDb(seed: nil)
+        guard case .success = dbInit else {
+            return XCTFail("Failed to initDataDb. Expected `.success`, got \(String(describing: dbInit))")
+        }
+
+        do {
+            _ = try await backend.migrationAvailability(upgradeGateBypass: false)
+            XCTFail("a wallet with no chain tip has no phase")
+        } catch ZcashError.rustMigrationAvailability(let message) {
+            XCTAssertTrue(message.contains("sync first"), "unexpected message: \(message)")
+        } catch {
+            XCTFail("Expected rustMigrationAvailability but got \(error)")
+        }
+
+        let bypassed = try await backend.migrationAvailability(upgradeGateBypass: true)
+        XCTAssertEqual(bypassed, MigrationAvailability(phase: .available, activationHeight: 4_465_026, isImmediateLaneAvailable: true))
+    }
+
+    /// The FFI struct decodes to the model: each phase constant to its case, and the `-1` sentinel
+    /// of a network with no NU7 activation height to a `nil` height. A phase the header does not
+    /// name is a malformed answer, not a guess.
+    func testAvailabilityMappingDecodesEachPhaseAndTheNoActivationSentinel() throws {
+        let cases: [(phase: Int32, expected: MigrationAvailability.Phase)] = [
+            (ZCASHLC_MIGRATION_AVAILABLE, .available),
+            (ZCASHLC_MIGRATION_PAUSED_UNTIL_UPGRADE, .pausedUntilNetworkUpgrade)
+        ]
+        for (phase, expected) in cases {
+            let ffi = FfiMigrationAvailability(phase: UInt32(phase), activation_height: 3_543_405, immediate_available: false)
+
+            let decoded = try XCTUnwrap(ffi.unsafeToMigrationAvailability())
+
+            XCTAssertEqual(decoded.phase, expected)
+            XCTAssertEqual(decoded.activationHeight, 3_543_405)
+            XCTAssertFalse(decoded.isImmediateLaneAvailable, "the flag is the FFI's, not derived from the phase")
+        }
+
+        let noNU7 = FfiMigrationAvailability(phase: UInt32(ZCASHLC_MIGRATION_AVAILABLE), activation_height: -1, immediate_available: true)
+        XCTAssertEqual(
+            noNU7.unsafeToMigrationAvailability(),
+            MigrationAvailability(phase: .available, activationHeight: nil, isImmediateLaneAvailable: true)
+        )
+
+        XCTAssertNil(FfiMigrationAvailability(phase: 99, activation_height: 3_543_405, immediate_available: true).unsafeToMigrationAvailability())
+    }
+
+    /// With no run stored there is nothing to end: the cancel succeeds and stores nothing, so there
+    /// is still no run to advance. The upgrade gate stops what starts a run, never what ends one,
+    /// so it succeeds throughout the preactivation pause, with no bypass.
+    func testCancelRunWithoutARunSucceeds() async throws {
+        try await rustBackend.migrationCancelRun(for: account)
+        let pastActivationStep = try await rustBackend.migrationAdvanceStep(for: account)
+        XCTAssertNil(pastActivationStep, "cancelling nothing stores nothing")
+
+        let directory = try makeUniqueStorageDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wallet = try await makePreActivationTestnetWallet(in: directory)
+        for tip in [Int32(4_000_000), Int32(4_464_977)] {
+            try await wallet.backend.updateChainTip(height: tip)
+
+            try await wallet.backend.migrationCancelRun(for: wallet.account)
+
+            let step = try await wallet.backend.migrationAdvanceStep(for: wallet.account)
+            XCTAssertNil(step, "tip \(tip): cancelling nothing stores nothing")
+        }
+    }
+
+    /// A cancel that fails reaches the caller as the cancel's own error, with the rust layer's
+    /// message: an account the wallet does not know has no run store to open.
+    func testCancelRunForAnUnknownAccountThrowsTheCancelError() async throws {
+        let stranger = AccountUUID(id: [UInt8](repeating: 0x07, count: 16))
+
+        do {
+            try await rustBackend.migrationCancelRun(for: stranger)
+            XCTFail("an unknown account has no run to cancel")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code, ZcashErrorCode.rustMigrationCancelRun)
+            XCTAssertEqual(error.code.rawValue, "ZRUST0161")
+        }
+    }
+
     /// Recording a SUCCESS against a transfer id with no active migration run throws: that path
     /// must load the stored run to mark the transfer broadcast, and there is none. A deterministic,
     /// sync-independent throw — it never touches the wallet schema.
@@ -320,11 +737,13 @@ final class MigrationFFITests: XCTestCase {
     /// at all, which this offline suite's setup always provides). This exercises the real FFI
     /// marshaling end-to-end (db/account bytes, the fixed 32-byte txid buffer, the boolean success
     /// mapping) and `migrationProgress`'s read reading it straight back: an unmined, unrecognized
-    /// txid falls into the documented fallback-pending bucket (`recorded_at_height + 40`, not yet
-    /// elapsed), so progress reports `0 of 1`, flagged `isImmediate`, not `nil`. The immediate lane
-    /// is entirely outside the migration engine (see `MigrationProgress.isImmediate`'s doc), so
-    /// `migrationAdvanceStep` -- which answers for the STORED (engine-tracked) run only -- must stay
-    /// `nil` throughout: the two surfaces are orthogonal.
+    /// txid falls into the documented fallback-pending bucket (the default expiry delta after
+    /// `recorded_at_height`, 120 blocks here because this fixture is testnet at its 4,500,000
+    /// checkpoint, past NU7; not yet elapsed), so progress reports `0 of 1`, flagged `isImmediate`,
+    /// not `nil`. The immediate lane is entirely outside the migration engine (see
+    /// `MigrationProgress.isImmediate`'s doc), so `migrationAdvanceStep` -- which answers for the
+    /// STORED (engine-tracked) run only -- must stay `nil` throughout: the two surfaces are
+    /// orthogonal.
     func testMigrationRecordImmediateRunThenMigrationProgressReportsInProgress() async throws {
         let txid = Data(repeating: 0xAB, count: 32)
 
@@ -816,6 +1235,49 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertNil(makeAdvanceStep(step: 5, id: 1).unsafeToMigrationAdvance())
     }
 
+    /// The two network-upgrade steps decode to their cases carrying the activation height the
+    /// step reports, with no outlook (neither names a transaction or carries one). A negative
+    /// height on either is the `-1` "none" sentinel where an activation must be, so the step is
+    /// malformed and decodes to `nil` like any other defensive failure. On every other step the
+    /// field is not read.
+    func testAdvanceStepDecodeMapsPausedAndInterrupted() throws {
+        let paused = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE),
+            id: 0,
+            networkUpgradeHeight: 3_543_405
+        )
+        let pausedAdvance = try XCTUnwrap(paused.unsafeToMigrationAdvance())
+        XCTAssertEqual(pausedAdvance.step, .pausedForNetworkUpgrade(activationHeight: 3_543_405))
+        XCTAssertNil(pausedAdvance.next)
+
+        let interrupted = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE),
+            id: 0,
+            networkUpgradeHeight: 3_543_405
+        )
+        let interruptedAdvance = try XCTUnwrap(interrupted.unsafeToMigrationAdvance())
+        XCTAssertEqual(interruptedAdvance.step, .interruptedByNetworkUpgrade(activationHeight: 3_543_405))
+        XCTAssertNil(interruptedAdvance.next)
+
+        for step in [ZCASHLC_ADVANCE_STEP_PAUSED_FOR_NETWORK_UPGRADE, ZCASHLC_ADVANCE_STEP_INTERRUPTED_BY_NETWORK_UPGRADE] {
+            XCTAssertNil(
+                makeAdvanceStep(step: UInt32(step), id: 0, networkUpgradeHeight: -1).unsafeToMigrationAdvance(),
+                "a network-upgrade step without an activation height is malformed"
+            )
+        }
+
+        let waiting = makeAdvanceStep(
+            step: UInt32(ZCASHLC_ADVANCE_STEP_WAITING),
+            id: 0,
+            networkUpgradeHeight: 3_543_405
+        )
+        XCTAssertEqual(
+            waiting.unsafeToMigrationAdvance()?.step,
+            .waiting,
+            "the activation height means nothing on a step the gate did not answer"
+        )
+    }
+
     /// A multi-entry Prove batch marshals every row, ordered and typed, mixing preparation and
     /// transfer kinds in one batch (upstream #2939); an EMPTY batch is a malformed step (upstream
     /// documents the batch never empty), so it decodes to `nil` rather than an empty-transactions
@@ -840,6 +1302,43 @@ final class MigrationFFITests: XCTestCase {
             empty.unsafeToMigrationAdvance(),
             "an empty Prove batch is malformed (upstream never serves one empty), not a valid step"
         )
+    }
+
+    // MARK: - Restart outcome decode mapping
+
+    /// A restart that planned carries the schedule and `-1`; one that waited for the upgrade carries
+    /// no schedule and the activation height. Constructed directly like the rows above: the first
+    /// shape needs a funded wallet over the real FFI, and the second a wallet before NU7.
+    func testRestartOutcomeDecode() throws {
+        let waiting = FfiMigrationRestartOutcome(schedule: nil, replan_after_height: 3_543_405)
+        XCTAssertEqual(
+            waiting.unsafeToMigrationRestartOutcome(),
+            .cancelledUntilNetworkUpgrade(activationHeight: 3_543_405)
+        )
+
+        let schedule = UnsafeMutablePointer<FfiMigrationSchedule>.allocate(capacity: 1)
+        schedule.initialize(
+            to: FfiMigrationSchedule(
+                transfers: nil,
+                transfers_len: 0,
+                estimated_duration_hours: 3,
+                proposal_handle: 7,
+                preparations: nil,
+                preparations_len: 0
+            )
+        )
+        defer { schedule.deallocate() }
+        let planned = FfiMigrationRestartOutcome(schedule: schedule, replan_after_height: -1)
+        XCTAssertEqual(
+            planned.unsafeToMigrationRestartOutcome(),
+            .replanned(MigrationSchedule(transfers: [], estimatedDurationHours: 3, proposalHandle: 7, preparations: []))
+        )
+    }
+
+    /// An outcome with neither a plan nor an activation height to wait for is malformed, and
+    /// decodes to `nil` like any other defensive failure.
+    func testRestartOutcomeDecodeRejectsAnOutcomeWithNeitherAPlanNorAHeight() {
+        XCTAssertNil(FfiMigrationRestartOutcome(schedule: nil, replan_after_height: -1).unsafeToMigrationRestartOutcome())
     }
 
     // MARK: - Prove outcome decode mapping (the txid seam)
@@ -1028,12 +1527,112 @@ final class MigrationFFITests: XCTestCase {
         XCTAssertTrue(message.hasPrefix("MIGRATION_PROVING_UNAVAILABLE"))
     }
 
+    /// `MIGRATION_PAUSED_UNTIL_UPGRADE:<activation height>` parses the height into
+    /// `.migrationPausedUntilNetworkUpgrade(height)`, whichever member the failure came from; a
+    /// height that does not parse (contract drift) degrades to the member's own fallback rather
+    /// than fabricating one.
+    func testPausedPrefixRoutesToTheTypedError() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        let routed = backend.migrationRoutedError(
+            "MIGRATION_PAUSED_UNTIL_UPGRADE:4465026",
+            fallback: ZcashError.rustMigrationProposeTransfers
+        )
+        guard case .migrationPausedUntilNetworkUpgrade(let activationHeight) = routed else {
+            XCTFail("expected migrationPausedUntilNetworkUpgrade, got \(routed)")
+            return
+        }
+        XCTAssertEqual(activationHeight, 4_465_026)
+        XCTAssertEqual(routed.code.rawValue, "ZRUST0159")
+
+        let malformedMessages = [
+            "MIGRATION_PAUSED_UNTIL_UPGRADE:",
+            "MIGRATION_PAUSED_UNTIL_UPGRADE:abc",
+            "MIGRATION_PAUSED_UNTIL_UPGRADE:-3",
+            "MIGRATION_PAUSED_UNTIL_UPGRADE:4465026 and more",
+            "MIGRATION_PAUSED_UNTIL_UPGRADE"
+        ]
+        for malformed in malformedMessages {
+            let degraded = backend.migrationRoutedError(malformed, fallback: ZcashError.rustMigrationProposeTransfers)
+
+            guard case .rustMigrationProposeTransfers(let message) = degraded else {
+                XCTFail("expected the rustMigrationProposeTransfers fallback for \(malformed), got \(degraded)")
+                return
+            }
+            XCTAssertEqual(message, malformed, "the fallback must carry the raw message untouched")
+        }
+    }
+
+    /// `MIGRATION_SUBMISSION_REFUSED:<code>` routes to `.migrationSubmissionRefused(refusal)` for
+    /// each code the rust layer emits, whichever member the failure came from; a code this SDK does
+    /// not know (contract drift), or none, degrades to the member's own fallback rather than
+    /// fabricating a refusal.
+    func testSubmissionRefusedPrefixRoutesToTheTypedError() throws {
+        let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
+
+        let codes: [(rustCode: String, refusal: TransactionSubmissionRefusal)] = [
+            ("wrong_branch", .wrongConsensusBranch),
+            ("expired", .expired)
+        ]
+        for (rustCode, refusal) in codes {
+            let routed = backend.migrationRoutedError(
+                "MIGRATION_SUBMISSION_REFUSED:\(rustCode)",
+                fallback: ZcashError.rustMigrationTakeBroadcastTransaction
+            )
+            guard case .migrationSubmissionRefused(let routedRefusal) = routed else {
+                XCTFail("expected migrationSubmissionRefused for \(rustCode), got \(routed)")
+                return
+            }
+            XCTAssertEqual(routedRefusal, refusal, rustCode)
+            XCTAssertEqual(routed.code.rawValue, "ZRUST0162")
+        }
+
+        let unknownMessages = [
+            "MIGRATION_SUBMISSION_REFUSED:",
+            "MIGRATION_SUBMISSION_REFUSED:not_a_code",
+            "MIGRATION_SUBMISSION_REFUSED:expired and more",
+            "MIGRATION_SUBMISSION_REFUSED:EXPIRED",
+            "MIGRATION_SUBMISSION_REFUSED"
+        ]
+        for unknown in unknownMessages {
+            let degraded = backend.migrationRoutedError(unknown, fallback: ZcashError.rustMigrationTakePreparation)
+
+            guard case .rustMigrationTakePreparation(let message) = degraded else {
+                XCTFail("expected the rustMigrationTakePreparation fallback for \(unknown), got \(degraded)")
+                return
+            }
+            XCTAssertEqual(message, unknown, "the fallback must carry the raw message untouched")
+        }
+    }
+
+    /// The refusal's local codes and descriptions are part of the public surface: a consumer that
+    /// carries a refusal in a failure with an integer code sees these, and none of them is a code a
+    /// server sends.
+    func testTransactionSubmissionRefusalHasStableCodesAndDescriptions() {
+        XCTAssertEqual(TransactionSubmissionRefusal.wrongConsensusBranch.code, -9101)
+        XCTAssertEqual(TransactionSubmissionRefusal.expired.code, -9102)
+        XCTAssertEqual(
+            Set([
+                TransactionSubmissionRefusal.wrongConsensusBranch.description,
+                TransactionSubmissionRefusal.expired.description
+            ]).count,
+            2,
+            "each refusal describes itself"
+        )
+    }
+
     /// An unrelated message — including one merely CONTAINING a known prefix mid-string — falls
     /// through to the member's own case untouched.
     func testMigrationRoutedErrorLeavesUnrelatedMessagesToTheFallback() throws {
         let backend = try XCTUnwrap(rustBackend as? ZcashRustBackend)
 
-        for unrelated in ["sqlite disk I/O error", "saw MIGRATION_PLAN_STALE downstream"] {
+        let unrelatedMessages = [
+            "sqlite disk I/O error",
+            "saw MIGRATION_PLAN_STALE downstream",
+            "saw MIGRATION_PAUSED_UNTIL_UPGRADE:3543405 downstream",
+            "saw MIGRATION_SUBMISSION_REFUSED:expired downstream"
+        ]
+        for unrelated in unrelatedMessages {
             let routed = backend.migrationRoutedError(unrelated, fallback: ZcashError.rustMigrationRestartStep)
 
             guard case .rustMigrationRestartStep(let message) = routed else {
@@ -1053,13 +1652,15 @@ final class MigrationFFITests: XCTestCase {
     ///
     /// THE BACKSTOP, OVER REAL FFI: the Swift surface makes the instruction un-forgeable, but this
     /// test forges one through `@testable` precisely to prove the honest-boundary claim in the
-    /// surface docs — the rust seam refuses it on its own per-row state, so nothing reaches the
-    /// broadcaster and nothing is recorded. A pre-broadcast refusal, not a silent no-op.
+    /// surface docs — the rust seam refuses it on its own per-row state, so nothing is submitted
+    /// and nothing is recorded. A pre-broadcast refusal, not a silent no-op. (The broadcaster is
+    /// reached, because the take runs from within it once it has connected and read a height, and it
+    /// is the take that is refused.)
     func testFreshWalletActorPerformBroadcastRefusesAnUninstructedIdOverRealFFI() async throws {
         let storageDirectory = try makeUniqueStorageDirectory()
         defer { try? FileManager.default.removeItem(at: storageDirectory) }
 
-        let broadcaster = ScriptedBroadcaster(script: .throwing(ZcashError.migrationTorUnavailable))
+        let broadcaster = ScriptedBroadcaster(script: .outcome(.submitted))
         let migration = OrchardMigration(
             welding: rustBackend,
             accountUUID: account,
@@ -1070,7 +1671,8 @@ final class MigrationFFITests: XCTestCase {
                 tickInterval: 3600,
                 logger: logger
             ),
-            logger: logger
+            logger: logger,
+            spacing: TargetBlockSpacing(networkType: .testnet)
         )
 
         do {
@@ -1088,7 +1690,7 @@ final class MigrationFFITests: XCTestCase {
             XCTFail("Expected rustMigrationTakeBroadcastTransaction but got \(error)")
         }
 
-        XCTAssertEqual(broadcaster.receivedCalls.count, 0, "a refused serve must never reach the network")
+        XCTAssertTrue(broadcaster.submittedTransactions.isEmpty, "a refused serve must never reach the network")
     }
 
     // MARK: - Gate ticker boundary wake (field-caught 2026-08-02)
@@ -1195,6 +1797,8 @@ final class MigrationFFITests: XCTestCase {
                 accountUUID: accountUUID,
                 torDirURL: storageDirectory.appendingPathComponent("tor", isDirectory: true),
                 generalStorageURL: storageDirectory,
+                upgradeGateBypass: MigrationUpgradeGateBypass(),
+                submissionHeight: { _ in 4_000_000 },
                 loggingPolicy: .noLogging
             )
         }
@@ -1265,12 +1869,14 @@ final class MigrationFFITests: XCTestCase {
     /// Builds an `FfiMigrationAdvanceStep` with no Prove batch (`prove_targets: nil`,
     /// `prove_targets_len: 0`) — every step but Prove, mirroring the FFI contract. `nextHeight`/
     /// `nextKind` default to the no-outlook sentinel (`-1`/`0`); override them for the outlook
-    /// decode tests below.
+    /// decode tests below. `networkUpgradeHeight` defaults to the `-1` "none" sentinel every step
+    /// but the two network-upgrade steps carries.
     private func makeAdvanceStep(
         step: UInt32,
         id: UInt32,
         nextHeight: Int64 = -1,
-        nextKind: UInt32 = 0
+        nextKind: UInt32 = 0,
+        networkUpgradeHeight: Int64 = -1
     ) -> FfiMigrationAdvanceStep {
         FfiMigrationAdvanceStep(
             step: step,
@@ -1278,7 +1884,8 @@ final class MigrationFFITests: XCTestCase {
             prove_targets: nil,
             prove_targets_len: 0,
             next_height: nextHeight,
-            next_kind: nextKind
+            next_kind: nextKind,
+            network_upgrade_height: networkUpgradeHeight
         )
     }
 
@@ -1302,7 +1909,8 @@ final class MigrationFFITests: XCTestCase {
             prove_targets: pointer,
             prove_targets_len: UInt(targets.count),
             next_height: -1,
-            next_kind: 0
+            next_kind: 0,
+            network_upgrade_height: -1
         )
     }
 

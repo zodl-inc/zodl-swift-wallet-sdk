@@ -86,10 +86,10 @@ final class MigrationSyncGate: @unchecked Sendable {
     /// emits values on `blockedSubject`. `publish(_:generation:)` holds this lock across the actual
     /// `blockedSubject.send(_:)` call (Combine requires sends on a subject to be serialized). Kept
     /// deliberately separate from `subscriptionLock` below -- see that property's doc for why.
-    /// `NSLock` rather than `OSAllocatedUnfairLock` (the usual preference for new locking code): this
-    /// package's deployment target (`Package.swift`: `.iOS(.v13)` / `.macOS(.v12)`) is below
-    /// `OSAllocatedUnfairLock`'s iOS 16 / macOS 13 floor, so this matches the plain-`NSLock`
-    /// convention already used elsewhere in this codebase (see `ZcashRustBackend.rustInitLock`).
+    /// `NSLock`, the plain-lock convention used elsewhere in this codebase (see
+    /// `ZcashRustBackend.rustInitLock`). It was chosen while the package still supported iOS 13 /
+    /// macOS 12, below `OSAllocatedUnfairLock`'s iOS 16 / macOS 13 floor; the package's iOS 16 /
+    /// macOS 14 floor now allows `OSAllocatedUnfairLock`.
     private let emissionLock = NSLock()
     /// The generation handed out to the most recently *started* `recompute()`, and the newest
     /// generation `publish(_:generation:)` has actually sent. Both guarded by `emissionLock`.

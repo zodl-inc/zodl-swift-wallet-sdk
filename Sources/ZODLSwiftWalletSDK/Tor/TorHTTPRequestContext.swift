@@ -23,7 +23,8 @@ final class TorHTTPRequestContext: @unchecked Sendable {
     let deadlineUptime: UInt64
     private let now: @Sendable () -> UInt64
     private let sleepUntil: @Sendable (UInt64) async throws -> Void
-    // NSLock preserves the SDK's iOS 13/macOS 12 deployment floors.
+    // NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
+    // iOS 16 / macOS 13.
     private let lock = NSLock()
     private var phase = Phase.waiting
     private var reason: Error?

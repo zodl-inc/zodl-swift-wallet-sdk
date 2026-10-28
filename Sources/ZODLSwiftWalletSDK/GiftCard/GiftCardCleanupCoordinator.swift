@@ -1,7 +1,8 @@
 import Foundation
 
 /// Owns teardown independently of the lifetime and cancellation of its callers.
-/// NSLock preserves the SDK's iOS 13 / macOS 12 deployment floors.
+/// NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
+/// iOS 16 / macOS 13.
 final class GiftCardCleanupCoordinator: @unchecked Sendable {
     private enum Phase {
         case idle

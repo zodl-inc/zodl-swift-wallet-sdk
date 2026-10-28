@@ -20,7 +20,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         await assertCancellation(caller)
         let calls = await fixture.engine.calls
         XCTAssertFalse(calls.contains("start"))
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         await gate.open()
         // This following call joins native preparation and reuses the completed account.
         let following = try await fixture.redeemer.check()
@@ -64,7 +64,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         } catch ZcashError.giftCardCleanupTimedOut {
         }
         let calls = await fixture.engine.calls
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
         assertAliasOwned(card: fixture.card)
         await gate.open()
@@ -96,7 +96,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         let root = testTempDirectory.appendingPathComponent(card.synchronizerAlias.description)
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
         let calls = await engine.calls
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         assertAliasOwned(card: card)
         let cleanup = startCleanup(try XCTUnwrap(retained))
         await gate.open()
@@ -151,7 +151,7 @@ final class GiftCardCheckDeadlineTests: ZcashTestCase {
         let cleanup = Task { try await fixture.redeemer.cleanup() }
         await fulfillment(of: [clock.expectSleep(at: 630_000_000_000)], timeout: 5)
         let calls = await fixture.engine.calls
-        XCTAssertFalse(calls.contains("stop"))
+        XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
         assertAliasOwned(card: fixture.card)
         await gate.open()
         let result = try await claim.value

@@ -214,8 +214,8 @@ extension SlipstreamSynchronizer {
 ///   child task would die with it. For the same reason `stop()` — called from a nonisolated,
 ///   possibly cancelled context — still runs its teardown to completion.
 ///
-/// `NSLock` (not `OSAllocatedUnfairLock`) keeps the SDK's iOS 13 / macOS 12 deployment floor, as
-/// `PendingStopSlot` did.
+/// `NSLock` (not `OSAllocatedUnfairLock`) dates from the package's iOS 13 / macOS 12 floor, below
+/// `OSAllocatedUnfairLock`'s iOS 16 / macOS 13, as `PendingStopSlot`'s lock did.
 final class LifecycleQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var tail: Task<Void, Never>?
@@ -260,8 +260,8 @@ final class LifecycleQueue: @unchecked Sendable {
 /// does not propagate to either on its own — this flag carries it across the boundary by hand,
 /// checked as the first thing the queued or detached body does.
 ///
-/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor, the same reason
-/// `Gate` and `LifecycleQueue` use one.
+/// `NSLock`, not `OSAllocatedUnfairLock`, dates from the package's iOS 13 / macOS 12 floor, below
+/// `OSAllocatedUnfairLock`'s iOS 16 / macOS 13, like the locks in `Gate` and `LifecycleQueue`.
 final class CancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var flagged = false
@@ -284,8 +284,8 @@ final class CancellationFlag: @unchecked Sendable {
 /// Races `operation` against a nanosecond timer.  Returns the operation's value if it
 /// completes first; throws `SummaryTimeoutError` when the timer wins.
 ///
-/// Uses `Task.sleep(nanoseconds:)` for iOS 13+/macOS 12+ compatibility (the newer
-/// `Task.sleep(for: Duration)` requires iOS 16+/macOS 13+).
+/// Uses `Task.sleep(nanoseconds:)`, a choice that dates from the package's iOS 13 / macOS 12 floor,
+/// which the newer `Task.sleep(for: Duration)` (iOS 16+/macOS 13+) did not reach.
 ///
 /// Both the operation task and the timer task are cancelled when the other wins
 /// (structured cancellation via `withThrowingTaskGroup`).  Structured concurrency
