@@ -218,7 +218,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "5993d88af4778fc7b3d5323e70dedf8bdbcc461b" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "05a53f26657f3dec8549a7789b937f30e4671fea" }
 
 # DO NOT ALTER THIS COMMENT
 #
