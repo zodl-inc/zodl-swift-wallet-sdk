@@ -837,13 +837,13 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testSubmitRejectedTerminallyByEveryEndpointIsRecordedAsRejected() async throws {
-        let first = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let first = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? first.stop() }
-        let second = try RecordingCompactTxStreamerService(
+        let second = try HeightReportingLightwalletd(
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "tx size exceeding the configured mempool maximum")
         )
         defer { try? second.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
         var rejected: [Set<Data>] = []
         synchronizer.rejectedTransactionIdsStream
@@ -861,11 +861,11 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testOneExplicitRejectionBesideATransientRefusalIsRecordedAsRejected() async throws {
-        let terminal = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? terminal.stop() }
-        let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
         defer { try? transient.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
@@ -1175,7 +1175,7 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testOnlyTransientRefusalsStaySubmitted() async throws {
-        let transient = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
         defer { try? transient.stop() }
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
@@ -1187,11 +1187,11 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testARejectionBesideAnAcceptanceIsNotRejected() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
-        let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let accepting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         _ = await synchronizer.broadcaster.submit(
@@ -1269,14 +1269,15 @@ final class BroadcasterTests: ZcashTestCase {
         let rawID = Data(repeating: 0xE4, count: 32)
         let rawTransaction = Data([0x01, 0x02])
         let synchronizer = try makeSynchronizer(
-            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: rawTransaction, rawID: rawID)])
+            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: rawTransaction, rawID: rawID)]),
+            rustBackend: ZcashRustBackendWeldingMock()
         )
         await synchronizer.updateStatus(.stopped)
-        let first = try RecordingCompactTxStreamerService(
+        let first = try HeightReportingLightwalletd(
             sendResponse: makeSendResponse(errorCode: -25, errorMessage: "exceeding the next block's ZIP 218 limit")
         )
         defer { try? first.stop() }
-        let second = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let second = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? second.stop() }
 
         let transactions = try await synchronizer.broadcaster.createProposedTransactions(
@@ -1296,9 +1297,9 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testAMigrationPreparationRejectedByEveryEndpointStaysSubmitted() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
         let store = mockContainer.resolve(SubmitPlanStoring.self)
         await store.markMigrationPreparation(txId: transaction.txId, lifecycle: await store.currentLifecycle())
@@ -1311,11 +1312,11 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     func testALaterAcceptanceClearsARejection() async throws {
-        let rejecting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? rejecting.stop() }
-        let accepting = try RecordingCompactTxStreamerService(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        let accepting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? accepting.stop() }
-        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
         _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
