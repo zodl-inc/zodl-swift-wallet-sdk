@@ -267,8 +267,8 @@ catch ZcashError.rustCreateToAddress(let error) {
 ## `ZcashError` gained cases — send-max
 
 `ZcashError` and `ZcashErrorCode` have three new cases, `rustProposalTransactionTooLarge`
-(`ZRUST0159`), `rustProposalTransparentMemo` (`ZRUST0160`) and `rustProposalUnsupportedAddress`
-(`ZRUST0161`), which `proposeSendMax` throws (the first also from `proposeTransfer` and
+(`ZRUST0174`), `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress`
+(`ZRUST0176`), which `proposeSendMax` throws (the first also from `proposeTransfer` and
 `proposefulfillingPaymentURI`).
 An exhaustive `switch` over either type stops compiling until they are handled. They carry no
 payload. `RustErrorKind` likewise gains `transactionTooLarge` and `transparentMemo`.

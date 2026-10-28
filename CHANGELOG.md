@@ -340,16 +340,16 @@ Changes are relative to `5.2.2`.
 - `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
   `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
   more notes than one transaction can spend within the block size limit is now refused when the
-  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0159`);
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
   before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
-  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0160`), and a recipient with
-  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0161`).
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
   Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
   carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
   None of the new cases carries the recipient, the memo or an amount.
 - `proposeTransfer(accountUUID:recipient:amount:memo:)` and
   `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
-  (`ZRUST0159`) for a payment whose transaction would not fit in a block, instead of
+  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
   `rustProposeTransfer` or `rustProposeTransferFromURI`.
 - `DerivationTool.describeUnifiedFullViewingKey(_:)` reports which items a `UnifiedFullViewingKey`
   carries, as a `UnifiedFullViewingKeyComponents` with `hasP2pkh`, `hasP2sh`, `hasSapling`,
@@ -422,8 +422,8 @@ Changes are relative to `5.2.2`.
   as `proposalInvalid`, and a wallet could only tell them apart by the upstream error text, which
   redaction now removes; the new case lets it say "scan further and retry". An exhaustive `switch`
   over `RustErrorKind` stops compiling until the new case is handled.
-- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0159`),
-  `rustProposalTransparentMemo` (`ZRUST0160`) and `rustProposalUnsupportedAddress` (`ZRUST0161`).
+- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
+  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
   An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
 - A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
   amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
