@@ -33,7 +33,7 @@ _ERRORS = {
     'probe': 'The installed stable Rust toolchain could not be verified.',
     'unstable': 'The installed stable compiler must report a numeric stable release.',
     'too_old': 'The installed stable compiler is older than the SDK Rust minimum.',
-    'override': 'An explicit RUSTC or RUSTUP_TOOLCHAIN override conflicts with stable Rust.',
+    'override': 'An explicit RUSTC or RUSTUP_TOOLCHAIN override conflicts with stable Rust. Remove the conflicting RUSTC or RUSTUP_TOOLCHAIN override and retry.',
 }
 
 

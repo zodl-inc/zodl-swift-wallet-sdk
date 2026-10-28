@@ -226,6 +226,20 @@ class ToolchainTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([path.read_text() for path in files], ['sentinel\n'] * 3)
 
+    def test_cli_override_failure_gives_safe_removal_guidance(self):
+        (self.root / 'Cargo.toml').write_text(
+            '[package]\nname="fixture"\nrust-version="1.80"\n')
+        canary = 'private-override-canary'
+        environment = os.environ.copy()
+        environment['PATH'] = '/opt/homebrew/bin:/Users/chlup/.cargo/bin:' + environment.get('PATH', '')
+        environment['RUSTC'] = canary
+        result = subprocess.run([sys.executable, str(HELPER), '--root', str(self.root)],
+                                capture_output=True, text=True, env=environment)
+        diagnostic = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Remove the conflicting RUSTC or RUSTUP_TOOLCHAIN override and retry.', diagnostic)
+        self.assertNotIn(canary, diagnostic)
+
     def test_cli_exports_only_validated_values(self):
         files = [self.root / name for name in ['env', 'output', 'path']]
         for path in files:
