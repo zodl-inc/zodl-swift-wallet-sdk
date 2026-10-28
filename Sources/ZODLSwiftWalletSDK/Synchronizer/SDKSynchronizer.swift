@@ -1378,7 +1378,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         if httpTor == nil {
             logger.info("Bootstrapping Tor client for making http requests")
-            if let torService = initializer.container.resolve(LightWalletService.self) as? LightWalletGRPCServiceOverTor {
+            let service = initializer.container.resolve(LightWalletService.self)
+            let concreteService = (service as? RebindingLightWalletService)?.currentService ?? service
+            if let torService = concreteService as? LightWalletGRPCServiceOverTor {
                 httpTor = try await torService.tor.isolatedClient()
             }
         }

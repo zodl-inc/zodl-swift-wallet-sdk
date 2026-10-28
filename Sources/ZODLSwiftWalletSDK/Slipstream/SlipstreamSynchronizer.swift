@@ -60,6 +60,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // `private` reaches the same-file private extension (Swift 4+ file-scope rule).
     private let initializer: Initializer
     private let transactionRepository: TransactionRepository
+    private let endpointService: RebindingLightWalletService
+    private let makeEndpointService: (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService
     private let transactionEncoder: TransactionEncoder
     private let broadcasterStorage: Broadcaster
     /// [#1976] Resolved once in `init` from the container (same singleton `broadcasterStorage`'s
@@ -96,8 +98,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     // ── Endpoint (mutable for switchTo) ───────────────────────────────────────
     // Tracks the endpoint currently in use — or, between a wipe and the next `prepare`, the one that
-    // `prepare` will use.  `engine.reopen(server:network:)` uses this value; `initializer.endpoint` is
-    // the initial value.
+    // `prepare` will use. Successful endpoint changes publish this value together with
+    // `initializer.endpoint` and the retained Swift service binding.
     private var currentEndpoint: LightWalletEndpoint
     /// Whether a completed `wipe()` closed the engine and no `prepare` has opened it since. In that window
     /// the wallet database does not exist, and opening an engine handle opens the database, which SQLite
@@ -412,6 +414,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         initializer: Initializer,
         alternateEndpoints: [LightWalletEndpoint],
         engine: any SlipstreamEngineControlling,
+        makeEndpointService: @escaping (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService = Dependencies.makeLightWalletService,
         torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         restoreAnchor: @escaping SlipstreamAnchorResolver = { isRestore, birthday, fallbackCheckpoint, server, network, torDirPath in
             await SlipstreamEngine.restoreAnchor(
@@ -424,6 +427,19 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             )
         }
     ) {
+        // Dependencies installs the binding before Initializer eagerly captures its downloader.
+        // Adopt it before constructing the encoder, broadcaster, or resubmitter. An injected raw
+        // service is wrapped here as well, and its initializer downloader is rebound to it.
+        let endpointService = initializer.lightWalletService as? RebindingLightWalletService
+            ?? RebindingLightWalletService(service: initializer.lightWalletService)
+        self.endpointService = endpointService
+        self.makeEndpointService = makeEndpointService
+        initializer.lightWalletService = endpointService
+        initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in endpointService }
+        initializer.container.register(type: BlockDownloaderService.self, isSingleton: true) { di in
+            BlockDownloaderServiceImpl(service: endpointService, storage: di.resolve(CompactBlockRepository.self))
+        }
+        initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
         self.engine = engine
         self.torHTTPUptime = torHTTPUptime
         self.restoreAnchor = restoreAnchor
@@ -2689,7 +2705,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // After a wipe the engine stays closed until `prepare`, which opens it at this server. Nothing
         // runs and no handle exists, so the switch changes no owner and moves no generation.
         if engineClosedByWipe {
-            currentEndpoint = endpoint
+            rebindEndpointServices(to: endpoint)
             initializer.logger.debug(
                 "switchTo after wipe: \(endpoint.host):\(endpoint.port) recorded for the next prepare, engine stays closed",
                 file: #file,
@@ -2733,8 +2749,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // Re-open the engine handle against the new endpoint.
         try await engine.reopen(server: endpoint, network: initializer.network)
 
-        // Record the new endpoint.
-        currentEndpoint = endpoint
+        // Publish the engine and Swift RPC route in the same lifecycle turn.
+        rebindEndpointServices(to: endpoint)
 
         // Also reset the tx-set-version mirror: the new handle's counter starts from zero.
         lastTxSetVersion = 0
@@ -2746,6 +2762,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         if wasRunning {
             try await startImpl(retry: false, resetRecoveryBudget: true)
         }
+    }
+
+    /// Called only after a successful reopen, or while a wipe keeps the engine closed. No
+    /// suspension separates replacement from endpoint publication or the subsequent restart.
+    private func rebindEndpointServices(to endpoint: LightWalletEndpoint) {
+        let service = makeEndpointService(
+            endpoint,
+            initializer.container.resolve(TorClient.self),
+            initializer.container.resolve(SDKFlags.self),
+            initializer.network.networkType
+        )
+        endpointService.replace(with: service)
+        currentEndpoint = endpoint
+        initializer.endpoint = endpoint
     }
 
     // ── Bounded rebuild (restartSync) ───────────────────────────────────────────
@@ -2799,7 +2829,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         try await engine.reopen(server: endpoint, network: initializer.network)
-        currentEndpoint = endpoint
+        rebindEndpointServices(to: endpoint)
 
         // The new handle's engine-side counters start at zero, so the emission mirrors must too —
         // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.

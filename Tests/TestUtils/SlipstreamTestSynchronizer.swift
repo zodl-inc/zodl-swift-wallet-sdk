@@ -56,7 +56,9 @@ extension ZcashTestCase {
         }
 
         container.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in welding }
-        container.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        container.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
         // `wipe()` closes the repository's database connection before deleting the files, and the
         // generated mock force-unwraps that closure — an un-stubbed call is a crash rather than a
         // failure, exactly like the welding defaults above.
