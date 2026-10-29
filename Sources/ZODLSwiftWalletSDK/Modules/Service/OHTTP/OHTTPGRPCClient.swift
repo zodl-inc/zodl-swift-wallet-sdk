@@ -158,6 +158,9 @@ actor OHTTPGRPCClient {
                         }
                     }
 
+                    // S5: check for partial frame at end of body
+                    try decoder.finish()
+
                     // S2: read trailers after body completes (grpc-status may be in trailers)
                     var allTrailers: [(String, String)] = []
                     for try await trailerChunk in inner.trailers {
@@ -421,6 +424,8 @@ private extension String {
 private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
     private var buffer = Data()
     private let frameHeaderSize = 5
+    // S5: max frame length = max relay response (256 MiB sealed + 1 MiB framing)
+    private let maxFrameLength = (256 * 1024 * 1024) + (1024 * 1024)
 
     /// Pushes a chunk and returns any complete messages decoded from the buffer.
     func push(_ chunk: Data) throws -> [T] {
@@ -439,8 +444,9 @@ private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
                 throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "compressed frames are not supported")
             }
 
-            guard length >= 0 else {
-                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "invalid frame length")
+            // S5: reject oversized length before buffering
+            guard length <= maxFrameLength else {
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "frame length \(length) exceeds cap")
             }
 
             let totalFrameSize = frameHeaderSize + length
@@ -463,5 +469,15 @@ private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
         }
 
         return messages
+    }
+
+    /// S5: called when the body ends; throws INTERNAL if partial frame remains
+    func finish() throws {
+        guard buffer.isEmpty else {
+            throw LightWalletServiceError.failed(
+                statusCode: OHTTPGRPCStatus.internalError,
+                message: "partial frame remains: \(buffer.count) bytes"
+            )
+        }
     }
 }
