@@ -241,12 +241,12 @@ test_codeql_swift_job_builds_with_ffi_ci() {
     assert_file_lacks "$(_codeql_workflow)" "run: make ffi-macos" "CodeQL no longer builds the universal slice"
     assert_file_contains "$(_codeql_workflow)" "key: codeql-ffi-xcframework-macos-arm64-nolto-" \
         "CodeQL's XCFramework key names the ffi-ci build"
-    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-' \
+    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-' \
         "CodeQL's cargo key carries the rustc version"
     assert_file_contains "$(_codeql_workflow)" "find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f" \
         "CodeQL's FFI hash covers the root Makefile"
     assert_file_contains "$(_codeql_workflow)" "id: toolchain" "CodeQL's Setup Rust step has an id"
-    assert_file_contains "$(_codeql_workflow)" 'echo "cachekey=' "CodeQL's Setup Rust step sets the cachekey output"
+    assert_file_contains "$(_codeql_workflow)" 'Scripts/ci/rust_toolchain.py' "CodeQL validates the compiler and exports its identity"
     assert_file_lacks "$(_codeql_workflow)" "x86_64-apple-darwin" "CodeQL installs no x86_64 target"
 }
 
@@ -295,7 +295,7 @@ test_every_local_action_a_workflow_uses_exists() {
 # would ever save the rebuilt ones, so the key has to name the rustc version.
 test_swift_workflow_cargo_key_includes_the_toolchain() {
     assert_file_contains "$(_swift_workflow)" "id: toolchain" "the build job's Rust setup step has an id"
-    assert_file_contains "$(_swift_workflow)" 'echo "cachekey=' "the Rust setup step sets the cachekey output"
+    assert_file_contains "$(_swift_workflow)" 'Scripts/ci/rust_toolchain.py' "the validator exports the cachekey output"
     assert_file_contains "$(_swift_workflow)" 'cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-' \
         "the cargo cache key carries the rustc identity and build variant"
 }
@@ -310,10 +310,9 @@ test_ci_cache_rust_setup_precedes_product_restore() {
 
 test_ci_cache_keys_include_complete_rust_identity() {
     local workflow key lines
-    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)"; do
-        assert_file_contains "$workflow" 'id: toolchain' 'Rust setup exports its identity'
-        assert_file_contains "$workflow" 'rustc +stable --version --verbose > "$rustc_version_file"' 'capture complete compiler identity'
-        assert_file_contains "$workflow" 'shasum -a 256 "$rustc_version_file"' 'hash every verbose identity field'
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        assert_file_contains "$workflow" 'id: toolchain' 'Rust validation exports its identity'
+        assert_file_contains "$workflow" 'Scripts/ci/rust_toolchain.py' 'validate complete compiler identity'
         lines="$(awk '/^[[:space:]]*key:/ { print } /^[[:space:]]*restore-keys:/ { fallback=1; next } fallback && /[^[:space:]]/ { if ($0 ~ /^[[:space:]]+\$\{\{/) print; else fallback=0 }' "$workflow" | grep -E 'cargo-|ffi-xcframework-')"
         while IFS= read -r key; do
             printf '%s\n' "$key" > "$SCRATCH/rust-key.txt"
@@ -326,24 +325,71 @@ test_ci_cache_keys_include_complete_rust_identity() {
 test_ci_cache_rust_identity_changes_for_verbose_fields() {
     local workflow script dir first second expected
     dir="$(mktemp -d "$SCRATCH/rust-identity.XXXXXX")"
-    printf '#!/bin/sh\nexit 0\n' > "$dir/rustup"
+    cat > "$dir/rustup" <<'SH'
+#!/bin/sh
+case "$1" in
+    show) printf 'stable-aarch64-apple-darwin (environment override)\n' ;;
+    which) printf '%s/%s\n' "$RUST_FIXTURE_BIN" "$4" ;;
+    *) exit 9 ;;
+esac
+SH
     printf '#!/bin/sh\ncat "$RUST_IDENTITY_FILE"\n' > "$dir/rustc"
-    chmod +x "$dir/rustup" "$dir/rustc"
-    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)"; do
-        script="$dir/setup.sh"
+    printf '#!/bin/sh\nprintf "cargo 1.100.0 (bbbbbbbbb 2026-10-28)\\n"\n' > "$dir/cargo"
+    chmod +x "$dir/rustup" "$dir/rustc" "$dir/cargo"
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        script="$dir/validate.sh"
         awk '/id: toolchain/ { active=1; next } active && /run: \|/ { body=1; next } active && body { if ($0 ~ /^[[:space:]]*(- name:|#|$)/) exit; print }' "$workflow" > "$script"
-        printf 'rustc fixture\ncommit-hash: abcdef012345\ncommit-date: 2026-10-24\nhost: aarch64-apple-darwin\nLLVM version: 22\n' > "$dir/identity"
+        printf 'rustc 1.100.0 (aaaaaaaaa 2026-10-28)\nbinary: rustc\ncommit-hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncommit-date: 2026-10-28\nhost: aarch64-apple-darwin\nrelease: 1.100.0\nLLVM version: 22\n' > "$dir/identity"
         : > "$dir/output"
-        PATH="$dir:$PATH" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" bash "$script" > /dev/null
+        (unset RUSTC RUSTUP_TOOLCHAIN; PATH="$dir:$PATH" RUST_FIXTURE_BIN="$dir" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" GITHUB_PATH="$dir/path" bash -e "$script") > /dev/null
         first="$(sed -n 's/^cachekey=//p' "$dir/output")"
         expected="$(shasum -a 256 "$dir/identity" | cut -d' ' -f1)"
-        assert_eq "$expected" "$first" 'cache identity hashes the full rustc output'
-        printf 'LLVM version: 23\n' >> "$dir/identity"
+        assert_eq "$expected" "$first" 'workflow validation hashes the full rustc output'
+        sed 's/LLVM version: 22/LLVM version: 23/' "$dir/identity" > "$dir/changed"
+        mv "$dir/changed" "$dir/identity"
         : > "$dir/output"
-        PATH="$dir:$PATH" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" bash "$script" > /dev/null
+        (unset RUSTC RUSTUP_TOOLCHAIN; PATH="$dir:$PATH" RUST_FIXTURE_BIN="$dir" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" GITHUB_PATH="$dir/path" bash -e "$script") > /dev/null
         second="$(sed -n 's/^cachekey=//p' "$dir/output")"
-        assert_succeeds 'a verbose identity field changes the cache key' test "$first" != "$second"
+        assert_succeeds 'a verbose identity field changes the workflow cache key' test "$first" != "$second"
     done
+}
+
+# Restrict swift.yml to its native build job so rustfmt's independent setup
+# cannot accidentally satisfy the build-job ordering contract.
+_rust_build_job() {
+    if [ "$1" = "$(_swift_workflow)" ]; then
+        awk '/^  build:/ { active=1 } active' "$1"
+    else
+        cat "$1"
+    fi
+}
+
+test_ci_validates_installed_stable_before_tests_and_cache_restore() {
+    local workflow job python install validate consumer
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        job="$SCRATCH/rust-build-job.yml"
+        _rust_build_job "$workflow" > "$job"
+        python="$(grep -n 'uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1' "$job" | cut -d: -f1)"
+        install="$(grep -n 'rustup toolchain install stable --profile minimal --no-self-update' "$job" | cut -d: -f1)"
+        validate="$(grep -n 'Scripts/ci/rust_toolchain.py' "$job" | cut -d: -f1)"
+        consumer="$(grep -nE 'uses: actions/cache@|run: make test-scripts|run: make ffi-ci' "$job" | head -1 | cut -d: -f1)"
+        assert_file_contains "$job" "python-version: '3.12'" 'validator and its tests use a TOML-capable Python'
+        assert_succeeds 'Python setup precedes validation' test "${python:-0}" -gt 0
+        assert_succeeds 'explicit stable install precedes validation' test "${install:-0}" -gt 0
+        assert_succeeds 'validator is configured' test "${validate:-0}" -gt 0
+        assert_succeeds 'known Python precedes validation' test "${python:-0}" -lt "${validate:-0}"
+        assert_succeeds 'stable install precedes validation' test "${install:-0}" -lt "${validate:-0}"
+        assert_succeeds 'validation precedes Cargo fixture tests and product restores' test "${validate:-0}" -lt "${consumer:-0}"
+        assert_file_contains "$job" 'python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"' 'validated selection survives into later CI steps'
+        assert_file_lacks "$job" 'rustup default stable' 'CI keeps the runner global default intact'
+    done
+}
+
+test_codeql_validation_is_required_on_ffi_cache_hits() {
+    local block="$SCRATCH/codeql-validator.yml"
+    awk '/- name: Validate Rust/ { active=1 } active && /- name:/ && !/Validate Rust/ { exit } active { print }' "$(_codeql_workflow)" > "$block"
+    assert_file_contains "$block" "if: matrix.language == 'swift'" 'validation covers every Swift matrix run'
+    assert_file_lacks "$block" 'cache-hit' 'CodeQL cache hits cannot bypass validation'
 }
 
 test_ci_cache_release_keeps_publication_and_targets() {
