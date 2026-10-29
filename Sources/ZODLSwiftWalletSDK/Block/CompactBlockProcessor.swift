@@ -528,17 +528,16 @@ extension CompactBlockProcessor {
     func consumeMempoolStream() async throws {
         let stream = try service.getMempoolStream()
 
-        do {
-            for try await rawTransaction in stream {
-                let mempoolTransactions = try await resolveMempools(rawTransaction: rawTransaction)
+        // S3: let errors propagate to watchMempool's 30s back-off; a clean end is a normal return
+        for try await rawTransaction in stream {
+            let mempoolTransactions = try await resolveMempools(rawTransaction: rawTransaction)
 
-                // The transactions are stored whatever the height is. The event carries it as a `BlockHeight`, so it is only
-                // sent for a height the SDK can use.
-                if !mempoolTransactions.isEmpty, let height = BlockHeight(serverHeight: rawTransaction.height) {
-                    await send(event: .foundTransactions(mempoolTransactions, .init(uncheckedBounds: (lower: height, upper: height))))
-                }
+            // The transactions are stored whatever the height is. The event carries it as a `BlockHeight`, so it is only
+            // sent for a height the SDK can use.
+            if !mempoolTransactions.isEmpty, let height = BlockHeight(serverHeight: rawTransaction.height) {
+                await send(event: .foundTransactions(mempoolTransactions, .init(uncheckedBounds: (lower: height, upper: height))))
             }
-        } catch { }
+        }
     }
 
     // DB-AUDIT (2026-08-03): WRITE — decryptAndStoreTransaction persists the decrypted tx;
