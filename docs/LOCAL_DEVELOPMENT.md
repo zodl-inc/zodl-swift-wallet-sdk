@@ -38,6 +38,10 @@ No manual `Package.swift` edits are needed.
    rustup target add aarch64-apple-darwin x86_64-apple-darwin
    ```
 
+3. **Python 3.11 or newer** — `make test-scripts` and the CI Rust validator use Python's standard-library TOML parser. CI selects Python 3.12 explicitly.
+
+CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
+
 ## Quick Start
 
 ### One-Time Setup

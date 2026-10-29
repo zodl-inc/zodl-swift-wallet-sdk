@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "5.0.0"
+version = "7.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -150,7 +150,7 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The `[patch.crates-io]` entry below pins the 0.4.0 release until registry publication.
+# The OHTTP engine patch below still identifies itself as 0.4.0.
 slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
