@@ -163,9 +163,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             httpSender = testClearnetSender
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
-            // with bounded response reading per ZIP MUST requirement
+            // with bounded response reading and 100s per-exchange deadline (non-streaming exchanges only)
             httpSender = { request, maxBytes in
-                let (data, response) = try await OHTTPTransport.boundedData(
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                     for: request,
                     maxBytes: maxBytes
                 )

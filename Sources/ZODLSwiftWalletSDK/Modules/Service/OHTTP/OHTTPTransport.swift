@@ -206,10 +206,9 @@ actor OHTTPTransport {
 
     private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
 
-    /// Makes the relay session. `timeoutIntervalForResource` (100 s) is the per-exchange deadline
-    /// for non-streaming exchanges. Streaming exchanges (mempool long poll, SSE) outlive this:
-    /// each task applies its `timeoutInterval` (idle timeout) only, and lasts as long as the
-    /// gateway keeps the stream open (~25 s for mempool, unbounded for SSE).
+    /// Makes the relay session. No resource timeout is set: non-streaming exchanges enforce
+    /// their 100s deadline per task, while streaming exchanges (mempool long poll, SSE) last
+    /// as long as the gateway keeps them open (~25s for mempool, unbounded for SSE).
     static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -219,7 +218,6 @@ actor OHTTPTransport {
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         cfg.httpAdditionalHeaders = nil
         cfg.waitsForConnectivity = false
-        cfg.timeoutIntervalForResource = 100
         return URLSession(configuration: cfg, delegate: RedirectRefusingDelegate.shared, delegateQueue: nil)
     }
 
@@ -307,7 +305,7 @@ actor OHTTPTransport {
         },
         streamDecoderFactory: @escaping StreamDecoderFactory = { try $0.streamDecoder() },
         httpSender: @escaping HTTPSender = { request, maxBytes in
-            let (data, response) = try await OHTTPTransport.boundedData(
+            let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                 for: request,
                 maxBytes: maxBytes
             )
@@ -743,6 +741,39 @@ extension OHTTPTransport {
         }
 
         return (accumulated, response)
+    }
+
+    /// Reads the relay's answer with both a size bound and a per-exchange deadline (100s).
+    /// The deadline is enforced by cancelling the task; it applies to the whole exchange, not
+    /// idle time between bytes. Use this for non-streaming exchanges only. Streaming exchanges
+    /// (mempool long poll, SSE) must not have a resource deadline.
+    ///
+    /// - Parameters:
+    ///   - request: The URL request to execute
+    ///   - maxBytes: Maximum allowed response size in bytes
+    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    /// - Returns: The response data and URLResponse
+    /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, `OHTTPError.transportError` if deadline exceeded, or other transport errors
+    static func boundedDataWithDeadline(
+        for request: URLRequest,
+        maxBytes: Int,
+        session: URLSession = OHTTPTransport.session
+    ) async throws -> (Data, URLResponse) {
+        let deadlineSeconds: TimeInterval = 100
+        return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
+            group.addTask {
+                try await boundedData(for: request, maxBytes: maxBytes, session: session)
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                throw OHTTPError.transportError("Exchange deadline exceeded (100s)")
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     /// The bound on one answer's body. For a 2xx: `maxBytes`, the call's ceiling, past which the read
