@@ -798,7 +798,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
         let client = OHTTPGRPCClient(authority: "test.zodl.com", transport: transport, singleCallTimeoutMS: 30000, streamingCallTimeoutMS: 30000)
 
-        let stream = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
+        let stream: AsyncThrowingStream<BlockID, Error> = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
         var messages: [BlockID] = []
         for try await message in stream {
             messages.append(message)
@@ -825,7 +825,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
         let client = OHTTPGRPCClient(authority: "test.zodl.com", transport: transport, singleCallTimeoutMS: 30000, streamingCallTimeoutMS: 30000)
 
-        let stream = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
+        let stream: AsyncThrowingStream<BlockID, Error> = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
         var messages: [BlockID] = []
         var caughtError: Error?
 
@@ -861,7 +861,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
         let client = OHTTPGRPCClient(authority: "test.zodl.com", transport: transport, singleCallTimeoutMS: 30000, streamingCallTimeoutMS: 30000)
 
-        let stream = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
+        let stream: AsyncThrowingStream<BlockID, Error> = try await client.serverStreamingIncremental(path: "/test", request: BlockID())
         var messages: [BlockID] = []
         var caughtError: Error?
 
