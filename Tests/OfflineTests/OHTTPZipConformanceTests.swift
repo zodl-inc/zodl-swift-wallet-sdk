@@ -406,14 +406,20 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
     }
 
-    func testTheMempoolStreamIsRefusedOverOHTTPBeforeAnyRequest() {
+    func testMempoolStreamIsAvailableOverOHTTP() throws {
+        // GetMempoolStream works over OHTTP using the streaming transport (ZIP #10, lines 149-153).
+        // The gateway ends it with grpc-status: 0 after ~25s without messages, which the caller
+        // treats as "poll again later", not an error (ZIP #10, lines 1294-1295).
         let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
-        XCTAssertThrowsError(try service.getMempoolStream()) { error in
-            guard case ZcashError.serviceGetMempoolStreamFailed = error else {
-                return XCTFail("Expected serviceGetMempoolStreamFailed, got \(error)")
-            }
-        }
+
+        // GetMempoolStream no longer throws before any request (the old behavior that this replaces).
+        // It returns a stream that will go through the relay when iterated.
+        let stream = try service.getMempoolStream()
+        XCTAssertNotNil(stream, "GetMempoolStream returns a stream over OHTTP")
+
+        // Full streaming behavior (clean end = poll again) is tested in OHTTPStreamingTests
+        // and integration tests, not here where we have no fake relay infrastructure.
     }
 
     func testTheBuiltInRelaysAreIndependent() {
