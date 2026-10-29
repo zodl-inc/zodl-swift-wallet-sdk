@@ -396,7 +396,7 @@ private extension String {
 /// Decodes gRPC frames incrementally as chunks arrive.
 private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
     private var buffer = Data()
-    private static let frameHeaderSize = 5
+    private let frameHeaderSize = 5
 
     /// Pushes a chunk and returns any complete messages decoded from the buffer.
     func push(_ chunk: Data) throws -> [T] {
@@ -404,7 +404,7 @@ private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
         var messages: [T] = []
         var pos = 0
 
-        while buffer.count - pos >= Self.frameHeaderSize {
+        while buffer.count - pos >= frameHeaderSize {
             let compressed = buffer[pos]
             let length = Int(buffer[pos + 1]) << 24 |
                         Int(buffer[pos + 2]) << 16 |
@@ -419,12 +419,12 @@ private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
                 throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "invalid frame length")
             }
 
-            let totalFrameSize = Self.frameHeaderSize + length
+            let totalFrameSize = frameHeaderSize + length
             guard buffer.count >= pos + totalFrameSize else {
                 break
             }
 
-            let messageStart = pos + Self.frameHeaderSize
+            let messageStart = pos + frameHeaderSize
             let messageData = buffer.subdata(in: messageStart..<messageStart + length)
             do {
                 messages.append(try T(serializedData: messageData))
