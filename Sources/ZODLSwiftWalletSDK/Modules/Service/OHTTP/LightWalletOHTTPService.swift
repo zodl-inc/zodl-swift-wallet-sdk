@@ -436,14 +436,14 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                         return
                     }
 
-                    let spec = ChainSpec()
-                    let stream: AsyncThrowingStream<CompactTx, Error> = try await client.serverStreamingIncremental(
+                    let empty = Empty()
+                    let stream: AsyncThrowingStream<RawTransaction, Error> = try await client.serverStreamingIncremental(
                         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
-                        request: spec
+                        request: empty
                     )
 
-                    for try await compactTx in stream {
-                        continuation.yield(RawTransaction(compactTx: compactTx))
+                    for try await rawTx in stream {
+                        continuation.yield(rawTx)
                     }
                     continuation.finish()
                 } catch {
