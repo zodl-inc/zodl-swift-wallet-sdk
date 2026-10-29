@@ -206,6 +206,10 @@ actor OHTTPTransport {
 
     private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
 
+    /// Makes the relay session. `timeoutIntervalForResource` (100 s) is the per-exchange deadline
+    /// for non-streaming exchanges. Streaming exchanges (mempool long poll, SSE) outlive this:
+    /// each task applies its `timeoutInterval` (idle timeout) only, and lasts as long as the
+    /// gateway keeps the stream open (~25 s for mempool, unbounded for SSE).
     static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -215,6 +219,7 @@ actor OHTTPTransport {
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         cfg.httpAdditionalHeaders = nil
         cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForResource = 100
         return URLSession(configuration: cfg, delegate: RedirectRefusingDelegate.shared, delegateQueue: nil)
     }
 
@@ -277,6 +282,8 @@ actor OHTTPTransport {
     /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     private let clientTraceIdPrefix: String?
+    /// The wallet's network. When set, a key configuration of the other network is refused.
+    private let walletNetwork: NetworkType?
     /// Test-only: fixed clock for signature verification (bypasses Date()).
     private let testNow: Date?
     /// Test-only: verifies the key configuration instead of the native code.
@@ -290,6 +297,7 @@ actor OHTTPTransport {
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
+        walletNetwork: NetworkType? = nil,
         testNow: Date? = nil,
         testKeyVerifier: KeyVerifier? = nil,
         viaTor: Bool = false,
@@ -315,6 +323,7 @@ actor OHTTPTransport {
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
         self.clientTraceIdPrefix = clientTraceIdPrefix
+        self.walletNetwork = walletNetwork
         self.testNow = testNow
         self.testKeyVerifier = testKeyVerifier
         self.keyCache = keyCache
@@ -383,6 +392,18 @@ actor OHTTPTransport {
             verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
         }
 
+        // Network binding check: the key's network must match the wallet's network
+        if let walletNetwork {
+            let walletIsTestnet = (walletNetwork == .testnet)
+            guard verified.isTestnet == walletIsTestnet else {
+                let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
+                let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
+                throw OHTTPError.keyConfigError(
+                    "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
+                )
+            }
+        }
+
         return verified
     }
 
@@ -416,6 +437,18 @@ actor OHTTPTransport {
                     verified = try testKeyVerifier(envelope, now)
                 } else {
                     verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: envelope, now: now)
+                }
+
+                // Network binding check: the key's network must match the wallet's network
+                if let walletNetwork {
+                    let walletIsTestnet = (walletNetwork == .testnet)
+                    guard verified.isTestnet == walletIsTestnet else {
+                        let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
+                        let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
+                        throw OHTTPError.keyConfigError(
+                            "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
+                        )
+                    }
                 }
 
                 return verified
@@ -645,11 +678,13 @@ actor OHTTPTransport {
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to
     /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement).
+    /// Uses a default prefix "x" when the sanitized prefix is empty.
     private func generateClientTraceId(prefix: String) -> String {
         let allowedCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
         let sanitized = prefix.unicodeScalars.filter { allowedCharacters.contains($0) }.map { String($0) }.joined()
+        let effectivePrefix = sanitized.isEmpty ? "x" : sanitized
         let uuid = UUID().uuidString
-        let full = "\(sanitized)-\(uuid)"
+        let full = "\(effectivePrefix)-\(uuid)"
         return full.count <= 64 ? full : String(full.prefix(64))
     }
 }

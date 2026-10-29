@@ -180,6 +180,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             gatewayHost: host,
             relayURL: relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: walletNetwork,
             testKeyVerifier: testKeyVerifier,
             viaTor: viaTor,
             httpSender: httpSender
@@ -421,16 +422,37 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
     }
 
-    /// lightwalletd keeps `GetMempoolStream` open until the next block, longer than one OHTTP exchange
-    /// can last (`grpc-timeout` 75 s, gateway upstream cut 80 s), so a gateway endpoint refuses the call
-    /// before anything is sent.
+    /// Mempool long poll over OHTTP. The gateway ends it with grpc-status: 0 after ~25 seconds
+    /// without messages, which the caller treats as "poll again later", not an error.
     override func getMempoolStream() throws -> AsyncThrowingStream<RawTransaction, Error> {
-        guard gatewayHost == nil else {
-            throw ZcashError.serviceGetMempoolStreamFailed(
-                LightWalletServiceError.generalError(message: "GetMempoolStream is not available over OHTTP")
-            )
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let client = try await self.ensureOHTTPClient(mode: .direct) else {
+                        for try await tx in try super.getMempoolStream() {
+                            continuation.yield(tx)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    let spec = ChainSpec()
+                    let stream: AsyncThrowingStream<CompactTx, Error> = try await client.serverStreamingIncremental(
+                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
+                        request: spec
+                    )
+
+                    for try await compactTx in stream {
+                        continuation.yield(RawTransaction(compactTx: compactTx))
+                    }
+                    continuation.finish()
+                } catch {
+                    let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+                    continuation.finish(throwing: ZcashError.serviceGetMempoolStreamFailed(serviceError))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-        return try super.getMempoolStream()
     }
 
     override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {

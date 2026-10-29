@@ -110,6 +110,99 @@ actor OHTTPGRPCClient {
         return try parseStreamingResponse(bhttpResponse)
     }
 
+    /// Performs a server-streaming gRPC call over OHTTP with incremental delivery.
+    /// Decodes gRPC frames as chunks arrive. Returns once the head is available; the body follows as decoded.
+    /// A clean end (grpc-status: 0) before any messages is returned as an empty stream, not an error.
+    func serverStreamingIncremental<Req: SwiftProtobuf.Message, Resp: SwiftProtobuf.Message>(
+        path: String,
+        request: Req,
+        timeout: Int? = nil
+    ) async throws -> AsyncThrowingStream<Resp, Error> {
+        let requestedTimeoutMS = timeout ?? streamingCallTimeoutMS
+        let grpcTimeoutMS = min(requestedTimeoutMS, Self.maxGRPCTimeoutMS)
+        let exchangeTimeoutMS = min(requestedTimeoutMS + Self.timeoutSlackMS, Self.maxExchangeTimeoutMS)
+
+        let body = try encodeGRPCMessage(request)
+
+        let headers: [(String, String)] = [
+            ("content-type", Self.grpcContentType),
+            ("te", "trailers"),
+            ("grpc-accept-encoding", "identity"),
+            ("user-agent", Self.userAgent),
+            ("grpc-timeout", "\(grpcTimeoutMS)m")
+        ]
+
+        let bhttpRequest = OHTTPRequest(
+            method: "POST",
+            scheme: "https",
+            authority: authority,
+            path: path,
+            headers: headers,
+            body: body
+        )
+
+        let inner = try await transport.stream(request: bhttpRequest, timeoutMS: exchangeTimeoutMS)
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try checkStreamingHead(status: inner.status, headers: inner.headers)
+                    let decoder = GRPCFrameDecoder<Resp>()
+                    var grpcStatus: Int?
+                    var grpcMessage: String?
+
+                    for try await chunk in inner.body {
+                        let messages = try decoder.push(chunk)
+                        for message in messages {
+                            continuation.yield(message)
+                        }
+                    }
+
+                    for (name, value) in inner.headers where name.lowercased() == "grpc-status" {
+                        grpcStatus = Int(value)
+                    }
+                    for (name, value) in inner.headers where name.lowercased() == "grpc-message" {
+                        grpcMessage = value.percentDecoded()
+                    }
+
+                    if let status = grpcStatus, status != 0 {
+                        throw LightWalletServiceError.failed(statusCode: status, message: grpcMessage ?? "")
+                    }
+
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: Self.serviceError(for: error))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func checkStreamingHead(status: Int, headers: [(String, String)]) throws {
+        guard status == Self.httpOK else {
+            throw LightWalletServiceError.failed(
+                statusCode: OHTTPGRPCStatus.internalError,
+                message: "gateway/lightwalletd returned HTTP \(status)"
+            )
+        }
+
+        let contentType = headers.first(where: { $0.0.lowercased() == "content-type" })?.1 ?? ""
+        guard contentType.hasPrefix(Self.grpcContentType) else {
+            throw LightWalletServiceError.failed(
+                statusCode: OHTTPGRPCStatus.internalError,
+                message: "unexpected content-type '\(contentType)'"
+            )
+        }
+
+        let encoding = headers.first(where: { $0.0.lowercased() == "grpc-encoding" })?.1
+        if let encoding = encoding, encoding != "identity" {
+            throw LightWalletServiceError.failed(
+                statusCode: OHTTPGRPCStatus.internalError,
+                message: "unsupported grpc-encoding '\(encoding)'"
+            )
+        }
+    }
+
     private func exchange(_ request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
         do {
             return try await transport.roundTrip(request: request, timeoutMS: timeoutMS)
@@ -295,5 +388,56 @@ private extension String {
         }
 
         return String(data: result, encoding: .utf8) ?? self
+    }
+}
+
+// MARK: - Incremental gRPC Frame Decoder
+
+/// Decodes gRPC frames incrementally as chunks arrive.
+private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
+    private var buffer = Data()
+    private static let frameHeaderSize = 5
+
+    /// Pushes a chunk and returns any complete messages decoded from the buffer.
+    func push(_ chunk: Data) throws -> [T] {
+        buffer.append(chunk)
+        var messages: [T] = []
+        var pos = 0
+
+        while buffer.count - pos >= Self.frameHeaderSize {
+            let compressed = buffer[pos]
+            let length = Int(buffer[pos + 1]) << 24 |
+                        Int(buffer[pos + 2]) << 16 |
+                        Int(buffer[pos + 3]) << 8 |
+                        Int(buffer[pos + 4])
+
+            guard compressed == 0 else {
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "compressed frames are not supported")
+            }
+
+            guard length >= 0 else {
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "invalid frame length")
+            }
+
+            let totalFrameSize = Self.frameHeaderSize + length
+            guard buffer.count >= pos + totalFrameSize else {
+                break
+            }
+
+            let messageStart = pos + Self.frameHeaderSize
+            let messageData = buffer.subdata(in: messageStart..<messageStart + length)
+            do {
+                messages.append(try T(serializedData: messageData))
+            } catch {
+                throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "malformed gRPC message: \(error)")
+            }
+            pos += totalFrameSize
+        }
+
+        if pos > 0 {
+            buffer.removeFirst(pos)
+        }
+
+        return messages
     }
 }
