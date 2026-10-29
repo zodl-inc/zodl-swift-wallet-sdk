@@ -158,11 +158,35 @@ actor OHTTPGRPCClient {
                         }
                     }
 
-                    for (name, value) in inner.headers where name.lowercased() == "grpc-status" {
+                    // S2: read trailers after body completes (grpc-status may be in trailers)
+                    var allTrailers: [(String, String)] = []
+                    for try await trailerChunk in inner.trailers {
+                        allTrailers.append(contentsOf: trailerChunk)
+                    }
+
+                    // S2: trailers first, headers second, else INTERNAL
+                    for (name, value) in allTrailers where name.lowercased() == "grpc-status" {
                         grpcStatus = Int(value)
                     }
+                    if grpcStatus == nil {
+                        for (name, value) in inner.headers where name.lowercased() == "grpc-status" {
+                            grpcStatus = Int(value)
+                        }
+                    }
+                    // Read grpc-message from both sources (trailers take precedence)
                     for (name, value) in inner.headers where name.lowercased() == "grpc-message" {
                         grpcMessage = value.percentDecoded()
+                    }
+                    for (name, value) in allTrailers where name.lowercased() == "grpc-message" {
+                        grpcMessage = value.percentDecoded()
+                    }
+
+                    // S2: if no grpc-status anywhere, that's INTERNAL
+                    if grpcStatus == nil {
+                        throw LightWalletServiceError.failed(
+                            statusCode: OHTTPGRPCStatus.internalError,
+                            message: "No grpc-status in headers or trailers"
+                        )
                     }
 
                     if let status = grpcStatus, status != 0 {

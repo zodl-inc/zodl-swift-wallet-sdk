@@ -25,6 +25,9 @@ struct OHTTPStreamedInner {
     let status: Int
     let headers: [(String, String)]
     let body: AsyncThrowingStream<Data, Error>
+    /// The trailers, available after the body completes. When the response has trailers, they are yielded
+    /// after all body chunks. S2: grpc-status may be in trailers, not headers.
+    let trailers: AsyncThrowingStream<[(String, String)], Error>
 
     /// Whether this is the gateway's freshness refusal (see ``OHTTPResponse/isFreshnessRefusal``).
     var isFreshnessRefusal: Bool {
@@ -189,6 +192,7 @@ extension OHTTPTransport {
     ) async throws -> OHTTPStreamedInner {
         let (heads, headContinuation) = AsyncThrowingStream.makeStream(of: OHTTPStreamedHead.self, throwing: Error.self)
         let (body, bodyContinuation) = AsyncThrowingStream.makeStream(of: Data.self, throwing: Error.self)
+        let (trailers, trailersContinuation) = AsyncThrowingStream.makeStream(of: [(String, String)].self, throwing: Error.self)
 
         let pump = Task {
             var headSent = false
@@ -201,6 +205,10 @@ extension OHTTPTransport {
                 if headSent, !events.body.isEmpty {
                     bodyContinuation.yield(events.body)
                 }
+                // S2: surface trailers after body chunks
+                if let responseTrailers = events.trailers {
+                    trailersContinuation.yield(responseTrailers)
+                }
             }
             do {
                 for try await chunk in outer {
@@ -211,12 +219,15 @@ extension OHTTPTransport {
                     throw OHTTPError.binaryHttpError("The gateway's answer has no response head")
                 }
                 bodyContinuation.finish()
+                trailersContinuation.finish()
             } catch {
                 if headSent {
                     bodyContinuation.finish(throwing: error)
+                    trailersContinuation.finish(throwing: error)
                 } else {
                     headContinuation.finish(throwing: error)
                     bodyContinuation.finish(throwing: error)
+                    trailersContinuation.finish(throwing: error)
                 }
             }
         }
@@ -227,7 +238,7 @@ extension OHTTPTransport {
             guard let head = try await iterator.next() else {
                 throw CancellationError()
             }
-            return OHTTPStreamedInner(status: head.status, headers: head.headers, body: body)
+            return OHTTPStreamedInner(status: head.status, headers: head.headers, body: body, trailers: trailers)
         } onCancel: {
             pump.cancel()
         }
