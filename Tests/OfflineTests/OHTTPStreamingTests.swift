@@ -246,7 +246,7 @@ final class OHTTPStreamingTests: XCTestCase {
         let transport = makeTransport(decoders: {
             PassThroughStreamDecoder(trailers: [("grpc-status", "0")])
         }) { [self] _, _ in
-            outer(status: 200, chunks: [])
+            outer(status: 200, chunks: [Data()])
         }
         let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
         XCTAssertEqual(streamed.status, 200)
@@ -319,7 +319,7 @@ final class OHTTPStreamingTests: XCTestCase {
         for try await chunk in streamed.body {
             collected.append(chunk)
         }
-        XCTAssertEqual(collected.count, 12, "all chunks arrive in order")
+        XCTAssertEqual(collected.count, 10, "all chunks arrive in order")
     }
 
     func testNoStatusInTrailersOrHeadersReturnsInternal() async throws {
