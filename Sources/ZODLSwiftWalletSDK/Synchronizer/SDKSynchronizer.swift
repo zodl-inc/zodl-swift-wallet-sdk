@@ -1879,8 +1879,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         // Validation of the server is first because any custom endpoint can be passed here
         // Extra instance of the service is created with lower timeout for a single call
-        initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000, sdkFlags: sdkFlags, networkType: initializer.network.networkType)
+        initializer.container.register(type: LightWalletService.self, isSingleton: true) { [self] _ in
+            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000, sdkFlags: sdkFlags, networkType: self.initializer.network.networkType)
         }
 
         let validateSever = ValidateServerAction(
@@ -1900,8 +1900,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // SWITCH TO NEW ENDPOINT
 
         // LightWalletService dependency update
-        initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            Self.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags, networkType: initializer.network.networkType)
+        initializer.container.register(type: LightWalletService.self, isSingleton: true) { [self] _ in
+            Self.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags, networkType: self.initializer.network.networkType)
         }
 
         // DEPENDENCIES
