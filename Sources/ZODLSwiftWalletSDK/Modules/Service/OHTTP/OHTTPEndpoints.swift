@@ -15,7 +15,7 @@
 //  Non-LWD proxy hosts (CMC, NEAR, voting) also route through the same relay→gateway
 //  pair. The gateway proxies these to their real backends; the destination never sees the client IP.
 //  When Tor is OFF: OHTTP hides the client IP from all external services.
-//  When Tor is ON:  All calls use Tor→Relay→Gateway (voting may go Tor-direct depending on configuration).
+//  When Tor is ON:  All calls use Tor→Relay→Gateway (voting goes Tor-direct as the ZIP mandates).
 //
 
 import Foundation

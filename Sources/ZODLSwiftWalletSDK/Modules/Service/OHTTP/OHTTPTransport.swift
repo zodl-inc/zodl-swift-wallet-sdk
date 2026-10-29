@@ -390,19 +390,21 @@ actor OHTTPTransport {
             verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
         }
 
-        // Network binding check: the key's network must match the wallet's network
-        if let walletNetwork {
-            let walletIsTestnet = (walletNetwork == .testnet)
-            guard verified.isTestnet == walletIsTestnet else {
-                let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
-                let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
-                throw OHTTPError.keyConfigError(
-                    "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
-                )
-            }
-        }
-
+        try checkNetworkBinding(of: verified)
         return verified
+    }
+
+    /// Nit: extracted duplicated network-check block
+    private func checkNetworkBinding(of verified: OHTTPVerifiedKey) throws {
+        guard let walletNetwork else { return }
+        let walletIsTestnet = (walletNetwork == .testnet)
+        guard verified.isTestnet == walletIsTestnet else {
+            let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
+            let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
+            throw OHTTPError.keyConfigError(
+                "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
+            )
+        }
     }
 
     /// Tries DNS-over-HTTPS as a fallback source when relay fetch or verification fails.
@@ -437,18 +439,7 @@ actor OHTTPTransport {
                     verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: envelope, now: now)
                 }
 
-                // Network binding check: the key's network must match the wallet's network
-                if let walletNetwork {
-                    let walletIsTestnet = (walletNetwork == .testnet)
-                    guard verified.isTestnet == walletIsTestnet else {
-                        let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
-                        let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
-                        throw OHTTPError.keyConfigError(
-                            "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
-                        )
-                    }
-                }
-
+                try checkNetworkBinding(of: verified)
                 return verified
             } catch {
                 continue
