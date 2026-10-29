@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import CryptoKit
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPZipConformanceTests: XCTestCase {
@@ -439,7 +440,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let clearnetCalled = Called()
 
         // Stub key verifier for the transport
-        let stubKeyVerifier: (Data, Bool) throws -> OHTTPVerifiedKey = { _, _ in
+        let stubKeyVerifier: (Data, Date) throws -> OHTTPVerifiedKey = { _, _ in
             var keyBytes = Data([0x01])
             keyBytes.append(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation)
             return OHTTPVerifiedKey(
