@@ -118,9 +118,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         guard let host = gatewayHost, let relayURL = gatewayRelayURL else {
             return nil
         }
-        if let walletNetwork {
-            try OHTTPEndpoints.checkGatewayNetwork(host: host, network: walletNetwork)
+        // Production services must set walletNetwork to validate gateway network binding (ZIP #10, lines 266-271).
+        // Tests that need nil must explicitly set testKeyVerifier to skip the native check.
+        guard let walletNetwork else {
+            throw OHTTPError.transportError("walletNetwork must be set for OHTTP gateway services")
         }
+        try OHTTPEndpoints.checkGatewayNetwork(host: host, network: walletNetwork)
 
         let isTorEnabled = await sdkFlags?.torEnabled ?? false
         let circuit: String?
@@ -155,8 +158,11 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             } else {
                 // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
                 // tried again, on a new circuit, only when it failed before any of it was sent.
+                // Apply 100s per-exchange deadline for non-streaming exchanges (streaming uses `streamSender`).
                 httpSender = { request, maxBytes in
-                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                    try await Self.withExchangeDeadline {
+                        try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                    }
                 }
             }
         } else if let testClearnetSender {
@@ -666,6 +672,28 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             try await TransparentAddressWalletStore.store(transaction, dbData: dbData, networkType: networkType)
         }
         return !transactions.isEmpty
+    }
+
+    /// Applies a 100-second per-exchange deadline to a non-streaming exchange.
+    /// Streaming exchanges (mempool long poll, SSE) must not use this.
+    private static func withExchangeDeadline<T>(
+        _ operation: @escaping () async throws -> T
+    ) async throws -> T {
+        let deadlineSeconds: TimeInterval = 100
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                throw OHTTPError.transportError("Exchange deadline exceeded (100s)")
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     override func closeConnections() async {

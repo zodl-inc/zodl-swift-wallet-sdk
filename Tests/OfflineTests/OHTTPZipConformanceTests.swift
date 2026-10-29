@@ -412,6 +412,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         // treats as "poll again later", not an error (ZIP #10, lines 1294-1295).
         let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+        service.walletNetwork = .testnet
 
         // GetMempoolStream no longer throws before any request (the old behavior that this replaces).
         // It returns a stream that will go through the relay when iterated.

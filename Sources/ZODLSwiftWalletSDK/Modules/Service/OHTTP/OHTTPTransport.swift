@@ -675,12 +675,18 @@ actor OHTTPTransport {
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to
-    /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement).
-    /// Uses a default prefix "x" when the sanitized prefix is empty.
+    /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement)
+    /// and must start with a letter or digit (ZIP 2198-2199). Leading non-alphanumerics are stripped,
+    /// then falls back to "x" when empty.
     private func generateClientTraceId(prefix: String) -> String {
         let allowedCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
         let sanitized = prefix.unicodeScalars.filter { allowedCharacters.contains($0) }.map { String($0) }.joined()
-        let effectivePrefix = sanitized.isEmpty ? "x" : sanitized
+
+        // Strip leading non-alphanumerics (must start with letter or digit per ZIP 2198-2199)
+        let alphanumeric = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+        let stripped = sanitized.drop(while: { !alphanumeric.contains($0.unicodeScalars.first!) })
+        let effectivePrefix = stripped.isEmpty ? "x" : String(stripped)
+
         let uuid = UUID().uuidString
         let full = "\(effectivePrefix)-\(uuid)"
         return full.count <= 64 ? full : String(full.prefix(64))
