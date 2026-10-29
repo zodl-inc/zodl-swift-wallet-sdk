@@ -438,14 +438,31 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let torCalled = Called()
         let clearnetCalled = Called()
 
+        // Stub key verifier for the transport
+        let stubKeyVerifier: (Data, Bool) throws -> OHTTPVerifiedKey = { _, _ in
+            var keyBytes = Data([0x01])
+            keyBytes.append(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation)
+            return OHTTPVerifiedKey(
+                bytes: keyBytes,
+                notAfter: UInt64(Date().timeIntervalSince1970) + 3600,
+                isTestnet: true
+            )
+        }
+
+        service.testKeyVerifier = stubKeyVerifier
         service.testTorStreamSender = { _ in
             return { _, _ in
                 torCalled.used = true
+                // Return a minimal valid stream that won't be decoded (test ends before iteration)
                 return OHTTPOuterStream(
                     status: 200,
                     contentType: "message/ohttp-chunked-res",
                     retryAfter: nil,
-                    body: AsyncThrowingStream { $0.finish() }
+                    body: AsyncThrowingStream { continuation in
+                        // Yield enough data for a minimal OHTTP sealed response (just a header)
+                        continuation.yield(Data(repeating: 0, count: 48))
+                        continuation.finish()
+                    }
                 )
             }
         }
@@ -459,11 +476,20 @@ final class OHTTPZipConformanceTests: XCTestCase {
             )
         }
 
+        // getMempoolStream creates the transport and sets up the stream sender
+        // The transport is created lazily, so we need to actually start iterating
         let stream = try service.getMempoolStream()
         XCTAssertNotNil(stream, "GetMempoolStream returns a stream")
 
-        // Iterate the stream to trigger the sender
-        for try await _ in stream {}
+        // Start iterating to trigger the transport creation and sender call
+        // We expect it to fail (unopenable sealed response) but that's OK - we just need to verify
+        // the correct sender was used
+        do {
+            var iterator = stream.makeAsyncIterator()
+            _ = try await iterator.next()
+        } catch {
+            // Expected: the stub data won't decode properly, but that's fine
+        }
 
         XCTAssertTrue(torCalled.used, "Tor mode must use Tor stream sender")
         XCTAssertFalse(clearnetCalled.used, "Tor mode must not use clearnet stream sender")
