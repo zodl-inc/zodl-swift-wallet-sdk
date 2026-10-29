@@ -1468,7 +1468,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             }
         } else {
             httpSender = { request, maxBytes in
-                let (data, response) = try await OHTTPTransport.boundedData(
+                // S4: use boundedDataWithDeadline for 100s timeout
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                     for: request,
                     maxBytes: maxBytes
                 )

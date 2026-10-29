@@ -366,7 +366,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             let client: any MigrationOHTTPClient
             do {
                 client = try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
-                    let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: maxBytes)
+                    // S4: use boundedDataWithDeadline for 100s timeout
+                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(for: request, maxBytes: maxBytes)
                     guard let httpResponse = response as? HTTPURLResponse else {
                         throw OHTTPError.transportError("Invalid response type")
                     }
