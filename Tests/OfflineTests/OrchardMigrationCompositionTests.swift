@@ -577,6 +577,7 @@ final class OrchardMigrationCompositionTests: ZcashTestCase {
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
             torClientFactory: { _ in throw StubTorBootstrapError() },
+            networkType: .testnet,
             directServiceFactory: { _ in service }
         )
     }
