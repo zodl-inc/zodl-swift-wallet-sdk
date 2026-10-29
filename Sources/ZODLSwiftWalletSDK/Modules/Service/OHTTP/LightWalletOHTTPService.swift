@@ -43,6 +43,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     var walletNetwork: NetworkType?
     /// Test-only: replaces the hardened clearnet session as the relay sender of the clients made from now on.
     var testClearnetSender: OHTTPTransport.HTTPSender?
+    /// Test-only: makes the clearnet relay stream sender, so a test can verify streaming calls use clearnet.
+    var testClearnetStreamSender: OHTTPTransport.StreamSender?
     /// Test-only: makes the relay sender of a Tor leg from the isolated client it would ride, instead of
     /// `TorClient.httpRequestSentOnce`, so a test can see which circuit each call was given.
     var testTorSender: ((TorClient) -> OHTTPTransport.HTTPSender)?
@@ -162,11 +164,9 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             } else {
                 // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
                 // tried again, on a new circuit, only when it failed before any of it was sent.
-                // Apply 100s per-exchange deadline for non-streaming exchanges (streaming uses `streamSender`).
+                // Rely on the native Tor timeout (the wrapper cannot interrupt a synchronous FFI call).
                 httpSender = { request, maxBytes in
-                    try await Self.withExchangeDeadline {
-                        try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
-                    }
+                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
                 }
             }
             // S1: streaming calls (mempool long poll) must also use the Tor circuit
@@ -179,9 +179,13 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
         } else if let testClearnetSender {
             httpSender = testClearnetSender
-            // Default streamSender (clearnet) is used when testClearnetSender is set
-            streamSender = { request, maxBytes in
-                try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+            // Test streamSender (clearnet) if provided, otherwise default
+            if let testClearnetStreamSender {
+                streamSender = testClearnetStreamSender
+            } else {
+                streamSender = { request, maxBytes in
+                    try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+                }
             }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
@@ -196,9 +200,13 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 }
                 return (data, httpResponse)
             }
-            // Default streamSender (clearnet)
-            streamSender = { request, maxBytes in
-                try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+            // Test streamSender (clearnet) if provided, otherwise default
+            if let testClearnetStreamSender {
+                streamSender = testClearnetStreamSender
+            } else {
+                streamSender = { request, maxBytes in
+                    try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+                }
             }
         }
 

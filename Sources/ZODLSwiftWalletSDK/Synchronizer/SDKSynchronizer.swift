@@ -930,7 +930,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         tor: TorClient,
         singleCallTimeout: Int64? = nil,
         sdkFlags: SDKFlags? = nil,
-        networkType: NetworkType? = nil
+        networkType: NetworkType
     ) -> LightWalletGRPCServiceOverTor {
         if OHTTPEndpoints.isGateway(endpoint.host) {
             let service: LightWalletOHTTPService
@@ -1484,6 +1484,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             gatewayHost: route.gatewayHost,
             relayURL: route.relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: initializer.network.networkType,
             viaTor: viaTor,
             httpSender: httpSender
         )

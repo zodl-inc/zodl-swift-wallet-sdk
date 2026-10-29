@@ -421,11 +421,11 @@ private extension String {
 // MARK: - Incremental gRPC Frame Decoder
 
 /// Decodes gRPC frames incrementally as chunks arrive.
-private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
+internal class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
     private var buffer = Data()
     private let frameHeaderSize = 5
-    // S5: max frame length = max relay response (256 MiB sealed + 1 MiB framing)
-    private let maxFrameLength = (256 * 1024 * 1024) + (1024 * 1024)
+    // S5: max frame length = 4 MiB (gRPC default; lightwalletd messages are below 2 MB)
+    private let maxFrameLength = 4 * 1024 * 1024
 
     /// Pushes a chunk and returns any complete messages decoded from the buffer.
     func push(_ chunk: Data) throws -> [T] {
@@ -465,7 +465,8 @@ private class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
         }
 
         if pos > 0 {
-            buffer.removeFirst(pos)
+            // Re-base the buffer to avoid slice indexing issues on the next push
+            buffer = Data(buffer.dropFirst(pos))
         }
 
         return messages

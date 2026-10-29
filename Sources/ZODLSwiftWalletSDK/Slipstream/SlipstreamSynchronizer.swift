@@ -3092,6 +3092,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             gatewayHost: route.gatewayHost,
             relayURL: route.relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: initializer.network.networkType,
             viaTor: viaTor,
             httpSender: httpSender
         )
