@@ -108,12 +108,30 @@ jobs:
       if: matrix.language == 'swift'
       run: sudo xcode-select -s '/Applications/Xcode_26.6.app/Contents/Developer'
 
+    # Validate on every Swift run, including an FFI cache hit.
+    - name: Setup Python
+      if: matrix.language == 'swift'
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      with:
+        python-version: '3.12'
+
+    - name: Install stable Rust
+      if: matrix.language == 'swift'
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+
+    - name: Validate Rust
+      id: toolchain
+      if: matrix.language == 'swift'
+      run: |
+        python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
+
     - name: Generate FFI source hash
       if: matrix.language == 'swift'
       id: ffi-hash
       run: |
         FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
-        echo "hash=$FFI_HASH" >> $GITHUB_OUTPUT
+        echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
         echo "FFI source hash: $FFI_HASH"
 
     - name: Cache FFI XCFramework
@@ -122,7 +140,7 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: codeql-ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
+        key: codeql-ffi-xcframework-macos-arm64-nolto-v2-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
 
     - name: Authorize cargo against the private slipstream repository
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
@@ -130,21 +148,6 @@ jobs:
       with:
         app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
         app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
-
-    # The same Rust setup as swift.yml's build job, whose comment explains it.
-    - name: Setup Rust
-      id: toolchain
-      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
-      run: |
-        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
-        rustup default stable
-        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
-        rustc_version="$(rustc +stable --version --verbose)"
-        echo "$rustc_version"
-        commit_date="$(sed -n 's/^commit-date: //p' <<< "$rustc_version" | tr -d -)"
-        commit_hash="$(sed -n 's/^commit-hash: //p' <<< "$rustc_version")"
-        echo "cachekey=${commit_date}${commit_hash:0:4}" >> "$GITHUB_OUTPUT"
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
@@ -162,17 +165,17 @@ jobs:
         # `registry/` is crates.io content and safe to cache. `target/` holds compiled rlib/rmeta
         # files, never sources: a far smaller disclosure should a private dependency return, and
         # too expensive to rebuild every run. The codeql- prefix keeps these caches apart from
-        # swift.yml's, which a different Xcode builds; v2 is ffi-ci's arm64-only, LTO-off build,
-        # and the toolchain's cachekey starts a fresh cache with each stable Rust release.
+        # swift.yml's, which a different Xcode builds; v3 is ffi-ci's arm64-only, LTO-off build,
+        # constrained by the validated compiler's complete verbose identity.
         path: |
           target
           ~/.cargo/bin
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-
+          codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-
 
     # The arm64 macOS slice without fat LTO is all the Swift build needs for
     # analysis; the universal LTO build used to run into the 30-minute limit.
