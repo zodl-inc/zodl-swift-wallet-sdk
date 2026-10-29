@@ -451,6 +451,11 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
 
         service.testKeyVerifier = stubKeyVerifier
+        // The key-configuration GET goes through the Tor HTTP sender: stub it too, so the test
+        // never bootstraps Tor or depends on a key another test left in the shared cache.
+        service.testTorSender = { _ in
+            { request, _ in (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200)) }
+        }
         service.testTorStreamSender = { _ in
             return { _, _ in
                 torCalled.used = true

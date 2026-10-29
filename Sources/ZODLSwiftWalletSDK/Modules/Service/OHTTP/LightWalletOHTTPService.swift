@@ -123,8 +123,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         guard let host = gatewayHost, let relayURL = gatewayRelayURL else {
             return nil
         }
-        // Production services must set walletNetwork to validate gateway network binding (ZIP #10, lines 266-271).
-        // Tests that need nil must explicitly set testKeyVerifier to skip the native check.
+        // Every service must set walletNetwork: the gateway and its signed key configuration are checked
+        // against the wallet's network (ZIP #10 "Network binding").
         guard let walletNetwork else {
             throw OHTTPError.transportError("walletNetwork must be set for OHTTP gateway services")
         }
@@ -701,28 +701,6 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             try await TransparentAddressWalletStore.store(transaction, dbData: dbData, networkType: networkType)
         }
         return !transactions.isEmpty
-    }
-
-    /// Applies a 100-second per-exchange deadline to a non-streaming exchange.
-    /// Streaming exchanges (mempool long poll, SSE) must not use this.
-    private static func withExchangeDeadline<T>(
-        _ operation: @escaping () async throws -> T
-    ) async throws -> T {
-        let deadlineSeconds: TimeInterval = 100
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
-                throw OHTTPError.transportError("Exchange deadline exceeded (100s)")
-            }
-
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
     }
 
     override func closeConnections() async {

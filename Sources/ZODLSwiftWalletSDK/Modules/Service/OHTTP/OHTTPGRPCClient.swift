@@ -444,7 +444,7 @@ internal class GRPCFrameDecoder<T: SwiftProtobuf.Message> {
                 throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "compressed frames are not supported")
             }
 
-            // S5: reject oversized length before buffering
+            // S5: reject an oversized length before waiting for its body
             guard length <= maxFrameLength else {
                 throw LightWalletServiceError.failed(statusCode: OHTTPGRPCStatus.internalError, message: "frame length \(length) exceeds cap")
             }
