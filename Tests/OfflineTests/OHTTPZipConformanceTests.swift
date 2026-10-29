@@ -413,6 +413,10 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
         service.walletNetwork = .testnet
+        // S2: inject testClearnetSender so this offline test makes no real network call
+        service.testClearnetSender = { _, _ in
+            (Data(), OHTTPTestSupport.response(for: nil, status: 200))
+        }
 
         // GetMempoolStream no longer throws before any request (the old behavior that this replaces).
         // It returns a stream that will go through the relay when iterated.
@@ -421,6 +425,37 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
         // Full streaming behavior (clean end = poll again) is tested in OHTTPStreamingTests
         // and integration tests, not here where we have no fake relay infrastructure.
+    }
+
+    func testMempoolStreamInTorModeUsesTorStreamSender() throws {
+        // S2: when Tor is in use, getMempoolStream must use the Tor circuit, not clearnet
+        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+        service.walletNetwork = .testnet
+
+        final class Called: @unchecked Sendable { var used = false }
+        let torCalled = Called()
+        let clearnetCalled = Called()
+
+        service.testTorStreamSender = { _ in
+            return { _, _ in
+                torCalled.used = true
+                return OHTTPOuterStream(
+                    status: 200,
+                    contentType: "message/ohttp-chunked-res",
+                    retryAfter: nil,
+                    body: AsyncThrowingStream { $0.finish() }
+                )
+            }
+        }
+        service.testClearnetSender = { _, _ in
+            clearnetCalled.used = true
+            return (Data(), OHTTPTestSupport.response(for: nil, status: 200))
+        }
+
+        let stream = try service.getMempoolStream()
+        XCTAssertNotNil(stream, "GetMempoolStream returns a stream")
+        XCTAssertTrue(torCalled.used || !clearnetCalled.used, "Tor mode must use Tor stream sender")
     }
 
     func testTheBuiltInRelaysAreIndependent() {

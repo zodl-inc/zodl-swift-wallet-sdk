@@ -174,7 +174,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 streamSender = testTorStreamSender(isolated)
             } else {
                 streamSender = { request, maxBytes in
-                    try isolated.httpPostStream(for: request, maxBytes: maxBytes)
+                    try await isolated.httpPostStream(for: request, maxBytes: maxBytes)
                 }
             }
         } else if let testClearnetSender {

@@ -164,6 +164,10 @@ extension OHTTPTransport {
                     body: AsyncThrowingStream { continuation in
                         continuation.yield(response.body)
                         continuation.finish()
+                    },
+                    trailers: AsyncThrowingStream { continuation in
+                        continuation.yield(response.trailers)
+                        continuation.finish()
                     }
                 )
 
