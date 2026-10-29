@@ -43,9 +43,14 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     var walletNetwork: NetworkType?
     /// Test-only: replaces the hardened clearnet session as the relay sender of the clients made from now on.
     var testClearnetSender: OHTTPTransport.HTTPSender?
+    /// Test-only: makes the clearnet relay stream sender, so a test can verify streaming calls use clearnet.
+    var testClearnetStreamSender: OHTTPTransport.StreamSender?
     /// Test-only: makes the relay sender of a Tor leg from the isolated client it would ride, instead of
     /// `TorClient.httpRequestSentOnce`, so a test can see which circuit each call was given.
     var testTorSender: ((TorClient) -> OHTTPTransport.HTTPSender)?
+    /// Test-only: makes the relay stream sender of a Tor leg from the isolated client it would ride, instead of
+    /// `TorClient.httpPostStream`, so a test can verify streaming calls use Tor.
+    var testTorStreamSender: ((TorClient) -> OHTTPTransport.StreamSender)?
     /// Test-only: verifies the key configuration instead of the native code.
     var testKeyVerifier: OHTTPTransport.KeyVerifier?
 
@@ -118,9 +123,12 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         guard let host = gatewayHost, let relayURL = gatewayRelayURL else {
             return nil
         }
-        if let walletNetwork {
-            try OHTTPEndpoints.checkGatewayNetwork(host: host, network: walletNetwork)
+        // Every service must set walletNetwork: the gateway and its signed key configuration are checked
+        // against the wallet's network (ZIP #10 "Network binding").
+        guard let walletNetwork else {
+            throw OHTTPError.transportError("walletNetwork must be set for OHTTP gateway services")
         }
+        try OHTTPEndpoints.checkGatewayNetwork(host: host, network: walletNetwork)
 
         let isTorEnabled = await sdkFlags?.torEnabled ?? false
         let circuit: String?
@@ -148,6 +156,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
     /// `viaTor`, on the hardened clearnet session otherwise.
     private func makeClient(host: String, relayURL: String, viaTor: Bool) async throws -> OHTTPGRPCClient {
         let httpSender: OHTTPTransport.HTTPSender
+        let streamSender: OHTTPTransport.StreamSender
         if viaTor {
             let isolated = try await torClient.isolatedClient()
             if let testTorSender {
@@ -155,17 +164,34 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             } else {
                 // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
                 // tried again, on a new circuit, only when it failed before any of it was sent.
+                // Rely on the native Tor timeout (the wrapper cannot interrupt a synchronous FFI call).
                 httpSender = { request, maxBytes in
                     try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
                 }
             }
+            // S1: streaming calls (mempool long poll) must also use the Tor circuit
+            if let testTorStreamSender {
+                streamSender = testTorStreamSender(isolated)
+            } else {
+                streamSender = { request, maxBytes in
+                    try await isolated.httpPostStream(for: request, maxBytes: maxBytes)
+                }
+            }
         } else if let testClearnetSender {
             httpSender = testClearnetSender
+            // Test streamSender (clearnet) if provided, otherwise default
+            if let testClearnetStreamSender {
+                streamSender = testClearnetStreamSender
+            } else {
+                streamSender = { request, maxBytes in
+                    try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+                }
+            }
         } else {
             // Clearnet sender: use the hardened session (ephemeral, no cookies, no cache, refuses redirects)
-            // with bounded response reading per ZIP MUST requirement
+            // with bounded response reading and 100s per-exchange deadline (non-streaming exchanges only)
             httpSender = { request, maxBytes in
-                let (data, response) = try await OHTTPTransport.boundedData(
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                     for: request,
                     maxBytes: maxBytes
                 )
@@ -174,14 +200,24 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 }
                 return (data, httpResponse)
             }
+            // Test streamSender (clearnet) if provided, otherwise default
+            if let testClearnetStreamSender {
+                streamSender = testClearnetStreamSender
+            } else {
+                streamSender = { request, maxBytes in
+                    try await OHTTPTransport.streamedData(for: request, maxBytes: maxBytes)
+                }
+            }
         }
 
         let transport = OHTTPTransport(
             gatewayHost: host,
             relayURL: relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: walletNetwork,
             testKeyVerifier: testKeyVerifier,
             viaTor: viaTor,
+            streamSender: streamSender,
             httpSender: httpSender
         )
 
@@ -421,16 +457,37 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
     }
 
-    /// lightwalletd keeps `GetMempoolStream` open until the next block, longer than one OHTTP exchange
-    /// can last (`grpc-timeout` 75 s, gateway upstream cut 80 s), so a gateway endpoint refuses the call
-    /// before anything is sent.
+    /// Mempool long poll over OHTTP. The gateway ends it with grpc-status: 0 after ~25 seconds
+    /// without messages, which the caller treats as "poll again later", not an error.
     override func getMempoolStream() throws -> AsyncThrowingStream<RawTransaction, Error> {
-        guard gatewayHost == nil else {
-            throw ZcashError.serviceGetMempoolStreamFailed(
-                LightWalletServiceError.generalError(message: "GetMempoolStream is not available over OHTTP")
-            )
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let client = try await self.ensureOHTTPClient(mode: .direct) else {
+                        for try await tx in try super.getMempoolStream() {
+                            continuation.yield(tx)
+                        }
+                        continuation.finish()
+                        return
+                    }
+
+                    let empty = Empty()
+                    let stream: AsyncThrowingStream<RawTransaction, Error> = try await client.serverStreamingIncremental(
+                        path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
+                        request: empty
+                    )
+
+                    for try await rawTx in stream {
+                        continuation.yield(rawTx)
+                    }
+                    continuation.finish()
+                } catch {
+                    let serviceError = error as? LightWalletServiceError ?? LightWalletServiceError.genericError(error: error)
+                    continuation.finish(throwing: ZcashError.serviceGetMempoolStreamFailed(serviceError))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-        return try super.getMempoolStream()
     }
 
     override func getSubtreeRoots(_ request: GetSubtreeRootsArg, mode: ServiceMode) throws -> AsyncThrowingStream<SubtreeRoot, Error> {

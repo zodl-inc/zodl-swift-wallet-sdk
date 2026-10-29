@@ -21,12 +21,14 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
     private let sdkFlags: SDKFlags
     private let rustBackend: ZcashRustBackendWelding
     private let logger: Logger
+    private let networkType: NetworkType
 
-    init(torClient: TorClient, sdkFlags: SDKFlags, rustBackend: ZcashRustBackendWelding, logger: Logger) {
+    init(torClient: TorClient, sdkFlags: SDKFlags, rustBackend: ZcashRustBackendWelding, logger: Logger, networkType: NetworkType) {
         self.torClient = torClient
         self.sdkFlags = sdkFlags
         self.rustBackend = rustBackend
         self.logger = logger
+        self.networkType = networkType
     }
 
     func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
@@ -53,7 +55,10 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
 
         let service: LightWalletGRPCServiceOverTor
         if OHTTPEndpoints.isGateway(endpoint.host) {
-            service = LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient)
+            // S7: pass wallet network on every production path
+            let ohttpService = LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient)
+            ohttpService.walletNetwork = networkType
+            service = ohttpService
         } else {
             service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: serviceTorClient)
         }

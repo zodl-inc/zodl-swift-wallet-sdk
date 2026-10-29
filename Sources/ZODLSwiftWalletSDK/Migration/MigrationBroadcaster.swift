@@ -89,6 +89,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     private let torMode: @Sendable () async -> Bool
     private let ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)?
     private let directServiceFactory: @Sendable (LightWalletEndpoint) -> any LightWalletService
+    /// S7: wallet network for OHTTP gateway validation
+    private let networkType: NetworkType
 
     /// The dedicated Tor client's bootstrap, cached as a `Task` on the first `useTor` broadcast so
     /// concurrent broadcasts await the exact SAME bootstrap attempt rather than each racing its own
@@ -111,12 +113,13 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     ///   documents), so sharing the directory is safe. ``torClientTask`` additionally removes the
     ///   duplicate-bootstrap race within a single broadcaster: concurrent `useTor` broadcasts on one
     ///   instance bootstrap the shared directory at most once (see ``dedicatedTorClient()``).
-    init(torDirURL: URL, logger: Logger, torMode: @escaping @Sendable () async -> Bool = { false }) {
+    init(torDirURL: URL, logger: Logger, networkType: NetworkType, torMode: @escaping @Sendable () async -> Bool = { false }) {
         self.init(
             torDirURL: torDirURL,
             logger: logger,
             torClientFactory: MigrationBroadcaster.bootstrapTorClient,
-            torMode: torMode
+            torMode: torMode,
+            networkType: networkType
         )
     }
 
@@ -132,6 +135,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         logger: Logger,
         torClientFactory: @escaping @Sendable (URL) async throws -> TorClient,
         torMode: @escaping @Sendable () async -> Bool = { false },
+        networkType: NetworkType,
         directServiceFactory: @escaping @Sendable (LightWalletEndpoint) -> any LightWalletService = { LightWalletGRPCService(endpoint: $0) },
         ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)? = nil
     ) {
@@ -139,6 +143,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         self.logger = logger
         self.torClientFactory = torClientFactory
         self.torMode = torMode
+        self.networkType = networkType
         self.directServiceFactory = directServiceFactory
         self.ohttpClientFactory = ohttpClientFactory
     }
@@ -366,7 +371,8 @@ actor MigrationBroadcaster: MigrationBroadcasting {
             let client: any MigrationOHTTPClient
             do {
                 client = try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
-                    let (data, response) = try await OHTTPTransport.boundedData(for: request, maxBytes: maxBytes)
+                    // S4: use boundedDataWithDeadline for 100s timeout
+                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(for: request, maxBytes: maxBytes)
                     guard let httpResponse = response as? HTTPURLResponse else {
                         throw OHTTPError.transportError("Invalid response type")
                     }
@@ -465,10 +471,12 @@ private extension MigrationBroadcaster {
             return try await ohttpClientFactory(endpoint)
         }
         let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+        // S7: pass wallet network for gateway validation
         let transport = OHTTPTransport(
             gatewayHost: endpoint.host,
             relayURL: relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: networkType,
             viaTor: viaTor,
             httpSender: httpSender
         )

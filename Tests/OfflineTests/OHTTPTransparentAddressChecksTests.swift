@@ -57,6 +57,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
             tor: TorClient(torDir: FileManager.default.temporaryDirectory),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
         )
+        service.walletNetwork = .testnet
         service.testKeyVerifier = OHTTPTestSupport.makeKeyVerifier()
         service.testClearnetSender = { request, _ in
             if request.httpMethod == "GET" {
@@ -199,6 +200,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
             tor: tor,
             sdkFlags: SDKFlags(torEnabled: true, exchangeRateEnabled: false)
         )
+        service.walletNetwork = .testnet
         service.testKeyVerifier = OHTTPTestSupport.makeKeyVerifier()
         service.testTorSender = { (isolated: TorClient) -> OHTTPTransport.HTTPSender in
             { request, _ in
@@ -259,6 +261,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
             tor: TorClient(torDir: FileManager.default.temporaryDirectory),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
         )
+        service.walletNetwork = .testnet
         let address = try await transparentAddress(of: account)
 
         let result = try await service.updateTransparentAddressTransactions(

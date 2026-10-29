@@ -22,7 +22,8 @@ final class EndpointSubmitterTests: ZcashTestCase {
             torClient: TorClient(torDir: try __torDirURL()),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
             rustBackend: rustBackend,
-            logger: submissionLifecycleLogger()
+            logger: submissionLifecycleLogger(),
+            networkType: .testnet
         )
     }
 

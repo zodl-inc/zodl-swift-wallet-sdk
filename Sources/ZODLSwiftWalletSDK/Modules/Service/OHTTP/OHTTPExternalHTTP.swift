@@ -117,6 +117,7 @@ enum OHTTPExternalHTTP {
                 gatewayHost: route.gatewayHost,
                 relayURL: route.relayURL,
                 clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+                walletNetwork: network,
                 viaTor: true,
                 streamSender: torStreamSender,
                 httpSender: torSender
@@ -125,7 +126,8 @@ enum OHTTPExternalHTTP {
             transport = OHTTPTransport(
                 gatewayHost: route.gatewayHost,
                 relayURL: route.relayURL,
-                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix
+                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+                walletNetwork: network
             )
         }
 

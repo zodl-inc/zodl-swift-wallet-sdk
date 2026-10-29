@@ -71,7 +71,8 @@ final class OrchardMigrationHostTests: ZcashTestCase {
         let sharedBroadcaster = MigrationBroadcaster(
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
-            torClientFactory: factory.make
+            torClientFactory: factory.make,
+            networkType: .testnet
         )
 
         let prepared = PreparedMigrationTransfer(

@@ -64,11 +64,13 @@ enum Dependencies {
         }
 
         container.register(type: EndpointSubmitter.self, isSingleton: true) { di in
+            // S7: pass networkType to submitter
             GRPCEndpointSubmitter(
                 torClient: di.resolve(TorClient.self),
                 sdkFlags: di.resolve(SDKFlags.self),
                 rustBackend: di.resolve(ZcashRustBackendWelding.self),
-                logger: di.resolve(Logger.self)
+                logger: di.resolve(Logger.self),
+                networkType: networkType
             )
         }
 

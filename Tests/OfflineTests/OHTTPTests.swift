@@ -310,6 +310,31 @@ final class OHTTPTests: XCTestCase {
                       "Trace ID should match allowed charset")
     }
 
+    func testClientTraceIdStartsWithAlphanumeric() async throws {
+        // ZIP 2198-2199: the trace ID must start with a letter or digit
+        let testCases = [
+            "-debug": "d",  // leading hyphen stripped
+            ".debug": "d",  // leading dot stripped
+            ":-test": "t",  // leading punctuation stripped
+            "...abc": "a",  // multiple leading punctuation stripped
+            "---": "x"      // all punctuation -> default "x"
+        ]
+
+        for (prefix, expectedStart) in testCases {
+            let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: prefix)
+            let traceId = post?.value(forHTTPHeaderField: "X-Client-Trace-Id")
+            XCTAssertNotNil(traceId, "Trace ID should be present for prefix '\(prefix)'")
+
+            let firstChar = String(traceId?.prefix(1) ?? "")
+            XCTAssertEqual(firstChar, expectedStart,
+                          "Trace ID for prefix '\(prefix)' should start with '\(expectedStart)', got '\(firstChar)'")
+
+            // Verify it matches the full pattern
+            XCTAssertTrue(traceId?.range(of: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$", options: .regularExpression) != nil,
+                          "Trace ID '\(traceId ?? "")' should match allowed charset starting with alphanumeric")
+        }
+    }
+
     func testClientTraceIdTruncation() async throws {
         let post = await OHTTPTestSupport.capturePost(clientTraceIdPrefix: String(repeating: "a", count: 60))
 

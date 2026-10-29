@@ -2948,7 +2948,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags)
+                    // S7: pass wallet network on every production path
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags, networkType: network)
                     let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
                     guard let probed = await Self.probe(
                         endpoint,
@@ -3075,7 +3076,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
         } else {
             httpSender = { request, maxBytes in
-                let (data, response) = try await OHTTPTransport.boundedData(
+                // S4: use boundedDataWithDeadline for 100s timeout
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                     for: request,
                     maxBytes: maxBytes
                 )
@@ -3090,6 +3092,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             gatewayHost: route.gatewayHost,
             relayURL: route.relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: initializer.network.networkType,
             viaTor: viaTor,
             httpSender: httpSender
         )
