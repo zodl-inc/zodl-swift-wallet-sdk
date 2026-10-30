@@ -35,8 +35,10 @@ final class TorHTTPGetRequest: @unchecked Sendable {
     private let native: TorHTTPGetNative
     private let bounded: Int?
     private let postBody: Data?
+    private let health: OHTTPHealthTraffic?
 
     init(runtime: OpaquePointer, request: URLRequest, url: URL, retryLimit: UInt8, deadline: UInt64, native: TorHTTPGetNative, bounded: Int? = nil) {
+        self.health = OHTTPHealthTraffic.current
         self.runtime = runtime
         self.url = url
         self.headers = request.allHTTPHeaderFields ?? [:]
@@ -79,7 +81,7 @@ final class TorHTTPGetRequest: @unchecked Sendable {
         var nativeHeaders = allocated.map { FfiHttpRequestHeader(name: $0.0, value: $0.1) }
         // Rust requires a non-null aligned slice pointer even when its length is zero.
         if nativeHeaders.isEmpty { nativeHeaders.append(FfiHttpRequestHeader(name: nil, value: nil)) }
-        var outcome = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_after_seconds: 0)
+        var outcome = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_not_before_ns: 0)
         let responsePointer = try nativeHeaders.withUnsafeBufferPointer { buffer in
             try url.absoluteString.withCString { urlPointer in
                 // Header/string allocation consumes the same deadline. Floor immediately
@@ -118,6 +120,7 @@ final class TorHTTPGetRequest: @unchecked Sendable {
                 return native.get(runtime, urlPointer, buffer.baseAddress, UInt(headers.count), retryLimit, milliseconds)
             }
         }
+        if bounded != nil { health?.outerResponse(outcome) }
         guard let responsePointer else {
             if bounded != nil { throw OHTTPNativeHTTPFailure(outcome) }
             throw ZcashError.rustTorHttpRequest(

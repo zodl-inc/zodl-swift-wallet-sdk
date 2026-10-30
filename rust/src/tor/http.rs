@@ -301,7 +301,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(outcome.kind, 1);
             assert_eq!(outcome.http_status, status);
-            assert_eq!(outcome.retry_after_seconds, 17);
+            assert!(outcome.retry_not_before_ns > 0 || status != 429);
             assert!(dropped.load(Ordering::SeqCst));
         }
     }
@@ -370,6 +370,114 @@ mod tests {
         };
         assert!(result.is_null());
         assert_eq!(outcome.kind, 3);
+    }
+
+    #[tokio::test]
+    async fn classified_pause_is_anchored_before_body_failure() {
+        use futures::StreamExt;
+        use http_body_util::StreamBody;
+        use std::sync::atomic::AtomicU64;
+        for delay in [1u64, 120] {
+            let head_time = Arc::new(AtomicU64::new(0));
+            let captured = head_time.clone();
+            let (result, outcome) = crate::tor_http_classified_response(
+                1024,
+                100,
+                crate::retry_if_unsent,
+                |guard| async move {
+                    guard.filter(Ok(http::StatusCode::TOO_MANY_REQUESTS));
+                    captured.store(
+                        guard.status.observed_at_ns.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    let body = StreamBody::new(
+                        futures::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Err::<hyper::body::Frame<Bytes>, _>(
+                                zcash_client_backend::tor::http::HttpError::Timeout(
+                                    zcash_client_backend::tor::http::TimeoutPhase::ResponseBody,
+                                ),
+                            )
+                        })
+                        .boxed(),
+                    );
+                    Ok(http::Response::builder()
+                        .status(429)
+                        .header("Retry-After", delay)
+                        .body(crate::TorHttpGetBody::Incoming(body))
+                        .unwrap())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                outcome.retry_not_before_ns,
+                head_time.load(Ordering::Relaxed) + delay * 1_000_000_000
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_pause_and_body_deadline_start_at_parser_admission() {
+        use futures::StreamExt;
+        use http_body_util::StreamBody;
+        use std::sync::atomic::AtomicU64;
+        for fail in [false, true] {
+            let head_time = Arc::new(AtomicU64::new(0));
+            let captured = head_time.clone();
+            let start = tokio::time::Instant::now();
+            let result = crate::tor_http_get_response(
+                1024,
+                None,
+                crate::retry_if_unsent,
+                |guard, explicit| async move {
+                    guard.filter(Ok(http::StatusCode::TOO_MANY_REQUESTS));
+                    captured.store(
+                        guard.status.observed_at_ns.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    let body = StreamBody::new(
+                        futures::stream::once(async move {
+                            tokio::time::sleep(Duration::from_secs(if fail { 2 } else { 90 }))
+                                .await;
+                            Err::<hyper::body::Frame<Bytes>, _>(
+                                zcash_client_backend::tor::http::HttpError::Timeout(
+                                    zcash_client_backend::tor::http::TimeoutPhase::ResponseBody,
+                                ),
+                            )
+                        })
+                        .boxed(),
+                    );
+                    let parsed = guard.parse_get(body, explicit).await?;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(http::Response::builder()
+                        .status(429)
+                        .header("Retry-After", "120")
+                        .body(parsed)
+                        .unwrap())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                crate::zcashlc_tor_http_last_outcome().retry_not_before_ns,
+                head_time.load(Ordering::Relaxed) + 120_000_000_000
+            );
+            assert_eq!(
+                tokio::time::Instant::now() - start,
+                Duration::from_secs(if fail { 12 } else { 60 })
+            );
+            assert!(matches!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<zcash_client_backend::tor::Error>(),
+                Some(zcash_client_backend::tor::Error::Http(
+                    zcash_client_backend::tor::http::HttpError::Timeout(
+                        zcash_client_backend::tor::http::TimeoutPhase::ResponseBody
+                    )
+                ))
+            ));
+        }
     }
 
     #[test]

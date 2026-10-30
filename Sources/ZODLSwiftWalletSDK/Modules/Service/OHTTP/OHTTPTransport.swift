@@ -393,8 +393,13 @@ actor OHTTPTransport {
         } catch OHTTPError.httpStatusError(let status, let message) where status == 429 {
             throw OHTTPError.httpStatusError(statusCode: status, message: message)
         } catch let relayError {
-            let outcome = OHTTPHealthTraffic.outcome(relayError)
-            if outcome == .configurationFailure || outcome == .responseRejected { OHTTPHealthTraffic.current?.classify(outcome) }
+            let outcome = OHTTPHealthTraffic.current?.failure ?? OHTTPHealthTraffic.outcome(relayError)
+            switch outcome {
+            case .policyRejected, .rateLimited, .configurationFailure, .responseRejected:
+                OHTTPHealthTraffic.current?.classify(outcome)
+            default: break
+            }
+            if OHTTPHealthProbe.budget != nil, case .rateLimited = outcome { throw relayError }
             return try await fetchKeyConfigFromDNS(relayError: relayError)
         }
     }
@@ -468,6 +473,14 @@ actor OHTTPTransport {
                 return verified
             } catch {
                 if error is CancellationError { throw error }
+                if OHTTPHealthProbe.budget != nil {
+                    let outcome = OHTTPHealthTraffic.outcome(error)
+                    if case .rateLimited = outcome {
+                        OHTTPHealthTraffic.current?.classify(outcome)
+                        throw error
+                    }
+                    if case .rateLimited = OHTTPHealthTraffic.current?.failure { throw error }
+                }
                 try OHTTPHealthProbe.budget?.check()
                 continue
             }

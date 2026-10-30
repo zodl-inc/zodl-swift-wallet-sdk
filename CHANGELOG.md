@@ -8,6 +8,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP health preserves an authenticated rejection when response decoding or body collection fails.
+  Diagnostic key fallback stops on a known rate limit, and Retry-After keeps its original head-time
+  deadline through delayed bodies and cleanup. Public RPC errors and submission behavior are unchanged.
+
 - `SlipstreamSynchronizer` preserves restore progress across retries and stop/start on the same
   engine instance, and limits rewind-related drops to reopened work. No caller changes are required.
 

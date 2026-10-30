@@ -1,4 +1,7 @@
 import XCTest
+import libzcashlc
+import Network
+import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthTrafficTests: XCTestCase {
@@ -246,6 +249,171 @@ final class OHTTPHealthTrafficTests: XCTestCase {
         XCTAssertFalse(session.snapshot().observations.contains { $0.outcome == .transportUnavailable })
     }
 
+    func testDiagnosticKeyHeadRejectionSurvivesBodyDeadlineAndBlocksRateLimitFallback() async throws {
+        for status in [403, 426, 429] {
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://key-\(status).test/relay", viaTor: true)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            var requests = 0
+            let transport = OHTTPTransport(
+                gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+                testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(), viaTor: true, keyCache: OHTTPKeyCache(),
+                httpSender: { _, _ in
+                    requests += 1
+                    try await Task.sleep(nanoseconds: 30_000_000)
+                    throw OHTTPNativeHTTPFailure(FfiTorHttpOutcome(kind: 1, http_status: UInt16(status), retry_not_before_ns: OHTTPHealthClock.nowNanoseconds + 120_000_000_000))
+                }
+            )
+            let result = await OHTTPHealthProbe.run(session: session, timeoutMilliseconds: 10) { budget in
+                try budget.admit()
+                _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+                return .usable
+            }
+            if status == 429 {
+                guard case .rateLimited = result.outcome else { return XCTFail("Known key pause must survive deadline") }
+            } else { XCTAssertEqual(result.outcome, .policyRejected) }
+            XCTAssertEqual(requests, 1)
+        }
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        var requests = 0
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            keyCache: OHTTPKeyCache(), httpSender: { _, _ in
+                requests += 1
+                throw OHTTPNativeHTTPFailure(FfiTorHttpOutcome(kind: 2, http_status: 429, retry_not_before_ns: OHTTPHealthClock.nowNanoseconds + 120_000_000_000))
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { _ in
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+            return .usable
+        }
+        guard case .rateLimited = result.outcome else { return XCTFail("Early body failure must retain key pause") }
+        XCTAssertEqual(requests, 1, "No DNS or POST may follow a known key pause")
+    }
+
+    func testDirectAndStreamOuterRejectionsSurviveBodyFailure() async throws {
+        for status in [404, 409, 422] {
+            for streaming in [false, true] {
+                let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://\(UUID().uuidString.lowercased()).test/\(status)", viaTor: false)
+                let session = try OHTTPHealthSession(route: route, generation: UUID())
+                defer { session.close() }
+                let peer = try RejectedHealthPeer(status: status)
+                let ready = expectation(description: "local peer ready")
+                peer.start { ready.fulfill() }
+                await fulfillment(of: [ready], timeout: 2)
+                defer { peer.close() }
+                let urlSession = URLSession(configuration: URLSessionConfiguration.ephemeral)
+                defer { urlSession.invalidateAndCancel() }
+                let transport = OHTTPTransport(
+                    gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+                    testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(), keyCache: OHTTPKeyCache(),
+                    streamSender: { _, _ in
+                        OHTTPOuterStream(status: status, contentType: "text/plain", retryAfter: nil, body: AsyncThrowingStream { continuation in
+                            continuation.finish(throwing: URLError(.networkConnectionLost))
+                        })
+                    },
+                    httpSender: { request, maxBytes in
+                        if request.httpMethod == "POST" {
+                            var local = request
+                            local.url = URL(string: "http://127.0.0.1:\(peer.port)/rejected")!
+                            local.timeoutInterval = 1
+                            let (data, response) = try await OHTTPTransport.boundedData(for: local, maxBytes: maxBytes, session: urlSession)
+                            return (data, response as! HTTPURLResponse)
+                        }
+                        return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+                    }
+                )
+                do {
+                    if streaming { _ = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000) }
+                    else { _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000) }
+                    XCTFail("Original body error must remain")
+                } catch { XCTAssertEqual((error as? URLError)?.code, streaming ? .networkConnectionLost : .timedOut, "\(error)") }
+                XCTAssertTrue(session.snapshot().observations.contains { $0.outcome == .responseRejected }, "status \(status), streaming \(streaming)")
+                XCTAssertFalse(session.snapshot().observations.contains { !$0.historical && $0.outcome == .transportUnavailable })
+            }
+        }
+    }
+
+    func testNativeDecodedPauseKeepsOriginalDeadlineAcrossSuccessfulBody() async throws {
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(), keyCache: OHTTPKeyCache(),
+            streamSender: { _, _ in
+                OHTTPOuterStream(status: 200, contentType: "message/ohttp-chunked-res", retryAfter: nil, body: AsyncThrowingStream { continuation in
+                    continuation.yield(Data([1]))
+                    continuation.finish()
+                })
+            },
+            streamDecoderFactory: { _ in NativePauseDecoder() },
+            httpSender: { request, _ in (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200)) }
+        )
+        let response = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+        for try await _ in response.body { }
+        let pauses = session.snapshot().observations.compactMap { observation -> UInt64? in
+            if case .rateLimited(let deadline) = observation.outcome { return deadline }
+            return nil
+        }
+        XCTAssertFalse(pauses.isEmpty)
+        XCTAssertTrue(pauses.allSatisfy { $0 == 123 }, "The expired authenticated head deadline must not restart in Swift")
+    }
+
+    func testInnerRetryAfterKeepsHeadDeadlineAfterDelayedBody() async throws {
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let body = AsyncThrowingStream.makeStream(of: Data.self, throwing: Error.self)
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(), keyCache: OHTTPKeyCache(),
+            streamSender: { _, _ in
+                body.continuation.yield(Data([1]))
+                return OHTTPOuterStream(status: 200, contentType: "message/ohttp-chunked-res", retryAfter: nil, body: body.stream)
+            },
+            streamDecoderFactory: { _ in PassThroughStreamDecoder(status: 429, headers: [("retry-after", "1")]) },
+            httpSender: { request, _ in (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200)) }
+        )
+        let beforeHead = OHTTPHealthClock.nowNanoseconds
+        let response = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+        let afterHead = OHTTPHealthClock.nowNanoseconds
+        let head = try XCTUnwrap(session.snapshot().observations.first { $0.stage == .responseHead && $0.scope != .route })
+        guard case .rateLimited(let deadline) = head.outcome else { return XCTFail("Expected head pause") }
+        XCTAssertGreaterThanOrEqual(deadline, beforeHead + 1_000_000_000)
+        XCTAssertLessThanOrEqual(deadline, afterHead + 1_000_000_000)
+        try await Task.sleep(nanoseconds: 1_020_000_000)
+        body.continuation.finish()
+        for try await _ in response.body {}
+        let completed = try XCTUnwrap(session.snapshot().observations.first { $0.stage == .complete && $0.scope != .route })
+        XCTAssertEqual(completed.outcome, .rateLimited(retryNotBefore: deadline))
+        XCTAssertLessThan(deadline, OHTTPHealthClock.nowNanoseconds, "Body completion must not restart an expired pause")
+    }
+
+    func testDiagnosticDNSRateLimitStopsRemainingResolversAfterRelayPolicyFailure() async throws {
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let pause = OHTTPHealthClock.nowNanoseconds + 120_000_000_000
+        var requests = 0
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            keyCache: OHTTPKeyCache(), httpSender: { _, _ in
+                requests += 1
+                if requests == 1 { throw OHTTPError.httpStatusError(statusCode: 403, message: "relay policy") }
+                throw OHTTPNativeHTTPFailure(FfiTorHttpOutcome(kind: 2, http_status: 429, retry_not_before_ns: pause))
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { _ in
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+            return .usable
+        }
+        XCTAssertEqual(requests, 2, "A DNS pause prohibits the second resolver and POST")
+        XCTAssertEqual(result.outcome, .rateLimited(retryNotBefore: pause))
+    }
+
     func testSharedKeyFailureKeepsTypedProvenanceForEveryWaiter() async throws {
         let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "unknown.test", relayURL: "https://shared-key.test/relay", viaTor: false)
         let session = try OHTTPHealthSession(route: route, generation: UUID())
@@ -331,4 +499,62 @@ private final class RejectedTruncatedDecoder: OHTTPStreamDecoding {
         OHTTPHealthTraffic.current?.nativeFailure(2)
         throw OHTTPError.transportError("truncated")
     }
+}
+
+private final class RejectedHealthPeer: @unchecked Sendable {
+    let listener: NWListener
+    let status: Int
+    private let connections = OSAllocatedUnfairLock(initialState: [NWConnection]())
+    var port: UInt16 { listener.port!.rawValue }
+    init(status: Int) throws {
+        self.status = status
+        listener = try NWListener(using: .tcp, on: .any)
+    }
+    func start(ready: @escaping @Sendable () -> Void) {
+        listener.stateUpdateHandler = { if case .ready = $0 { ready() } }
+        listener.newConnectionHandler = { [self] connection in
+            connections.withLock { $0.append(connection) }
+            connection.start(queue: DispatchQueue.global())
+            receiveRequest(connection, accumulated: Data())
+        }
+        listener.start(queue: DispatchQueue.global())
+    }
+    private func receiveRequest(_ connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] bytes, _, _, error in
+            guard let bytes, error == nil else { return }
+            var request = accumulated
+            request.append(bytes)
+            guard let separator = request.range(of: Data("\r\n\r\n".utf8)) else {
+                receiveRequest(connection, accumulated: request)
+                return
+            }
+            let headers = String(decoding: request[..<separator.lowerBound], as: UTF8.self)
+            let length = headers.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
+                .flatMap { Int($0.split(separator: ":", maxSplits: 1)[1].trimmingCharacters(in: .whitespaces)) } ?? 0
+            guard request.count >= separator.upperBound + length else {
+                receiveRequest(connection, accumulated: request)
+                return
+            }
+            var response = Data("HTTP/1.1 \(status) Rejected\r\nContent-Type: text/plain\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n".utf8)
+            // A large non-final fragment makes URLSession expose the head before the body stalls.
+            response.append(Data(repeating: 120, count: 32768))
+            connection.send(content: response, completion: .contentProcessed { _ in })
+        }
+    }
+    func close() {
+        listener.cancel()
+        connections.withLock { connections in
+            connections.forEach { $0.cancel() }
+            connections.removeAll()
+        }
+    }
+}
+
+private final class NativePauseDecoder: OHTTPStreamDecoding {
+    private let decoder = PassThroughStreamDecoder(status: 429, headers: [("retry-after", "120")])
+    func push(_ bytes: Data) throws -> OHTTPStreamEvents {
+        OHTTPHealthTraffic.current?.decodedHead(FfiOhttpDecodeOutcome(kind: 0, http_status: 429, retry_not_before_ns: 123))
+        return try decoder.push(bytes)
+    }
+    func finish() throws -> OHTTPStreamEvents { try decoder.finish() }
 }

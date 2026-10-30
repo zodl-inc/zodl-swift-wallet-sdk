@@ -89,12 +89,14 @@ final class OHTTPNativeStreamDecoder: OHTTPStreamDecoding, @unchecked Sendable {
     }
 
     private func events(_ result: UnsafeMutablePointer<OhttpStreamEvents>?) throws -> OHTTPStreamEvents {
+        let decoded = zcashlc_ohttp_last_decode_outcome()
         guard let result else {
-            OHTTPHealthTraffic.current?.nativeFailure(zcashlc_ohttp_last_failure_kind())
+            OHTTPHealthTraffic.current?.nativeFailure(decoded)
             let error = OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
             release()
             throw error
         }
+        OHTTPHealthTraffic.current?.decodedHead(decoded)
         defer { zcashlc_free_ohttp_stream_events(result) }
 
         let value = result.pointee

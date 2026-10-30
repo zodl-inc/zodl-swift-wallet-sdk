@@ -330,10 +330,12 @@ final class OHTTPPendingResponse: @unchecked Sendable {
                 )
             }
         }
+        let decoded = zcashlc_ohttp_last_decode_outcome()
         guard let result else {
-            OHTTPHealthTraffic.current?.nativeFailure(zcashlc_ohttp_last_failure_kind())
+            OHTTPHealthTraffic.current?.nativeFailure(decoded)
             throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
         }
+        OHTTPHealthTraffic.current?.decodedHead(decoded)
         defer { zcashlc_free_ohttp_outcome(result) }
 
         let outcome = result.pointee

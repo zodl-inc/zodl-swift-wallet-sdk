@@ -41,23 +41,49 @@ use zodl_ohttp_client::{
     unpack_fields, verify_signed_config,
 };
 
-thread_local! {
-    static LAST_FAILURE_KIND: std::cell::Cell<u32> = const { std::cell::Cell::new(5) };
+/// Typed local metadata from the immediately preceding complete/push/finish call.
+/// Only an authenticated decoded head can populate http_status and retry_not_before_ns.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FfiOhttpDecodeOutcome {
+    pub kind: u32,
+    pub http_status: u16,
+    pub retry_not_before_ns: u64,
 }
 
-/// The immediately preceding OHTTP decode call's structured failure on this thread.
+thread_local! {
+    static LAST_DECODE_OUTCOME: std::cell::Cell<FfiOhttpDecodeOutcome> = const {
+        std::cell::Cell::new(FfiOhttpDecodeOutcome { kind: 5, http_status: 0, retry_not_before_ns: 0 })
+    };
+}
+
+/// Copy immediately after complete/push/finish on the same thread, before cleanup or other calls.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_last_decode_outcome() -> FfiOhttpDecodeOutcome {
+    LAST_DECODE_OUTCOME.get()
+}
+
 /// 2 means truncated transport, 3 configuration, 4 rejected response, 5 inconclusive.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_ohttp_last_failure_kind() -> u32 {
-    LAST_FAILURE_KIND.get()
+    LAST_DECODE_OUTCOME.get().kind
+}
+
+fn reset_decode_outcome() {
+    LAST_DECODE_OUTCOME.set(FfiOhttpDecodeOutcome {
+        kind: 5,
+        ..Default::default()
+    });
 }
 
 fn classified_decode(error: zodl_ohttp_client::Error) -> zodl_ohttp_client::Error {
-    LAST_FAILURE_KIND.set(match &error {
+    let mut outcome = LAST_DECODE_OUTCOME.get();
+    outcome.kind = match &error {
         zodl_ohttp_client::Error::Truncated => 2,
         zodl_ohttp_client::Error::KeyConfig(_) | zodl_ohttp_client::Error::Seal(_) => 3,
         _ => 4,
-    });
+    };
+    LAST_DECODE_OUTCOME.set(outcome);
     error
 }
 
@@ -373,7 +399,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
     // SAFETY: the pointer is the only state the closure reads. A panic leaves nothing to observe
     // through it: the opener is taken out of its box before anything else can fail, and is
     // dropped (and zeroized) with the closure's frame on every path.
-    LAST_FAILURE_KIND.set(5);
+    reset_decode_outcome();
     let opener = AssertUnwindSafe(opener);
 
     let res = catch_panic(|| {
@@ -406,7 +432,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
         let outcome = match outer_outcome {
             OuterOutcome::Sealed => {
                 // Decode the chunked response
-                let mut decoder = inner.decoder();
+                let mut decoder = OhttpStreamDecoder::new(inner.decoder());
                 let mut events = decoder.push(sealed).map_err(classified_decode)?;
                 events.extend(decoder.finish().map_err(classified_decode)?);
 
@@ -549,6 +575,108 @@ pub unsafe extern "C" fn zcashlc_ohttp_opener_free(ptr: *mut OhttpOpener) {
 /// [`zcashlc_ohttp_stream_decoder_free`]. The secret it holds is zeroized when it is dropped.
 pub struct OhttpStreamDecoder {
     inner: ChunkedResponseDecoder,
+    framing: ResponseFraming,
+    outcome: FfiOhttpDecodeOutcome,
+}
+
+/// Only locates wire chunk boundaries. The existing decoder owns all validation,
+/// authentication and Binary HTTP parsing; no additional response buffer is retained.
+struct ResponseFraming {
+    phase: u8,
+    remaining: u64,
+    length: u64,
+}
+
+impl Default for ResponseFraming {
+    fn default() -> Self {
+        Self {
+            phase: 0,
+            remaining: 16,
+            length: 0,
+        }
+    }
+}
+
+impl ResponseFraming {
+    fn span(&mut self, input: &[u8]) -> usize {
+        match self.phase {
+            0 | 2 => {
+                let count = self.remaining.min(input.len() as u64) as usize;
+                self.remaining -= count as u64;
+                if self.remaining == 0 {
+                    self.phase = 1;
+                }
+                count
+            }
+            1 => {
+                let count;
+                if self.remaining == 0 {
+                    self.remaining = (1u64 << (input[0] >> 6)) - 1;
+                    self.length = u64::from(input[0] & 63);
+                    count = 1;
+                } else {
+                    count = self.remaining.min(input.len() as u64) as usize;
+                    for byte in &input[..count] {
+                        self.length = (self.length << 8) | u64::from(*byte);
+                    }
+                    self.remaining -= count as u64;
+                }
+                if self.remaining == 0 {
+                    self.phase = if self.length == 0 { 3 } else { 2 };
+                    self.remaining = self.length;
+                }
+                count
+            }
+            _ => input.len(),
+        }
+    }
+}
+
+impl OhttpStreamDecoder {
+    fn new(inner: ChunkedResponseDecoder) -> Self {
+        Self {
+            inner,
+            framing: ResponseFraming::default(),
+            outcome: FfiOhttpDecodeOutcome::default(),
+        }
+    }
+
+    fn remember(&mut self, events: &[ResponseEvent]) {
+        for event in events {
+            if let ResponseEvent::Head { status, headers } = event {
+                self.outcome.http_status = *status;
+                self.outcome.retry_not_before_ns = crate::retry_not_before_ns(
+                    *status,
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                        .map(|(_, value)| value.as_str()),
+                    slipstream_core::transport_health::monotonic_time_nanoseconds(),
+                );
+            }
+        }
+        LAST_DECODE_OUTCOME.set(self.outcome);
+    }
+
+    fn push(&mut self, mut input: &[u8]) -> Result<Vec<ResponseEvent>, zodl_ohttp_client::Error> {
+        LAST_DECODE_OUTCOME.set(self.outcome);
+        let mut events = Vec::new();
+        while !input.is_empty() {
+            let count = self.framing.span(input);
+            let decoded = self.inner.push(&input[..count])?;
+            self.remember(&decoded);
+            events.extend(decoded);
+            input = &input[count..];
+        }
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ResponseEvent>, zodl_ohttp_client::Error> {
+        LAST_DECODE_OUTCOME.set(self.outcome);
+        let events = self.inner.finish()?;
+        self.remember(&events);
+        Ok(events)
+    }
 }
 
 /// What the bytes given to [`zcashlc_ohttp_stream_push`] or [`zcashlc_ohttp_stream_finish`]
@@ -687,9 +815,9 @@ pub unsafe extern "C" fn zcashlc_ohttp_stream_decoder(
             return Err(anyhow!("missing OHTTP opener"));
         }
         let OhttpOpener { inner } = *unsafe { Box::from_raw(opener) };
-        Ok(Box::into_raw(Box::new(OhttpStreamDecoder {
-            inner: inner.decoder(),
-        })))
+        Ok(Box::into_raw(Box::new(OhttpStreamDecoder::new(
+            inner.decoder(),
+        ))))
     });
     unwrap_exc_or_null(res)
 }
@@ -712,14 +840,14 @@ pub unsafe extern "C" fn zcashlc_ohttp_stream_push(
     bytes_ptr: *const u8,
     bytes_len: usize,
 ) -> *mut OhttpStreamEvents {
-    LAST_FAILURE_KIND.set(5);
+    reset_decode_outcome();
     let decoder = AssertUnwindSafe(decoder);
 
     let res = catch_panic(|| {
         let decoder =
             unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
         let input = unsafe { bytes(bytes_ptr, bytes_len)? };
-        stream_events(decoder.inner.push(input).map_err(classified_decode)?)
+        stream_events(decoder.push(input).map_err(classified_decode)?)
     });
     unwrap_exc_or_null(res)
 }
@@ -738,13 +866,13 @@ pub unsafe extern "C" fn zcashlc_ohttp_stream_push(
 pub unsafe extern "C" fn zcashlc_ohttp_stream_finish(
     decoder: *mut OhttpStreamDecoder,
 ) -> *mut OhttpStreamEvents {
-    LAST_FAILURE_KIND.set(5);
+    reset_decode_outcome();
     let decoder = AssertUnwindSafe(decoder);
 
     let res = catch_panic(|| {
         let decoder =
             unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
-        stream_events(decoder.inner.finish().map_err(classified_decode)?)
+        stream_events(decoder.finish().map_err(classified_decode)?)
     });
     unwrap_exc_or_null(res)
 }
@@ -1505,6 +1633,150 @@ mod tests {
         zcashlc_clear_last_error();
         unsafe { zcashlc_ohttp_free_bytes(ptr::null_mut(), 0) };
     }
+    // Build a cryptographically authenticated non-final response chunk from the real request.
+    // The final chunk is deliberately absent; the business decoder must still reject the response.
+    fn authenticated_rejection(status: u16) -> (*mut OhttpOpener, Vec<u8>) {
+        use aes_gcm::{
+            Aes128Gcm, Nonce,
+            aead::{Aead, KeyInit},
+        };
+        use hpke::{Deserializable, Kem, Serializable};
+        type KemType = hpke::kem::X25519HkdfSha256;
+        let (private, public) = KemType::derive_keypair(&[42; 32]);
+        let mut key = [0; 33];
+        key[0] = 7;
+        key[1..].copy_from_slice(&public.to_bytes());
+        let (opener, request) = take_opener(seal(b"/rejected", &key));
+        let enc = <KemType as Kem>::EncappedKey::from_bytes(&request[7..39]).unwrap();
+        let mut info = b"message/bhttp chunked request\0".to_vec();
+        info.extend_from_slice(&request[..7]);
+        let context =
+            hpke::setup_receiver::<hpke::aead::AesGcm128, hpke::kdf::HkdfSha256, KemType>(
+                &hpke::OpModeR::Base,
+                &private,
+                &enc,
+                &info,
+            )
+            .unwrap();
+        let mut secret = [0; 16];
+        context
+            .export(b"message/bhttp chunked response", &mut secret)
+            .unwrap();
+        let nonce = [3; 16];
+        let mut salt = request[7..39].to_vec();
+        salt.extend_from_slice(&nonce);
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), &secret);
+        let mut key = [0; 16];
+        let mut iv = [0; 12];
+        hkdf.expand(b"key", &mut key).unwrap();
+        hkdf.expand(b"nonce", &mut iv).unwrap();
+        // Indeterminate-length BHTTP response, final status, Retry-After header, end of headers.
+        let mut head = vec![3, 0x40 | ((status >> 8) as u8), status as u8, 11];
+        head.extend_from_slice(b"retry-after");
+        head.extend_from_slice(&[3, b'1', b'2', b'0']);
+        if status == 429 {
+            // Exercise a two-byte wire length, including splits inside its prefix and payload.
+            head.push(7);
+            head.extend_from_slice(b"padding");
+            head.extend_from_slice(&[0x40, 70]);
+            head.extend_from_slice(&[b'x'; 70]);
+        }
+        head.push(0);
+        let sealed = Aes128Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(Nonce::from_slice(&iv), head.as_slice())
+            .unwrap();
+        assert!(sealed.len() < 16384);
+        let mut response = nonce.to_vec();
+        if sealed.len() >= 64 {
+            response.push(0x40 | (sealed.len() >> 8) as u8);
+        }
+        response.push(sealed.len() as u8);
+        response.extend_from_slice(&sealed);
+        (opener, response)
+    }
+
+    #[test]
+    fn authenticated_unary_rejection_survives_missing_final_chunk() {
+        for status in [403, 429, 503] {
+            let (opener, wire) = authenticated_rejection(status);
+            let before = slipstream_core::transport_health::monotonic_time_nanoseconds();
+            let result = unsafe {
+                zcashlc_ohttp_complete(IOS, opener, 200, ptr::null(), wire.as_ptr(), wire.len(), 0)
+            };
+            assert!(result.is_null());
+            assert!(
+                last_error_message()
+                    .starts_with("the gateway's answer ended before its final chunk")
+            );
+            let outcome = zcashlc_ohttp_last_decode_outcome();
+            assert_eq!(outcome.kind, 2);
+            assert_eq!(outcome.http_status, status);
+            if status == 429 {
+                assert!(outcome.retry_not_before_ns >= before + 120_000_000_000);
+                assert!(
+                    outcome.retry_not_before_ns
+                        <= slipstream_core::transport_health::monotonic_time_nanoseconds()
+                            + 120_000_000_000
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_stream_rejection_survives_later_push_and_finish_failure() {
+        for finish in [false, true] {
+            let (opener, wire) = authenticated_rejection(429);
+            let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+            let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), wire.len()) };
+            assert!(!events.is_null());
+            assert_eq!(unsafe { (*events).status }, 429);
+            unsafe { zcashlc_free_ohttp_stream_events(events) };
+            let head = zcashlc_ohttp_last_decode_outcome();
+            assert_eq!(head.http_status, 429);
+            let failed = if finish {
+                unsafe { zcashlc_ohttp_stream_finish(decoder) }
+            } else {
+                let invalid = [17u8; 18];
+                unsafe { zcashlc_ohttp_stream_push(decoder, invalid.as_ptr(), invalid.len()) }
+            };
+            assert!(failed.is_null());
+            let outcome = zcashlc_ohttp_last_decode_outcome();
+            assert_eq!(outcome.http_status, 429);
+            assert_eq!(outcome.retry_not_before_ns, head.retry_not_before_ns);
+            unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+        }
+    }
+
+    #[test]
+    fn authenticated_metadata_is_equivalent_for_split_and_combined_chunks() {
+        for split in [0, 1, 7, 16, 17, 35] {
+            let (opener, mut wire) = authenticated_rejection(429);
+            wire.extend_from_slice(&[17u8; 18]);
+            let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+            let first = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), split) };
+            assert!(!first.is_null());
+            unsafe { zcashlc_free_ohttp_stream_events(first) };
+            let failed = unsafe {
+                zcashlc_ohttp_stream_push(decoder, wire[split..].as_ptr(), wire.len() - split)
+            };
+            assert!(failed.is_null());
+            let outcome = zcashlc_ohttp_last_decode_outcome();
+            assert_eq!(outcome.http_status, 429);
+            assert_eq!(outcome.kind, 4);
+            assert!(outcome.retry_not_before_ns > 0);
+            unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+        }
+        for wire in [vec![0; 8], [vec![0; 16], vec![255; 8]].concat()] {
+            let (opener, _) = authenticated_rejection(403);
+            let result = unsafe {
+                zcashlc_ohttp_complete(IOS, opener, 200, ptr::null(), wire.as_ptr(), wire.len(), 0)
+            };
+            assert!(result.is_null());
+            assert_eq!(zcashlc_ohttp_last_decode_outcome().http_status, 0);
+        }
+    }
+
     #[test]
     fn decode_failure_kind_does_not_leak_across_calls_or_threads() {
         let _ = classified_decode(zodl_ohttp_client::Error::Truncated);
@@ -1517,6 +1789,13 @@ mod tests {
         );
         assert!(unsafe { zcashlc_ohttp_stream_finish(std::ptr::null_mut()) }.is_null());
         assert_eq!(zcashlc_ohttp_last_failure_kind(), 5);
+        assert_eq!(zcashlc_ohttp_last_decode_outcome().http_status, 0);
+        assert_eq!(
+            std::thread::spawn(|| zcashlc_ohttp_last_decode_outcome().http_status)
+                .join()
+                .unwrap(),
+            0
+        );
         let _ = classified_decode(zodl_ohttp_client::Error::TooLarge { max: 1 });
         assert_eq!(zcashlc_ohttp_last_failure_kind(), 4);
         let _ = classified_decode(zodl_ohttp_client::Error::KeyConfig("invalid".into()));

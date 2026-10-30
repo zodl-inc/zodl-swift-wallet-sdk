@@ -42,6 +42,12 @@ final class OHTTPHealthTraffic: Sendable {
 
     func classify(_ outcome: OHTTPHealthOutcome) {
         state.withLock {
+            // A newly observed explicit pause also applies after a rejected fallback source.
+            if case .rateLimited = outcome {
+                if case .rateLimited = $0.failure { return }
+                $0.failure = outcome
+                return
+            }
             switch $0.failure {
             case .backendUnavailable, .policyRejected, .configurationFailure, .responseRejected, .rateLimited:
                 return
@@ -60,9 +66,28 @@ final class OHTTPHealthTraffic: Sendable {
         }
     }
 
+    func nativeFailure(_ native: FfiOhttpDecodeOutcome) {
+        if !decodedHead(native) { nativeFailure(native.kind) }
+    }
+
+    @discardableResult
+    func decodedHead(_ native: FfiOhttpDecodeOutcome) -> Bool {
+        if native.http_status != 0 { ticket.recordRouteUsable(stage: .responseHead) }
+        switch native.http_status {
+        case 429: classify(.rateLimited(retryNotBefore: native.retry_not_before_ns))
+        case 400, 401, 403, 404, 405, 409, 413, 415, 422, 426, 500...599:
+            classify(Self.statusOutcome(Int(native.http_status)))
+        default: return false
+        }
+        return true
+    }
+
     func received(_ response: OHTTPResponse, stage: OHTTPHealthStage) {
         ticket.recordRouteUsable(stage: stage)
-        let outcome = Self.responseOutcome(response)
+        var outcome = Self.responseOutcome(response)
+        if case .rateLimited = outcome, case .rateLimited(let originalDeadline) = failure {
+            outcome = .rateLimited(retryNotBefore: originalDeadline)
+        }
         if outcome != .usable { classify(outcome) }
         ticket.record(outcome: outcome, stage: stage)
     }
@@ -71,9 +96,16 @@ final class OHTTPHealthTraffic: Sendable {
         if status == 429 {
             let seconds = OHTTPTransport.retryAfter(retryAfter) ?? OHTTPTransport.defaultRateLimitPause
             classify(.rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(seconds * 1_000_000_000)))
-        } else if [401, 403, 413, 426].contains(status) {
+        } else if [400, 401, 403, 404, 405, 409, 413, 415, 422, 426].contains(status) {
             classify(Self.statusOutcome(status))
         }
+    }
+
+    func outerResponse(_ native: FfiTorHttpOutcome) {
+        let status = Int(native.http_status)
+        guard (400..<500).contains(status) else { return }
+        if case .inconclusive = Self.statusOutcome(status) { return }
+        classify(OHTTPNativeHTTPFailure(native).outcome)
     }
 
     static func scope(_ authority: String) -> OHTTPHealthScope {
@@ -118,6 +150,10 @@ final class OHTTPHealthTraffic: Sendable {
     }
 
     static func responseOutcome(_ response: OHTTPResponse) -> OHTTPHealthOutcome {
+        if response.status == 429 {
+            let delay = OHTTPTransport.retryAfter(response.field("retry-after")) ?? OHTTPTransport.defaultRateLimitPause
+            return .rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(delay * 1_000_000_000))
+        }
         let outcome = statusOutcome(response.status)
         guard outcome == .usable, let status = response.field("grpc-status"), status != "0" else { return outcome }
         switch Int(status) {
@@ -139,7 +175,7 @@ struct OHTTPNativeHTTPFailure: Error {
         case 401, 403, 426: outcome = .policyRejected
         case 400, 404, 405, 409, 413, 415, 422: outcome = .responseRejected
         case 429:
-            outcome = .rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(native.retry_after_seconds) * 1_000_000_000)
+            outcome = .rateLimited(retryNotBefore: native.retry_not_before_ns)
         default:
             switch native.kind {
             case 1, 2: outcome = .transportUnavailable

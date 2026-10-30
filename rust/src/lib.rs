@@ -4755,7 +4755,7 @@ unsafe fn tor_http_post_bounded_impl(
                             })
                         },
                         http_body_util::Full::new(body_data),
-                        |body| guard.collect(body),
+                        |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),
                     )
@@ -4766,7 +4766,9 @@ unsafe fn tor_http_post_bounded_impl(
         ffi::HttpResponseBytes::from_rust(response)
     });
     if res.is_ok() {
-        set_tor_http_outcome(FfiTorHttpOutcome::default());
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
     }
     unwrap_exc_or_null(res)
 }
@@ -4848,7 +4850,9 @@ unsafe fn tor_http_get_impl(
         ffi::HttpResponseBytes::from_rust(response)
     });
     if res.is_ok() {
-        set_tor_http_outcome(FfiTorHttpOutcome::default());
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
     }
     unwrap_exc_or_null(res)
 }
@@ -4861,12 +4865,12 @@ unsafe fn tor_http_get_impl(
 pub struct FfiTorHttpOutcome {
     pub kind: u32,
     pub http_status: u16,
-    pub retry_after_seconds: u32,
+    pub retry_not_before_ns: u64,
 }
 
 thread_local! {
     static TOR_HTTP_OUTCOME: std::cell::Cell<FfiTorHttpOutcome> = const {
-        std::cell::Cell::new(FfiTorHttpOutcome { kind: 5, http_status: 0, retry_after_seconds: 0 })
+        std::cell::Cell::new(FfiTorHttpOutcome { kind: 5, http_status: 0, retry_not_before_ns: 0 })
     };
 }
 
@@ -4895,7 +4899,33 @@ fn tor_http_error_outcome(
     FfiTorHttpOutcome {
         kind,
         http_status: status,
-        retry_after_seconds: 30,
+        retry_not_before_ns: 0,
+    }
+}
+
+fn retry_not_before_ns(status: u16, value: Option<&str>, observed_at_ns: u64) -> u64 {
+    if status != 429 {
+        return 0;
+    }
+    let seconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(30)
+        .min(120);
+    observed_at_ns.saturating_add(seconds.saturating_mul(1_000_000_000))
+}
+
+fn http_head_outcome(parts: &http::response::Parts, observed_at_ns: u64) -> FfiTorHttpOutcome {
+    FfiTorHttpOutcome {
+        kind: 0,
+        http_status: parts.status.as_u16(),
+        retry_not_before_ns: retry_not_before_ns(
+            parts.status.as_u16(),
+            parts
+                .headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            observed_at_ns,
+        ),
     }
 }
 
@@ -4903,7 +4933,12 @@ fn note_tor_http_error(
     error: zcash_client_backend::tor::Error,
     status: u16,
 ) -> zcash_client_backend::tor::Error {
-    set_tor_http_outcome(tor_http_error_outcome(&error, status));
+    let mut outcome = tor_http_error_outcome(&error, status);
+    let previous = zcashlc_tor_http_last_outcome();
+    if previous.http_status == status {
+        outcome.retry_not_before_ns = previous.retry_not_before_ns;
+    }
+    set_tor_http_outcome(outcome);
     error
 }
 
@@ -4933,19 +4968,17 @@ where
             max_bytes,
             retry_filter,
         };
+        let head = guard.status.clone();
         let response = request(guard).await.map_err(|error| {
             outcome.kind = tor_http_error_outcome(&error, 0).kind;
             error
         })?;
-        outcome.http_status = response.status().as_u16();
-        outcome.retry_after_seconds = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(30)
-            .min(120);
         let (parts, body) = response.into_parts();
+        outcome = http_head_outcome(
+            &parts,
+            head.observed_at_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let limit = if parts.status.is_success() {
             max_bytes
         } else {
@@ -4955,7 +4988,9 @@ where
             TorHttpGetBody::Incoming(body) => collect_http_response_body_limited(body, limit)
                 .await
                 .inspect_err(|_| outcome.kind = 2)?,
-            TorHttpGetBody::Collected(body) => body,
+            TorHttpGetBody::Legacy { .. } => {
+                unreachable!("classified calls use the explicit native deadline")
+            }
         };
         if body.is_none() && parts.status.is_success() {
             outcome.kind = 4;
@@ -5168,18 +5203,25 @@ const TOR_HTTP_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// collector the body only, but calls the retry filter with every response's status first, the
 /// final one included, so the collector can pick its bound from the status through this.
 #[derive(Default)]
-struct SeenStatus(std::sync::atomic::AtomicU16);
+struct SeenStatus {
+    code: std::sync::atomic::AtomicU16,
+    observed_at_ns: std::sync::atomic::AtomicU64,
+}
 
 impl SeenStatus {
     fn see(&self, res: &Result<http::StatusCode, &zcash_client_backend::tor::Error>) {
         let code = res.as_ref().map_or(0, |status| status.as_u16());
-        self.0.store(code, std::sync::atomic::Ordering::Relaxed);
+        self.code.store(code, std::sync::atomic::Ordering::Relaxed);
+        self.observed_at_ns.store(
+            slipstream_core::transport_health::monotonic_time_nanoseconds(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// `max_bytes` for a 2xx answer (or when no status was seen), the fixed
     /// [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] for any other status.
     fn body_limit(&self, max_bytes: usize) -> usize {
-        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+        match self.code.load(std::sync::atomic::Ordering::Relaxed) {
             0 | 200..=299 => max_bytes,
             _ => TOR_HTTP_MAX_ERROR_BODY_BYTES,
         }
@@ -5191,7 +5233,9 @@ impl SeenStatus {
 ///
 /// The crate's `http_request` calls `retry_filter` with every response's status, the final one
 /// included, and only then hands that response's body to `parse_response`: [`Self::filter`]
-/// records the status, [`Self::collect`] reads the body up to the bound the status selects.
+/// records the original head time. The parser returns the body immediately; collection
+/// below keeps that head metadata and the original body deadline. Backend retries finish
+/// before parse_response, so relocating body collection cannot change dispatch counts.
 struct TorHttpBodyGuard<R> {
     status: std::sync::Arc<SeenStatus>,
     max_bytes: usize,
@@ -5213,24 +5257,15 @@ where
         self.status.see(&res);
         (self.retry_filter)(res)
     }
-
-    /// The crate's `parse_response`: reads the body up to `max_bytes` for a 2xx answer, up to
-    /// [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] for any other, as [`Self::filter`] recorded it.
-    fn collect<B>(
-        &self,
-        body: B,
-    ) -> impl std::future::Future<Output = Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>>
-    where
-        B: BodyExt<Data = bytes::Bytes> + Unpin,
-        HttpError: From<B::Error>,
-    {
-        collect_http_response_body_limited(body, self.status.body_limit(self.max_bytes))
-    }
 }
 
 enum TorHttpGetBody<B> {
     Incoming(B),
-    Collected(Option<bytes::Bytes>),
+    Legacy {
+        body: B,
+        deadline: tokio::time::Instant,
+        limit: usize,
+    },
 }
 
 impl<R> TorHttpBodyGuard<R>
@@ -5253,7 +5288,13 @@ where
             // a body whose caller supplied a longer total deadline.
             Ok(TorHttpGetBody::Incoming(body))
         } else {
-            self.collect(body).await.map(TorHttpGetBody::Collected)
+            // Preserve the backend's 60s response-body deadline from parser admission.
+            // Returning the unread body keeps authenticated headers available on body failure.
+            Ok(TorHttpGetBody::Legacy {
+                body,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                limit: self.status.body_limit(self.max_bytes),
+            })
         }
     }
 }
@@ -5285,33 +5326,39 @@ where
         let (parts, body) = request(guard, timeout_ms.is_some())
             .await
             .map_err(|error| {
-                note_tor_http_error(error, status.0.load(std::sync::atomic::Ordering::Relaxed))
+                note_tor_http_error(
+                    error,
+                    status.code.load(std::sync::atomic::Ordering::Relaxed),
+                )
             })?
             .into_parts();
-        set_tor_http_outcome(FfiTorHttpOutcome {
-            kind: 0,
-            http_status: parts.status.as_u16(),
-            retry_after_seconds: parts
-                .headers
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30)
-                .min(120),
-        });
-        let body = match body {
-            TorHttpGetBody::Collected(body) => body,
-            TorHttpGetBody::Incoming(body) => {
-                let limit = if parts.status.is_success() {
-                    max_bytes
-                } else {
-                    TOR_HTTP_MAX_ERROR_BODY_BYTES
-                };
-                collect_http_response_body_limited(body, limit)
-                    .await
-                    .map_err(|error| note_tor_http_error(error, parts.status.as_u16()))?
-            }
+        set_tor_http_outcome(http_head_outcome(
+            &parts,
+            status
+                .observed_at_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
+        let limit = if parts.status.is_success() {
+            max_bytes
+        } else {
+            TOR_HTTP_MAX_ERROR_BODY_BYTES
         };
+        let collected = match body {
+            TorHttpGetBody::Incoming(body) => collect_http_response_body_limited(body, limit).await,
+            TorHttpGetBody::Legacy {
+                body,
+                deadline,
+                limit,
+            } => tokio::time::timeout_at(deadline, collect_http_response_body_limited(body, limit))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HttpError::Timeout(
+                        zcash_client_backend::tor::http::TimeoutPhase::ResponseBody,
+                    )
+                    .into())
+                }),
+        };
+        let body = collected.map_err(|error| note_tor_http_error(error, parts.status.as_u16()))?;
         within_response_limit(http::Response::from_parts(parts, body))
     };
     let result = match timeout_ms {
@@ -5332,11 +5379,11 @@ where
 
 /// Runs one Tor HTTP request with the response-body guard shared by every `zcashlc_tor_http_*`
 /// call. `request` makes the call on `zcash_client_backend` with the guard it is given: it passes
-/// [`TorHttpBodyGuard::filter`] as the crate's `retry_filter` and [`TorHttpBodyGuard::collect`]
+/// [`TorHttpBodyGuard::filter`] as the crate's `retry_filter` and [`TorHttpBodyGuard::parse_get`]
 /// as its `parse_response`, and returns the crate's response. A body that ran past its bound
 /// ([`collect_http_response_body_limited`] returned `None`) comes back as an empty body for a
 /// non-2xx answer and as an error for a 2xx one ([`within_response_limit`]).
-async fn tor_http_with_body_guard<R, Fut>(
+async fn tor_http_with_body_guard<R, Fut, B>(
     max_bytes: usize,
     retry_filter: R,
     request: impl FnOnce(TorHttpBodyGuard<R>) -> Fut,
@@ -5346,19 +5393,12 @@ where
         Result<http::StatusCode, &zcash_client_backend::tor::Error>,
     ) -> Option<zcash_client_backend::tor::http::Retry>,
     Fut: std::future::Future<
-            Output = Result<http::Response<Option<bytes::Bytes>>, zcash_client_backend::tor::Error>,
+            Output = Result<http::Response<TorHttpGetBody<B>>, zcash_client_backend::tor::Error>,
         >,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
 {
-    let guard = TorHttpBodyGuard {
-        status: std::sync::Arc::new(SeenStatus::default()),
-        max_bytes,
-        retry_filter,
-    };
-    let status = guard.status.clone();
-    let response = request(guard).await.map_err(|error| {
-        note_tor_http_error(error, status.0.load(std::sync::atomic::Ordering::Relaxed))
-    })?;
-    within_response_limit(response)
+    tor_http_get_response(max_bytes, None, retry_filter, |guard, _| request(guard)).await
 }
 
 /// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
@@ -5414,7 +5454,7 @@ fn within_response_limit(
             set_tor_http_outcome(FfiTorHttpOutcome {
                 kind: 4,
                 http_status: parts.status.as_u16(),
-                retry_after_seconds: 0,
+                retry_not_before_ns: 0,
             });
             anyhow::bail!("Tor HTTP response body exceeds {TOR_HTTP_MAX_RESPONSE_BYTES} bytes");
         }
@@ -5512,7 +5552,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                             })
                         },
                         http_body_util::Full::new(body_data),
-                        |body| guard.collect(body),
+                        |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),
                     )
@@ -5523,7 +5563,9 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
         ffi::HttpResponseBytes::from_rust(response)
     });
     if res.is_ok() {
-        set_tor_http_outcome(FfiTorHttpOutcome::default());
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
     }
     unwrap_exc_or_null(res)
 }
@@ -5533,6 +5575,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
 /// Obtained from [`zcashlc_tor_http_post_stream`] and freed with
 /// [`zcashlc_free_tor_http_stream`], which closes the stream.
 pub struct TorHttpStream {
+    retry_not_before_ns: u64,
     runtime: tor_rtcompat::PreferredRuntime,
     status: u16,
     headers: http::HeaderMap,
@@ -5611,34 +5654,37 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
     });
     let tor_runtime = AssertUnwindSafe(tor_runtime);
 
-    let res = catch_panic(|| {
-        let tor_runtime =
-            unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+    let res =
+        catch_panic(|| {
+            let tor_runtime = unsafe { tor_runtime.as_mut() }
+                .ok_or_else(|| anyhow!("A Tor runtime is required"))?;
 
-        let url = unsafe { CStr::from_ptr(url).to_str()? }
-            .try_into()
-            .map_err(|e| anyhow!("Invalid URL: {e}"))?;
+            let url = unsafe { CStr::from_ptr(url).to_str()? }
+                .try_into()
+                .map_err(|e| anyhow!("Invalid URL: {e}"))?;
 
-        let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
-            .iter()
-            .map(|header| {
-                anyhow::Ok((
-                    unsafe { CStr::from_ptr(header.name) }.to_str()?,
-                    unsafe { CStr::from_ptr(header.value) }.to_str()?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
+                .iter()
+                .map(|header| {
+                    anyhow::Ok((
+                        unsafe { CStr::from_ptr(header.name) }.to_str()?,
+                        unsafe { CStr::from_ptr(header.value) }.to_str()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-        let body_data = if body_len == 0 {
-            bytes::Bytes::new()
-        } else {
-            bytes::Bytes::copy_from_slice(unsafe { slice::from_raw_parts(body, body_len) })
-        };
+            let body_data = if body_len == 0 {
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::copy_from_slice(unsafe { slice::from_raw_parts(body, body_len) })
+            };
 
-        let response = tor_runtime
-            .runtime()
-            .block_on(async {
+            let head = SeenStatus::default();
+            let response =
                 tor_runtime
+                    .runtime()
+                    .block_on(async {
+                        tor_runtime
                     .client()
                     .http_post(
                         url,
@@ -5650,24 +5696,37 @@ pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
                         http_body_util::Full::new(body_data),
                         |body| async move { Ok(body.map_err(HttpError::from).boxed_unsync()) },
                         TOR_HTTP_UNSENT_RETRIES,
-                        retry_if_unsent,
+                        |result| { head.see(&result); retry_if_unsent(result) },
                     )
                     .await
-            })
-            .map_err(|error| note_tor_http_error(error, 0))?;
+                    })
+                    .map_err(|error| note_tor_http_error(error, 0))?;
 
-        let (parts, body) = response.into_parts();
-        Ok(Box::into_raw(Box::new(TorHttpStream {
-            runtime: tor_runtime.runtime().clone(),
-            status: parts.status.as_u16(),
-            headers: parts.headers,
-            body,
-            read: 0,
-            max_bytes,
-        })))
-    });
+            let (parts, body) = response.into_parts();
+            set_tor_http_outcome(http_head_outcome(
+                &parts,
+                head.observed_at_ns
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            Ok(Box::into_raw(Box::new(TorHttpStream {
+                retry_not_before_ns: http_head_outcome(
+                    &parts,
+                    head.observed_at_ns
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .retry_not_before_ns,
+                runtime: tor_runtime.runtime().clone(),
+                status: parts.status.as_u16(),
+                headers: parts.headers,
+                body,
+                read: 0,
+                max_bytes,
+            })))
+        });
     if res.is_ok() {
-        set_tor_http_outcome(FfiTorHttpOutcome::default());
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
     }
     unwrap_exc_or_null(res)
 }
@@ -5749,6 +5808,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
             unsafe { state.as_mut() }.ok_or_else(|| anyhow!("A stream state is required"))?;
 
         let TorHttpStream {
+            retry_not_before_ns,
             runtime,
             status,
             body,
@@ -5785,7 +5845,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                     set_tor_http_outcome(FfiTorHttpOutcome {
                         kind: 2,
                         http_status: *status,
-                        retry_after_seconds: 30,
+                        retry_not_before_ns: *retry_not_before_ns,
                     });
                     error
                 })?;
@@ -5798,7 +5858,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
                             set_tor_http_outcome(FfiTorHttpOutcome {
                                 kind: 4,
                                 http_status: *status,
-                                retry_after_seconds: 0,
+                                retry_not_before_ns: *retry_not_before_ns,
                             });
                             return Err(anyhow!(
                                 "Tor HTTP response body exceeds {max_bytes} bytes"
@@ -5829,7 +5889,9 @@ pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
         }
     });
     if res.is_ok() {
-        set_tor_http_outcome(FfiTorHttpOutcome::default());
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
     }
     unwrap_exc_or_null(res)
 }
@@ -11263,6 +11325,7 @@ mod tor_http_stream_tests {
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
 
         let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
             runtime,
             status: 429,
             headers: http::HeaderMap::new(),
@@ -11326,6 +11389,7 @@ mod tor_http_stream_tests {
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
 
         let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
             runtime,
             status: 503,
             headers: http::HeaderMap::new(),
@@ -11384,6 +11448,7 @@ mod tor_http_stream_tests {
         .boxed_unsync();
 
         Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
             runtime: tor_rtcompat::PreferredRuntime::create().unwrap(),
             status,
             headers: http::HeaderMap::new(),
@@ -11535,6 +11600,7 @@ mod tor_http_stream_tests {
 
         let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
         let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
             runtime,
             status: 200,
             headers: http::HeaderMap::new(),

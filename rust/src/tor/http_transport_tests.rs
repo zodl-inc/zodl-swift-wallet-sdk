@@ -881,7 +881,7 @@ struct GuardedCall {
 }
 
 /// One GET through `tor_http_with_body_guard` with the test's local hyper client, the crate's
-/// call order replayed: `guard.filter` with the final status, then `guard.collect` with the body.
+/// call order replayed: `guard.filter` with the final status, then `guard.parse_get` with the body.
 async fn guarded_local_get(addr: SocketAddr, max_bytes: usize) -> GuardedCall {
     let (mut sender, driver) = connect_client(addr).await;
     let consumed = Arc::new(AtomicUsize::new(0));
@@ -908,7 +908,7 @@ async fn guarded_local_get(addr: SocketAddr, max_bytes: usize) -> GuardedCall {
                     }
                     frame
                 });
-                let body = guard.collect(body).await?;
+                let body = guard.parse_get(body, false).await?;
                 Ok(http::Response::from_parts(parts, body))
             },
         ),
@@ -1218,4 +1218,23 @@ async fn explicit_get_preserves_response_size_and_status_guards() {
         assert_eq!(response.body().len(), expected_len);
         assert!(outcome.client_eof);
     }
+}
+
+#[tokio::test]
+async fn legacy_429_preserves_actual_pause_after_a_real_body_error() {
+    let server = LocalHttpServer::spawn(ResponseScript {
+        headers: b"HTTP/1.1 429 Limited\r\nRetry-After: 120\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
+        body: b"x", delay_before_headers: Duration::ZERO, hold_open_after_body: false,
+    }).await;
+    let before = slipstream_core::transport_health::monotonic_time_nanoseconds();
+    let call = guarded_local_get(server.addr(), 1024).await;
+    assert!(call.response.is_err());
+    let outcome = crate::zcashlc_tor_http_last_outcome();
+    assert_eq!(outcome.http_status, 429);
+    assert!(outcome.retry_not_before_ns >= before + 120_000_000_000);
+    assert!(
+        outcome.retry_not_before_ns
+            <= slipstream_core::transport_health::monotonic_time_nanoseconds() + 120_000_000_000
+    );
+    server.join().await;
 }

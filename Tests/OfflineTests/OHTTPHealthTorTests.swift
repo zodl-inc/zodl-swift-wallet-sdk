@@ -13,7 +13,7 @@ final class OHTTPHealthTorTests: XCTestCase {
             XCTAssertGreaterThan(timeout, 0)
             XCTAssertLessThanOrEqual(timeout, 100)
             Thread.sleep(forTimeInterval: 0.03)
-            outcome?.pointee = FfiTorHttpOutcome(kind: 1, http_status: 403, retry_after_seconds: 0)
+            outcome?.pointee = FfiTorHttpOutcome(kind: 1, http_status: 403, retry_not_before_ns: 0)
             return nil
         }
         let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
@@ -35,7 +35,7 @@ final class OHTTPHealthTorTests: XCTestCase {
         var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: { runtimes.free($0) })
         native.postOnce = { _, _, _, _, _, _, _, _, outcome in
             Thread.sleep(forTimeInterval: 0.03)
-            outcome?.pointee = FfiTorHttpOutcome(kind: 1, http_status: 403, retry_after_seconds: 0)
+            outcome?.pointee = FfiTorHttpOutcome(kind: 1, http_status: 403, retry_not_before_ns: 0)
             return nil
         }
         let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
@@ -50,6 +50,35 @@ final class OHTTPHealthTorTests: XCTestCase {
             return .usable
         }
         XCTAssertEqual(result.outcome, .policyRejected)
+        try await client.close()
+    }
+
+    func testBufferedKeyRateLimitUsesNativeHeadDeadlineAfterBodyAndCleanup() async throws {
+        let runtimes = TorTestRuntimes()
+        let response = TorResponseFixture()
+        response.pointer.pointee.status = 429
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: { runtimes.free($0) })
+        native.classifiedGet = { _, _, _, _, _, _, _, outcome in
+            Thread.sleep(forTimeInterval: 0.02)
+            outcome?.pointee = FfiTorHttpOutcome(kind: 0, http_status: 429, retry_not_before_ns: 123)
+            return response.pointer
+        }
+        native.freeResponse = { _ in response.free() }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://buffered-pause.test/relay", viaTor: true)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            viaTor: true, keyCache: OHTTPKeyCache(), httpSender: { request, maxBytes in
+                try await client.httpRequestSentOnce(for: request, maxBytes: maxBytes, timeoutMilliseconds: 2000)
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { _ in
+            _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 2000)
+            return .usable
+        }
+        XCTAssertEqual(result.outcome, .rateLimited(retryNotBefore: 123))
         try await client.close()
     }
 

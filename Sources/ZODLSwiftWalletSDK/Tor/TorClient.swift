@@ -242,8 +242,10 @@ public actor TorClient {
             }
         }
 
+        let outcome = zcashlc_tor_http_last_outcome()
+        OHTTPHealthTraffic.current?.outerResponse(outcome)
         guard let responsePtr else {
-            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(zcashlc_tor_http_last_outcome()).outcome)
+            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(outcome).outcome)
             throw ZcashError.rustTorHttpRequest(
                 lastErrorMessage(fallback: "`TorClient.httpRequest` failed with unknown error")
             )
@@ -302,8 +304,10 @@ public actor TorClient {
             }
         }
 
+        let outcome = zcashlc_tor_http_last_outcome()
+        OHTTPHealthTraffic.current?.outerResponse(outcome)
         guard let streamPtr else {
-            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(zcashlc_tor_http_last_outcome()).outcome)
+            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(outcome).outcome)
             throw ZcashError.rustTorHttpRequest(
                 lastErrorMessage(fallback: "`TorClient.httpPostStream` failed with unknown error")
             )

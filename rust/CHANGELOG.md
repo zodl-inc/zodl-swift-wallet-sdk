@@ -8,6 +8,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OHTTP complete/push/finish retain authenticated inner rejection metadata across truncated or rejected
+  later chunks. `zcashlc_ohttp_last_decode_outcome` exposes the kind, HTTP status and absolute
+  CLOCK_MONOTONIC `retry_not_before_ns`; read it immediately on the same thread before cleanup.
+  `FfiTorHttpOutcome` uses the same absolute deadline field, preserving actual
+  Retry-After values through legacy and bounded HTTP body errors. Legacy buffered collection keeps
+  its existing 60-second deadline from parser admission; retry, dispatch and public errors are unchanged.
+
 - `zcashlc_tor_http_get_with_timeout` collects response bodies under the caller's total
   deadline after returning from the backend parser, so its default 60-second body timer
   cannot truncate a longer explicit budget. Untimed GET behavior, retry policy, body-size

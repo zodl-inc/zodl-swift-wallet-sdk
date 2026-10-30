@@ -3134,6 +3134,7 @@ dependencies = [
 name = "libzcashlc"
 version = "7.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "bech32",
@@ -3151,6 +3152,8 @@ dependencies = [
  "fs-mistrust",
  "futures",
  "hex",
+ "hkdf",
+ "hpke",
  "http",
  "http-body",
  "http-body-util",
@@ -3180,6 +3183,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sharded-slab",
  "shardtree 0.8.0",
  "tempfile",
