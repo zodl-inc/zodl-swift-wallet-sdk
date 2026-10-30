@@ -123,6 +123,7 @@ mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
 mod ohttp;
+mod ohttp_health;
 mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
@@ -11627,3 +11628,6 @@ mod ohttp_single_use_taddr_timing_tests {
         assert_schedule(NETWORK_ID_REGTEST, 4_500_000 + 5_000, 83);
     }
 }
+
+#[cfg(test)]
+mod ohttp_health_tests;

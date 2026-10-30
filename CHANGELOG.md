@@ -43,6 +43,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `OHTTPHealthSession(route:generation:)` adds retained OHTTP health snapshots and operation completion
+  updates without changing `Synchronizer`. Initialization throws when the native capability is unsupported.
+  Use `OHTTPHealthContext.withOperation` to correlate child work locally, then publish the business result
+  before awaiting `OHTTPHealthContext.complete(_:failed:)`. Completion includes its own bounded evidence;
+  a stalled update consumer applies backpressure after 64 completions. Drain updates without waiting for
+  UI interaction, and cancel the consumer or call `close()` when retiring the route. Compare evidence
+  using `OHTTPHealthClock` and reject historical or older-generation observations as fresh traffic.
+
 - `Synchronizer.httpStreamOverOHTTP(for:viaTor:)` sends an HTTP request through the OHTTP relay and
   gateway like `httpRequestOverOHTTP` and returns once the response head is in, with the body read
   as the gateway sends it (`OHTTPStreamedResponse`): a server-sent event stream arrives event by

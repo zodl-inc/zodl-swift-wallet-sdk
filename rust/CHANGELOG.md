@@ -25,6 +25,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_ohttp_health_api_version` reports additive health ABI version 1.
+  `zcashlc_ohttp_health_subscribe_v1` observes a configured route independently of the wallet engine;
+  its callback borrows at most 63 fixed-layout observations, which callers must copy before returning.
+  `zcashlc_ohttp_health_snapshot_v1` copies retained evidence without partial writes, returning the
+  required count when capacity is insufficient or `SIZE_MAX` for invalid arguments. Preserve historical
+  flags, source versions, original generations and monotonic timestamps when interpreting replay.
+  `zcashlc_ohttp_health_unsubscribe_v1` fences callbacks before releasing the caller-owned context.
+  Existing snapshot layouts and exported signatures are unchanged.
+
 - The Oblivious HTTP (RFC 9458) exchange of the iOS client, on the shared `zodl-ohttp-client` core
   (`ClientProfile::IOS`, profile `2`). Headers cross as one byte array (for each name and value a 4-byte
   big-endian length and the bytes), text arguments as bytes, and every failure returns null with the
