@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `SlipstreamSynchronizer` preserves restore progress across retries and stop/start on the same
+  engine instance, and limits rewind-related drops to reopened work. No caller changes are required.
+
 - `SlipstreamEngine.stop()` and `stopForWalletChange()` both request scan interruption between
   blocks; unfinished scan work is retried by the next session. Wallet-changing operations still
   use `stopForWalletChange()` to identify host intent and require a quiescent stop report before
