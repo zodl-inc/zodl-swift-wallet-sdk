@@ -190,9 +190,9 @@ public actor SlipstreamEngine {
     /// what the report says is whether the wallet file was PROVED free of the engine's own writers.
     /// A nil handle is quiescent by definition — there is no engine to be writing.
     ///
-    /// This is the plain stop, for backgrounding and shutdown: a scan call in progress runs to its
-    /// end, by default the end of its chunk, before the stop reaches it. Right before changing the
-    /// wallet, stop with `stopForWalletChange()` instead.
+    /// Both stop entry points request scan interruption between blocks; unfinished scan work is
+    /// retried by the next session. This entry point expresses backgrounding or shutdown intent.
+    /// Right before changing the wallet, use `stopForWalletChange()`.
     @discardableResult
     public func stop() async -> SlipstreamStopReport {
         await stopOffTheCooperativePool(zcashlc_slipstream_stop)
@@ -204,10 +204,10 @@ public actor SlipstreamEngine {
     /// report, on which `deleteAccount`/`importAccount`/`rewind`/`wipe` refuse to write when it is
     /// not quiescent.
     ///
-    /// `stop()` lets a scan call in progress run to the end of its chunk first, which can outlast
-    /// the ten-second budget when accounts are added in quick succession. This stop ends the scan at
-    /// its next block, writes nothing for the scan call it interrupted, and leaves those blocks for
-    /// the next pass to scan again. A nil handle is quiescent by definition, as for `stop()`.
+    /// Both entry points request interruption between blocks and leave unfinished scan work for
+    /// the next session to retry. This entry point identifies the host's intent to change the
+    /// wallet; the report must still prove quiescence before any mutation. A nil handle is
+    /// quiescent by definition, as for `stop()`.
     public func stopForWalletChange() async -> SlipstreamStopReport {
         await stopOffTheCooperativePool(zcashlc_slipstream_stop_for_wallet_change)
     }

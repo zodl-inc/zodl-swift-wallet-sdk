@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `SlipstreamEngine.stop()` and `stopForWalletChange()` both request scan interruption between
+  blocks; unfinished scan work is retried by the next session. Wallet-changing operations still
+  use `stopForWalletChange()` to identify host intent and require a quiescent stop report before
+  mutation. No caller changes are needed.
+
 - Sapling parameter downloads over Tor preserve on-demand runtime preparation and use one
   30-minute total GET budget across preparation, admission, retries, and body collection. A slow
   valid body can complete after the backend's default 60-second body timeout. Downloads still
