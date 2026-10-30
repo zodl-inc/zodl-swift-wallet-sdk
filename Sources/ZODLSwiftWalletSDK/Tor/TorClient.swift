@@ -243,6 +243,7 @@ public actor TorClient {
         }
 
         guard let responsePtr else {
+            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(zcashlc_tor_http_last_outcome()).outcome)
             throw ZcashError.rustTorHttpRequest(
                 lastErrorMessage(fallback: "`TorClient.httpRequest` failed with unknown error")
             )
@@ -302,6 +303,7 @@ public actor TorClient {
         }
 
         guard let streamPtr else {
+            OHTTPHealthTraffic.current?.classify(OHTTPNativeHTTPFailure(zcashlc_tor_http_last_outcome()).outcome)
             throw ZcashError.rustTorHttpRequest(
                 lastErrorMessage(fallback: "`TorClient.httpPostStream` failed with unknown error")
             )
@@ -757,6 +759,51 @@ extension FfiHttpResponseBytes {
                 count: Int(body_len)
             ),
             response: response
+        )
+    }
+}
+
+extension TorClient {
+    /// Internal OHTTP sender. Both key GET and single-send POST own the remaining probe
+    /// budget before actor admission and execute with a real native send/read deadline.
+    nonisolated func httpRequestSentOnce(
+        for request: URLRequest,
+        maxBytes: Int,
+        timeoutMilliseconds: UInt64
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let deadline = try TorHTTPRequestExecutor.deadline(timeoutMilliseconds: timeoutMilliseconds, now: DispatchTime.now().uptimeNanoseconds)
+        let context = TorHTTPRequestContext(deadlineUptime: deadline, preserveHTTPFailure: true)
+        return try await context.run { context in
+            let owned = try await self.prepareBoundedOHTTP(for: request, maxBytes: maxBytes, context: context)
+            return try await self.httpExecutor.execute(
+                deadlineUptime: context.deadlineUptime,
+                operation: { remaining in
+                    try context.checkCancellation()
+                    return try owned.run(timeoutMilliseconds: remaining)
+                },
+                dispose: { owned.dispose() },
+                preserveHTTPFailure: true
+            )
+        }
+    }
+
+    private func prepareBoundedOHTTP(for request: URLRequest, maxBytes: Int, context: TorHTTPRequestContext) throws -> TorHTTPGetRequest {
+        try context.checkCancellation()
+        let url = try TorHTTPGetRequest.validate(request, allowPost: true)
+        guard maxBytes >= 0 else { throw URLError(.badURL) }
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
+        try context.claimOwnership()
+        guard let isolated = httpGetNative.isolateRuntime(runtime) else {
+            throw ZcashError.rustTorIsolatedClient(lastErrorMessage(fallback: "OHTTP could not isolate runtime"))
+        }
+        return TorHTTPGetRequest(
+            runtime: isolated,
+            request: request,
+            url: url,
+            retryLimit: 0,
+            deadline: context.deadlineUptime,
+            native: httpGetNative,
+            bounded: maxBytes
         )
     }
 }

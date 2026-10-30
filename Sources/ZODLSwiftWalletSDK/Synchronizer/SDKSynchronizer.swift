@@ -2119,3 +2119,28 @@ extension SessionTicker {
 }
 
 extension SDKSynchronizer: TrustedTransactionRecording {}
+
+extension SDKSynchronizer: OHTTPHealthProviding {
+    public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
+        let binding = await healthBinding()
+        try binding.validate(route)
+        return try OHTTPHealthSession(route: route, generation: generation)
+    }
+
+    public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
+        await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await self.healthBinding()
+            return try await binding.probe(session: session, budget: budget)
+        }
+    }
+
+    private func healthBinding() async -> OHTTPHealthProbeBinding {
+        let viaTor = await sdkFlags.torEnabled
+        return OHTTPHealthProbeBinding(
+            endpoint: initializer.endpoint,
+            network: initializer.network.networkType,
+            viaTor: viaTor,
+            tor: initializer.container.resolve(TorClient.self)
+        )
+    }
+}

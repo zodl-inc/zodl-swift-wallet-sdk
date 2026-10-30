@@ -142,7 +142,7 @@ public struct OHTTPHealthSnapshot: Sendable, Equatable {
 
 public enum OHTTPHealthUpdate: Sendable, Equatable {
     case snapshot(OHTTPHealthSnapshot)
-    /// Own correlated evidence, unaffected by another operation replacing the latest snapshot.
+    /// Evidence of the explicitly failed network attempt only. Empty for a local failure or when no final attempt is attributed.
     case operationCompleted(OHTTPHealthOperation, failed: Bool, observations: [OHTTPHealthObservation])
 }
 
@@ -153,19 +153,33 @@ public enum OHTTPHealthError: Error, Sendable, Equatable {
 
 public enum OHTTPHealthContext {
     @TaskLocal public static var operation: OHTTPHealthOperation?
+    @TaskLocal static var attempt: OHTTPHealthAttempt?
 
     public static func withOperation<T: Sendable>(
         _ operation: OHTTPHealthOperation,
         operation work: @Sendable () async throws -> T
     ) async rethrows -> T {
-        try await $operation.withValue(operation) { try await work() }
+        try await $attempt.withValue(nil) {
+            try await $operation.withValue(operation) { try await work() }
+        }
+    }
+
+    /// Scope only the network await whose final failure may determine the operation result.
+    /// Nested foreign operations and reused attempt tokens never inherit attribution.
+    public static func withAttempt<T: Sendable>(
+        _ attempt: OHTTPHealthAttempt,
+        operation work: @Sendable () async throws -> T
+    ) async rethrows -> T {
+        let admitted = operation == attempt.operation && attempt.enter()
+        defer { if admitted { attempt.leave() } }
+        return try await $attempt.withValue(admitted ? attempt : nil) { try await work() }
     }
 
     /// Publish the business result and leave transaction/wallet critical sections before awaiting health delivery. A stalled subscriber applies
     /// backpressure after 64 completions. Cancellation does not discard accepted completion evidence;
     /// consuming or closing the subscriber releases this wait. This never changes individual outcomes.
-    public static func complete(_ operation: OHTTPHealthOperation, failed: Bool) async {
-        await OHTTPHealthCenter.shared.complete(operation, failed: failed)
+    public static func complete(_ operation: OHTTPHealthOperation, failed: Bool, failedAttempt: OHTTPHealthAttempt? = nil) async {
+        await OHTTPHealthCenter.shared.complete(operation, failed: failed, failedAttempt: failedAttempt)
     }
 }
 

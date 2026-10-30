@@ -20,6 +20,7 @@ struct TorHTTPStreamNative: Sendable {
         zcashlc_tor_http_stream_next($0, $1, $2)
     }
     var freeSlice: @Sendable (UnsafeMutablePointer<FfiBoxedSlice>) -> Void = { zcashlc_free_boxed_slice($0) }
+    var lastOutcome: @Sendable () -> FfiTorHttpOutcome = { zcashlc_tor_http_last_outcome() }
     var freeStream: @Sendable (OpaquePointer) -> Void = { zcashlc_free_tor_http_stream($0) }
 }
 
@@ -46,6 +47,7 @@ final class TorHTTPStreamReader: @unchecked Sendable {
     private let idleTimeoutNanoseconds: UInt64
     private let native: TorHTTPStreamNative
     private let now: @Sendable () -> UInt64
+    private let health: OHTTPHealthTraffic?
 
     /// - Parameters:
     ///   - stream: The native stream, freed when the reader is released.
@@ -66,6 +68,7 @@ final class TorHTTPStreamReader: @unchecked Sendable {
         self.idleTimeoutNanoseconds = Self.nanoseconds(idleTimeout)
         self.native = native
         self.now = now
+        self.health = OHTTPHealthTraffic.current
     }
 
     deinit {
@@ -112,6 +115,7 @@ final class TorHTTPStreamReader: @unchecked Sendable {
             }
             var state: UInt8 = 0
             guard let slice = native.next(stream, Self.waitMilliseconds, &state) else {
+                health?.classify(OHTTPNativeHTTPFailure(native.lastOutcome()).outcome)
                 continuation.finish(
                     throwing: ZcashError.rustTorHttpRequest(
                         lastErrorMessage(fallback: "`TorClient.httpPostStream` body read failed")

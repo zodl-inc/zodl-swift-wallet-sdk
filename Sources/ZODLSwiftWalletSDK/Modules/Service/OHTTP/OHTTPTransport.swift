@@ -65,7 +65,17 @@ actor OHTTPKeyCache {
             return cached
         }
         let task = fetches[cacheKey] ?? startFetch(for: cacheKey, fetch)
-        return try await Self.waitCancellable(task)
+        do {
+            return try await Self.waitCancellable(task)
+        } catch let failure as KeyFetchFailure {
+            OHTTPHealthTraffic.current?.classify(failure.outcome)
+            throw failure.underlying
+        }
+    }
+
+    private struct KeyFetchFailure: Error {
+        let underlying: Error
+        let outcome: OHTTPHealthOutcome
     }
 
     private func startFetch(
@@ -77,9 +87,12 @@ actor OHTTPKeyCache {
             do {
                 result = .success(try await fetch())
             } catch {
-                result = .failure(error)
+                result = .failure(KeyFetchFailure(
+                    underlying: error,
+                    outcome: OHTTPHealthTraffic.current?.failure ?? OHTTPHealthTraffic.outcome(error)
+                ))
             }
-            await self.finishFetch(for: cacheKey, result)
+            self.finishFetch(for: cacheKey, result)
             return try result.get()
         }
         fetches[cacheKey] = task
@@ -259,6 +272,7 @@ actor OHTTPTransport {
     /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
     /// signed key configuration is checked against.
     private let gatewayHost: String
+    nonisolated let healthRoute: OHTTPHealthRoute
     let relayURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
@@ -317,6 +331,7 @@ actor OHTTPTransport {
     ) {
         // The relay URL is checked for https at request time (see httpGet/httpPost).
         self.gatewayHost = gatewayHost
+        self.healthRoute = OHTTPHealthRoute(network: walletNetwork ?? .mainnet, gatewayHost: gatewayHost, relayURL: relayURL, viaTor: viaTor)
         self.relayURL = relayURL
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
@@ -336,6 +351,13 @@ actor OHTTPTransport {
     /// Derives the signed config URL from relayURL and verifies it in the shared core.
     func keyConfig(forceRefresh: Bool = false) async throws -> OHTTPVerifiedKey {
         let profile = try OHTTPNative.profileInfo()
+
+        // Diagnostics own their key work independently. Cancelling their bounded read cannot
+        // cancel another consumer's shared real-request fetch or leave a probe-only fetch alive.
+        if let budget = OHTTPHealthProbe.budget {
+            try budget.check()
+            return try await fetchKeyConfig(profile: profile)
+        }
 
         // The cached key is used while the profile says it is fresh.
         return try await keyCache.key(
@@ -371,6 +393,8 @@ actor OHTTPTransport {
         } catch OHTTPError.httpStatusError(let status, let message) where status == 429 {
             throw OHTTPError.httpStatusError(statusCode: status, message: message)
         } catch let relayError {
+            let outcome = OHTTPHealthTraffic.outcome(relayError)
+            if outcome == .configurationFailure || outcome == .responseRejected { OHTTPHealthTraffic.current?.classify(outcome) }
             return try await fetchKeyConfigFromDNS(relayError: relayError)
         }
     }
@@ -421,6 +445,7 @@ actor OHTTPTransport {
         }
 
         for dohURL in dohURLs {
+            try OHTTPHealthProbe.budget?.check()
             do {
                 // Fetch DoH JSON
                 let dohBody = try await httpGetForDNS(url: dohURL, timeoutMS: keyFetchTimeoutMS)
@@ -442,6 +467,8 @@ actor OHTTPTransport {
                 try checkNetworkBinding(of: verified)
                 return verified
             } catch {
+                if error is CancellationError { throw error }
+                try OHTTPHealthProbe.budget?.check()
                 continue
             }
         }
@@ -466,7 +493,7 @@ actor OHTTPTransport {
         request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = TimeInterval(timeoutMS) / 1000.0
 
-        let (data, response) = try await httpSender(request, 64 * 1024) // 64 KiB limit for DoH
+        let (data, response) = try await send(request, maxBytes: 64 * 1024) // 64 KiB limit for DoH
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OHTTPError.transportError("DoH response is not HTTP")
@@ -479,35 +506,15 @@ actor OHTTPTransport {
         return data
     }
 
-    /// Performs one OHTTP call: `roundTripOnce`, and once more (sealed afresh) when the gateway refused the
-    /// request as stale, an inner 400 with `ohttp-freshness: rejected` ("Request freshness" in the ZIP).
-    /// That response carried the gateway clock, which the native core has already learned, so the second
-    /// attempt is stamped right even on a device whose clock is off. Never more than one such retry.
-    func roundTrip(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
-        try await Self.withFreshnessRetry {
-            try await self.roundTripOnce(request: request, timeoutMS: timeoutMS)
-        }
-    }
-
-    /// Runs `attempt`, and once more when its answer is the gateway's freshness refusal. A second refusal
-    /// is returned as it is.
-    static func withFreshnessRetry(
-        _ attempt: () async throws -> OHTTPResponse
-    ) async throws -> OHTTPResponse {
-        let first = try await attempt()
-        guard first.isFreshnessRefusal else {
-            return first
-        }
-        return try await attempt()
-    }
-
     /// Performs one OHTTP round trip. When the relay or gateway answers 400 or 422 the key configuration is
     /// fetched again and the request is sealed afresh and sent once more; a second 400 or 422 is final.
-    private func roundTripOnce(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+    private func roundTripOnce(request: OHTTPRequest, timeoutMS: Int, health: OHTTPHealthTraffic) async throws -> OHTTPResponse {
+        health.advance(.keyConfiguration)
         var key = try await self.keyConfig()
         var attempt: UInt32 = 0
 
         while true {
+            health.advance(.connection)
             let completed = try await exchange(key: key, request: request, timeoutMS: timeoutMS, attempt: attempt)
             switch completed {
             case .response(let response):
@@ -515,8 +522,10 @@ actor OHTTPTransport {
 
             case .refetchKeyConfig:
                 guard attempt == 0 else {
+                    OHTTPHealthTraffic.current?.classify(.configurationFailure)
                     throw OHTTPError.transportError("OHTTP key configuration was refused twice")
                 }
+                health.advance(.keyConfiguration)
                 key = try await refetchKeyConfig()
                 attempt = 1
 
@@ -525,6 +534,7 @@ actor OHTTPTransport {
                 throw OHTTPError.httpStatusError(statusCode: status, message: message)
 
             case .wrongMediaType(let contentType):
+                OHTTPHealthTraffic.current?.classify(.responseRejected)
                 throw OHTTPError.transportError("Relay/gateway answered \(contentType), not a sealed response")
             }
         }
@@ -551,6 +561,7 @@ actor OHTTPTransport {
 
         let (data, httpResponse) = try await httpPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
 
+        OHTTPHealthTraffic.current?.advance(.responseBody)
         return try sealed.pending.complete(
             status: httpResponse.statusCode,
             contentType: httpResponse.value(forHTTPHeaderField: "Content-Type"),
@@ -586,7 +597,7 @@ actor OHTTPTransport {
         }
 
         try await checkRelayBackoff()
-        let (data, httpResponse) = try await httpSender(request, Self.maxKeyConfigBytes)
+        let (data, httpResponse) = try await send(request, maxBytes: Self.maxKeyConfigBytes)
         await noteRelayAnswer(status: httpResponse.statusCode, retryAfter: httpResponse.value(forHTTPHeaderField: "Retry-After"))
 
         guard httpResponse.statusCode == Self.keyFetchSuccessStatus else {
@@ -602,9 +613,17 @@ actor OHTTPTransport {
     private func httpPost(url: String, body: Data, timeoutMS: Int) async throws -> (Data, HTTPURLResponse) {
         let request = try relayPost(url: url, body: body, timeoutMS: timeoutMS)
         try await checkRelayBackoff()
-        let (data, response) = try await httpSender(request, Self.maxRelayResponseBytes)
+        let (data, response) = try await send(request, maxBytes: Self.maxRelayResponseBytes)
         await noteRelayAnswer(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         return (data, response)
+    }
+
+    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        var request = request
+        if let budget = OHTTPHealthProbe.budget {
+            request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000
+        }
+        return try await httpSender(request, maxBytes)
     }
 
     /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
@@ -643,6 +662,7 @@ actor OHTTPTransport {
     /// or ``defaultRateLimitPause`` when the answer carries none that can be read (ZIP "Outer response
     /// contract": "otherwise SHOULD wait 30 s (reference default)").
     func noteRelayAnswer(status: Int, retryAfter: String?) async {
+        OHTTPHealthTraffic.current?.outerResponse(status: status, retryAfter: retryAfter)
         guard status == 429 else { return }
         let delay = Self.retryAfter(retryAfter) ?? Self.defaultRateLimitPause
         await keyCache.setBackoff(until: Date().addingTimeInterval(delay), for: backoffKey)
@@ -652,6 +672,7 @@ actor OHTTPTransport {
     /// (ZIP "Outer response contract": a call made during the pause is failed locally, as a 429).
     func checkRelayBackoff() async throws {
         guard let remaining = await relayPauseRemaining() else { return }
+        OHTTPHealthTraffic.current?.classify(.rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(remaining * 1_000_000_000)))
         throw OHTTPError.httpStatusError(
             statusCode: 429,
             message: "relay rate limit: not sent, \(Int(remaining.rounded(.up)))s of the relay's pause left"
@@ -684,6 +705,40 @@ actor OHTTPTransport {
     }
 }
 
+extension OHTTPTransport {
+    /// Performs one OHTTP call: `roundTripOnce`, and once more (sealed afresh) when the gateway refused the
+    /// request as stale, an inner 400 with `ohttp-freshness: rejected` ("Request freshness" in the ZIP).
+    /// That response carried the gateway clock, which the native core has already learned, so the second
+    /// attempt is stamped right even on a device whose clock is off. Never more than one such retry.
+    nonisolated func roundTrip(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPResponse {
+        let health = OHTTPHealthTraffic(route: healthRoute, request: request)
+        do {
+            let response = try await OHTTPHealthTraffic.$current.withValue(health) {
+                try await Self.withFreshnessRetry {
+                    try await self.roundTripOnce(request: request, timeoutMS: timeoutMS, health: health)
+                }
+            }
+            health.received(response, stage: .complete)
+            return response
+        } catch {
+            health.failed(error)
+            throw error
+        }
+    }
+
+    /// Runs `attempt`, and once more when its answer is the gateway's freshness refusal. A second refusal
+    /// is returned as it is.
+    static func withFreshnessRetry(
+        _ attempt: () async throws -> OHTTPResponse
+    ) async throws -> OHTTPResponse {
+        let first = try await attempt()
+        guard first.isFreshnessRefusal else {
+            return first
+        }
+        return try await attempt()
+    }
+}
+
 // MARK: - Bounded reading of the relay's answers
 
 extension OHTTPTransport {
@@ -706,6 +761,9 @@ extension OHTTPTransport {
         session: URLSession = OHTTPTransport.session
     ) async throws -> (Data, URLResponse) {
         let (bytes, response) = try await session.bytes(for: oneShotBody(request))
+        if let response = response as? HTTPURLResponse {
+            OHTTPHealthTraffic.current?.outerResponse(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
+        }
         let bound = bodyBound(for: response, maxBytes: maxBytes)
 
         // Reject early if Content-Length header exceeds the limit
@@ -754,9 +812,9 @@ extension OHTTPTransport {
     static func boundedDataWithDeadline(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
+        session: URLSession = OHTTPTransport.session,
+        deadlineSeconds: TimeInterval = 100
     ) async throws -> (Data, URLResponse) {
-        let deadlineSeconds: TimeInterval = 100
         return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
             group.addTask {
                 try await boundedData(for: request, maxBytes: maxBytes, session: session)
@@ -764,6 +822,9 @@ extension OHTTPTransport {
 
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                if OHTTPHealthTraffic.current?.failure == nil {
+                    OHTTPHealthTraffic.current?.classify(.transportUnavailable)
+                }
                 throw OHTTPError.transportError("Exchange deadline exceeded (100s)")
             }
 

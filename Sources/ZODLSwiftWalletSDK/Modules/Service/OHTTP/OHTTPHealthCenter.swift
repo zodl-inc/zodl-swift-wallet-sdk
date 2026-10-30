@@ -8,6 +8,7 @@ struct OHTTPHealthRequest: Sendable {
     let scope: OHTTPHealthScope
     let purpose: OHTTPHealthPurpose
     let operation: OHTTPHealthOperation?
+    let attempt: OHTTPHealthAttempt?
     let requestID: UInt64
     let startedAtNanoseconds: UInt64
     let recipients: [OHTTPHealthRecipient]
@@ -75,6 +76,7 @@ final class OHTTPHealthCenter: Sendable {
                 scope: scope,
                 purpose: purpose ?? (operation == nil ? .background : .userOperation),
                 operation: operation,
+                attempt: OHTTPHealthContext.attempt.flatMap { $0.operation == operation && $0.isActive ? $0 : nil },
                 requestID: state.nextRequest,
                 startedAtNanoseconds: OHTTPHealthClock.nowNanoseconds,
                 recipients: recipients
@@ -111,6 +113,7 @@ final class OHTTPHealthCenter: Sendable {
                 purpose: observation.purpose == .userOperation && recipient.operation == nil ? .background : observation.purpose
             )
             recipient.storage?.record([entry])
+            request.attempt?.record(entry)
         }
     }
 
@@ -137,12 +140,12 @@ final class OHTTPHealthCenter: Sendable {
         )
     }
 
-    func complete(_ operation: OHTTPHealthOperation, failed: Bool) async {
+    func complete(_ operation: OHTTPHealthOperation, failed: Bool, failedAttempt: OHTTPHealthAttempt? = nil) async {
         let sessions = state.withLock { $0.sessions.compactMap(\.storage) }
         // One stalled subscriber must not prevent another route/subscriber receiving completion.
         await withTaskGroup(of: Void.self) { group in
             for storage in sessions {
-                group.addTask { await storage.complete(operation, failed: failed) }
+                group.addTask { await storage.complete(operation, failed: failed, failedAttempt: failedAttempt) }
             }
         }
     }
@@ -157,7 +160,7 @@ final class OHTTPHealthStorage: Sendable {
         var closed = false
         var version: UInt64 = 0
         var observations: [OHTTPHealthObservation] = []
-        var operations: [OHTTPHealthOperation: [OHTTPHealthObservation]] = [:]
+        var operations: Set<OHTTPHealthOperation> = []
         var mailboxes: [UUID: OHTTPHealthMailbox] = [:]
     }
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -173,9 +176,7 @@ final class OHTTPHealthStorage: Sendable {
             // Request ownership is captured NOW. An inherited action predating this owner loses
             // action attribution, but this genuinely new request still reports fresh route health.
             let currentOperation = operation.flatMap { $0.startedAtNanoseconds > startedAtNanoseconds ? $0 : nil }
-            if let currentOperation, state.operations[currentOperation] == nil {
-                state.operations[currentOperation] = []
-            }
+            if let currentOperation { state.operations.insert(currentOperation) }
             return OHTTPHealthRecipient(storage: self, generation: generation, operation: currentOperation)
         }
     }
@@ -199,10 +200,6 @@ final class OHTTPHealthStorage: Sendable {
             for observation in observations {
                 guard observation.route == route, observation.historical || observation.generation == generation else { continue }
                 Self.retain(observation, in: &state.observations)
-                if !observation.historical, let operation = observation.operation, var evidence = state.operations[operation] {
-                    Self.retain(observation, in: &evidence)
-                    state.operations[operation] = evidence
-                }
             }
             guard previous != state.observations else { return nil }
             state.version += 1
@@ -250,9 +247,11 @@ final class OHTTPHealthStorage: Sendable {
         deinit { retire() }
     }
 
-    func complete(_ operation: OHTTPHealthOperation, failed: Bool) async {
+    func complete(_ operation: OHTTPHealthOperation, failed: Bool, failedAttempt: OHTTPHealthAttempt? = nil) async {
         let delivery = state.withLock { state -> ([OHTTPHealthObservation], [OHTTPHealthMailbox])? in
-            guard !state.closed, let evidence = state.operations.removeValue(forKey: operation) else { return nil }
+            guard !state.closed, state.operations.remove(operation) != nil else { return nil }
+            let evidence = failed && failedAttempt?.operation == operation
+                ? failedAttempt?.evidence(route: route, generation: generation) ?? [] : []
             return (evidence, Array(state.mailboxes.values))
         }
         guard let delivery else { return }
@@ -268,7 +267,7 @@ final class OHTTPHealthStorage: Sendable {
             let mailboxes = Array(state.mailboxes.values)
             state.mailboxes = [:]
             state.observations = []
-            state.operations = [:]
+            state.operations = []
             return mailboxes
         }
         for mailbox in mailboxes { mailbox.close() }

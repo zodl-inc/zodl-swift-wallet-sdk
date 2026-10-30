@@ -41,6 +41,26 @@ use zodl_ohttp_client::{
     unpack_fields, verify_signed_config,
 };
 
+thread_local! {
+    static LAST_FAILURE_KIND: std::cell::Cell<u32> = const { std::cell::Cell::new(5) };
+}
+
+/// The immediately preceding OHTTP decode call's structured failure on this thread.
+/// 2 means truncated transport, 3 configuration, 4 rejected response, 5 inconclusive.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_last_failure_kind() -> u32 {
+    LAST_FAILURE_KIND.get()
+}
+
+fn classified_decode(error: zodl_ohttp_client::Error) -> zodl_ohttp_client::Error {
+    LAST_FAILURE_KIND.set(match &error {
+        zodl_ohttp_client::Error::Truncated => 2,
+        zodl_ohttp_client::Error::KeyConfig(_) | zodl_ohttp_client::Error::Seal(_) => 3,
+        _ => 4,
+    });
+    error
+}
+
 use crate::{
     free_ptr_from_vec, ptr_from_vec, unwrap_exc_or, unwrap_exc_or_null, zcashlc_string_free,
 };
@@ -353,6 +373,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
     // SAFETY: the pointer is the only state the closure reads. A panic leaves nothing to observe
     // through it: the opener is taken out of its box before anything else can fail, and is
     // dropped (and zeroized) with the closure's frame on every path.
+    LAST_FAILURE_KIND.set(5);
     let opener = AssertUnwindSafe(opener);
 
     let res = catch_panic(|| {
@@ -386,8 +407,8 @@ pub unsafe extern "C" fn zcashlc_ohttp_complete(
             OuterOutcome::Sealed => {
                 // Decode the chunked response
                 let mut decoder = inner.decoder();
-                let mut events = decoder.push(sealed)?;
-                events.extend(decoder.finish()?);
+                let mut events = decoder.push(sealed).map_err(classified_decode)?;
+                events.extend(decoder.finish().map_err(classified_decode)?);
 
                 // Collect events into BhttpResponse
                 let mut status = None;
@@ -691,13 +712,14 @@ pub unsafe extern "C" fn zcashlc_ohttp_stream_push(
     bytes_ptr: *const u8,
     bytes_len: usize,
 ) -> *mut OhttpStreamEvents {
+    LAST_FAILURE_KIND.set(5);
     let decoder = AssertUnwindSafe(decoder);
 
     let res = catch_panic(|| {
         let decoder =
             unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
         let input = unsafe { bytes(bytes_ptr, bytes_len)? };
-        stream_events(decoder.inner.push(input)?)
+        stream_events(decoder.inner.push(input).map_err(classified_decode)?)
     });
     unwrap_exc_or_null(res)
 }
@@ -716,12 +738,13 @@ pub unsafe extern "C" fn zcashlc_ohttp_stream_push(
 pub unsafe extern "C" fn zcashlc_ohttp_stream_finish(
     decoder: *mut OhttpStreamDecoder,
 ) -> *mut OhttpStreamEvents {
+    LAST_FAILURE_KIND.set(5);
     let decoder = AssertUnwindSafe(decoder);
 
     let res = catch_panic(|| {
         let decoder =
             unsafe { decoder.as_mut() }.ok_or_else(|| anyhow!("missing OHTTP stream decoder"))?;
-        stream_events(decoder.inner.finish()?)
+        stream_events(decoder.inner.finish().map_err(classified_decode)?)
     });
     unwrap_exc_or_null(res)
 }
@@ -1320,6 +1343,7 @@ mod tests {
         // The answer ends before its final chunk: truncated, a transport failure.
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_stream_finish(decoder) }.is_null());
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 2);
         assert!(
             last_error_message().starts_with("the gateway's answer ended before its final chunk")
         );
@@ -1339,6 +1363,7 @@ mod tests {
         zcashlc_clear_last_error();
         let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), wire.len()) };
         assert!(events.is_null());
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 4);
         assert_eq!(last_error_message(), "the gateway's answer does not open");
         zcashlc_clear_last_error();
         unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
@@ -1353,6 +1378,7 @@ mod tests {
         wire.extend_from_slice(&[0u8; 16]);
         zcashlc_clear_last_error();
         assert!(complete(opener, 200, &wire, 0).is_null());
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 4);
         assert_eq!(last_error_message(), "the gateway's answer does not open");
         zcashlc_clear_last_error();
     }
@@ -1478,5 +1504,22 @@ mod tests {
         }
         zcashlc_clear_last_error();
         unsafe { zcashlc_ohttp_free_bytes(ptr::null_mut(), 0) };
+    }
+    #[test]
+    fn decode_failure_kind_does_not_leak_across_calls_or_threads() {
+        let _ = classified_decode(zodl_ohttp_client::Error::Truncated);
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 2);
+        assert_eq!(
+            std::thread::spawn(|| zcashlc_ohttp_last_failure_kind())
+                .join()
+                .unwrap(),
+            5
+        );
+        assert!(unsafe { zcashlc_ohttp_stream_finish(std::ptr::null_mut()) }.is_null());
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 5);
+        let _ = classified_decode(zodl_ohttp_client::Error::TooLarge { max: 1 });
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 4);
+        let _ = classified_decode(zodl_ohttp_client::Error::KeyConfig("invalid".into()));
+        assert_eq!(zcashlc_ohttp_last_failure_kind(), 3);
     }
 }

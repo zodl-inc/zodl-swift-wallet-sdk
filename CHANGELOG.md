@@ -43,6 +43,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- Concrete synchronizers implement `OHTTPHealthProviding` to create a health session and run a
+  fresh read-only diagnostic using their selected OHTTP endpoint and Tor runtime. Diagnostics use
+  one 5-second direct or 20-second Tor budget across admission, keys, retries, and response collection;
+  native resource cleanup can extend completion. Explicit relay pauses prevent dispatch.
+- Real Swift OHTTP requests now contribute typed route and backend evidence without changing RPC
+  results or retry behavior. Use `OHTTPHealthContext.withAttempt` with a distinct `OHTTPHealthAttempt`
+  for each network alternative. Pass the explicitly failed token as `failedAttempt` to `complete`;
+  omitting it reports business failure with no attributed final network evidence. Earlier optional
+  failures must not be attributed to an unrelated local failure. Publish the business result before
+  awaiting completion delivery. Attempt identities remain local and are never sent on the wire.
+
 - `OHTTPHealthSession(route:generation:)` adds retained OHTTP health snapshots and operation completion
   updates without changing `Synchronizer`. Initialization throws when the native capability is unsupported.
   Use `OHTTPHealthContext.withOperation` to correlate child work locally, then publish the business result

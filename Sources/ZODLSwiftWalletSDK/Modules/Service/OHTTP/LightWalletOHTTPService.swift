@@ -158,7 +158,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         let httpSender: OHTTPTransport.HTTPSender
         let streamSender: OHTTPTransport.StreamSender
         if viaTor {
-            let isolated = try await torClient.isolatedClient()
+            let isolated = OHTTPHealthProbe.budget != nil ? torClient : try await torClient.isolatedClient()
             if let testTorSender {
                 httpSender = testTorSender(isolated)
             } else {
@@ -166,7 +166,14 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 // tried again, on a new circuit, only when it failed before any of it was sent.
                 // Rely on the native Tor timeout (the wrapper cannot interrupt a synchronous FFI call).
                 httpSender = { request, maxBytes in
-                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                    if let budget = OHTTPHealthProbe.budget {
+                        return try await isolated.httpRequestSentOnce(
+                            for: request,
+                            maxBytes: maxBytes,
+                            timeoutMilliseconds: budget.remainingMilliseconds()
+                        )
+                    }
+                    return try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
                 }
             }
             // S1: streaming calls (mempool long poll) must also use the Tor circuit
@@ -210,6 +217,24 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             }
         }
 
+        let effectiveStreamSender: OHTTPTransport.StreamSender
+        if OHTTPHealthProbe.budget != nil {
+            effectiveStreamSender = { request, maxBytes in
+                var request = request
+                if let budget = OHTTPHealthProbe.budget { request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000 }
+                let (body, response) = try await httpSender(request, maxBytes)
+                return OHTTPOuterStream(
+                    status: response.statusCode,
+                    contentType: response.value(forHTTPHeaderField: "Content-Type"),
+                    retryAfter: response.value(forHTTPHeaderField: "Retry-After"),
+                    body: AsyncThrowingStream { continuation in
+                        continuation.yield(body)
+                        continuation.finish()
+                    }
+                )
+            }
+        } else { effectiveStreamSender = streamSender }
+
         let transport = OHTTPTransport(
             gatewayHost: host,
             relayURL: relayURL,
@@ -217,7 +242,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             walletNetwork: walletNetwork,
             testKeyVerifier: testKeyVerifier,
             viaTor: viaTor,
-            streamSender: streamSender,
+            streamSender: effectiveStreamSender,
             httpSender: httpSender
         )
 
@@ -227,6 +252,13 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             singleCallTimeoutMS: Int(singleCallTimeoutMS),
             streamingCallTimeoutMS: Int(streamingCallTimeoutMS)
         )
+    }
+
+    /// One read-only GetLightdInfo through a fresh client; no wallet addresses or transaction data.
+    func healthInfo(viaTor: Bool) async throws -> OHTTPHealthOutcome {
+        guard let host = gatewayHost, let relay = gatewayRelayURL, let network = walletNetwork else { return .configurationFailure }
+        let client = try await makeClient(host: host, relayURL: relay, viaTor: viaTor)
+        return try await OHTTPHealthProbe.readInfo(client: client, network: network)
     }
 
     /// The circuit name of the calls that carry public, non-identifying chain data.

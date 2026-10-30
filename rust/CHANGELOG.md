@@ -25,6 +25,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_tor_http_post_once_with_timeout` and `zcashlc_tor_http_get_classified_with_timeout`
+  provide additive bounded HTTP calls with `FfiTorHttpOutcome` metadata for deadline, transport,
+  configuration, and size failures. The deadline covers sending and response collection; POST
+  retains the existing unsent-only retry rule. Known HTTP rejection and Retry-After metadata survive
+  body failure and deadline expiry. Existing HTTP APIs and their error text remain unchanged.
+- `zcashlc_tor_http_last_outcome` exposes the typed outcome of legacy GET, POST, and streaming
+  operations; `zcashlc_ohttp_last_failure_kind` exposes typed complete/push/finish codec failures.
+  Both getters are thread-local. Read immediately after the corresponding call on that thread,
+  before cleanup or another FFI operation. Unknown kinds must not be treated as relay outages.
+
 - `zcashlc_ohttp_health_api_version` reports additive health ABI version 1.
   `zcashlc_ohttp_health_subscribe_v1` observes a configured route independently of the wallet engine;
   its callback borrows at most 63 fixed-layout observations, which callers must copy before returning.

@@ -331,6 +331,7 @@ final class OHTTPPendingResponse: @unchecked Sendable {
             }
         }
         guard let result else {
+            OHTTPHealthTraffic.current?.nativeFailure(zcashlc_ohttp_last_failure_kind())
             throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
         }
         defer { zcashlc_free_ohttp_outcome(result) }

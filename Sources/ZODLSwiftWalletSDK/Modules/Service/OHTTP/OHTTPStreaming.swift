@@ -90,6 +90,7 @@ final class OHTTPNativeStreamDecoder: OHTTPStreamDecoding, @unchecked Sendable {
 
     private func events(_ result: UnsafeMutablePointer<OhttpStreamEvents>?) throws -> OHTTPStreamEvents {
         guard let result else {
+            OHTTPHealthTraffic.current?.nativeFailure(zcashlc_ohttp_last_failure_kind())
             let error = OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
             release()
             throw error
@@ -123,15 +124,57 @@ extension OHTTPTransport {
     ///
     /// `timeoutMS` bounds each wait for the relay, not the whole answer: a stream lasts as long as the gateway
     /// keeps it open.
-    func stream(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPStreamedInner {
-        let first = try await streamOnce(request: request, timeoutMS: timeoutMS)
-        guard first.isFreshnessRefusal else {
-            return first
+    nonisolated func stream(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPStreamedInner {
+        var health = OHTTPHealthTraffic(route: healthRoute, request: request)
+        do {
+            let first = try await OHTTPHealthTraffic.$current.withValue(health) {
+                try await streamOnce(request: request, timeoutMS: timeoutMS, health: health)
+            }
+            if first.isFreshnessRefusal {
+                health = OHTTPHealthTraffic(ticket: health.ticket)
+                let retry = try await OHTTPHealthTraffic.$current.withValue(health) {
+                    try await streamOnce(request: request, timeoutMS: timeoutMS, health: health)
+                }
+                return Self.observed(retry, health: health)
+            }
+            return Self.observed(first, health: health)
+        } catch {
+            health.failed(error)
+            throw error
         }
-        return try await streamOnce(request: request, timeoutMS: timeoutMS)
     }
 
-    private func streamOnce(request: OHTTPRequest, timeoutMS: Int) async throws -> OHTTPStreamedInner {
+    private nonisolated static func observed(_ response: OHTTPStreamedInner, health: OHTTPHealthTraffic) -> OHTTPStreamedInner {
+        health.received(OHTTPResponse(status: response.status, headers: response.headers, body: Data(), trailers: []), stage: .responseHead)
+        health.advance(.responseBody)
+        let (body, continuation) = AsyncThrowingStream.makeStream(of: Data.self, throwing: Error.self)
+        let (trailers, trailerContinuation) = AsyncThrowingStream.makeStream(of: [(String, String)].self, throwing: Error.self)
+        let task = Task {
+            do {
+                for try await chunk in response.body { continuation.yield(chunk) }
+                try Task.checkCancellation()
+                var fields: [(String, String)] = []
+                for try await chunk in response.trailers {
+                    fields.append(contentsOf: chunk)
+                    trailerContinuation.yield(chunk)
+                }
+                health.received(OHTTPResponse(status: response.status, headers: response.headers, body: Data(), trailers: fields), stage: .complete)
+                continuation.finish()
+                trailerContinuation.finish()
+            } catch {
+                health.failed(error)
+                continuation.finish(throwing: error)
+                trailerContinuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { reason in
+            if case .cancelled = reason { task.cancel() }
+        }
+        return OHTTPStreamedInner(status: response.status, headers: response.headers, body: body, trailers: trailers)
+    }
+
+    private func streamOnce(request: OHTTPRequest, timeoutMS: Int, health: OHTTPHealthTraffic) async throws -> OHTTPStreamedInner {
+        health.advance(.keyConfiguration)
         var key = try await keyConfig()
         var attempt: UInt32 = 0
 
@@ -139,6 +182,7 @@ extension OHTTPTransport {
             let sealed = try OHTTPNative.encapsulate(key: key, request: request)
             let post = try relayPost(url: relayURL, body: sealed.body, timeoutMS: timeoutMS)
             try await checkRelayBackoff()
+            health.advance(.connection)
             let outer = try await streamSender(post, Self.maxRelayResponseBytes)
             await noteRelayAnswer(status: outer.status, retryAfter: outer.retryAfter)
 
@@ -175,6 +219,7 @@ extension OHTTPTransport {
                 guard attempt == 0 else {
                     throw OHTTPError.transportError("OHTTP key configuration was refused twice")
                 }
+                health.advance(.keyConfiguration)
                 key = try await refetchKeyConfig()
                 attempt = 1
 

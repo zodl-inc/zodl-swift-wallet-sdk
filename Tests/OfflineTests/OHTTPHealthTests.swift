@@ -57,13 +57,16 @@ final class OHTTPHealthTests: XCTestCase {
         var updates = session.updates().makeAsyncIterator()
         let first = OHTTPHealthOperation()
         let second = OHTTPHealthOperation()
+        let firstAttempt = OHTTPHealthAttempt(operation: first)
         await OHTTPHealthContext.withOperation(first) {
-            OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
+            await OHTTPHealthContext.withAttempt(firstAttempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
+            }
         }
         await OHTTPHealthContext.withOperation(second) {
             OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
         }
-        await OHTTPHealthContext.complete(first, failed: true)
+        await OHTTPHealthContext.complete(first, failed: true, failedAttempt: firstAttempt)
         for _ in 0..<4 {
             guard let update = await updates.next() else { return XCTFail("Session ended before completion") }
             if case let .operationCompleted(operation, failed, observations) = update {
