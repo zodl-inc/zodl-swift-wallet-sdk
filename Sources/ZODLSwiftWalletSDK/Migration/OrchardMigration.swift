@@ -197,7 +197,8 @@ actor OrchardMigration {
         let logger = config.loggingPolicy.makeLogger(category: "migrationLogs")
         self.init(
             config: config,
-            sharedBroadcaster: MigrationBroadcaster(torDirURL: config.torDirURL, logger: logger)
+            // S7: pass network to broadcaster
+            sharedBroadcaster: MigrationBroadcaster(torDirURL: config.torDirURL, logger: logger, networkType: config.network.networkType)
         )
     }
 

@@ -144,7 +144,8 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
             torClient: TorClient(torDir: try __torDirURL()),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
             rustBackend: rustBackend,
-            logger: submissionLifecycleLogger()
+            logger: submissionLifecycleLogger(),
+            networkType: .testnet
         )
 
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in self.transactionRepository }

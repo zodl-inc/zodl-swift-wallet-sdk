@@ -14,12 +14,14 @@ import XCTest
 final class PassThroughStreamDecoder: OHTTPStreamDecoding {
     let status: Int
     let headers: [(String, String)]
+    let trailers: [(String, String)]?
     let failOnFinish: Bool
     private var headSent = false
 
-    init(status: Int = 200, headers: [(String, String)] = [("content-type", "text/event-stream")], failOnFinish: Bool = false) {
+    init(status: Int = 200, headers: [(String, String)] = [("content-type", "text/event-stream")], trailers: [(String, String)]? = nil, failOnFinish: Bool = false) {
         self.status = status
         self.headers = headers
+        self.trailers = trailers
         self.failOnFinish = failOnFinish
     }
 
@@ -38,6 +40,7 @@ final class PassThroughStreamDecoder: OHTTPStreamDecoding {
             throw OHTTPError.transportError("the gateway's answer ended before its final chunk")
         }
         var events = OHTTPStreamEvents()
+        events.trailers = trailers
         events.end = true
         return events
     }
@@ -235,6 +238,118 @@ final class OHTTPStreamingTests: XCTestCase {
         XCTAssertTrue(events.body.isEmpty)
         XCTAssertThrowsError(try decoder.finish())
         XCTAssertThrowsError(try sealed.pending.streamDecoder(), "the response context is used once")
+    }
+
+    // MARK: - Trailers (S2)
+
+    func testNoMessagesAndStatusZeroInTrailersIsACleanFinish() async throws {
+        let transport = makeTransport(decoders: {
+            PassThroughStreamDecoder(trailers: [("grpc-status", "0")])
+        }) { [self] _, _ in
+            outer(status: 200, chunks: [Data()])
+        }
+        let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+        XCTAssertEqual(streamed.status, 200)
+
+        var bodyChunks = 0
+        for try await _ in streamed.body {
+            bodyChunks += 1
+        }
+        XCTAssertEqual(bodyChunks, 0, "no body messages before trailers")
+
+        var iterator = streamed.trailers.makeAsyncIterator()
+        let trailers = try await iterator.next()
+        XCTAssertEqual(trailers?.first?.0, "grpc-status")
+        XCTAssertEqual(trailers?.first?.1, "0")
+    }
+
+    func testMessagesAndStatusThirteenInTrailersReturnsMessagesAndError() async throws {
+        let transport = makeTransport(decoders: {
+            PassThroughStreamDecoder(trailers: [("grpc-status", "13")])
+        }) { [self] _, _ in
+            outer(status: 200, chunks: [Data("msg1".utf8), Data("msg2".utf8)])
+        }
+        let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+
+        var collected = Data()
+        for try await chunk in streamed.body {
+            collected.append(chunk)
+        }
+        XCTAssertEqual(collected, Data("msg1msg2".utf8), "body messages arrive before trailers")
+
+        var iterator = streamed.trailers.makeAsyncIterator()
+        let trailers = try await iterator.next()
+        let status = trailers?.first(where: { $0.0 == "grpc-status" })?.1
+        XCTAssertEqual(status, "13")
+    }
+
+    func testFramesSplitInsideHeaderAndBodyArriveInOrder() async throws {
+        final class SplitFrameDecoder: OHTTPStreamDecoding {
+            private var headSent = false
+            private var chunks: [Data] = []
+
+            func push(_ bytes: Data) throws -> OHTTPStreamEvents {
+                chunks.append(bytes)
+                var events = OHTTPStreamEvents()
+                if !headSent {
+                    headSent = true
+                    events.head = (200, [("content-type", "application/grpc")])
+                }
+                events.body = bytes
+                return events
+            }
+
+            func finish() throws -> OHTTPStreamEvents {
+                var events = OHTTPStreamEvents()
+                events.end = true
+                return events
+            }
+        }
+
+        let transport = makeTransport(decoders: { SplitFrameDecoder() }) { [self] _, _ in
+            outer(status: 200, chunks: [
+                Data([0x00, 0x00]),
+                Data([0x00, 0x00, 0x05]),
+                Data("hello".utf8)
+            ])
+        }
+        let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+
+        var collected = Data()
+        for try await chunk in streamed.body {
+            collected.append(chunk)
+        }
+        XCTAssertEqual(collected.count, 10, "all chunks arrive in order")
+    }
+
+    func testNoStatusInTrailersOrHeadersReturnsInternal() async throws {
+        let transport = makeTransport(decoders: {
+            PassThroughStreamDecoder(status: 200, headers: [("content-type", "application/grpc")])
+        }) { [self] _, _ in
+            outer(status: 200, chunks: [Data("body".utf8)])
+        }
+        let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+
+        var bodyCount = 0
+        for try await _ in streamed.body {
+            bodyCount += 1
+        }
+        XCTAssertEqual(bodyCount, 1)
+
+        var iterator = streamed.trailers.makeAsyncIterator()
+        let trailers = try await iterator.next()
+        XCTAssertNil(trailers, "no trailers when decoder doesn't provide them")
+    }
+
+    func testPartialTrailingFrameFailsTheStream() async throws {
+        let transport = makeTransport(decoders: { PassThroughStreamDecoder(failOnFinish: true) }) { [self] _, _ in
+            outer(status: 200, chunks: [Data([0x00, 0x00])])
+        }
+        let streamed = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+        do {
+            for try await _ in streamed.body {}
+            XCTFail("a partial frame must fail")
+        } catch {}
     }
 }
 

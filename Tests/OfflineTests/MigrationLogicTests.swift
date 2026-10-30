@@ -689,7 +689,8 @@ final class MigrationLogicTests: ZcashTestCase {
         let broadcaster = MigrationBroadcaster(
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
-            torClientFactory: factory.make
+            torClientFactory: factory.make,
+            networkType: .testnet
         )
 
         let first = Task { try await broadcaster.dedicatedTorClient() }
@@ -719,7 +720,8 @@ final class MigrationLogicTests: ZcashTestCase {
         let broadcaster = MigrationBroadcaster(
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
-            torClientFactory: factory.make
+            torClientFactory: factory.make,
+            networkType: .testnet
         )
         let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
 
@@ -767,6 +769,7 @@ final class MigrationLogicTests: ZcashTestCase {
             logger: logger,
             torClientFactory: { _ in throw StubTorBootstrapError() },
             torMode: { true },
+            networkType: .testnet,
             directServiceFactory: { _ in
                 events.record("direct")
                 return service
@@ -802,6 +805,7 @@ final class MigrationLogicTests: ZcashTestCase {
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
             torClientFactory: { _ in throw StubTorBootstrapError() },
+            networkType: .testnet,
             directServiceFactory: { _ in service }
         )
     }

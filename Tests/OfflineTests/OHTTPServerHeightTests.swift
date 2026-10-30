@@ -6,13 +6,15 @@ final class OHTTPServerHeightTests: XCTestCase {
     private let invalidHeight = UInt64(Int32.max) + 1
 
     private func makeService() -> LightWalletOHTTPService {
-        LightWalletOHTTPService(
+        let service = LightWalletOHTTPService(
             endpoint: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true),
             singleCallTimeout: 1000,
             streamingCallTimeout: 1000,
             tor: TorClient(torDir: FileManager.default.temporaryDirectory),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
         )
+        service.walletNetwork = .testnet
+        return service
     }
 
     func testLatestBlockHeightRejectsAHeightAboveInt32Max() async throws {

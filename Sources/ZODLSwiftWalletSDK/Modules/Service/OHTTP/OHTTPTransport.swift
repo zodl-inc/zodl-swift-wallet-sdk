@@ -206,6 +206,9 @@ actor OHTTPTransport {
 
     private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
 
+    /// Makes the relay session. No resource timeout is set: non-streaming exchanges enforce
+    /// their 100s deadline per task, while streaming exchanges (mempool long poll, SSE) last
+    /// as long as the gateway keeps them open (~25s for mempool, unbounded for SSE).
     static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -277,6 +280,8 @@ actor OHTTPTransport {
     /// **Privacy warning:** a custom trace ID makes that wallet's requests linkable across relay
     /// and gateway logs. DEBUG ONLY. Never set in release builds. Off by default.
     private let clientTraceIdPrefix: String?
+    /// The wallet's network. When set, a key configuration of the other network is refused.
+    private let walletNetwork: NetworkType?
     /// Test-only: fixed clock for signature verification (bypasses Date()).
     private let testNow: Date?
     /// Test-only: verifies the key configuration instead of the native code.
@@ -290,6 +295,7 @@ actor OHTTPTransport {
         connectTimeoutMS: Int = 15000,
         keyFetchTimeoutMS: Int = 15000,
         clientTraceIdPrefix: String? = nil,
+        walletNetwork: NetworkType? = nil,
         testNow: Date? = nil,
         testKeyVerifier: KeyVerifier? = nil,
         viaTor: Bool = false,
@@ -299,7 +305,7 @@ actor OHTTPTransport {
         },
         streamDecoderFactory: @escaping StreamDecoderFactory = { try $0.streamDecoder() },
         httpSender: @escaping HTTPSender = { request, maxBytes in
-            let (data, response) = try await OHTTPTransport.boundedData(
+            let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                 for: request,
                 maxBytes: maxBytes
             )
@@ -315,6 +321,7 @@ actor OHTTPTransport {
         self.connectTimeoutMS = connectTimeoutMS
         self.keyFetchTimeoutMS = keyFetchTimeoutMS
         self.clientTraceIdPrefix = clientTraceIdPrefix
+        self.walletNetwork = walletNetwork
         self.testNow = testNow
         self.testKeyVerifier = testKeyVerifier
         self.keyCache = keyCache
@@ -383,7 +390,21 @@ actor OHTTPTransport {
             verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: jsonData, now: now)
         }
 
+        try checkNetworkBinding(of: verified)
         return verified
+    }
+
+    /// Nit: extracted duplicated network-check block
+    private func checkNetworkBinding(of verified: OHTTPVerifiedKey) throws {
+        guard let walletNetwork else { return }
+        let walletIsTestnet = (walletNetwork == .testnet)
+        guard verified.isTestnet == walletIsTestnet else {
+            let keyNetwork = verified.isTestnet ? "testnet" : "mainnet"
+            let walletNetworkStr = walletIsTestnet ? "testnet" : "mainnet"
+            throw OHTTPError.keyConfigError(
+                "Key configuration network (\(keyNetwork)) does not match wallet network (\(walletNetworkStr))"
+            )
+        }
     }
 
     /// Tries DNS-over-HTTPS as a fallback source when relay fetch or verification fails.
@@ -418,6 +439,7 @@ actor OHTTPTransport {
                     verified = try OHTTPNative.verifyKeyConfig(gatewayHost: gatewayHost, envelope: envelope, now: now)
                 }
 
+                try checkNetworkBinding(of: verified)
                 return verified
             } catch {
                 continue
@@ -644,12 +666,20 @@ actor OHTTPTransport {
     }
 
     /// Generates a client trace ID from the given prefix: `<sanitized-prefix>-<uuid>`, truncated to
-    /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement).
+    /// 64 chars. The prefix is sanitised to match `^[A-Za-z0-9._:-]+$` (relay/gateway requirement)
+    /// and must start with a letter or digit (ZIP 2198-2199). Leading non-alphanumerics are stripped,
+    /// then falls back to "x" when empty.
     private func generateClientTraceId(prefix: String) -> String {
         let allowedCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-")
         let sanitized = prefix.unicodeScalars.filter { allowedCharacters.contains($0) }.map { String($0) }.joined()
+
+        // Strip leading non-alphanumerics (must start with letter or digit per ZIP 2198-2199)
+        let alphanumeric = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+        let stripped = sanitized.drop(while: { !alphanumeric.contains($0.unicodeScalars.first!) })
+        let effectivePrefix = stripped.isEmpty ? "x" : String(stripped)
+
         let uuid = UUID().uuidString
-        let full = "\(sanitized)-\(uuid)"
+        let full = "\(effectivePrefix)-\(uuid)"
         return full.count <= 64 ? full : String(full.prefix(64))
     }
 }
@@ -708,6 +738,39 @@ extension OHTTPTransport {
         }
 
         return (accumulated, response)
+    }
+
+    /// Reads the relay's answer with both a size bound and a per-exchange deadline (100s).
+    /// The deadline is enforced by cancelling the task; it applies to the whole exchange, not
+    /// idle time between bytes. Use this for non-streaming exchanges only. Streaming exchanges
+    /// (mempool long poll, SSE) must not have a resource deadline.
+    ///
+    /// - Parameters:
+    ///   - request: The URL request to execute
+    ///   - maxBytes: Maximum allowed response size in bytes
+    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    /// - Returns: The response data and URLResponse
+    /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, `OHTTPError.transportError` if deadline exceeded, or other transport errors
+    static func boundedDataWithDeadline(
+        for request: URLRequest,
+        maxBytes: Int,
+        session: URLSession = OHTTPTransport.session
+    ) async throws -> (Data, URLResponse) {
+        let deadlineSeconds: TimeInterval = 100
+        return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
+            group.addTask {
+                try await boundedData(for: request, maxBytes: maxBytes, session: session)
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                throw OHTTPError.transportError("Exchange deadline exceeded (100s)")
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     /// The bound on one answer's body. For a 2xx: `maxBytes`, the call's ceiling, past which the read

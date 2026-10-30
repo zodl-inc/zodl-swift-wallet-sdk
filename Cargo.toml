@@ -193,8 +193,10 @@ gpu = ["slipstream-core/gpu"]
 # without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
 # init-local-ffi.sh / rebuild-local-ffi.sh --trace,
 # make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
-# release builds (build-ffi.yml, prepare-release.sh) never enable it.
-ohttp-trace = []
+# release builds (build-ffi.yml, prepare-release.sh) never enable it. It turns on
+# the engine's own `client-trace` feature, so Slipstream OHTTP requests carry the
+# prefix too.
+ohttp-trace = ["slipstream-core/client-trace"]
 
 [lib]
 name = "zcashlc"
@@ -218,7 +220,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "05a53f26657f3dec8549a7789b937f30e4671fea" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "69e8927208c7fdf1d6abc5edb466123d78b0d0fb" }
 
 # DO NOT ALTER THIS COMMENT
 #

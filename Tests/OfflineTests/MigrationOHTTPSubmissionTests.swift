@@ -53,6 +53,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
             torClientFactory: { _ in throw Failure.bootstrap },
+            networkType: .testnet,
             ohttpClientFactory: { _ in
                 state.values.withLock { $0.factories += 1 }
                 return client
