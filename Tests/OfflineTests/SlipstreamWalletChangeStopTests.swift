@@ -10,13 +10,10 @@ import XCTest
 
 /// [MOB-2184] Which stop each lifecycle operation makes.
 ///
-/// A plain stop lets a scan call in progress run to its end, by default the end of its chunk, and
-/// that can outlast the ten-second budget the engine gives its wait for the pass. When it does, the
-/// stop cannot prove the wallet file quiescent and every operation that changes the wallet refuses
-/// with ZRUST0155, which is how adding several accounts in quick succession failed. The stop for a
-/// wallet change asks the scan to end at its next block first, so every operation that changes the
-/// wallet, or reopens a handle onto it, must make that one. The background stop changes nothing in
-/// the wallet, so it keeps the plain stop.
+/// Both stop entry points request interruption between blocks and leave unfinished scan work
+/// for the next session to retry. Operations that change the wallet, or reopen a handle onto it,
+/// identify that intent with the wallet-change entry point and require a quiescent report before
+/// proceeding. The background stop changes nothing in the wallet, so it keeps the ordinary stop.
 ///
 /// Each test starts a pass, runs one operation, and reads which stops the engine was asked for
 /// before anything else stops it.
@@ -119,8 +116,8 @@ final class SlipstreamWalletChangeStopTests: ZcashTestCase {
         sync.stop()
     }
 
-    /// The background stop changes nothing in the wallet, so it keeps the plain stop, which lets a
-    /// scan call finish its chunk instead of discarding the work.
+    /// The background stop changes nothing in the wallet, so it keeps the ordinary entry point.
+    /// Its scan interruption behavior is the same as the wallet-change stop.
     func testTheBackgroundStopKeepsThePlainStop() async throws {
         let (sync, engine) = try await runningSynchronizer()
 

@@ -73,8 +73,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wallet (adding or removing an account, a rewind, a wipe, or reopening a handle on the same
   wallet). It asks the running session to end its scan at the next block, then stops exactly as
   `zcashlc_slipstream_stop` does and returns the same `FfiSlipstreamStopReport`. Refuse the change
-  unless `settled` and `drained` are both 1. `zcashlc_slipstream_stop` lets a scan call in progress
-  run to the end of its chunk first, which can outlast its ten-second budget.
+  unless `settled` and `drained` are both 1. Both entry points request interruption between blocks;
+  unfinished scan work is retried by the next session. The wallet-change entry point identifies
+  host intent, and a quiescent report is still required before mutation. No caller changes are needed.
 - `zcashlc_check_transaction_submittable(db_data, db_data_len, network_id, tx, tx_len,
   submission_server_height)` reports whether a raw transaction can be valid in the next block, so that nothing is
   submitted that no block can include. The next block is the one after the higher of the wallet's chain tip and

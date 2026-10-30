@@ -755,9 +755,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
         // non-quiescent one changes nothing here beyond what a reader of the logs should know:
         // the pass is stopped either way, and an engine writer that outlives it has only the
-        // engine's own file to finish with. [MOB-2184] For the same reason this is the plain stop,
-        // not `stopForWalletChange()`: nothing about the wallet changes, so a scan call in progress
-        // may run to the end of its chunk rather than leave its blocks for the next pass.
+        // engine's own file to finish with. [MOB-2184] This uses the ordinary stop because the
+        // host is not changing the wallet. Both stops request interruption between blocks and
+        // leave unfinished scan work for the next session to retry.
         let report = await engine.stop()
         if let reason = report.refusalReason {
             initializer.logger.warn(
@@ -1185,8 +1185,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // collision the recovery exists to clear. Thrown into the reopen's own failure handling,
         // so the attempt counts as spent and the host hears the give-up exactly as it would from
         // an endpoint that could not be reopened at all. [MOB-2184] Reopening a handle onto the same
-        // wallet is a wallet change to the engine, so this is its stop for one: the scan ends at its
-        // next block instead of finishing its chunk inside the budget the proof needs.
+        // wallet identifies wallet-change intent, so it uses that stop entry point. Both stops
+        // request interruption between blocks; reopening still requires proof of quiescence.
         let report = await engine.stopForWalletChange()
 
         do {
@@ -1636,10 +1636,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // proceed on the assumption: an orphan commit landing after the force-re-queue is exactly
         // the silent scope loss this serialization exists to prevent. Leave the wallet untouched,
         // put the pass back the way it was found, and tell the caller.
-        // [MOB-2184] The stop for a wallet change, as in every operation below that changes the
-        // wallet or reopens a handle onto it: a plain stop lets the scan finish its whole chunk
-        // first, which outlasted the ten-second budget when accounts were added in quick
-        // succession, and every one of those imports was refused.
+        // [MOB-2184] Every operation below that changes the wallet or reopens a handle onto it
+        // identifies that intent with the wallet-change stop. Both stops interrupt between blocks,
+        // and unfinished scan work is retried. Mutation still requires a quiescent report.
         let report = await engine.stopForWalletChange()
         guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)

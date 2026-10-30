@@ -8,6 +8,7 @@
 
 import XCTest
 import CryptoKit
+import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPZipConformanceTests: XCTestCase {
@@ -415,8 +416,8 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
         service.walletNetwork = .testnet
         // S2: inject testClearnetSender so this offline test makes no real network call
-        service.testClearnetSender = { _, _ in
-            (Data(), OHTTPTestSupport.response(for: nil, status: 200))
+        service.testClearnetSender = { request, _ in
+            (Data(), OHTTPTestSupport.response(for: request.url, status: 200))
         }
 
         // GetMempoolStream no longer throws before any request (the old behavior that this replaces).
@@ -431,13 +432,31 @@ final class OHTTPZipConformanceTests: XCTestCase {
     func testMempoolStreamInTorModeUsesTorStreamSender() async throws {
         // S2: when Tor is in use, getMempoolStream must use the Tor circuit, not clearnet
         let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
-        let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
+        let runtimes = TorTestRuntimes()
+        let state = TorRoutingState()
+        let torDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ohttp-tor-routing-\(UUID().uuidString)", isDirectory: true)
+        let native = TorHTTPGetNative(
+            isolateRuntime: { pointer in
+                state.withLock { $0.runtimeIsolations += 1 }
+                XCTAssertTrue(runtimes.isAlive(pointer))
+                return runtimes.clone(pointer)
+            },
+            freeRuntime: { pointer in
+                runtimes.free(pointer)
+            },
+            createRuntime: { path, _ in
+                state.withLock { $0.runtimeCreations += 1 }
+                XCTAssertEqual(path, torDirectory.path)
+                return runtimes.parent
+            }
+        )
+        let tor = TorClient(torDir: torDirectory, httpGetNative: native)
+        let service = LightWalletOHTTPService(endpoint: endpoint, tor: tor)
         service.walletNetwork = .testnet
         service.sdkFlags = SDKFlags(torEnabled: true, exchangeRateEnabled: false)
 
-        final class Called: @unchecked Sendable { var used = false }
-        let torCalled = Called()
-        let clearnetCalled = Called()
+        defer { try? FileManager.default.removeItem(at: torDirectory) }
 
         // Stub key verifier for the transport
         let stubKeyVerifier: (Data, Date) throws -> OHTTPVerifiedKey = { _, _ in
@@ -453,13 +472,17 @@ final class OHTTPZipConformanceTests: XCTestCase {
         service.testKeyVerifier = stubKeyVerifier
         // The key-configuration GET goes through the Tor HTTP sender: stub it too, so the test
         // never bootstraps Tor or depends on a key another test left in the shared cache.
-        service.testTorSender = { _ in
-            { request, _ in (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200)) }
+        service.testTorSender = { isolated in
+            state.withLock { $0.isolatedRuntime = isolated }
+            return { request, _ in
+                (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+            }
         }
-        service.testTorStreamSender = { _ in
+        service.testTorStreamSender = { isolated in
+            state.withLock { $0.isolatedRuntime = isolated }
             return { _, _ in
-                torCalled.used = true
-                // Return a minimal valid stream that won't be decoded (test ends before iteration)
+                state.withLock { $0.torStreamCalls += 1 }
+                // A malformed response is enough once the stream route itself is exercised.
                 return OHTTPOuterStream(
                     status: 200,
                     contentType: "message/ohttp-chunked-res",
@@ -472,33 +495,58 @@ final class OHTTPZipConformanceTests: XCTestCase {
                 )
             }
         }
+        service.testClearnetSender = { _, _ in
+            state.withLock { $0.clearnetHTTPCalls += 1 }
+            throw OHTTPError.transportError("Unexpected clearnet HTTP sender invocation")
+        }
         service.testClearnetStreamSender = { _, _ in
-            clearnetCalled.used = true
-            return OHTTPOuterStream(
-                status: 200,
-                contentType: "message/ohttp-chunked-res",
-                retryAfter: nil,
-                body: AsyncThrowingStream { $0.finish() }
-            )
+            state.withLock { $0.clearnetStreamCalls += 1 }
+            throw OHTTPError.transportError("Unexpected clearnet stream sender invocation")
         }
 
-        // getMempoolStream creates the transport and sets up the stream sender
-        // The transport is created lazily, so we need to actually start iterating
-        let stream = try service.getMempoolStream()
-        XCTAssertNotNil(stream, "GetMempoolStream returns a stream")
-
-        // Start iterating to trigger the transport creation and sender call
-        // We expect it to fail (unopenable sealed response) but that's OK - we just need to verify
-        // the correct sender was used
         do {
+            // The transport is lazy, so iterate to trigger creation and its sender.
+            let stream = try service.getMempoolStream()
+            XCTAssertNotNil(stream, "GetMempoolStream returns a stream")
             var iterator = stream.makeAsyncIterator()
             _ = try await iterator.next()
         } catch {
-            // Expected: the stub data won't decode properly, but that's fine
+            let calls = state.withLock { $0 }
+            XCTAssertEqual(calls.torStreamCalls, 1, "Only a malformed response after Tor routing is expected to fail")
         }
 
-        XCTAssertTrue(torCalled.used, "Tor mode must use Tor stream sender")
-        XCTAssertFalse(clearnetCalled.used, "Tor mode must not use clearnet stream sender")
+        let isolatedRuntime = state.withLock { counts -> TorClient? in
+            let isolatedRuntime = counts.isolatedRuntime
+            counts.isolatedRuntime = nil
+            return isolatedRuntime
+        }
+        try await isolatedRuntime?.close()
+        try await tor.close()
+        XCTAssertNil(state.withLock { $0.isolatedRuntime }, "The routing state must release its isolated runtime")
+        let calls = state.withLock { $0 }
+        XCTAssertEqual(calls.runtimeCreations, 1, "Tor runtime creation must be injected")
+        XCTAssertEqual(calls.runtimeIsolations, 1, "Tor stream transport must receive an isolated runtime")
+        XCTAssertEqual(calls.torStreamCalls, 1, "Tor mode must invoke the Tor stream sender")
+        XCTAssertEqual(calls.clearnetHTTPCalls, 0, "Tor mode must not invoke clearnet HTTP")
+        XCTAssertEqual(calls.clearnetStreamCalls, 0, "Tor mode must not invoke clearnet streaming")
+        XCTAssertFalse(runtimes.isAlive(runtimes.parent), "Closing the client must release its fake runtime")
+    }
+
+    private final class TorRoutingState: Sendable {
+        struct Counts: Sendable {
+            var runtimeCreations = 0
+            var runtimeIsolations = 0
+            var torStreamCalls = 0
+            var clearnetHTTPCalls = 0
+            var clearnetStreamCalls = 0
+            var isolatedRuntime: TorClient?
+        }
+
+        private let counts = OSAllocatedUnfairLock(initialState: Counts())
+
+        func withLock<T: Sendable>(_ body: @Sendable (inout Counts) -> T) -> T {
+            counts.withLock(body)
+        }
     }
 
     func testTheBuiltInRelaysAreIndependent() {
