@@ -416,8 +416,8 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
         service.walletNetwork = .testnet
         // S2: inject testClearnetSender so this offline test makes no real network call
-        service.testClearnetSender = { _, _ in
-            (Data(), OHTTPTestSupport.response(for: nil, status: 200))
+        service.testClearnetSender = { request, _ in
+            (Data(), OHTTPTestSupport.response(for: request.url, status: 200))
         }
 
         // GetMempoolStream no longer throws before any request (the old behavior that this replaces).
