@@ -515,9 +515,14 @@ final class OHTTPZipConformanceTests: XCTestCase {
             XCTAssertEqual(calls.torStreamCalls, 1, "Only a malformed response after Tor routing is expected to fail")
         }
 
-        let isolatedRuntime = state.withLock { $0.isolatedRuntime }
+        let isolatedRuntime = state.withLock { counts -> TorClient? in
+            let isolatedRuntime = counts.isolatedRuntime
+            counts.isolatedRuntime = nil
+            return isolatedRuntime
+        }
         try await isolatedRuntime?.close()
         try await tor.close()
+        XCTAssertNil(state.withLock { $0.isolatedRuntime }, "The routing state must release its isolated runtime")
         let calls = state.withLock { $0 }
         XCTAssertEqual(calls.runtimeCreations, 1, "Tor runtime creation must be injected")
         XCTAssertEqual(calls.runtimeIsolations, 1, "Tor stream transport must receive an isolated runtime")
