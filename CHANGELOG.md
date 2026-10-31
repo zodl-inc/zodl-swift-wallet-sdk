@@ -8,6 +8,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Migration OHTTP key preparation failures are included in `OHTTPHealthContext.complete`
+  evidence for the selected failed attempt, for direct and Tor routes. Transaction results,
+  key fallback and successful key preparation behavior are unchanged. No caller changes are needed.
+
 - Buffered OHTTP health retains authenticated gRPC rejection status when later decoding fails.
   Policy rejections (7 and 16) and backend unavailability (14) keep their health classification
   through a missing final chunk. A zero status alone never establishes complete-body success,

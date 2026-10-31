@@ -467,9 +467,11 @@ actor MigrationBroadcaster: MigrationBroadcasting {
 private extension MigrationBroadcaster {
     /// The OHTTP client for the gateway `endpoint`, with its key configuration already fetched. Both the
     /// height read and submission share this client and its chosen sender.
-    func preparedOHTTPClient(
+    internal func preparedOHTTPClient(
         for endpoint: LightWalletEndpoint,
         viaTor: Bool,
+        keyCache: OHTTPKeyCache = .shared,
+        testKeyVerifier: OHTTPTransport.KeyVerifier? = nil,
         httpSender: @escaping OHTTPTransport.HTTPSender
     ) async throws -> any MigrationOHTTPClient {
         if let ohttpClientFactory {
@@ -482,10 +484,12 @@ private extension MigrationBroadcaster {
             relayURL: relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
             walletNetwork: networkType,
+            testKeyVerifier: testKeyVerifier,
             viaTor: viaTor,
+            keyCache: keyCache,
             httpSender: httpSender
         )
-        _ = try await transport.keyConfig()
+        try await transport.prepareKeyConfig()
         return OHTTPGRPCClient(
             authority: endpoint.host,
             transport: transport,

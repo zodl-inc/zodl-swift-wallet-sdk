@@ -881,3 +881,19 @@ extension OHTTPTransport {
         return remaining > 0 ? remaining : nil
     }
 }
+
+extension OHTTPTransport {
+    /// Key preparation owns only its terminal failure; a usable key alone cannot prove route recovery.
+    func prepareKeyConfig() async throws {
+        let ticket = OHTTPHealthCenter.shared.begin(route: healthRoute, scope: .route)
+        let traffic = OHTTPHealthTraffic(ticket: ticket)
+        try await OHTTPHealthTraffic.$current.withValue(traffic) {
+            do {
+                _ = try await keyConfig()
+            } catch {
+                traffic.failed(error)
+                throw error
+            }
+        }
+    }
+}
