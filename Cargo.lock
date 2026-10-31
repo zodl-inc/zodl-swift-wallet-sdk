@@ -8882,7 +8882,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream"
 version = "0.4.0"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3dc2f20f2c769b2ce4f821dc39ad2986d191d032#3dc2f20f2c769b2ce4f821dc39ad2986d191d032"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=f3e134943a8a2a2038770928c2f7c07ebff3ef32#f3e134943a8a2a2038770928c2f7c07ebff3ef32"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8937,7 +8937,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=3dc2f20f2c769b2ce4f821dc39ad2986d191d032#3dc2f20f2c769b2ce4f821dc39ad2986d191d032"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=f3e134943a8a2a2038770928c2f7c07ebff3ef32#f3e134943a8a2a2038770928c2f7c07ebff3ef32"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",

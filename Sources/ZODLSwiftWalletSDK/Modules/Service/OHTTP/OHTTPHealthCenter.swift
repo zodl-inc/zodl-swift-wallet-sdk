@@ -202,9 +202,17 @@ final class OHTTPHealthStorage: Sendable {
     static func retain(_ observation: OHTTPHealthObservation, in entries: inout [OHTTPHealthObservation]) {
         if let index = entries.firstIndex(where: {
             $0.source == observation.source && $0.scope == observation.scope && $0.outcome.category == observation.outcome.category
+                && ($0.purpose == .diagnostic) == (observation.purpose == .diagnostic)
         }) {
             let previous = entries[index]
-            guard (observation.observedAtNanoseconds, observation.version) > (previous.observedAtNanoseconds, previous.version) else { return }
+            let newer: Bool
+            if observation.purpose != .diagnostic, observation.scope == .route, observation.outcome == .usable {
+                newer = (observation.startedAtNanoseconds, observation.observedAtNanoseconds, observation.version)
+                    > (previous.startedAtNanoseconds, previous.observedAtNanoseconds, previous.version)
+            } else {
+                newer = (observation.observedAtNanoseconds, observation.version) > (previous.observedAtNanoseconds, previous.version)
+            }
+            guard newer else { return }
             entries[index] = observation
         } else {
             entries.append(observation)

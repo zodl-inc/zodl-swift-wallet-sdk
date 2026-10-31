@@ -8,6 +8,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `OHTTPHealthSnapshot` preserves ordinary recovery evidence beside diagnostic observations
+  and later completions from older requests. Ordinary route success keeps its greatest request
+  start and original metadata; failure ordering is unchanged. No caller changes are needed.
+
 - The source-built native dependency includes the rejected-response body-failure classification
   correction. All five configured architectures use the same pinned native revision.
 

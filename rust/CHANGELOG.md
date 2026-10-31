@@ -44,7 +44,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `zcashlc_ohttp_health_api_version` reports additive health ABI version 1.
   `zcashlc_ohttp_health_subscribe_v1` observes a configured route independently of the wallet engine;
-  its callback borrows at most 63 fixed-layout observations, which callers must copy before returning.
+  its callback borrows at most 126 fixed-layout observations, which callers must copy before returning.
   `zcashlc_ohttp_health_snapshot_v1` copies retained evidence without partial writes, returning the
   required count when capacity is insufficient or `SIZE_MAX` for invalid arguments. Preserve historical
   flags, source versions, original generations and monotonic timestamps when interpreting replay.

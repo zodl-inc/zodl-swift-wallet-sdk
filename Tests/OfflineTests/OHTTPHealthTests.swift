@@ -171,6 +171,62 @@ final class OHTTPHealthTests: XCTestCase {
         }
     }
 
+    func testNativeCallbackCopiesAll126EntriesAndRejectsInvalidBounds() throws {
+        let received = OSAllocatedUnfairLock(initialState: [[OHTTPHealthObservation]]())
+        let generation = UUID()
+        let box = OHTTPNativeHealth.CallbackBox(route: route(), generation: generation, nativeGeneration: 77) { observations in
+            received.withLock { $0.append(observations) }
+        }
+        var entries = (0..<126).map { index in
+            var entry = FfiOHTTPHealthObservationV1()
+            entry.generation = 77
+            entry.version = UInt64(index + 1)
+            entry.request_id = UInt64(index + 1)
+            entry.started_at_nanoseconds = UInt64(index + 100)
+            entry.observed_at_nanoseconds = UInt64(index + 300)
+            entry.scope = UInt32(index / 18)
+            entry.outcome = UInt32((index / 2) % 9)
+            entry.purpose = index.isMultiple(of: 2) ? 0 : 2
+            entry.stage = 4
+            entry.retry_not_before_nanoseconds = 900
+            return entry
+        }
+        entries.withUnsafeBufferPointer { box.copy($0.baseAddress, count: 126, generation: 77) }
+        entries[0].request_id = 0
+        entries[125].version = 0
+        let copied = received.withLock { $0.first ?? [] }
+        XCTAssertEqual(copied.count, 126)
+        XCTAssertEqual(copied.map(\.requestID), (1...126).map { UInt64($0) })
+        XCTAssertEqual(copied.last?.version, 126)
+        XCTAssertEqual(copied.first?.startedAtNanoseconds, 100)
+        XCTAssertEqual(copied.last?.observedAtNanoseconds, 425)
+        XCTAssertTrue(copied.allSatisfy { $0.generation == generation && $0.nativeGeneration == 77 })
+        let outcomes: [OHTTPHealthOutcome] = [
+            .usable, .transportUnavailable, .backendUnavailable, .rateLimited(retryNotBefore: 900),
+            .policyRejected, .configurationFailure, .responseRejected, .cancelled, .inconclusive
+        ]
+        for (index, observation) in copied.enumerated() {
+            XCTAssertEqual(observation.source, .native)
+            XCTAssertEqual(observation.scope.rawValue, UInt32(index / 18))
+            XCTAssertEqual(observation.outcome, outcomes[(index / 2) % 9])
+            XCTAssertEqual(observation.stage, .complete)
+            XCTAssertEqual(observation.purpose, index.isMultiple(of: 2) ? .background : .diagnostic)
+            XCTAssertEqual(observation.version, UInt64(index + 1))
+            XCTAssertEqual(observation.startedAtNanoseconds, UInt64(index + 100))
+            XCTAssertEqual(observation.observedAtNanoseconds, UInt64(index + 300))
+            XCTAssertNil(observation.operation)
+            XCTAssertFalse(observation.historical)
+        }
+        entries.withUnsafeBufferPointer {
+            box.copy($0.baseAddress, count: 127, generation: 77)
+            box.copy($0.baseAddress, count: -1, generation: 77)
+            box.copy($0.baseAddress, count: 126, generation: 78)
+        }
+        box.copy(nil, count: 126, generation: 77)
+        box.copy(nil, count: 0, generation: 77)
+        XCTAssertEqual(received.withLock { $0.count }, 1)
+    }
+
     func testSharedSnapshotKeepsNativeAndSwiftEvidenceAndIgnoresLateReplay() throws {
         let route = route()
         let generation = UUID()
@@ -207,6 +263,170 @@ final class OHTTPHealthTests: XCTestCase {
         guard case let .snapshot(snapshot) = await updates.next() else { return XCTFail("Missing snapshot") }
         XCTAssertEqual(snapshot.observations.count, 1)
         XCTAssertEqual(snapshot.observations.first?.version, 100)
+    }
+
+    func testCoalescedMailboxRetainsOrdinaryAndDiagnosticEvidenceSeparately() async throws {
+        let storage = OHTTPHealthStorage(route: route(), generation: UUID())
+        defer { storage.close() }
+        var updates = storage.updates().makeAsyncIterator()
+        let ordinarySuccess = OHTTPHealthObservation(
+            source: .swift,
+            route: storage.route,
+            scope: .route,
+            outcome: .usable,
+            stage: .complete,
+            generation: storage.generation,
+            version: 11,
+            requestID: 41,
+            startedAtNanoseconds: 200,
+            observedAtNanoseconds: 300
+        )
+        let diagnosticHead = OHTTPHealthObservation(
+            source: .swift,
+            route: storage.route,
+            scope: .route,
+            outcome: .usable,
+            stage: .responseHead,
+            generation: storage.generation,
+            version: 12,
+            requestID: 42,
+            startedAtNanoseconds: 100,
+            observedAtNanoseconds: 400,
+            purpose: .diagnostic
+        )
+        let ordinaryFailure = OHTTPHealthObservation(
+            source: .swift,
+            route: storage.route,
+            scope: .lightwalletd,
+            outcome: .transportUnavailable,
+            stage: .connection,
+            generation: storage.generation,
+            version: 13,
+            requestID: 43,
+            startedAtNanoseconds: 500,
+            observedAtNanoseconds: 600
+        )
+        let diagnosticFailure = OHTTPHealthObservation(
+            source: .swift,
+            route: storage.route,
+            scope: .lightwalletd,
+            outcome: .transportUnavailable,
+            stage: .responseBody,
+            generation: storage.generation,
+            version: 14,
+            requestID: 42,
+            startedAtNanoseconds: 100,
+            observedAtNanoseconds: 700,
+            purpose: .diagnostic
+        )
+        // Subscribe first and leave the real consumer paused through both same-category collisions.
+        for observation in [ordinarySuccess, diagnosticHead, ordinaryFailure, diagnosticFailure] {
+            storage.record([observation])
+        }
+        guard case let .snapshot(snapshot) = await updates.next() else { return XCTFail("Missing coalesced mailbox snapshot") }
+        XCTAssertEqual(snapshot.observations.count, 4)
+        // Whole-value equality checks original identity, purpose, timestamps and source version too.
+        XCTAssertEqual(snapshot.observations.first { $0.requestID == ordinarySuccess.requestID }, ordinarySuccess)
+        XCTAssertEqual(snapshot.observations.first { $0.requestID == ordinaryFailure.requestID }, ordinaryFailure)
+        XCTAssertTrue(snapshot.observations.contains(diagnosticHead))
+        XCTAssertTrue(snapshot.observations.contains(diagnosticFailure))
+    }
+
+    func testPurposePartitionKeepsCoalescingBoundedAndRejectsOlderEvidence() {
+        let storage = OHTTPHealthStorage(route: route(), generation: UUID())
+        defer { storage.close() }
+        let purposes: [OHTTPHealthPurpose] = [.background, .userOperation, .diagnostic]
+        let sources: [OHTTPHealthSource] = [.native, .swift]
+        let outcomes: [OHTTPHealthOutcome] = [
+            .usable, .transportUnavailable, .backendUnavailable, .rateLimited(retryNotBefore: 900),
+            .policyRejected, .configurationFailure, .responseRejected, .cancelled, .inconclusive
+        ]
+        for source in sources {
+            for scope in OHTTPHealthScope.allCases {
+                for outcome in outcomes {
+                    for (purposeIndex, purpose) in purposes.enumerated() {
+                        for version in 1...100 {
+                            let observation = OHTTPHealthObservation(
+                                source: source,
+                                route: storage.route,
+                                scope: scope,
+                                outcome: outcome,
+                                stage: .complete,
+                                generation: storage.generation,
+                                version: UInt64(purposeIndex * 100 + version),
+                                requestID: UInt64(purposeIndex * 100 + version),
+                                startedAtNanoseconds: UInt64(purposeIndex * 100 + version),
+                                observedAtNanoseconds: UInt64(purposeIndex * 100 + version + 1),
+                                purpose: purpose
+                            )
+                            storage.record([observation])
+                        }
+                        let before = storage.snapshot()
+                        // A higher version cannot rescue older observed-at evidence in either class.
+                        storage.record([
+                            OHTTPHealthObservation(
+                                source: source,
+                                route: storage.route,
+                                scope: scope,
+                                outcome: outcome,
+                                stage: .complete,
+                                generation: storage.generation,
+                                version: 1_000,
+                                requestID: 1_000,
+                                startedAtNanoseconds: 1,
+                                observedAtNanoseconds: 2,
+                                purpose: purpose
+                            )
+                        ])
+                        XCTAssertEqual(storage.snapshot(), before)
+                    }
+                    let bucket = storage.snapshot().observations.filter {
+                        $0.source == source && $0.scope == scope && $0.outcome.category == outcome.category
+                    }
+                    XCTAssertLessThanOrEqual(bucket.count, 2)
+                    XCTAssertTrue(bucket.allSatisfy {
+                        $0.version == ($0.purpose == .diagnostic ? 300 : 200) && $0.requestID == $0.version
+                    })
+                    XCTAssertFalse(bucket.contains { $0.purpose == .background })
+                }
+            }
+        }
+        XCTAssertLessThanOrEqual(storage.snapshot().observations.count, 252)
+    }
+
+    func testOrdinaryRouteSuccessKeepsGreatestRequestStartAcrossCoalescedMailbox() async throws {
+        for reverse in [false, true] {
+            let storage = OHTTPHealthStorage(route: route(), generation: UUID())
+            defer { storage.close() }
+            var updates = storage.updates().makeAsyncIterator()
+            func observation(start: UInt64, end: UInt64, version: UInt64, outcome: OHTTPHealthOutcome = .usable) -> OHTTPHealthObservation {
+                OHTTPHealthObservation(
+                    source: .swift,
+                    route: storage.route,
+                    scope: .route,
+                    outcome: outcome,
+                    stage: .complete,
+                    generation: storage.generation,
+                    version: version,
+                    requestID: version,
+                    startedAtNanoseconds: start,
+                    observedAtNanoseconds: end
+                )
+            }
+            let fresh = observation(start: 300, end: 400, version: 2)
+            let old = observation(start: 100, end: 500, version: 3)
+            storage.record(reverse ? [old, fresh] : [fresh, old])
+            guard case let .snapshot(snapshot) = await updates.next() else { return XCTFail("Missing coalesced snapshot") }
+            XCTAssertEqual(snapshot.observations, [fresh], "Ordinary recovery must survive either insertion order")
+            let laterEnd = observation(start: 300, end: 600, version: 4)
+            let laterVersion = observation(start: 300, end: 600, version: 5)
+            storage.record([laterEnd, laterVersion, fresh, laterEnd])
+            XCTAssertEqual(storage.snapshot().observations, [laterVersion], "Equal starts use end, then source version")
+            let newerFailure = observation(start: 400, end: 700, version: 6, outcome: .transportUnavailable)
+            let laterOlderFailure = observation(start: 100, end: 800, version: 7, outcome: .transportUnavailable)
+            storage.record([newerFailure, laterOlderFailure])
+            XCTAssertEqual(storage.snapshot().observations, [laterVersion, laterOlderFailure], "Failure ordering remains completion based")
+        }
     }
 
     func testOperationContextDoesNotLeakIntoSerializedRelayHeaders() async throws {

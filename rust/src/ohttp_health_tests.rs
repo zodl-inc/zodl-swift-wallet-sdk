@@ -131,6 +131,135 @@ fn ohttp_health_snapshot_preserves_history_and_never_partially_copies() {
     }
 }
 
+#[test]
+fn ohttp_health_copies_all_126_entries_without_partial_writes_and_fences_callbacks() {
+    use transport_health::HealthPurpose;
+    unsafe extern "C" fn copy_callback(
+        entries: *const FfiOHTTPHealthObservationV1,
+        count: usize,
+        _: u64,
+        _: u64,
+        context: *mut c_void,
+    ) {
+        let sender = unsafe { &*context.cast::<mpsc::Sender<Vec<FfiOHTTPHealthObservationV1>>>() };
+        sender
+            .send(unsafe { std::slice::from_raw_parts(entries, count) }.to_vec())
+            .unwrap();
+    }
+    let route = route();
+    for scope in [
+        HealthScope::Route,
+        HealthScope::Lightwalletd,
+        HealthScope::ExchangeRates,
+        HealthScope::Swaps,
+        HealthScope::Voting,
+        HealthScope::Flexa,
+        HealthScope::Other,
+    ] {
+        for outcome in [
+            HealthOutcome::Usable,
+            HealthOutcome::TransportUnavailable,
+            HealthOutcome::BackendUnavailable,
+            HealthOutcome::RateLimited {
+                retry_not_before_nanoseconds: 900,
+            },
+            HealthOutcome::PolicyRejected,
+            HealthOutcome::ConfigurationFailure,
+            HealthOutcome::ResponseRejected,
+            HealthOutcome::Cancelled,
+            HealthOutcome::Inconclusive,
+        ] {
+            for purpose in [HealthPurpose::Background, HealthPurpose::Diagnostic] {
+                transport_health::begin_request(&route, scope)
+                    .with_context(purpose, None)
+                    .record(outcome, HealthStage::Complete);
+            }
+        }
+    }
+    let gateway = CString::new(route.gateway_host.clone()).unwrap();
+    let relay = CString::new(route.relay_url.clone()).unwrap();
+    let (sender, receiver) = mpsc::channel::<Vec<FfiOHTTPHealthObservationV1>>();
+    let mut short = [FfiOHTTPHealthObservationV1::default(); 63];
+    for entry in &mut short {
+        entry.request_id = 123456;
+    }
+    let mut full = [FfiOHTTPHealthObservationV1::default(); 126];
+    let mut version = 0;
+    let mut generation = 0;
+    let (required, short_required, full_required, callback);
+    unsafe {
+        let subscription = zcashlc_ohttp_health_subscribe_v1(
+            gateway.as_ptr(),
+            relay.as_ptr(),
+            false,
+            91,
+            Some(copy_callback),
+            (&sender as *const mpsc::Sender<Vec<FfiOHTTPHealthObservationV1>>)
+                .cast_mut()
+                .cast(),
+        );
+        assert!(!subscription.is_null());
+        required = zcashlc_ohttp_health_snapshot_v1(
+            subscription,
+            std::ptr::null_mut(),
+            0,
+            &mut version,
+            &mut generation,
+        );
+        short_required = zcashlc_ohttp_health_snapshot_v1(
+            subscription,
+            short.as_mut_ptr(),
+            63,
+            &mut version,
+            &mut generation,
+        );
+        full_required = zcashlc_ohttp_health_snapshot_v1(
+            subscription,
+            full.as_mut_ptr(),
+            126,
+            &mut version,
+            &mut generation,
+        );
+        callback = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+        zcashlc_ohttp_health_unsubscribe_v1(subscription);
+    }
+    transport_health::begin_request(&route, HealthScope::Route)
+        .record(HealthOutcome::Usable, HealthStage::Complete);
+    assert!(
+        receiver.try_recv().is_err(),
+        "retired C callback must not restart"
+    );
+    assert_eq!(
+        required, 126,
+        "native bound must cross the actual C sizing export"
+    );
+    assert_eq!(short_required, 126);
+    assert!(
+        short.iter().all(|entry| entry.request_id == 123456),
+        "short capacity must never partially copy"
+    );
+    assert_eq!(full_required, 126);
+    assert_eq!(callback.len(), 126);
+    assert_eq!(generation, 91);
+    assert!(version > 0);
+    assert!(
+        full.iter()
+            .all(|entry| entry.historical && entry.generation == 0 && entry.request_id != 0)
+    );
+    for (copied, notified) in full.iter().zip(callback.iter()) {
+        assert_eq!(copied.request_id, notified.request_id);
+        assert_eq!(copied.version, notified.version);
+        assert_eq!(
+            copied.started_at_nanoseconds,
+            notified.started_at_nanoseconds
+        );
+        assert_eq!(
+            copied.observed_at_nanoseconds,
+            notified.observed_at_nanoseconds
+        );
+    }
+}
+
 struct CallbackState {
     entered: mpsc::Sender<()>,
     release: (Mutex<bool>, Condvar),

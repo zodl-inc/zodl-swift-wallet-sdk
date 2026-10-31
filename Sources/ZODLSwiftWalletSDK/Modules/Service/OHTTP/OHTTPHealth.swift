@@ -131,7 +131,8 @@ public struct OHTTPHealthSnapshot: Sendable, Equatable {
     public let generation: UUID
     /// Session delivery version. Each observation also preserves its own source version.
     public let version: UInt64
-    /// At most 126 entries: two sources × seven scopes × nine outcome categories.
+    /// At most 252 entries: two sources × seven scopes × nine outcomes × two purpose classes.
+    /// Diagnostic and ordinary evidence remain separate.
     public let observations: [OHTTPHealthObservation]
 
     public init(generation: UUID, version: UInt64, observations: [OHTTPHealthObservation]) {

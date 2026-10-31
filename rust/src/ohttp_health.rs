@@ -169,7 +169,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_health_subscribe_v1(
     Box::into_raw(Box::new(OHTTPHealthSubscription { inner }))
 }
 
-/// Copies an atomic snapshot. Returns the required element count (at most 63),
+/// Copies an atomic snapshot. Returns the required element count (at most 126),
 /// or SIZE_MAX on invalid arguments. Insufficient capacity never partially copies.
 /// `version` and `generation` are optional outputs, including for sizing calls.
 ///

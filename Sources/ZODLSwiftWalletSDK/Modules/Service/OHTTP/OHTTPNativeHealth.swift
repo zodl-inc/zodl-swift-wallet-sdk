@@ -4,7 +4,9 @@ import os
 
 /// Owns only native subscription resources. Its callback copies borrowed memory before returning.
 final class OHTTPNativeHealth: Sendable {
-    private final class CallbackBox: Sendable {
+    static let maximumObservationCount = 126
+
+    final class CallbackBox: Sendable {
         let route: OHTTPHealthRoute
         let generation: UUID
         let nativeGeneration: UInt64
@@ -18,7 +20,7 @@ final class OHTTPNativeHealth: Sendable {
         }
 
         func copy(_ entries: UnsafePointer<FfiOHTTPHealthObservationV1>?, count: Int, generation: UInt64) {
-            guard generation == nativeGeneration, count <= 63, count >= 0, let entries else { return }
+            guard generation == nativeGeneration, count <= OHTTPNativeHealth.maximumObservationCount, count >= 0, let entries else { return }
             let observations = UnsafeBufferPointer(start: entries, count: count).compactMap {
                 OHTTPNativeHealth.observation($0, route: route, generation: self.generation, nativeGeneration: nativeGeneration)
             }
@@ -64,7 +66,7 @@ final class OHTTPNativeHealth: Sendable {
         }
         ownership.withLockUnchecked { $0 = Ownership(subscription: subscription, context: context) }
         // Replay synchronously; a racing worker copy is deduplicated by original source version/time.
-        var entries = Array(repeating: FfiOHTTPHealthObservationV1(), count: 63)
+        var entries = Array(repeating: FfiOHTTPHealthObservationV1(), count: Self.maximumObservationCount)
         var version: UInt64 = 0
         var owner: UInt64 = 0
         let count = zcashlc_ohttp_health_snapshot_v1(subscription, &entries, UInt(entries.count), &version, &owner)
