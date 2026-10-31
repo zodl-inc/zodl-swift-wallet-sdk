@@ -51,7 +51,11 @@ final class OHTTPHealthCenter: Sendable {
     func register(_ storage: OHTTPHealthStorage) {
         state.withLock { state in
             state.sessions.removeAll { $0.storage == nil }
-            let replay = (state.history[storage.route] ?? []).map { observation in
+            let replay = (state.history[storage.route] ?? []).filter { observation in
+                guard observation.purpose == .diagnostic else { return true }
+                if case .rateLimited(let deadline) = observation.outcome { return deadline > OHTTPHealthClock.nowNanoseconds }
+                return false
+            }.map { observation in
                 var replay = observation
                 replay.historical = true
                 return replay
@@ -93,9 +97,15 @@ final class OHTTPHealthCenter: Sendable {
             precondition(state.version < UInt64.max, "OHTTP evidence version exhausted")
             state.version += 1
             let observation = makeObservation(request, scope: scope, outcome: outcome, stage: stage, version: state.version)
-            // Diagnostics belong exclusively to their session, including retained replay. Business
-            // observations retain the existing route history independently of recipient lifetime.
-            if request.purpose != .diagnostic {
+            // Availability stays session-owned. An explicit pause accepted before recipient closure
+            // must also constrain later same-route admission, without admitting late diagnostic work.
+            let acceptedPause: Bool
+            if request.purpose == .diagnostic, case .rateLimited(let deadline) = outcome, deadline > observation.observedAtNanoseconds {
+                acceptedPause = request.recipients.contains { $0.storage?.capture(nil) != nil }
+            } else {
+                acceptedPause = false
+            }
+            if request.purpose != .diagnostic || acceptedPause {
                 var history = state.history[request.route] ?? []
                 OHTTPHealthStorage.retain(observation, in: &history)
                 state.history[request.route] = history

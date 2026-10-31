@@ -11,7 +11,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both synchronizers retire OHTTP health sessions before committed engine or service replacement
   and wallet wipes, including failed replacements. A retained binding reports when the selected
   route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence
-  or rate-limit replay to replacement sessions.
+  or late rate-limit replay to replacement sessions.
+  An unexpired server pause accepted before retirement still prevents diagnostics on the same route after replacement.
 
 - `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
   including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted

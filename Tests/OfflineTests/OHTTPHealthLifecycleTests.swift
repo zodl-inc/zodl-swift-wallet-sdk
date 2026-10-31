@@ -1,4 +1,5 @@
 import XCTest
+import os
 @testable import TestUtils
 @testable import ZODLSwiftWalletSDK
 
@@ -436,6 +437,83 @@ final class OHTTPHealthLifecycleTests: ZcashTestCase {
         XCTAssertTrue(old.snapshot().observations.isEmpty)
     }
 
+    func testAcceptedInnerDiagnosticPauseSurvivesReplacementUntilOriginalDeadline() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        let old = try await session(sync)
+        defer {
+            old.close()
+            sync.stop()
+        }
+        let posts = OSAllocatedUnfairLock(initialState: 0)
+        let transport = OHTTPTransport(
+            gatewayHost: old.route.gatewayHost,
+            relayURL: old.route.relayURL,
+            walletNetwork: .testnet,
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+            keyCache: OHTTPKeyCache(),
+            streamSender: { _, _ in
+                posts.withLock { $0 += 1 }
+                return OHTTPOuterStream(
+                    status: 200,
+                    contentType: "message/ohttp-chunked-res",
+                    retryAfter: nil,
+                    body: AsyncThrowingStream { continuation in
+                        continuation.yield(Data([1]))
+                        continuation.finish()
+                    }
+                )
+            },
+            streamDecoderFactory: { _ in
+                PassThroughStreamDecoder(status: posts.withLock { $0 == 1 ? 429 : 403 }, headers: [("retry-after", "2")])
+            },
+            httpSender: { request, _ in (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200)) }
+        )
+        let client = OHTTPGRPCClient(authority: old.route.gatewayHost, transport: transport, singleCallTimeoutMS: 5000, streamingCallTimeoutMS: 5000)
+        let before = OHTTPHealthClock.nowNanoseconds
+        _ = await OHTTPHealthProbe.run(session: old) { _ in
+            try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
+        }
+        let after = OHTTPHealthClock.nowNanoseconds
+        let pause = try XCTUnwrap(old.snapshot().observations.first {
+            if case .rateLimited = $0.outcome { return $0.scope == .lightwalletd && $0.purpose == .diagnostic }
+            return false
+        })
+        guard case .rateLimited(let deadline) = pause.outcome else { return XCTFail("Expected decoded inner 429 pause") }
+        XCTAssertGreaterThanOrEqual(deadline, before + 2_000_000_000)
+        XCTAssertLessThanOrEqual(deadline, after + 2_000_000_000)
+        XCTAssertEqual(posts.withLock { $0 }, 1)
+
+        try await sync.restartSync(at: endpoint)
+        XCTAssertFalse(old.isValid)
+        let current = try await session(sync)
+        defer { current.close() }
+        XCTAssertLessThan(OHTTPHealthClock.nowNanoseconds, deadline)
+        let paused = await OHTTPHealthProbe.run(session: current) { _ in
+            try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
+        }
+        XCTAssertEqual(paused.outcome, .rateLimited(retryNotBefore: deadline))
+        XCTAssertEqual(posts.withLock { $0 }, 1, "The replacement must not dispatch inside the accepted server pause")
+        XCTAssertTrue(
+            current.snapshot().observations.filter { $0.purpose == .diagnostic }.allSatisfy {
+                $0.outcome == .rateLimited(retryNotBefore: deadline)
+            },
+            "Diagnostic availability evidence remains owned by its original session"
+        )
+
+        let now = OHTTPHealthClock.nowNanoseconds
+        if deadline > now { try await Task.sleep(nanoseconds: deadline - now + 1_000_000) }
+        let resumed = await OHTTPHealthProbe.run(session: current) { _ in
+            try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
+        }
+        XCTAssertEqual(resumed.outcome, .inconclusive)
+        XCTAssertEqual(posts.withLock { $0 }, 2, "The original deadline must expire without being restarted by admission")
+        let later = try await session(sync)
+        defer { later.close() }
+        XCTAssertFalse(later.snapshot().observations.contains { $0.purpose == .diagnostic }, "Expired pauses and availability do not replay")
+    }
+
     func testDelayedDiagnosticChildCannotCaptureReplacementSession() async throws {
         let engine = GatedFakeSlipstreamEngine()
         let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
@@ -455,8 +533,12 @@ final class OHTTPHealthLifecycleTests: ZcashTestCase {
         let probe = Task {
             await OHTTPHealthProbe.run(session: old) { budget in
                 try budget.admit()
+                let captured = OHTTPHealthTraffic(route: old.route, request: OHTTPRequest(
+                    method: "POST", scheme: "https", authority: old.route.gatewayHost, path: "/test", headers: [], body: Data()
+                ))
                 entered.fulfill()
                 await release.wait()
+                captured.ticket.record(outcome: .rateLimited(retryNotBefore: pause), stage: .responseHead)
                 let child = OHTTPHealthTraffic(route: old.route, request: OHTTPRequest(
                     method: "POST", scheme: "https", authority: "lightwalletd.test", path: "/test", headers: [], body: Data()
                 ))
