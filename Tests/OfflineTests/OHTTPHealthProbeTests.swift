@@ -104,4 +104,30 @@ final class OHTTPHealthProbeTests: XCTestCase {
         XCTAssertThrowsError(try budget.remainingMilliseconds())
     }
 
+    func testDiagnosticPauseIsPinnedToOnlyItsSession() async throws {
+        let route = route()
+        let first = try OHTTPHealthSession(route: route, generation: UUID())
+        let other = try OHTTPHealthSession(route: route, generation: UUID())
+        defer {
+            first.close()
+            other.close()
+        }
+        let pause = OHTTPHealthClock.nowNanoseconds + 20_000_000_000
+        OHTTPHealthCenter.shared.begin(route: route, scope: .route)
+            .record(outcome: .rateLimited(retryNotBefore: pause), stage: .responseHead)
+        let before = other.snapshot()
+        let result = await OHTTPHealthProbe.run(session: first) { _ in
+            XCTFail("Explicit pause must prevent dispatch")
+            return .usable
+        }
+        XCTAssertEqual(result.outcome, .rateLimited(retryNotBefore: pause))
+        XCTAssertEqual(other.snapshot(), before)
+        XCTAssertTrue(first.snapshot().observations.contains { $0.purpose == .diagnostic })
+        first.close()
+        let retired = await OHTTPHealthProbe.run(session: first) { _ in
+            XCTFail("Closed session cannot dispatch")
+            return .usable
+        }
+        XCTAssertEqual(retired.outcome, .cancelled)
+    }
 }

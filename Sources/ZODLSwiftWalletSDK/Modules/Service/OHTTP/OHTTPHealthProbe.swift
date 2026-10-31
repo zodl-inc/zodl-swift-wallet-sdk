@@ -4,8 +4,13 @@ import libzcashlc
 
 /// Additive capability; the synchronizer keeps ownership of its selected endpoint and Tor runtime.
 public protocol OHTTPHealthProviding {
+    var ohttpHealthBinding: OHTTPHealthBinding? { get }
     func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession
     func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult
+}
+
+public extension OHTTPHealthProviding {
+    var ohttpHealthBinding: OHTTPHealthBinding? { nil }
 }
 
 public struct OHTTPHealthProbeResult: Sendable, Equatable {
@@ -51,6 +56,7 @@ struct OHTTPHealthProbeBinding {
     func probe(session: OHTTPHealthSession, budget: OHTTPHealthProbeBudget) async throws -> OHTTPHealthOutcome {
         try budget.check()
         try validate(session.route)
+        guard session.isValid else { throw CancellationError() }
         try budget.admit()
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: tor)
         service.walletNetwork = network
@@ -60,6 +66,7 @@ struct OHTTPHealthProbeBinding {
 
 enum OHTTPHealthProbe {
     @TaskLocal static var budget: OHTTPHealthProbeBudget?
+    @TaskLocal static var recipient: OHTTPHealthRecipient?
 
     static func readInfo(client: OHTTPGRPCClient, network: NetworkType) async throws -> OHTTPHealthOutcome {
         let stream: AsyncThrowingStream<LightdInfo, Error> = try await client.serverStreamingIncremental(
@@ -84,11 +91,34 @@ enum OHTTPHealthProbe {
         timeoutMilliseconds: UInt64? = nil,
         operation: @escaping @Sendable (OHTTPHealthProbeBudget) async throws -> OHTTPHealthOutcome
     ) async -> OHTTPHealthProbeResult {
+        await $recipient.withValue(session.diagnosticRecipient) {
+            await runPinned(session: session, timeoutMilliseconds: timeoutMilliseconds, operation: operation)
+        }
+    }
+
+    static func cancelled(session: OHTTPHealthSession, startedAt: UInt64 = OHTTPHealthClock.nowNanoseconds) -> OHTTPHealthProbeResult {
+        OHTTPHealthProbeResult(
+            outcome: .cancelled,
+            route: session.route,
+            generation: session.generation,
+            startedAtNanoseconds: startedAt,
+            observedAtNanoseconds: OHTTPHealthClock.nowNanoseconds
+        )
+    }
+
+    private static func runPinned(
+        session: OHTTPHealthSession,
+        timeoutMilliseconds: UInt64?,
+        operation: @escaping @Sendable (OHTTPHealthProbeBudget) async throws -> OHTTPHealthOutcome
+    ) async -> OHTTPHealthProbeResult {
+        guard session.isValid else { return cancelled(session: session) }
         let ticket = OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd, purpose: .diagnostic)
         let budget = OHTTPHealthProbeBudget(
             milliseconds: timeoutMilliseconds ?? budgetMilliseconds(viaTor: session.route.viaTor),
             nativeDeadline: session.route.viaTor
         )
+        session.register(budget)
+        defer { session.remove(budget) }
         let outcome: OHTTPHealthOutcome
         let pauses = session.snapshot().observations.compactMap { observation -> UInt64? in
             if case .rateLimited(let deadline) = observation.outcome, deadline > OHTTPHealthClock.nowNanoseconds { return deadline }
@@ -101,6 +131,7 @@ enum OHTTPHealthProbe {
                 try await Self.$budget.withValue(budget) { try await operation(budget) }
             }
         }
+        guard session.isValid else { return cancelled(session: session, startedAt: ticket.startedAtNanoseconds) }
         ticket.record(outcome: outcome, stage: .complete)
         if outcome == .usable { ticket.recordRouteUsable(stage: .complete) }
         return OHTTPHealthProbeResult(
@@ -206,6 +237,8 @@ final class OHTTPHealthProbeBudget: Sendable {
         }
         if cancel { task.cancel() }
     }
+
+    func cancel() { stop(.cancelled) }
 
     private func stop(_ reason: OHTTPHealthOutcome) {
         let effects = state.withLock { state -> (Task<Void, Never>?, Bool) in

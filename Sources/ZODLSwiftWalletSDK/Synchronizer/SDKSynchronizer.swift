@@ -8,10 +8,13 @@
 
 import Foundation
 import Combine
+import os
 
 /// Synchronizer implementation for UIKit and iOS 16+
 // swiftlint:disable type_body_length file_length
 public class SDKSynchronizer: AwaitableStopSynchronizer {
+    private nonisolated let healthOwner: OHTTPHealthBinding
+
     public var alias: ZcashSynchronizerAlias { initializer.alias }
 
     private lazy var streamsUpdateQueue = { DispatchQueue(label: "streamsUpdateQueue_\(initializer.alias.description)") }()
@@ -98,6 +101,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     ) {
         self.connectionState = .idle
         self.underlyingStatus = GenericActor(status)
+        self.healthOwner = OHTTPHealthBinding(endpoint: initializer.endpoint)
         self.initializer = initializer
         self.transactionEncoder = transactionEncoder
         self.transactionRepository = transactionRepository
@@ -151,6 +155,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     deinit {
+        healthOwner.retire()
         Task { [blockProcessor] in
             await blockProcessor.stop()
         }
@@ -899,16 +904,23 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 return
             }
 
+            let healthTransition = OSAllocatedUnfairLock<UUID?>(initialState: nil)
             let context = AfterSyncHooksManager.WipeContext(
                 prewipe: { [weak self] in
-                    self?.transactionEncoder.closeDBConnection()
-                    self?.transactionRepository.closeDBConnection()
+                    guard let self else { return }
+                    let transition = self.healthOwner.beginTransition(walletReset: true)
+                    healthTransition.withLock { $0 = transition }
+                    self.transactionEncoder.closeDBConnection()
+                    self.transactionRepository.closeDBConnection()
                 },
                 completion: { [weak self] possibleError in
                     if possibleError == nil {
                         await self?.submitPlanStore.wipe()
                     }
                     await self?.updateStatus(.unprepared)
+                    if let self, let transition = healthTransition.withLock({ $0 }) {
+                        self.healthOwner.settle(transition: transition, endpoint: self.initializer.endpoint)
+                    }
                     if let error = possibleError {
                         subject.send(completion: .failure(error))
                     } else {
@@ -920,6 +932,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             do {
                 try await blockProcessor.wipe(context: context)
             } catch {
+                if let transition = healthTransition.withLock({ $0 }) {
+                    healthOwner.settle(transition: transition, endpoint: initializer.endpoint)
+                }
                 subject.send(completion: .failure(error))
             }
         }
@@ -1913,6 +1928,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // final instance of the service will be instantiated and propagated to the all parties
 
         // SWITCH TO NEW ENDPOINT
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: initializer.endpoint) }
 
         // LightWalletService dependency update
         // S6: use captured networkType (already declared above)
@@ -1974,6 +1991,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         initializer.lightWalletService = initializer.container.resolve(LightWalletService.self)
         initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
         initializer.endpoint = endpoint
+        healthOwner.recordPublishedEndpoint(endpoint)
 
         // SELF
         self.latestBlocksDataProvider = initializer.container.resolve(LatestBlocksDataProvider.self)
@@ -2132,20 +2150,47 @@ extension SessionTicker {
 extension SDKSynchronizer: TrustedTransactionRecording {}
 
 extension SDKSynchronizer: OHTTPHealthProviding {
+    public nonisolated var ohttpHealthBinding: OHTTPHealthBinding? { healthOwner }
+
     public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
-        let binding = await healthBinding()
+        try await makeOHTTPHealthSession(route: route, generation: generation) { await self.healthBinding() }
+    }
+
+    func makeOHTTPHealthSession(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        lookup: @Sendable () async -> OHTTPHealthProbeBinding
+    ) async throws -> OHTTPHealthSession {
+        let token = try healthOwner.readyToken()
+        let binding = await lookup()
+        guard try healthOwner.readyToken() == token else { throw OHTTPHealthError.bindingUnavailable }
         try binding.validate(route)
-        return try OHTTPHealthSession(route: route, generation: generation)
+        let session = try OHTTPHealthSession(route: route, generation: generation, bindingID: token, ownerID: healthOwner.ownerID)
+        try healthOwner.admit(session)
+        return session
     }
 
     public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
-        await OHTTPHealthProbe.run(session: session) { budget in
-            let binding = await self.healthBinding()
-            return try await binding.probe(session: session, budget: budget)
-        }
+        await probeOHTTPHealth(session: session) { await self.healthBinding() }
     }
 
-    private func healthBinding() async -> OHTTPHealthProbeBinding {
+    nonisolated func probeOHTTPHealth(
+        session: OHTTPHealthSession,
+        lookup: @escaping @Sendable () async -> OHTTPHealthProbeBinding
+    ) async -> OHTTPHealthProbeResult {
+        guard healthOwner.accepts(session) else { return OHTTPHealthProbe.cancelled(session: session) }
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await lookup()
+            guard self.healthOwner.accepts(session) else { throw CancellationError() }
+            return try await binding.probe(session: session, budget: budget)
+        }
+        guard healthOwner.accepts(session) else {
+            return OHTTPHealthProbe.cancelled(session: session, startedAt: result.startedAtNanoseconds)
+        }
+        return result
+    }
+
+    func healthBinding() async -> OHTTPHealthProbeBinding {
         let viaTor = await sdkFlags.torEnabled
         return OHTTPHealthProbeBinding(
             endpoint: initializer.endpoint,

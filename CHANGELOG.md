@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Both synchronizers retire OHTTP health sessions before committed engine or service replacement
+  and wallet wipes, including failed replacements. A retained binding reports when the selected
+  route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence
+  or rate-limit replay to replacement sessions.
+
 - `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
   including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted
   fallback, known-on-server recovery, local creation failures and unresolved timeouts do not reuse

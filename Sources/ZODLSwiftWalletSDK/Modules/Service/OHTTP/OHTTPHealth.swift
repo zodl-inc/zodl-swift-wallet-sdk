@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 
 /// A configuration identity, never a per-request URL or a backend destination.
@@ -149,6 +150,8 @@ public enum OHTTPHealthUpdate: Sendable, Equatable {
 public enum OHTTPHealthError: Error, Sendable, Equatable {
     case unsupportedNativeVersion(UInt32)
     case subscriptionFailed
+    /// The provider is replacing its selected route. Retry setup after its binding becomes ready.
+    case bindingUnavailable
 }
 
 public enum OHTTPHealthContext {
@@ -198,17 +201,54 @@ public enum OHTTPHealthContext {
 public final class OHTTPHealthSession: Sendable {
     public let route: OHTTPHealthRoute
     public let generation: UUID
-    private let storage: OHTTPHealthStorage
-    private let native: OHTTPNativeHealth
+    public let bindingID: UUID?
+    let ownerID: UUID?
+    private struct State {
+        var valid = true
+        var budgets: [ObjectIdentifier: OHTTPHealthProbeBudget] = [:]
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let closeCompletion = DispatchGroup()
+    public var isValid: Bool { state.withLock { $0.valid } }
+    var diagnosticRecipient: OHTTPHealthRecipient { OHTTPHealthRecipient(storage: storage, generation: generation) }
 
-    public init(route: OHTTPHealthRoute, generation: UUID) throws {
+    func register(_ budget: OHTTPHealthProbeBudget) {
+        let accepted = state.withLock { state in
+            guard state.valid else { return false }
+            state.budgets[ObjectIdentifier(budget)] = budget
+            return true
+        }
+        if !accepted { budget.cancel() }
+    }
+
+    func remove(_ budget: OHTTPHealthProbeBudget) {
+        _ = state.withLock { $0.budgets.removeValue(forKey: ObjectIdentifier(budget)) }
+    }
+    private let storage: OHTTPHealthStorage
+    private let closeNative: @Sendable () -> Void
+
+    public convenience init(route: OHTTPHealthRoute, generation: UUID) throws {
+        try self.init(route: route, generation: generation, bindingID: nil, ownerID: nil)
+    }
+
+    init(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        bindingID: UUID?,
+        ownerID: UUID?,
+        closeNative: @escaping @Sendable (OHTTPNativeHealth) -> Void = { $0.close() }
+    ) throws {
+        self.bindingID = bindingID
+        self.ownerID = ownerID
         self.route = route
         self.generation = generation
         let storage = OHTTPHealthStorage(route: route, generation: generation)
         self.storage = storage
-        native = try OHTTPNativeHealth(route: route, generation: generation) { [weak storage] observations in
+        let native = try OHTTPNativeHealth(route: route, generation: generation) { [weak storage] observations in
             storage?.record(observations)
         }
+        self.closeNative = { closeNative(native) }
+        closeCompletion.enter()
         OHTTPHealthCenter.shared.register(storage)
     }
 
@@ -220,8 +260,23 @@ public final class OHTTPHealthSession: Sendable {
 
     /// Retires delivery before fencing native callbacks; never holds a callback-required lock.
     public func close() {
+        let budgets = state.withLock { state -> [OHTTPHealthProbeBudget]? in
+            guard state.valid else { return nil }
+            state.valid = false
+            let budgets = Array(state.budgets.values)
+            state.budgets = [:]
+            return budgets
+        }
+        guard let budgets else {
+            // Join only synchronous native teardown, never diagnostic tasks or async work.
+            // The native callback touches storage alone and cannot re-enter this close.
+            closeCompletion.wait()
+            return
+        }
         storage.close()
-        native.close()
+        for budget in budgets { budget.cancel() }
+        closeNative()
+        closeCompletion.leave()
     }
 
     deinit { close() }

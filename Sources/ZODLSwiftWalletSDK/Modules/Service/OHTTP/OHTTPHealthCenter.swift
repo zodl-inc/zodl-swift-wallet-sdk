@@ -62,12 +62,16 @@ final class OHTTPHealthCenter: Sendable {
     }
 
     func begin(route: OHTTPHealthRoute, scope: OHTTPHealthScope, purpose: OHTTPHealthPurpose? = nil) -> OHTTPHealthRequest {
+        let pinned = OHTTPHealthProbe.recipient
+        let purpose = pinned == nil ? purpose : .diagnostic
         let operation = purpose == .background || purpose == .diagnostic ? nil : OHTTPHealthContext.operation
         return state.withLock { state in
             precondition(state.nextRequest < UInt64.max, "OHTTP request identity exhausted")
             state.nextRequest += 1
             state.sessions.removeAll { $0.storage == nil }
-            let recipients = state.sessions.compactMap { recipient -> OHTTPHealthRecipient? in
+            // A pinned but closed recipient means nobody, never a replacement route subscriber.
+            let candidates = pinned.map { [$0] } ?? state.sessions
+            let recipients = candidates.compactMap { recipient -> OHTTPHealthRecipient? in
                 guard let storage = recipient.storage, storage.route == route else { return nil }
                 return storage.capture(operation)
             }
@@ -89,12 +93,16 @@ final class OHTTPHealthCenter: Sendable {
             precondition(state.version < UInt64.max, "OHTTP evidence version exhausted")
             state.version += 1
             let observation = makeObservation(request, scope: scope, outcome: outcome, stage: stage, version: state.version)
-            var history = state.history[request.route] ?? []
-            OHTTPHealthStorage.retain(observation, in: &history)
-            state.history[request.route] = history
-            state.recent.removeAll { $0 == request.route }
-            state.recent.append(request.route)
-            if state.recent.count > 32 { state.history.removeValue(forKey: state.recent.removeFirst()) }
+            // Diagnostics belong exclusively to their session, including retained replay. Business
+            // observations retain the existing route history independently of recipient lifetime.
+            if request.purpose != .diagnostic {
+                var history = state.history[request.route] ?? []
+                OHTTPHealthStorage.retain(observation, in: &history)
+                state.history[request.route] = history
+                state.recent.removeAll { $0 == request.route }
+                state.recent.append(request.route)
+                if state.recent.count > 32 { state.history.removeValue(forKey: state.recent.removeFirst()) }
+            }
             return observation
         }
         for recipient in request.recipients {
