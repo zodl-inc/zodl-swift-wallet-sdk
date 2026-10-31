@@ -194,6 +194,27 @@ public enum OHTTPHealthContext {
     public static func complete(_ operation: OHTTPHealthOperation, failed: Bool, failedAttempt: OHTTPHealthAttempt? = nil) async {
         await OHTTPHealthCenter.shared.complete(operation, failed: failed, failedAttempt: failedAttempt)
     }
+
+    /// Select only the complete finite set of attempts whose failures determine the final business result.
+    /// Mixed, pending or unknown results cannot be inferred to be all-failed from an error alone.
+    /// Each child must be finished, distinct and unused, with complete nonempty terminal transport
+    /// failures for the same route and generation. Invalid or missing children and more than 64
+    /// terminal request identities leave completion without qualifying evidence. Original identities
+    /// and global observations are preserved. Success does not consume the supplied attempts.
+    /// Publish the original business result and release transaction/wallet guards before awaiting
+    /// completion. Delivery has the same backpressure and cancellation semantics as single-attempt completion.
+    public static func complete(_ operation: OHTTPHealthOperation, failed: Bool, allFailedAttempts: [OHTTPHealthAttempt?]) async {
+        guard failed else {
+            await complete(operation, failed: false)
+            return
+        }
+        let aggregate = OHTTPHealthAttempt(operation: operation)
+        _ = aggregate.enter()
+        aggregate.beginDelegation()
+        aggregate.adoptAllFailures(from: allFailedAttempts)
+        aggregate.leave()
+        await complete(operation, failed: true, failedAttempt: aggregate)
+    }
 }
 
 /// Owns a retained native subscription and Swift observations for exactly one route generation.

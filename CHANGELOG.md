@@ -64,6 +64,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `OHTTPHealthContext.complete(_:failed:allFailedAttempts:)` accepts the complete finite set of
+  attempts whose failures determine an all-failed business result. Use distinct, finished attempts
+  for every failed branch; mixed or unknown results, missing or invalid children, and groups beyond
+  64 terminal request identities supply no qualifying evidence. Every child must have terminal
+  transport failures for the same route and generation. Original request identities and global
+  health observations are preserved; `failed: false` supplies no evidence and does not consume
+  children. Publish the original business result and release transaction/wallet guards before awaiting
+  completion, which retains existing backpressure and cancellation behavior. Existing call sites
+  using `failedAttempt` need no changes.
+
 - `OHTTPHealthContext.withBackground(operation:)` clears inherited user-operation attribution for
   automatic refreshes, retries and other background work. Wrap those awaits in this scope; real
   requests still update global connection health.

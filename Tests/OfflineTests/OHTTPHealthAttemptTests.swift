@@ -286,4 +286,238 @@ final class OHTTPHealthAttemptTests: XCTestCase {
         XCTAssertTrue(observations.isEmpty)
     }
 
+    func testPublicAllFailedCompletionPreservesEveryTerminalCauseAndOneCompletion() async throws {
+        let session = try session()
+        defer { session.close() }
+        let stream = session.updates()
+        let operation = OHTTPHealthOperation()
+        let children = [OHTTPHealthAttempt(operation: operation), OHTTPHealthAttempt(operation: operation)]
+        let originals = await OHTTPHealthContext.withOperation(operation) {
+            var observations: [OHTTPHealthObservation] = []
+            for child in children {
+                await OHTTPHealthContext.withAttempt(child) {
+                    OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                        .record(outcome: .transportUnavailable, stage: .connection)
+                }
+                observations.append(contentsOf: session.snapshot().observations)
+            }
+            return observations
+        }
+        XCTAssertEqual(originals.count, 2)
+        XCTAssertEqual(Set(originals.map(\.requestID)).count, 2)
+        XCTAssertTrue(originals.allSatisfy { $0.source == .swift && $0.operation == operation })
+        let publisher = Task {
+            await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: children)
+        }
+        publisher.cancel()
+        await publisher.value
+        var iterator = stream.makeAsyncIterator()
+        let first = await iterator.next()
+        guard case let .operationCompleted(completed, failed, evidence) = first else {
+            return XCTFail("Expected the all-failed completion")
+        }
+        XCTAssertEqual(completed, operation)
+        XCTAssertTrue(failed)
+        XCTAssertEqual(evidence, originals, "Every source/request identity, version, recipient and timestamp must survive")
+        XCTAssertEqual(session.snapshot().observations, [originals[1]], "Global observations remain independent and coalesced")
+
+        await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: children)
+        let sentinel = OHTTPHealthOperation()
+        await OHTTPHealthContext.withOperation(sentinel) {
+            OHTTPHealthCenter.shared.begin(route: session.route, scope: .other)
+                .record(outcome: .usable, stage: .complete)
+        }
+        await OHTTPHealthContext.complete(sentinel, failed: false)
+        let next = await iterator.next()
+        XCTAssertEqual(
+            next,
+            .operationCompleted(sentinel, failed: false, observations: []),
+            "Only one completion is delivered per captured operation"
+        )
+    }
+
+    func testPublicAllFailedCompletionRejectsIncompleteMixedOrInvalidGroups() async throws {
+        let session = try session()
+        defer { session.close() }
+        for scenario in [
+            "empty", "missing", "unentered", "localEmpty", "usable", "policy", "configuration", "rate", "backend",
+            "response", "cancelled", "inconclusive", "active", "foreign", "duplicate", "duplicateIdentity", "reused", "consumed"
+        ] {
+            let operation = OHTTPHealthOperation()
+            let first = OHTTPHealthAttempt(operation: operation)
+            let secondOperation = scenario == "foreign" ? OHTTPHealthOperation() : operation
+            let second = OHTTPHealthAttempt(operation: secondOperation, id: scenario == "duplicateIdentity" ? first.id : UUID())
+            let stream = session.updates()
+            await OHTTPHealthContext.withOperation(operation) {
+                await OHTTPHealthContext.withAttempt(first) {
+                    OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                        .record(outcome: .transportUnavailable, stage: .connection)
+                }
+                if scenario != "unentered" {
+                    await OHTTPHealthContext.withOperation(secondOperation) {
+                        await OHTTPHealthContext.withAttempt(second) {
+                            let outcome: OHTTPHealthOutcome
+                            switch scenario {
+                            case "usable": outcome = .usable
+                            case "policy": outcome = .policyRejected
+                            case "configuration": outcome = .configurationFailure
+                            case "rate": outcome = .rateLimited(retryNotBefore: UInt64.max)
+                            case "backend": outcome = .backendUnavailable
+                            case "response": outcome = .responseRejected
+                            case "cancelled": outcome = .cancelled
+                            case "inconclusive": outcome = .inconclusive
+                            default: outcome = .transportUnavailable
+                            }
+                            if scenario != "localEmpty" {
+                                OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                                    .record(outcome: outcome, stage: .complete)
+                            }
+                            if scenario == "active" {
+                                await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: [first, second])
+                            }
+                        }
+                    }
+                }
+                if scenario == "reused" {
+                    await OHTTPHealthContext.withAttempt(second) {}
+                }
+            }
+            if scenario == "consumed" {
+                await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: [first, second])
+                let consumedEvidence = await completion(stream)
+                XCTAssertEqual(consumedEvidence.count, 2)
+                await OHTTPHealthContext.withOperation(operation) {
+                    OHTTPHealthCenter.shared.begin(route: session.route, scope: .other)
+                        .record(outcome: .usable, stage: .complete)
+                }
+            }
+            if scenario != "active" {
+                let selected: [OHTTPHealthAttempt?]
+                switch scenario {
+                case "empty": selected = []
+                case "missing": selected = [first, nil]
+                case "duplicate": selected = [first, first]
+                default: selected = [first, second]
+                }
+                await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: selected)
+            }
+            var iterator = stream.makeAsyncIterator()
+            let update = await iterator.next()
+            XCTAssertEqual(update, .operationCompleted(operation, failed: true, observations: []), scenario)
+            XCTAssertTrue(session.snapshot().observations.contains { $0.outcome == .transportUnavailable }, scenario)
+        }
+    }
+
+    func testPublicAllFailedCompletionRespectsRecipientAnd64KeyBound() async throws {
+        for scenario in ["route", "64", "65"] {
+            let session = try session()
+            defer { session.close() }
+            let otherRoute = OHTTPHealthRoute(
+                network: .testnet,
+                gatewayHost: "\(UUID().uuidString).test",
+                relayURL: "https://other.test/",
+                viaTor: false
+            )
+            let other = try OHTTPHealthSession(route: otherRoute, generation: UUID())
+            defer { other.close() }
+            let operation = OHTTPHealthOperation()
+            let children = [OHTTPHealthAttempt(operation: operation), OHTTPHealthAttempt(operation: operation)]
+            let stream = session.updates()
+            let otherStream = other.updates()
+            let requests = await OHTTPHealthContext.withOperation(operation) {
+                var requests: [OHTTPHealthRequest] = []
+                for (index, child) in children.enumerated() {
+                    let childRequests = await OHTTPHealthContext.withAttempt(child) {
+                        var childRequests: [OHTTPHealthRequest] = []
+                        let count = scenario == "route" ? 1 : (index == 1 && scenario == "65" ? 33 : 32)
+                        for _ in 0..<count {
+                            let route = scenario == "route" && index == 1 ? other.route : session.route
+                            let request = OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd)
+                            childRequests.append(request)
+                            request.record(outcome: .transportUnavailable, stage: .connection)
+                        }
+                        return childRequests
+                    }
+                    requests.append(contentsOf: childRequests)
+                }
+                return requests
+            }
+            await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: children)
+            let evidence = await completion(stream)
+            XCTAssertEqual(evidence.count, scenario == "64" ? 64 : 0, scenario)
+            if scenario == "64" {
+                XCTAssertEqual(Set(evidence.map(\.requestID)), Set(requests.map(\.requestID)))
+                XCTAssertTrue(evidence.allSatisfy { $0.route == session.route && $0.generation == session.generation })
+            }
+            if scenario == "route" {
+                let otherEvidence = await completion(otherStream)
+                XCTAssertTrue(otherEvidence.isEmpty)
+            }
+        }
+
+        let session = try session()
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let children = [OHTTPHealthAttempt(operation: operation), OHTTPHealthAttempt(operation: operation)]
+        let stream = session.updates()
+        await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(children[0]) {
+                OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                    .record(outcome: .transportUnavailable, stage: .connection)
+            }
+            await OHTTPHealthContext.withAttempt(children[1]) {
+                let request = OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                // A callback from another generation must never qualify for this recipient.
+                children[1].record(OHTTPHealthObservation(
+                    source: .swift,
+                    route: session.route,
+                    scope: .lightwalletd,
+                    outcome: .transportUnavailable,
+                    stage: .connection,
+                    generation: UUID(),
+                    version: 1,
+                    requestID: request.requestID,
+                    startedAtNanoseconds: request.startedAtNanoseconds,
+                    observedAtNanoseconds: OHTTPHealthClock.nowNanoseconds,
+                    operation: operation,
+                    purpose: .userOperation
+                ))
+            }
+        }
+        await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: children)
+        let evidence = await completion(stream)
+        XCTAssertTrue(evidence.isEmpty, "Different generations cannot qualify as one all-failed group")
+    }
+
+    func testSuccessfulPublicGroupCompletionDoesNotAdoptFailures() async throws {
+        let session = try session()
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let children = [OHTTPHealthAttempt(operation: operation), OHTTPHealthAttempt(operation: operation)]
+        let stream = session.updates()
+        await OHTTPHealthContext.withOperation(operation) {
+            for child in children {
+                await OHTTPHealthContext.withAttempt(child) {
+                    OHTTPHealthCenter.shared.begin(route: session.route, scope: .lightwalletd)
+                        .record(outcome: .transportUnavailable, stage: .connection)
+                }
+            }
+        }
+        await OHTTPHealthContext.complete(operation, failed: false, allFailedAttempts: children)
+        var iterator = stream.makeAsyncIterator()
+        let successful = await iterator.next()
+        XCTAssertEqual(successful, .operationCompleted(operation, failed: false, observations: []))
+        await OHTTPHealthContext.withOperation(operation) {
+            OHTTPHealthCenter.shared.begin(route: session.route, scope: .other).record(outcome: .usable, stage: .complete)
+        }
+        await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: children)
+        let failed = await iterator.next()
+        guard case let .operationCompleted(completed, businessFailed, evidence) = failed else {
+            return XCTFail("Expected unconsumed children to remain eligible")
+        }
+        XCTAssertEqual(completed, operation)
+        XCTAssertTrue(businessFailed)
+        XCTAssertEqual(evidence.count, 2)
+        XCTAssertEqual(Set(evidence.map(\.requestID)).count, 2)
+    }
 }

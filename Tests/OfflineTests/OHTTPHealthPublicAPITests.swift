@@ -15,4 +15,14 @@ final class OHTTPHealthPublicAPITests: XCTestCase {
         XCTAssertEqual(result.observedAtNanoseconds, 20)
         XCTAssertEqual(result.outcome, .usable)
     }
+    func testConsumerCanCompleteSingleAndAllFailedAttempts() async {
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {}
+        }
+        await OHTTPHealthContext.complete(operation, failed: false)
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        await OHTTPHealthContext.complete(operation, failed: true, allFailedAttempts: [attempt, nil])
+    }
 }
