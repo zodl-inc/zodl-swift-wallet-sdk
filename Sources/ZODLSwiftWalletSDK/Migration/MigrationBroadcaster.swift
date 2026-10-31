@@ -464,10 +464,10 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     }
 }
 
-private extension MigrationBroadcaster {
+extension MigrationBroadcaster {
     /// The OHTTP client for the gateway `endpoint`, with its key configuration already fetched. Both the
     /// height read and submission share this client and its chosen sender.
-    internal func preparedOHTTPClient(
+    func preparedOHTTPClient(
         for endpoint: LightWalletEndpoint,
         viaTor: Bool,
         keyCache: OHTTPKeyCache = .shared,
@@ -497,7 +497,9 @@ private extension MigrationBroadcaster {
             streamingCallTimeoutMS: Self.ohttpSubmitTimeoutMS
         )
     }
+}
 
+private extension MigrationBroadcaster {
     static let ohttpSubmitTimeoutMS = 30_000
 
     func submitViaOHTTP(

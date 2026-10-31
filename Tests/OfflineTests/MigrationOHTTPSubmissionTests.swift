@@ -218,7 +218,9 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
             let route = try preparationRoute(viaTor: viaTor)
             let session = try OHTTPHealthSession(route: route, generation: UUID())
             defer { session.close() }
-            let cache = OHTTPKeyCache()
+            let enrolled = expectation(description: "both cache waiters enrolled")
+            enrolled.expectedFulfillmentCount = 2
+            let cache = OHTTPKeyCache(testWaiterEnrolled: { enrolled.fulfill() })
             let calls = State()
             let gate = MigrationKeyGate()
             let started = expectation(description: "shared relay fetch started")
@@ -235,8 +237,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
             let tasks = operations.indices.map { index in
                 Task { await self.prepare(viaTor: viaTor, cache: cache, operation: operations[index], attempt: attempts[index], sender: sender) }
             }
-            await fulfillment(of: [started], timeout: 2)
-            try await Task.sleep(nanoseconds: 20_000_000)
+            await fulfillment(of: [started, enrolled], timeout: 2)
             await gate.release()
             for task in tasks {
                 let error = await task.value
@@ -291,7 +292,9 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                     XCTAssertEqual(calls.values.withLock { $0.events.count }, 3)
                 }
             }
-            let cache = OHTTPKeyCache()
+            let enrolled = expectation(description: "both cache waiters enrolled")
+            enrolled.expectedFulfillmentCount = 2
+            let cache = OHTTPKeyCache(testWaiterEnrolled: { enrolled.fulfill() })
             let calls = State()
             let gate = MigrationKeyGate()
             let started = expectation(description: "cancellable shared fetch started")
@@ -315,7 +318,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
             let remaining = Task {
                 await self.prepare(viaTor: viaTor, cache: cache, operation: remainingOperation, attempt: remainingAttempt, sender: sender)
             }
-            try await Task.sleep(nanoseconds: 20_000_000)
+            await fulfillment(of: [enrolled], timeout: 2)
             cancelled.cancel()
             let cancelledError = await cancelled.value
             XCTAssertTrue(cancelledError is CancellationError)

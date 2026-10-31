@@ -47,6 +47,12 @@ actor OHTTPKeyCache {
     private var keys: [String: OHTTPVerifiedKey] = [:]
     private var fetches: [String: Task<OHTTPVerifiedKey, Error>] = [:]
     private var notBefore: [String: Date] = [:]
+    private let testWaiterEnrolled: @Sendable () -> Void
+
+    /// Tests acknowledge enrollment after task selection without suspending the shared fetch owner.
+    init(testWaiterEnrolled: @escaping @Sendable () -> Void = {}) {
+        self.testWaiterEnrolled = testWaiterEnrolled
+    }
 
     func store(_ key: OHTTPVerifiedKey?, for cacheKey: String) {
         keys[cacheKey] = key
@@ -65,6 +71,7 @@ actor OHTTPKeyCache {
             return cached
         }
         let task = fetches[cacheKey] ?? startFetch(for: cacheKey, fetch)
+        testWaiterEnrolled()
         do {
             return try await Self.waitCancellable(task)
         } catch let failure as KeyFetchFailure {
