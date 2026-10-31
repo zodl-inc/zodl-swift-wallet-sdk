@@ -88,7 +88,11 @@ final class OHTTPHealthTraffic: Sendable {
         if case .rateLimited = outcome, case .rateLimited(let originalDeadline) = failure {
             outcome = .rateLimited(retryNotBefore: originalDeadline)
         }
-        if outcome != .usable { classify(outcome) }
+        if outcome != .usable {
+            classify(outcome)
+            // RPC error wrapping must preserve rejections, while usable headers cannot establish body success.
+            OHTTPHealthProbe.budget?.record(outcome)
+        }
         ticket.record(outcome: outcome, stage: stage)
     }
 

@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `probeOHTTPHealth(session:)` preserves authenticated inner HTTP and gRPC rejection outcomes,
+  including the original Retry-After deadline. RPC errors and caller code are unchanged.
+
 - Both synchronizers retire OHTTP health sessions before committed engine or service replacement
   and wallet wipes, including failed replacements. A retained binding reports when the selected
   route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence

@@ -507,7 +507,7 @@ final class OHTTPHealthLifecycleTests: ZcashTestCase {
         let resumed = await OHTTPHealthProbe.run(session: current) { _ in
             try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
         }
-        XCTAssertEqual(resumed.outcome, .inconclusive)
+        XCTAssertEqual(resumed.outcome, .policyRejected)
         XCTAssertEqual(posts.withLock { $0 }, 2, "The original deadline must expire without being restarted by admission")
         let later = try await session(sync)
         defer { later.close() }
