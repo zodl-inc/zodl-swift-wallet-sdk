@@ -52,6 +52,7 @@ pub struct FfiOhttpDecodeOutcome {
 }
 
 thread_local! {
+    static LAST_GRPC_STATUS: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
     static LAST_DECODE_OUTCOME: std::cell::Cell<FfiOhttpDecodeOutcome> = const {
         std::cell::Cell::new(FfiOhttpDecodeOutcome { kind: 5, http_status: 0, retry_not_before_ns: 0 })
     };
@@ -69,7 +70,16 @@ pub extern "C" fn zcashlc_ohttp_last_failure_kind() -> u32 {
     LAST_DECODE_OUTCOME.get().kind
 }
 
+/// Authenticated canonical gRPC status from the immediately preceding decode call.
+/// -1 means absent or invalid; zero does not establish complete-body success.
+/// Copy on the same thread before cleanup, alongside the legacy decode outcome.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_last_grpc_status() -> i32 {
+    LAST_GRPC_STATUS.get()
+}
+
 fn reset_decode_outcome() {
+    LAST_GRPC_STATUS.set(-1);
     LAST_DECODE_OUTCOME.set(FfiOhttpDecodeOutcome {
         kind: 5,
         ..Default::default()
@@ -577,6 +587,8 @@ pub struct OhttpStreamDecoder {
     inner: ChunkedResponseDecoder,
     framing: ResponseFraming,
     outcome: FfiOhttpDecodeOutcome,
+    grpc_status: i32,
+    grpc_response: bool,
 }
 
 /// Only locates wire chunk boundaries. The existing decoder owns all validation,
@@ -638,28 +650,70 @@ impl OhttpStreamDecoder {
             inner,
             framing: ResponseFraming::default(),
             outcome: FfiOhttpDecodeOutcome::default(),
+            grpc_status: -1,
+            grpc_response: false,
         }
+    }
+
+    fn publish(&self) {
+        LAST_DECODE_OUTCOME.set(self.outcome);
+        LAST_GRPC_STATUS.set(self.grpc_status);
     }
 
     fn remember(&mut self, events: &[ResponseEvent]) {
+        fn grpc_status(fields: &[(String, String)]) -> Option<i32> {
+            fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("grpc-status"))
+                .map(|(_, value)| {
+                    (0..=16)
+                        .find(|status| value == &status.to_string())
+                        .unwrap_or(-1)
+                })
+        }
         for event in events {
-            if let ResponseEvent::Head { status, headers } = event {
-                self.outcome.http_status = *status;
-                self.outcome.retry_not_before_ns = crate::retry_not_before_ns(
-                    *status,
-                    headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-                        .map(|(_, value)| value.as_str()),
-                    slipstream_core::transport_health::monotonic_time_nanoseconds(),
-                );
+            match event {
+                ResponseEvent::Head { status, headers } => {
+                    self.outcome.http_status = *status;
+                    self.outcome.retry_not_before_ns = crate::retry_not_before_ns(
+                        *status,
+                        headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                            .map(|(_, value)| value.as_str()),
+                        slipstream_core::transport_health::monotonic_time_nanoseconds(),
+                    );
+                    self.grpc_response = *status == 200
+                        && headers.iter().any(|(name, value)| {
+                            let media = value
+                                .split(';')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_lowercase();
+                            name.eq_ignore_ascii_case("content-type")
+                                && (media == "application/grpc"
+                                    || media.starts_with("application/grpc+"))
+                        });
+                    self.grpc_status = if self.grpc_response {
+                        grpc_status(headers).unwrap_or(-1)
+                    } else {
+                        -1
+                    };
+                }
+                ResponseEvent::Trailers(trailers) if self.grpc_response => {
+                    if let Some(status) = grpc_status(trailers) {
+                        self.grpc_status = status;
+                    }
+                }
+                _ => {}
             }
         }
-        LAST_DECODE_OUTCOME.set(self.outcome);
+        self.publish();
     }
 
     fn push(&mut self, mut input: &[u8]) -> Result<Vec<ResponseEvent>, zodl_ohttp_client::Error> {
-        LAST_DECODE_OUTCOME.set(self.outcome);
+        self.publish();
         let mut events = Vec::new();
         while !input.is_empty() {
             let count = self.framing.span(input);
@@ -672,7 +726,7 @@ impl OhttpStreamDecoder {
     }
 
     fn finish(&mut self) -> Result<Vec<ResponseEvent>, zodl_ohttp_client::Error> {
-        LAST_DECODE_OUTCOME.set(self.outcome);
+        self.publish();
         let events = self.inner.finish()?;
         self.remember(&events);
         Ok(events)
@@ -1636,6 +1690,21 @@ mod tests {
     // Build a cryptographically authenticated non-final response chunk from the real request.
     // The final chunk is deliberately absent; the business decoder must still reject the response.
     fn authenticated_rejection(status: u16) -> (*mut OhttpOpener, Vec<u8>) {
+        // Indeterminate-length BHTTP response, final status, Retry-After header, end of headers.
+        let mut head = vec![3, 0x40 | ((status >> 8) as u8), status as u8, 11];
+        head.extend_from_slice(b"retry-after");
+        head.extend_from_slice(&[3, b'1', b'2', b'0']);
+        if status == 429 {
+            head.push(7);
+            head.extend_from_slice(b"padding");
+            head.extend_from_slice(&[0x40, 70]);
+            head.extend_from_slice(&[b'x'; 70]);
+        }
+        head.push(0);
+        authenticated_response(head)
+    }
+
+    fn authenticated_response(head: Vec<u8>) -> (*mut OhttpOpener, Vec<u8>) {
         use aes_gcm::{
             Aes128Gcm, Nonce,
             aead::{Aead, KeyInit},
@@ -1670,18 +1739,7 @@ mod tests {
         let mut iv = [0; 12];
         hkdf.expand(b"key", &mut key).unwrap();
         hkdf.expand(b"nonce", &mut iv).unwrap();
-        // Indeterminate-length BHTTP response, final status, Retry-After header, end of headers.
-        let mut head = vec![3, 0x40 | ((status >> 8) as u8), status as u8, 11];
-        head.extend_from_slice(b"retry-after");
-        head.extend_from_slice(&[3, b'1', b'2', b'0']);
-        if status == 429 {
-            // Exercise a two-byte wire length, including splits inside its prefix and payload.
-            head.push(7);
-            head.extend_from_slice(b"padding");
-            head.extend_from_slice(&[0x40, 70]);
-            head.extend_from_slice(&[b'x'; 70]);
-        }
-        head.push(0);
+        let head = head;
         let sealed = Aes128Gcm::new_from_slice(&key)
             .unwrap()
             .encrypt(Nonce::from_slice(&iv), head.as_slice())
@@ -1694,6 +1752,127 @@ mod tests {
         response.push(sealed.len() as u8);
         response.extend_from_slice(&sealed);
         (opener, response)
+    }
+
+    fn grpc_response(
+        status: Option<&str>,
+        trailers: Option<&str>,
+        media: &str,
+    ) -> (*mut OhttpOpener, Vec<u8>) {
+        fn field(head: &mut Vec<u8>, name: &str, value: &str) {
+            head.push(name.len() as u8);
+            head.extend_from_slice(name.as_bytes());
+            head.push(value.len() as u8);
+            head.extend_from_slice(value.as_bytes());
+        }
+        let mut head = vec![3, 0x40, 200];
+        field(&mut head, "content-type", media);
+        if let Some(status) = status {
+            field(&mut head, "grpc-status", status);
+        }
+        head.push(0);
+        if let Some(status) = trailers {
+            head.push(0); // End of indeterminate body.
+            field(&mut head, "grpc-status", status);
+            head.push(0); // End of trailers.
+        }
+        authenticated_response(head)
+    }
+
+    #[test]
+    fn authenticated_grpc_rejection_survives_missing_final_chunk() {
+        for (status, media, expected) in [
+            (Some("7"), "application/grpc", 7),
+            (Some("16"), "application/grpc+proto", 16),
+            (Some("14"), "application/grpc; charset=utf-8", 14),
+            (Some("0"), "application/grpc", 0),
+            (None, "application/grpc", -1),
+            (Some("17"), "application/grpc", -1),
+            (Some("-1"), "application/grpc", -1),
+            (Some("07"), "application/grpc", -1),
+            (Some("bad"), "application/grpc", -1),
+            (Some("7"), "text/plain", -1),
+        ] {
+            let (opener, wire) = grpc_response(status, None, media);
+            let result = unsafe {
+                zcashlc_ohttp_complete(IOS, opener, 200, ptr::null(), wire.as_ptr(), wire.len(), 0)
+            };
+            assert!(result.is_null());
+            assert_eq!(zcashlc_ohttp_last_decode_outcome().kind, 2);
+            assert_eq!(
+                zcashlc_ohttp_last_grpc_status(),
+                expected,
+                "{status:?} {media}"
+            );
+            assert_eq!(std::mem::size_of::<FfiOhttpDecodeOutcome>(), 16);
+        }
+        for split in [0, 1, 16, 17, 35] {
+            let (opener, mut wire) = grpc_response(Some("7"), None, "application/grpc");
+            wire.extend_from_slice(&[17u8; 18]);
+            let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+            let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), split) };
+            assert!(!events.is_null());
+            unsafe { zcashlc_free_ohttp_stream_events(events) };
+            assert!(
+                unsafe {
+                    zcashlc_ohttp_stream_push(decoder, wire[split..].as_ptr(), wire.len() - split)
+                }
+                .is_null()
+            );
+            assert_eq!(zcashlc_ohttp_last_grpc_status(), 7);
+            unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+        }
+    }
+
+    #[test]
+    fn authenticated_grpc_metadata_preserves_trailer_precedence() {
+        for (trailer, expected) in [("16", 16), ("14", 14), ("0", 0), ("bad", -1), ("17", -1)] {
+            let (opener, wire) = grpc_response(Some("7"), Some(trailer), "application/grpc");
+            let decoder = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+            let events = unsafe { zcashlc_ohttp_stream_push(decoder, wire.as_ptr(), wire.len()) };
+            assert!(!events.is_null());
+            unsafe { zcashlc_free_ohttp_stream_events(events) };
+            assert_eq!(zcashlc_ohttp_last_grpc_status(), expected);
+            assert!(unsafe { zcashlc_ohttp_stream_finish(decoder) }.is_null());
+            assert_eq!(zcashlc_ohttp_last_grpc_status(), expected);
+            unsafe { zcashlc_ohttp_stream_decoder_free(decoder) };
+        }
+    }
+
+    #[test]
+    fn grpc_metadata_isolated_across_decoders_and_threads() {
+        let (opener, wire) = grpc_response(Some("7"), None, "application/grpc");
+        let first = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+        let events = unsafe { zcashlc_ohttp_stream_push(first, wire.as_ptr(), wire.len()) };
+        assert!(!events.is_null());
+        unsafe { zcashlc_free_ohttp_stream_events(events) };
+        assert_eq!(zcashlc_ohttp_last_grpc_status(), 7);
+        assert_eq!(
+            std::thread::spawn(|| zcashlc_ohttp_last_grpc_status())
+                .join()
+                .unwrap(),
+            -1
+        );
+        let (opener, mut wire) = grpc_response(Some("16"), None, "application/grpc");
+        let second = unsafe { zcashlc_ohttp_stream_decoder(opener) };
+        wire[20] ^= 1;
+        assert!(unsafe { zcashlc_ohttp_stream_push(second, wire.as_ptr(), wire.len()) }.is_null());
+        assert_eq!(zcashlc_ohttp_last_grpc_status(), -1);
+        assert!(unsafe { zcashlc_ohttp_stream_finish(first) }.is_null());
+        assert_eq!(zcashlc_ohttp_last_grpc_status(), 7);
+        unsafe {
+            zcashlc_ohttp_stream_decoder_free(first);
+            zcashlc_ohttp_stream_decoder_free(second);
+        }
+        assert!(unsafe { zcashlc_ohttp_stream_finish(ptr::null_mut()) }.is_null());
+        assert_eq!(zcashlc_ohttp_last_grpc_status(), -1);
+        assert!(
+            unsafe {
+                zcashlc_ohttp_complete(IOS, ptr::null_mut(), 200, ptr::null(), ptr::null(), 0, 0)
+            }
+            .is_null()
+        );
+        assert_eq!(zcashlc_ohttp_last_grpc_status(), -1);
     }
 
     #[test]

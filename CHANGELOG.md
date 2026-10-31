@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Buffered OHTTP health retains authenticated gRPC rejection status when later decoding fails.
+  Policy rejections (7 and 16) and backend unavailability (14) keep their health classification
+  through a missing final chunk. A zero status alone never establishes complete-body success,
+  and original RPC errors and HTTP rejection precedence are unchanged.
+
 - `OHTTPHealthSnapshot` preserves ordinary recovery evidence beside diagnostic observations
   and later completions from older requests. Ordinary route success keeps its greatest request
   start and original metadata; failure ordering is unchanged. No caller changes are needed.

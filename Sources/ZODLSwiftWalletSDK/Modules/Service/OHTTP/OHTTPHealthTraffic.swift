@@ -66,8 +66,13 @@ final class OHTTPHealthTraffic: Sendable {
         }
     }
 
-    func nativeFailure(_ native: FfiOhttpDecodeOutcome) {
-        if !decodedHead(native) { nativeFailure(native.kind) }
+    func nativeFailure(_ native: FfiOhttpDecodeOutcome, grpcStatus: Int32 = -1) {
+        if decodedHead(native) { return }
+        if (1...16).contains(grpcStatus) {
+            classify(Self.grpcOutcome(grpcStatus))
+        } else {
+            nativeFailure(native.kind)
+        }
     }
 
     @discardableResult
@@ -160,7 +165,11 @@ final class OHTTPHealthTraffic: Sendable {
         }
         let outcome = statusOutcome(response.status)
         guard outcome == .usable, let status = response.field("grpc-status"), status != "0" else { return outcome }
-        switch Int(status) {
+        return grpcOutcome(Int32(status) ?? -1)
+    }
+
+    private static func grpcOutcome(_ status: Int32) -> OHTTPHealthOutcome {
+        switch status {
         case 1: return .cancelled
         case 4, 14: return .backendUnavailable
         case 7, 16: return .policyRejected

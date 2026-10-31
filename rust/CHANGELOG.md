@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OHTTP decoding failures preserve authenticated canonical gRPC status from HTTP 200
+  application/grpc heads and trailers, with trailers taking precedence. Metadata is isolated
+  per decoder and thread and resets with each complete/push/finish call. Legacy failure kinds
+  and the 16-byte `FfiOhttpDecodeOutcome` layout are unchanged.
+
 - OHTTP complete/push/finish retain authenticated inner rejection metadata across truncated or rejected
   later chunks. `zcashlc_ohttp_last_decode_outcome` exposes the kind, HTTP status and absolute
   CLOCK_MONOTONIC `retry_not_before_ns`; read it immediately on the same thread before cleanup.
@@ -31,6 +36,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged.
 
 ### Added
+
+- `zcashlc_ohttp_last_grpc_status` returns the immediately preceding decode call's authenticated
+  canonical status (0 through 16), or -1 when absent or invalid. Copy it immediately on the same
+  thread alongside `zcashlc_ohttp_last_decode_outcome`, before cleanup or another native call.
+  Zero describes an authenticated status and does not establish complete-body success.
 
 - `zcashlc_tor_http_post_once_with_timeout` and `zcashlc_tor_http_get_classified_with_timeout`
   provide additive bounded HTTP calls with `FfiTorHttpOutcome` metadata for deadline, transport,

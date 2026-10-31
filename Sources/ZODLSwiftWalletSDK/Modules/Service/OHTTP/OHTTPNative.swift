@@ -331,8 +331,9 @@ final class OHTTPPendingResponse: @unchecked Sendable {
             }
         }
         let decoded = zcashlc_ohttp_last_decode_outcome()
+        let grpcStatus = zcashlc_ohttp_last_grpc_status()
         guard let result else {
-            OHTTPHealthTraffic.current?.nativeFailure(decoded)
+            OHTTPHealthTraffic.current?.nativeFailure(decoded, grpcStatus: grpcStatus)
             throw OHTTPError.native(lastErrorMessage(fallback: "OHTTP response could not be opened"))
         }
         OHTTPHealthTraffic.current?.decodedHead(decoded)

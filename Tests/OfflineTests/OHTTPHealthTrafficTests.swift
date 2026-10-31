@@ -20,6 +20,73 @@ final class OHTTPHealthTrafficTests: XCTestCase {
         )
     }
 
+    private struct GRPCFailureCase {
+        let status: String?
+        let trailer: String?
+        let corrupt: Bool
+        let nativeStatus: Int32
+        let outcome: OHTTPHealthOutcome
+    }
+
+    @available(iOS 17, macOS 14, *)
+    func testBufferedAuthenticatedGRPCRejectionSurvivesNativeDecodeFailure() throws {
+        let cases = [
+            GRPCFailureCase(status: "7", trailer: nil, corrupt: false, nativeStatus: 7, outcome: .policyRejected),
+            GRPCFailureCase(status: "16", trailer: nil, corrupt: false, nativeStatus: 16, outcome: .policyRejected),
+            GRPCFailureCase(status: "14", trailer: nil, corrupt: false, nativeStatus: 14, outcome: .backendUnavailable),
+            GRPCFailureCase(status: "12", trailer: nil, corrupt: false, nativeStatus: 12, outcome: .responseRejected),
+            GRPCFailureCase(status: "0", trailer: nil, corrupt: false, nativeStatus: 0, outcome: .transportUnavailable),
+            GRPCFailureCase(status: nil, trailer: nil, corrupt: false, nativeStatus: -1, outcome: .transportUnavailable),
+            GRPCFailureCase(status: "bad", trailer: nil, corrupt: false, nativeStatus: -1, outcome: .transportUnavailable),
+            GRPCFailureCase(status: "7", trailer: "14", corrupt: false, nativeStatus: 14, outcome: .backendUnavailable),
+            GRPCFailureCase(status: "7", trailer: "0", corrupt: false, nativeStatus: 0, outcome: .transportUnavailable),
+            GRPCFailureCase(status: "7", trailer: nil, corrupt: true, nativeStatus: -1, outcome: .responseRejected)
+        ]
+        for item in cases {
+            let route = route()
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let traffic = OHTTPHealthTraffic(route: route, request: OHTTPTestSupport.simpleRequest)
+            let peer = try OHTTPTestSupport.grpcPeerResponse(status: item.status, trailer: item.trailer, corrupt: item.corrupt)
+            OHTTPHealthTraffic.$current.withValue(traffic) {
+                do {
+                    _ = try peer.pending.complete(status: 200, contentType: "message/ohttp-chunked-res", body: peer.body, attempt: 0)
+                    XCTFail("The original native decoding error must still be thrown")
+                } catch {
+                    XCTAssertEqual(zcashlc_ohttp_last_grpc_status(), item.nativeStatus)
+                    if item.corrupt {
+                        guard case .binaryHttpError = error as? OHTTPError else { return XCTFail("Expected original authentication error") }
+                    } else {
+                        guard case .transportError(let message) = error as? OHTTPError else { return XCTFail("Expected original truncation error") }
+                        XCTAssertTrue(message.hasPrefix("the gateway's answer ended before its final chunk"))
+                    }
+                    traffic.failed(error)
+                }
+            }
+            let outcomes = session.snapshot().observations.map(\.outcome)
+            XCTAssertTrue(outcomes.contains(item.outcome), "status=\(item.status ?? "absent") trailer=\(item.trailer ?? "absent")")
+            if item.outcome != .transportUnavailable { XCTAssertFalse(outcomes.contains(.transportUnavailable)) }
+            XCTAssertFalse(
+                session.snapshot().observations.contains { $0.scope != .route && $0.outcome == .usable },
+                "An authenticated head cannot establish complete-body success"
+            )
+        }
+    }
+
+    @available(iOS 17, macOS 14, *)
+    func testBufferedCompleteGRPCResponseUsesFinalStatusWithoutEarlyHeaderFailure() throws {
+        for (header, trailer, expected) in [("7", "0", OHTTPHealthOutcome.usable), ("0", "16", .policyRejected), ("14", "7", .policyRejected)] {
+            let traffic = OHTTPHealthTraffic(route: route(), request: OHTTPTestSupport.simpleRequest)
+            let peer = try OHTTPTestSupport.grpcPeerResponse(status: header, trailer: trailer, complete: true)
+            try OHTTPHealthTraffic.$current.withValue(traffic) {
+                let completed = try peer.pending.complete(status: 200, contentType: "message/ohttp-chunked-res", body: peer.body, attempt: 0)
+                guard case .response(let response) = completed else { return XCTFail("Expected complete response") }
+                XCTAssertNil(traffic.failure, "Header status must not latch before body completion")
+                XCTAssertEqual(OHTTPHealthTraffic.responseOutcome(response), expected)
+            }
+        }
+    }
+
     func testUnaryTransportFailureRetainsOriginalOperationWithoutChangingError() async throws {
         let route = route()
         let session = try OHTTPHealthSession(route: route, generation: UUID())
