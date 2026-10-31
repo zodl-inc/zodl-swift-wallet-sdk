@@ -8,6 +8,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
+  including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted
+  fallback, known-on-server recovery, local creation failures and unresolved timeouts do not reuse
+  earlier network failures. Transaction results and retries are unchanged. Keep `withAttempt` active
+  while consuming a submission stream, then publish the business result and release transaction
+  guards before calling `complete`. Attempts retain at most 64 terminal request identities; exceeding
+  that limit leaves the completion without attributed evidence.
+
 - OHTTP health preserves an authenticated rejection when response decoding or body collection fails.
   Diagnostic key fallback stops on a known rate limit, and Retry-After keeps its original head-time
   deadline through delayed bodies and cleanup. Public RPC errors and submission behavior are unchanged.
@@ -46,6 +54,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small frame per compact block, stay within the limit. No caller changes are required.
 
 ## Added
+
+- `OHTTPHealthContext.withBackground(operation:)` clears inherited user-operation attribution for
+  automatic refreshes, retries and other background work. Wrap those awaits in this scope; real
+  requests still update global connection health.
 
 - Concrete synchronizers implement `OHTTPHealthProviding` to create a health session and run a
   fresh read-only diagnostic using their selected OHTTP endpoint and Tor runtime. Diagnostics use

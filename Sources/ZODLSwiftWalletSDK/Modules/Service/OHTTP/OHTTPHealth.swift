@@ -164,8 +164,18 @@ public enum OHTTPHealthContext {
         }
     }
 
+    /// Automatic retries, timers and follow-up work must not inherit a user's action identity.
+    public static func withBackground<T: Sendable>(operation work: @Sendable () async throws -> T) async rethrows -> T {
+        try await $attempt.withValue(nil) {
+            try await $operation.withValue(nil) { try await work() }
+        }
+    }
+
     /// Scope only the network await whose final failure may determine the operation result.
     /// Nested foreign operations and reused attempt tokens never inherit attribution.
+    /// For a lazy submission stream, keep this scope active until consumption finishes. SDK
+    /// submission owners select their terminal child internally; the caller still decides whether
+    /// the final business result failed before supplying this token to `complete`.
     public static func withAttempt<T: Sendable>(
         _ attempt: OHTTPHealthAttempt,
         operation work: @Sendable () async throws -> T

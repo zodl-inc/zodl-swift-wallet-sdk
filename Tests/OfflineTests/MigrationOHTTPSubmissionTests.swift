@@ -61,6 +61,73 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
         )
     }
 
+    private struct AttributedClient: MigrationOHTTPClient {
+        let route: OHTTPHealthRoute
+        let failure: String
+        func latestBlock() async throws -> BlockID {
+            OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: failure == "height" ? .transportUnavailable : .usable, stage: .complete)
+            if failure == "height" { throw Failure.height }
+            var block = BlockID()
+            block.height = 4_465_026
+            return block
+        }
+        func submit(_ transaction: RawTransaction) async throws -> SendResponse {
+            OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .policyRejected, stage: .responseHead)
+            throw Failure.height
+        }
+    }
+
+    func testMigrationSelectsActualFailedStageAndExcludesPreparationFailures() async throws {
+        for failure in ["key", "height", "preparation", "submit"] {
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let calls = State()
+            let broadcaster = MigrationBroadcaster(
+                torDirURL: testGeneralStorageDirectory, logger: logger,
+                torClientFactory: { _ in throw Failure.bootstrap }, networkType: .testnet,
+                ohttpClientFactory: { _ in
+                    calls.event("client")
+                    if failure == "key" {
+                        OHTTPHealthCenter.shared.begin(route: route, scope: .route).record(outcome: .transportUnavailable, stage: .keyConfiguration)
+                        throw Failure.bootstrap
+                    }
+                    return AttributedClient(route: route, failure: failure)
+                }
+            )
+            let operation = OHTTPHealthOperation()
+            let attempt = OHTTPHealthAttempt(operation: operation)
+            await OHTTPHealthContext.withOperation(operation) {
+                await OHTTPHealthContext.withAttempt(attempt) {
+                    OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
+                    do {
+                        let result = try await broadcaster.broadcast(to: self.endpoint, useTor: false, onWillSubmit: { calls.event("willSubmit") }) { _ in
+                            calls.event("prepare")
+                            if failure == "preparation" { throw Failure.preparation }
+                            return Data([1])
+                        }
+                        XCTAssertEqual(result, .transportError)
+                        XCTAssertNotEqual(failure, "preparation")
+                    } catch Failure.preparation {
+                        XCTAssertEqual(failure, "preparation")
+                    } catch { XCTFail("Unexpected error: \(error)") }
+                }
+            }
+            let updates = session.updates()
+            await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+            for await update in updates {
+                if case .operationCompleted(_, _, let observations) = update {
+                    let expected: [OHTTPHealthOutcome] = failure == "preparation" ? [] : [failure == "submit" ? .policyRejected : .transportUnavailable]
+                    XCTAssertEqual(observations.map(\.outcome), expected, failure)
+                    XCTAssertFalse(observations.contains { $0.scope == .swaps }, failure)
+                    break
+                }
+            }
+            let expectedEvents = failure == "submit" ? ["client", "prepare", "willSubmit"] : failure == "preparation" ? ["client", "prepare"] : ["client"]
+            XCTAssertEqual(calls.values.withLock { $0.events }, expectedEvents)
+        }
+    }
+
     func testGatewayReadsHeightBeforePreparationAndSubmit() async throws {
         let state = State()
         let client = Client(state: state)

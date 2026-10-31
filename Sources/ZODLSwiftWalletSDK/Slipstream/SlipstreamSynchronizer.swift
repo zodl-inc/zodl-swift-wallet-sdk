@@ -3298,6 +3298,7 @@ private extension SlipstreamSynchronizer {
     // "trust the network over the submit-side error" recovery branch. Submission is shared SDK
     // logic — slipstream only owns the sync path — so this stays byte-for-byte the SDK behaviour.
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
@@ -3307,8 +3308,11 @@ private extension SlipstreamSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                let attempt = health.makeAttempt()
                 do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    try await health.withAttempt(attempt) {
+                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    }
                     // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
                     // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
                     // ring event for ring consumers) — the poll loop's version compare re-fetches
@@ -3319,19 +3323,26 @@ private extension SlipstreamSynchronizer {
                 } catch ZcashError.serviceSubmitFailed(let error) {
                     // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
                     // If the server already has this tx, the broadcast landed — treat as success.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                    if await health.withAttempt(health.makeAttempt(), operation: {
+                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                    }) {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 } catch TransactionEncoderError.notSubmittable(let refusal) {
                     // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
                     // network, so there is no server to ask whether it knows the transaction.
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                } catch {
+                    health.adoptFailure(from: attempt)
+                    throw error
                 }
             }
         })

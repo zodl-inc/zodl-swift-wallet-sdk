@@ -557,6 +557,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
@@ -566,28 +567,38 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                let attempt = health.makeAttempt()
                 do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    try await health.withAttempt(attempt) {
+                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    }
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
                     // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
                     // Trust the network over the submit-side error: if the server confirms
                     // it has this tx, the broadcast already landed (e.g. Zebra's
                     // MempoolError::InMempool / AlreadyQueued, zcashd's "already in chain",
                     // or any future variant). Treat as success and skip the failure screen.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                    if await health.withAttempt(health.makeAttempt(), operation: {
+                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                    }) {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 } catch TransactionEncoderError.notSubmittable(let refusal) {
                     // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
                     // network, so there is no server to ask whether it knows the transaction.
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                } catch {
+                    health.adoptFailure(from: attempt)
+                    throw error
                 }
             }
         })

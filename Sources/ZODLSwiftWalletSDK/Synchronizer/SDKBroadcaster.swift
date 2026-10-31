@@ -62,6 +62,7 @@ final class SDKBroadcaster: Broadcaster {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> TransactionSubmissionOutcome {
+        OHTTPHealthContext.attempt?.beginDelegation()
         let txId = transaction.txId.toHexStringTxId()
 
         guard !endpoints.isEmpty else {
@@ -123,6 +124,7 @@ final class SDKBroadcaster: Broadcaster {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> [TransactionSubmissionReport] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         logger.debug("Batch submitting \(transactions.count) transaction(s).")
         var reports: [TransactionSubmissionReport] = []
         var stopped = false
@@ -156,6 +158,7 @@ final class SDKBroadcaster: Broadcaster {
         ovkPolicy: OvkPolicy = .sender,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         try statusCheck()
 
         // Captured before the (potentially slow) sapling-parameter download and proving work so a
@@ -189,6 +192,7 @@ final class SDKBroadcaster: Broadcaster {
         pcztWithSigs: Pczt,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         try statusCheck()
 
         // Captured before the (potentially slow) sapling-parameter download and PCZT extraction so

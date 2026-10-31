@@ -231,6 +231,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         onWillSubmit: @Sendable () -> Void,
         prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
+        OHTTPHealthContext.attempt?.beginDelegation()
         let torModeOn = await torMode()
         if useTor || torModeOn {
             return try await broadcastOverTor(
@@ -307,9 +308,11 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         if OHTTPEndpoints.isGateway(endpoint.host) {
             let client: any MigrationOHTTPClient
             do {
-                let isolated = try await runtime.isolatedClient()
-                client = try await preparedOHTTPClient(for: endpoint, viaTor: true) { request, maxBytes in
-                    try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                client = try await OHTTPHealthFailureOwner().request {
+                    let isolated = try await runtime.isolatedClient()
+                    return try await preparedOHTTPClient(for: endpoint, viaTor: true) { request, maxBytes in
+                        try await isolated.httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                    }
                 }
             } catch {
                 logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host) over Tor: \(error)")
@@ -370,13 +373,15 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         if OHTTPEndpoints.isGateway(endpoint.host) {
             let client: any MigrationOHTTPClient
             do {
-                client = try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
-                    // S4: use boundedDataWithDeadline for 100s timeout
-                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(for: request, maxBytes: maxBytes)
-                    guard let httpResponse = response as? HTTPURLResponse else {
-                        throw OHTTPError.transportError("Invalid response type")
+                client = try await OHTTPHealthFailureOwner().request {
+                    return try await preparedOHTTPClient(for: endpoint, viaTor: false) { request, maxBytes in
+                        // S4: use boundedDataWithDeadline for 100s timeout
+                        let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(for: request, maxBytes: maxBytes)
+                        guard let httpResponse = response as? HTTPURLResponse else {
+                            throw OHTTPError.transportError("Invalid response type")
+                        }
+                        return (data, httpResponse)
                     }
-                    return (data, httpResponse)
                 }
             } catch {
                 logger.error("MigrationBroadcaster: could not reach the OHTTP relay of \(endpoint.host): \(error)")
@@ -496,9 +501,10 @@ private extension MigrationBroadcaster {
         onWillSubmit: @Sendable () -> Void,
         prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
     ) async throws -> MigrationBroadcastOutcome {
+        let health = OHTTPHealthFailureOwner()
         let serverHeight: BlockHeight
         do {
-            let latestBlock = try await client.latestBlock()
+            let latestBlock = try await health.request { try await client.latestBlock() }
             guard let height = BlockHeight(serverHeight: latestBlock.height) else {
                 logger.error("MigrationBroadcaster: the OHTTP submission server reported an unusable latest block height")
                 return MigrationBroadcastOutcome.transportError
@@ -515,7 +521,7 @@ private extension MigrationBroadcaster {
         transaction.data = rawTransaction
         onWillSubmit()
         do {
-            let response = try await client.submit(transaction)
+            let response = try await health.request { try await client.submit(transaction) }
             return outcome(from: response)
         } catch {
             logger.error("MigrationBroadcaster: OHTTP submit failure: \(error.localizedDescription)")
