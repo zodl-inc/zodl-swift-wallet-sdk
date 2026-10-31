@@ -8,6 +8,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
+  For custom regtest snapshots at height 11 or later, the registered activation schedule must
+  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
 - The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
   which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
   (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
