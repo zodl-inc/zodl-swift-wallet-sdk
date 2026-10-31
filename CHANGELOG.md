@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- The source-built native dependency includes the rejected-response body-failure classification
+  correction. All five configured architectures use the same pinned native revision.
+
 - `probeOHTTPHealth(session:)` preserves authenticated inner HTTP and gRPC rejection outcomes,
   including the original Retry-After deadline. RPC errors and caller code are unchanged.
 
@@ -16,6 +19,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence
   or late rate-limit replay to replacement sessions.
   An unexpired server pause accepted before retirement still prevents diagnostics on the same route after replacement.
+  Consumers should retain `OHTTPHealthProviding.ohttpHealthBinding`, wait for its ready publication,
+  and create a new session through that provider after resource replacement. Recheck
+  `OHTTPHealthSession.bindingID` against the ready binding and `OHTTPHealthSession.isValid` before
+  consuming evidence or probing. `OHTTPHealthError.bindingUnavailable` defers setup until the binding
+  is ready. Provider probes cancel foreign, retired and directly constructed unbound sessions before
+  dispatch; direct session construction does not establish provider ownership.
 
 - `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
   including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted

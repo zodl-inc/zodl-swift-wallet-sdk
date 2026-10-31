@@ -514,6 +514,138 @@ final class OHTTPHealthLifecycleTests: ZcashTestCase {
         XCTAssertFalse(later.snapshot().observations.contains { $0.purpose == .diagnostic }, "Expired pauses and availability do not replay")
     }
 
+    func testActualOuterPauseCacheSeparatesAcceptedAndRetiredSenderCompletion() async throws {
+        for retireBeforeResponse in [false, true] {
+            let engine = GatedFakeSlipstreamEngine()
+            let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
+            await sync.setInternalSyncStatusForTesting(.disconnected)
+            let old = try await session(sync)
+            let entered = expectation(description: "actual relay sender entered")
+            let release = Gate()
+            let posts = OSAllocatedUnfairLock(initialState: 0)
+            let originalRequest = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
+            let transport = OHTTPTransport(
+                gatewayHost: old.route.gatewayHost,
+                relayURL: old.route.relayURL,
+                walletNetwork: .testnet,
+                testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+                streamSender: { _, _ in
+                    posts.withLock { $0 += 1 }
+                    originalRequest.withLock { $0 = OHTTPHealthTraffic.current?.ticket.requestID }
+                    entered.fulfill()
+                    await release.wait()
+                    return OHTTPOuterStream(status: 429, contentType: nil, retryAfter: "1", body: AsyncThrowingStream { $0.finish() })
+                },
+                httpSender: { request, _ in
+                    (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+                }
+            )
+            let client = OHTTPGRPCClient(
+                authority: old.route.gatewayHost,
+                transport: transport,
+                singleCallTimeoutMS: 5000,
+                streamingCallTimeoutMS: 5000
+            )
+            defer {
+                release.open()
+                old.close()
+                sync.stop()
+            }
+            let probe = Task {
+                await OHTTPHealthProbe.run(session: old) { budget in
+                    try budget.admit()
+                    return try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
+                }
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            if retireBeforeResponse {
+                try await sync.restartSync(at: endpoint)
+                await sync.stopAndWait()
+                XCTAssertFalse(old.isValid)
+                probe.cancel()
+            }
+            let beforeResponse = OHTTPHealthClock.nowNanoseconds
+            release.open()
+            let result = await probe.value
+            let afterResponse = OHTTPHealthClock.nowNanoseconds
+            XCTAssertEqual(posts.withLock { $0 }, 1)
+            let cacheKey = "\(old.route.relayURL)|direct"
+            let cachedDeadline = await OHTTPKeyCache.shared.backoffDeadline(for: cacheKey)
+            let transportDeadline = try XCTUnwrap(cachedDeadline)
+            XCTAssertGreaterThan(transportDeadline.timeIntervalSinceNow, 0)
+            XCTAssertLessThanOrEqual(transportDeadline.timeIntervalSinceNow, 1)
+            if !retireBeforeResponse {
+                guard case .rateLimited(let deadline) = result.outcome else { return XCTFail("Accepted outer pause must remain typed") }
+                XCTAssertGreaterThanOrEqual(deadline, beforeResponse + 1_000_000_000)
+                XCTAssertLessThanOrEqual(deadline, afterResponse + 1_000_000_000)
+                try await sync.restartSync(at: endpoint)
+                await sync.stopAndWait()
+                let current = try await session(sync)
+                let paused = await OHTTPHealthProbe.run(session: current) { _ in
+                    XCTFail("Accepted pause must prevent replacement dispatch")
+                    return .usable
+                }
+                XCTAssertEqual(paused.outcome, result.outcome)
+                current.close()
+            } else {
+                XCTAssertEqual(result.outcome, .cancelled)
+                let current = try await session(sync)
+                XCTAssertFalse(current.snapshot().observations.contains { $0.purpose == .diagnostic })
+                current.close()
+                let later = try await session(sync)
+                XCTAssertFalse(
+                    later.snapshot().observations.contains { $0.purpose == .diagnostic },
+                    "Late sender completion cannot replay old health"
+                )
+                let freshStart = OHTTPHealthClock.nowNanoseconds
+                let fresh = OHTTPTransport(
+                    gatewayHost: old.route.gatewayHost,
+                    relayURL: old.route.relayURL,
+                    walletNetwork: .testnet,
+                    httpSender: { _, _ in
+                        XCTFail("The shared server pause must prevent fresh network dispatch")
+                        throw URLError(.cannotConnectToHost)
+                    }
+                )
+                let localPause = await OHTTPHealthProbe.run(session: later) { budget in
+                    try budget.admit()
+                    _ = try await fresh.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+                    return .usable
+                }
+                guard case .rateLimited = localPause.outcome else { return XCTFail("Fresh request must observe local transport backoff") }
+                let newEvidence = later.snapshot().observations.filter { $0.purpose == .diagnostic }
+                XCTAssertFalse(newEvidence.isEmpty)
+                XCTAssertTrue(
+                    newEvidence.allSatisfy {
+                        !$0.historical && $0.generation == later.generation && $0.startedAtNanoseconds >= freshStart &&
+                        $0.requestID != originalRequest.withLock { $0 }
+                    },
+                    "A later local backoff is fresh current-owner evidence, never retired-sender replay"
+                )
+                later.close()
+            }
+            // A real server response still owns the transport pause even after caller retirement.
+            // A second transport sharing the production cache must fail locally without sending.
+            let next = OHTTPTransport(gatewayHost: old.route.gatewayHost, relayURL: old.route.relayURL)
+            do {
+                try await next.checkRelayBackoff()
+                XCTFail("The existing shared transport pause must be preserved")
+            } catch {
+                guard case .httpStatusError(let status, _) = error as? OHTTPError else {
+                    return XCTFail("Expected unchanged local backoff error")
+                }
+                XCTAssertEqual(status, 429)
+            }
+            let unchangedDeadline = await OHTTPKeyCache.shared.backoffDeadline(for: cacheKey)
+            XCTAssertEqual(unchangedDeadline, transportDeadline)
+            let remaining = transportDeadline.timeIntervalSinceNow
+            if remaining > 0 { try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000) + 1_000_000) }
+            try await next.checkRelayBackoff()
+            old.close()
+            sync.stop()
+        }
+    }
+
     func testDelayedDiagnosticChildCannotCaptureReplacementSession() async throws {
         let engine = GatedFakeSlipstreamEngine()
         let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
