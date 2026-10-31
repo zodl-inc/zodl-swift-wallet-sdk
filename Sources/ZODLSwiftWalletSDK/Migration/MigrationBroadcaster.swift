@@ -472,12 +472,13 @@ extension MigrationBroadcaster {
         viaTor: Bool,
         keyCache: OHTTPKeyCache = .shared,
         testKeyVerifier: OHTTPTransport.KeyVerifier? = nil,
+        testRelayURL: String? = nil,
         httpSender: @escaping OHTTPTransport.HTTPSender
     ) async throws -> any MigrationOHTTPClient {
         if let ohttpClientFactory {
             return try await ohttpClientFactory(endpoint)
         }
-        let relayURL = try OHTTPEndpoints.relayURL(for: endpoint.host)
+        let relayURL = try testRelayURL ?? OHTTPEndpoints.relayURL(for: endpoint.host)
         // S7: pass wallet network for gateway validation
         let transport = OHTTPTransport(
             gatewayHost: endpoint.host,

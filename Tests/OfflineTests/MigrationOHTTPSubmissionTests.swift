@@ -107,6 +107,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
 
     private func prepare(
         viaTor: Bool, cache: OHTTPKeyCache, operation: OHTTPHealthOperation, attempt: OHTTPHealthAttempt,
+        testRelayURL: String? = nil,
         verifier: OHTTPTransport.KeyVerifier? = nil, sender: @escaping OHTTPTransport.HTTPSender
     ) async -> Error? {
         await OHTTPHealthContext.withOperation(operation) {
@@ -115,7 +116,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                     _ = try await OHTTPHealthFailureOwner().request {
                         try await self.realBroadcaster().preparedOHTTPClient(
                             for: self.preparationEndpoint, viaTor: viaTor,
-                            keyCache: cache, testKeyVerifier: verifier, httpSender: sender
+                            keyCache: cache, testKeyVerifier: verifier, testRelayURL: testRelayURL, httpSender: sender
                         )
                     }
                     return nil
@@ -257,7 +258,10 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
 
     func testRealMigrationKeyPreparationCancellationAndRejectionStayTyped() async throws {
         for viaTor in [false, true] {
-            let route = try preparationRoute(viaTor: viaTor)
+            let route = OHTTPHealthRoute(
+                network: .testnet, gatewayHost: preparationEndpoint.host,
+                relayURL: "https://migration-rejection-\(UUID().uuidString.lowercased()).test/relay", viaTor: viaTor
+            )
             let session = try OHTTPHealthSession(route: route, generation: UUID())
             defer { session.close() }
             for status in [429, 403, 200] {
@@ -267,7 +271,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                 let attempt = OHTTPHealthAttempt(operation: operation)
                 let error = await prepare(
                     viaTor: viaTor, cache: cache, operation: operation, attempt: attempt,
-                    verifier: { _, _ in throw OHTTPError.keyConfigError("invalid signed configuration") }
+                    testRelayURL: route.relayURL, verifier: { _, _ in throw OHTTPError.keyConfigError("invalid signed configuration") }
                 ) { request, _ in
                     calls.event(request.url?.host ?? "")
                     if calls.values.withLock({ $0.events.count }) > 1 { throw URLError(.cannotConnectToHost) }
@@ -284,8 +288,18 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                 if status == 429 {
                     guard case .rateLimited(let pause) = evidence.first?.outcome else { return XCTFail("Known pause must survive") }
                     XCTAssertGreaterThan(pause, OHTTPHealthClock.nowNanoseconds + 100_000_000_000)
+                    let retained = try OHTTPHealthSession(route: route, generation: UUID())
+                    defer { retained.close() }
+                    XCTAssertTrue(retained.snapshot().observations.contains {
+                        $0.historical && $0.operation == operation && $0.route == route && $0.outcome == .rateLimited(retryNotBefore: pause)
+                    }, "The active pause must remain retained on the fixture route")
+                    let canonical = try OHTTPHealthSession(route: try preparationRoute(viaTor: viaTor), generation: UUID())
+                    defer { canonical.close() }
+                    XCTAssertFalse(canonical.snapshot().observations.contains {
+                        $0.operation == operation && $0.outcome == .rateLimited(retryNotBefore: pause)
+                    }, "The fixture pause must not contaminate the canonical route")
                     let deadline = await cache.backoffDeadline(for: "\(route.relayURL)|\(viaTor ? "tor" : "direct")")
-                    XCTAssertNotNil(deadline)
+                    XCTAssertGreaterThan(try XCTUnwrap(deadline).timeIntervalSinceNow, 100)
                     XCTAssertEqual(calls.values.withLock { $0.events.count }, 1, "429 prohibits DNS fallback")
                 } else {
                     XCTAssertEqual(evidence.first?.outcome, status == 403 ? .policyRejected : .configurationFailure)
@@ -312,11 +326,17 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                 throw URLError(.cannotConnectToHost)
             }
             let cancelled = Task {
-                await self.prepare(viaTor: viaTor, cache: cache, operation: cancelledOperation, attempt: cancelledAttempt, sender: sender)
+                await self.prepare(
+                    viaTor: viaTor, cache: cache, operation: cancelledOperation, attempt: cancelledAttempt,
+                    testRelayURL: route.relayURL, sender: sender
+                )
             }
             await fulfillment(of: [started], timeout: 2)
             let remaining = Task {
-                await self.prepare(viaTor: viaTor, cache: cache, operation: remainingOperation, attempt: remainingAttempt, sender: sender)
+                await self.prepare(
+                    viaTor: viaTor, cache: cache, operation: remainingOperation, attempt: remainingAttempt,
+                    testRelayURL: route.relayURL, sender: sender
+                )
             }
             await fulfillment(of: [enrolled], timeout: 2)
             cancelled.cancel()
