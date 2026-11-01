@@ -1,5 +1,23 @@
 # Migrating from previous versions to _Unreleased_
 
+## `TorClient` methods await cold startup
+
+`TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,
+`sleep` and `wake` now have explicit `async` signatures. External actor calls already using
+`await` keep their existing syntax. Code isolated to the actor must add `await`, for example:
+
+```swift
+// Before, in actor-isolated code:
+let isolated = try isolatedClient()
+
+// After:
+let isolated = try await isolatedClient()
+```
+
+Throwing methods can now report `CancellationError` when their preparation is cancelled and
+`URLError(.timedOut)` when its startup deadline expires. `sleep` and `wake` continue ignoring
+preparation errors.
+
 ## `ZcashError.slipstreamEngineNotQuiescent` carries the refused stop's report
 
 `ZRUST0155` now carries the `SlipstreamStopReport` of the stop that refused the operation, so its

@@ -286,7 +286,7 @@ private final class SlipstreamTorLifecycleFixture: @unchecked Sendable {
                 }
                 runtimes.free(pointer)
             },
-            createRuntime: { [self] _, _ in
+            startup: TorRuntimeStartupNative.fixture { [self] _, _ in
                 lock.withLock { creations += 1 }
                 return runtimes.parent
             }

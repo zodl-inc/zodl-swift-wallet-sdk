@@ -64,7 +64,7 @@ final class SaplingParameterDownloaderTests: XCTestCase {
             freeResponse: { XCTAssertEqual($0, response.pointer) },
             isolateRuntime: { runtimes.clone($0) },
             freeRuntime: { runtimes.free($0) },
-            createRuntime: { _, _ in
+            startup: TorRuntimeStartupNative.fixture { _, _ in
                 Thread.sleep(forTimeInterval: 0.025)
                 created.fulfill()
                 return runtimes.parent
@@ -103,7 +103,7 @@ final class SaplingParameterDownloaderTests: XCTestCase {
                 XCTFail("Failed preparation must not isolate")
                 return nil
             },
-            createRuntime: { _, _ in
+            startup: TorRuntimeStartupNative.fixture { _, _ in
                 created.fulfill()
                 return nil
             }
@@ -153,7 +153,7 @@ final class SaplingParameterDownloaderTests: XCTestCase {
                 runtimes.free(runtime)
                 released.fulfill()
             },
-            createRuntime: { _, _ in
+            startup: TorRuntimeStartupNative.fixture { _, _ in
                 entered.fulfill()
                 XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
                 return runtimes.parent

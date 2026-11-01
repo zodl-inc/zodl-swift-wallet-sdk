@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Cold `TorClient` startup now leaves the actor responsive and cancels native bootstrap when
+  its final waiting caller cancels or the client closes. Standalone cold startup uses a 60-second
+  deadline including worker waiting, and late results cannot restore a closed client. Prepared isolated clients
+  remain usable after the base client closes.
+
 - Migration OHTTP key preparation failures are included in `OHTTPHealthContext.complete`
   evidence for the selected failed attempt, for direct and Tor routes. Transaction results,
   key fallback and successful key preparation behavior are unchanged. No caller changes are needed.
@@ -134,6 +139,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client's own and goes through (the gateway replaces only the placeholder publishable key).
 
 ## Changed
+
+- `TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,
+  `sleep` and `wake` are explicitly asynchronous so a cold client can await bounded Tor startup.
+  Existing external actor calls using `await` need no edits; synchronous actor-isolated callers
+  must now await them.
 
 - Sapling parameter files are now verified with SHA-256 instead of SHA-1.
 

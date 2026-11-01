@@ -10,6 +10,8 @@ import libzcashlc
 
 public actor TorClient {
     private var underlyingRuntime: OpaquePointer?
+    private var runtimeGeneration: UInt64 = 0
+    private var pendingStartup: TorRuntimeAttempt?
     private var torDir: URL
     private let httpGetNative: TorHTTPGetNative
     private let httpExecutor: TorHTTPRequestExecutor
@@ -41,50 +43,8 @@ public actor TorClient {
     deinit {
         guard let runtime = underlyingRuntime else { return }
 
-        httpGetNative.freeRuntime(runtime)
-    }
-
-    func prepare() throws {
-        _ = try resolveRuntime()
-    }
-
-    func close() throws {
-        guard let runtime = underlyingRuntime else { return }
-
-        httpGetNative.freeRuntime(runtime)
-
-        underlyingRuntime = nil
-    }
-
-    public func updateCachedFiatCurrencyResult(_ result: FiatCurrencyResult?) async {
-        cachedFiatCurrencyResult = result
-    }
-
-    private func resolveRuntime() throws -> OpaquePointer {
-        if let runtime = underlyingRuntime {
-            return runtime
-        }
-
-        // Ensure that the directory exists.
-        let fileManager = FileManager()
-        if !fileManager.fileExists(atPath: torDir.path) {
-            do {
-                try fileManager.createDirectory(at: torDir, withIntermediateDirectories: true)
-            } catch {
-                throw ZcashError.blockRepositoryCreateBlocksCacheDirectory(torDir, error)
-            }
-        }
-
-        let rawDir = torDir.osPathStr()
-        let runtimePtr = httpGetNative.createRuntime(rawDir.0, rawDir.1)
-
-        guard let runtimePtr else {
-            throw ZcashError.rustTorClientInit(lastErrorMessage(fallback: "`TorClient` init failed with unknown error"))
-        }
-
-        underlyingRuntime = runtimePtr
-
-        return runtimePtr
+        let disposal = TorRuntimeDisposal(runtime: runtime, freeRuntime: httpGetNative.freeRuntime)
+        TorRuntimeStartup.workerQueue.async { disposal.dispose() }
     }
 
     /// Open a voting round session that rides this client's Tor runtime.
@@ -95,27 +55,29 @@ public actor TorClient {
     /// sole ownership of the runtime it can later close.
     ///
     /// Opening the session reaches no network. Getting to it may: on a client
-    /// with no runtime yet, `resolveRuntime()` creates the Tor directory and
-    /// bootstraps Arti first, which takes as long as reaching the Tor network
-    /// takes and holds this actor for all of it.
+    /// with no runtime yet, `prepareRuntime()` creates the Tor directory and
+    /// bootstraps Arti first, under a bounded deadline while this actor remains available for cancellation.
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         isCustomServer: Bool,
         epoch: UInt64
-    ) throws -> VotingRoundSession {
-        try backend.makeSession(
+    ) async throws -> VotingRoundSession {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
+        return try backend.makeSession(
             inputs: inputs,
             binding: binding,
-            torRuntime: resolveRuntime(),
+            torRuntime: runtime,
             isCustomServer: isCustomServer,
             epoch: epoch
         )
     }
 
-    public func isolatedClient() throws -> TorClient {
-        let runtime = try resolveRuntime()
+    public func isolatedClient() async throws -> TorClient {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         let isolatedPtr = httpGetNative.isolateRuntime(runtime)
 
@@ -135,8 +97,9 @@ public actor TorClient {
     /// a while, especially on mobile platforms.
     ///
     /// - Parameter mode: what level of sleep to put a Tor client into.
-    func setDormant(mode: TorDormantMode) throws {
-        let runtime = try resolveRuntime()
+    func setDormant(mode: TorDormantMode) async throws {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         if !zcashlc_tor_set_dormant(runtime, mode) {
             throw ZcashError.rustTorIsolatedClient(
@@ -148,12 +111,12 @@ public actor TorClient {
         }
     }
 
-    public func sleep() {
-        try? setDormant(mode: Soft)
+    public func sleep() async {
+        try? await setDormant(mode: Soft)
     }
 
-    public func wake() {
-        try? setDormant(mode: Normal)
+    public func wake() async {
+        try? await setDormant(mode: Normal)
     }
 
     /// Makes an HTTP request over Tor.
@@ -161,15 +124,15 @@ public actor TorClient {
     /// - Parameter maxBytes: Maximum allowed response size in bytes (defaults to 257 MiB)
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
-    public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) throws -> (data: Data, response: HTTPURLResponse) {
-        try httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit, postOnce: false)
+    public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit, postOnce: false)
     }
 
     /// Makes an HTTP request over Tor whose body must never be resent, such as an OHTTP relay post: a POST
     /// is tried again, on a new circuit, only when it failed to reach the server before any of it was sent
     /// (as ``httpPostStream(for:maxBytes:)`` is); a GET is not retried.
-    func httpRequestSentOnce(for request: URLRequest, maxBytes: Int) throws -> (data: Data, response: HTTPURLResponse) {
-        try httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0, postOnce: true)
+    func httpRequestSentOnce(for request: URLRequest, maxBytes: Int) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0, postOnce: true)
     }
 
     private func httpRequest(
@@ -177,8 +140,9 @@ public actor TorClient {
         maxBytes: Int,
         retryLimit: UInt8,
         postOnce: Bool
-    ) throws -> (data: Data, response: HTTPURLResponse) {
-        let runtime = try resolveRuntime()
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         let url = request.url
         guard let url else {
@@ -268,8 +232,9 @@ public actor TorClient {
     /// stream. The body is read on a queue of its own, so a long stream holds no thread of the Swift
     /// concurrency pool. A body that gets no bytes for `request.timeoutInterval` fails with
     /// `URLError.timedOut`: a stream may last as long as the server keeps it open, but not stand still for that long.
-    func httpPostStream(for request: URLRequest, maxBytes: Int) throws -> OHTTPOuterStream {
-        let runtime = try resolveRuntime()
+    func httpPostStream(for request: URLRequest, maxBytes: Int) async throws -> OHTTPOuterStream {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         guard let url = request.url else {
             throw ZcashError.rustTorHttpRequest("`TorClient.httpPostStream` requires a URL")
@@ -345,9 +310,9 @@ public actor TorClient {
     }
 
     /// Parameter downloads preserve lazy Tor preparation within the same request deadline.
-    /// While bootstrap owns this actor, cancellation/expiry can complete the waiting caller.
-    /// The admission task retains the actor until native creation returns, then checks its
-    /// context before isolation or GET. The root runtime remains actor-owned throughout.
+    /// While bootstrap runs on its native worker, cancellation/expiry can complete the waiting caller.
+    /// A departing preparation releases its own interest; the last departure cancels native work.
+    /// The context is checked again before isolation or GET. The root remains actor-owned throughout.
     nonisolated func httpGetPreparingRuntime(
         for request: URLRequest,
         retryLimit: UInt8,
@@ -364,10 +329,10 @@ public actor TorClient {
         }
     }
 
-    private func prepareHTTPRuntime(for request: URLRequest, context: TorHTTPRequestContext) throws {
+    private func prepareHTTPRuntime(for request: URLRequest, context: TorHTTPRequestContext) async throws {
         try context.checkCancellation()
         _ = try TorHTTPGetRequest.validate(request)
-        _ = try resolveRuntime()
+        try await prepareRuntime(deadline: context.deadlineUptime)
         try context.checkCancellation()
     }
 
@@ -411,8 +376,9 @@ public actor TorClient {
         )
     }
 
-    public func getExchangeRateUSD() throws -> FiatCurrencyResult {
-        let runtime = try resolveRuntime()
+    public func getExchangeRateUSD() async throws -> FiatCurrencyResult {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         let rate = zcashlc_get_exchange_rate_usd(runtime)
 
@@ -435,8 +401,9 @@ public actor TorClient {
         return newValue
     }
 
-    public func connectToLightwalletd(endpoint: String) throws -> TorLwdConn {
-        let runtime = try resolveRuntime()
+    public func connectToLightwalletd(endpoint: String) async throws -> TorLwdConn {
+        try await prepareRuntime()
+        guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
         guard !endpoint.containsCStringNullBytesBeforeStringEnding() else {
             throw ZcashError.rustTorConnectToLightwalletd("endpoint string contains null bytes")
@@ -453,6 +420,101 @@ public actor TorClient {
         }
 
         return TorLwdConn(connPtr: lwdConnPtr, free: httpGetNative.freeLightwalletd)
+    }
+}
+
+private struct TorRuntimeAttempt {
+    let generation: UInt64
+    let owner: TorRuntimeStartup
+    let task: Task<Void, Error>
+}
+
+extension TorClient {
+    /// The deadline is monotonic uptime in nanoseconds, shared with other startup owners.
+    /// The first attempt keeps its native deadline; later callers cannot extend it. Each caller
+    /// may leave independently, and the last abandoned interest cancels native work.
+    nonisolated func prepare(deadline: UInt64? = nil) async throws {
+        let deadline = try deadline ?? TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: 60_000,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        try await prepareRuntime(deadline: deadline)
+    }
+
+    /// Supersedes every preparation caller and dispatches native cancellation before suspending.
+    /// A later preparation waits for the cancelled native attempt to quiesce before starting again.
+    func close() async throws {
+        runtimeGeneration &+= 1
+        pendingStartup?.owner.cancel()
+        guard let runtime = underlyingRuntime else { return }
+        underlyingRuntime = nil
+        let disposal = TorRuntimeDisposal(runtime: runtime, freeRuntime: httpGetNative.freeRuntime)
+        await withCheckedContinuation { continuation in
+            TorRuntimeStartup.workerQueue.async {
+                disposal.dispose()
+                continuation.resume()
+            }
+        }
+    }
+
+    public func updateCachedFiatCurrencyResult(_ result: FiatCurrencyResult?) async {
+        cachedFiatCurrencyResult = result
+    }
+
+    private func prepareRuntime(deadline: UInt64? = nil) async throws {
+        try Task.checkCancellation()
+        if underlyingRuntime != nil { return }
+        let deadline = try deadline ?? TorHTTPRequestExecutor.deadline(
+            timeoutMilliseconds: 60_000,
+            now: DispatchTime.now().uptimeNanoseconds
+        )
+        if let previous = pendingStartup,
+           previous.owner.isCancelled {
+            let generation = runtimeGeneration
+            previous.owner.cancel()
+            _ = await previous.task.result
+            guard runtimeGeneration == generation else { throw CancellationError() }
+            if pendingStartup?.generation == previous.generation { pendingStartup = nil }
+            try Task.checkCancellation()
+            return try await prepareRuntime(deadline: deadline)
+        }
+        if pendingStartup == nil {
+            runtimeGeneration &+= 1
+            let owner = TorRuntimeStartup(
+                directory: torDir,
+                deadline: deadline,
+                native: httpGetNative.startup,
+                freeRuntime: httpGetNative.freeRuntime
+            )
+            pendingStartup = TorRuntimeAttempt(generation: runtimeGeneration, owner: owner, task: Task { try await owner.run() })
+        }
+        guard let attempt = pendingStartup else { throw ZcashError.torClientUnavailable }
+        guard let id = attempt.owner.registerWaiter() else {
+            let generation = runtimeGeneration
+            _ = await attempt.task.result
+            guard runtimeGeneration == generation else { throw CancellationError() }
+            if pendingStartup?.generation == attempt.generation { pendingStartup = nil }
+            return try await prepareRuntime(deadline: deadline)
+        }
+        let waiter = TorRuntimeStartupWaiter { attempt.owner.releaseWaiter(id, cancelling: true) }
+        do {
+            try await waiter.wait(for: attempt.task, deadline: deadline)
+            try Task.checkCancellation()
+            guard DispatchTime.now().uptimeNanoseconds < deadline else { throw URLError(.timedOut) }
+            guard runtimeGeneration == attempt.generation, !attempt.owner.isCancelled else { throw CancellationError() }
+            if underlyingRuntime == nil {
+                underlyingRuntime = try attempt.owner.claimRuntime()
+                pendingStartup = nil
+            }
+            attempt.owner.releaseWaiter(id, cancelling: false)
+        } catch {
+            attempt.owner.releaseWaiter(id, cancelling: true)
+            if attempt.owner.isCancelled {
+                _ = await attempt.task.result
+                if pendingStartup?.generation == attempt.generation { pendingStartup = nil }
+            }
+            throw error
+        }
     }
 }
 

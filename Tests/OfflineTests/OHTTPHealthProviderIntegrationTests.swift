@@ -47,7 +47,7 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
             let calls = OSAllocatedUnfairLock(initialState: [String]())
             let runtimes = TorTestRuntimes()
             var native = TorHTTPGetNative()
-            native.createRuntime = { _, _ in
+            native.startup = TorRuntimeStartupNative.fixture { _, _ in
                 calls.withLock { $0.append("create") }
                 return nil
             }
@@ -130,7 +130,7 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
                 return runtimes.clone($0)
             }
             native.freeRuntime = { runtimes.free($0) }
-            native.createRuntime = { _, _ in
+            native.startup = TorRuntimeStartupNative.fixture { _, _ in
                 calls.withLock { $0 += 1 }
                 XCTFail("Deadline must precede runtime creation")
                 return nil
