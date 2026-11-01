@@ -32,6 +32,7 @@ public protocol TorTransitionProviding: AnyObject {
 final class TorRouteTransition: Sendable {
     private struct State {
         var generation: UInt64 = 0
+        var installedGeneration: UInt64 = 0
         var request: TorTransitionRequest?
         var snapshot: TorTransitionState?
         var healthTransitions: [UUID] = []
@@ -81,6 +82,7 @@ final class TorRouteTransition: Sendable {
             state.generation += 1
             let request = TorTransitionRequest(
                 generation: state.generation,
+                retiringRouteGeneration: state.installedGeneration,
                 enabled: enabled,
                 acquisitionDeadline: now() + 30_000_000_000,
                 startsSync: startsSync,
@@ -144,10 +146,17 @@ final class TorRouteTransition: Sendable {
         try state.withLock { state in
             guard state.request === request, !request.isCancelled else { throw CancellationError() }
             apply()
+            state.installedGeneration = request.generation
             for token in state.healthTransitions { health.settle(transition: token, endpoint: endpoint) }
             state.healthTransitions.removeAll()
             publish(request, phase: .ready, failure: nil, state: &state)
         }
+    }
+
+    /// Retirement belongs to the installed predecessor, not to an observer that may already
+    /// have failed or been superseded. A later successful install makes old retirement stale.
+    func canRetirePredecessor(of request: TorTransitionRequest) -> Bool {
+        state.withLock { $0.installedGeneration == request.retiringRouteGeneration }
     }
 
     func publish(_ request: TorTransitionRequest, phase: TorTransitionState.Phase, failure: TorTransitionState.Failure? = nil) {

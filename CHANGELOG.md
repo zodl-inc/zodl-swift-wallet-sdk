@@ -22,6 +22,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Expired or cancelled Tor acquisition now owns safe retirement of the old native sync loop,
+  while admitted broadcasts retain their resources, route and result. Retirement cannot apply an
+  expired replacement or stop a newer installed route, and observer failure stays immediate.
+- Tor startup APIs now return the same typed failure shown by their state stream, including HTTP
+  and native timeouts and later ordinary sync starts; cancellation remains `CancellationError`.
+
 - `SlipstreamSynchronizer.tor(enabled:)` now stops the old pass and waits for both required Tor
   owners before resuming an intended-running wallet. Idle wallets remain idle. Failed enablement
   keeps Tor required, and new network work fails with `TorTransitionState.Failure.routeUnavailable`

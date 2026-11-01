@@ -329,6 +329,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     private let torTransition: TorRouteTransition
     private nonisolated let routeAdmission: TorNetworkAdmission
     private var torIntendedRunning: Bool?
+    private var retiredTorRouteGeneration: UInt64?
     /// [#1755] Mirrors the wallet's deep-recovery state. Seeded from the persisted summary at
     /// prepare()/start(); ENGINE-OWNED during a run (tickPoll adopts `snap.isRecovering`, which embeds
     /// the terminal fail-safe latch — Done/Error force it 0). Drives the "Restoring"
@@ -3163,11 +3164,47 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                     }
                     return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
                 },
-                cancellation: {},
+                cancellation: { [weak self, weak request] in
+                    guard let self, let request, !request.hasAcquired else { return }
+                    self.scheduleTorRetirement(request)
+                },
                 dormantCancelled: { [weak self, weak request] in
                     guard let self, let request else { return }
                     self.torTransition.publish(request, phase: .cancelled)
+                    self.scheduleTorRetirement(request)
                 }
+            )
+        }
+    }
+
+    /// Owns native-only cleanup independently of the already-completed request observer.
+    /// Also used by tests to deliver a delayed retirement through the real lifecycle boundary.
+    @discardableResult
+    nonisolated func scheduleTorRetirement(_ request: TorTransitionRequest) -> Task<Void, Never> {
+        lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+    }
+
+    private func retireNativePassAfterFailedAcquisition(_ request: TorTransitionRequest) async {
+        guard request.isCancelled, !request.hasAcquired,
+              routeAdmission.isFenced,
+              torTransition.canRetirePredecessor(of: request),
+              retiredTorRouteGeneration != request.retiringRouteGeneration else { return }
+        retiredTorRouteGeneration = request.retiringRouteGeneration
+        guard passIntendedRunning else { return }
+        torIntendedRunning = torIntendedRunning ?? passIntendedRunning
+        passGeneration += 1
+        isRunning = false
+        stopPolling()
+        // This stops only the native sync loop. Admitted broadcasts keep their HTTP/runtime
+        // resources and original route; no close, rebind, free, or resubmission cancellation.
+        let report = await engine.stop()
+        publishStoppedState()
+        if let reason = report.refusalReason {
+            initializer.logger.warn(
+                "Tor acquisition retirement could not prove native quiescence: \(reason)",
+                file: #file,
+                function: #function,
+                line: #line
             )
         }
     }
@@ -3245,6 +3282,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 sdkFlags.routeAdmission.install(request.enabled)
             }
             torIntendedRunning = nil
+            retiredTorRouteGeneration = nil
         } catch {
             if ownsEngine {
                 stopPolling()
@@ -3254,12 +3292,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             if error is CancellationError {
                 torTransition.publish(request, phase: .cancelled)
-            } else {
-                let failure = error as? TorTransitionState.Failure
-                    ?? ((error as? URLError)?.code == .timedOut ? .startupTimedOut : .startupFailed)
-                torTransition.publish(request, phase: .failed, failure: failure)
+                if !ownsEngine { request.cancel(error: error) }
+                throw error
             }
-            throw error
+            let failure = error as? TorTransitionState.Failure
+                ?? ((error as? URLError)?.code == .timedOut ? .startupTimedOut : .startupFailed)
+            torTransition.publish(request, phase: .failed, failure: failure)
+            if !ownsEngine { request.cancel(error: failure) }
+            throw failure
         }
     }
 

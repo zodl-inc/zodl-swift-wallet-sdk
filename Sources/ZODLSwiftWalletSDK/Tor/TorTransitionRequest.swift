@@ -6,6 +6,7 @@ import os
 public final class TorTransitionRequest: Sendable {
     public let id: UUID
     let generation: UInt64
+    let retiringRouteGeneration: UInt64
     let enabled: Bool
     let startsSync: Bool
     let resetRecoveryBudget: Bool
@@ -17,14 +18,23 @@ public final class TorTransitionRequest: Sendable {
         var cancellation: (@Sendable () -> Void)?
         var dormantCancelled: (@Sendable () -> Void)?
         var activated = false
+        var acquired = false
         var cancelled = false
     }
     private let work = OSAllocatedUnfairLock(initialState: Work())
     private let completion = TorTransitionCompletion()
 
-    init(generation: UInt64, enabled: Bool, acquisitionDeadline: UInt64, startsSync: Bool, resetRecoveryBudget: Bool) {
+    init(
+        generation: UInt64,
+        retiringRouteGeneration: UInt64,
+        enabled: Bool,
+        acquisitionDeadline: UInt64,
+        startsSync: Bool,
+        resetRecoveryBudget: Bool
+    ) {
         self.id = UUID()
         self.generation = generation
+        self.retiringRouteGeneration = retiringRouteGeneration
         self.enabled = enabled
         self.startsSync = startsSync
         self.resetRecoveryBudget = resetRecoveryBudget
@@ -51,6 +61,7 @@ public final class TorTransitionRequest: Sendable {
 
     func acquired() {
         let timer = work.withLock { state in
+            state.acquired = true
             let timer = state.timer
             state.timer = nil
             return timer
@@ -135,6 +146,7 @@ public final class TorTransitionRequest: Sendable {
     }
 
     var isCancelled: Bool { work.withLock { $0.cancelled } }
+    var hasAcquired: Bool { work.withLock { $0.acquired } }
 }
 
 /// A completion with independently cancellable observers, also usable before activation.

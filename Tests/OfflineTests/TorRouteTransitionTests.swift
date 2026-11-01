@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import libzcashlc
 import os
 import XCTest
 @testable import ZODLSwiftWalletSDK
@@ -42,7 +43,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
         do {
             try await sync.tor(enabled: true)
             XCTFail("Bootstrap must fail")
-        } catch {}
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupFailed) }
         let tor = await mockContainer.resolve(SDKFlags.self).torEnabled
         XCTAssertTrue(tor, "Failed enable must not select direct networking")
     }
@@ -322,6 +323,215 @@ final class TorRouteTransitionTests: ZcashTestCase {
         XCTAssertEqual(sync.torTransitionState?.failure, .acquisitionTimedOut)
     }
 
+    func testActiveAcquisitionExpiryRetiresNativePassWithoutCancellingAdmittedSend() async throws {
+        try await assertFailedAcquisitionRetiresNativePass(activate: true, cancel: false)
+    }
+
+    func testNeverActivatedExpiryRetiresNativePassWithoutApplyingReplacement() async throws {
+        try await assertFailedAcquisitionRetiresNativePass(activate: false, cancel: false)
+    }
+
+    func testDormantCancellationRetiresNativePassWithoutCancellingAdmittedSend() async throws {
+        try await assertFailedAcquisitionRetiresNativePass(activate: false, cancel: true)
+    }
+
+    func testNonquiescentRetirementDoesNotFreeResourcesOrRewriteAcquisitionFailure() async throws {
+        try await assertFailedAcquisitionRetiresNativePass(activate: true, cancel: false, nonquiescent: true)
+    }
+
+    private func assertFailedAcquisitionRetiresNativePass(activate: Bool, cancel: Bool, nonquiescent: Bool = false) async throws {
+        let time = OSAllocatedUnfairLock(initialState: DispatchTime.now().uptimeNanoseconds)
+        let timerEntered = expectation(description: "acquisition timer registered")
+        let timer = Gate()
+        let owner = TorRouteTransition(now: { time.withLock { $0 } }, sleep: { _ in
+            timerEntered.fulfill()
+            await timer.wait()
+            try Task.checkCancellation()
+        })
+        let rootFrees = OSAllocatedUnfairLock(initialState: 0)
+        let client = TorClient(runtimePtr: OpaquePointer(bitPattern: 1)!, torDir: testTempDirectory,
+                               httpGetNative: TorHTTPGetNative(freeRuntime: { _ in rootFrees.withLock { $0 += 1 } }))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let sendEntered = expectation(description: "original direct broadcast admitted")
+        let releaseSend = Gate()
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let endpoint = LightWalletEndpoint(address: "admitted.test", port: 443)
+        mockContainer.mock(type: MultiEndpointSubmitter.self, isSingleton: true) { container in
+            let flags = container.resolve(SDKFlags.self)
+            return MultiEndpointSubmitter(endpointSubmitter: ClosureEndpointSubmitter { _ in
+                calls.withLock { $0 += 1 }
+                sendEntered.fulfill()
+                await releaseSend.wait()
+                let usesTor = await flags.torEnabled
+                XCTAssertFalse(usesTor, "Retirement must preserve the admitted broadcast's original route")
+            }, logger: NullLogger())
+        }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, torTransition: owner)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        let service = mockContainer.resolve(LightWalletService.self) as! LightWalletServiceMock
+        let send = Task {
+            await sync.broadcaster.submit(
+                transaction: CreatedTransaction(txId: Data(repeating: 3, count: 32), raw: Data([1]), expiryHeight: 0),
+                to: [endpoint], timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0)
+            )
+        }
+        await fulfillment(of: [sendEntered], timeout: 2)
+        let retirementEntered = expectation(description: "failed acquisition owns native retirement")
+        await engine.onCall("stop") { retirementEntered.fulfill() }
+        engine.stopGate.close()
+        if nonquiescent { engine.stopReport = .passStillRunning }
+        let request = sync.requestTorTransition(enabled: true)
+        await fulfillment(of: [timerEntered], timeout: 2)
+        let applying: Task<Void, Error>? = activate ? Task { try await request.apply() } : nil
+        if activate {
+            let queued = await waitUntil { sync.lifecycleQueueDepthForTesting() > 0 }
+            XCTAssertTrue(queued)
+        }
+        if cancel {
+            XCTAssertTrue(request.cancelBeforeApplying())
+        } else {
+            time.withLock { $0 += 30_000_000_001 }
+            timer.open()
+        }
+        let observerFinished = expectation(description: "terminal observer does not wait for held native retirement")
+        let observer = Task {
+            defer { observerFinished.fulfill() }
+            do {
+                try await request.wait()
+                XCTFail("Failed acquisition must finish its observer before native cleanup returns")
+            } catch {
+                if cancel { XCTAssertTrue(error is CancellationError) } else {
+                    XCTAssertEqual(error as? TorTransitionState.Failure, .acquisitionTimedOut)
+                }
+            }
+        }
+        await fulfillment(of: [observerFinished, retirementEntered], timeout: 0.2)
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        XCTAssertEqual(rootFrees.withLock { $0 }, 0)
+        XCTAssertEqual(service.closeConnectionsCallsCount, 0)
+        let heldCalls = await engine.calls
+        XCTAssertFalse(heldCalls.contains("startTor"))
+        XCTAssertFalse(heldCalls.contains("close"))
+        releaseSend.open()
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .accepted(by: endpoint))
+        XCTAssertEqual(calls.withLock { $0 }, 1)
+        engine.stopGate.open()
+        timer.open()
+        _ = await applying?.result
+        await observer.value
+        let drained = await waitUntil { sync.lifecycleQueueDepthForTesting() == 0 }
+        XCTAssertTrue(drained)
+        let running = await sync.isRunningForTesting()
+        XCTAssertFalse(running, "The failed choice must not leave the old native request loop running")
+        let retiredCalls = await engine.calls
+        XCTAssertTrue(retiredCalls.contains("stop:done"))
+        XCTAssertFalse(retiredCalls.contains("close"))
+        XCTAssertFalse(retiredCalls.contains(where: { $0.hasPrefix("reopen") }))
+        XCTAssertEqual(sync.torTransitionState?.phase, cancel ? .cancelled : .failed)
+        if !cancel { XCTAssertEqual(sync.torTransitionState?.failure, .acquisitionTimedOut) }
+        do {
+            try await request.apply()
+            XCTFail("Retirement cannot reactivate an expired/cancelled replacement")
+        } catch {
+            if cancel { XCTAssertTrue(error is CancellationError) } else {
+                XCTAssertEqual(error as? TorTransitionState.Failure, .acquisitionTimedOut)
+            }
+        }
+        await sync.stopAndWait()
+    }
+
+    func testDelayedFailedRetirementCannotStopInstalledSuccessorAndRetryKeepsIntent() async throws {
+        let rootFrees = OSAllocatedUnfairLock(initialState: 0)
+        let client = TorClient(runtimePtr: OpaquePointer(bitPattern: 1)!, torDir: testTempDirectory,
+                               httpGetNative: TorHTTPGetNative(freeRuntime: { _ in rootFrees.withLock { $0 += 1 } }))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        let failed = sync.requestTorTransition(enabled: true)
+        XCTAssertTrue(failed.cancelBeforeApplying())
+        let retired = await waitUntil { sync.lifecycleQueueDepthForTesting() == 0 }
+        XCTAssertTrue(retired)
+        let stopped = await sync.isRunningForTesting()
+        XCTAssertFalse(stopped)
+        let successor = sync.requestTorTransition(enabled: true)
+        XCTAssertNotEqual(successor.id, failed.id)
+        try await successor.apply()
+        let resumed = await sync.isRunningForTesting()
+        XCTAssertTrue(resumed, "Native-only retirement preserves intended-running state for explicit retry")
+        let stopsBeforeDelayedCleanup = await engine.calls.filter { $0 == "stop" }.count
+        // A newer dormant choice fences again without retiring this successful successor yet.
+        // Deliver the older request's cleanup late through the actual lifecycle entry point.
+        let latest = sync.requestTorTransition(enabled: false)
+        await sync.scheduleTorRetirement(failed).value
+        let stopsAfterDelayedCleanup = await engine.calls.filter { $0 == "stop" }.count
+        XCTAssertEqual(stopsAfterDelayedCleanup, stopsBeforeDelayedCleanup)
+        let stillRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(stillRunning, "A stale predecessor token cannot stop a newly installed pass")
+        XCTAssertEqual(sync.torTransitionState?.requestID, latest.id)
+        XCTAssertEqual(sync.torTransitionState?.phase, .waitingForWork)
+        XCTAssertEqual(rootFrees.withLock { $0 }, 0)
+        do {
+            try await failed.wait()
+            XCTFail("Retirement and successor success cannot rewrite the old terminal result")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(latest.cancelBeforeApplying())
+        await sync.stopAndWait()
+    }
+
+    func testNativeStartupCancellationRemainsCancellationError() async throws {
+        let client = TorClient(runtimePtr: OpaquePointer(bitPattern: 1)!, torDir: testTempDirectory,
+                               httpGetNative: TorHTTPGetNative(freeRuntime: { _ in }))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        await engine.setStartError(CancellationError())
+        do {
+            try await sync.tor(enabled: true)
+            XCTFail("Cancelled native startup cannot succeed")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(sync.torTransitionState?.phase, .cancelled)
+        await sync.stopAndWait()
+    }
+
+    func testHTTPStartupTimeoutReturnsTypedFailure() async throws {
+        var startup = TorRuntimeStartupNative.fixture { _, _ in nil }
+        startup.wait = { _ in 3 }
+        startup.take = { _ in FfiTorStartupResultV1(status: 3, runtime: nil) }
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(startup: startup))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let sync = try makeSlipstreamSynchronizer(engine: GatedFakeSlipstreamEngine())
+        do {
+            try await sync.tor(enabled: true)
+            XCTFail("HTTP timeout must fail startup")
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupTimedOut) }
+        XCTAssertEqual(sync.torTransitionState?.failure, .startupTimedOut)
+        await sync.stopAndWait()
+    }
+
+    func testNativeStartupTimeoutReturnsTypedFailure() async throws {
+        let client = TorClient(runtimePtr: OpaquePointer(bitPattern: 1)!, torDir: testTempDirectory,
+                               httpGetNative: TorHTTPGetNative(freeRuntime: { _ in }))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        await engine.setStartError(URLError(.timedOut))
+        do {
+            try await sync.requestTorTransition(enabled: true).apply()
+            XCTFail("Native timeout must fail startup")
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupTimedOut) }
+        XCTAssertEqual(sync.torTransitionState?.failure, .startupTimedOut)
+        await sync.stopAndWait()
+    }
+
     func testJoinersActivateOnceAndWaiterCancellationDoesNotCancelOwner() async throws {
         let engine = GatedFakeSlipstreamEngine()
         await engine.closeGate(.stop)
@@ -515,7 +725,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
         do {
             try await first.apply()
             XCTFail("Native failure cannot become ready")
-        } catch {}
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupFailed) }
         XCTAssertEqual(sync.torTransitionState?.phase, .failed)
         XCTAssertEqual(sync.torTransitionState?.failure, .startupFailed)
         XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
@@ -531,6 +741,14 @@ final class TorRouteTransitionTests: ZcashTestCase {
     }
 
     func testIdleEnableThenNormalStartPublishesCurrentNativeFailure() async throws {
+        try await assertLaterNormalStartError(ZcashError.rustSlipstreamStart("synthetic normal-start failure"), expected: .startupFailed)
+    }
+
+    func testIdleEnableThenNormalStartReturnsTypedTimeout() async throws {
+        try await assertLaterNormalStartError(URLError(.timedOut), expected: .startupTimedOut)
+    }
+
+    private func assertLaterNormalStartError(_ error: Error, expected: TorTransitionState.Failure) async throws {
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
             freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
         ))
@@ -540,13 +758,13 @@ final class TorRouteTransitionTests: ZcashTestCase {
         await sync.setInternalSyncStatusForTesting(.stopped)
         try await sync.tor(enabled: true)
         let previous = sync.torTransitionState
-        await engine.setStartError(ZcashError.rustSlipstreamStart("synthetic normal-start failure"))
+        await engine.setStartError(error)
         do {
             try await sync.start()
             XCTFail("Required native startup fails")
-        } catch {}
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, expected) }
         XCTAssertEqual(sync.torTransitionState?.phase, .failed)
-        XCTAssertEqual(sync.torTransitionState?.failure, .startupFailed)
+        XCTAssertEqual(sync.torTransitionState?.failure, expected)
         XCTAssertNotEqual(sync.torTransitionState?.generation, previous?.generation)
         let initialized = await sync.isTorSuccessfullyInitialized()
         XCTAssertEqual(initialized, false)
