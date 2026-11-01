@@ -123,11 +123,14 @@ final class TorRuntimeStartupTests: XCTestCase {
 
     func testDuplicatePrepareJoins() async throws {
         let fixture = StartupFixture()
-        let client = fixture.client()
+        let registered = expectation(description: "both prepare interests registered")
+        let client = fixture.client(startupInterestChanged: { count in
+            if count == 2 { registered.fulfill() }
+        })
         let first = Task { try await client.prepare() }
         await fulfillment(of: [fixture.entered], timeout: 2)
         let second = Task { try await client.prepare() }
-        await client.updateCachedFiatCurrencyResult(nil)
+        await fulfillment(of: [registered], timeout: 2)
         fixture.release.signal()
         try await first.value
         try await second.value
@@ -332,7 +335,10 @@ private final class StartupFixture: @unchecked Sendable {
         )
     }
 
-    func client(startupNative: TorRuntimeStartupNative? = nil) -> TorClient {
+    func client(
+        startupNative: TorRuntimeStartupNative? = nil,
+        startupInterestChanged: @escaping @Sendable (Int) -> Void = { _ in }
+    ) -> TorClient {
         let native = TorHTTPGetNative(
             get: { [self] pointer, _, _, _, _, _ in
                 XCTAssertTrue(runtimes.isAlive(pointer))
@@ -349,7 +355,7 @@ private final class StartupFixture: @unchecked Sendable {
             },
             startup: startupNative ?? self.native
         )
-        return TorClient(torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        return TorClient(torDir: FileManager.default.temporaryDirectory, httpGetNative: native, startupInterestChanged: startupInterestChanged)
     }
 
     deinit {

@@ -326,6 +326,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // A plain `let` of a Sendable lock-guarded object — reachable from the nonisolated `stop()`,
     // `rewind()` and `wipe()` as well as from the actor.
     private let lifecycle = LifecycleQueue()
+    private let torTransition: TorRouteTransition
+    private nonisolated let routeAdmission: TorNetworkAdmission
+    private var torIntendedRunning: Bool?
     /// [#1755] Mirrors the wallet's deep-recovery state. Seeded from the persisted summary at
     /// prepare()/start(); ENGINE-OWNED during a run (tickPoll adopts `snap.isRecovering`, which embeds
     /// the terminal fail-safe latch — Done/Error force it 0). Drives the "Restoring"
@@ -419,6 +422,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         initializer: Initializer,
         alternateEndpoints: [LightWalletEndpoint],
         engine: any SlipstreamEngineControlling,
+        torTransition: TorRouteTransition = TorRouteTransition(),
         makeEndpointService: @escaping (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService = Dependencies.makeLightWalletService,
         torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         restoreAnchor: @escaping SlipstreamAnchorResolver = { isRestore, birthday, fallbackCheckpoint, server, network, torDirPath in
@@ -445,6 +449,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             BlockDownloaderServiceImpl(service: endpointService, storage: di.resolve(CompactBlockRepository.self))
         }
         initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
+        self.torTransition = torTransition
+        self.routeAdmission = initializer.container.resolve(SDKFlags.self).routeAdmission
         self.engine = engine
         self.torHTTPUptime = torHTTPUptime
         self.restoreAnchor = restoreAnchor
@@ -479,7 +485,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
         // [#1975] Same container, same singletons the old pipeline's `TxResubmissionAction`
         // resolves — so both synchronizers resubmit through one implementation.
-        self.txResubmitter = TxResubmitter(container: initializer.container)
+        self.txResubmitter = TxResubmitter(
+            container: initializer.container, routeAdmission: routeAdmission
+        )
         // [#1755] zcash #1757 (multiserver submission) reworked SDKBroadcaster's init: it now
         // takes submitPlanStore + multiEndpointSubmitter (resolved from the container, same as
         // SDKSynchronizer) and no longer takes sdkFlags. Mirror SDKSynchronizer exactly.
@@ -510,40 +518,45 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
-        // [v2.1 E-6] Route init-time provisioning (restore recover_until / new-wallet tree
-        // state) through the engine's `restore_anchor` primitive — the offline fallback
-        // policy and Tor privacy live ENGINE-side, one implementation for every host. The
-        // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
-        //
-        // Read here, before the engine step takes its turn on the lifecycle queue, on purpose: the
-        // anchor is wanted by `initializer.initialize` below, which runs outside the queue. A switch
-        // that lands between this read and the engine step therefore provisions from the server
-        // recorded when `prepare` began and opens the engine at the one recorded when the step's turn
-        // comes (`SlipstreamWipeEndpointTests`). Queueing the anchor fetch as well would hold every
-        // switch for the whole of provisioning; the two servers differing in that window is accepted.
-        let anchorServer = currentEndpoint
-        try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
-        let anchorNetwork = initializer.network
-        let anchorTorDir = await slipstreamTorDirPath()
-        let resolveAnchor = restoreAnchor
-        initializer.slipstreamAnchorSource = { isRestore, birthday, fallbackCheckpoint in
-            await resolveAnchor(
-                isRestore,
-                birthday,
-                fallbackCheckpoint,
-                anchorServer,
-                anchorNetwork,
-                anchorTorDir
+        torTransition.invalidate()
+        torIntendedRunning = nil
+        // Provisioning owns a route before capture, but releases it before entering the lifecycle
+        // queue: a Tor transition in that queue must be able to drain this already-admitted work.
+        let initialized = try await routeAdmission.withLease {
+            // [v2.1 E-6] Route init-time provisioning (restore recover_until / new-wallet tree
+            // state) through the engine's `restore_anchor` primitive — the offline fallback
+            // policy and Tor privacy live ENGINE-side, one implementation for every host. The
+            // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
+            //
+            // Read here, before the engine step takes its turn on the lifecycle queue, on purpose: the
+            // anchor is wanted by `initializer.initialize` below, which runs outside the queue. A switch
+            // that lands between this read and the engine step therefore provisions from the server
+            // recorded when `prepare` began and opens the engine at the one recorded when the step's turn
+            // comes (`SlipstreamWipeEndpointTests`). Queueing the anchor fetch as well would hold every
+            // switch for the whole of provisioning; the two servers differing in that window is accepted.
+            let anchorServer = currentEndpoint
+            try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
+            let anchorNetwork = initializer.network
+            let anchorTorDir = await slipstreamTorDirPath()
+            let resolveAnchor = restoreAnchor
+            initializer.slipstreamAnchorSource = { isRestore, birthday, fallbackCheckpoint in
+                await resolveAnchor(
+                    isRestore,
+                    birthday,
+                    fallbackCheckpoint,
+                    anchorServer,
+                    anchorNetwork,
+                    anchorTorDir
+                )
+            }
+            return try await initializer.initialize(
+                with: seed,
+                walletBirthday: walletBirthday,
+                name: name,
+                keySource: keySource
             )
         }
-        if case .seedRequired = try await initializer.initialize(
-            with: seed,
-            walletBirthday: walletBirthday,
-            name: name,
-            keySource: keySource
-        ) {
-            return .seedRequired
-        }
+        if case .seedRequired = initialized { return .seedRequired }
         // The engine step is one lifecycle operation, in turn with every switch. A switch queued before
         // it has already recorded its server, and the step opens the engine at what is recorded when
         // its turn comes. A switch made while it runs waits for it and then moves the engine, so the
@@ -625,7 +638,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///     True when the app is starting a run of its own or a takeover is bringing up a new handle;
     ///     false for the `startImpl` a recovery restart performs, because that budget is what bounds
     ///     the restart calling it, and clearing it would make the cap unreachable.
-    private func startImpl(retry: Bool, resetRecoveryBudget: Bool) async throws {
+    private func startImpl(
+        retry: Bool,
+        resetRecoveryBudget: Bool,
+        routeTransition: Bool = false,
+        torRequest: TorTransitionRequest? = nil,
+        torStartup: (any SlipstreamTorStartupControlling)? = nil
+    ) async throws {
+        guard routeTransition || !routeAdmission.isFenced else {
+            throw TorTransitionState.Failure.routeUnavailable
+        }
         // T8.3 (T5.5 wart fix): a start() before prepare() must throw
         // .synchronizerNotPrepared — parity with SDKSynchronizer.start
         // (SDKSynchronizer.swift:189-192). Without this guard, start() reached
@@ -635,6 +657,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // direct SlipstreamEngine misuse, covered by its own test).
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
+        }
+        if !routeTransition && routeAdmission.selectedTor {
+            let request = makeTorTransition(enabled: true, startsSync: true, resetRecoveryBudget: resetRecoveryBudget)
+            guard request.startsSync else { throw TorTransitionState.Failure.routeUnavailable }
+            do {
+                try await request.apply()
+            } catch {
+                await request.waitUntilOwnerFinishes()
+                throw error
+            }
+            return
         }
         // Migration privacy gate — parity with SDKSynchronizer.start's `.stopped, .synced,
         // .disconnected, .error` branch: a sync session must not start while a migration
@@ -667,9 +700,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         //   idempotency. Current strategy: ufvk=nil (keyless) since prepare() already
         //   imported the account and stored its birthday treestate.
         let slipstreamTorDir = await slipstreamTorDirPath()
-        try await engine.start(ufvk: nil, birthday: birthday, torDir: slipstreamTorDir)
-        isRunning = true
-        startPolling()
+        if let torStartup, let torDir = slipstreamTorDir, let torEngine = engine as? any SlipstreamTorStarting {
+            try await torEngine.startTor(birthday: birthday, torDir: torDir, startup: torStartup)
+            try await torStartup.waitUntilReady()
+        } else {
+            try await engine.start(ufvk: nil, birthday: birthday, torDir: slipstreamTorDir)
+        }
+        if torStartup != nil { return }
+        try await publishStartedPass(request: torRequest)
+    }
+
+    private func publishStartedPass(request: TorTransitionRequest? = nil) async throws {
+        if let request { try torTransition.check(request) }
         // [v2.1 E-3] Warm start emission straight off the truthful snapshot: the engine
         // seeded the permille floor / recovery flag / persisted tip at open(), so a
         // cold-launch catch-up reads its real near-100% position (never 0%) with no
@@ -678,6 +720,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // which the reentrant actor may have already moved past this snapshot's balances (e.g. a
         // concurrent `getAccountsBalances()` call between the `await` above and here).
         let snap = await engine.snapshot()
+        if let request { try torTransition.check(request) }
+        isRunning = true
+        startPolling()
         currentlyRecovering = snap?.isRecovering == 1
         stateSubject.send(SynchronizerState(
             syncSessionID: UUID(),
@@ -703,6 +748,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Waits for earlier lifecycle operations and this stop's teardown to finish.
     /// A returned engine stop may still report non-quiescence, as for `stop()`.
     public nonisolated func stopAndWait() async {
+        torTransition.invalidate()
         await lifecycle.enqueue { await self.stopImpl() }.value
     }
 
@@ -720,11 +766,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// competing one. This also keeps `stopRequestGeneration`'s bump where the stop actually
     /// happens, so a recovery still in the queue behind it sees the request and abandons instead.
     public nonisolated func stop() {
+        torTransition.invalidate()
         lifecycle.enqueue { await self.stopImpl() }
     }
 
     /// The queued body of `stop()`.
     private func stopImpl() async {
+        torIntendedRunning = nil
         // [MOB-1850] This teardown owns the engine now: retire every tick decided for the pass it
         // is taking down, before anything else happens.
         passGeneration += 1
@@ -747,19 +795,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // next foreground start(). The sdkStopped()/engine.stop() side effects below
         // stay unconditional (engine.stop() on a nil handle is a no-op). Mirrors
         // SDKSynchronizer.stop ordering (SDKSynchronizer.swift:243-249).
-        if latestState.internalSyncStatus.isPrepared {
-            stateSubject.send(SynchronizerState(
-                syncSessionID: latestState.syncSessionID,
-                accountsBalances: latestState.accountsBalances,
-                localAccountsBalances: latestState.localAccountsBalances,
-                internalSyncStatus: .stopped,
-                latestBlockHeight: latestState.latestBlockHeight,
-                fullyScannedHeight: latestState.fullyScannedHeight,
-                // Balances carry over verbatim here, so their masked-ness must carry with them
-                // rather than silently reading as authoritative.
-                isSpendableMasked: latestState.isSpendableMasked
-            ))
-        }
+        publishStoppedState()
         // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
         // moment, and a start() more than 1.6 target block intervals later (120 s before NU7,
         // 40 s from it) re-masks via snapshot.tipFresh (E-2).
@@ -777,6 +813,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 function: #function,
                 line: #line
             )
+        }
+    }
+
+    private func publishStoppedState() {
+        if latestState.internalSyncStatus.isPrepared {
+            stateSubject.send(SynchronizerState(
+                syncSessionID: latestState.syncSessionID,
+                accountsBalances: latestState.accountsBalances,
+                localAccountsBalances: latestState.localAccountsBalances,
+                internalSyncStatus: .stopped,
+                latestBlockHeight: latestState.latestBlockHeight,
+                fullyScannedHeight: latestState.fullyScannedHeight,
+                // Balances carry over verbatim here, so their masked-ness must carry with them
+                // rather than silently reading as authoritative.
+                isSpendableMasked: latestState.isSpendableMasked
+            ))
         }
     }
 
@@ -1574,14 +1626,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // resolver a shipped synchronizer is built with is exactly that primitive, and a test can
         // hand in one that needs no server.
         let fallbackCheckpoint = checkpointSource.birthday(for: BlockHeight.max).height
-        let anchor = await restoreAnchor(
-            true, // a restore: the anchor is the account's recover-until height
-            birthday ?? 0,
-            fallbackCheckpoint,
-            currentEndpoint,
-            initializer.network,
-            await slipstreamTorDirPath()
-        )
+        let anchor = try await routeAdmission.withLease {
+            await restoreAnchor(
+                true, // a restore: the anchor is the account's recover-until height
+                birthday ?? 0,
+                fallbackCheckpoint,
+                currentEndpoint,
+                initializer.network,
+                await slipstreamTorDirPath()
+            )
+        }
         let chainTipHeight = anchor.map { UInt32($0.height) }
         let effectiveBirthday = birthday ?? (chainTipHeight.map { BlockHeight($0) } ?? initializer.walletBirthday)
 
@@ -1941,20 +1995,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func addProofsToPCZT(pczt: Pczt) async throws -> Pczt {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let container = initializer.container
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: initializer.logger,
-            torClientProvider: {
-                let isTorEnabled = await sdkFlags.torEnabled
-                return isTorEnabled ? container.resolve(TorClient.self) : nil
-            }
-        )
-        return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let container = initializer.container
+            try await SaplingParameterDownloader.downloadParamsIfnotPresent(
+                spendURL: initializer.spendParamsURL,
+                spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
+                outputURL: initializer.outputParamsURL,
+                outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
+                logger: initializer.logger,
+                torClientProvider: {
+                    let isTorEnabled = await sdkFlags.torEnabled
+                    return isTorEnabled ? container.resolve(TorClient.self) : nil
+                }
+            )
+            return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
+        }
     }
 
     public func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
@@ -2086,19 +2142,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func enhanceTransactionBy(txId: TxId) async throws {
-        let txIdData = txId.id.data
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let response = try await initializer.blockDownloaderService.fetchTransaction(
-            txId: txIdData,
-            mode: await sdkFlags.ifTor(ServiceMode.txIdGroup(prefix: "fetch", txId: txIdData))
-        )
-        if response.status == .txidNotRecognized {
-            try await initializer.rustBackend.setTransactionStatus(txId: txIdData, status: .txidNotRecognized)
-        } else if let fetchedTransaction = response.tx {
-            _ = try await initializer.rustBackend.decryptAndStoreTransaction(
-                txBytes: fetchedTransaction.raw.bytes,
-                minedHeight: fetchedTransaction.minedHeight
+        return try await routeAdmission.withLease {
+            let txIdData = txId.id.data
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let response = try await initializer.blockDownloaderService.fetchTransaction(
+                txId: txIdData,
+                mode: await sdkFlags.ifTor(ServiceMode.txIdGroup(prefix: "fetch", txId: txIdData))
             )
+            if response.status == .txidNotRecognized {
+                try await initializer.rustBackend.setTransactionStatus(txId: txIdData, status: .txidNotRecognized)
+            } else if let fetchedTransaction = response.tx {
+                _ = try await initializer.rustBackend.decryptAndStoreTransaction(
+                    txBytes: fetchedTransaction.raw.bytes,
+                    minedHeight: fetchedTransaction.minedHeight
+                )
+            }
         }
     }
 
@@ -2124,41 +2182,45 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // ── Height queries ────────────────────────────────────────────────────────
 
     public func latestHeight() async throws -> BlockHeight {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor))
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor))
+        }
     }
 
     // ── UTXO refresh ──────────────────────────────────────────────────────────
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
-        // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: address.stringEncoded,
-            startHeight: height,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
-        var utxos: [UnspentTransactionOutputEntity] = []
-        for try await utxo in stream {
-            utxos.append(utxo)
-        }
-        var inserted: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await initializer.rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-                inserted.append(utxo)
-            } catch {
-                skipped.append(utxo)
+        return try await routeAdmission.withLease {
+            // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
+                tAddress: address.stringEncoded,
+                startHeight: height,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+            var utxos: [UnspentTransactionOutputEntity] = []
+            for try await utxo in stream {
+                utxos.append(utxo)
             }
+            var inserted: [UnspentTransactionOutputEntity] = []
+            var skipped: [UnspentTransactionOutputEntity] = []
+            for utxo in utxos {
+                do {
+                    try await initializer.rustBackend.putUnspentTransparentOutput(
+                        txid: utxo.txid.bytes,
+                        index: utxo.index,
+                        script: utxo.script.bytes,
+                        value: Int64(utxo.valueZat),
+                        height: utxo.height
+                    )
+                    inserted.append(utxo)
+                } catch {
+                    skipped.append(utxo)
+                }
+            }
+            return RefreshedUTXOs(inserted: inserted, skipped: skipped)
         }
-        return RefreshedUTXOs(inserted: inserted, skipped: skipped)
     }
 
     // ── Exchange rate ─────────────────────────────────────────────────────────
@@ -2169,8 +2231,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             guard await sdkFlags.exchangeRateEnabled else { return }
             let torClient = initializer.container.resolve(TorClient.self)
             do {
-                let isolatedClient = try await torClient.isolatedClient()
-                exchangeRateSubject.send(try await isolatedClient.getExchangeRateUSD())
+                try await sdkFlags.routeAdmission.withLease {
+                    let isolatedClient = try await torClient.isolatedClient()
+                    exchangeRateSubject.send(try await isolatedClient.getExchangeRateUSD())
+                }
             } catch {
                 // swallow exchange rate fetch errors (best-effort)
             }
@@ -2309,6 +2373,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
     /// mirroring the `SDKSynchronizer.wipe()` idiom.
     public nonisolated func wipe() -> AnyPublisher<Void, Error> {
+        torTransition.invalidate()
         let subject = PassthroughSubject<Void, Error>()
         Task(priority: .high) { [weak self] in
             guard let self else {
@@ -2334,6 +2399,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// The queued body of `wipe()`.
     private func wipeOnLifecycleQueue(_ subject: PassthroughSubject<Void, Error>) async {
+        torIntendedRunning = nil
         passGeneration += 1
         // [MOB-1850] Captured before `isRunning` is cleared, for the same reason every account
         // mutation captures it: a wipe this method refuses must leave the pass as it found it.
@@ -2515,8 +2581,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         usk: UnifiedSpendingKey,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        return try await routeAdmission.withLease {
+            try throwIfSyncingForMigrationBroadcast()
+            return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        }
     }
 
     public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -2556,8 +2624,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         _ instruction: MigrationBroadcastInstruction,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        return try await routeAdmission.withLease {
+            try throwIfSyncingForMigrationBroadcast()
+            return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        }
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -2700,6 +2770,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 7. Store `endpoint` in `currentEndpoint`.
     /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
+        torTransition.invalidate()
+        torIntendedRunning = nil
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
         // comparison belongs in this operation's own turn rather than before it.
@@ -2811,6 +2883,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
     public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        torTransition.invalidate()
+        torIntendedRunning = nil
         // A caller cancelled while this restart is still queued — the app backgrounding while a
         // terminal rebuild waits its turn — must not have the restart run behind the stop that
         // background enqueued: the queued task is unstructured and inherits no cancellation, so the
@@ -2972,6 +3046,19 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
+        do {
+            return try await routeAdmission.withLease {
+                await self.measureAdmittedEndpoints(endpoints: endpoints, network: network)
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private func measureAdmittedEndpoints(
+        endpoints: [LightWalletEndpoint],
+        network: NetworkType
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
         let torClient = initializer.container.resolve(TorClient.self)
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
@@ -3048,18 +3135,132 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     // ── Tor ───────────────────────────────────────────────────────────────────
 
-    public func tor(enabled: Bool) async throws {
+    public nonisolated var torTransitionState: TorTransitionState? { torTransition.snapshot }
+
+    public nonisolated func torTransitionUpdates() -> AsyncStream<TorTransitionState> { torTransition.updates() }
+
+    public nonisolated func requestTorTransition(enabled: Bool) -> TorTransitionRequest {
+        makeTorTransition(enabled: enabled)
+    }
+
+    private nonisolated func makeTorTransition(
+        enabled: Bool,
+        startsSync: Bool = false,
+        resetRecoveryBudget: Bool = true
+    ) -> TorTransitionRequest {
+        return torTransition.begin(
+            enabled: enabled,
+            health: healthOwner,
+            startsSync: startsSync,
+            resetRecoveryBudget: resetRecoveryBudget
+        ) { request in
+            self.routeAdmission.require(enabled)
+            request.configure(
+                activate: { [weak self, weak request] in
+                    guard let self, let request else { return Task { throw CancellationError() } }
+                    if startsSync {
+                        return Task { try await self.applyTorMode(request) }
+                    }
+                    return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
+                },
+                cancellation: {},
+                dormantCancelled: { [weak self, weak request] in
+                    guard let self, let request else { return }
+                    self.torTransition.publish(request, phase: .cancelled)
+                }
+            )
+        }
+    }
+
+    public nonisolated func tor(enabled: Bool) async throws {
+        try await requestTorTransition(enabled: enabled).apply()
+    }
+
+    private func applyTorMode(_ request: TorTransitionRequest) async throws {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torClient = initializer.container.resolve(TorClient.self)
-        if enabled {
-            try await torClient.prepare()
-        } else {
-            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
-            if !exchangeRateEnabled {
-                try await torClient.close()
+        var ownsEngine = false
+        do {
+            try torTransition.check(request)
+            try await sdkFlags.routeAdmission.drain(deadline: request.acquisitionDeadline)
+            try torTransition.check(request)
+            try torTransition.acquired(request)
+            ownsEngine = true
+            let wasRunning = request.startsSync || (torIntendedRunning ?? passIntendedRunning)
+            torIntendedRunning = wasRunning
+            passGeneration += 1
+            isRunning = false
+            stopPolling()
+            let report = await engine.stop()
+            try torTransition.check(request)
+            publishStoppedState()
+            await sdkFlags.torFlagUpdate(request.enabled)
+            try torTransition.check(request)
+            guard report.isQuiescent else { throw TorTransitionState.Failure.nonquiescent }
+            torTransition.publish(request, phase: .starting)
+            let deadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+            if request.enabled {
+                // Cancelling the owned task cancels its structured preparation waiter immediately.
+                // Runtime close stays in awaited cleanup so no delayed close can retire a successor.
+                try torTransition.check(request)
+                let native = wasRunning ? try (engine as? any SlipstreamTorStarting)?.makeTorStartup(deadline: deadline) : nil
+                if wasRunning && native == nil { throw TorTransitionState.Failure.startupFailed }
+                if let native { request.onCancellation { native.cancel() } }
+                do {
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask { try await torClient.prepare(deadline: deadline) }
+                        if let native {
+                            group.addTask {
+                                try await self.startImpl(
+                                    retry: false,
+                                    resetRecoveryBudget: request.resetRecoveryBudget,
+                                    routeTransition: true,
+                                    torStartup: native
+                                )
+                            }
+                        }
+                        do {
+                            while try await group.next() != nil {}
+                        } catch {
+                            native?.cancel()
+                            group.cancelAll()
+                            try? await torClient.close()
+                            throw error
+                        }
+                    }
+                } catch {
+                    native?.cancel()
+                    throw error
+                }
+            } else {
+                if !(await sdkFlags.exchangeRateEnabled) { try await torClient.close() }
+                try torTransition.check(request)
+                if wasRunning { try await startImpl(retry: false, resetRecoveryBudget: true, routeTransition: true, torRequest: request) }
             }
+            try torTransition.check(request)
+            torTransition.publish(request, phase: .applying)
+            if request.enabled && wasRunning { try await publishStartedPass(request: request) }
+            try torTransition.commit(request, health: healthOwner, endpoint: currentEndpoint) {
+                rebindEndpointServices(to: currentEndpoint)
+                sdkFlags.routeAdmission.install(request.enabled)
+            }
+            torIntendedRunning = nil
+        } catch {
+            if ownsEngine {
+                stopPolling()
+                isRunning = false
+                _ = await engine.stop()
+                try? await torClient.close()
+            }
+            if error is CancellationError {
+                torTransition.publish(request, phase: .cancelled)
+            } else {
+                let failure = error as? TorTransitionState.Failure
+                    ?? ((error as? URLError)?.code == .timedOut ? .startupTimedOut : .startupFailed)
+                torTransition.publish(request, phase: .failed, failure: failure)
+            }
+            throw error
         }
-        await sdkFlags.torFlagUpdate(enabled)
     }
 
     public func exchangeRateOverTor(enabled: Bool) async throws {
@@ -3078,70 +3279,82 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func isTorSuccessfullyInitialized() async -> Bool? {
+        if routeAdmission.selectedTor, let state = torTransition.snapshot, state.requestedEnabled {
+            switch state.phase {
+            case .ready: return true
+            case .failed: return false
+            default: return nil
+            }
+        }
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
-        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
-        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
-        // and the path-restricted voting-config mirror.
-        guard let host = request.url?.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
-                || OHTTPEndpoints.isProxyAllowlisted(host: host)
-                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
-            throw ZcashError.ohttpUnsupportedHost
-        }
-        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
-        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
-        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
-        let viaTor = viaTor || torMode
-
-        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
-        let httpSender: OHTTPTransport.HTTPSender
-        if viaTor {
-            // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
-            // tried again, on a new circuit, only when it failed before any of it was sent.
-            httpSender = { [weak self] request, maxBytes in
-                guard let self else { throw ZcashError.ohttpTransportError }
-                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+        return try await routeAdmission.withLease {
+            // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+            // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+            // and the path-restricted voting-config mirror.
+            guard let host = request.url?.host,
+                  OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                    || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                    || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+                throw ZcashError.ohttpUnsupportedHost
             }
-        } else {
-            httpSender = { request, maxBytes in
-                // S4: use boundedDataWithDeadline for 100s timeout
-                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
-                    for: request,
-                    maxBytes: maxBytes
-                )
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw OHTTPError.transportError("Invalid response type")
+            let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+            // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+            let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+            let viaTor = viaTor || torMode
+
+            // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+            let httpSender: OHTTPTransport.HTTPSender
+            if viaTor {
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                httpSender = { [weak self] request, maxBytes in
+                    guard let self else { throw ZcashError.ohttpTransportError }
+                    return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
                 }
-                return (data, httpResponse)
+            } else {
+                httpSender = { request, maxBytes in
+                    // S4: use boundedDataWithDeadline for 100s timeout
+                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
+                        for: request,
+                        maxBytes: maxBytes
+                    )
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw OHTTPError.transportError("Invalid response type")
+                    }
+                    return (data, httpResponse)
+                }
             }
-        }
 
-        let transport = OHTTPTransport(
-            gatewayHost: route.gatewayHost,
-            relayURL: route.relayURL,
-            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
-            walletNetwork: initializer.network.networkType,
-            viaTor: viaTor,
-            httpSender: httpSender
-        )
-        // The inner request: the caller's fields without the connection's own, the alias credentials the
-        // gateway injects stripped, the body read out of its stream when it has one.
-        let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
-        let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
-        guard let httpResp = HTTPURLResponse(
-            url: request.url!,
-            statusCode: response.status,
-            httpVersion: "HTTP/1.1",
-            headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
-        ) else { throw ZcashError.ohttpResponseError }
-        return (response.body, httpResp)
+            let transport = OHTTPTransport(
+                gatewayHost: route.gatewayHost,
+                relayURL: route.relayURL,
+                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+                walletNetwork: initializer.network.networkType,
+                viaTor: viaTor,
+                httpSender: httpSender
+            )
+            // The inner request: the caller's fields without the connection's own, the alias credentials the
+            // gateway injects stripped, the body read out of its stream when it has one.
+            let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
+            let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+            guard let httpResp = HTTPURLResponse(
+                url: request.url!,
+                statusCode: response.status,
+                httpVersion: "HTTP/1.1",
+                headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
+            ) else { throw ZcashError.ohttpResponseError }
+            return (response.body, httpResp)
+        }
     }
 
     public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        let admission = routeAdmission
+        let lease = try admission.acquire()
+        let streamed = try await TorNetworkAdmission.$current.withValue(lease) {
         // Tor mode puts every relay leg on Tor, whatever the caller asked for.
         let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
         return try await OHTTPExternalHTTP.stream(
@@ -3157,6 +3370,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
             }
         )
+        }
+        let body = TorAdmittedResponseBody(body: streamed.body, lease: lease)
+        return OHTTPStreamedResponse(response: streamed.response, body: AsyncThrowingStream(unfolding: { try await body.next() }))
     }
 
     // swiftlint:disable function_parameter_count
@@ -3205,11 +3421,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
-        try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+        return try await routeAdmission.withLease {
+            try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+        }
     }
 
     public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
-        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+        return try await routeAdmission.withLease {
+            try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+        }
     }
 
     /// The Tor client the HTTP requests over Tor isolate theirs from. Throws unless Tor or the
@@ -3235,8 +3455,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         )
         let context = TorHTTPRequestContext(deadlineUptime: deadline, now: torHTTPUptime)
         return try await context.run { context in
-            let torClient = try await self.httpGetClient(context: context)
-            return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+            try await self.routeAdmission.withLease {
+                let torClient = try await self.httpGetClient(context: context)
+                return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+            }
         }
     }
 
@@ -3260,50 +3482,58 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // to `ifTor(.uniqueTor)` old-SDK parity 2026-07-08.
 
     public func checkSingleUseTransparentAddresses(accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.checkSingleUseTransparentAddresses(
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            accountUUID: accountUUID,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.checkSingleUseTransparentAddresses(
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                accountUUID: accountUUID,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     public func updateTransparentAddressTransactions(address: String) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.updateTransparentAddressTransactions(
-            address: address,
-            start: 0,
-            end: -1,
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.updateTransparentAddressTransactions(
+                address: address,
+                start: 0,
+                end: -1,
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     public func fetchUTXOsBy(address: String, accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.fetchUTXOsByAddress(
-            address: address,
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            accountUUID: accountUUID,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.fetchUTXOsByAddress(
+                address: address,
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                accountUUID: accountUUID,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     // ── Tree state ────────────────────────────────────────────────────────────
 
     public func getTreeState(height: UInt64) async throws -> Data {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let treeState = try await initializer.lightWalletService.getTreeState(
-            BlockID(height: height),
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
-        return try treeState.serializedData()
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let treeState = try await initializer.lightWalletService.getTreeState(
+                BlockID(height: height),
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+            return try treeState.serializedData()
+        }
     }
 
     // ── Database debug ────────────────────────────────────────────────────────
@@ -3311,7 +3541,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     public nonisolated func debugDatabase(sql: String) -> String {
         transactionRepository.debugDatabase(sql: sql)
     }
-
 }
 
 // MARK: - Private helpers
@@ -3325,57 +3554,62 @@ private extension SlipstreamSynchronizer {
         try await enhanceWithState(transactionRepository.findReceived(offset: 0, limit: Int.max))
     }
 
-
     // [#1755] Mirrors SDKSynchronizer.submitTransactions after zcash #1757 (multiserver
     // submission): consumes [CreatedTransaction] (was [ZcashTransaction.Overview]) and adopts the
     // "trust the network over the submit-side error" recovery branch. Submission is shared SDK
     // logic — slipstream only owns the sync path — so this stays byte-for-byte the SDK behaviour.
+}
+
+extension SlipstreamSynchronizer {
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
         let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
+        let admission = routeAdmission
         return AsyncThrowingStream(unfolding: {
             guard let transaction = iterator.next() else { return nil }
 
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
-                let attempt = health.makeAttempt()
-                do {
-                    try await health.withAttempt(attempt) {
-                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
-                    }
-                    // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
-                    // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
-                    // ring event for ring consumers) — the poll loop's version compare re-fetches
-                    // and emits on the next tick (≤ the poll cadence). One path for every host.
-                    // Fire-and-forget; never delays the submit stream.
-                    Task { await self.engine.notifyTxChange() }
-                    return TransactionSubmitResult.success(txId: transaction.txId)
-                } catch ZcashError.serviceSubmitFailed(let error) {
-                    // The server could not be reached. That includes its height not being readable, the first request of a submission.
-                    submitFailed = true
-                    health.adoptFailure(from: attempt)
-                    return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
-                } catch TransactionEncoderError.submitError(let code, let message) {
-                    // If the server already has this tx, the broadcast landed — treat as success.
-                    if await health.withAttempt(health.makeAttempt(), operation: {
-                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
-                    }) {
+                return try await admission.withLease {
+                    let attempt = health.makeAttempt()
+                    do {
+                        try await health.withAttempt(attempt) {
+                            try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                        }
+                        // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
+                        // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
+                        // ring event for ring consumers) — the poll loop's version compare re-fetches
+                        // and emits on the next tick (≤ the poll cadence). One path for every host.
+                        // Fire-and-forget; never delays the submit stream.
+                        Task { await self.engine.notifyTxChange() }
                         return TransactionSubmitResult.success(txId: transaction.txId)
+                    } catch ZcashError.serviceSubmitFailed(let error) {
+                        // The server could not be reached. That includes its height not being readable, the first request of a submission.
+                        submitFailed = true
+                        health.adoptFailure(from: attempt)
+                        return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
+                    } catch let TransactionEncoderError.submitError(code, message) {
+                        // If the server already has this tx, the broadcast landed — treat as success.
+                        if await health.withAttempt(health.makeAttempt(), operation: {
+                            await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                        }) {
+                            return TransactionSubmitResult.success(txId: transaction.txId)
+                        }
+                        submitFailed = true
+                        health.adoptFailure(from: attempt)
+                        return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
+                    } catch TransactionEncoderError.notSubmittable(let refusal) {
+                        // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
+                        // network, so there is no server to ask whether it knows the transaction.
+                        submitFailed = true
+                        return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                    } catch {
+                        health.adoptFailure(from: attempt)
+                        throw error
                     }
-                    submitFailed = true
-                    health.adoptFailure(from: attempt)
-                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
-                } catch TransactionEncoderError.notSubmittable(let refusal) {
-                    // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
-                    // network, so there is no server to ask whether it knows the transaction.
-                    submitFailed = true
-                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
-                } catch {
-                    health.adoptFailure(from: attempt)
-                    throw error
                 }
             }
         })
@@ -3435,3 +3669,5 @@ extension SlipstreamSynchronizer: OHTTPHealthProviding {
         )
     }
 }
+
+extension SlipstreamSynchronizer: TorTransitionProviding {}

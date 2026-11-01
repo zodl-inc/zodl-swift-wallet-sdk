@@ -15,29 +15,34 @@ public actor TorClient {
     private var torDir: URL
     private let httpGetNative: TorHTTPGetNative
     private let httpExecutor: TorHTTPRequestExecutor
+    private let startupInterestChanged: @Sendable (Int) -> Void
 
     public var cachedFiatCurrencyResult: FiatCurrencyResult?
 
     init(
         torDir: URL,
         httpGetNative: TorHTTPGetNative = TorHTTPGetNative(),
-        httpExecutor: TorHTTPRequestExecutor = .shared
+        httpExecutor: TorHTTPRequestExecutor = .shared,
+        startupInterestChanged: @escaping @Sendable (Int) -> Void = { _ in }
     ) {
         self.torDir = torDir
         self.httpGetNative = httpGetNative
         self.httpExecutor = httpExecutor
+        self.startupInterestChanged = startupInterestChanged
     }
 
     init(
         runtimePtr: OpaquePointer,
         torDir: URL,
         httpGetNative: TorHTTPGetNative = TorHTTPGetNative(),
-        httpExecutor: TorHTTPRequestExecutor = .shared
+        httpExecutor: TorHTTPRequestExecutor = .shared,
+        startupInterestChanged: @escaping @Sendable (Int) -> Void = { _ in }
     ) {
         underlyingRuntime = runtimePtr
         self.torDir = torDir
         self.httpGetNative = httpGetNative
         self.httpExecutor = httpExecutor
+        self.startupInterestChanged = startupInterestChanged
     }
 
     deinit {
@@ -496,6 +501,7 @@ extension TorClient {
             if pendingStartup?.generation == attempt.generation { pendingStartup = nil }
             return try await prepareRuntime(deadline: deadline)
         }
+        startupInterestChanged(attempt.owner.interestCount)
         let waiter = TorRuntimeStartupWaiter { attempt.owner.releaseWaiter(id, cancelling: true) }
         do {
             try await waiter.wait(for: attempt.task, deadline: deadline)

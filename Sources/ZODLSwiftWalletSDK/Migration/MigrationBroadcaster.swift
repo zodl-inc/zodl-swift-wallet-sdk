@@ -86,6 +86,7 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     private let logger: Logger
     private let torClientFactory: @Sendable (URL) async throws -> TorClient
     /// The SDK's Tor mode: while it is on, every broadcast goes over Tor whatever the caller asked for.
+    private let admission: TorNetworkAdmission?
     private let torMode: @Sendable () async -> Bool
     private let ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)?
     private let directServiceFactory: @Sendable (LightWalletEndpoint) -> any LightWalletService
@@ -113,13 +114,14 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     ///   documents), so sharing the directory is safe. ``torClientTask`` additionally removes the
     ///   duplicate-bootstrap race within a single broadcaster: concurrent `useTor` broadcasts on one
     ///   instance bootstrap the shared directory at most once (see ``dedicatedTorClient()``).
-    init(torDirURL: URL, logger: Logger, networkType: NetworkType, torMode: @escaping @Sendable () async -> Bool = { false }) {
+    init(torDirURL: URL, logger: Logger, networkType: NetworkType, admission: TorNetworkAdmission? = nil, torMode: @escaping @Sendable () async -> Bool = { false }) {
         self.init(
             torDirURL: torDirURL,
             logger: logger,
             torClientFactory: MigrationBroadcaster.bootstrapTorClient,
             torMode: torMode,
-            networkType: networkType
+            networkType: networkType,
+            admission: admission
         )
     }
 
@@ -137,8 +139,10 @@ actor MigrationBroadcaster: MigrationBroadcasting {
         torMode: @escaping @Sendable () async -> Bool = { false },
         networkType: NetworkType,
         directServiceFactory: @escaping @Sendable (LightWalletEndpoint) -> any LightWalletService = { LightWalletGRPCService(endpoint: $0) },
-        ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)? = nil
+        ohttpClientFactory: (@Sendable (LightWalletEndpoint) async throws -> any MigrationOHTTPClient)? = nil,
+        admission: TorNetworkAdmission? = nil
     ) {
+        self.admission = admission
         self.torDirURL = torDirURL
         self.logger = logger
         self.torClientFactory = torClientFactory
@@ -226,6 +230,20 @@ actor MigrationBroadcaster: MigrationBroadcasting {
     ///   run when the server's height could not be read, so a caller that took nothing from the
     ///   wallet in `prepareTransaction` knows nothing was submitted.
     func broadcast(
+        to endpoint: LightWalletEndpoint,
+        useTor: Bool,
+        onWillSubmit: @Sendable () -> Void,
+        prepareTransaction: @Sendable (_ serverHeight: BlockHeight) async throws -> Data
+    ) async throws -> MigrationBroadcastOutcome {
+        if let admission {
+            return try await admission.withLease {
+                try await self.broadcastAdmitted(to: endpoint, useTor: useTor, onWillSubmit: onWillSubmit, prepareTransaction: prepareTransaction)
+            }
+        }
+        return try await broadcastAdmitted(to: endpoint, useTor: useTor, onWillSubmit: onWillSubmit, prepareTransaction: prepareTransaction)
+    }
+
+    private func broadcastAdmitted(
         to endpoint: LightWalletEndpoint,
         useTor: Bool,
         onWillSubmit: @Sendable () -> Void,

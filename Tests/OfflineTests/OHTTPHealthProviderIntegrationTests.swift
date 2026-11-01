@@ -101,9 +101,9 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
             } else if let sync = provider as? SlipstreamSynchronizer {
                 try await sync.tor(enabled: true)
             }
-            XCTAssertTrue(session.isValid, "Changing Tor flags alone keeps the binding, then route validation rejects it")
+            XCTAssertEqual(session.isValid, !slipstream, "A Slipstream route transition retires the prior diagnostic binding")
             let mismatch = await provider.probeOHTTPHealth(session: session)
-            XCTAssertEqual(mismatch.outcome, .configurationFailure)
+            XCTAssertEqual(mismatch.outcome, slipstream ? .cancelled : .configurationFailure)
             XCTAssertTrue(calls.withLock { $0.isEmpty })
             let torSession = try await provider.makeOHTTPHealthSession(route: route(viaTor: true), generation: UUID())
             let result = await provider.probeOHTTPHealth(session: torSession)

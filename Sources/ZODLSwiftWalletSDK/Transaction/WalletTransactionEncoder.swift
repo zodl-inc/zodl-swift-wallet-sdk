@@ -182,6 +182,12 @@ class WalletTransactionEncoder: TransactionEncoder {
     func submit(
         transaction: EncodedTransaction
     ) async throws {
+        try await sdkFlags.routeAdmission.withLease {
+            try await self.submitAdmitted(transaction: transaction)
+        }
+    }
+
+    private func submitAdmitted(transaction: EncodedTransaction) async throws {
         let health = OHTTPHealthFailureOwner()
         let mode = await sdkFlags.torEnabled
             ? ServiceMode.txIdGroup(prefix: "submit", txId: transaction.transactionId)

@@ -6,7 +6,38 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `TorTransitionProviding` exposes retained `TorTransitionState` and updates on `SlipstreamSynchronizer`.
+  `requestTorTransition(enabled:)` immediately fences new requests and cancels an opposite startup.
+  Its `TorTransitionRequest.apply()` activates once after the host acquires its transaction guard;
+  `wait()` only observes, and `cancelBeforeApplying()` cancels a dormant ticket. Existing
+  `Synchronizer` conformers need no new members.
+
+## Changed
+
+- `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
+  `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
+  are unchanged; actor-isolated callers must add `await`.
+
 ## Fixed
+
+- `SlipstreamSynchronizer.tor(enabled:)` now stops the old pass and waits for both required Tor
+  owners before resuming an intended-running wallet. Idle wallets remain idle. Failed enablement
+  keeps Tor required, and new network work fails with `TorTransitionState.Failure.routeUnavailable`
+  until a successful route choice. Already-admitted broadcasts retain their route and original
+  result, including outcome recovery and multi-endpoint propagation after acceptance. The existing
+  nonthrowing `Broadcaster.submit` reports a refused admission as `.unreachable` and retains the
+  created transaction's intended retry endpoints without recreating plans after a wipe.
+- An idle Tor enable keeps its completed ticket result while a later normal sync start publishes
+  fresh pending, ready or failed state for the native owner it now requires.
+- Wallet and account provisioning now retain their admitted route through native restore-anchor
+  work, and new provisioning and server-selection probes cannot bypass a pending route fence.
+- Explicit Tor choices have a 30-second acquisition budget, including host guard waiting, followed
+  by a shared 60-second startup budget after safe stop. Stop, wipe, prepare and endpoint replacement
+  invalidate pending choices. Superseded diagnostic sessions are cancelled; create a new health
+  session after the replacement binding becomes ready.
+
 
 - Cold `TorClient` startup now leaves the actor responsive and cancels native bootstrap when
   its final waiting caller cancels or the client closes. Standalone cold startup uses a 60-second

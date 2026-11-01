@@ -1,5 +1,29 @@
 # Migrating from previous versions to _Unreleased_
 
+## Slipstream Tor choices and engine calls
+
+`tor(enabled:)` remains the standalone async convenience. Hosts with a transaction guard may
+cast to `TorTransitionProviding`, create the ticket before waiting for that guard, then call
+`apply()` while holding it. If guard acquisition fails, call `cancelBeforeApplying()`. Creating
+a ticket immediately fences new network work and cancels opposite startup; it does not apply
+the replacement route. `wait()` observes without activation, and cancelling an observer does
+not cancel the shared owner. Use the request identity to avoid acquiring the host guard twice
+for joined UI choices. A completed ticket keeps its result. When an idle Tor-enabled wallet later
+starts syncing, the current state stream reports a fresh run identity and requires native readiness
+as well as HTTP readiness. Observe that current state for startup failure and retry UI.
+
+`SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
+`drainEvents` now explicitly suspend until exclusive handle access is available. External actor
+calls keep their syntax. Inside code isolated to the actor, add `await`:
+
+```swift
+// Before, inside actor-isolated code:
+let progress = snapshot()
+
+// After:
+let progress = await snapshot()
+```
+
 ## `TorClient` methods await cold startup
 
 `TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,

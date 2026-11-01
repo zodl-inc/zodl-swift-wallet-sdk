@@ -9,6 +9,26 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class EndpointSubmitterTests: ZcashTestCase {
+    func testTransitionFenceRejectsBeforeHeightOrBroadcast() async throws {
+        let flags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        service.latestBlockHeightModeReturnValue = 3_543_404
+        service.submitSpendTransactionModeReturnValue = SendResponse()
+        let submitter = GRPCEndpointSubmitter(
+            torClient: TorClient(torDir: testTempDirectory), sdkFlags: flags,
+            rustBackend: rustBackend, logger: submissionLifecycleLogger(), networkType: .testnet,
+            serviceFactory: { _, _ in service }
+        )
+        flags.routeAdmission.require(false)
+        do {
+            try await submitter.submit(transaction: makeTransaction(), to: LightWalletEndpointBuilder.default)
+            XCTFail("Retired route must reject a new endpoint broadcast")
+        } catch {}
+        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 0)
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+    }
+
     /// The check every submission passes. It lets everything through unless a test says otherwise.
     private var rustBackend: ZcashRustBackendWeldingMock!
 

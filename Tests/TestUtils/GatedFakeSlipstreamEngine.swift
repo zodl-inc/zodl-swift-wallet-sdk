@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import os
 @testable import ZODLSwiftWalletSDK
 
 /// A latch a test opens to release calls suspended on it.
@@ -72,7 +73,23 @@ final class Gate: @unchecked Sendable {
 /// Gates start OPEN by default, so a test that only wants a fast, inert engine constructs one and
 /// says nothing more. `GatedFakeSlipstreamEngine(openGates: false)` starts every gate closed, and
 /// the test opens the ones it wants to release.
-actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
+actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling, SlipstreamTorStarting {
+    nonisolated let torStartup = FakeSlipstreamTorStartup()
+    private nonisolated let torStartupCount = OSAllocatedUnfairLock(initialState: 0)
+
+    nonisolated func makeTorStartup(deadline: UInt64) throws -> any SlipstreamTorStartupControlling {
+        let first = torStartupCount.withLock { count in
+            count += 1
+            return count == 1
+        }
+        return first ? torStartup : FakeSlipstreamTorStartup()
+    }
+
+    func startTor(birthday: BlockHeight, torDir: String, startup: any SlipstreamTorStartupControlling) async throws {
+        record("startTor")
+        try await start(ufvk: nil, birthday: birthday, torDir: torDir)
+    }
+
     /// Every call the synchronizer made, in order. Names are the bare member name, except `reopen`,
     /// which carries the endpoint it was pointed at (`"reopen(host:port)"`) because which server a
     /// restart chose is the interesting half of that call.
@@ -362,4 +379,21 @@ extension SlipstreamStopReport {
         settleWait: .zero,
         drainWait: .seconds(10)
     )
+}
+
+final class FakeSlipstreamTorStartup: @unchecked Sendable, SlipstreamTorStartupControlling {
+    let ready = Gate()
+    let entered = Gate()
+    private let cancellation = CancellationFlag()
+    init() { ready.open() }
+    var isCancelled: Bool { cancellation.isCancelled }
+    func cancel() {
+        cancellation.markCancelled()
+        ready.open()
+    }
+    func waitUntilReady() async throws {
+        entered.open()
+        await ready.wait()
+        if cancellation.isCancelled { throw CancellationError() }
+    }
 }

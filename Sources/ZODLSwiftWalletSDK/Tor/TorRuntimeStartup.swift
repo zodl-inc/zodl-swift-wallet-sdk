@@ -50,6 +50,8 @@ final class TorRuntimeStartup: @unchecked Sendable {
         self.now = now
     }
 
+    var interestCount: Int { state.withLockUnchecked { $0.waiters.count } }
+
     var isCancelled: Bool { state.withLockUnchecked { $0.cancelled } }
 
     func registerWaiter() -> UUID? {

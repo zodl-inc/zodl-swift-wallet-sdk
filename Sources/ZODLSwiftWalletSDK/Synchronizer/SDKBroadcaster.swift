@@ -62,6 +62,23 @@ final class SDKBroadcaster: Broadcaster {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> TransactionSubmissionOutcome {
+        do {
+            return try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                await self.submitAdmitted(transaction: transaction, to: endpoints, timing: timing)
+            }
+        } catch {
+            // Admission refusal is still a pending submission result. Preserve the caller's
+            // intended endpoints only for transactions belonging to the live wallet lifecycle.
+            await releaseForResubmission(transactions: [transaction], to: endpoints)
+            return .unreachable
+        }
+    }
+
+    private func submitAdmitted(
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> TransactionSubmissionOutcome {
         OHTTPHealthContext.attempt?.beginDelegation()
         let txId = transaction.txId.toHexStringTxId()
 
@@ -226,19 +243,21 @@ final class SDKBroadcaster: Broadcaster {
     // MARK: - Private
 
     private func downloadSaplingParamsIfNeeded() async throws {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let container = initializer.container
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger,
-            torClientProvider: {
-                let isTorEnabled = await sdkFlags.torEnabled
-                return isTorEnabled ? container.resolve(TorClient.self) : nil
-            }
-        )
+        return try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let container = initializer.container
+            try await SaplingParameterDownloader.downloadParamsIfnotPresent(
+                spendURL: initializer.spendParamsURL,
+                spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
+                outputURL: initializer.outputParamsURL,
+                outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
+                logger: logger,
+                torClientProvider: {
+                    let isTorEnabled = await sdkFlags.torEnabled
+                    return isTorEnabled ? container.resolve(TorClient.self) : nil
+                }
+            )
+        }
     }
 
     private func overviewsForEvent(txIds: [Data]) async -> [ZcashTransaction.Overview] {
