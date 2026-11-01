@@ -37,6 +37,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_tor_startup_begin_v1` adds owned Tor runtime creation under a caller-supplied
+  remaining monotonic budget. Use `zcashlc_tor_startup_cancel_v1` to cancel bootstrap,
+  `zcashlc_tor_startup_wait_v1` to await its typed status, `zcashlc_tor_startup_take_v1` to
+  transfer the runtime at most once, and `zcashlc_tor_startup_free_v1` to release the job.
+  Status is independent of thread-local errors. Existing `zcashlc_create_tor_runtime`
+  callers need no changes.
+- `zcashlc_slipstream_start_v2` accepts a one-shot generation/deadline capability from
+  `zcashlc_slipstream_tor_startup_begin_v1`. Use `zcashlc_slipstream_tor_startup_cancel_v1`
+  during startup, `zcashlc_slipstream_tor_startup_snapshot_v1` to read retained typed status,
+  and `zcashlc_slipstream_tor_startup_free_v1` to release caller ownership. Stop/free cancel
+  pending startup; legacy start and snapshot layouts remain unchanged.
+
 - `zcashlc_ohttp_last_grpc_status` returns the immediately preceding decode call's authenticated
   canonical status (0 through 16), or -1 when absent or invalid. Copy it immediately on the same
   thread alongside `zcashlc_ohttp_last_decode_outcome`, before cleanup or another native call.

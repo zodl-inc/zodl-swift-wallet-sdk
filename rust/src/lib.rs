@@ -128,6 +128,7 @@ mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
 mod tor;
+use tor::startup::*;
 mod voting;
 
 #[cfg(target_vendor = "apple")]
@@ -8688,6 +8689,179 @@ mod tests {
 
 use slipstream_core::ffi_handle::SyncState;
 
+/// One-shot startup capability, independent of the exclusively borrowed Slipstream handle.
+/// Retain until start returns; cancel/snapshot may race start and each other. Free is exclusive.
+pub struct FfiSlipstreamTorStartupV1 {
+    control: slipstream_core::TorStartupControl,
+    claimed: std::sync::atomic::AtomicBool,
+    admission_failure: std::sync::Mutex<bool>,
+}
+
+/// Retained startup status for one immutable generation. Status values match ZCASHLC_TOR_STARTUP_*.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiSlipstreamTorStartupSnapshotV1 {
+    pub generation: u64,
+    pub status: u32,
+}
+
+impl FfiSlipstreamTorStartupV1 {
+    fn snapshot(&self) -> FfiSlipstreamTorStartupSnapshotV1 {
+        use slipstream_core::TorStartupPhase;
+        let failed = self
+            .admission_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let snapshot = self.control.snapshot();
+        let status = if *failed {
+            ZCASHLC_TOR_STARTUP_FAILED
+        } else {
+            match snapshot.phase {
+                TorStartupPhase::Starting
+                    if tokio::time::Instant::now() >= self.control.deadline() =>
+                {
+                    ZCASHLC_TOR_STARTUP_TIMED_OUT
+                }
+                TorStartupPhase::Starting => ZCASHLC_TOR_STARTUP_PENDING,
+                TorStartupPhase::Ready => ZCASHLC_TOR_STARTUP_READY,
+                TorStartupPhase::Failed => ZCASHLC_TOR_STARTUP_FAILED,
+                TorStartupPhase::TimedOut => ZCASHLC_TOR_STARTUP_TIMED_OUT,
+                TorStartupPhase::Cancelled => ZCASHLC_TOR_STARTUP_CANCELLED,
+            }
+        };
+        FfiSlipstreamTorStartupSnapshotV1 {
+            generation: snapshot.generation,
+            status,
+        }
+    }
+
+    fn claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn fail_admission(&self) {
+        // Commit includes the decision: cancellation cannot publish between the read and write.
+        #[cfg(test)]
+        tor_startup_ffi_tests::before_admission_commit();
+        let mut failed = self
+            .admission_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.control.snapshot().phase == slipstream_core::TorStartupPhase::Starting
+            && tokio::time::Instant::now() < self.control.deadline()
+        {
+            *failed = true;
+        }
+    }
+}
+
+/// Establishes a monotonic deadline before admission. Null indicates an unrepresentable budget.
+/// Free the returned capability with zcashlc_slipstream_tor_startup_free_v1.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_slipstream_tor_startup_begin_v1(
+    generation: u64,
+    remaining_ms: u64,
+) -> *mut FfiSlipstreamTorStartupV1 {
+    let now = tokio::time::Instant::now();
+    let Some(deadline) = now.checked_add(std::time::Duration::from_millis(remaining_ms)) else {
+        return std::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(FfiSlipstreamTorStartupV1 {
+        control: slipstream_core::TorStartupControl::new(generation, deadline),
+        claimed: std::sync::atomic::AtomicBool::new(false),
+        admission_failure: std::sync::Mutex::new(false),
+    }))
+}
+
+/// Immediately wakes native bootstrap/admission. A Ready session still requires ordinary stop.
+/// # Safety
+/// Capability must be null or live. May race snapshot/start/cancel; never free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_cancel_v1(
+    startup: *const FfiSlipstreamTorStartupV1,
+) {
+    if let Some(startup) = unsafe { startup.as_ref() } {
+        // Serialize cancellation with pre-launch failure: the first terminal outcome wins.
+        let failed = startup
+            .admission_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !*failed {
+            startup.control.cancel();
+        }
+    }
+}
+
+/// Read retained status without touching the exclusively borrowed engine handle.
+/// # Safety
+/// Capability must be null or live. May race snapshot/start/cancel; never free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_snapshot_v1(
+    startup: *const FfiSlipstreamTorStartupV1,
+) -> FfiSlipstreamTorStartupSnapshotV1 {
+    unsafe { startup.as_ref() }.map_or(
+        FfiSlipstreamTorStartupSnapshotV1 {
+            generation: 0,
+            status: ZCASHLC_TOR_STARTUP_INVALID,
+        },
+        FfiSlipstreamTorStartupV1::snapshot,
+    )
+}
+
+/// Releases caller ownership. The engine keeps its clone until replaced/freed; this does not stop it.
+/// # Safety
+/// Capability must be null or live; no other capability call or start may use it during/after free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_free_v1(
+    startup: *mut FfiSlipstreamTorStartupV1,
+) {
+    if !startup.is_null() {
+        drop(unsafe { Box::from_raw(startup) });
+    }
+}
+
+/// Opt-in bounded Tor start. The capability supplies generation and deadline; each is one-shot.
+/// Returns false for reused/stale/cancelled/expired capabilities without disturbing the active pass.
+/// Retained capability status reports startup, independently of legacy progress/error snapshots.
+/// # Safety
+/// Same handle/directory/UFVK rules as zcashlc_slipstream_start. Capability must be live through
+/// this call; only capability cancel/snapshot may run concurrently. Handle calls remain exclusive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_start_v2(
+    handle: *mut SlipstreamHandle,
+    ufvk: *const u8,
+    ufvk_len: usize,
+    birthday_height: u64,
+    tor_dir: *const u8,
+    tor_dir_len: usize,
+    startup: *const FfiSlipstreamTorStartupV1,
+) -> bool {
+    let Some(startup) = (unsafe { startup.as_ref() }) else {
+        return false;
+    };
+    if !startup.claim() {
+        return false;
+    }
+    unsafe {
+        start_slipstream(
+            handle,
+            ufvk,
+            ufvk_len,
+            birthday_height,
+            tor_dir,
+            tor_dir_len,
+            Some(startup),
+        )
+    }
+}
+
 /// Opaque handle to a Slipstream engine instance.
 ///
 /// Wraps [`slipstream_core::ffi_handle::SlipstreamHandle`] as a crate-local newtype so
@@ -8697,6 +8871,8 @@ use slipstream_core::ffi_handle::SyncState;
 /// All state is stored in `inner`; the six `zcashlc_slipstream_*` functions delegate
 /// directly to it.
 pub struct SlipstreamHandle {
+    tor_startup: Option<slipstream_core::TorStartupControl>,
+    tor_startup_generation: Option<u64>,
     inner: slipstream_core::ffi_handle::SlipstreamHandle,
     /// [API v2.1 E-1] Upstream-summary cache: the expensive `get_wallet_summary` walk is
     /// rationed HERE (engine-side), so hosts may call the unified summary whenever they
@@ -9056,6 +9232,8 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
         tracing::info!(total_memory_bytes, "slipstream handle opened");
 
         Ok(Box::into_raw(Box::new(SlipstreamHandle {
+            tor_startup: None,
+            tor_startup_generation: None,
             inner,
             summary_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             summary_refresh_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
@@ -9213,11 +9391,56 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
     tor_dir: *const u8,
     tor_dir_len: usize,
 ) -> bool {
+    unsafe {
+        start_slipstream(
+            handle,
+            ufvk,
+            ufvk_len,
+            birthday_height,
+            tor_dir,
+            tor_dir_len,
+            None,
+        )
+    }
+}
+
+unsafe fn start_slipstream(
+    handle: *mut SlipstreamHandle,
+    ufvk: *const u8,
+    ufvk_len: usize,
+    birthday_height: u64,
+    tor_dir: *const u8,
+    tor_dir_len: usize,
+    startup: Option<&FfiSlipstreamTorStartupV1>,
+) -> bool {
     // SAFETY: callers must respect mutability rules on the Swift side so that observing
     // a panic from another thread does not leave the handle in an inconsistent state.
     let handle = AssertUnwindSafe(handle);
     let res = catch_panic(|| {
         let handle = unsafe { handle.as_mut() }.ok_or_else(|| anyhow!("null handle"))?;
+
+        if let Some(startup) = startup {
+            if startup.snapshot().status != ZCASHLC_TOR_STARTUP_PENDING
+                || tor_dir.is_null()
+                || tor_dir_len == 0
+            {
+                return Ok(false);
+            }
+            if handle
+                .tor_startup_generation
+                .is_some_and(|generation| startup.control.snapshot().generation <= generation)
+            {
+                startup.control.cancel();
+                return Ok(false);
+            }
+        }
+        if let Some(previous) = handle.tor_startup.take() {
+            previous.cancel();
+        }
+        if let Some(startup) = startup {
+            handle.tor_startup = Some(startup.control.clone());
+            handle.tor_startup_generation = Some(startup.control.snapshot().generation);
+        }
 
         // [API v2.1 E-2] Tip-freshness bookkeeping (shouldMarkChainTipUpdated parity):
         // capture the refresh-counter baseline BEFORE the pass starts — a later advance
@@ -9415,19 +9638,30 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         // + a tag=4/value=2 event instead of a silent death stuck at "Syncing" forever.
         let sup_state = std::sync::Arc::clone(&h.state);
         let sup_events = std::sync::Arc::clone(&h.events);
+        if startup.is_some_and(|startup| startup.snapshot().status != ZCASHLC_TOR_STARTUP_PENDING) {
+            *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Error(2);
+            return Ok(false);
+        }
         h.task = Some(slipstream_core::ffi_handle::spawn_supervised(
             &h.runtime,
-            slipstream_core::session::run_session(
+            slipstream_core::session::run_session_with_tor_startup(
                 session_config,
                 reporter,
                 std::sync::Arc::clone(&h.pass_lock),
+                handle.tor_startup.clone(),
             ),
             sup_state,
             sup_events,
         ));
         Ok(true)
     });
-    unwrap_exc_or(res, false)
+    let success = unwrap_exc_or(res, false);
+    if !success {
+        if let Some(startup) = startup {
+            startup.fail_admission();
+        }
+    }
+    success
 }
 
 /// Stops any in-flight Slipstream sync and waits, bounded, for the wallet file to fall quiet.
@@ -9505,6 +9739,9 @@ unsafe fn stop_slipstream(
     let handle = AssertUnwindSafe(handle);
     let res = catch_panic(|| {
         let handle = unsafe { handle.as_mut() }.ok_or_else(|| anyhow!("null handle"))?;
+        if let Some(startup) = &handle.tor_startup {
+            startup.cancel();
+        }
         // [API v2.1 E-2] Stamp the stop: a start() within `tip_fresh_stop_window` keeps tip
         // freshness (quick background hop; parity with `SDKFlags.sdkStarted()` before NU7, which
         // keeps a flat 120 s window); a longer gap re-masks.
@@ -10477,6 +10714,9 @@ pub unsafe extern "C" fn zcashlc_slipstream_free(handle: *mut SlipstreamHandle) 
         // SAFETY: handle is non-null and was returned by zcashlc_slipstream_open (caller
         // contract). We take ownership here and drop it at end of scope.
         let mut h: Box<SlipstreamHandle> = unsafe { Box::from_raw(handle) };
+        if let Some(startup) = &h.tor_startup {
+            startup.cancel();
+        }
         // Abort the in-flight task before dropping the runtime; dropping a Runtime with
         // live tasks causes a panic on some platforms.
         if let Some(task) = h.inner.task.take() {
@@ -12089,3 +12329,345 @@ mod ohttp_single_use_taddr_timing_tests {
 
 #[cfg(test)]
 mod ohttp_health_tests;
+
+#[cfg(test)]
+mod tor_startup_ffi_tests {
+    use super::*;
+    use std::{ptr, sync::Arc, time::Duration};
+
+    thread_local! {
+        static ADMISSION_COMMIT_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_admission_commit() {
+        ADMISSION_COMMIT_GATE.with(|gate| {
+            if let Some((paused, resume)) = gate.borrow_mut().take() {
+                paused.send(()).unwrap();
+                resume.recv().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn tor_startup_cancel_before_failure_commit_remains_terminal() {
+        let startup = zcashlc_slipstream_tor_startup_begin_v1(19, 60_000);
+        let (paused, decision_paused) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let startup_ref = unsafe { &*startup };
+            let failure = scope.spawn(move || {
+                ADMISSION_COMMIT_GATE.with(|gate| *gate.borrow_mut() = Some((paused, resumed)));
+                startup_ref.fail_admission();
+            });
+            decision_paused
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            unsafe {
+                zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            }
+            assert_eq!(
+                unsafe { zcashlc_slipstream_tor_startup_snapshot_v1(startup) }.status,
+                4
+            );
+            resume.send(()).unwrap();
+            failure.join().unwrap();
+        });
+        let snapshot = unsafe { zcashlc_slipstream_tor_startup_snapshot_v1(startup) };
+        unsafe {
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+        }
+        assert_eq!((snapshot.generation, snapshot.status), (19, 4));
+    }
+
+    fn open() -> (tempfile::TempDir, *mut SlipstreamHandle) {
+        let (dir, db) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        let host = b"127.0.0.1";
+        let handle = unsafe {
+            zcashlc_slipstream_open(
+                db.as_ptr(),
+                db.len(),
+                host.as_ptr(),
+                host.len(),
+                9,
+                false,
+                NETWORK_ID_TESTNET,
+                0,
+            )
+        };
+        assert!(!handle.is_null());
+        (dir, handle)
+    }
+
+    #[test]
+    fn tor_startup_admission_failure_remains_terminal_after_cancel() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        let ufvk = b"invalid viewing key";
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(17, 60_000);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ufvk.as_ptr(),
+                ufvk.len(),
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                2
+            );
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let snapshot = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((snapshot.generation, snapshot.status), (17, 2));
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_cancel_during_exclusive_quiescence_never_launches_worker() {
+        struct BlockDrop(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (_dir, handle) = open();
+        let (entered, worker_entered) = std::sync::mpsc::channel();
+        let (unwinding, worker_unwinding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        unsafe {
+            (*handle).inner.task = Some(
+                (*handle)
+                    .inner
+                    .runtime
+                    .spawn(async move {
+                        let _guard = BlockDrop(unwinding, released);
+                        entered.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    })
+                    .abort_handle(),
+            );
+            worker_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(18, 60_000);
+            let handle_address = handle as usize;
+            let startup_address = startup as usize;
+            let start = std::thread::spawn(move || {
+                let path = b"/unused";
+                zcashlc_slipstream_start_v2(
+                    handle_address as *mut SlipstreamHandle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup_address as *const FfiSlipstreamTorStartupV1,
+                )
+            });
+            worker_unwinding
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            // Only the independent capability is touched while start owns the handle.
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                4
+            );
+            release.send(()).unwrap();
+            assert!(!start.join().unwrap());
+            assert!((*handle).inner.task.is_none());
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_ffi_expired_http_job_has_owned_timeout() {
+        let path = b"/unused";
+        unsafe {
+            let job = zcashlc_tor_startup_begin_v1(path.as_ptr(), path.len(), 0);
+            assert!(!job.is_null());
+            assert_eq!(zcashlc_tor_startup_wait_v1(job), 3);
+            let result = zcashlc_tor_startup_take_v1(job);
+            assert_eq!(result.status, 3);
+            assert!(result.runtime.is_null());
+            zcashlc_tor_startup_free_v1(job);
+        }
+    }
+
+    #[test]
+    fn tor_startup_expired_and_cancelled_capability_do_not_disturb_handle() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            for cancel in [false, true] {
+                let startup =
+                    zcashlc_slipstream_tor_startup_begin_v1(7, if cancel { 60_000 } else { 0 });
+                if cancel {
+                    zcashlc_slipstream_tor_startup_cancel_v1(startup);
+                }
+                assert!(!zcashlc_slipstream_start_v2(
+                    handle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup
+                ));
+                assert_eq!(zcashlc_slipstream_snapshot(handle).state, 0);
+                let snapshot = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+                assert_eq!(snapshot.generation, 7);
+                assert_eq!(snapshot.status, if cancel { 4 } else { 3 });
+                zcashlc_slipstream_tor_startup_free_v1(startup);
+            }
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_native_boundary_cancel_wakes_pass_lock_wait_and_retains_generation() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let pass_lock = Arc::clone(&(*handle).inner.pass_lock);
+            let guard = pass_lock.blocking_lock();
+            let old = zcashlc_slipstream_tor_startup_begin_v1(8, 60_000);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                old
+            ));
+            zcashlc_slipstream_tor_startup_cancel_v1(old);
+            let control = (*old).control.clone();
+            let result = (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), control.wait_for_terminal())
+                    .await
+                    .unwrap()
+            });
+            (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !(*handle).inner.task.as_ref().unwrap().is_finished() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(result.phase, slipstream_core::TorStartupPhase::Cancelled);
+            assert_eq!(result.generation, 8);
+            drop(guard);
+            let new = zcashlc_slipstream_tor_startup_begin_v1(9, 60_000);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                new
+            ));
+            let active_task = (*handle).inner.task.as_ref().unwrap().id();
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                new
+            ));
+            assert_eq!((*handle).inner.task.as_ref().unwrap().id(), active_task);
+            let stale = zcashlc_slipstream_tor_startup_begin_v1(8, 60_000);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                stale
+            ));
+            assert_eq!((*handle).inner.task.as_ref().unwrap().id(), active_task);
+            zcashlc_slipstream_tor_startup_free_v1(stale);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                old
+            ));
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(new).generation,
+                9
+            );
+            zcashlc_slipstream_stop(handle);
+            assert_eq!(zcashlc_slipstream_tor_startup_snapshot_v1(new).status, 4);
+            zcashlc_slipstream_tor_startup_free_v1(old);
+            zcashlc_slipstream_tor_startup_free_v1(new);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_native_boundary_timeout_bounds_pass_lock_wait_and_legacy_start_still_works() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let pass_lock = Arc::clone(&(*handle).inner.pass_lock);
+            let guard = pass_lock.blocking_lock();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(10, 100);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            let control = (*startup).control.clone();
+            let result = (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), control.wait_for_terminal())
+                    .await
+                    .unwrap()
+            });
+            (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !(*handle).inner.task.as_ref().unwrap().is_finished() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(result.phase, slipstream_core::TorStartupPhase::TimedOut);
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                3
+            );
+            drop(guard);
+            zcashlc_slipstream_stop(handle);
+            assert!(zcashlc_slipstream_start(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                ptr::null(),
+                0
+            ));
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+}
