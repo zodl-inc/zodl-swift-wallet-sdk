@@ -8694,7 +8694,7 @@ use slipstream_core::ffi_handle::SyncState;
 pub struct FfiSlipstreamTorStartupV1 {
     control: slipstream_core::TorStartupControl,
     claimed: std::sync::atomic::AtomicBool,
-    admission_failure: std::sync::Mutex<bool>,
+    terminal_status: std::sync::Mutex<Option<u32>>,
 }
 
 /// Retained startup status for one immutable generation. Status values match ZCASHLC_TOR_STARTUP_*.
@@ -8706,32 +8706,39 @@ pub struct FfiSlipstreamTorStartupSnapshotV1 {
 }
 
 impl FfiSlipstreamTorStartupV1 {
-    fn snapshot(&self) -> FfiSlipstreamTorStartupSnapshotV1 {
+    fn observe_terminal(&self, terminal: &mut Option<u32>) -> u32 {
         use slipstream_core::TorStartupPhase;
-        let failed = self
-            .admission_failure
+        if let Some(status) = *terminal {
+            return status;
+        }
+        let mut snapshot = self.control.snapshot();
+        let expired = tokio::time::Instant::now() >= self.control.deadline();
+        if snapshot.phase == TorStartupPhase::Starting && expired {
+            // A native completion before the deadline takes precedence over an older read.
+            snapshot = self.control.snapshot();
+        }
+        let status = match snapshot.phase {
+            TorStartupPhase::Starting if expired => ZCASHLC_TOR_STARTUP_TIMED_OUT,
+            TorStartupPhase::Starting => ZCASHLC_TOR_STARTUP_PENDING,
+            TorStartupPhase::Ready => ZCASHLC_TOR_STARTUP_READY,
+            TorStartupPhase::Failed => ZCASHLC_TOR_STARTUP_FAILED,
+            TorStartupPhase::TimedOut => ZCASHLC_TOR_STARTUP_TIMED_OUT,
+            TorStartupPhase::Cancelled => ZCASHLC_TOR_STARTUP_CANCELLED,
+        };
+        if status != ZCASHLC_TOR_STARTUP_PENDING {
+            *terminal = Some(status);
+        }
+        status
+    }
+
+    fn snapshot(&self) -> FfiSlipstreamTorStartupSnapshotV1 {
+        let mut terminal = self
+            .terminal_status
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let snapshot = self.control.snapshot();
-        let status = if *failed {
-            ZCASHLC_TOR_STARTUP_FAILED
-        } else {
-            match snapshot.phase {
-                TorStartupPhase::Starting
-                    if tokio::time::Instant::now() >= self.control.deadline() =>
-                {
-                    ZCASHLC_TOR_STARTUP_TIMED_OUT
-                }
-                TorStartupPhase::Starting => ZCASHLC_TOR_STARTUP_PENDING,
-                TorStartupPhase::Ready => ZCASHLC_TOR_STARTUP_READY,
-                TorStartupPhase::Failed => ZCASHLC_TOR_STARTUP_FAILED,
-                TorStartupPhase::TimedOut => ZCASHLC_TOR_STARTUP_TIMED_OUT,
-                TorStartupPhase::Cancelled => ZCASHLC_TOR_STARTUP_CANCELLED,
-            }
-        };
         FfiSlipstreamTorStartupSnapshotV1 {
-            generation: snapshot.generation,
-            status,
+            generation: self.control.snapshot().generation,
+            status: self.observe_terminal(&mut terminal),
         }
     }
 
@@ -8750,14 +8757,12 @@ impl FfiSlipstreamTorStartupV1 {
         // Commit includes the decision: cancellation cannot publish between the read and write.
         #[cfg(test)]
         tor_startup_ffi_tests::before_admission_commit();
-        let mut failed = self
-            .admission_failure
+        let mut terminal = self
+            .terminal_status
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if self.control.snapshot().phase == slipstream_core::TorStartupPhase::Starting
-            && tokio::time::Instant::now() < self.control.deadline()
-        {
-            *failed = true;
+        if self.observe_terminal(&mut terminal) == ZCASHLC_TOR_STARTUP_PENDING {
+            *terminal = Some(ZCASHLC_TOR_STARTUP_FAILED);
         }
     }
 }
@@ -8776,7 +8781,7 @@ pub extern "C" fn zcashlc_slipstream_tor_startup_begin_v1(
     Box::into_raw(Box::new(FfiSlipstreamTorStartupV1 {
         control: slipstream_core::TorStartupControl::new(generation, deadline),
         claimed: std::sync::atomic::AtomicBool::new(false),
-        admission_failure: std::sync::Mutex::new(false),
+        terminal_status: std::sync::Mutex::new(None),
     }))
 }
 
@@ -8788,13 +8793,20 @@ pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_cancel_v1(
     startup: *const FfiSlipstreamTorStartupV1,
 ) {
     if let Some(startup) = unsafe { startup.as_ref() } {
-        // Serialize cancellation with pre-launch failure: the first terminal outcome wins.
-        let failed = startup
-            .admission_failure
+        let mut terminal = startup
+            .terminal_status
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if !*failed {
-            startup.control.cancel();
+        match startup.observe_terminal(&mut terminal) {
+            ZCASHLC_TOR_STARTUP_PENDING => {
+                startup.control.cancel();
+                startup.observe_terminal(&mut terminal);
+            }
+            ZCASHLC_TOR_STARTUP_TIMED_OUT => {
+                // Wake unfinished native work without reclassifying an exposed timeout.
+                startup.control.cancel();
+            }
+            _ => {}
         }
     }
 }
@@ -12396,6 +12408,115 @@ mod tor_startup_ffi_tests {
         };
         assert!(!handle.is_null());
         (dir, handle)
+    }
+
+    fn wait_until_startup_deadline(startup: *const FfiSlipstreamTorStartupV1) {
+        let deadline = unsafe { &*startup }.control.deadline().into_std();
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        assert!(std::time::Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn tor_startup_zero_budget_timeout_remains_terminal_after_cancel() {
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(20, 0);
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((observed.generation, observed.status), (20, 3));
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((retained.generation, retained.status), (20, 3));
+        }
+    }
+
+    #[test]
+    fn tor_startup_delayed_admission_timeout_survives_failure_and_cleanup() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(21, 1);
+            wait_until_startup_deadline(startup);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            assert_eq!(zcashlc_slipstream_snapshot(handle).state, 0);
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((observed.generation, observed.status), (21, 3));
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_free(handle);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((retained.generation, retained.status), (21, 3));
+        }
+    }
+
+    #[test]
+    fn tor_startup_quiescence_timeout_survives_cancel_stop_and_free() {
+        struct BlockDrop(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (_dir, handle) = open();
+        let (entered, worker_entered) = std::sync::mpsc::channel();
+        let (unwinding, worker_unwinding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        unsafe {
+            (*handle).inner.task = Some(
+                (*handle)
+                    .inner
+                    .runtime
+                    .spawn(async move {
+                        let _guard = BlockDrop(unwinding, released);
+                        entered.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    })
+                    .abort_handle(),
+            );
+            worker_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(22, 1_000);
+            let handle_address = handle as usize;
+            let startup_address = startup as usize;
+            let start = std::thread::spawn(move || {
+                let path = b"/unused";
+                zcashlc_slipstream_start_v2(
+                    handle_address as *mut SlipstreamHandle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup_address as *const FfiSlipstreamTorStartupV1,
+                )
+            });
+            worker_unwinding
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            wait_until_startup_deadline(startup);
+            // Start still owns the handle: observe only its separate capability.
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            release.send(()).unwrap();
+            assert!(!start.join().unwrap());
+            assert!((*handle).inner.task.is_none());
+            zcashlc_slipstream_stop(handle);
+            let stopped = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_free(handle);
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((observed.generation, observed.status), (22, 3));
+            assert_eq!((stopped.generation, stopped.status), (22, 3));
+            assert_eq!((retained.generation, retained.status), (22, 3));
+        }
     }
 
     #[test]

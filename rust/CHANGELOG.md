@@ -47,7 +47,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_slipstream_tor_startup_begin_v1`. Use `zcashlc_slipstream_tor_startup_cancel_v1`
   during startup, `zcashlc_slipstream_tor_startup_snapshot_v1` to read retained typed status,
   and `zcashlc_slipstream_tor_startup_free_v1` to release caller ownership. Stop/free cancel
-  pending startup; legacy start and snapshot layouts remain unchanged.
+  pending startup. Terminal status, including timeout before native admission, remains retained
+  across cancellation and engine cleanup; legacy start and snapshot layouts remain unchanged.
 
 - `zcashlc_ohttp_last_grpc_status` returns the immediately preceding decode call's authenticated
   canonical status (0 through 16), or -1 when absent or invalid. Copy it immediately on the same
