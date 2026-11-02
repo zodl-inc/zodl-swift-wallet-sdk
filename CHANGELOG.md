@@ -17,6 +17,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the flood was previously processed without limit. lightwalletd's block streams, which send one
   small frame per compact block, stay within the limit. No caller changes are required.
 
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3532500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3537500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4550000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4570000.json
+````
+
 # 7.0.0 - 2026-10-27
 
 ## Added
