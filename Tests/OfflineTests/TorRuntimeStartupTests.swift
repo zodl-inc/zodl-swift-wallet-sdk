@@ -301,6 +301,42 @@ final class TorRuntimeStartupTests: XCTestCase {
         }
         XCTAssertEqual(statuses, [3, 3])
     }
+
+    func testSourceBuiltNativePendingCancellationABI() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tor-startup-cancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            do {
+                try FileManager.default.removeItem(at: directory)
+            } catch {
+                XCTFail("Native startup cleanup did not release its test directory: \(error)")
+            }
+        }
+
+        let statuses: [UInt32] = await withCheckedContinuation { continuation in
+            TorRuntimeStartup.workerQueue.async {
+                let native = TorRuntimeStartupNative()
+                let bytes = Array(directory.path.utf8)
+                guard let job = native.begin(bytes, 5_000) else {
+                    XCTFail("Source-built startup ABI must admit a valid pending job")
+                    continuation.resume(returning: [])
+                    return
+                }
+                native.cancel(job)
+                let status = native.wait(job)
+                let result = native.take(job)
+                let returnedRuntime = result.runtime
+                if let returnedRuntime {
+                    zcashlc_free_tor_runtime(returnedRuntime)
+                }
+                native.free(job)
+                XCTAssertNil(returnedRuntime)
+                continuation.resume(returning: [status, result.status])
+            }
+        }
+        XCTAssertEqual(statuses, [4, 4])
+    }
 }
 
 private final class StartupFixture: @unchecked Sendable {
