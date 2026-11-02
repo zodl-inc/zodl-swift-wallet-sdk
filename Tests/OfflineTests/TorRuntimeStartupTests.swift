@@ -207,6 +207,48 @@ final class TorRuntimeStartupTests: XCTestCase {
         fixture.runtimes.free(runtime)
     }
 
+    func testQueuedClientOwnerSettlesBeforeUnrelatedNativeStartup() async throws {
+        for operation in ["cancel", "close", "deadline"] {
+            let blocker = StartupFixture()
+            let blockingClient = blocker.client()
+            let blockingPrepare = Task { try await blockingClient.prepare() }
+            await fulfillment(of: [blocker.entered], timeout: 2)
+            let queued = StartupFixture()
+            let registered = expectation(description: "queued preparation registered")
+            let settled = expectation(description: "queued owner and Off settle before unrelated bootstrap")
+            let client = queued.client(startupInterestChanged: { _ in registered.fulfill() })
+            let prepare = Task {
+                do {
+                    let deadline = DispatchTime.now().uptimeNanoseconds + (operation == "deadline" ? 100_000_000 : 60_000_000_000)
+                    try await client.prepare(deadline: deadline)
+                    XCTFail("Retired queued startup must not succeed")
+                } catch {
+                    if operation == "deadline" {
+                        XCTAssertEqual((error as? URLError)?.code, .timedOut)
+                    } else {
+                        XCTAssertTrue(error is CancellationError)
+                    }
+                }
+                try await client.close()
+                settled.fulfill()
+            }
+            await fulfillment(of: [registered], timeout: 2)
+            if operation == "cancel" { prepare.cancel() }
+            if operation == "close" { try await client.close() }
+            await fulfillment(of: [settled], timeout: 0.5)
+            XCTAssertEqual(queued.counts, [0, 0, 0, 0])
+            blocker.release.signal()
+            try await blockingPrepare.value
+            try await prepare.value
+            try await blockingClient.close()
+            // Draining the actual shared queue proves the retired closure cannot begin later.
+            await withCheckedContinuation { continuation in
+                TorRuntimeStartup.workerQueue.async { continuation.resume() }
+            }
+            XCTAssertEqual(queued.counts, [0, 0, 0, 0])
+        }
+    }
+
     func testDeadlineIncludesWorkerQueue() async throws {
         let queue = DispatchQueue(label: "startup-test-queue")
         let entered = expectation(description: "worker queue occupied")

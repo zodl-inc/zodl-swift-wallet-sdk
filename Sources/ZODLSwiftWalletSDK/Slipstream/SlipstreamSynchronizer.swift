@@ -104,6 +104,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // `prepare` will use. Successful endpoint changes publish this value together with
     // `initializer.endpoint` and the retained Swift service binding.
     private var currentEndpoint: LightWalletEndpoint
+    // A published endpoint whose restart failed has not become an accepted route. Retain the
+    // previous wallet route until a lifecycle owner restores it or a newer explicit switch succeeds.
+    private var pendingEndpointReconciliation: LightWalletEndpoint?
     /// Whether a completed `wipe()` closed the engine and no `prepare` has opened it since. In that window
     /// the wallet database does not exist, and opening an engine handle opens the database, which SQLite
     /// would recreate before `prepare` has initialized it. So while this is set `switchTo(endpoint:)` only
@@ -646,9 +649,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         torRequest: TorTransitionRequest? = nil,
         torStartup: (any SlipstreamTorStartupControlling)? = nil
     ) async throws {
-        guard routeTransition || !routeAdmission.isFenced else {
-            throw TorTransitionState.Failure.routeUnavailable
-        }
         // T8.3 (T5.5 wart fix): a start() before prepare() must throw
         // .synchronizerNotPrepared — parity with SDKSynchronizer.start
         // (SDKSynchronizer.swift:189-192). Without this guard, start() reached
@@ -659,8 +659,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
-        if !routeTransition && routeAdmission.selectedTor {
-            let request = makeTorTransition(enabled: true, startsSync: true, resetRecoveryBudget: resetRecoveryBudget)
+        if !routeTransition && (routeAdmission.selectedTor || pendingEndpointReconciliation != nil) {
+            let request = makeTorTransition(
+                enabled: routeAdmission.selectedTor,
+                startsSync: true,
+                resetRecoveryBudget: resetRecoveryBudget
+            )
             guard request.startsSync else { throw TorTransitionState.Failure.routeUnavailable }
             do {
                 try await request.apply()
@@ -669,6 +673,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 throw error
             }
             return
+        }
+        // A stopped or failed Tor request retains its fail-closed fence. Ordinary resume
+        // above revalidates that intent under a fresh owner before any networking is admitted.
+        guard routeTransition || !routeAdmission.isFenced else {
+            throw TorTransitionState.Failure.routeUnavailable
         }
         // Migration privacy gate — parity with SDKSynchronizer.start's `.stopped, .synced,
         // .disconnected, .error` branch: a sync session must not start while a migration
@@ -2440,6 +2449,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         // 3. Free the engine handle (exact-once — close() guards against double-free).
         let healthTransition = healthOwner.beginTransition(walletReset: true)
+        pendingEndpointReconciliation = nil
         healthEngineClosed = true
         await engine.close()
 
@@ -2788,7 +2798,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // host, port and TLS flag must all match (`isSameServer`). [MOB-1850] Checked BEFORE the
         // generation bump: a switch that turns out to be a no-op changes nothing about who owns the
         // engine, so it must not retire the running pass's in-flight tick.
-        if endpoint.isSameServer(as: currentEndpoint) {
+        if endpoint.isSameServer(as: currentEndpoint), pendingEndpointReconciliation == nil {
             initializer.logger.debug(
                 "switchTo: endpoint unchanged (\(endpoint.host):\(endpoint.port)) — no-op",
                 file: #file, function: #function, line: #line
@@ -2843,6 +2853,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         // Re-open the engine handle against the new endpoint.
+        let previousEndpoint = pendingEndpointReconciliation ?? currentEndpoint
         let healthTransition = healthOwner.beginTransition()
         defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
         healthEngineClosed = true
@@ -2859,9 +2870,40 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         resetStallWatchdog()
 
         // Restart if the engine was previously running.
-        if wasRunning {
+        try await startAfterPublishingEndpoint(previousEndpoint: previousEndpoint, startsSync: wasRunning)
+    }
+
+    /// A Tor startup failure happens after publication. Subsequent Tor choices and ordinary
+    /// resumes must not revive that route the host did not accept after a failed host rollback.
+    private func startAfterPublishingEndpoint(previousEndpoint: LightWalletEndpoint, startsSync: Bool) async throws {
+        pendingEndpointReconciliation = nil
+        guard startsSync else { return }
+        let torWasSelected = routeAdmission.selectedTor
+        do {
             try await startImpl(retry: false, resetRecoveryBudget: true)
+        } catch {
+            if torWasSelected || routeAdmission.selectedTor {
+                pendingEndpointReconciliation = previousEndpoint
+                // The failed request already retains its fence. Do not rewrite a newer Tor choice.
+            }
+            throw error
         }
+    }
+
+    /// Called only after this lifecycle owner proves the engine stopped. Failure leaves the
+    /// original target retained and networking fenced, including for the next ordinary resume.
+    private func reconcileEndpointBeforeTorStart() async throws {
+        guard let endpoint = pendingEndpointReconciliation else { return }
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
+        try await engine.reopen(server: endpoint, network: initializer.network)
+        healthEngineClosed = false
+        rebindEndpointServices(to: endpoint)
+        lastTxSetVersion = 0
+        lastRevealRecovering = false
+        resetStallWatchdog()
+        pendingEndpointReconciliation = nil
     }
 
     /// Called only after a successful reopen, or while a wipe keeps the engine closed. No
@@ -2931,6 +2973,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
+        let previousEndpoint = pendingEndpointReconciliation ?? currentEndpoint
         let healthTransition = healthOwner.beginTransition()
         defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
         healthEngineClosed = true
@@ -2949,7 +2992,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // `if wasRunning`, this is the one lifecycle operation that starts a pass regardless of
         // whether one was running, which is the whole point of a "restart after nothing is left
         // running" API.
-        try await startImpl(retry: false, resetRecoveryBudget: true)
+        try await startAfterPublishingEndpoint(previousEndpoint: previousEndpoint, startsSync: true)
     }
 
     /// [v0.7 P1b] Replaces the alternate-server list at runtime — the host calls this
@@ -3234,6 +3277,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             await sdkFlags.torFlagUpdate(request.enabled)
             try torTransition.check(request)
             guard report.isQuiescent else { throw TorTransitionState.Failure.nonquiescent }
+            try await reconcileEndpointBeforeTorStart()
+            try torTransition.check(request)
             torTransition.publish(request, phase: .starting)
             let deadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
             if request.enabled {

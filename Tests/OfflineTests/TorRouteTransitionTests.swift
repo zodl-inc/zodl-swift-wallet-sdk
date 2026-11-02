@@ -78,6 +78,58 @@ final class TorRouteTransitionTests: ZcashTestCase {
         _ = await independent.result
     }
 
+    func testOffSettlesWhileUnrelatedClientOwnsStartupWorker() async throws {
+        let entered = expectation(description: "unrelated HTTP bootstrap entered")
+        let release = DispatchSemaphore(value: 0)
+        let blocker = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in
+                entered.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+                return OpaquePointer(bitPattern: 1)
+            }
+        ))
+        let blockingPrepare = Task { try await blocker.prepare() }
+        await fulfillment(of: [entered], timeout: 2)
+        let queued = expectation(description: "wallet startup queued")
+        let settled = expectation(description: "Off lifecycle settled before unrelated startup returns")
+        let begins = OSAllocatedUnfairLock(initialState: 0)
+        var native = TorRuntimeStartupNative.fixture { _, _ in nil }
+        native.begin = { _, _ in
+            begins.withLock { $0 += 1 }
+            return nil
+        }
+        let client = TorClient(
+            torDir: testTempDirectory,
+            httpGetNative: TorHTTPGetNative(startup: native),
+            startupInterestChanged: { _ in queued.fulfill() }
+        )
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        let enable = Task { try await sync.tor(enabled: true) }
+        await fulfillment(of: [queued], timeout: 2)
+        let off = Task {
+            try await sync.tor(enabled: false)
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 0.5)
+        XCTAssertEqual(sync.torTransitionState?.phase, .ready)
+        XCTAssertEqual(sync.torTransitionState?.requestedEnabled, false)
+        XCTAssertFalse(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        release.signal()
+        try await blockingPrepare.value
+        _ = await enable.result
+        try await off.value
+        try await blocker.close()
+        await withCheckedContinuation { continuation in
+            TorRuntimeStartup.workerQueue.async { continuation.resume() }
+        }
+        XCTAssertEqual(begins.withLock { $0 }, 0)
+        await sync.stopAndWait()
+    }
+
     func testStopRejectsLateStart() async throws {
         let engine = GatedFakeSlipstreamEngine()
         engine.torStartup.ready.close()
@@ -611,6 +663,228 @@ final class TorRouteTransitionTests: ZcashTestCase {
         XCTAssertEqual(sync.torTransitionState?.phase, .ready)
         XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
         await sync.stopAndWait()
+    }
+
+    func testOrdinaryStartRecoversStoppedPendingHTTPStartup() async throws {
+        try await assertOrdinaryStartRecoversRetainedTorIntent(pendingHTTP: true, failBeforeStop: false)
+    }
+
+    func testOrdinaryStartRecoversStoppedPendingNativeStartup() async throws {
+        try await assertOrdinaryStartRecoversRetainedTorIntent(pendingHTTP: false, failBeforeStop: false)
+    }
+
+    func testOrdinaryStartRecoversTorFailureBeforeBackground() async throws {
+        try await assertOrdinaryStartRecoversRetainedTorIntent(pendingHTTP: false, failBeforeStop: true)
+    }
+
+    private func assertOrdinaryStartRecoversRetainedTorIntent(pendingHTTP: Bool, failBeforeStop: Bool) async throws {
+        let httpEntered = failBeforeStop ? nil : expectation(description: "HTTP startup entered")
+        let releaseHTTP = DispatchSemaphore(value: 0)
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in
+                let first = calls.withLock { count in
+                    count += 1
+                    return count == 1
+                }
+                if first {
+                    httpEntered?.fulfill()
+                    if pendingHTTP { _ = releaseHTTP.wait(timeout: .now() + 5) }
+                }
+                return OpaquePointer(bitPattern: 1)
+            }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        try await sync.start()
+        if !pendingHTTP && !failBeforeStop { engine.torStartup.ready.close() }
+        if failBeforeStop { await engine.setStartError(ZcashError.rustSlipstreamStart("synthetic startup failure")) }
+        let enable = Task { try await sync.tor(enabled: true) }
+        if let httpEntered { await fulfillment(of: [httpEntered], timeout: 2) }
+        if failBeforeStop {
+            do {
+                try await enable.value
+                XCTFail("Initial native startup must fail")
+            } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupFailed) }
+        } else if !pendingHTTP {
+            await engine.torStartup.entered.wait()
+        }
+        let previous = sync.torTransitionState
+        sync.stop()
+        releaseHTTP.signal()
+        _ = await enable.result
+        await sync.stopAndWait()
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        XCTAssertFalse(sync.latestState.internalSyncStatus.isSyncing)
+        await engine.setStartError(nil)
+        let startsBeforeResume = await engine.calls.filter { $0 == "startTor" }.count
+        do {
+            try await sync.start()
+        } catch {
+            XCTFail("Ordinary resume must revalidate retained Tor intent: \(error)")
+        }
+        XCTAssertNotEqual(sync.torTransitionState?.requestID, previous?.requestID)
+        XCTAssertEqual(sync.torTransitionState?.phase, .ready)
+        XCTAssertEqual(sync.torTransitionState?.requestedEnabled, true)
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+        let torStarts = await engine.calls.filter { $0 == "startTor" }.count
+        XCTAssertEqual(torStarts, startsBeforeResume + 1, "Resume must start a fresh Tor run, never Direct")
+        XCTAssertFalse(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        await sync.stopAndWait()
+        try await client.close()
+    }
+
+    func testOrdinaryResumeReconcilesFailedPublishedSwitchBeforeTorStartup() async throws {
+        try await assertFailedPublishedSwitchReconciles(explicitTorRetry: false)
+    }
+
+    func testExplicitTorRetryReconcilesFailedPublishedSwitchBeforeStartup() async throws {
+        try await assertFailedPublishedSwitchReconciles(explicitTorRetry: true)
+    }
+
+    func testRestartReconcilesFailedPublishedEndpointBeforeOrdinaryStart() async throws {
+        try await assertFailedPublishedSwitchReconciles(explicitTorRetry: false, restart: true)
+    }
+
+    private func assertFailedPublishedSwitchReconciles(explicitTorRetry: Bool, restart: Bool = false) async throws {
+        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: original)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        try await sync.tor(enabled: true)
+        try await sync.start()
+        await engine.setStartError(ZcashError.rustSlipstreamStart("fast startup failure after reopen"))
+        do {
+            if restart { try await sync.restartSync(at: candidate) } else { try await sync.switchTo(endpoint: candidate) }
+            XCTFail("The published switch must report the Tor startup failure")
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupFailed) }
+        let published = await sync.currentEndpointForTesting()
+        XCTAssertEqual(published, candidate, "Regression must cross actual SDK endpoint publication")
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        await engine.setReopenError(URLError(.cannotConnectToHost))
+        do {
+            try await sync.switchTo(endpoint: original)
+            XCTFail("The app's move-back cannot reopen the original endpoint yet")
+        } catch {}
+        await engine.setStartError(nil)
+        let beforeRetry = await engine.calls.filter { $0 == "start" }.count
+        do {
+            if explicitTorRetry { try await sync.tor(enabled: true) } else { try await sync.start() }
+            XCTFail("Unreconciled endpoint must refuse every Tor restart entry point")
+        } catch {}
+        let afterRetry = await engine.calls.filter { $0 == "start" }.count
+        XCTAssertEqual(afterRetry, beforeRetry, "No native startup may revive the unrecorded public route")
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.selectedTor)
+        XCTAssertFalse(sync.latestState.internalSyncStatus.isSyncing)
+        await engine.setReopenError(nil)
+        if explicitTorRetry { try await sync.tor(enabled: true) }
+        try await sync.start()
+        let restored = await sync.currentEndpointForTesting()
+        XCTAssertEqual(restored, original)
+        XCTAssertEqual(sync.torTransitionState?.phase, .ready)
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+        let calls = await engine.calls
+        XCTAssertTrue(calls.contains("reopen(\(original.host):443)"))
+        await sync.stopAndWait()
+        try await client.close()
+    }
+
+    func testOffSupersedingFailedSwitchRetainsEndpointRecovery() async throws {
+        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: original)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        try await sync.tor(enabled: true)
+        try await sync.start()
+        await engine.onCall("startTor") { _ = sync.requestTorTransition(enabled: false) }
+        await engine.setStartError(ZcashError.rustSlipstreamStart("superseded startup failure"))
+        do {
+            try await sync.switchTo(endpoint: candidate)
+            XCTFail("Superseded restart must fail")
+        } catch {}
+        XCTAssertFalse(mockContainer.resolve(SDKFlags.self).routeAdmission.selectedTor)
+        await engine.setReopenError(URLError(.cannotConnectToHost))
+        do {
+            try await sync.switchTo(endpoint: original)
+            XCTFail("Move back is still unavailable")
+        } catch {}
+        await engine.setStartError(nil)
+        do {
+            try await sync.start()
+            XCTFail("Ordinary Off resume cannot bypass failed endpoint restoration")
+        } catch {}
+        do {
+            try await sync.tor(enabled: false)
+            XCTFail("Explicit Off must also restore the endpoint before admitting Direct")
+        } catch {}
+        XCTAssertTrue(mockContainer.resolve(SDKFlags.self).routeAdmission.isFenced)
+        XCTAssertFalse(mockContainer.resolve(SDKFlags.self).routeAdmission.selectedTor)
+        await engine.setReopenError(nil)
+        try await sync.start()
+        let endpoint = await sync.currentEndpointForTesting()
+        XCTAssertEqual(endpoint, original)
+        XCTAssertEqual(sync.torTransitionState?.requestedEnabled, false)
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+        await sync.stopAndWait()
+        try await client.close()
+    }
+
+    func testNewExplicitEndpointChoiceRetiresFailedSwitchRecovery() async throws {
+        try await assertRecoveryRetiresAtWalletOrRouteReplacement(wipeWallet: false)
+    }
+
+    func testWipeRetiresFailedSwitchRecoveryWithoutReopeningOldWallet() async throws {
+        try await assertRecoveryRetiresAtWalletOrRouteReplacement(wipeWallet: true)
+    }
+
+    private func assertRecoveryRetiresAtWalletOrRouteReplacement(wipeWallet: Bool) async throws {
+        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let replacement = LightWalletEndpoint(address: "replacement.example.com", port: 443, secure: true)
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: original)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        try await sync.tor(enabled: true)
+        try await sync.start()
+        await engine.setStartError(ZcashError.rustSlipstreamStart("startup failure after publication"))
+        do {
+            try await sync.switchTo(endpoint: candidate)
+            XCTFail("Initial published switch must fail")
+        } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .startupFailed) }
+        await engine.setStartError(nil)
+        if wipeWallet {
+            for try await _ in sync.wipe().values {}
+            let previousCalls = await engine.calls
+            try await sync.tor(enabled: true)
+            let calls = await engine.calls
+            XCTAssertEqual(calls.filter { $0.hasPrefix("reopen(") }, previousCalls.filter { $0.hasPrefix("reopen(") })
+            XCTAssertFalse(sync.latestState.internalSyncStatus.isPrepared)
+        } else {
+            try await sync.switchTo(endpoint: replacement)
+            try await sync.start()
+            let endpoint = await sync.currentEndpointForTesting()
+            XCTAssertEqual(endpoint, replacement, "A stale restoration target cannot override a newer successful explicit choice")
+            XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+            await sync.stopAndWait()
+        }
+        try await client.close()
     }
 
     func testIdleAndUnpreparedDoNotStartNativeWork() async throws {

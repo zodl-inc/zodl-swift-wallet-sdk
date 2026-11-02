@@ -21,6 +21,8 @@ final class TorRuntimeStartup: @unchecked Sendable {
 
     private struct State {
         var cancelled = false
+        var admitted = false
+        var continuation: CheckedContinuation<Void, Error>?
         var job: TorNativeStartupJob?
         var runtime: OpaquePointer?
         var waiters: Set<UUID> = []
@@ -78,6 +80,12 @@ final class TorRuntimeStartup: @unchecked Sendable {
     private func cancel(_ state: inout State) {
         guard !state.cancelled else { return }
         state.cancelled = true
+        // A queued closure owns no native resource. Finish it now; atomic admission below
+        // ensures that closure can never begin native work after this cancellation wins.
+        if !state.admitted {
+            state.continuation?.resume(throwing: CancellationError())
+            state.continuation = nil
+        }
         state.job?.cancel()
         disposeRuntime(&state)
     }
@@ -94,9 +102,28 @@ final class TorRuntimeStartup: @unchecked Sendable {
     }
 
     func run() async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let queued = state.withLockUnchecked { state in
+                guard !state.cancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return false
+                }
+                state.continuation = continuation
+                return true
+            }
+            guard queued else { return }
             workerQueue.async { [self] in
-                continuation.resume(with: Result { try runOnWorker() })
+                let admitted = state.withLockUnchecked { state in
+                    guard !state.cancelled else { return false }
+                    state.admitted = true
+                    return true
+                }
+                guard admitted else { return }
+                let result = Result { try runOnWorker() }
+                state.withLockUnchecked { state in
+                    state.continuation?.resume(with: result)
+                    state.continuation = nil
+                }
             }
         }
     }
