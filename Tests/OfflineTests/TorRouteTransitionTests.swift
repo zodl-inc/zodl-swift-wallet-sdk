@@ -354,6 +354,53 @@ final class TorRouteTransitionTests: ZcashTestCase {
         await sync.stopAndWait()
     }
 
+    func testOrdinaryStartDoesNotActivateDormantRouteRequest() async throws {
+        for enabled in [false, true] {
+            let engine = GatedFakeSlipstreamEngine()
+            let sync = try makeSlipstreamSynchronizer(engine: engine)
+            await sync.setInternalSyncStatusForTesting(.stopped)
+            let request = sync.requestTorTransition(enabled: enabled)
+            do {
+                try await sync.start()
+                XCTFail("Ordinary start cannot activate a ticket still waiting for the app guard")
+            } catch { XCTAssertEqual(error as? TorTransitionState.Failure, .routeUnavailable) }
+            XCTAssertEqual(sync.torTransitionState?.requestID, request.id)
+            XCTAssertEqual(sync.torTransitionState?.phase, .waitingForWork)
+            let calls = await engine.calls
+            XCTAssertTrue(calls.isEmpty)
+            request.cancelBeforeApplying()
+            await sync.stopAndWait()
+        }
+    }
+
+    func testOrdinaryStartQueuesBehindApplyingOffRequest() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        let enteredStop = expectation(description: "Explicit Off owns the lifecycle turn")
+        await engine.closeGate(.stop)
+        await engine.onCall("stop") { enteredStop.fulfill() }
+        let request = sync.requestTorTransition(enabled: false)
+        let applying = Task { try await request.apply() }
+        await fulfillment(of: [enteredStop], timeout: 2)
+        let depth = sync.lifecycleQueueDepthForTesting()
+        let resume = Task { try await sync.start() }
+        let queued = await waitUntil { sync.lifecycleQueueDepthForTesting() > depth }
+        XCTAssertTrue(queued)
+        XCTAssertEqual(sync.torTransitionState?.requestID, request.id)
+        let heldCalls = await engine.calls
+        XCTAssertEqual(heldCalls.filter { $0 == "stop" }.count, 1)
+        XCTAssertFalse(heldCalls.contains("start"))
+        await engine.openGate(.stop)
+        try await applying.value
+        try await resume.value
+        XCTAssertEqual(sync.torTransitionState?.requestID, request.id)
+        XCTAssertEqual(sync.torTransitionState?.phase, .ready)
+        let finalCalls = await engine.calls
+        XCTAssertEqual(finalCalls.filter { $0 == "start" }.count, 1)
+        await sync.stopAndWait()
+    }
+
     func testDormantExpiryCannotApplyAndBudgetDoesNotReset() async throws {
         let time = OSAllocatedUnfairLock(initialState: UInt64(100))
         let timer = Gate()
@@ -838,6 +885,109 @@ final class TorRouteTransitionTests: ZcashTestCase {
         XCTAssertEqual(endpoint, original)
         XCTAssertEqual(sync.torTransitionState?.requestedEnabled, false)
         XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+        await sync.stopAndWait()
+        try await client.close()
+    }
+
+    func testOffDuringSwitchReopenRetainsFailedPublicationRecovery() async throws {
+        try await assertFailedPublicationRecoveryAfterReopen(restart: false, newerChoice: false)
+    }
+
+    func testOffDuringRestartReopenRetainsFailedPublicationRecovery() async throws {
+        try await assertFailedPublicationRecoveryAfterReopen(restart: true, newerChoice: false)
+    }
+
+    func testOffDuringSwitchReopenAllowsNewExplicitEndpoint() async throws {
+        try await assertFailedPublicationRecoveryAfterReopen(restart: false, newerChoice: true)
+    }
+
+    func testOffDuringRestartReopenAllowsNewExplicitEndpoint() async throws {
+        try await assertFailedPublicationRecoveryAfterReopen(restart: true, newerChoice: true)
+    }
+
+    func testDirectStartupFailureRetainsFailedPublicationRecovery() async throws {
+        try await assertFailedPublicationRecoveryAfterReopen(restart: false, newerChoice: false, offDuringReopen: false)
+    }
+
+    private func assertFailedPublicationRecoveryAfterReopen(
+        restart: Bool,
+        newerChoice: Bool,
+        offDuringReopen: Bool = true
+    ) async throws {
+        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let replacement = LightWalletEndpoint(address: "replacement.example.com", port: 443, secure: true)
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, endpoint: original)
+        let admission = mockContainer.resolve(SDKFlags.self).routeAdmission
+        await sync.setInternalSyncStatusForTesting(.stopped)
+        if offDuringReopen { try await sync.tor(enabled: true) }
+        try await sync.start()
+        let enteredReopen = expectation(description: "Candidate reopen suspended before endpoint publication")
+        await engine.closeGate(.reopen)
+        await engine.onCall("reopen") { enteredReopen.fulfill() }
+        let change = Task {
+            if restart { try await sync.restartSync(at: candidate) } else { try await sync.switchTo(endpoint: candidate) }
+        }
+        await fulfillment(of: [enteredReopen], timeout: 2)
+        let beforePublication = await sync.currentEndpointForTesting()
+        XCTAssertEqual(beforePublication, original)
+        if offDuringReopen {
+            _ = sync.requestTorTransition(enabled: false)
+            XCTAssertTrue(admission.isFenced)
+        } else {
+            await engine.setStartError(ZcashError.rustSlipstreamStart("Direct restart failed after publication"))
+        }
+        XCTAssertFalse(admission.selectedTor)
+        await engine.openGate(.reopen)
+        do {
+            try await change.value
+            XCTFail("The required restart after candidate publication must fail")
+        } catch {
+            if offDuringReopen { XCTAssertEqual(error as? TorTransitionState.Failure, .routeUnavailable) }
+        }
+        let published = await sync.currentEndpointForTesting()
+        XCTAssertEqual(published, candidate)
+        XCTAssertTrue(admission.isFenced, "Every failed required restart fences the unaccepted endpoint")
+        XCTAssertThrowsError(try admission.acquire(), "New requests must not use the unaccepted route")
+        await engine.setStartError(nil)
+        await engine.setReopenError(URLError(.cannotConnectToHost))
+        do {
+            try await sync.switchTo(endpoint: original)
+            XCTFail("The captured original endpoint cannot yet be restored")
+        } catch { XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost) }
+        let afterRollbackFailure = await sync.currentEndpointForTesting()
+        XCTAssertEqual(afterRollbackFailure, candidate)
+        let callsBeforeResume = await engine.calls
+        for explicitOff in [false, true] {
+            do {
+                if explicitOff { try await sync.tor(enabled: false) } else { try await sync.start() }
+                XCTFail("Neither ordinary resume nor Off may admit the unrecorded public endpoint")
+            } catch {}
+            XCTAssertTrue(admission.isFenced)
+            XCTAssertFalse(admission.selectedTor, "Endpoint recovery must preserve the newest Off intent")
+        }
+        let callsAfterResume = await engine.calls
+        XCTAssertEqual(callsAfterResume.filter { $0 == "start" }, callsBeforeResume.filter { $0 == "start" })
+        XCTAssertThrowsError(try admission.acquire())
+        XCTAssertFalse(sync.latestState.internalSyncStatus.isSyncing)
+        await engine.setReopenError(nil)
+        let expected = newerChoice ? replacement : original
+        if newerChoice { try await sync.switchTo(endpoint: replacement) }
+        try await sync.start()
+        let recovered = await sync.currentEndpointForTesting()
+        XCTAssertEqual(recovered, expected)
+        XCTAssertFalse(admission.selectedTor)
+        XCTAssertFalse(admission.isFenced)
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing)
+        let finalCalls = await engine.calls
+        let lastReopen = try XCTUnwrap(finalCalls.lastIndex { $0 == "reopen(\(expected.host):443)" })
+        let lastStart = try XCTUnwrap(finalCalls.lastIndex(of: "start"))
+        XCTAssertLessThan(lastReopen, lastStart, "Only the restored or newer explicitly accepted route can restart")
         await sync.stopAndWait()
         try await client.close()
     }

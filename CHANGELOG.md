@@ -23,9 +23,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Fixed
 
 - `SlipstreamSynchronizer.start(retry:)` revalidates retained Tor intent after a stopped or failed startup.
-  Failed Tor restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint for
-  restoration before a later start or Tor retry. A newer explicit server choice or wallet wipe retires
-  that restoration target. No call-site changes are required.
+  Failed required restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint
+  and block new networking until restoration, including when Tor is turned off during the switch.
+  A newer explicit server choice or wallet wipe retires that restoration target. No call-site changes are required.
 - Cancelling a queued Tor preparation no longer waits for an unrelated wallet's native bootstrap.
 
 - Expired or cancelled Tor acquisition now owns safe retirement of the old native sync loop,

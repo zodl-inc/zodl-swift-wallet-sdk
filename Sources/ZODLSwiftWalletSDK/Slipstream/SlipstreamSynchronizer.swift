@@ -659,7 +659,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
-        if !routeTransition && (routeAdmission.selectedTor || pendingEndpointReconciliation != nil) {
+        if !routeTransition,
+           routeAdmission.selectedTor || routeAdmission.isFenced || pendingEndpointReconciliation != nil {
             let request = makeTorTransition(
                 enabled: routeAdmission.selectedTor,
                 startsSync: true,
@@ -674,8 +675,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             return
         }
-        // A stopped or failed Tor request retains its fail-closed fence. Ordinary resume
-        // above revalidates that intent under a fresh owner before any networking is admitted.
+        // A stopped or failed route request retains its fail-closed fence. Ordinary resume
+        // above revalidates the latest intent under a fresh owner before networking is admitted.
         guard routeTransition || !routeAdmission.isFenced else {
             throw TorTransitionState.Failure.routeUnavailable
         }
@@ -2873,19 +2874,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         try await startAfterPublishingEndpoint(previousEndpoint: previousEndpoint, startsSync: wasRunning)
     }
 
-    /// A Tor startup failure happens after publication. Subsequent Tor choices and ordinary
-    /// resumes must not revive that route the host did not accept after a failed host rollback.
+    /// Publication is accepted only after its required restart succeeds. Subsequent route choices
+    /// and ordinary resumes must restore the prior endpoint after a failed host rollback.
     private func startAfterPublishingEndpoint(previousEndpoint: LightWalletEndpoint, startsSync: Bool) async throws {
         pendingEndpointReconciliation = nil
         guard startsSync else { return }
-        let torWasSelected = routeAdmission.selectedTor
         do {
             try await startImpl(retry: false, resetRecoveryBudget: true)
         } catch {
-            if torWasSelected || routeAdmission.selectedTor {
-                pendingEndpointReconciliation = previousEndpoint
-                // The failed request already retains its fence. Do not rewrite a newer Tor choice.
-            }
+            pendingEndpointReconciliation = previousEndpoint
+            // Off may have arrived during reopen, before this restart even began. Preserve it
+            // while withholding the unaccepted endpoint from both Tor and Direct requests.
+            routeAdmission.fence()
             throw error
         }
     }

@@ -39,6 +39,9 @@ final class TorNetworkAdmission: Sendable {
         }
     }
 
+    /// Withholds an unaccepted endpoint without replacing a concurrently requested route choice.
+    func fence() { state.withLock { $0.fenced = true } }
+
     func updateEffective(_ enabled: Bool) { state.withLock { $0.enabled = enabled } }
 
     func install(_ enabled: Bool) {
