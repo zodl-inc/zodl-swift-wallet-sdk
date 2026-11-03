@@ -1031,8 +1031,10 @@ three separate validators, and refuses a branch id supplied from outside. Note s
 honour the registered heights, so the two halves of a round can resolve different branches at the
 same height.
 
-Voting runs on NU6.3 on both sides, so where the two differ at least one of them has not reached
-NU6.3 at that height, and at least one half refuses the round on its own.
+Voting accepts Ironwood notes at both NU6.3 and NU7 snapshots. The TX1 PCZT signing profile remains
+V6/NU6.3. The supplied snapshot branch is checked against the voting base identity's schedule, so a
+custom registered schedule must select the same branch as that identity at the round's snapshot.
+Standard mainnet and testnet schedules align with their own voting identities.
 `makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` compares them and refuses, naming both
 branches and the snapshot height, as the first thing it does once its inputs decode — so a host
 reads one clear reason rather than an unsupported note version from note selection or an unsupported
@@ -1049,25 +1051,25 @@ do {
     // Opening refuses several things as `.invalidInput` — a malformed round id and an anchor that
     // is not a `TreeState` among them — so show the message rather than labelling every one of them
     // a chain mismatch. This one names both branches and the height:
-    // "…select consensus branch Nu6_2 at the round's snapshot height 4200000, but voting
-    //  delegation follows the Mainnet schedule, which selects Nu6_3…"
+    // "…select consensus branch Nu6_2 at the round's snapshot height 4_200_000, but voting
+    //  delegation follows the Mainnet schedule, which selects Nu7…"
     showRoundUnavailable(error.message)
 }
 ```
 
 The rule is per round, not per chain: the comparison is made at that round's snapshot height, so a
 custom chain whose schedule differs elsewhere but selects the same branch there opens and votes as
-the base network does — provided that branch is NU6.3, the only one voting runs on. A host on a
-custom chain drives the rounds whose snapshot falls where the two schedules agree. Keep the
-registered heights mirroring the `nuparams` of the node you connect to whatever a round asks for:
-they are what sync and spending resolve against, and moving them to suit a round breaks both.
+the base network does. Keep registered heights mirroring the actual node or lightwalletd `nuparams`:
+sync and spending use those heights, so they cannot be changed to make a voting round agree. For a
+later custom regtest snapshot, configure both the registered heights and actual node to select NU7
+at that snapshot.
 
 Mainnet and testnet are unaffected — a standard network is compared against itself and agrees at
-every height. A regtest base is the one stock configuration the comparison turns away:
-`ZcashNetworkBuilder.network(for: .regtest)` registers `NetworkActivationHeights.allActiveFromGenesis`,
-which activates NU6.3 at height 1, while the voting crate's own regtest schedule activates it at
-height 10. A round whose snapshot height falls below 10 is refused there; from height 10 on, the two
-agree.
+every height. `ZcashNetworkBuilder.network(for: .regtest)` registers
+`NetworkActivationHeights.allActiveFromGenesis` by default, which activates NU6.3 at height 1 and
+leaves NU7 disabled. The voting crate's built-in regtest schedule activates NU6.3 at height 10 and
+NU7 at height 11, so the default schedule agrees only at snapshot 10; snapshots 1–9 and 11+ are
+rejected.
 
 ### Validate every stage before shipping
 
@@ -2009,11 +2011,14 @@ Ironwood testing backend) whose network upgrades activate at arbitrary heights:
   modified chain may identify with its base chain's name and a nonstandard branch id). The
   Sapling-activation-height check still applies.
 - Coinholder voting reads these heights for note selection but not for its delegation branch, which
-  the voting crate derives from the base network alone. A round session opens only where the custom
-  network's consensus branch at the round's snapshot height equals the base network's, and throws
-  `VotingError` with `kind == .invalidInput` otherwise — which for the stock heights of `network(for: .regtest)` means
-  every round whose snapshot height is from 1 to 9. See "Voting on a custom network: only where the consensus
-  branch agrees" above.
+  the voting crate derives from the base network alone. Voting accepts NU6.3 and NU7 snapshots, but
+  a round session opens only where the custom network's consensus branch at the round's snapshot
+  height equals the base network's, and throws `VotingError` with `kind == .invalidInput` otherwise.
+  The default regtest heights agree with voting only at snapshot 10: snapshots 1–9 and 11+ are
+  rejected. For later regtest snapshots, explicitly configure the registered heights and actual node
+  to select NU7 at the snapshot. Keep registered heights aligned with the actual node/lightwalletd
+  `nuparams` because sync and spending use them. See "Voting on a custom network: only where the
+  consensus branch agrees" above.
 
 **Process-global registration and ordering.** The custom network's parameters are registered with
 the Rust core **once per process** (the first `Initializer` created with a custom network does this).

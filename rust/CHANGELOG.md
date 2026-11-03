@@ -30,6 +30,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   24-hour exposure window and uses 25-second blocks for recheck delays after NU7, matching the Tor path.
   Exported signatures are unchanged.
 
+- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
+  For custom regtest snapshots at height 11 or later, the registered activation schedule must
+  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
 - Refused stale migration submissions now persist recovery state: `zcashlc_migration_advance_step` returns Reevaluate
   until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
   or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
