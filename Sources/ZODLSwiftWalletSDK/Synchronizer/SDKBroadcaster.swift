@@ -13,6 +13,9 @@ final class SDKBroadcaster: Broadcaster {
     private let eventSubject: PassthroughSubject<SynchronizerEvent, Never>
     private let submitPlanStore: SubmitPlanStoring
     private let multiEndpointSubmitter: MultiEndpointSubmitter
+    private let transactionRepository: TransactionRepository
+    /// The last chain tip the synchronizer knows; `0` before it knows one.
+    private let chainTip: () -> BlockHeight
     private let statusCheck: () throws -> Void
 
     init(
@@ -22,6 +25,8 @@ final class SDKBroadcaster: Broadcaster {
         eventSubject: PassthroughSubject<SynchronizerEvent, Never>,
         submitPlanStore: SubmitPlanStoring,
         multiEndpointSubmitter: MultiEndpointSubmitter,
+        transactionRepository: TransactionRepository,
+        chainTip: @escaping () -> BlockHeight,
         statusCheck: @escaping () throws -> Void
     ) {
         self.transactionEncoder = transactionEncoder
@@ -30,6 +35,8 @@ final class SDKBroadcaster: Broadcaster {
         self.eventSubject = eventSubject
         self.submitPlanStore = submitPlanStore
         self.multiEndpointSubmitter = multiEndpointSubmitter
+        self.transactionRepository = transactionRepository
+        self.chainTip = chainTip
         self.statusCheck = statusCheck
     }
 
@@ -298,5 +305,61 @@ final class SDKBroadcaster: Broadcaster {
         }
 
         return createdTransactions
+    }
+}
+
+// MARK: - Unaccepted transactions after a server change
+
+extension SDKBroadcaster {
+    func resubmitUnacceptedTransactions(
+        through endpoint: LightWalletEndpoint,
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport] {
+        let server = "\(endpoint.host):\(endpoint.port)"
+        let candidates: [ZcashTransaction.Overview]
+        do {
+            // Like `submit`, no prepared synchronizer is required: a wallet database that cannot be read yet only
+            // means there is nothing to list. The same selection background resubmission makes: sent, not mined,
+            // not expired as of the last tip.
+            // Before any tip is known that is every unmined send; the submitter refuses an expired one itself.
+            candidates = try await transactionRepository.findForResubmission(upTo: chainTip())
+        } catch {
+            logger.warn("Unaccepted transactions could not be listed for \(server); nothing sent: \(error.localizedDescription)")
+            return []
+        }
+
+        var reports: [TransactionSubmissionReport] = []
+        for overview in candidates {
+            // The store decides whether the transaction is stuck (submitted, not accepted) and extends its plan in
+            // the same step. Its token makes an acceptance that arrives after a `wipe()` provably stale.
+            guard let lifecycle = await submitPlanStore.addEndpointToUnacceptedPlan(txId: overview.rawID, endpoint: endpoint) else {
+                continue
+            }
+            let txId = overview.rawID.toHexStringTxId()
+            guard let transaction = try? CreatedTransaction(overview: overview) else {
+                logger.warn("Transaction \(txId) has no raw bytes to send through \(server).")
+                continue
+            }
+            // Each transaction on its own: one that the server does not take must not keep the next one waiting,
+            // unlike a batch, whose later transactions may depend on the earlier ones.
+            let outcome: TransactionSubmissionOutcome
+            do {
+                outcome = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                    await self.multiEndpointSubmitter.submit(transaction: transaction, to: [endpoint], timing: timing)
+                }
+            } catch {
+                outcome = .unreachable
+            }
+            if case .accepted(by: let acceptingEndpoint) = outcome {
+                await submitPlanStore.markAccepted(
+                    txId: overview.rawID,
+                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
+                    lifecycle: lifecycle
+                )
+            }
+            logger.debug("Transaction \(txId) resubmission through \(server) \(outcome.logDescription).")
+            reports.append(TransactionSubmissionReport(txId: overview.rawID, outcome: outcome))
+        }
+        return reports
     }
 }

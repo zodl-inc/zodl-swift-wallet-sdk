@@ -464,6 +464,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         self.transactionRepository = initializer.transactionRepository
         self.transactionEncoder = WalletTransactionEncoder(initializer: initializer)
         let eventSubjectRef = eventSubject
+        let stateSubjectRef = stateSubject
 
         let logger = initializer.logger
 
@@ -502,6 +503,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             eventSubject: eventSubjectRef,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
+            transactionRepository: initializer.transactionRepository,
+            chainTip: { stateSubjectRef.value.latestBlockHeight },
             statusCheck: {}
         )
     }

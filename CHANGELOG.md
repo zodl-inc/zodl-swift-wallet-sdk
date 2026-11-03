@@ -8,6 +8,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
+  with the default timing, send every transaction that was submitted but that no server has accepted yet
+  through the given server, once and right away, and add that server at the end of each transaction's retry
+  plan; background resubmission keeps trying the recorded servers first. Meant for a wallet whose user moved
+  to another server while sends were stuck, such as during a private relay outage. Each report says whether
+  the server took the transaction. The server receives these transactions with the device's network address
+  unless the route hides it (Tor). Custom `Broadcaster` conformers inherit a no-op and need no changes.
 - `TorTransitionProviding` exposes retained `TorTransitionState` and updates on `SlipstreamSynchronizer`.
   `requestTorTransition(enabled:)` immediately fences new requests and cancels an opposite startup.
   Its `TorTransitionRequest.apply()` activates once after the host acquires its transaction guard;
