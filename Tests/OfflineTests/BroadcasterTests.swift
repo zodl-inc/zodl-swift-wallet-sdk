@@ -796,6 +796,30 @@ final class BroadcasterTests: ZcashTestCase {
         ))
     }
 
+    func testEmptySubmissionDoesNotAttributeEarlierTraffic() async throws {
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        let result = await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                return await synchronizer.broadcaster.submit(transaction: self.makeCreatedTransaction(), to: [])
+            }
+        }
+        XCTAssertEqual(result, .unreachable)
+        let updates = session.updates()
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        for await update in updates {
+            if case .operationCompleted(_, _, let observations) = update {
+                XCTAssertTrue(observations.isEmpty)
+                break
+            }
+        }
+    }
+
     func testSubmitWithEmptyEndpointsIsUnreachableAndRecordsNoPlan() async throws {
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()

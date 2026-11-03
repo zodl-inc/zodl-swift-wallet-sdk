@@ -165,6 +165,11 @@ hex = "0.4"
 zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "b0b2087c9d867115f38ddfbd6021988b64abf8f9", default-features = false }
 
 [dev-dependencies]
+# Authenticated response fixtures exercise the real OHTTP decoder.
+aes-gcm = "0.10"
+hkdf = "0.12"
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+sha2 = "0.10"
 futures = "0.3"
 http-body = "1"
 http-body-util = "0.1"
@@ -220,7 +225,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "69e8927208c7fdf1d6abc5edb466123d78b0d0fb" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "f34de63586d3ce0e08f214f8e6bcae546260e3db" }
 
 # DO NOT ALTER THIS COMMENT
 #

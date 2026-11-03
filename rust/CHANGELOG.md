@@ -8,6 +8,18 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OHTTP decoding failures preserve authenticated canonical gRPC status from HTTP 200
+  application/grpc heads and trailers, with trailers taking precedence. Metadata is isolated
+  per decoder and thread and resets with each complete/push/finish call. Legacy failure kinds
+  and the 16-byte `FfiOhttpDecodeOutcome` layout are unchanged.
+
+- OHTTP complete/push/finish retain authenticated inner rejection metadata across truncated or rejected
+  later chunks. `zcashlc_ohttp_last_decode_outcome` exposes the kind, HTTP status and absolute
+  CLOCK_MONOTONIC `retry_not_before_ns`; read it immediately on the same thread before cleanup.
+  `FfiTorHttpOutcome` uses the same absolute deadline field, preserving actual
+  Retry-After values through legacy and bounded HTTP body errors. Legacy buffered collection keeps
+  its existing 60-second deadline from parser admission; retry, dispatch and public errors are unchanged.
+
 - `zcashlc_tor_http_get_with_timeout` collects response bodies under the caller's total
   deadline after returning from the backend parser, so its default 60-second body timer
   cannot truncate a longer explicit budget. Untimed GET behavior, retry policy, body-size
@@ -24,6 +36,30 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged.
 
 ### Added
+
+- `zcashlc_ohttp_last_grpc_status` returns the immediately preceding decode call's authenticated
+  canonical status (0 through 16), or -1 when absent or invalid. Copy it immediately on the same
+  thread alongside `zcashlc_ohttp_last_decode_outcome`, before cleanup or another native call.
+  Zero describes an authenticated status and does not establish complete-body success.
+
+- `zcashlc_tor_http_post_once_with_timeout` and `zcashlc_tor_http_get_classified_with_timeout`
+  provide additive bounded HTTP calls with `FfiTorHttpOutcome` metadata for deadline, transport,
+  configuration, and size failures. The deadline covers sending and response collection; POST
+  retains the existing unsent-only retry rule. Known HTTP rejection and Retry-After metadata survive
+  body failure and deadline expiry. Existing HTTP APIs and their error text remain unchanged.
+- `zcashlc_tor_http_last_outcome` exposes the typed outcome of legacy GET, POST, and streaming
+  operations; `zcashlc_ohttp_last_failure_kind` exposes typed complete/push/finish codec failures.
+  Both getters are thread-local. Read immediately after the corresponding call on that thread,
+  before cleanup or another FFI operation. Unknown kinds must not be treated as relay outages.
+
+- `zcashlc_ohttp_health_api_version` reports additive health ABI version 1.
+  `zcashlc_ohttp_health_subscribe_v1` observes a configured route independently of the wallet engine;
+  its callback borrows at most 126 fixed-layout observations, which callers must copy before returning.
+  `zcashlc_ohttp_health_snapshot_v1` copies retained evidence without partial writes, returning the
+  required count when capacity is insufficient or `SIZE_MAX` for invalid arguments. Preserve historical
+  flags, source versions, original generations and monotonic timestamps when interpreting replay.
+  `zcashlc_ohttp_health_unsubscribe_v1` fences callbacks before releasing the caller-owned context.
+  Existing snapshot layouts and exported signatures are unchanged.
 
 - The Oblivious HTTP (RFC 9458) exchange of the iOS client, on the shared `zodl-ohttp-client` core
   (`ClientProfile::IOS`, profile `2`). Headers cross as one byte array (for each name and value a 4-byte

@@ -8,6 +8,49 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Migration OHTTP key preparation failures are included in `OHTTPHealthContext.complete`
+  evidence for the selected failed attempt, for direct and Tor routes. Transaction results,
+  key fallback and successful key preparation behavior are unchanged. No caller changes are needed.
+
+- Buffered OHTTP health retains authenticated gRPC rejection status when later decoding fails.
+  Policy rejections (7 and 16) and backend unavailability (14) keep their health classification
+  through a missing final chunk. A zero status alone never establishes complete-body success,
+  and original RPC errors and HTTP rejection precedence are unchanged.
+
+- `OHTTPHealthSnapshot` preserves ordinary recovery evidence beside diagnostic observations
+  and later completions from older requests. Ordinary route success keeps its greatest request
+  start and original metadata; failure ordering is unchanged. No caller changes are needed.
+
+- The source-built native dependency includes the rejected-response body-failure classification
+  correction. All five configured architectures use the same pinned native revision.
+
+- `probeOHTTPHealth(session:)` preserves authenticated inner HTTP and gRPC rejection outcomes,
+  including the original Retry-After deadline. RPC errors and caller code are unchanged.
+
+- Both synchronizers retire OHTTP health sessions before committed engine or service replacement
+  and wallet wipes, including failed replacements. A retained binding reports when the selected
+  route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence
+  or late rate-limit replay to replacement sessions.
+  An unexpired server pause accepted before retirement still prevents diagnostics on the same route after replacement.
+  Consumers should retain `OHTTPHealthProviding.ohttpHealthBinding`, wait for its ready publication,
+  and create a new session through that provider after resource replacement. Recheck
+  `OHTTPHealthSession.bindingID` against the ready binding and `OHTTPHealthSession.isValid` before
+  consuming evidence or probing. `OHTTPHealthError.bindingUnavailable` defers setup until the binding
+  is ready. Provider probes cancel foreign, retired and directly constructed unbound sessions before
+  dispatch; direct session construction does not establish provider ownership.
+
+- `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
+  including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted
+  fallback, known-on-server recovery, local creation failures and unresolved timeouts do not reuse
+  earlier network failures. Transaction results and retries are unchanged. Keep `withAttempt` active
+  while consuming a submission stream, then publish the business result and release transaction
+  guards before calling `complete`. Attempts retain at most 64 terminal request identities; exceeding
+  that limit leaves the completion without attributed evidence.
+
+- OHTTP health preserves an authenticated rejection when response decoding or body collection fails.
+  Diagnostic key fallback stops on a known rate limit, and Retry-After keeps its original head-time
+  deadline through delayed bodies and cleanup. Public RPC errors and submission behavior are unchanged.
+
 - `SlipstreamSynchronizer` preserves restore progress across retries and stop/start on the same
   engine instance, and limits rewind-related drops to reopened work. No caller changes are required.
 
@@ -42,6 +85,39 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small frame per compact block, stay within the limit. No caller changes are required.
 
 ## Added
+
+- `OHTTPHealthContext.complete(_:failed:allFailedAttempts:)` accepts the complete finite set of
+  attempts whose failures determine an all-failed business result. Use distinct, finished attempts
+  for every failed branch; mixed or unknown results, missing or invalid children, and groups beyond
+  64 terminal request identities supply no qualifying evidence. Every child must have terminal
+  transport failures for the same route and generation. Original request identities and global
+  health observations are preserved; `failed: false` supplies no evidence and does not consume
+  children. Publish the original business result and release transaction/wallet guards before awaiting
+  completion, which retains existing backpressure and cancellation behavior. Existing call sites
+  using `failedAttempt` need no changes.
+
+- `OHTTPHealthContext.withBackground(operation:)` clears inherited user-operation attribution for
+  automatic refreshes, retries and other background work. Wrap those awaits in this scope; real
+  requests still update global connection health.
+
+- Concrete synchronizers implement `OHTTPHealthProviding` to create a health session and run a
+  fresh read-only diagnostic using their selected OHTTP endpoint and Tor runtime. Diagnostics use
+  one 5-second direct or 20-second Tor budget across admission, keys, retries, and response collection;
+  native resource cleanup can extend completion. Explicit relay pauses prevent dispatch.
+- Real Swift OHTTP requests now contribute typed route and backend evidence without changing RPC
+  results or retry behavior. Use `OHTTPHealthContext.withAttempt` with a distinct `OHTTPHealthAttempt`
+  for each network alternative. Pass the explicitly failed token as `failedAttempt` to `complete`;
+  omitting it reports business failure with no attributed final network evidence. Earlier optional
+  failures must not be attributed to an unrelated local failure. Publish the business result before
+  awaiting completion delivery. Attempt identities remain local and are never sent on the wire.
+
+- `OHTTPHealthSession(route:generation:)` adds retained OHTTP health snapshots and operation completion
+  updates without changing `Synchronizer`. Initialization throws when the native capability is unsupported.
+  Use `OHTTPHealthContext.withOperation` to correlate child work locally, then publish the business result
+  before awaiting `OHTTPHealthContext.complete(_:failed:)`. Completion includes its own bounded evidence;
+  a stalled update consumer applies backpressure after 64 completions. Drain updates without waiting for
+  UI interaction, and cancel the consumer or call `close()` when retiring the route. Compare evidence
+  using `OHTTPHealthClock` and reject historical or older-generation observations as fresh traffic.
 
 - `Synchronizer.httpStreamOverOHTTP(for:viaTor:)` sends an HTTP request through the OHTTP relay and
   gateway like `httpRequestOverOHTTP` and returns once the response head is in, with the body read

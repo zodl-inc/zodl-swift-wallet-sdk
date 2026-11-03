@@ -3134,6 +3134,7 @@ dependencies = [
 name = "libzcashlc"
 version = "7.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "bech32",
@@ -3151,6 +3152,8 @@ dependencies = [
  "fs-mistrust",
  "futures",
  "hex",
+ "hkdf",
+ "hpke",
  "http",
  "http-body",
  "http-body-util",
@@ -3180,6 +3183,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sharded-slab",
  "shardtree 0.8.0",
  "tempfile",
@@ -8878,7 +8882,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream"
 version = "0.4.0"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=69e8927208c7fdf1d6abc5edb466123d78b0d0fb#69e8927208c7fdf1d6abc5edb466123d78b0d0fb"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=f34de63586d3ce0e08f214f8e6bcae546260e3db#f34de63586d3ce0e08f214f8e6bcae546260e3db"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8933,7 +8937,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=69e8927208c7fdf1d6abc5edb466123d78b0d0fb#69e8927208c7fdf1d6abc5edb466123d78b0d0fb"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=f34de63586d3ce0e08f214f8e6bcae546260e3db#f34de63586d3ce0e08f214f8e6bcae546260e3db"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",

@@ -58,6 +58,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     // ── Shared infrastructure ──────────────────────────────────────────────────
     // `private` reaches the same-file private extension (Swift 4+ file-scope rule).
+    private nonisolated let healthOwner: OHTTPHealthBinding
+    deinit { healthOwner.retire() }
+
     private let initializer: Initializer
     private let transactionRepository: TransactionRepository
     private let endpointService: RebindingLightWalletService
@@ -106,6 +109,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// would recreate before `prepare` has initialized it. So while this is set `switchTo(endpoint:)` only
     /// records the server, and `prepare` opens the engine at whatever was recorded.
     private var engineClosedByWipe = false
+    /// Health tracks actual destruction even when a wipe or reopen subsequently fails.
+    private var healthEngineClosed = false
 
     // ── Running state (for switchTo restart decision) ──────────────────────────
     private var isRunning: Bool = false
@@ -443,6 +448,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         self.engine = engine
         self.torHTTPUptime = torHTTPUptime
         self.restoreAnchor = restoreAnchor
+        self.healthOwner = OHTTPHealthBinding(endpoint: initializer.endpoint)
         self.initializer = initializer
         self.currentEndpoint = initializer.endpoint
         self.transactionRepository = initializer.transactionRepository
@@ -574,6 +580,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The queued body of `prepare`'s engine step. It reads `currentEndpoint` and `engineClosedByWipe`
     /// here, in its own turn, so what it sees is what every switch queued before it left behind.
     private func openEngineOnLifecycleQueue() async throws {
+        let healthTransition = healthEngineClosed ? healthOwner.beginTransition() : nil
+        defer {
+            if let healthTransition { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        }
         if engineClosedByWipe {
             // The engine still holds the server it had before the wipe: a switch since then only
             // recorded the next one. `reopen` binds the fresh handle to the recorded server; the
@@ -585,6 +595,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         } else {
             try await engine.open(network: initializer.network)
         }
+        healthEngineClosed = false
     }
 
     // ── start ──────────────────────────────────────────────────────────────────
@@ -1189,11 +1200,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // request interruption between blocks; reopening still requires proof of quiescence.
         let report = await engine.stopForWalletChange()
 
+        var healthTransition: UUID?
+        defer {
+            if let healthTransition { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        }
         do {
             guard report.isQuiescent else {
                 throw ZcashError.slipstreamEngineNotQuiescent(report)
             }
+            healthTransition = healthOwner.beginTransition()
+            healthEngineClosed = true
             try await engine.reopen(server: currentEndpoint, network: initializer.network)
+            healthEngineClosed = false
         } catch {
             // A reopen that failed still spent an attempt. Not counting it would leave the backoff
             // unarmed and the cap unreachable, so an endpoint that cannot be reopened at all would
@@ -2354,6 +2372,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         // 3. Free the engine handle (exact-once — close() guards against double-free).
+        let healthTransition = healthOwner.beginTransition(walletReset: true)
+        healthEngineClosed = true
         await engine.close()
 
         // 3a. Reset the per-handle tx-set-version mirror: the engine handle is being
@@ -2400,9 +2420,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             engineClosedByWipe = true
             stateSubject.send(.zero)
 
-            // 8. Signal completion.
+            // 8. Signal completion after the selected route has settled.
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .finished)
         } catch {
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .failure(error))
         }
     }
@@ -2704,7 +2726,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // After a wipe the engine stays closed until `prepare`, which opens it at this server. Nothing
         // runs and no handle exists, so the switch changes no owner and moves no generation.
         if engineClosedByWipe {
+            let healthTransition = healthOwner.beginTransition()
             rebindEndpointServices(to: endpoint)
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             initializer.logger.debug(
                 "switchTo after wipe: \(endpoint.host):\(endpoint.port) recorded for the next prepare, engine stays closed",
                 file: #file,
@@ -2746,7 +2770,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         // Re-open the engine handle against the new endpoint.
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
         try await engine.reopen(server: endpoint, network: initializer.network)
+        healthEngineClosed = false
 
         // Publish the engine and Swift RPC route in the same lifecycle turn.
         rebindEndpointServices(to: endpoint)
@@ -2775,6 +2803,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         endpointService.replace(with: service)
         currentEndpoint = endpoint
         initializer.endpoint = endpoint
+        healthOwner.recordPublishedEndpoint(endpoint)
     }
 
     // ── Bounded rebuild (restartSync) ───────────────────────────────────────────
@@ -2827,7 +2856,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
         try await engine.reopen(server: endpoint, network: initializer.network)
+        healthEngineClosed = false
         rebindEndpointServices(to: endpoint)
 
         // The new handle's engine-side counters start at zero, so the emission mirrors must too —
@@ -3298,6 +3331,7 @@ private extension SlipstreamSynchronizer {
     // "trust the network over the submit-side error" recovery branch. Submission is shared SDK
     // logic — slipstream only owns the sync path — so this stays byte-for-byte the SDK behaviour.
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
@@ -3307,8 +3341,11 @@ private extension SlipstreamSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                let attempt = health.makeAttempt()
                 do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    try await health.withAttempt(attempt) {
+                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    }
                     // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
                     // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
                     // ring event for ring consumers) — the poll loop's version compare re-fetches
@@ -3319,19 +3356,26 @@ private extension SlipstreamSynchronizer {
                 } catch ZcashError.serviceSubmitFailed(let error) {
                     // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
                     // If the server already has this tx, the broadcast landed — treat as success.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                    if await health.withAttempt(health.makeAttempt(), operation: {
+                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                    }) {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 } catch TransactionEncoderError.notSubmittable(let refusal) {
                     // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
                     // network, so there is no server to ask whether it knows the transaction.
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                } catch {
+                    health.adoptFailure(from: attempt)
+                    throw error
                 }
             }
         })
@@ -3339,3 +3383,55 @@ private extension SlipstreamSynchronizer {
 }
 
 extension SlipstreamSynchronizer: TrustedTransactionRecording {}
+
+extension SlipstreamSynchronizer: OHTTPHealthProviding {
+    public nonisolated var ohttpHealthBinding: OHTTPHealthBinding? { healthOwner }
+
+    public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
+        try await makeOHTTPHealthSession(route: route, generation: generation) { await self.healthBinding() }
+    }
+
+    func makeOHTTPHealthSession(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        lookup: @Sendable () async -> OHTTPHealthProbeBinding
+    ) async throws -> OHTTPHealthSession {
+        let token = try healthOwner.readyToken()
+        let binding = await lookup()
+        guard try healthOwner.readyToken() == token else { throw OHTTPHealthError.bindingUnavailable }
+        try binding.validate(route)
+        let session = try OHTTPHealthSession(route: route, generation: generation, bindingID: token, ownerID: healthOwner.ownerID)
+        try healthOwner.admit(session)
+        return session
+    }
+
+    public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
+        await probeOHTTPHealth(session: session) { await self.healthBinding() }
+    }
+
+    nonisolated func probeOHTTPHealth(
+        session: OHTTPHealthSession,
+        lookup: @escaping @Sendable () async -> OHTTPHealthProbeBinding
+    ) async -> OHTTPHealthProbeResult {
+        guard healthOwner.accepts(session) else { return OHTTPHealthProbe.cancelled(session: session) }
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await lookup()
+            guard self.healthOwner.accepts(session) else { throw CancellationError() }
+            return try await binding.probe(session: session, budget: budget)
+        }
+        guard healthOwner.accepts(session) else {
+            return OHTTPHealthProbe.cancelled(session: session, startedAt: result.startedAtNanoseconds)
+        }
+        return result
+    }
+
+    func healthBinding() async -> OHTTPHealthProbeBinding {
+        let viaTor = await initializer.container.resolve(SDKFlags.self).torEnabled
+        return OHTTPHealthProbeBinding(
+            endpoint: currentEndpoint,
+            network: initializer.network.networkType,
+            viaTor: viaTor,
+            tor: initializer.container.resolve(TorClient.self)
+        )
+    }
+}

@@ -8,10 +8,13 @@
 
 import Foundation
 import Combine
+import os
 
 /// Synchronizer implementation for UIKit and iOS 16+
 // swiftlint:disable type_body_length file_length
 public class SDKSynchronizer: AwaitableStopSynchronizer {
+    private nonisolated let healthOwner: OHTTPHealthBinding
+
     public var alias: ZcashSynchronizerAlias { initializer.alias }
 
     private lazy var streamsUpdateQueue = { DispatchQueue(label: "streamsUpdateQueue_\(initializer.alias.description)") }()
@@ -98,6 +101,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     ) {
         self.connectionState = .idle
         self.underlyingStatus = GenericActor(status)
+        self.healthOwner = OHTTPHealthBinding(endpoint: initializer.endpoint)
         self.initializer = initializer
         self.transactionEncoder = transactionEncoder
         self.transactionRepository = transactionRepository
@@ -151,6 +155,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     deinit {
+        healthOwner.retire()
         Task { [blockProcessor] in
             await blockProcessor.stop()
         }
@@ -557,6 +562,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
@@ -566,28 +572,38 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                let attempt = health.makeAttempt()
                 do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    try await health.withAttempt(attempt) {
+                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    }
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
                     // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
                     // Trust the network over the submit-side error: if the server confirms
                     // it has this tx, the broadcast already landed (e.g. Zebra's
                     // MempoolError::InMempool / AlreadyQueued, zcashd's "already in chain",
                     // or any future variant). Treat as success and skip the failure screen.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                    if await health.withAttempt(health.makeAttempt(), operation: {
+                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                    }) {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 } catch TransactionEncoderError.notSubmittable(let refusal) {
                     // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
                     // network, so there is no server to ask whether it knows the transaction.
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                } catch {
+                    health.adoptFailure(from: attempt)
+                    throw error
                 }
             }
         })
@@ -888,16 +904,23 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 return
             }
 
+            let healthTransition = OSAllocatedUnfairLock<UUID?>(initialState: nil)
             let context = AfterSyncHooksManager.WipeContext(
                 prewipe: { [weak self] in
-                    self?.transactionEncoder.closeDBConnection()
-                    self?.transactionRepository.closeDBConnection()
+                    guard let self else { return }
+                    let transition = self.healthOwner.beginTransition(walletReset: true)
+                    healthTransition.withLock { $0 = transition }
+                    self.transactionEncoder.closeDBConnection()
+                    self.transactionRepository.closeDBConnection()
                 },
                 completion: { [weak self] possibleError in
                     if possibleError == nil {
                         await self?.submitPlanStore.wipe()
                     }
                     await self?.updateStatus(.unprepared)
+                    if let self, let transition = healthTransition.withLock({ $0 }) {
+                        self.healthOwner.settle(transition: transition, endpoint: self.initializer.endpoint)
+                    }
                     if let error = possibleError {
                         subject.send(completion: .failure(error))
                     } else {
@@ -909,6 +932,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             do {
                 try await blockProcessor.wipe(context: context)
             } catch {
+                if let transition = healthTransition.withLock({ $0 }) {
+                    healthOwner.settle(transition: transition, endpoint: initializer.endpoint)
+                }
                 subject.send(completion: .failure(error))
             }
         }
@@ -1902,6 +1928,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // final instance of the service will be instantiated and propagated to the all parties
 
         // SWITCH TO NEW ENDPOINT
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: initializer.endpoint) }
 
         // LightWalletService dependency update
         // S6: use captured networkType (already declared above)
@@ -1963,6 +1991,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         initializer.lightWalletService = initializer.container.resolve(LightWalletService.self)
         initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
         initializer.endpoint = endpoint
+        healthOwner.recordPublishedEndpoint(endpoint)
 
         // SELF
         self.latestBlocksDataProvider = initializer.container.resolve(LatestBlocksDataProvider.self)
@@ -2119,3 +2148,55 @@ extension SessionTicker {
 }
 
 extension SDKSynchronizer: TrustedTransactionRecording {}
+
+extension SDKSynchronizer: OHTTPHealthProviding {
+    public nonisolated var ohttpHealthBinding: OHTTPHealthBinding? { healthOwner }
+
+    public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
+        try await makeOHTTPHealthSession(route: route, generation: generation) { await self.healthBinding() }
+    }
+
+    func makeOHTTPHealthSession(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        lookup: @Sendable () async -> OHTTPHealthProbeBinding
+    ) async throws -> OHTTPHealthSession {
+        let token = try healthOwner.readyToken()
+        let binding = await lookup()
+        guard try healthOwner.readyToken() == token else { throw OHTTPHealthError.bindingUnavailable }
+        try binding.validate(route)
+        let session = try OHTTPHealthSession(route: route, generation: generation, bindingID: token, ownerID: healthOwner.ownerID)
+        try healthOwner.admit(session)
+        return session
+    }
+
+    public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
+        await probeOHTTPHealth(session: session) { await self.healthBinding() }
+    }
+
+    nonisolated func probeOHTTPHealth(
+        session: OHTTPHealthSession,
+        lookup: @escaping @Sendable () async -> OHTTPHealthProbeBinding
+    ) async -> OHTTPHealthProbeResult {
+        guard healthOwner.accepts(session) else { return OHTTPHealthProbe.cancelled(session: session) }
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await lookup()
+            guard self.healthOwner.accepts(session) else { throw CancellationError() }
+            return try await binding.probe(session: session, budget: budget)
+        }
+        guard healthOwner.accepts(session) else {
+            return OHTTPHealthProbe.cancelled(session: session, startedAt: result.startedAtNanoseconds)
+        }
+        return result
+    }
+
+    func healthBinding() async -> OHTTPHealthProbeBinding {
+        let viaTor = await sdkFlags.torEnabled
+        return OHTTPHealthProbeBinding(
+            endpoint: initializer.endpoint,
+            network: initializer.network.networkType,
+            viaTor: viaTor,
+            tor: initializer.container.resolve(TorClient.self)
+        )
+    }
+}
