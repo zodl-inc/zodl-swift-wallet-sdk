@@ -114,7 +114,7 @@ build_arm_xcframework() {
         # cargo is incremental, so repeat builds after small edits are fast.
         rustup target add "$rust_target"
         # $FEATURE_ARGS is intentionally unquoted (empty = no extra args).
-        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --required -- cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"
@@ -206,6 +206,12 @@ esac
 
 if [[ "$BUILD_MODE" == "cached" && -n "$FFI_CARGO_FEATURES" ]]; then
     usage "--trace needs a source build; it cannot be combined with --cached."
+fi
+
+# Resolve before any architecture loop or product replacement. Inner Cargo
+# invocations validate the inherited complete environment without loading it again.
+if [[ "$BUILD_MODE" != "cached" && "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
+    exec python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 /bin/bash Scripts/init-local-ffi.sh "$@"
 fi
 
 if [[ "$BUILD_MODE" == "arm" ]]; then

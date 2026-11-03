@@ -27,6 +27,10 @@ CARGO ?= cargo
 BUILD_SUPPORT := BuildSupport
 SCRIPTS := Scripts
 
+# Internal re-entry and dry runs already have a safe build environment.
+OHTTP_ENV_RESOLVED ?=
+OHTTP_BUILD_READY := $(filter 1,$(OHTTP_ENV_RESOLVED))$(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS))))
+
 # The XCFramework the Swift package links against when built locally.
 XCFRAMEWORK := $(BUILD_SUPPORT)/products/libzcashlc.xcframework
 
@@ -94,14 +98,22 @@ build: ## Build the Swift package
 build-release: ## Build the Swift package in release mode
 	$(SWIFT) build -c release $(SWIFT_BUILD_FLAGS)
 
+ifneq ($(OHTTP_BUILD_READY),)
 .PHONY: test
 test: test-scripts test-offline ## Run the script and offline test suites
 
 .PHONY: check
 check: build test test-rust ## Build, run the offline tests, then the Rust tests
 
+else
+.PHONY: test check
+test check:
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 $(MAKE) $@
+endif
+
 # `build` links whatever FFI is already in place; these build the Rust from
 # source first, so the XCFramework matches the tree.
+ifneq ($(OHTTP_BUILD_READY),)
 .PHONY: build-all
 build-all: ffi-macos configure-local-ffi build ## Build the FFI from source, then the Swift package
 
@@ -110,6 +122,12 @@ build-all-release: ffi-macos configure-local-ffi build-release ## Build the FFI 
 
 .PHONY: check-all
 check-all: build-all test ## Build everything from source and run the offline tests
+
+else
+.PHONY: build-all build-all-release check-all
+build-all build-all-release check-all:
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 $(MAKE) $@
+endif
 
 .PHONY: clean
 clean: ## Clean the SwiftPM build directory
@@ -136,7 +154,7 @@ resolve: ## Resolve the SwiftPM dependencies
 
 .PHONY: test-offline
 test-offline: ## Run the offline tests (no network, no lightwalletd)
-	$(SWIFT) test --filter $(OFFLINE_TEST_FILTER)
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- $(SWIFT) test --filter $(OFFLINE_TEST_FILTER)
 
 .PHONY: test-scripts
 test-scripts: ## Run the release-script unit tests
@@ -150,7 +168,7 @@ test-all: ## Run the whole test suite, including networked tests
 # they are not reached by any `swift test` filter and need their own target.
 .PHONY: test-rust
 test-rust: ## Run the Rust unit tests
-	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) test --locked
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- $(CARGO) test --locked
 
 .PHONY: format-rust
 format-rust: ## Format the Rust sources with rustfmt
@@ -187,11 +205,11 @@ swift-build: build ## Alias for `make build`
 
 .PHONY: build-rust
 build-rust: ## Build the Rust crate for the host (debug)
-	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) build
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- $(CARGO) build
 
 .PHONY: build-rust-release
 build-rust-release: ## Build the Rust crate for the host (release)
-	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) build --release
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- $(CARGO) build --release
 
 # Removes target/ entirely, including the cross-compiled slices the ffi-*
 # targets build. clean-ffi preserves those on purpose.
@@ -207,6 +225,9 @@ clean-rust: ## Clean the Cargo build artifacts (target/)
 # release profile, then assembles the XCFramework around it. macOS alone is
 # enough to build and test the Swift package.
 
+# Resolve once before sub-makes and before ffi-ci removes old products.
+# A dry run prints the complete graph without resolving any configuration.
+ifneq ($(OHTTP_BUILD_READY),)
 .PHONY: ffi-macos
 ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
 	$(MAKE) -C $(BUILD_SUPPORT) macos
@@ -238,6 +259,12 @@ ffi-ci: require-macos ## Build the FFI the way CI does: arm64 macOS only, withou
 .PHONY: ffi-all
 ffi-all: require-macos ## Build the full XCFramework for every platform
 	$(MAKE) -C $(BUILD_SUPPORT) xcframework FFI_CARGO_FEATURES=
+
+else
+.PHONY: ffi-macos ffi-ci ffi-all
+ffi-macos ffi-ci ffi-all: require-macos
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 $(MAKE) $@
+endif
 
 .PHONY: verify-ffi
 verify-ffi: ## Check the XCFramework exists and show its contents

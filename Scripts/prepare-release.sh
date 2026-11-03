@@ -32,10 +32,9 @@ cd "$(git rev-parse --show-toplevel)"
 # shellcheck source=lib/release-lib.sh
 . "Scripts/lib/release-lib.sh"
 
-# Ensure cargo/rustup are on PATH (needed when invoked from CI or Xcode).
-if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck source=/dev/null
-    . "$HOME/.cargo/env"
+# Find the normal toolchain without sourcing interactive or personal startup.
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 usage() {
@@ -452,6 +451,18 @@ produce_artifacts() {
 
     : "${GH_REPO:=${GITHUB_REPOSITORY:-$DEFAULT_REPO}}"
     export GH_REPO
+
+    # Keep compilation and native-sensitive verification in the same resolved
+    # child. Re-enter only artifact production, so caller-side version/PR work
+    # is not repeated and validation precedes destructive product cleanup.
+    if [ "$DRY_RUN" != "true" ] && [ "${OHTTP_ENV_RESOLVED:-}" != "1" ]; then
+        local -a config_args=(artifacts "$version")
+        [ "$force" != "true" ] || config_args+=(--force-overwrite-existing-release)
+        [ "$verify" != "false" ] || config_args+=(--skip-verify)
+        python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 \
+            /bin/bash Scripts/prepare-release.sh "${config_args[@]}"
+        return
+    fi
 
     if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
         [ "$verify" = "true" ] && [ "$DRY_RUN" = "false" ] || \

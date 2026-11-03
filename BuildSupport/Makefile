@@ -5,6 +5,10 @@ SHELL := bash
 MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
 
+# Internal re-entry and dry runs already have a safe build environment.
+OHTTP_ENV_RESOLVED ?=
+OHTTP_BUILD_READY := $(filter 1,$(OHTTP_ENV_RESOLVED))$(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS))))
+
 PLATFORMS = ios-device macos ios-simulator
 IOS_DEVICE_ARCHS = aarch64-apple-ios
 IOS_SIM_ARCHS_STABLE = x86_64-apple-ios  aarch64-apple-ios-sim
@@ -34,7 +38,7 @@ IPHONEOS_DEPLOYMENT_TARGET = 16.0
 # Extra Cargo features, for QA builds only (ohttp-e2e.yml passes ohttp-trace);
 # release builds leave it empty.
 FFI_CARGO_FEATURES ?=
-CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) python3 ../Scripts/lib/ohttp_env.py --optional -- cargo build --locked --manifest-path ../Cargo.toml --release $(if $(FFI_CARGO_FEATURES),--features $(FFI_CARGO_FEATURES))
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) python3 ../Scripts/lib/ohttp_env.py --required -- cargo build --locked --manifest-path ../Cargo.toml --release $(if $(FFI_CARGO_FEATURES),--features $(FFI_CARGO_FEATURES))
 cargo_targets = $(addprefix --target ,$(1))
 
 RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml
@@ -46,6 +50,9 @@ install:
 	
 .PHONY: install
 
+# Direct BuildSupport entrypoints need the same one-resolution boundary.
+# A dry run prints the complete graph without resolving any configuration.
+ifneq ($(OHTTP_BUILD_READY),)
 release: clean xcframework
 .PHONY: release
 
@@ -137,3 +144,14 @@ cargo-ios-device:
 cargo-ios-simulator:
 	$(CARGO_BUILD) $(call cargo_targets,$(IOS_SIM_ARCHS))
 .PHONY: cargo-ios-simulator
+
+else
+.PHONY: release xcframework frameworks $(PLATFORMS) cargo-all cargo-macos cargo-ios-device cargo-ios-simulator
+release xcframework frameworks $(PLATFORMS) cargo-all cargo-macos cargo-ios-device cargo-ios-simulator:
+	python3 ../Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 $(MAKE) $@
+clean:
+	rm -rf products
+distclean: clean
+	rm -rf ../target
+.PHONY: clean distclean
+endif

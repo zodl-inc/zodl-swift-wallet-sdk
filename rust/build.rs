@@ -2,7 +2,16 @@ extern crate cbindgen;
 
 use std::{env, path::PathBuf};
 
+#[path = "build_support/ohttp_config.rs"]
+mod ohttp_config;
+
 fn main() {
+    println!("cargo:rerun-if-changed=rust/build_support/ohttp_config.rs");
+    for name in ohttp_config::NAMES {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    ohttp_config::validate(|name| env::var(name).ok()).unwrap_or_else(|error| panic!("{error}"));
+
     // The whole source tree feeds cbindgen (ffi.rs carries the #[repr(C)] types) —
     // watching only lib.rs left the generated header stale after ffi.rs-only edits.
     println!("cargo:rerun-if-changed=rust/src");

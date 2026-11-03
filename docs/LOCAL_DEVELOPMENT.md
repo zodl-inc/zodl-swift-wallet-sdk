@@ -42,38 +42,44 @@ No manual `Package.swift` edits are needed.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
 
-## OHTTP relay build inputs
+## Required OHTTP build inputs
 
-Native compilation reads `ZODL_OHTTP_RELAY_URL_MAINNET` and
-`ZODL_OHTTP_RELAY_URL_TESTNET` from the child process environment. Export both
-before building configured native OHTTP support. For example, using synthetic
-endpoints only:
+Every SDK native source build requires these eight nonempty exported values:
 
-```bash
-export ZODL_OHTTP_RELAY_URL_MAINNET='https://main.example.invalid/relay'
-export ZODL_OHTTP_RELAY_URL_TESTNET='https://test.example.invalid/relay'
-make ffi-ci
-```
+- `ZODL_OHTTP_GATEWAY_HOST_MAINNET`
+- `ZODL_OHTTP_GATEWAY_HOST_TESTNET`
+- `ZODL_OHTTP_RELAY_URL_MAINNET`
+- `ZODL_OHTTP_RELAY_URL_TESTNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
 
-SDK builds accept absent, partial or explicitly empty relay inputs. A nonempty
-input must be a valid HTTPS URL. The app build requires both nonempty valid
-inputs, including when it consumes a remote or prebuilt SDK. There is no global
-SDK OHTTP switch.
+The gateway hosts must differ ignoring ASCII case. Relay URLs must be valid
+HTTPS URLs. The native OHTTP library owns host, DNS and public-key format
+validation. There is exactly one configured SDK product.
 
-Local native build entrypoints fill only absent values from exported variables
-in a bounded login/interactive zsh startup. Inherited values always win, including
-explicit empty strings. For Xcode builds, exports can therefore live in the zsh
-startup environment. Startup output is discarded and values are never printed
-by the runner. `CI` or `GITHUB_ACTIONS` disables shell import completely; CI
-supplies process environment values directly. Ordinary offline SDK CI needs no
-AWS configuration. Live OHTTP and native release workflows load both masked
-inputs before native compilation.
+Local source-build entrypoints resolve once before architecture loops. Inherited
+values win, including explicitly empty strings (which fail validation). Absent
+names are imported from exported login/interactive zsh parameters with bounded
+startup. Remaining absent names are read with `gh variable get` from
+`zodl-inc/zodl-swift-wallet-sdk-private`. Authenticate `gh` normally and ensure
+read access to that repository's Actions variables. The resolver never prints
+values or obtains a new credential, and never evaluates configuration as code.
 
-A prebuilt native binary retains its own compiled relay environment. Using that
-binary with a different app build environment is accepted: there is no value
-matching, automatic rebuild or value-derived cache identity. Rebuild the native
-artifact explicitly when its compiled relay inputs need to change. Build scripts
-never generate URL-bearing Swift source or rewrite tracked sources.
+`CI` or `GITHUB_ACTIONS` disables both shell startup and GitHub lookup. All four
+native workflows supply the eight Actions variables before configuration
+validation and cache lookup. Completed FFI cache identities include a digest of
+all eight exact values. `python3 Scripts/lib/ohttp_env.py --hash` prints that
+validated versioned digest, and `--required -- COMMAND ARG...` runs a child with
+the resolved environment. The helper also supports the system Python used by
+Xcode build phases. Direct Cargo compilation enforces the same required-input
+and distinct-gateway invariants without shell startup or network lookup.
+
+A precompiled SDK retains its compiled configuration. Consuming it and running
+`init-local-ffi.sh --cached` do not fetch configuration. Rebuild native source
+when its configuration must change. Native-sensitive tests must receive the
+same resolved environment as the artifact being tested.
 
 ## Quick Start
 

@@ -52,12 +52,24 @@ concurrency:
 
 jobs:
   ffi:
+    env:
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+    outputs:
+      configuration-hash: ${{ steps.ohttp-config.outputs.hash }}
+      source-hash: ${{ steps.ffi-hash.outputs.hash }}
+      xcode-hash: ${{ steps.xcode-cache-key.outputs.hash }}
     name: Build FFI (macOS arm64)
     runs-on: xcode-27
     timeout-minutes: 90
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -73,12 +85,27 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Load OHTTP relay build inputs
-        uses: zodl-inc/actions/aws-secrets@1089c3325c069e5cdd6ae5aa625006c850388c56
-        with:
-          secrets: |
-            ZODL_OHTTP_RELAY_URL_MAINNET
-            ZODL_OHTTP_RELAY_URL_TESTNET
+      - name: Report Xcode and compute cache identity
+        id: xcode-cache-key
+        run: |
+          xcode_version_file=$(mktemp)
+          trap 'rm -f "$xcode_version_file"' EXIT
+          xcodebuild -version -skipMacroValidation -derivedDataPath "${RUNNER_TEMP}/DerivedData" > "$xcode_version_file"
+          echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+
+      - name: Validate Rust
+        id: toolchain
+        run: |
+          python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
+
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+          echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
 
       - name: FFI source hash
         id: ffi-hash
@@ -91,14 +118,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: BuildSupport/products/libzcashlc.xcframework
-          key: ohttp-e2e-xcframework-macos-arm64-ohttp-trace-${{ steps.ffi-hash.outputs.hash }}
-
-      - name: Setup Rust
-        if: steps.cache-ffi.outputs.cache-hit != 'true'
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-          targets: aarch64-apple-darwin
+          key: ohttp-e2e-xcframework-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
 
       - name: Cache Cargo
         if: steps.cache-ffi.outputs.cache-hit != 'true'
@@ -109,10 +129,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-            ~/.cargo/git
-          key: ohttp-e2e-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ohttp-e2e-cargo-
+            ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
 
       # arm64 only: the runner is arm64 and nothing here links an x86_64 slice.
       # ohttp-trace: client trace ids (client_trace_prefix input) work only in such a build.
@@ -133,6 +152,15 @@ jobs:
           if-no-files-found: error
 
   e2e:
+    env:
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     name: E2E (${{ matrix.mode }})
     needs: ffi
     runs-on: xcode-27
@@ -159,10 +187,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
-          key: ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
-          restore-keys: |
-            ohttp-e2e-swiftpm-${{ hashFiles('Package.resolved') }}-
-            ohttp-e2e-swiftpm-
+          key: ohttp-e2e-swiftpm-v2-${{ runner.os }}-${{ runner.arch }}-${{ needs.ffi.outputs.xcode-hash }}-${{ needs.ffi.outputs.source-hash }}-${{ needs.ffi.outputs.configuration-hash }}-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
 
       - name: Build Swift package
         timeout-minutes: 30

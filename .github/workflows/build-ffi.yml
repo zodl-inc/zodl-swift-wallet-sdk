@@ -27,13 +27,21 @@ permissions: {}
 
 jobs:
   build-xcframework:
+    env:
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     # Xcode 27 ships only on this image, which GitHub still marks as a public
     # preview (https://github.com/actions/runner-images/issues/14404). If it
     # misbehaves, macos-26 with Xcode 26.6 is the fallback.
     runs-on: xcode-27
     permissions:
       contents: write # Required for creating draft releases
-      id-token: write # Required to load masked native relay inputs
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -70,6 +78,12 @@ jobs:
         run: |
           python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
 
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+          echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
+
       - name: Cache Cargo
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
@@ -91,16 +105,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-
-
-      - name: Load OHTTP relay build inputs
-        uses: zodl-inc/actions/aws-secrets@1089c3325c069e5cdd6ae5aa625006c850388c56
-        with:
-          secrets: |
-            ZODL_OHTTP_RELAY_URL_MAINNET
-            ZODL_OHTTP_RELAY_URL_TESTNET
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
 
       - name: Build and upload draft release
         env:
