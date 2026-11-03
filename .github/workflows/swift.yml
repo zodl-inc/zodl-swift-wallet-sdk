@@ -2,21 +2,11 @@ name: Build and Run Offline Tests
 
 on:
   pull_request:
-    paths-ignore:
-      - '.github/ISSUE_TEMPLATE/*'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - 'README.md'
-      - 'CHANGELOG.md'
-      - 'CONTRIBUTING.md'
-      - 'responsible_disclosure.md'
-      - 'SECURITY.md'
-      - 'SWIFTLINT.md'
-      - 'docs/**'
 
   # Pushes to main build too, so that main always holds warm caches: a
   # pull_request run can restore only its own caches and its base branch's, and
   # without these every pull request's first run compiled the whole Rust graph
-  # from scratch. Keep this list identical to the one above.
+  # from scratch. PR filtering happens within the required rustfmt gate.
   push:
     branches: [main]
     paths-ignore:
@@ -40,8 +30,11 @@ jobs:
   # rewrites. Run `make format-rust` (or `cargo fmt --all`) to fix a failure.
   rustfmt:
     name: rustfmt
+    outputs:
+      run_ci: ${{ steps.changes.outputs.run_ci }}
     permissions:
       contents: read
+      pull-requests: read
 
     runs-on: ubuntu-latest
 
@@ -51,17 +44,30 @@ jobs:
         persist-credentials: false
       timeout-minutes: 1
 
+    - name: Test PR change classification
+      run: python3 -B -m unittest discover -s Scripts/tests -p 'test_pr_change_filter.py'
+
+    - name: Classify PR changes
+      id: changes
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 Scripts/ci/pr_change_filter.py --profile sdk-build --github-output "$GITHUB_OUTPUT"
+
     # The runner image already ships rustup, so no toolchain action is needed.
     - name: Setup Rust
+      if: steps.changes.outputs.run_ci == 'true'
       run: |
         rustup toolchain install stable --profile minimal --component rustfmt
         rustup override set stable
 
     - name: Rustfmt
+      if: steps.changes.outputs.run_ci == 'true'
       timeout-minutes: 5
       run: make check-format-rust
 
   build:
+    needs: rustfmt
+    if: needs.rustfmt.outputs.run_ci == 'true'
     permissions:
       contents: read
 

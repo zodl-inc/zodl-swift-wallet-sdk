@@ -126,12 +126,59 @@ test_swift_workflow_also_runs_on_pushes_to_main() {
     assert_file_contains "$f" "    branches: [main]" "only on pushes to main"
 }
 
-test_swift_workflow_push_and_pull_request_ignore_the_same_paths() {
-    local pr push
-    pr="$(_paths_ignore_of pull_request "$(_swift_workflow)")"
-    push="$(_paths_ignore_of push "$(_swift_workflow)")"
-    assert_succeeds "pull_request has a paths-ignore list" test -n "$pr"
-    assert_eq "$pr" "$push" "push ignores exactly the paths pull_request ignores"
+test_required_workflows_report_for_every_pr() {
+    local workflow
+    for workflow in swift proto-sync; do
+        assert_eq '' "$(_paths_ignore_of pull_request "$REPO_ROOT/.github/workflows/$workflow.yml")" \
+            "$workflow reports required checks for docs-only PRs"
+        assert_file_contains "$REPO_ROOT/.github/workflows/$workflow.yml" '  pull_request:' 'PR trigger is retained'
+    done
+    local expected
+    expected="$(printf "      - '.github/ISSUE_TEMPLATE/*'\n      - '.github/PULL_REQUEST_TEMPLATE.md'\n      - 'README.md'\n      - 'CHANGELOG.md'\n      - 'CONTRIBUTING.md'\n      - 'responsible_disclosure.md'\n      - 'SECURITY.md'\n      - 'SWIFTLINT.md'\n      - 'docs/**'")"
+    assert_eq "$expected" "$(_paths_ignore_of push "$(_swift_workflow)")" 'main push filter stays unchanged'
+}
+
+_ci_job() {
+    awk -v name="  $2:" '$0 == name { active=1; print; next } active && /^  [A-Za-z_]+:/ { exit } active { print }' "$1"
+}
+
+test_required_build_routes_through_successful_rustfmt_classification() {
+    local gate="$SCRATCH/rustfmt-gate.yml" build="$SCRATCH/build-gate.yml"
+    _ci_job "$(_swift_workflow)" rustfmt > "$gate"
+    _ci_job "$(_swift_workflow)" build > "$build"
+    assert_file_contains "$gate" '    name: rustfmt' 'required rustfmt check name stays stable'
+    assert_eq '' "$(grep '^    if:' "$gate")" 'the required gate itself cannot skip'
+    assert_file_lacks "$gate" 'continue-on-error:' 'classification and formatting failures remain required failures'
+    assert_file_contains "$gate" '      pull-requests: read' 'file enumeration has read-only PR permission'
+    assert_file_contains "$gate" '      run_ci: ${{ steps.changes.outputs.run_ci }}' 'classifier output is available to downstream build'
+    assert_file_contains "$gate" 'python3 Scripts/ci/pr_change_filter.py --profile sdk-build --github-output "$GITHUB_OUTPUT"' 'build classification uses its original ignore set'
+    assert_file_contains "$gate" 'GH_TOKEN: ${{ github.token }}' 'token travels only through the environment'
+    assert_file_contains "$gate" "python3 -B -m unittest discover -s Scripts/tests -p 'test_pr_change_filter.py'" 'cheap tests execute in the required gate'
+    assert_file_contains "$build" '    needs: rustfmt' 'build cannot start until the required gate succeeds'
+    assert_file_contains "$build" "    if: needs.rustfmt.outputs.run_ci == 'true'" 'only explicit code classification enables expensive build'
+    local step
+    for step in 'Setup Rust' Rustfmt; do
+        _step_block "$step" > "$SCRATCH/format-step.yml"
+        assert_file_contains "$SCRATCH/format-step.yml" "      if: steps.changes.outputs.run_ci == 'true'" 'formatting setup and check run only for code changes'
+    done
+}
+
+test_proto_required_job_classifies_without_skipping_the_job() {
+    local f="$REPO_ROOT/.github/workflows/proto-sync.yml"
+    assert_eq '' "$(grep '^    if:' "$f")" 'the required proto job itself cannot skip'
+    assert_file_lacks "$f" 'continue-on-error:' 'classification failure fails the required proto gate'
+    assert_file_contains "$f" '      pull-requests: read' 'proto enumeration is read-only'
+    assert_file_contains "$f" 'python3 Scripts/ci/pr_change_filter.py --profile sdk-proto --github-output "$GITHUB_OUTPUT"' 'proto keeps its licensing exclusions'
+    assert_file_contains "$f" 'GH_TOKEN: ${{ github.token }}' 'proto token is passed through env'
+    assert_file_contains "$f" "      if: steps.changes.outputs.run_ci == 'true'" 'only the expensive comparison is conditional'
+    assert_file_contains "$f" '      run: ./Scripts/update-proposal-proto.sh --check' 'comparison command is preserved'
+}
+
+test_optional_swiftlint_scope_stays_narrow() {
+    local actual expected
+    actual="$(awk '/^    paths:/ { active=1; next } active && /^      - / { print; next } active { exit }' "$REPO_ROOT/.github/workflows/swiftlint.yml")"
+    expected="$(printf "      - '.github/workflows/swiftlint.yml'\n      - '.swiftlint.yml'\n      - '**/*.swift'")"
+    assert_eq "$expected" "$actual" 'optional SwiftLint keeps its existing workflow and Swift-only scope'
 }
 
 # The whole list item of the step named $1, whichever key comes first.

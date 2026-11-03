@@ -105,7 +105,7 @@ The `CompactBlockProcessor` downloads compact blocks via `Block/Download/`, stor
 
 ### Networking
 
-- gRPC lightwalletd client: `Modules/Service/GRPC/`. The lightwalletd proto files are vendored from https://github.com/zcash/lightwallet-protocol as a git subtree under `lightwallet-protocol/`; update them with `Scripts/update-lightwallet-protocol.sh <ref>` (needs `protoc`, provided by `nix develop`), which also regenerates the checked-in `*.pb.swift`/`*.grpc.swift` sources (excluded from SwiftLint; regenerate, don't hand-edit). `ProtoBuf/proto/proposal.proto` is vendored from librustzcash, not the subtree; re-derive it with `Scripts/update-proposal-proto.sh` and never hand-edit it, because `proto-sync.yml` re-derives it from the pinned `zcash_client_backend` on every PR and fails if the committed copy differs.
+- gRPC lightwalletd client: `Modules/Service/GRPC/`. The lightwalletd proto files are vendored from https://github.com/zcash/lightwallet-protocol as a git subtree under `lightwallet-protocol/`; update them with `Scripts/update-lightwallet-protocol.sh <ref>` (needs `protoc`, provided by `nix develop`), which also regenerates the checked-in `*.pb.swift`/`*.grpc.swift` sources (excluded from SwiftLint; regenerate, don't hand-edit). `ProtoBuf/proto/proposal.proto` is vendored from librustzcash, not the subtree; re-derive it with `Scripts/update-proposal-proto.sh` and never hand-edit it, because `proto-sync.yml` re-derives it from the pinned `zcash_client_backend` on every code-affecting PR and fails if the committed copy differs.
 - Tor: `Modules/Service/Tor/` and `Tor/TorClient.swift`. A Tor directory is provisioned in the Initializer config.
 - `Modules/Service/LightWalletService.swift` is the service-level abstraction the rest of the SDK depends on.
 
@@ -208,21 +208,27 @@ hand-written `swift` command:
 
 | Workflow | Trigger | Local equivalent |
 |---|---|---|
-| `swift.yml` | any PR, and any push to `main`, outside its `paths-ignore` list | `make check` (`make build`, `make test-offline`, `make test-rust`) |
+| `swift.yml` | every PR reports `rustfmt`; code changes build and test; pushes to `main` retain `paths-ignore` | `make check` (`make build`, `make test-offline`, `make test-rust`) |
 | `swiftlint.yml` | any PR touching `**/*.swift` or `.swiftlint.yml` | `make lint` |
-| `proto-sync.yml` | any PR outside its `paths-ignore` list | `./Scripts/update-proposal-proto.sh --check` |
+| `proto-sync.yml` | every PR reports; code changes compare the proto | `./Scripts/update-proposal-proto.sh --check` |
 | `zizmor.yml` | every PR | matters when you change a workflow file |
 
 `codeql.yml` does **not** run per PR — only on merges to `main` and weekly,
 because its Swift matrix entry needs `build-mode: manual` and an FFI build
 (`make ffi-ci`).
 
-The `paths-ignore` list is specific: `README.md`, `CHANGELOG.md`,
+PRs are classified inside the required jobs, so docs-only PRs report a successful
+`rustfmt` and `check_proposal_proto` without expensive work. The build depends on
+a successful `rustfmt` and its explicit `run_ci=true` output. API errors fail
+the required job; incomplete or changing PR diffs require full CI. Main pushes
+retain their workflow-level `paths-ignore` filter.
+
+The ignored path list is specific: `README.md`, `CHANGELOG.md`,
 `CONTRIBUTING.md`, `SWIFTLINT.md`, `responsible_disclosure.md`, `SECURITY.md`,
-`docs/**`, and the issue and PR templates. `proto-sync.yml` also ignores the
+`docs/**`, and the issue and PR templates. The proto classifier also ignores the
 licensing files — `LICENSE`, `LICENSE-MIT`, `LICENSE-EXCEPTIONS.md`,
 `COMMERCIAL-LICENSE.md` — which `swift.yml` deliberately does not, so a
-licensing-only PR still runs the required build check. This file is **not** on
+licensing-only PR still runs formatting, build and tests. This file is **not** on
 the list, so a change to `AGENTS.md` alone still triggers a full build.
 
 `make lint` runs `swiftlint lint --quiet`. Adding `--strict` promotes warnings
@@ -251,7 +257,7 @@ says nothing about them; `swift.yml` runs both.
 
 | Change | Minimum |
 |---|---|
-| A file on the `paths-ignore` list | nothing |
+| A file on the ignored path list | no expensive checks; required PR jobs still classify the diff |
 | Any other doc, including this one | `make check` — the build runs regardless |
 | Swift style or rename | `make lint` |
 | Swift logic or refactor | `make check`, then `make lint` |

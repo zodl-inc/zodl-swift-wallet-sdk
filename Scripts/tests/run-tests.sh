@@ -74,6 +74,11 @@ fixture() {
     printf '%s\n' "$dest"
 }
 
+test_pr_change_filter_unit_suite() {
+    assert_succeeds 'PR file classification unit tests' \
+        python3 -B -m unittest discover -s "$REPO_ROOT/Scripts/tests" -p test_pr_change_filter.py
+}
+
 for f in "$TESTS_DIR"/test-*.sh; do
     [ -e "$f" ] || continue
     # shellcheck source=/dev/null
