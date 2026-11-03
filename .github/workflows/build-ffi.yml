@@ -33,6 +33,7 @@ jobs:
     runs-on: xcode-27
     permissions:
       contents: write # Required for creating draft releases
+      id-token: write # Required to load masked native relay inputs
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -93,6 +94,13 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-
+
+      - name: Load OHTTP relay build inputs
+        uses: zodl-inc/actions/aws-secrets@1089c3325c069e5cdd6ae5aa625006c850388c56
+        with:
+          secrets: |
+            ZODL_OHTTP_RELAY_URL_MAINNET
+            ZODL_OHTTP_RELAY_URL_TESTNET
 
       - name: Build and upload draft release
         env:

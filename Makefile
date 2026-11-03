@@ -150,7 +150,7 @@ test-all: ## Run the whole test suite, including networked tests
 # they are not reached by any `swift test` filter and need their own target.
 .PHONY: test-rust
 test-rust: ## Run the Rust unit tests
-	cargo test --locked
+	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) test --locked
 
 .PHONY: format-rust
 format-rust: ## Format the Rust sources with rustfmt
@@ -187,11 +187,11 @@ swift-build: build ## Alias for `make build`
 
 .PHONY: build-rust
 build-rust: ## Build the Rust crate for the host (debug)
-	$(CARGO) build
+	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) build
 
 .PHONY: build-rust-release
 build-rust-release: ## Build the Rust crate for the host (release)
-	$(CARGO) build --release
+	python3 $(SCRIPTS)/lib/ohttp_env.py --optional -- $(CARGO) build --release
 
 # Removes target/ entirely, including the cross-compiled slices the ffi-*
 # targets build. clean-ffi preserves those on purpose.

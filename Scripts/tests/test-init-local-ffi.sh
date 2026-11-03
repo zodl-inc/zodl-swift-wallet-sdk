@@ -4,9 +4,9 @@
 # inside a function), so these invoke the script directly rather than sourcing
 # it. Every case here is rejected by argument validation before the script
 # reaches cargo, rustup, or the network -- usage() calls exit 1 on its own,
-# well before build_arm_xcframework or any download path runs. Accepting
-# --arm-simulator is deliberately NOT exercised here, since that would compile
-# Rust; it is covered by a separate functional smoke test instead.
+# well before build_arm_xcframework or any download path runs. The functional
+# tests below cover accepted arm subsets with only the Cargo/toolchain boundary
+# replaced, keeping compilation and network access out of this suite.
 
 _init_local_ffi() { "$REPO_ROOT/Scripts/init-local-ffi.sh" "$@"; }
 
@@ -46,4 +46,10 @@ test_init_local_ffi_rejects_trace_with_cached() {
 
 test_init_local_ffi_rejects_too_many_arguments_with_trace() {
     assert_fails "too many arguments besides --trace" _init_local_ffi --trace foo bar
+}
+
+# Fake only the toolchain boundary; execute the real packaging scripts.
+test_native_relay_environment() {
+    assert_succeeds 'native initializer rebuild and Makefile relay propagation' \
+        python3 -B -m unittest discover -s "$REPO_ROOT/Scripts/tests" -p test_native_relay_env.py
 }

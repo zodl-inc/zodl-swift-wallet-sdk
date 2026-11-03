@@ -33,8 +33,8 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
 
 # Ensure cargo/rustup are on PATH (needed when invoked from Xcode)
-if [[ -f "$HOME/.cargo/env" ]]; then
-    source "$HOME/.cargo/env"
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
@@ -114,7 +114,7 @@ build_arm_xcframework() {
         # cargo is incremental, so repeat builds after small edits are fast.
         rustup target add "$rust_target"
         # $FEATURE_ARGS is intentionally unquoted (empty = no extra args).
-        cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --locked --target "$rust_target" --release $FEATURE_ARGS
 
         # Populate the framework for this slice.
         local framework="$temp_xcfw/$slice/libzcashlc.framework"

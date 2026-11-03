@@ -55,6 +55,9 @@ jobs:
     name: Build FFI (macOS arm64)
     runs-on: xcode-27
     timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -65,10 +68,22 @@ jobs:
           app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Load OHTTP relay build inputs
+        uses: zodl-inc/actions/aws-secrets@1089c3325c069e5cdd6ae5aa625006c850388c56
+        with:
+          secrets: |
+            ZODL_OHTTP_RELAY_URL_MAINNET
+            ZODL_OHTTP_RELAY_URL_TESTNET
+
       - name: FFI source hash
         id: ffi-hash
         run: |
-          FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -not -path "*/target/*" -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
+          FFI_HASH=$(Scripts/ci/ffi-input-hash.sh)
           echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache XCFramework

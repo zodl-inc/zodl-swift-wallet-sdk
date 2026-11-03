@@ -42,6 +42,39 @@ No manual `Package.swift` edits are needed.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
 
+## OHTTP relay build inputs
+
+Native compilation reads `ZODL_OHTTP_RELAY_URL_MAINNET` and
+`ZODL_OHTTP_RELAY_URL_TESTNET` from the child process environment. Export both
+before building configured native OHTTP support. For example, using synthetic
+endpoints only:
+
+```bash
+export ZODL_OHTTP_RELAY_URL_MAINNET='https://main.example.invalid/relay'
+export ZODL_OHTTP_RELAY_URL_TESTNET='https://test.example.invalid/relay'
+make ffi-ci
+```
+
+SDK builds accept absent, partial or explicitly empty relay inputs. A nonempty
+input must be a valid HTTPS URL. The app build requires both nonempty valid
+inputs, including when it consumes a remote or prebuilt SDK. There is no global
+SDK OHTTP switch.
+
+Local native build entrypoints fill only absent values from exported variables
+in a bounded login/interactive zsh startup. Inherited values always win, including
+explicit empty strings. For Xcode builds, exports can therefore live in the zsh
+startup environment. Startup output is discarded and values are never printed
+by the runner. `CI` or `GITHUB_ACTIONS` disables shell import completely; CI
+supplies process environment values directly. Ordinary offline SDK CI needs no
+AWS configuration. Live OHTTP and native release workflows load both masked
+inputs before native compilation.
+
+A prebuilt native binary retains its own compiled relay environment. Using that
+binary with a different app build environment is accepted: there is no value
+matching, automatic rebuild or value-derived cache identity. Rebuild the native
+artifact explicitly when its compiled relay inputs need to change. Build scripts
+never generate URL-bearing Swift source or rewrite tracked sources.
+
 ## Quick Start
 
 ### One-Time Setup
@@ -242,7 +275,7 @@ The Makefile (used by `init-local-ffi.sh`) and `rebuild-local-ffi.sh` invoke `ca
 
 ### `rustup: command not found` in Xcode build
 
-The scripts source `~/.cargo/env` to find the Rust toolchain. If you installed Rust via a non-standard method (e.g., Homebrew, Nix), you may need to ensure `cargo` and `rustup` are on the default PATH or add the appropriate source/export to `~/.zprofile`.
+The scripts fall back to `~/.cargo/bin` on PATH to find the Rust toolchain. If you installed Rust via a non-standard method (e.g., Homebrew, Nix), you may need to ensure `cargo` and `rustup` are on the default PATH or add the appropriate source/export to `~/.zprofile`.
 
 ## Full Rebuild
 

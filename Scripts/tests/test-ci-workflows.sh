@@ -62,13 +62,13 @@ _package_platforms() {
 
 test_ffi_builds_pass_the_deployment_targets() {
     local f; f="$(_dry_run ffi-ci)"
-    assert_file_contains "$f" "MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build" \
+    assert_file_contains "$f" "MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 python3 ../Scripts/lib/ohttp_env.py --optional -- cargo build" \
         "make ffi-ci passes both deployment targets to cargo"
     f="$(_dry_run ffi-all)"
     local builds; builds="$(grep -c 'cargo build' "$f")"
     assert_succeeds "make ffi-all runs cargo at least once" test "$builds" -gt 0
     assert_eq "$builds" \
-        "$(grep -c 'MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build' "$f")" \
+        "$(grep -c 'MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 python3 ../Scripts/lib/ohttp_env.py --optional -- cargo build' "$f")" \
         "every cargo build in make ffi-all carries both deployment targets"
 }
 
@@ -243,8 +243,8 @@ test_codeql_swift_job_builds_with_ffi_ci() {
         "CodeQL's XCFramework key names the ffi-ci build"
     assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-' \
         "CodeQL's cargo key carries the rustc version"
-    assert_file_contains "$(_codeql_workflow)" "find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f" \
-        "CodeQL's FFI hash covers the root Makefile"
+    assert_file_contains "$(_codeql_workflow)" "Scripts/ci/ffi-input-hash.sh" \
+        "CodeQL's FFI hash covers committed native build inputs including the runner"
     assert_file_contains "$(_codeql_workflow)" "id: toolchain" "CodeQL's Setup Rust step has an id"
     assert_file_contains "$(_codeql_workflow)" 'Scripts/ci/rust_toolchain.py' "CodeQL validates the compiler and exports its identity"
     assert_file_lacks "$(_codeql_workflow)" "x86_64-apple-darwin" "CodeQL installs no x86_64 target"
@@ -536,4 +536,35 @@ test_release_ffi_builds_never_enable_ohttp_trace() {
     FFI_CARGO_FEATURES=ohttp-trace make -C "$REPO_ROOT" -n ffi-all > "$out" 2>/dev/null
     assert_file_lacks "$out" " --features" "make ffi-all ignores FFI_CARGO_FEATURES from the environment"
     assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
+}
+
+# Parse Actions configuration so moving a fetch after compilation or to the
+# wrong job fails even if all the same strings remain in the workflow.
+test_configured_native_workflows_fetch_relay_inputs_before_compilation() {
+    local workflow
+    for workflow in ohttp-e2e build-ffi; do
+        assert_succeeds "$workflow fetches masked relay inputs before native compilation" \
+            ruby -ryaml -e '
+              workflow = YAML.load_file(ARGV[0])
+              job = workflow.fetch("jobs").fetch(ARGV[1])
+              abort "missing OIDC permission" unless job.fetch("permissions", {}).fetch("id-token", "") == "write"
+              steps = job.fetch("steps")
+              index = steps.index { |step| step["uses"] == "zodl-inc/actions/aws-secrets@1089c3325c069e5cdd6ae5aa625006c850388c56" }
+              abort "missing pinned secrets fetch" unless index
+              names = steps[index].fetch("with").fetch("secrets").split
+              abort "relay names missing" unless names == %w[ZODL_OHTTP_RELAY_URL_MAINNET ZODL_OHTTP_RELAY_URL_TESTNET]
+              native = steps.index { |step| step.fetch("run", "").match?(/make ffi-macos|prepare-release.sh artifacts/) }
+              abort "fetch after native build" unless native && index < native
+              python = steps.index { |step| step["uses"] == "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1" && step.fetch("with", {})["python-version"] == "3.12" }
+              abort "missing supported Python before native build" unless python && python < native
+              abort "secret values interpolated into command" if steps.any? { |step| step.fetch("run", "").include?("secrets.ZODL_OHTTP") }
+              if ARGV[1] == "ffi"
+                hash = steps.find { |step| step["id"] == "ffi-hash" }
+                abort "native hash omits runner" unless hash.fetch("run").include?("Scripts/ci/ffi-input-hash.sh")
+              end
+            ' "$REPO_ROOT/.github/workflows/$workflow.yml" "$([ "$workflow" = ohttp-e2e ] && echo ffi || echo build-xcframework)"
+    done
+    for workflow in swift codeql; do
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'zodl-inc/actions/aws-secrets@' 'ordinary offline SDK jobs need no AWS'
+    done
 }

@@ -22,8 +22,8 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
 
 # Ensure cargo/rustup are on PATH (needed when invoked from Xcode)
-if [[ -f "$HOME/.cargo/env" ]]; then
-    source "$HOME/.cargo/env"
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 # Parse a target (ios-sim|ios-device|macos) + optional --gpu (v0.3 GPU Orchard offload
@@ -131,7 +131,7 @@ if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        cargo build --target "$t" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-macos-universal.a"
     lipo -create \
@@ -144,7 +144,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        cargo build --target "$t" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
     lipo -create \
@@ -152,7 +152,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         target/x86_64-apple-ios/release/libzcashlc.a \
         -output "$BUILT_LIB"
 else
-    cargo build --target "$RUST_TARGET" --release $FEATURE_ARGS
+    python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$RUST_TARGET" --release $FEATURE_ARGS
     # Path to built static library (target/ is at repo root)
     BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
 fi
