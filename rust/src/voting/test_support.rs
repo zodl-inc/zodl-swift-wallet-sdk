@@ -172,8 +172,8 @@ pub(crate) fn last_error_string() -> String {
 /// Snapshot height every synthetic session fixture uses.
 ///
 /// Not an arbitrary number: note selection resolves the voting note version
-/// from the snapshot height and `zcash_voting` accepts only Ironwood / NU6.3
-/// notes, so a height below that activation is refused before the wallet is
+/// from the snapshot height and `zcash_voting` accepts Ironwood notes at NU6.3 and NU7 snapshots,
+/// so a height below the Ironwood activation is refused before the wallet is
 /// read at all. This one is above NU6.3 on mainnet (3_428_143) and testnet
 /// (4_134_000) alike, so one constant serves both.
 pub(crate) const SYNTHETIC_SNAPSHOT_HEIGHT: u64 = 4_200_000;
