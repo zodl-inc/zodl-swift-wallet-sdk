@@ -115,11 +115,20 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
         XCTAssertGreaterThan(resubmitter.latestResolvedTime, 0)
     }
 
+    func testBackgroundResubmissionCannotBypassTransitionFence() async throws {
+        let flags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        let resubmitter = try makeResubmitter(flags: flags)
+        flags.routeAdmission.require(false)
+        await resubmitter.checkAndResubmit(latestBlockHeight: 100_000)
+        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 0)
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+    }
+
     // MARK: - Helpers
 
     /// A resubmitter over the two candidates, `firstId` before `secondId`. The encoder is the real single-server sink over the
     /// stubbed service and check. A transaction with a submit plan goes through `GRPCEndpointSubmitter` over the same check.
-    private func makeResubmitter() throws -> TxResubmitter {
+    private func makeResubmitter(flags: SDKFlags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)) throws -> TxResubmitter {
         let candidates = [
             CreatedTransactionTests.makeTransaction(raw: firstRaw, rawID: firstId),
             CreatedTransactionTests.makeTransaction(raw: secondRaw, rawID: secondId)
@@ -138,11 +147,11 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
             spendParams: try __spendParamsURL(),
             networkType: .testnet,
             logger: submissionLifecycleLogger(),
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+            sdkFlags: flags
         )
         let endpointSubmitter = GRPCEndpointSubmitter(
             torClient: TorClient(torDir: try __torDirURL()),
-            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            sdkFlags: flags,
             rustBackend: rustBackend,
             logger: submissionLifecycleLogger(),
             networkType: .testnet

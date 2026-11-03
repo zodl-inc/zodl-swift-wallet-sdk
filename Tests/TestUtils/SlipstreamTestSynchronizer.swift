@@ -44,7 +44,8 @@ extension ZcashTestCase {
         endpoint: LightWalletEndpoint = LightWalletEndpointBuilder.default,
         network: ZcashNetwork = ZcashNetworkBuilder.network(for: .testnet),
         alternateEndpoints: [LightWalletEndpoint] = [],
-        restoreAnchor: SlipstreamAnchorResolver? = nil
+        restoreAnchor: SlipstreamAnchorResolver? = nil,
+        torTransition: TorRouteTransition = TorRouteTransition()
     ) throws -> SlipstreamSynchronizer {
         let container = container ?? mockContainer!
         let welding = welding ?? ZcashRustBackendWeldingMock()
@@ -87,13 +88,15 @@ extension ZcashTestCase {
                 initializer: initializer,
                 alternateEndpoints: alternateEndpoints,
                 engine: engine,
+                torTransition: torTransition,
                 restoreAnchor: restoreAnchor
             )
         }
         return SlipstreamSynchronizer(
             initializer: initializer,
             alternateEndpoints: alternateEndpoints,
-            engine: engine
+            engine: engine,
+            torTransition: torTransition
         )
     }
 }

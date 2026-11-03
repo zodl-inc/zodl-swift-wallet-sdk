@@ -19,10 +19,30 @@ import libzcashlc
 //   full T4.4 darkside test suite is green and the server-switch path is wired up.
 
 /// Swift actor wrapping the Rust Slipstream engine handle.
-/// All calls into the C FFI surface are serialised by the actor's executor.
-public actor SlipstreamEngine {
+/// An asynchronous ownership gate serializes handle access even while blocking FFI suspends the actor.
+public actor SlipstreamEngine: SlipstreamTorStarting {
+    private var ffiBusy = false
+    private var ffiWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireFFI() async {
+        if ffiBusy {
+            await withCheckedContinuation { ffiWaiters.append($0) }
+        } else {
+            ffiBusy = true
+        }
+    }
+
+    private func releaseFFI() {
+        if ffiWaiters.isEmpty {
+            ffiBusy = false
+        } else {
+            ffiWaiters.removeFirst().resume()
+        }
+    }
+
     // ── Storage ────────────────────────────────────────────────────────────────
     private var handle: OpaquePointer?
+    private let beforeBlockingFFI: @Sendable () -> Void
     private let dbURL: URL
     // `server` is mutable so `switchTo(endpoint:)` can re-open the handle against
     // a different endpoint without constructing a new engine actor.
@@ -41,6 +61,14 @@ public actor SlipstreamEngine {
         self.dbURL = dbURL
         self.server = server
         self.alternates = alternates
+        self.beforeBlockingFFI = {}
+    }
+
+    init(dbURL: URL, server: LightWalletEndpoint, beforeBlockingFFI: @escaping @Sendable () -> Void) {
+        self.beforeBlockingFFI = beforeBlockingFFI
+        self.dbURL = dbURL
+        self.server = server
+        self.alternates = []
     }
 
     // ── deinit ─────────────────────────────────────────────────────────────────
@@ -59,7 +87,13 @@ public actor SlipstreamEngine {
     ///
     /// - Parameter network: the Zcash network (mainnet or testnet).
     /// - Throws: `ZcashError.rustSlipstreamOpen` if the Rust call fails.
-    public func open(network: ZcashNetwork) throws {
+    public func open(network: ZcashNetwork) async throws {
+        await acquireFFI()
+        defer { releaseFFI() }
+        try openImpl(network: network)
+    }
+
+    private func openImpl(network: ZcashNetwork) throws {
         guard handle == nil else { return }
 
         // Use osPathStr() (filesystem path, not URL string) — same as ZcashRustBackend.swift:105.
@@ -99,7 +133,9 @@ public actor SlipstreamEngine {
     /// list restores exact single-server behavior (probe skipped, failover
     /// disarmed): this is how the host revokes consent (e.g. the user switches
     /// server selection from Automatic to Manual).
-    public func setAlternates(_ endpoints: [LightWalletEndpoint]) {
+    public func setAlternates(_ endpoints: [LightWalletEndpoint]) async {
+        await acquireFFI()
+        defer { releaseFFI() }
         alternates = endpoints
         if let handlePtr = handle {
             pushAlternates(to: handlePtr)
@@ -138,6 +174,29 @@ public actor SlipstreamEngine {
     /// SEPARATE from the old SDK's `TorClient` directory (arti holds a state lock).
     /// (The engine mirrors the old SDK's per-platform `dangerously_trust_everyone` internally.)
     public func start(ufvk: String?, birthday: BlockHeight, torDir: String?) async throws {
+        let startup = try torDir.map { _ in try SlipstreamTorStartup(deadline: DispatchTime.now().uptimeNanoseconds + 60_000_000_000) }
+        await acquireFFI()
+        defer { releaseFFI() }
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await startImpl(ufvk: ufvk, birthday: birthday, torDir: torDir, startup: startup)
+            try await startup?.waitUntilReady()
+        } onCancel: { startup?.cancel() }
+    }
+
+    nonisolated func makeTorStartup(deadline: UInt64) throws -> any SlipstreamTorStartupControlling {
+        try SlipstreamTorStartup(deadline: deadline)
+    }
+
+    func startTor(birthday: BlockHeight, torDir: String, startup: any SlipstreamTorStartupControlling) async throws {
+        guard let startup = startup as? SlipstreamTorStartup else { throw TorTransitionState.Failure.startupFailed }
+        await acquireFFI()
+        defer { releaseFFI() }
+        try Task.checkCancellation()
+        try await startImpl(ufvk: nil, birthday: birthday, torDir: torDir, startup: startup)
+    }
+
+    private func startImpl(ufvk: String?, birthday: BlockHeight, torDir: String?, startup: SlipstreamTorStartup?) async throws {
         guard let handlePtr = handle else {
             throw ZcashError.rustSlipstreamNotOpen
         }
@@ -152,9 +211,11 @@ public actor SlipstreamEngine {
         // [B4-16 drain] The FFI now DRAINS the aborted pass's in-flight write-behind
         // commit (bounded ≤10 s) before spawning the new session — a real wait, so hop
         // off the cooperative pool (same pattern as restoreAnchor).
+        let beforeBlockingFFI = beforeBlockingFFI
         let result: Bool = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let ok: Bool = torBytes.withUnsafeBufferPointer { torPtr in
+                beforeBlockingFFI()
+                let started: Bool = torBytes.withUnsafeBufferPointer { torPtr in
                     let torBase = torPtr.baseAddress
                     let torLen = UInt(torPtr.count)
                     if let ufvkBytes {
@@ -162,18 +223,30 @@ public actor SlipstreamEngine {
                         // withUnsafeBufferPointer for explicit pointer + length
                         // (matches plan C9 correction).
                         return ufvkBytes.withUnsafeBufferPointer { ptr in
-                            zcashlc_slipstream_start(handlePtr, ptr.baseAddress, UInt(ptr.count), UInt64(birthday), torBase, torLen)
+                            startup.map {
+                                zcashlc_slipstream_start_v2(
+                                    handlePtr, ptr.baseAddress, UInt(ptr.count), UInt64(birthday), torBase, torLen, $0.pointer
+                                )
+                            } ?? zcashlc_slipstream_start(handlePtr, ptr.baseAddress, UInt(ptr.count), UInt64(birthday), torBase, torLen)
                         }
                     } else {
                         // Keyless update: pass null UFVK pointer with length 0.
-                        return zcashlc_slipstream_start(handlePtr, nil, 0, UInt64(birthday), torBase, torLen)
+                        return startup.map { zcashlc_slipstream_start_v2(handlePtr, nil, 0, UInt64(birthday), torBase, torLen, $0.pointer) }
+                            ?? zcashlc_slipstream_start(handlePtr, nil, 0, UInt64(birthday), torBase, torLen)
                     }
                 }
-                continuation.resume(returning: ok)
+                continuation.resume(returning: started)
             }
         }
 
         guard result else {
+            if let startup {
+                switch startup.snapshot.status {
+                case 3: throw TorTransitionState.Failure.startupTimedOut
+                case 4: throw CancellationError()
+                default: break
+                }
+            }
             throw ZcashError.rustSlipstreamStart(lastErrorMessage(fallback: "`SlipstreamEngine.start` failed with unknown error"))
         }
     }
@@ -195,7 +268,9 @@ public actor SlipstreamEngine {
     /// Right before changing the wallet, use `stopForWalletChange()`.
     @discardableResult
     public func stop() async -> SlipstreamStopReport {
-        await stopOffTheCooperativePool(zcashlc_slipstream_stop)
+        await acquireFFI()
+        defer { releaseFFI() }
+        return await stopOffTheCooperativePool(zcashlc_slipstream_stop)
     }
 
     /// [MOB-2184] The stop to make right before changing the wallet: adding or removing an account,
@@ -209,7 +284,9 @@ public actor SlipstreamEngine {
     /// wallet; the report must still prove quiescence before any mutation. A nil handle is
     /// quiescent by definition, as for `stop()`.
     public func stopForWalletChange() async -> SlipstreamStopReport {
-        await stopOffTheCooperativePool(zcashlc_slipstream_stop_for_wallet_change)
+        await acquireFFI()
+        defer { releaseFFI() }
+        return await stopOffTheCooperativePool(zcashlc_slipstream_stop_for_wallet_change)
     }
 
     /// Runs one of the two C stops off the cooperative pool: both wait, bounded, for the engine's
@@ -218,8 +295,10 @@ public actor SlipstreamEngine {
         _ stop: @escaping @Sendable (OpaquePointer?) -> FfiSlipstreamStopReport
     ) async -> SlipstreamStopReport {
         guard let handlePtr = handle else { return .quiescent }
+        let beforeBlockingFFI = beforeBlockingFFI
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                beforeBlockingFFI()
                 continuation.resume(returning: SlipstreamStopReport(stop(handlePtr)))
             }
         }
@@ -229,7 +308,9 @@ public actor SlipstreamEngine {
     /// outside a sync pass (a just-broadcast transaction was stored). The engine emits a
     /// FoundTransactions event through its normal channel, so the poll loop surfaces the
     /// pending transaction on the next tick — uniformly for every host. No-op on a nil handle.
-    public func notifyTxChange() {
+    public func notifyTxChange() async {
+        await acquireFFI()
+        defer { releaseFFI() }
         guard let handlePtr = handle else { return }
         _ = zcashlc_slipstream_notify_tx_change(handlePtr)
     }
@@ -241,7 +322,13 @@ public actor SlipstreamEngine {
     /// nil handle to avoid a double-free.
     ///
     /// - Note: idempotent — safe to call even if the engine was never opened.
-    public func close() {
+    public func close() async {
+        await acquireFFI()
+        defer { releaseFFI() }
+        closeImpl()
+    }
+
+    private func closeImpl() {
         guard let handlePtr = handle else { return }
         zcashlc_slipstream_free(handlePtr)
         handle = nil
@@ -256,13 +343,15 @@ public actor SlipstreamEngine {
     ///   - newServer: the replacement `LightWalletEndpoint`.
     ///   - network:   the Zcash network (unchanged across switches).
     /// - Throws: `ZcashError.rustSlipstreamOpen` if the re-open fails.
-    public func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) throws {
+    public func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) async throws {
+        await acquireFFI()
+        defer { releaseFFI() }
         // Free the old handle (exact-once guard already inside close()).
-        close()
+        closeImpl()
         // Store the new endpoint so subsequent open/start calls use it.
         server = newServer
         // Open a fresh handle bound to the new endpoint.
-        try open(network: network)
+        try openImpl(network: network)
     }
 
     /// [Engine API v2 §0.5 / v2.1 Phase 1] The unified, PHASE-RESOLVING wallet summary:
@@ -286,7 +375,9 @@ public actor SlipstreamEngine {
     /// (Internal because `WalletSummary` is an internal model — the synchronizer is the consumer.)
     func walletSummary(
         confirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultTransferPolicy()
-    ) -> WalletSummary? {
+    ) async -> WalletSummary? {
+        await acquireFFI()
+        defer { releaseFFI() }
         guard let handlePtr = handle else { return nil }
         guard let summaryPtr = zcashlc_slipstream_wallet_summary(handlePtr, confirmationsPolicy.toBackend()) else {
             return nil
@@ -299,7 +390,9 @@ public actor SlipstreamEngine {
 
     /// Returns a snapshot of current progress counters (non-blocking).
     /// Returns `nil` when the engine is not yet open.
-    public func snapshot() -> SlipstreamSnapshot? {
+    public func snapshot() async -> SlipstreamSnapshot? {
+        await acquireFFI()
+        defer { releaseFFI() }
         guard let handlePtr = handle else { return nil }
         // zcashlc_slipstream_snapshot returns FfiSlipstreamSnapshot BY VALUE.
         let cSnapshot = zcashlc_slipstream_snapshot(handlePtr)
@@ -310,7 +403,9 @@ public actor SlipstreamEngine {
     /// Returns up to `capacity` events (EVENT_RING_CAP = 64 in Rust).
     ///
     /// - Parameter capacity: maximum events to drain (defaults to 64 matching `EVENT_RING_CAP`).
-    public func drainEvents(capacity: Int = 64) -> [SlipstreamEngineEvent] {
+    public func drainEvents(capacity: Int = 64) async -> [SlipstreamEngineEvent] {
+        await acquireFFI()
+        defer { releaseFFI() }
         guard let handlePtr = handle else { return [] }
         var buf = [FfiSlipstreamEvent](
             repeating: FfiSlipstreamEvent(tag: 0, value: 0),

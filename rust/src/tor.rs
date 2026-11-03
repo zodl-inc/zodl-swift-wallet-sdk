@@ -5,6 +5,7 @@
 //! reaches it through its relay (over Tor when Tor is on). A gateway endpoint is refused.
 
 pub(crate) mod http;
+pub(crate) mod startup;
 
 use std::convert::TryInto;
 use std::path::Path;

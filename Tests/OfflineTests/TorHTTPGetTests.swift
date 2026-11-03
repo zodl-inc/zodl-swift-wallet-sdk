@@ -67,7 +67,7 @@ final class TorHTTPGetTests: XCTestCase {
                 runtimes.free(runtime)
                 freed.fulfill()
             },
-            createRuntime: { _, _ in
+            startup: TorRuntimeStartupNative.fixture { _, _ in
                 entered.fulfill()
                 XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
                 return runtimes.parent
@@ -300,7 +300,7 @@ final class TorTestRuntimes: @unchecked Sendable {
 
     func clone(_ pointer: OpaquePointer?) -> OpaquePointer? {
         lock.withLock {
-            guard pointer == parent && parentAlive else {
+            guard let pointer, (pointer == parent && parentAlive) || children.contains(pointer) else {
                 XCTFail("Cloning a freed or unexpected runtime")
                 return nil
             }

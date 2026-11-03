@@ -20,8 +20,10 @@ final class TxResubmitter {
     let submitPlanStore: SubmitPlanStoring
     let submitPlanExecutor: SubmitPlanExecutor
     let logger: Logger
+    let routeAdmission: TorNetworkAdmission?
 
-    init(container: DIContainer) {
+    init(container: DIContainer, routeAdmission: TorNetworkAdmission? = nil) {
+        self.routeAdmission = routeAdmission
         transactionRepository = container.resolve(TransactionRepository.self)
         transactionEncoder = container.resolve(TransactionEncoder.self)
         submitPlanStore = container.resolve(SubmitPlanStoring.self)
@@ -77,6 +79,14 @@ final class TxResubmitter {
 
 private extension TxResubmitter {
     func resubmit(transaction: ZcashTransaction.Overview) async throws {
+        if let routeAdmission {
+            try await routeAdmission.withLease { try await self.resubmitAdmitted(transaction: transaction) }
+        } else {
+            try await resubmitAdmitted(transaction: transaction)
+        }
+    }
+
+    func resubmitAdmitted(transaction: ZcashTransaction.Overview) async throws {
         // Captured before `plan(for:)` itself, not merely before the network round trip: the two
         // are separate awaits into the store's actor, and a `wipe()` can land between them. A
         // token captured only after `plan(for:)` returns could already reflect the post-wipe

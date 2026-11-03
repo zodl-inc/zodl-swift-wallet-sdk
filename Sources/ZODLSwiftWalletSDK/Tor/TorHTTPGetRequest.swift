@@ -13,7 +13,7 @@ struct TorHTTPGetNative: Sendable {
         zcashlc_tor_connect_to_lightwalletd($0, $1)
     }
     var freeLightwalletd: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_lwd_conn($0) }
-    var createRuntime: @Sendable (String, UInt) -> OpaquePointer? = { zcashlc_create_tor_runtime($0, $1) }
+    var startup = TorRuntimeStartupNative()
     var postOnce: @Sendable (
         OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<FfiHttpRequestHeader>?, UInt,
         UnsafePointer<UInt8>?, UInt, UInt, UInt64, UnsafeMutablePointer<FfiTorHttpOutcome>?

@@ -41,6 +41,12 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
     }
 
     func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+        try await sdkFlags.routeAdmission.withLease {
+            try await self.submitAdmitted(transaction: transaction, to: endpoint)
+        }
+    }
+
+    private func submitAdmitted(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
         let health = OHTTPHealthFailureOwner()
         let mode: ServiceMode
         let serviceTorClient: TorClient

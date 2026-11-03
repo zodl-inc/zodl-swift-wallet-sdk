@@ -38,6 +38,55 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
         try await super.tearDown()
     }
 
+    func testPrepareAfterTorFenceCannotProvisionANewAnchor() async throws {
+        let fixture = try makeFixture()
+        _ = fixture.synchronizer.requestTorTransition(enabled: true)
+        do {
+            try await prepare(fixture, restoringFrom: restoreBirthday)
+            XCTFail("New provisioning must fail before choosing or dispatching an anchor route")
+        } catch {
+            XCTAssertEqual(error as? TorTransitionState.Failure, .routeUnavailable)
+        }
+        let servers = await fixture.anchor.servers
+        XCTAssertTrue(servers.isEmpty)
+        XCTAssertEqual(fixture.backend.initDataDbSeedCallsCount, 0)
+        XCTAssertEqual(fixture.synchronizer.torTransitionState?.phase, .cancelled)
+    }
+
+    func testAdmittedPrepareFinishesCapturedDirectAnchorBeforeTorStop() async throws {
+        let fixture = try makeFixture()
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
+            freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+        ))
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let provisioning = expectation(description: "route captured before anchor dispatch")
+        let release = Gate()
+        fixture.backend.initDataDbSeedClosure = { _ in
+            provisioning.fulfill()
+            await release.wait()
+            return DbInitResult.success
+        }
+        let preparing = Task { try await prepare(fixture, restoringFrom: restoreBirthday) }
+        await fulfillment(of: [provisioning], timeout: 2)
+        let stopped = expectation(description: "route stop must not pass admitted provisioning")
+        stopped.isInverted = true
+        await fixture.engine.onCall("stop") { stopped.fulfill() }
+        let request = fixture.synchronizer.requestTorTransition(enabled: true)
+        let applying = Task { try await request.apply() }
+        await fulfillment(of: [stopped], timeout: 0.05)
+        await fixture.engine.onCall("stop") {}
+        release.open()
+        try await preparing.value
+        try await applying.value
+        let stopsAtDispatch = await fixture.anchor.stopsAtDispatch
+        let routes = await fixture.anchor.torDirectories
+        XCTAssertEqual(stopsAtDispatch, [0], "Direct anchor dispatch belongs before the route stop acknowledgement")
+        XCTAssertEqual(routes.count, 1)
+        XCTAssertNil(routes[0], "Already-admitted provisioning keeps its original route")
+        XCTAssertEqual(fixture.synchronizer.torTransitionState?.phase, .ready)
+        await fixture.synchronizer.stopAndWait()
+    }
+
     // MARK: - A switch between a wipe and the next prepare
 
     /// The break this catches: a switch after a wipe that reopens the engine. On the real engine that reopen is the
@@ -350,9 +399,13 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
     /// was asked is what these tests follow, not what it said.
     private actor AnchorRequests {
         private(set) var servers: [LightWalletEndpoint] = []
+        private(set) var torDirectories: [String?] = []
+        private(set) var stopsAtDispatch: [Int] = []
 
-        func record(_ server: LightWalletEndpoint) -> SlipstreamRestoreAnchor? {
+        func record(_ server: LightWalletEndpoint, torDirectory: String?, stops: Int) -> SlipstreamRestoreAnchor? {
             servers.append(server)
+            torDirectories.append(torDirectory)
+            stopsAtDispatch.append(stops)
             return nil
         }
     }
@@ -418,8 +471,9 @@ final class SlipstreamWipeEndpointTests: ZcashTestCase {
             alternateEndpoints: [],
             engine: engine,
             makeEndpointService: { endpoint, _, _, _ in Self.recordingService(at: endpoint) },
-            restoreAnchor: { _, _, _, server, _, _ in
-                await anchor.record(server)
+            restoreAnchor: { _, _, _, server, _, torDirectory in
+                let stops = await engine.calls.filter { $0 == "stop" }.count
+                return await anchor.record(server, torDirectory: torDirectory, stops: stops)
             }
         )
         return Fixture(synchronizer: synchronizer, engine: engine, backend: backend, anchor: anchor)

@@ -225,7 +225,9 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
     ) throws -> Initializer {
         mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in ZcashRustBackendWeldingMock() }
-        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service ?? LightWalletServiceMock() }
+        let defaultService = LightWalletServiceMock()
+        defaultService.closeConnectionsClosure = {}
+        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service ?? defaultService }
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in TransactionRepositoryMock() }
         return Initializer(
             container: mockContainer,
@@ -286,7 +288,7 @@ private final class SlipstreamTorLifecycleFixture: @unchecked Sendable {
                 }
                 runtimes.free(pointer)
             },
-            createRuntime: { [self] _, _ in
+            startup: TorRuntimeStartupNative.fixture { [self] _, _ in
                 lock.withLock { creations += 1 }
                 return runtimes.parent
             }

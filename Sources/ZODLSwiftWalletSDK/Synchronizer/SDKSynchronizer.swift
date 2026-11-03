@@ -137,6 +137,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             eventSubject: eventSubject,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
+            transactionRepository: transactionRepository,
+            chainTip: { [weak self] in self?.latestState.latestBlockHeight ?? 0 },
             statusCheck: { [weak self] in
                 guard let self else {
                     throw ZcashError.synchronizerNotPrepared

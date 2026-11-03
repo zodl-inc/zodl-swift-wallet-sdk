@@ -5,6 +5,30 @@ import XCTest
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 final class MigrationOHTTPSubmissionTests: ZcashTestCase {
+    func testMigrationRejectsBeforePreparationWhenRouteIsRetired() async throws {
+        let admission = TorNetworkAdmission(enabled: false)
+        let state = State()
+        let client = Client(state: state)
+        let broadcaster = MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory, logger: logger,
+            torClientFactory: { _ in throw Failure.bootstrap }, networkType: .testnet,
+            ohttpClientFactory: { _ in client }, admission: admission
+        )
+        admission.require(false)
+        do {
+            _ = try await broadcaster.broadcast(
+                to: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443),
+                useTor: false, onWillSubmit: { state.event("willSubmit") },
+                prepareTransaction: { _ in
+                    state.event("prepare")
+                    return Data([1])
+                }
+            )
+            XCTFail("Retired route must reject migration work")
+        } catch {}
+        XCTAssertEqual(state.values.withLock { $0.events }, [])
+    }
+
     private let endpoint = LightWalletEndpoint(address: "ohttp-gateway.example", port: 443)
 
     private final class State: Sendable {

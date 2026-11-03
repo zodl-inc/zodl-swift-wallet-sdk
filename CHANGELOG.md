@@ -6,7 +6,62 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
+  with the default timing, send every transaction that was submitted but that no server has accepted yet
+  through the given server, once and right away, and add that server at the end of each transaction's retry
+  plan; background resubmission keeps trying the recorded servers first. Meant for a wallet whose user moved
+  to another server while sends were stuck, such as during a private relay outage. Each report says whether
+  the server took the transaction. The server receives these transactions with the device's network address
+  unless the route hides it (Tor). Custom `Broadcaster` conformers inherit a no-op and need no changes.
+- `TorTransitionProviding` exposes retained `TorTransitionState` and updates on `SlipstreamSynchronizer`.
+  `requestTorTransition(enabled:)` immediately fences new requests and cancels an opposite startup.
+  Its `TorTransitionRequest.apply()` activates once after the host acquires its transaction guard;
+  `wait()` only observes, and `cancelBeforeApplying()` cancels a dormant ticket. Existing
+  `Synchronizer` conformers need no new members.
+
+## Changed
+
+- `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
+  `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
+  are unchanged; actor-isolated callers must add `await`.
+
 ## Fixed
+
+- `SlipstreamSynchronizer.start(retry:)` revalidates retained Tor intent after a stopped or failed startup.
+  Failed required restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint
+  and block new networking until restoration, including when Tor is turned off during the switch.
+  A newer explicit server choice or wallet wipe retires that restoration target. No call-site changes are required.
+- Cancelling a queued Tor preparation no longer waits for an unrelated wallet's native bootstrap.
+
+- Expired or cancelled Tor acquisition now owns safe retirement of the old native sync loop,
+  while admitted broadcasts retain their resources, route and result. Retirement cannot apply an
+  expired replacement or stop a newer installed route, and observer failure stays immediate.
+- Tor startup APIs now return the same typed failure shown by their state stream, including HTTP
+  and native timeouts and later ordinary sync starts; cancellation remains `CancellationError`.
+
+- `SlipstreamSynchronizer.tor(enabled:)` now stops the old pass and waits for both required Tor
+  owners before resuming an intended-running wallet. Idle wallets remain idle. Failed enablement
+  keeps Tor required, and new network work fails with `TorTransitionState.Failure.routeUnavailable`
+  until a successful route choice. Already-admitted broadcasts retain their route and original
+  result, including outcome recovery and multi-endpoint propagation after acceptance. The existing
+  nonthrowing `Broadcaster.submit` reports a refused admission as `.unreachable` and retains the
+  created transaction's intended retry endpoints without recreating plans after a wipe.
+- An idle Tor enable keeps its completed ticket result while a later normal sync start publishes
+  fresh pending, ready or failed state for the native owner it now requires.
+- Wallet and account provisioning now retain their admitted route through native restore-anchor
+  work, and new provisioning and server-selection probes cannot bypass a pending route fence.
+- Explicit Tor choices have a 30-second acquisition budget, including host guard waiting, followed
+  by a shared 60-second startup budget after safe stop. Stop, wipe, prepare and endpoint replacement
+  invalidate pending choices. Superseded diagnostic sessions are cancelled; create a new health
+  session after the replacement binding becomes ready.
+
+
+- Cold `TorClient` startup now leaves the actor responsive and cancels native bootstrap when
+  its final waiting caller cancels or the client closes. Standalone cold startup uses a 60-second
+  deadline including worker waiting, and late results cannot restore a closed client. Prepared isolated clients
+  remain usable after the base client closes.
 
 - Migration OHTTP key preparation failures are included in `OHTTPHealthContext.complete`
   evidence for the selected failed attempt, for direct and Tor routes. Transaction results,
@@ -134,6 +189,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client's own and goes through (the gateway replaces only the placeholder publishable key).
 
 ## Changed
+
+- `TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,
+  `sleep` and `wake` are explicitly asynchronous so a cold client can await bounded Tor startup.
+  Existing external actor calls using `await` need no edits; synchronous actor-isolated callers
+  must now await them.
 
 - Sapling parameter files are now verified with SHA-256 instead of SHA-1.
 

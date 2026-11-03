@@ -445,7 +445,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
             freeRuntime: { pointer in
                 runtimes.free(pointer)
             },
-            createRuntime: { path, _ in
+            startup: TorRuntimeStartupNative.fixture { path, _ in
                 state.withLock { $0.runtimeCreations += 1 }
                 XCTAssertEqual(path, torDirectory.path)
                 return runtimes.parent
