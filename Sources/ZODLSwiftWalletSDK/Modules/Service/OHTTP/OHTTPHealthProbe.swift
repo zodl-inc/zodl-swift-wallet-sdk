@@ -150,6 +150,7 @@ enum OHTTPHealthProbe {
 final class OHTTPHealthProbeBudget: Sendable {
     let deadline: UInt64
     private let nativeDeadline: Bool
+    private let now: @Sendable () -> UInt64
     private struct State {
         var admitted = false
         var stop: OHTTPHealthOutcome?
@@ -161,9 +162,14 @@ final class OHTTPHealthProbeBudget: Sendable {
     }
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    init(milliseconds: UInt64, nativeDeadline: Bool = false) {
+    init(
+        milliseconds: UInt64,
+        nativeDeadline: Bool = false,
+        now: @escaping @Sendable () -> UInt64 = { OHTTPHealthClock.nowNanoseconds }
+    ) {
         self.nativeDeadline = nativeDeadline
-        let now = OHTTPHealthClock.nowNanoseconds
+        self.now = now
+        let now = now()
         let duration = milliseconds.multipliedReportingOverflow(by: 1_000_000)
         let sum = now.addingReportingOverflow(duration.partialValue)
         deadline = duration.overflow || sum.overflow ? UInt64.max : sum.partialValue
@@ -171,7 +177,7 @@ final class OHTTPHealthProbeBudget: Sendable {
 
     func remainingMilliseconds() throws -> UInt64 {
         try check()
-        let now = OHTTPHealthClock.nowNanoseconds
+        let now = now()
         let remaining = deadline > now ? (deadline - now) / 1_000_000 : 0
         guard remaining > 0 else { throw URLError(.timedOut) }
         return remaining
@@ -179,7 +185,7 @@ final class OHTTPHealthProbeBudget: Sendable {
 
     func check() throws {
         try Task.checkCancellation()
-        guard OHTTPHealthClock.nowNanoseconds < deadline else { throw URLError(.timedOut) }
+        guard now() < deadline else { throw URLError(.timedOut) }
         if state.withLock({ $0.stop != nil }) { throw CancellationError() }
     }
 
@@ -218,7 +224,7 @@ final class OHTTPHealthProbeBudget: Sendable {
                 install(task, timer: false)
                 let timer = Task {
                     do {
-                        let now = OHTTPHealthClock.nowNanoseconds
+                        let now = now()
                         if deadline > now { try await Task.sleep(nanoseconds: deadline - now) }
                         try Task.checkCancellation()
                         stop(.transportUnavailable)

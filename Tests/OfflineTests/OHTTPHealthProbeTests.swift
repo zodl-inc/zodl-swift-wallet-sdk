@@ -336,14 +336,57 @@ final class OHTTPHealthProbeTests: XCTestCase {
         )
     }
 
-    func testBudgetDoesNotResetBetweenKeyAndPost() async throws {
-        let budget = OHTTPHealthProbeBudget(milliseconds: 50)
-        let first = try budget.remainingMilliseconds()
-        try await Task.sleep(nanoseconds: 20_000_000)
-        let second = try budget.remainingMilliseconds()
-        XCTAssertLessThan(second, first)
-        try await Task.sleep(nanoseconds: 40_000_000)
-        XCTAssertThrowsError(try budget.remainingMilliseconds())
+    func testBudgetDoesNotResetBetweenKeyAndPost() throws {
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let budget = OHTTPHealthProbeBudget(milliseconds: 50, now: { clock.withLock { $0 } })
+        XCTAssertEqual(budget.deadline, 1_050_000_000)
+        XCTAssertEqual(try budget.remainingMilliseconds(), 50)
+        clock.withLock { $0 = 1_020_000_000 }
+        XCTAssertEqual(try budget.remainingMilliseconds(), 30)
+        try budget.admit()
+        XCTAssertEqual(budget.deadline, 1_050_000_000)
+        clock.withLock { $0 = 1_050_000_000 }
+        XCTAssertThrowsError(try budget.remainingMilliseconds()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+    }
+
+    func testBudgetPreservesMillisecondAndExpiryBoundaries() throws {
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let budget = OHTTPHealthProbeBudget(milliseconds: 50, now: { clock.withLock { $0 } })
+        clock.withLock { $0 = 1_049_000_000 }
+        XCTAssertEqual(try budget.remainingMilliseconds(), 1)
+        clock.withLock { $0 = 1_049_500_000 }
+        XCTAssertNoThrow(try budget.check())
+        XCTAssertThrowsError(try budget.remainingMilliseconds()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        clock.withLock { $0 = 1_050_000_000 }
+        XCTAssertThrowsError(try budget.check()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertThrowsError(try budget.remainingMilliseconds()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+    }
+
+    func testBudgetPreservesZeroAndOverflowDeadlines() throws {
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let zero = OHTTPHealthProbeBudget(milliseconds: 0, now: { clock.withLock { $0 } })
+        XCTAssertEqual(zero.deadline, 1_000_000_000)
+        XCTAssertThrowsError(try zero.check()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertThrowsError(try zero.remainingMilliseconds()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        let durationOverflow = OHTTPHealthProbeBudget(milliseconds: UInt64.max, now: { clock.withLock { $0 } })
+        XCTAssertEqual(durationOverflow.deadline, UInt64.max)
+        XCTAssertNoThrow(try durationOverflow.check())
+        clock.withLock { $0 = UInt64.max - 500_000 }
+        let additionOverflow = OHTTPHealthProbeBudget(milliseconds: 1, now: { clock.withLock { $0 } })
+        XCTAssertEqual(additionOverflow.deadline, UInt64.max)
+        XCTAssertNoThrow(try additionOverflow.check())
     }
 
     func testDiagnosticPauseIsPinnedToOnlyItsSession() async throws {
