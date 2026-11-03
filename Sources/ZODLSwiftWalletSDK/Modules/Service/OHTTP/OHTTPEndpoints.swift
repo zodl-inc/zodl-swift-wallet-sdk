@@ -19,6 +19,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 public enum OHTTPEndpoints {
     /// Optional client trace ID prefix for debug end-to-end tracking. When set, every outer OHTTP POST
@@ -267,10 +268,16 @@ public enum OHTTPEndpoints {
     /// The relay hosts run by a party independent of the gateway operator: the production relays. Any
     /// other relay (a build pointed at the relay simulator) is run by the gateway operator, which then
     /// sees both the device address and the request, so it is not private.
-    static let independentRelayHosts: Set<String> = [
-        "mainnet-relay.example.invalid",
-        "testnet-relay.example.invalid"
+    static let independentRelayHostFingerprints: Set<String> = [
+        "f3aec311b948b8d86d88a0ffdfaf23c6a35ddc2c26beb410fe919dfc2eb69c87",
+        "54d9951ab67cea3f069555738dfce2722218bdd5501e4b6c1f4ad9ad3ff732c7"
     ]
+
+    /// Match exact normalized hosts without publishing relay endpoint defaults.
+    static func isIndependentRelayHost(_ host: String, fingerprints: Set<String>) -> Bool {
+        let fingerprint = SHA256.hash(data: Data(host.lowercased().utf8)).map { String(format: "%02x", $0) }.joined()
+        return fingerprints.contains(fingerprint)
+    }
 
     /// Whether requests to the gateway `gatewayHost` go through a relay that is not independent of the
     /// gateway operator (a test relay): such a configuration gives no network privacy and is shown to the
@@ -280,7 +287,7 @@ public enum OHTTPEndpoints {
               let relayHost = URL(string: relay)?.host?.lowercased() else {
             return true
         }
-        return !independentRelayHosts.contains(relayHost)
+        return !isIndependentRelayHost(relayHost, fingerprints: independentRelayHostFingerprints)
     }
 
     /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.

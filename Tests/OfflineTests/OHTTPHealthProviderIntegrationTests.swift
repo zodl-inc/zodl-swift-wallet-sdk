@@ -43,6 +43,8 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
     }
 
     func testBothProvidersValidateFactoriesAndSelectedTorBeforeDispatch() async throws {
+        let relay = try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example"))
+        let signedConfigURL = try OHTTPNative.signedConfigURL(relayURL: relay)
         for slipstream in [false, true] {
             let calls = OSAllocatedUnfairLock(initialState: [String]())
             let runtimes = TorTestRuntimes()
@@ -60,7 +62,7 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
                 calls.withLock { $0.append("get") }
                 XCTAssertTrue(runtimes.isAlive(pointer))
                 XCTAssertNotEqual(pointer, runtimes.parent)
-                XCTAssertEqual(String(cString: url!), "https://testnet-relay.example.invalid/ohttp-configs/signed")
+                XCTAssertEqual(String(cString: url!), signedConfigURL)
                 XCTAssertEqual(retries, 0)
                 XCTAssertGreaterThan(timeout, 0)
                 XCTAssertLessThanOrEqual(timeout, 20_000)

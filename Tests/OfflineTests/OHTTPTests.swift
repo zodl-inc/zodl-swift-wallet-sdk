@@ -33,34 +33,30 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testOHTTPEndpointsRelayMapping() throws {
-        // Relay URLs come from zodl-ohttp-client (native lib) and can be overridden at build time
-        // via ZODL_OHTTP_RELAY_URL_MAINNET / ZODL_OHTTP_RELAY_URL_TESTNET. These assertions verify
-        // the default URLs (Fastly production hostnames).
+        // Relay routing must use the native build configuration for the selected network.
         let relay1 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(relay1, "https://testnet-relay.example.invalid/relay")
+        XCTAssertEqual(relay1, try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example")))
 
         let relay2 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway.example")
-        XCTAssertEqual(relay2, "https://mainnet-relay.example.invalid/relay")
+        XCTAssertEqual(relay2, try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway.example")))
 
         XCTAssertThrowsError(try OHTTPEndpoints.relayURL(for: "unknown.zodl.com"))
     }
 
     func testTheSignedKeyConfigurationURLFollowsTheRelay() throws {
-        // The alias hosts ride the mainnet relay; the signed key configuration is fetched next to it.
+        // The alias hosts ride the configured mainnet relay.
+        let mainnetRelay = try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway.example"))
         for host in ["ohttp-gateway.example", "cmc.zodl.com", "near.zodl.com", "vote.zodl.com"] {
             let relay = try OHTTPEndpoints.relayURL(for: host)
-            XCTAssertEqual(relay, "https://mainnet-relay.example.invalid/relay", host)
+            XCTAssertEqual(relay, mainnetRelay, host)
+        }
+        // Synthetic inputs pin the native signed-key path independently of build configuration.
+        for network in ["mainnet", "testnet"] {
             XCTAssertEqual(
-                try OHTTPNative.signedConfigURL(relayURL: relay),
-                "https://mainnet-relay.example.invalid/ohttp-configs/signed",
-                host
+                try OHTTPNative.signedConfigURL(relayURL: "https://\(network)-relay.example.invalid/relay"),
+                "https://\(network)-relay.example.invalid/ohttp-configs/signed"
             )
         }
-        let testnetRelay = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(
-            try OHTTPNative.signedConfigURL(relayURL: testnetRelay),
-            "https://testnet-relay.example.invalid/ohttp-configs/signed"
-        )
     }
 
     // MARK: Finding D - GitHub voting config path routing
@@ -82,7 +78,7 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNoThrow(try OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com"),
                          "relayURL should accept raw.githubusercontent.com")
         let relay = try? OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com")
-        XCTAssertEqual(relay, "https://mainnet-relay.example.invalid/relay",
+        XCTAssertEqual(relay, OHTTPNative.relayURL(for: "ohttp-gateway.example"),
                        "raw.githubusercontent.com should use mainnet relay")
 
         // A routable third-party URL, never a gateway (cannot become a lightwalletd endpoint)
