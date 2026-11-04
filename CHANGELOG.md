@@ -53,6 +53,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native source-build wrappers reject malformed OHTTP gateway/DNS names and relay URL schemes
   before starting Cargo, without including configured values in validation errors. No call-site changes are required.
 
+- `SlipstreamSynchronizer.prepare` throws the `Initializer`'s URL parsing error (`urlsParsingError`)
+  before preparing, as `SDKSynchronizer.prepare` does.
+
 - Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
   the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
   gateways from the other wallet network remain rejected. No call-site changes are required.

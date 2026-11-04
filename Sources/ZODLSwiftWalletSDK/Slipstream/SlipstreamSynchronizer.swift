@@ -525,6 +525,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
+        // Parity with `SDKSynchronizer.prepare`: an Initializer whose storage URLs were refused cannot
+        // be prepared.
+        if let initialisationError = initializer.urlsParsingError {
+            throw initialisationError
+        }
         torTransition.invalidate()
         torIntendedRunning = nil
         // Provisioning owns a route before capture, but releases it before entering the lifecycle
