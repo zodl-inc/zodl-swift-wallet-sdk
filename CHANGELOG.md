@@ -32,6 +32,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
   Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
 
+- OHTTP relay connections detect silent calls from received traffic and per-call stall limits
+  without HTTP/2 keep-alive PINGs, so slow or Tor connections are not retired for a late PING
+  response. A connection whose response body stays silent past its timeout is no longer reused.
+
 - `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
   `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
   are unchanged; actor-isolated callers must add `await`.
@@ -48,6 +52,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Native source-build wrappers reject malformed OHTTP gateway/DNS names and relay URL schemes
   before starting Cargo, without including configured values in validation errors. No call-site changes are required.
+
+- `SlipstreamSynchronizer.prepare` throws the `Initializer`'s URL parsing error (`urlsParsingError`)
+  before preparing, as `SDKSynchronizer.prepare` does.
 
 - Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
   the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
@@ -163,13 +170,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
   For custom regtest snapshots at height 11 or later, the registered activation schedule must
   select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
-
-- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
-  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
-  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
-  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
-  the flood was previously processed without limit. lightwalletd's block streams, which send one
-  small frame per compact block, stay within the limit. No caller changes are required.
 
 ## Added
 
@@ -300,6 +300,35 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
   responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
   no longer used. See PR #4 in zodl-inc/ohttp.
+
+# 7.0.1 - 2026-11-02
+
+## Fixed
+
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3532500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3537500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4550000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4570000.json
+````
 
 # 7.0.0 - 2026-10-27
 

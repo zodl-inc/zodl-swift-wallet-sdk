@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "7.0.0"
+version = "7.0.1"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -225,7 +225,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "60d69bfe143e08ebd53b60032356f89c9e88f9e3" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "1a0c5e4ed053480b5b7277c4031296e2e73eba3d" }
 
 # DO NOT ALTER THIS COMMENT
 #

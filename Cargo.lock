@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "7.0.0"
+version = "7.0.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8841,7 +8841,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream"
 version = "0.4.0"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=60d69bfe143e08ebd53b60032356f89c9e88f9e3#60d69bfe143e08ebd53b60032356f89c9e88f9e3"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=1a0c5e4ed053480b5b7277c4031296e2e73eba3d#1a0c5e4ed053480b5b7277c4031296e2e73eba3d"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8868,6 +8868,7 @@ dependencies = [
  "secrecy",
  "shardtree 0.8.0",
  "sinsemilla",
+ "socket2",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
@@ -8896,7 +8897,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=60d69bfe143e08ebd53b60032356f89c9e88f9e3#60d69bfe143e08ebd53b60032356f89c9e88f9e3"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=1a0c5e4ed053480b5b7277c4031296e2e73eba3d#1a0c5e4ed053480b5b7277c4031296e2e73eba3d"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",
