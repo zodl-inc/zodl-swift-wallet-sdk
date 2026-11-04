@@ -7,11 +7,17 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 MAINNET = 'ZODL_OHTTP_RELAY_URL_MAINNET'
 TESTNET = 'ZODL_OHTTP_RELAY_URL_TESTNET'
 NAMES = tuple('ZODL_OHTTP_' + suffix for suffix in ('GATEWAY_HOST_MAINNET', 'GATEWAY_HOST_TESTNET', 'RELAY_URL_MAINNET', 'RELAY_URL_TESTNET', 'SIGNING_PUBKEY_MAINNET', 'SIGNING_PUBKEY_TESTNET', 'KEYS_DNS_NAME_MAINNET', 'KEYS_DNS_NAME_TESTNET'))
+COMPILER_ENVIRONMENT_NAMES = (
+    'CARGO', 'RUSTC', 'CARGO_BUILD_RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+    'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+    'RUSTUP_TOOLCHAIN', 'RUSTUP_AUTO_INSTALL',
+)
 MAIN_URL = 'https://main.example.invalid/relay'
 TEST_URL = 'https://test.example.invalid/relay'
 VALUES = dict(zip(NAMES, ('main.example.invalid', 'test.example.invalid', MAIN_URL, TEST_URL, 'a'*64, 'b'*64, '_main.example.invalid', '_test.example.invalid')))
@@ -40,6 +46,11 @@ with open(os.environ['CAPTURE'], 'a') as output:
     output.write(json.dumps([sys.argv[1:], {key: os.environ.get(key) for key in os.environ if key.startswith('ZODL_OHTTP_')}])+'\\n')
 args=sys.argv[1:]
 root=pathlib.Path(os.environ['FIXTURE_ROOT'])
+with (root/'compiler-environment.jsonl').open('a') as output:
+    names = ('CARGO', 'RUSTC', 'CARGO_BUILD_RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+             'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+             'RUSTUP_TOOLCHAIN', 'RUSTUP_AUTO_INSTALL')
+    output.write(json.dumps({name: os.environ[name] for name in names if name in os.environ})+'\\n')
 for index, arg in enumerate(args):
     if arg == '--target':
         lib=root/'target'/args[index+1]/'release/libzcashlc.a'
@@ -63,8 +74,10 @@ else:
         startup = self.root / 'shell'
         startup.mkdir()
         (startup / '.zshenv').write_text('')
+        # Real CI compiler selection belongs to the parent build, not this fake repository.
         self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith('ZODL_OHTTP_') and key not in ('CI', 'GITHUB_ACTIONS', 'CARGO_HOME', 'RUSTUP_HOME', 'OHTTP_ENV_RESOLVED')}
+                    if not key.startswith('ZODL_OHTTP_') and key not in COMPILER_ENVIRONMENT_NAMES
+                    and key not in ('CI', 'GITHUB_ACTIONS', 'CARGO_HOME', 'RUSTUP_HOME', 'OHTTP_ENV_RESOLVED')}
         gh = tools / 'gh'
         gh.write_text('''#!/usr/bin/env python3
 import json,os,pathlib,sys
@@ -109,6 +122,35 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
         self.assertEqual([call[2] for call in lookups], list(NAMES))
         self.assertTrue(all(call[3:] == ['--repo', 'zodl-inc/zodl-swift-wallet-sdk-private', '--json', 'name,value'] for call in lookups))
         return calls
+
+    def test_ci_compiler_overrides_cannot_escape_fixture_tools(self):
+        marker = self.root / 'escaped-compiler'
+        sentinel = self.root / 'ci-compiler'
+        sentinel.write_text(
+            '#!/usr/bin/env python3\n'
+            'from pathlib import Path\n'
+            f'Path({str(marker)!r}).write_text("unexpected compiler invocation")\n'
+            'raise SystemExit(97)\n'
+        )
+        sentinel.chmod(0o755)
+        overrides = {
+            'CARGO': str(sentinel), 'RUSTC': str(sentinel), 'CARGO_BUILD_RUSTC': str(sentinel),
+            'RUSTC_WRAPPER': str(sentinel), 'RUSTC_WORKSPACE_WRAPPER': str(sentinel),
+            'CARGO_BUILD_RUSTC_WRAPPER': str(sentinel), 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER': str(sentinel),
+            'RUSTUP_TOOLCHAIN': 'ci-selected-toolchain', 'RUSTUP_AUTO_INSTALL': '0',
+        }
+        with mock.patch.dict(os.environ, dict(overrides, CI='1', GITHUB_ACTIONS='true', OHTTP_ENV_RESOLVED='1')):
+            fixture = NativeRelayEnvironmentTests(methodName='test_root_native_cargo_commands_receive_local_exports')
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+            fixture.run_native(['make', 'build-rust'])
+            self.assertEqual(
+                [json.loads(line) for line in (fixture.root / 'compiler-environment.jsonl').read_text().splitlines()],
+                [{}],
+            )
+            self.assertFalse(marker.exists(), 'Inherited compiler selection bypassed the fixture tool boundary')
+            for name, value in overrides.items():
+                self.assertEqual(os.environ[name], value, name)
 
     def test_init_arm_subsets_receive_local_exports(self):
         for flag, targets in (('--arm-macos', ['aarch64-apple-darwin']),
