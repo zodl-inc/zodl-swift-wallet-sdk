@@ -303,7 +303,8 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
             self.run_native(command, cwd=outside)
 
     def test_source_make_dry_runs_never_resolve_or_fetch(self):
-        for command in (['make', '-n', 'ffi-ci'], ['make', '-n', '-C', 'BuildSupport', 'xcframework']):
+        for command in (['make', '-n', 'ffi-ci'], ['make', '-n', '-C', 'BuildSupport', 'xcframework'],
+                        ['make', '-n', '-C', 'BuildSupport', 'release']):
             result = subprocess.run(command, cwd=self.root, env=dict(self.env, CI='1'), capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('cargo build', result.stdout)

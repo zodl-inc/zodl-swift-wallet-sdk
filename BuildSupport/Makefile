@@ -53,11 +53,14 @@ install:
 # Direct BuildSupport entrypoints need the same one-resolution boundary.
 # A dry run prints the complete graph without resolving any configuration.
 ifneq ($(OHTTP_BUILD_READY),)
-release:
-	python3 ../Scripts/lib/ohttp_env.py --required
+# Keep validation out of the recursive recipe: make -n executes that recipe.
+release: validate-release-environment
 	$(MAKE) clean
-	$(MAKE) xcframework
-.PHONY: release
+	$(MAKE) xcframework OHTTP_ENV_RESOLVED=1
+.PHONY: release validate-release-environment
+
+validate-release-environment:
+	python3 ../Scripts/lib/ohttp_env.py --required
 
 # Discard assembled build products. ../target is deliberately preserved so that
 # cargo's fingerprints (and CI's restored Rust cache) still apply; cargo decides
