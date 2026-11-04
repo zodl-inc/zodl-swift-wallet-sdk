@@ -64,14 +64,16 @@ Every SDK native source build requires these eight nonempty exported values:
 - `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
 - `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
 
-The gateway hosts must differ ignoring ASCII case. Gateway hosts and key DNS
+Every corresponding mainnet/testnet pair must differ ignoring ASCII case: gateway
+hosts, relay URLs, signing public keys and key DNS names. Gateway hosts and key DNS
 names must be bare ASCII DNS names: at most 253 characters total, with nonempty
 dot-separated labels of at most 63 letters, digits or hyphens, and no leading or
 trailing label hyphen. Source-build wrappers reject schemes, ports, paths,
 trailing dots and underscores before Cargo starts, with variable-name-only
 diagnostics. Relay URLs must start with literal lowercase `https://` and be valid
 HTTPS URLs. The native OHTTP library remains authoritative for
-configuration formats, including public keys. There is exactly one configured
+configuration formats. Signing public keys must contain exactly 64 ASCII hex digits;
+source-build wrappers validate this before starting Cargo. There is exactly one configured
 SDK product.
 
 Export all eight values in the environment that launches a local source build.
@@ -88,9 +90,12 @@ cache identities include a digest of all eight exact values.
 `python3 Scripts/lib/ohttp_env.py --hash` prints that validated versioned digest,
 and `--required -- COMMAND ARG...` runs a child with the validated inherited
 environment. The helper also supports the system Python used by Xcode build
-phases. Direct Cargo compilation enforces the same required-input and
-distinct-gateway invariants. Relay URLs, signing public keys and key DNS names
-may be shared between networks.
+phases. The child environment always sets `ZODL_OHTTP_REQUIRE=1`, overriding
+an inherited `0`; all four native CI workflows also set it as build policy.
+This flag is not a ninth secret and is excluded from the configuration digest.
+All eight values retain their exact bytes, including their case. Direct Cargo
+compilation enforces required inputs and distinct values for all four network
+pairs through the SDK build guard and the native core.
 
 A precompiled SDK retains its compiled configuration. Consuming it and running
 `init-local-ffi.sh --cached` require no OHTTP configuration. Rebuild native source

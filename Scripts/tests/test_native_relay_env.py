@@ -113,12 +113,12 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
     def run_native(self, command, cwd=None):
         (self.root / 'values.json').write_text(json.dumps(VALUES))
         (self.root / 'gh.jsonl').unlink(missing_ok=True)
-        result = subprocess.run(command, cwd=cwd or self.root, env=dict(self.env, **VALUES), text=True, capture_output=True, timeout=30)
+        result = subprocess.run(command, cwd=cwd or self.root, env=dict(self.env, **VALUES, ZODL_OHTTP_REQUIRE='0'), text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = [json.loads(line) for line in (self.root / 'cargo.jsonl').read_text().splitlines()]
         self.assertTrue(calls)
         for argv, values in calls:
-            self.assertEqual(values, VALUES)
+            self.assertEqual(values, dict(VALUES, ZODL_OHTTP_REQUIRE='1'))
             self.assertNotIn(MAIN_URL, argv)
             self.assertNotIn(TEST_URL, argv)
         self.assertFalse((self.root / 'gh.jsonl').exists(), 'GitHub configuration lookup executed')
@@ -143,6 +143,27 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn(name, result.stderr)
                         self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_invalid_configuration_preserves_products_and_prevents_native_or_cache_reuse(self):
+        product = self.root / 'BuildSupport/products/macos/keep'
+        invalid = []
+        for first, second in zip(NAMES[::2], NAMES[1::2]):
+            for case_only in (False, True):
+                value = VALUES[first]
+                duplicate = (value[:8] + value[8:].upper() if 'RELAY_URL' in first else value.upper()) if case_only else value
+                invalid.append(dict(VALUES, **{second: duplicate}))
+        invalid.append(dict(VALUES, **{NAMES[4]: 'g' * 64}))
+        for values in invalid:
+            for command in (['make', 'ffi-ci'], ['bash', 'Scripts/init-local-ffi.sh', '--arm-macos']):
+                with self.subTest(command=command, values=list(values)):
+                    product.parent.mkdir(parents=True, exist_ok=True)
+                    product.write_text('existing product')
+                    result = subprocess.run(command, cwd=self.root, env=dict(self.env, **values),
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(product.read_text(), 'existing product')
+                    self.assertFalse((self.root / 'cargo.jsonl').exists())
+                    self.assertNotIn(MAIN_URL, result.stdout + result.stderr)
 
     def test_ci_compiler_overrides_cannot_escape_fixture_tools(self):
         marker = self.root / 'escaped-compiler'
@@ -289,9 +310,9 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
                 self.run_native(['make', target])
                 swift_calls = [json.loads(line) for line in (self.root / 'swift.jsonl').read_text().splitlines()]
                 self.assertTrue(swift_calls)
-                self.assertTrue(all(values == VALUES for values in swift_calls))
+                self.assertTrue(all(values == dict(VALUES, ZODL_OHTTP_REQUIRE='1') for values in swift_calls))
                 if target in ('check-all', 'check'):
-                    self.assertEqual([json.loads(line) for line in (self.root / 'suite.jsonl').read_text().splitlines()], [VALUES])
+                    self.assertEqual([json.loads(line) for line in (self.root / 'suite.jsonl').read_text().splitlines()], [dict(VALUES, ZODL_OHTTP_REQUIRE='1')])
 
     def test_relative_script_paths_work_from_another_directory(self):
         outside = self.root / 'outside'
@@ -316,7 +337,7 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
         (self.root / 'Cargo.toml').write_text('[package]\nversion = "7.0.0"\n')
         self.run_native(['bash', 'Scripts/prepare-release.sh', 'artifacts', '7.0.0'])
         swift_calls = [json.loads(line) for line in (self.root / 'swift.jsonl').read_text().splitlines()]
-        self.assertEqual(swift_calls, [VALUES, VALUES])
+        self.assertEqual(swift_calls, [dict(VALUES, ZODL_OHTTP_REQUIRE='1')] * 2)
         self.assertTrue((self.root / 'BuildSupport/products/release.env').exists())
 
     def test_offline_test_helper_requires_a_complete_resolved_environment(self):

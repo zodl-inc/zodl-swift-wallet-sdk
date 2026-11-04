@@ -1,5 +1,22 @@
 # Migrating from previous versions to _Unreleased_
 
+## Native OHTTP source-build configuration
+
+Previously, mainnet and testnet could share relay URLs, signing keys and key DNS names.
+Native SDK source builds now require all eight exported `ZODL_OHTTP_*` inputs and reject
+sharing in any corresponding gateway host, relay URL, signing key or key DNS name pair,
+including differences consisting only of ASCII letter case. Replace each shared pair with
+separate mainnet/testnet configuration before rebuilding. Each signing public key must be
+exactly 64 ASCII hex digits. Missing, empty or malformed inputs fail before native compilation
+or configured cache reuse, with variable names rather than values in the error.
+
+The build child sets `ZODL_OHTTP_REQUIRE=1`, even when the inherited value is `0`.
+This is build policy, not a ninth secret or a configuration-digest input. Keep exporting the
+same eight names listed in `docs/LOCAL_DEVELOPMENT.md`; their spelling and exact bytes are
+preserved in the compiled configuration and versioned digest. Rebuild native source after
+changing configuration. Consuming a precompiled SDK or running `init-local-ffi.sh --cached`
+requires no new environment variables or Swift call-site edits.
+
 ## Slipstream Tor choices and engine calls
 
 `tor(enabled:)` remains the standalone async convenience. Hosts with a transaction guard may

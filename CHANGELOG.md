@@ -26,6 +26,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- Native SDK source builds reject shared mainnet/testnet gateway hosts, relay URLs, signing
+  keys or key DNS names, including case-only differences. Export all eight inputs with distinct
+  values for each corresponding network pair and 64 ASCII hex digits per signing key. Build
+  wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
+  Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
+
 - `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
   `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
   are unchanged; actor-isolated callers must add `await`.

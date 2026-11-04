@@ -548,6 +548,7 @@ test_configured_native_workflows_use_required_actions_secrets_before_cache() {
               job = YAML.load_file(ARGV[0]).fetch("jobs").fetch(ARGV[1])
               names = %w[GATEWAY_HOST_MAINNET GATEWAY_HOST_TESTNET RELAY_URL_MAINNET RELAY_URL_TESTNET SIGNING_PUBKEY_MAINNET SIGNING_PUBKEY_TESTNET KEYS_DNS_NAME_MAINNET KEYS_DNS_NAME_TESTNET].map { |n| "ZODL_OHTTP_" + n }
               names.each { |n| abort "missing Actions secret #{n}" unless job.fetch("env", {})[n] == "${{ secrets.#{n} }}" }
+              abort "native CI must require strict OHTTP" unless job.fetch("env", {})["ZODL_OHTTP_REQUIRE"] == "1"
               steps = job.fetch("steps")
               abort "AWS OHTTP fetch remains" if steps.any? { |s| s.fetch("uses", "").include?("aws-secrets") }
               index = steps.index { |s| s["id"] == "ohttp-config" && s.fetch("run", "").include?("ohttp_env.py --hash") }

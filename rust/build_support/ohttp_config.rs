@@ -18,8 +18,14 @@ pub fn validate(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<(), St
             .ok_or_else(|| format!("{name} is required"))?;
         values.push(value);
     }
-    if values[0].eq_ignore_ascii_case(&values[1]) {
-        return Err(format!("{} and {} must differ", NAMES[0], NAMES[1]));
+    for first in (0..NAMES.len()).step_by(2) {
+        if values[first].eq_ignore_ascii_case(&values[first + 1]) {
+            return Err(format!(
+                "{} and {} must differ",
+                NAMES[first],
+                NAMES[first + 1]
+            ));
+        }
     }
     Ok(())
 }
@@ -56,19 +62,24 @@ mod tests {
     }
 
     #[test]
-    fn gateway_identities_must_differ_ignoring_ascii_case() {
-        let error = validate(|name| {
-            if name == NAMES[0] {
-                Some("Main.example.invalid".to_string())
-            } else if name == NAMES[1] {
-                Some("MAIN.EXAMPLE.INVALID".to_string())
-            } else {
-                configured(name)
+    fn each_network_pair_must_differ_ignoring_ascii_case() {
+        for first in (0..NAMES.len()).step_by(2) {
+            for duplicate in ["Private.Example.Invalid", "PRIVATE.EXAMPLE.INVALID"] {
+                let error = validate(|name| {
+                    if name == NAMES[first] {
+                        Some("Private.Example.Invalid".to_string())
+                    } else if name == NAMES[first + 1] {
+                        Some(duplicate.to_string())
+                    } else {
+                        configured(name)
+                    }
+                })
+                .unwrap_err();
+                assert!(error.contains(NAMES[first]));
+                assert!(error.contains(NAMES[first + 1]));
+                assert!(!error.contains("Example.Invalid"));
+                assert!(!error.contains("EXAMPLE.INVALID"));
             }
-        })
-        .unwrap_err();
-        assert!(error.contains("GATEWAY_HOST_MAINNET"));
-        assert!(error.contains("GATEWAY_HOST_TESTNET"));
-        assert!(!error.contains("example.invalid"));
+        }
     }
 }

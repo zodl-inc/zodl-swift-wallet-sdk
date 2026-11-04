@@ -40,7 +40,7 @@ class RelayEnvironmentTests(unittest.TestCase):
                 patch.object(subprocess, 'run', side_effect=AssertionError('GitHub started')):
             resolved = self.resolve(inherited)
         self.assertEqual(self.runner.OHTTP_NAMES, NAMES)
-        self.assertEqual(resolved, inherited)
+        self.assertEqual(resolved, dict(inherited, ZODL_OHTTP_REQUIRE='1'))
         self.assertIsNot(resolved, inherited)
         resolved['OTHER'] = 'changed'
         self.assertEqual(inherited['OTHER'], 'preserved')
@@ -60,11 +60,53 @@ class RelayEnvironmentTests(unittest.TestCase):
                             self.assertRaisesRegex(ValueError, name):
                         self.resolve(values)
 
-    def test_shared_relay_key_and_dns_values_are_accepted_unchanged(self):
-        values = dict(VALUES)
-        for first, second in ((NAMES[2], NAMES[3]), (NAMES[4], NAMES[5]), (NAMES[6], NAMES[7])):
-            values[second] = values[first]
-        self.assertEqual(self.resolve(values), values)
+    def test_each_network_pair_must_differ_even_with_only_ascii_case_changes(self):
+        for first, second in zip(NAMES[::2], NAMES[1::2]):
+            for case_only in (False, True):
+                values = dict(VALUES)
+                value = values[first]
+                values[second] = (value[:8] + value[8:].upper() if 'RELAY_URL' in first else value.upper()) if case_only else value
+                for operation in (self.resolve, self.runner.configuration_hash):
+                    with self.subTest(first=first, case_only=case_only, operation=operation.__name__):
+                        with self.assertRaises(ValueError) as error:
+                            operation(values)
+                        self.assertIn(first, str(error.exception))
+                        self.assertIn(second, str(error.exception))
+                        self.assertNotIn(value, str(error.exception))
+
+    def test_signing_keys_require_exactly_64_ascii_hex_digits(self):
+        for name in NAMES[4:6]:
+            for value in ('g' * 64, 'a' * 63, 'a' * 65, 'a' * 63 + 'é', 'Ａ' * 64):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError) as error:
+                        self.resolve(dict(VALUES, **{name: value}))
+                    self.assertIn(name, str(error.exception))
+                    self.assertNotIn(value, str(error.exception))
+
+    def test_strict_child_policy_does_not_mutate_inputs_or_enter_the_digest(self):
+        for require in ('0', '1', 'invalid'):
+            inherited = dict(VALUES, ZODL_OHTTP_REQUIRE=require)
+            original = dict(inherited)
+            self.assertIsNone(self.runner.validate_configuration(inherited))
+            self.assertEqual(self.resolve(inherited), dict(original, ZODL_OHTTP_REQUIRE='1'))
+            self.assertEqual(self.runner.configuration_hash(inherited), 'a2bddd883cc977a28d0a01647b082acb5a15c3add9773f9e3330e0d5f9f17241')
+            self.assertEqual(inherited, original)
+
+    def test_invalid_configuration_never_executes_child_or_produces_cache_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'child-started'
+            invalid = []
+            for first, second in zip(NAMES[::2], NAMES[1::2]):
+                invalid.append(dict(VALUES, **{second: VALUES[first]}))
+            invalid.append(dict(VALUES, **{NAMES[4]: 'g' * 64}))
+            for values in invalid:
+                with self.subTest(values=list(values)):
+                    result = self.cli(['--', sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()'], values)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists())
+                    result = self.cli([], values, mode='--hash')
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, '')
 
     def test_missing_inputs_never_execute_filling_zshrc_or_gh_fixture(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,7 +171,7 @@ class RelayEnvironmentTests(unittest.TestCase):
             for value in valid:
                 with self.subTest(name=name, value=value):
                     environment = dict(VALUES, CI='1', **{name: value})
-                    self.assertEqual(environment, self.resolve(environment))
+                    self.assertEqual(dict(environment, ZODL_OHTTP_REQUIRE='1'), self.resolve(environment))
 
     def test_duplicate_gateway_rejected_ignoring_ascii_case(self):
         values = dict(VALUES)
@@ -151,7 +193,7 @@ class RelayEnvironmentTests(unittest.TestCase):
         self.assertEqual(self.runner.configuration_hash(dict(reversed(list(VALUES.items())), OTHER='ignored')), expected)
         for name in NAMES:
             changed = dict(VALUES)
-            changed[name] += '/change' if 'RELAY_URL' in name else 'x'
+            changed[name] = 'c' * 64 if 'SIGNING_PUBKEY' in name else changed[name] + ('/change' if 'RELAY_URL' in name else 'x')
             self.assertNotEqual(self.runner.configuration_hash(changed), expected)
         self.assertEqual(self.cli([], dict(VALUES, CI='1'), mode='--hash').stdout, expected + '\n')
 
@@ -184,7 +226,7 @@ class RelayEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / 'executed'
             value = f'https://main.example.invalid/$(touch${{IFS}}{marker});literal'
-            inherited = dict(VALUES, CI='1', OTHER='kept')
+            inherited = dict(VALUES, CI='1', OTHER='kept', ZODL_OHTTP_REQUIRE='0')
             inherited[MAINNET] = value
             code = 'import json,os,sys; print(json.dumps([dict(os.environ),sys.argv[1:]])); sys.exit(23)'
             result = self.cli(['--', sys.executable, '-c', code, 'a b', '$(literal)'], inherited)
@@ -193,6 +235,7 @@ class RelayEnvironmentTests(unittest.TestCase):
             self.assertEqual(child[MAINNET], value)
             self.assertEqual(child[TESTNET], TEST_URL)
             self.assertEqual(child['OTHER'], 'kept')
+            self.assertEqual(child['ZODL_OHTTP_REQUIRE'], '1')
             self.assertEqual(argv, ['a b', '$(literal)'])
             self.assertFalse(marker.exists())
 

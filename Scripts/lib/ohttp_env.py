@@ -67,8 +67,13 @@ def validate_configuration(environ: dict[str, str]) -> None:
                 raise ValueError(f'{name} must be a bare DNS host name (no scheme, port, path or trailing dot)')
     # Match Rust's eq_ignore_ascii_case rather than Unicode case folding.
     ascii_lower = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
-    if environ[OHTTP_NAMES[0]].translate(ascii_lower) == environ[OHTTP_NAMES[1]].translate(ascii_lower):
-        raise ValueError('ZODL_OHTTP_GATEWAY_HOST_MAINNET and ZODL_OHTTP_GATEWAY_HOST_TESTNET must differ')
+    for first, second in zip(OHTTP_NAMES[::2], OHTTP_NAMES[1::2]):
+        if environ[first].translate(ascii_lower) == environ[second].translate(ascii_lower):
+            raise ValueError(f'{first} and {second} must differ')
+    for name in OHTTP_NAMES[4:6]:
+        value = environ[name]
+        if len(value) != 64 or any(character not in '0123456789abcdefABCDEF' for character in value):
+            raise ValueError(f'{name} must be a raw Ed25519 public key as 64 hex digits')
     for name in RELAY_NAMES:
         validate_relay_url(name, environ[name], required=True)
 
@@ -76,6 +81,8 @@ def validate_configuration(environ: dict[str, str]) -> None:
 def resolve_ohttp_environment(environ: dict[str, str]) -> dict[str, str]:
     child = dict(environ)
     validate_configuration(child)
+    # Build policy, independent of the eight exact configuration inputs and their digest.
+    child['ZODL_OHTTP_REQUIRE'] = '1'
     return child
 
 
