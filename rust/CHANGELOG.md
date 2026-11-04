@@ -6,7 +6,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated configured gateway host
+  (`false` mainnet, `true` testnet). Free each result with `zcashlc_string_free`.
+
 ### Fixed
+
+- `zcashlc_ohttp_encapsulate` lowercases ASCII authority letters before sealing a request,
+  preserving the port, method, scheme, path, query and body. Its signature is unchanged.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
+- OHTTP relay lookup, signed-key verification and DNS helpers recognize configured gateway hosts
+  ignoring ASCII case, and voting uses the configured gateway for its network. Unknown gateway
+  hosts remain errors for key and DNS operations. Existing function signatures are unchanged.
 
 - OHTTP decoding failures preserve authenticated canonical gRPC status from HTTP 200
   application/grpc heads and trailers, with trailers taking precedence. Metadata is isolated

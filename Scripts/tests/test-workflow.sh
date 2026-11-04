@@ -92,3 +92,14 @@ YAML
         "$(_run_script_interpolations "$f")" \
         "the scanner flags the run: splice and nothing else"
 }
+
+test_workflow_configuration_failure_stops_before_cache() {
+    local workflow job script
+    for workflow in swift codeql ohttp-e2e build-ffi; do
+        case "$workflow" in swift) job=build ;; codeql) job=analyze ;; ohttp-e2e) job=ffi ;; build-ffi) job=build-xcframework ;; esac
+        script="$SCRATCH/$workflow-config.sh"
+        ruby -ryaml -e 'puts YAML.load_file(ARGV[0]).fetch("jobs").fetch(ARGV[1]).fetch("steps").find { |s| s["id"] == "ohttp-config" }.fetch("run")' "$REPO_ROOT/.github/workflows/$workflow.yml" "$job" > "$script"
+        assert_fails "$workflow rejects missing configuration before cache lookup" \
+            env -i PATH="$PATH" CI=1 GITHUB_OUTPUT="$SCRATCH/config-output" bash -e "$script"
+    done
+}

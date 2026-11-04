@@ -5,7 +5,7 @@ import libzcashlc
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
-    private let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+    private let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
 
     private func route(viaTor: Bool) throws -> OHTTPHealthRoute {
         OHTTPHealthRoute(
@@ -43,7 +43,7 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
     }
 
     func testBothProvidersValidateFactoriesAndSelectedTorBeforeDispatch() async throws {
-        let relay = try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example"))
+        let relay = try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.testnetHost))
         let signedConfigURL = try OHTTPNative.signedConfigURL(relayURL: relay)
         for slipstream in [false, true] {
             let calls = OSAllocatedUnfairLock(initialState: [String]())

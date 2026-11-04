@@ -161,8 +161,8 @@ hex = "0.4"
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. b0b2087c: DNS fallback for signed key configuration.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "b0b2087c9d867115f38ddfbd6021988b64abf8f9", default-features = false }
+# fails loudly, a branch would follow a force-push. Both SDK and Slipstream share this source.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0324db3240adf00ea847aa0a93e8d765e32b61da", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -225,7 +225,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "86e9b4a6802074fdb7f6077595641fd76b22d6e3" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "60d69bfe143e08ebd53b60032356f89c9e88f9e3" }
 
 # DO NOT ALTER THIS COMMENT
 #

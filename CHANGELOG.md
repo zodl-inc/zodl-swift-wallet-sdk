@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `OHTTPEndpoints.gatewayHost(for:)` returns the gateway configured into the native SDK for the
+  selected network. Use it when constructing gateway endpoints instead of a fixed hostname.
+
 - `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
   with the default timing, send every transaction that was submitted but that no server has accepted yet
   through the given server, once and right away, and add that server at the end of each transaction's retry
@@ -23,11 +26,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- Native SDK source builds reject shared mainnet/testnet gateway hosts, relay URLs, signing
+  keys or key DNS names, including case-only differences. Export all eight inputs with distinct
+  values for each corresponding network pair and 64 ASCII hex digits per signing key. Build
+  wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
+  Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
+
 - `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
   `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
   are unchanged; actor-isolated callers must add `await`.
 
 ## Fixed
+
+- OHTTP requests lowercase ASCII letters in the wire authority while preserving its port and
+  the method, path, query and body. Mixed-case gateway hosts now reach the configured backend.
+  No call-site changes are required.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
+- Native source-build wrappers reject malformed OHTTP gateway/DNS names and relay URL schemes
+  before starting Cargo, without including configured values in validation errors. No call-site changes are required.
+
+- Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
+  the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
+  gateways from the other wallet network remain rejected. No call-site changes are required.
 
 - `SlipstreamSynchronizer.start(retry:)` revalidates retained Tor intent after a stopped or failed startup.
   Failed required restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint

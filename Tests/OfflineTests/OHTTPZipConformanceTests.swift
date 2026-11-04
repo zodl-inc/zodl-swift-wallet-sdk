@@ -21,7 +21,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
     private let request = OHTTPRequest(
         method: "POST",
         scheme: "https",
-        authority: "ohttp-gateway-testnet.example",
+        authority: OHTTPTestSupport.testnetHost,
         path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
         headers: [],
         body: Data([0x00])
@@ -88,7 +88,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
         for viaTor in [false, true, false, true] {
             let transport = OHTTPTransport(
-                gatewayHost: "ohttp-gateway-testnet.example",
+                gatewayHost: OHTTPTestSupport.testnetHost,
                 relayURL: "https://testnet-operator-relay.example.invalid/relay",
                 testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
                 viaTor: viaTor,
@@ -371,28 +371,28 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
     func testThirdPartyHostsUseTheGatewayOfTheWalletNetwork() throws {
         let testnet = try OHTTPEndpoints.proxyRoute(for: "vote.zodl.com", network: .testnet)
-        XCTAssertEqual(testnet.gatewayHost, "ohttp-gateway-testnet.example")
-        XCTAssertEqual(testnet.relayURL, OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example"))
+        XCTAssertEqual(testnet.gatewayHost, OHTTPTestSupport.testnetHost)
+        XCTAssertEqual(testnet.relayURL, OHTTPNative.relayURL(for: OHTTPTestSupport.testnetHost))
 
         let mainnet = try OHTTPEndpoints.proxyRoute(for: "cmc.zodl.com", network: .mainnet)
-        XCTAssertEqual(mainnet.gatewayHost, "ohttp-gateway.example")
+        XCTAssertEqual(mainnet.gatewayHost, OHTTPTestSupport.mainnetHost)
 
-        let gateway = try OHTTPEndpoints.proxyRoute(for: "ohttp-gateway-testnet.example", network: .testnet)
-        XCTAssertEqual(gateway.gatewayHost, "ohttp-gateway-testnet.example")
+        let gateway = try OHTTPEndpoints.proxyRoute(for: OHTTPTestSupport.testnetHost, network: .testnet)
+        XCTAssertEqual(gateway.gatewayHost, OHTTPTestSupport.testnetHost)
         XCTAssertThrowsError(
-            try OHTTPEndpoints.proxyRoute(for: "ohttp-gateway.example", network: .testnet),
+            try OHTTPEndpoints.proxyRoute(for: OHTTPTestSupport.mainnetHost, network: .testnet),
             "a testnet call never goes to the mainnet gateway"
         )
     }
 
     func testAGatewayOfTheOtherNetworkIsRefusedBeforeAnyRequest() async throws {
-        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway.example", network: .mainnet))
-        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway-testnet.example", network: .testnet))
+        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: OHTTPTestSupport.mainnetHost, network: .mainnet))
+        XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: OHTTPTestSupport.testnetHost, network: .testnet))
         XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: "lwd.example.com", network: .testnet))
-        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway.example", network: .testnet))
-        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: "ohttp-gateway-testnet.example", network: .mainnet))
+        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: OHTTPTestSupport.mainnetHost, network: .testnet))
+        XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: OHTTPTestSupport.testnetHost, network: .mainnet))
 
-        let endpoint = LightWalletEndpoint(address: "ohttp-gateway.example", port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.mainnetHost, port: 443, secure: true)
         let service = LightWalletOHTTPService(
             endpoint: endpoint,
             singleCallTimeout: 1000,
@@ -412,7 +412,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         // GetMempoolStream works over OHTTP using the streaming transport (ZIP #10, lines 149-153).
         // The gateway ends it with grpc-status: 0 after ~25s without messages, which the caller
         // treats as "poll again later", not an error (ZIP #10, lines 1294-1295).
-        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let service = LightWalletOHTTPService(endpoint: endpoint, tor: TorClient(torDir: FileManager.default.temporaryDirectory))
         service.walletNetwork = .testnet
         // S2: inject testClearnetSender so this offline test makes no real network call
@@ -431,7 +431,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
 
     func testMempoolStreamInTorModeUsesTorStreamSender() async throws {
         // S2: when Tor is in use, getMempoolStream must use the Tor circuit, not clearnet
-        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let runtimes = TorTestRuntimes()
         let state = TorRoutingState()
         let torDirectory = FileManager.default.temporaryDirectory
@@ -549,9 +549,20 @@ final class OHTTPZipConformanceTests: XCTestCase {
         }
     }
 
-    func testTheBuiltInRelaysAreIndependent() {
-        XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway.example"))
-        XCTAssertFalse(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "ohttp-gateway-testnet.example"))
+    func testConfiguredRelaysReportTheirOperatorIndependence() throws {
+        let independentFingerprints: Set<String> = [
+            "f3aec311b948b8d86d88a0ffdfaf23c6a35ddc2c26beb410fe919dfc2eb69c87",
+            "54d9951ab67cea3f069555738dfce2722218bdd5501e4b6c1f4ad9ad3ff732c7"
+        ]
+        for (gateway, name) in [
+            (OHTTPTestSupport.mainnetHost, "ZODL_OHTTP_RELAY_URL_MAINNET"),
+            (OHTTPTestSupport.testnetHost, "ZODL_OHTTP_RELAY_URL_TESTNET")
+        ] {
+            let url = try XCTUnwrap(URL(string: OHTTPTestSupport.configuredValue(name)))
+            let host = try XCTUnwrap(url.host).lowercased()
+            let fingerprint = SHA256.hash(data: Data(host.utf8)).map { String(format: "%02x", $0) }.joined()
+            XCTAssertEqual(OHTTPEndpoints.usesOperatorRelay(gatewayHost: gateway), !independentFingerprints.contains(fingerprint))
+        }
         XCTAssertTrue(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "lwd.example.com"))
     }
 
@@ -565,7 +576,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
             made.count += 1
             try await Task.sleep(nanoseconds: 100_000_000)
             let transport = OHTTPTestSupport.makeTransport { _, _ in throw OHTTPError.transportError("unused") }
-            return OHTTPGRPCClient(authority: "ohttp-gateway-testnet.example", transport: transport, singleCallTimeoutMS: 1000, streamingCallTimeoutMS: 1000)
+            return OHTTPGRPCClient(authority: OHTTPTestSupport.testnetHost, transport: transport, singleCallTimeoutMS: 1000, streamingCallTimeoutMS: 1000)
         }
 
         let clients = try await withThrowingTaskGroup(of: OHTTPGRPCClient.self) { group in
@@ -837,7 +848,7 @@ final class OHTTPZipConformanceTests: XCTestCase {
         headers: [(String, String)] = [("content-type", "application/grpc")]
     ) -> OHTTPTransport {
         OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             streamSender: { _, _ in

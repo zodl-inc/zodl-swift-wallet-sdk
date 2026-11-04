@@ -42,38 +42,65 @@ No manual `Package.swift` edits are needed.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
 
-## OHTTP relay build inputs
+## Configured gateway endpoints
 
-Native compilation reads `ZODL_OHTTP_RELAY_URL_MAINNET` and
-`ZODL_OHTTP_RELAY_URL_TESTNET` from the child process environment. Export both
-before building configured native OHTTP support. For example, using synthetic
-endpoints only:
+`OHTTPEndpoints.gatewayHost(for:)` exposes the native build's gateway hostname for each network.
+Use this getter to construct `LightWalletEndpoint` values. Gateway, relay, signed-configuration
+and DNS routing share this native configuration; caller host matching ignores ASCII case and
+returns the exact configured spelling. Unknown hosts are not recognized as gateways, and
+cross-network gateway requests are rejected. The gateway getter's native failure indicates an
+SDK invariant violation: every source build requires both network configurations below.
 
-```bash
-export ZODL_OHTTP_RELAY_URL_MAINNET='https://main.example.invalid/relay'
-export ZODL_OHTTP_RELAY_URL_TESTNET='https://test.example.invalid/relay'
-make ffi-ci
-```
+## Required OHTTP build inputs
 
-SDK builds accept absent, partial or explicitly empty relay inputs. A nonempty
-input must be a valid HTTPS URL. The app build requires both nonempty valid
-inputs, including when it consumes a remote or prebuilt SDK. There is no global
-SDK OHTTP switch.
+Every SDK native source build requires these eight nonempty exported values:
 
-Local native build entrypoints fill only absent values from exported variables
-in a bounded login/interactive zsh startup. Inherited values always win, including
-explicit empty strings. For Xcode builds, exports can therefore live in the zsh
-startup environment. Startup output is discarded and values are never printed
-by the runner. `CI` or `GITHUB_ACTIONS` disables shell import completely; CI
-supplies process environment values directly. Ordinary offline SDK CI needs no
-AWS configuration. Live OHTTP and native release workflows load both masked
-inputs before native compilation.
+- `ZODL_OHTTP_GATEWAY_HOST_MAINNET`
+- `ZODL_OHTTP_GATEWAY_HOST_TESTNET`
+- `ZODL_OHTTP_RELAY_URL_MAINNET`
+- `ZODL_OHTTP_RELAY_URL_TESTNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
 
-A prebuilt native binary retains its own compiled relay environment. Using that
-binary with a different app build environment is accepted: there is no value
-matching, automatic rebuild or value-derived cache identity. Rebuild the native
-artifact explicitly when its compiled relay inputs need to change. Build scripts
-never generate URL-bearing Swift source or rewrite tracked sources.
+Every corresponding mainnet/testnet pair must differ ignoring ASCII case: gateway
+hosts, relay URLs, signing public keys and key DNS names. Gateway hosts and key DNS
+names must be bare ASCII DNS names: at most 253 characters total, with nonempty
+dot-separated labels of at most 63 letters, digits or hyphens, and no leading or
+trailing label hyphen. Source-build wrappers reject schemes, ports, paths,
+trailing dots and underscores before Cargo starts, with variable-name-only
+diagnostics. Relay URLs must start with literal lowercase `https://` and be valid
+HTTPS URLs. The native OHTTP library remains authoritative for
+configuration formats. Signing public keys must contain exactly 64 ASCII hex digits;
+source-build wrappers validate this before starting Cargo. There is exactly one configured
+SDK product.
+
+Export all eight values in the environment that launches a local source build.
+The build validates a copy of that inherited environment, preserves the original
+values and unrelated exports, and fails on absent or explicitly empty inputs.
+It does not start a shell or retrieve configuration from an external service.
+For workspace builds, launch Xcode from that configured environment or supply
+all eight values in its build environment so FFIBuilder inherits them. A GUI
+launch does not automatically inherit exports from a terminal session.
+
+All four native CI workflows supply the eight values from GitHub repository
+Actions secrets before configuration validation and cache lookup. Completed FFI
+cache identities include a digest of all eight exact values.
+`python3 Scripts/lib/ohttp_env.py --hash` prints that validated versioned digest,
+and `--required -- COMMAND ARG...` runs a child with the validated inherited
+environment. The helper also supports the system Python used by Xcode build
+phases. The child environment always sets `ZODL_OHTTP_REQUIRE=1`, overriding
+an inherited `0`; all four native CI workflows also set it as build policy.
+This flag is not a ninth secret and is excluded from the configuration digest.
+All eight values retain their exact bytes, including their case. Direct Cargo
+compilation enforces required inputs and distinct values for all four network
+pairs through the SDK build guard and the native core.
+
+A precompiled SDK retains its compiled configuration. Consuming it and running
+`init-local-ffi.sh --cached` require no OHTTP configuration. Rebuild native source
+when its configuration must change. Native-sensitive tests must receive the
+same inherited environment as the artifact being tested.
 
 ## Quick Start
 

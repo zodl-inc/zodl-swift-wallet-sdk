@@ -6,7 +6,7 @@ import libzcashlc
 
 final class OHTTPNativeHealthDeliveryTests: ZcashTestCase {
     func testNativeDeliveryWhileProductionWalletSummaryIsBlocked() async throws {
-        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: OHTTPEndpoints.gatewayHost(for: .testnet), port: 443, secure: true)
         let engine = GatedFakeSlipstreamEngine()
         let synchronizer = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
         let route = OHTTPHealthRoute(

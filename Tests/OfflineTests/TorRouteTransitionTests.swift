@@ -796,7 +796,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
     }
 
     private func assertFailedPublishedSwitchReconciles(explicitTorRetry: Bool, restart: Bool = false) async throws {
-        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let original = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
             freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
@@ -845,7 +845,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
     }
 
     func testOffSupersedingFailedSwitchRetainsEndpointRecovery() async throws {
-        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let original = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
             freeRuntime: { _ in }, startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
@@ -914,7 +914,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
         newerChoice: Bool,
         offDuringReopen: Bool = true
     ) async throws {
-        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let original = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
         let replacement = LightWalletEndpoint(address: "replacement.example.com", port: 443, secure: true)
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(
@@ -1001,7 +1001,7 @@ final class TorRouteTransitionTests: ZcashTestCase {
     }
 
     private func assertRecoveryRetiresAtWalletOrRouteReplacement(wipeWallet: Bool) async throws {
-        let original = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let original = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let candidate = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
         let replacement = LightWalletEndpoint(address: "replacement.example.com", port: 443, secure: true)
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(

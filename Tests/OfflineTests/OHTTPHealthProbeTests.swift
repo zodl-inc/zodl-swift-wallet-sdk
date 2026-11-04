@@ -5,7 +5,7 @@ import libzcashlc
 
 final class OHTTPHealthProbeTests: XCTestCase {
     private func route(viaTor: Bool = false) -> OHTTPHealthRoute {
-        OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://\(UUID().uuidString.lowercased()).test/relay", viaTor: viaTor)
+        OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString.lowercased()).test/relay", viaTor: viaTor)
     }
 
     func testProbeBudgetsAreFiveAndTwentySeconds() {

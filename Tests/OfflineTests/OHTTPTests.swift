@@ -13,8 +13,8 @@ final class OHTTPTests: XCTestCase {
     // MARK: - OHTTP Endpoints Tests
 
     func testOHTTPEndpointsGatewayDetection() {
-        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway-testnet.example"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway.example"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway(OHTTPTestSupport.testnetHost))
+        XCTAssertTrue(OHTTPEndpoints.isGateway(OHTTPTestSupport.mainnetHost))
         XCTAssertFalse(OHTTPEndpoints.isGateway("lightwalletd.testnet.electriccoin.co"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("example.com"))
     }
@@ -27,26 +27,26 @@ final class OHTTPTests: XCTestCase {
             XCTAssertTrue(OHTTPEndpoints.isAliasHost(alias), alias)
             XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: alias, network: .testnet), alias)
         }
-        XCTAssertFalse(OHTTPEndpoints.isAliasHost("ohttp-gateway.example"))
+        XCTAssertFalse(OHTTPEndpoints.isAliasHost(OHTTPTestSupport.mainnetHost))
         XCTAssertFalse(OHTTPEndpoints.isAliasHost("prod.vote-chain-primary.valargroup.org"))
         XCTAssertFalse(OHTTPEndpoints.isAliasHost("example.com"))
     }
 
     func testOHTTPEndpointsRelayMapping() throws {
         // Relay routing must use the native build configuration for the selected network.
-        let relay1 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway-testnet.example")
-        XCTAssertEqual(relay1, try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example")))
+        let relay1 = try OHTTPEndpoints.relayURL(for: OHTTPTestSupport.testnetHost)
+        XCTAssertEqual(relay1, try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.testnetHost)))
 
-        let relay2 = try OHTTPEndpoints.relayURL(for: "ohttp-gateway.example")
-        XCTAssertEqual(relay2, try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway.example")))
+        let relay2 = try OHTTPEndpoints.relayURL(for: OHTTPTestSupport.mainnetHost)
+        XCTAssertEqual(relay2, try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.mainnetHost)))
 
         XCTAssertThrowsError(try OHTTPEndpoints.relayURL(for: "unknown.zodl.com"))
     }
 
     func testTheSignedKeyConfigurationURLFollowsTheRelay() throws {
         // The alias hosts ride the configured mainnet relay.
-        let mainnetRelay = try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway.example"))
-        for host in ["ohttp-gateway.example", "cmc.zodl.com", "near.zodl.com", "vote.zodl.com"] {
+        let mainnetRelay = try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.mainnetHost))
+        for host in [OHTTPTestSupport.mainnetHost, "cmc.zodl.com", "near.zodl.com", "vote.zodl.com"] {
             let relay = try OHTTPEndpoints.relayURL(for: host)
             XCTAssertEqual(relay, mainnetRelay, host)
         }
@@ -78,7 +78,7 @@ final class OHTTPTests: XCTestCase {
         XCTAssertNoThrow(try OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com"),
                          "relayURL should accept raw.githubusercontent.com")
         let relay = try? OHTTPEndpoints.relayURL(for: "raw.githubusercontent.com")
-        XCTAssertEqual(relay, OHTTPNative.relayURL(for: "ohttp-gateway.example"),
+        XCTAssertEqual(relay, OHTTPNative.relayURL(for: OHTTPTestSupport.mainnetHost),
                        "raw.githubusercontent.com should use mainnet relay")
 
         // A routable third-party URL, never a gateway (cannot become a lightwalletd endpoint)
@@ -188,8 +188,8 @@ final class OHTTPTests: XCTestCase {
     func testProxyAllowlistGatewayDetection() {
         // isGateway uses exact host matching for configured relays only; the aliases are HTTP
         // destinations (isAliasHost), not gateways.
-        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway.example"))
-        XCTAssertTrue(OHTTPEndpoints.isGateway("ohttp-gateway-testnet.example"))
+        XCTAssertTrue(OHTTPEndpoints.isGateway(OHTTPTestSupport.mainnetHost))
+        XCTAssertTrue(OHTTPEndpoints.isGateway(OHTTPTestSupport.testnetHost))
         XCTAssertFalse(OHTTPEndpoints.isGateway("cmc.zodl.com"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("near.zodl.com"))
         XCTAssertFalse(OHTTPEndpoints.isGateway("vote.zodl.com"))
@@ -516,7 +516,7 @@ final class OHTTPTests: XCTestCase {
         // No test verifier: the native core checks the envelope against the pinned key, and refuses a body
         // that is not a signed envelope.
         let transport = OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: "https://testnet-operator-relay.example.invalid/relay"
         ) { request, _ in
             if request.httpMethod == "GET" {

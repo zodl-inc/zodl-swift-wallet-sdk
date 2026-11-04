@@ -62,11 +62,20 @@ enum OHTTPNative {
     /// `ClientProfile::IOS` of the shared core.
     static let profile: UInt32 = 2
 
+    /// Every valid native SDK build supplies both networks. A missing host is an SDK invariant failure.
+    static func gatewayHost(for network: NetworkType) -> String {
+        guard let result = zcashlc_ohttp_gateway_host(network == .testnet) else {
+            preconditionFailure("SDK invariant: native OHTTP gateway configuration is unavailable")
+        }
+        defer { zcashlc_string_free(result) }
+        return String(cString: result)
+    }
+
     /// Verifies the signed key-configuration `envelope` fetched for `gatewayHost` and selects the gateway's
     /// key out of it. The network, and so the pinned signing key, follows from the host.
     static func verifyKeyConfig(gatewayHost: String, envelope: Data, now: Date) throws -> OHTTPVerifiedKey {
         let seconds = UInt64(max(0, now.timeIntervalSince1970))
-        let host = Array(gatewayHost.lowercased().utf8)
+        let host = Array(gatewayHost.utf8)
         let result: UnsafeMutablePointer<OhttpKey>? = host.withUnsafeBufferPointer { hostBuffer in
             envelope.withUnsafeBytes { (json: UnsafeRawBufferPointer) -> UnsafeMutablePointer<OhttpKey>? in
                 zcashlc_ohttp_verify_key_config(
@@ -222,7 +231,7 @@ enum OHTTPNative {
     /// The built-in mapping can be overridden at build time via environment variables
     /// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
     static func relayURL(for gatewayHost: String) -> String? {
-        let host = Array(gatewayHost.lowercased().utf8)
+        let host = Array(gatewayHost.utf8)
         let result: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer { hostBuffer in
             zcashlc_ohttp_relay_url_for(
                 hostBuffer.baseAddress,
@@ -244,7 +253,7 @@ enum OHTTPNative {
     /// The DoH query URLs of the signed key configuration of `gatewayHost`'s network, in resolver
     /// order (Cloudflare, then Google). Only for the DNS source, after the relay source failed.
     static func dohQueryURLs(gatewayHost: String) throws -> [String] {
-        let host = Array(gatewayHost.lowercased().utf8)
+        let host = Array(gatewayHost.utf8)
         return try (0..<zcashlc_ohttp_doh_resolver_count()).map { index in
             let url: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer {
                 zcashlc_ohttp_doh_query_url(index, $0.baseAddress, UInt($0.count))
@@ -260,7 +269,7 @@ enum OHTTPNative {
     /// The signed envelope carried by a DoH JSON response for `gatewayHost`'s network; verify it with
     /// `verifyKeyConfig` like one fetched through the relay.
     static func envelopeFromDohJSON(dohBody: Data, gatewayHost: String) throws -> Data {
-        let host = Array(gatewayHost.lowercased().utf8)
+        let host = Array(gatewayHost.utf8)
         var envelopeLen: UInt = 0
         let result: UnsafeMutablePointer<UInt8>? = dohBody.withUnsafeBytes { bodyBuffer in
             host.withUnsafeBufferPointer { hostBuffer in

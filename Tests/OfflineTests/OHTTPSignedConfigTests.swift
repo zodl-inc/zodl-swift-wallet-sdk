@@ -4,8 +4,8 @@
 //
 //  The signed key-configuration envelope is verified by the shared Rust core (`zodl-ohttp-client`, iOS
 //  profile) against the pinned signing keys, so these tests drive it through `OHTTPNative.verifyKeyConfig`.
-//  The pinned keys have no private half here, so an envelope cannot be made that passes the signature; the
-//  tests check that every rule in front of the signature refuses what it should and that an envelope which
+//  Only public signing keys are supplied here. These fixtures exercise rejection, checking
+//  that every rule in front of the signature refuses what it should and that an envelope which
 //  satisfies them all stops only at the signature.
 //
 
@@ -13,10 +13,10 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPSignedConfigTests: XCTestCase {
-    private static let testnetHost = "ohttp-gateway-testnet.example"
-    private static let mainnetHost = "ohttp-gateway.example"
-    private static let testnetKeyId = "a3620fb6"
-    private static let mainnetKeyId = "ba8a2dbd"
+    private static let testnetHost = OHTTPTestSupport.testnetHost
+    private static let mainnetHost = OHTTPTestSupport.mainnetHost
+    private static let testnetKeyId = OHTTPTestSupport.signingKeyId(for: .testnet)
+    private static let mainnetKeyId = OHTTPTestSupport.signingKeyId(for: .mainnet)
 
     /// Middle of the validity window the envelopes below use.
     private let now = Date(timeIntervalSince1970: 1_700_010_000)
@@ -118,12 +118,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
     }
 
     func testWrongKeyIdFails() throws {
-        let message = try XCTUnwrap(failure(of: envelope(keyId: "deadbeef")))
-        XCTAssertTrue(message.contains("signed by key deadbeef, not \(Self.testnetKeyId)"), message)
-
-        // The other network's key id is wrong too.
-        let swapped = try XCTUnwrap(failure(of: envelope(keyId: Self.mainnetKeyId)))
-        XCTAssertTrue(swapped.contains("signed by key \(Self.mainnetKeyId)"), swapped)
+        for (network, host, expectedId) in [
+            ("mainnet", Self.mainnetHost, Self.mainnetKeyId),
+            ("testnet", Self.testnetHost, Self.testnetKeyId)
+        ] {
+            let firstDigit = try XCTUnwrap(expectedId.first)
+            let mismatchedId = "\(firstDigit == "0" ? "1" : "0")\(expectedId.dropFirst())"
+            let message = try XCTUnwrap(failure(of: envelope(network: network, keyId: mismatchedId), host: host))
+            XCTAssertTrue(message.contains("signed by key \(mismatchedId), not \(expectedId)"), message)
+        }
     }
 
     func testUnsupportedProtocolVersionFails() throws {
@@ -236,23 +239,22 @@ final class OHTTPSignedConfigTests: XCTestCase {
     func testOHTTPEndpointsNetworkDetection() {
         // ZIP #10: network is statically configured, not inferred from hostname.
         // Only the two known gateway hosts have a configured network.
-        XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway-testnet.example"), "testnet")
-        XCTAssertEqual(OHTTPEndpoints.network(for: "ohttp-gateway.example"), "mainnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: OHTTPTestSupport.testnetHost), "testnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: OHTTPTestSupport.mainnetHost), "mainnet")
         XCTAssertNil(OHTTPEndpoints.network(for: "cmc.zodl.com"))
         XCTAssertNil(OHTTPEndpoints.network(for: "vote.zodl.com"))
         XCTAssertNil(OHTTPEndpoints.network(for: "unknown.zodl.com"))
     }
 
     /// ZIP #10: The network is statically configured (NetworkRule::KnownHosts), not inferred from the host name.
-    /// Only ohttp-gateway.example (mainnet) and ohttp-gateway-testnet.example (testnet) have a configured
-    /// network; all other hosts return nil and would be rejected before signature verification.
+    /// Only the configured mainnet and testnet hosts have a configured network; all other hosts return nil and would be rejected before signature verification.
     func testTheCoreAndOHTTPEndpointsAgreeOnTheNetworkOfAHost() throws {
         // Test the two known gateway hosts (case-insensitive)
         for (host, expectedNetwork) in [
-            ("ohttp-gateway-testnet.example", "testnet"),
-            ("OHTTP-GATEWAY-TESTNET.ZODL.COM", "testnet"),
-            ("ohttp-gateway.example", "mainnet"),
-            ("OHTTP-GATEWAY.ZODL.COM", "mainnet")
+            (OHTTPTestSupport.testnetHost, "testnet"),
+            (OHTTPTestSupport.testnetHost.uppercased(), "testnet"),
+            (OHTTPTestSupport.mainnetHost, "mainnet"),
+            (OHTTPTestSupport.mainnetHost.uppercased(), "mainnet")
         ] {
             guard let network = OHTTPEndpoints.network(for: host) else {
                 XCTFail("\(host) should have a configured network")

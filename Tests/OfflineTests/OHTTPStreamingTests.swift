@@ -73,7 +73,7 @@ final class OHTTPStreamingTests: XCTestCase {
         streamSender: @escaping OHTTPTransport.StreamSender
     ) -> OHTTPTransport {
         OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: keyCache,
@@ -363,7 +363,7 @@ final class OHTTPExternalHTTPTests: XCTestCase {
         XCTAssertTrue(OHTTPEndpoints.needsHeaderStripping(host: "cmc.zodl.com"))
 
         let route = try OHTTPEndpoints.proxyRoute(for: "flexa.zodl.com", network: .mainnet)
-        XCTAssertEqual(route.gatewayHost, "ohttp-gateway.example")
+        XCTAssertEqual(route.gatewayHost, OHTTPTestSupport.mainnetHost)
         XCTAssertThrowsError(try OHTTPEndpoints.proxyRoute(for: "flexa.zodl.com", network: .testnet))
     }
 

@@ -50,6 +50,12 @@ done
 if [[ "$UNIVERSAL" == "true" && "$TARGET" != "macos" && "$TARGET" != "ios-sim" ]]; then
     echo "--universal is only meaningful for the macos and ios-sim targets"; exit 1
 fi
+# Resolve before any architecture loop or product replacement. Inner Cargo
+# invocations validate the inherited complete environment without loading it again.
+if [[ true && "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
+    exec python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 /bin/bash Scripts/rebuild-local-ffi.sh "$@"
+fi
+
 XCFRAMEWORK_DIR="LocalPackages/libzcashlc.xcframework"
 
 # Check if initialized
@@ -131,7 +137,7 @@ if [[ "$TARGET" == "macos" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$t" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --required -- cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-macos-universal.a"
     lipo -create \
@@ -144,7 +150,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         if ! rustup target list --installed | grep -q "^${t}$"; then
             rustup target add "$t"
         fi
-        python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$t" --release $FEATURE_ARGS
+        python3 Scripts/lib/ohttp_env.py --required -- cargo build --target "$t" --release $FEATURE_ARGS
     done
     BUILT_LIB="target/libzcashlc-ios-sim-universal.a"
     lipo -create \
@@ -152,7 +158,7 @@ elif [[ "$TARGET" == "ios-sim" && "$UNIVERSAL" == "true" ]]; then
         target/x86_64-apple-ios/release/libzcashlc.a \
         -output "$BUILT_LIB"
 else
-    python3 Scripts/lib/ohttp_env.py --optional -- cargo build --target "$RUST_TARGET" --release $FEATURE_ARGS
+    python3 Scripts/lib/ohttp_env.py --required -- cargo build --target "$RUST_TARGET" --release $FEATURE_ARGS
     # Path to built static library (target/ is at repo root)
     BUILT_LIB="target/$RUST_TARGET/release/libzcashlc.a"
 fi

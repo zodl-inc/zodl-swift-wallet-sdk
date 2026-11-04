@@ -4,7 +4,7 @@ import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthLifecycleTests: ZcashTestCase {
-    private let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+    private let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
 
     private func session(_ sync: SlipstreamSynchronizer) async throws -> OHTTPHealthSession {
         try await sync.makeOHTTPHealthSession(

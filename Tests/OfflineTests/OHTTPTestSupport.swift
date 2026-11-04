@@ -10,11 +10,37 @@ import CryptoKit
 @testable import ZODLSwiftWalletSDK
 
 enum OHTTPTestSupport {
+    /// Expectations come from the same public build environment as the compiled native fixture.
+    static func configuredValue(_ name: String) -> String {
+        guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
+            preconditionFailure("Tests require the native build configuration: \(name)")
+        }
+        return value
+    }
+
+    static let mainnetHost = configuredValue("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
+    static let testnetHost = configuredValue("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
+    static let mainnetDNSName = configuredValue("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET")
+    static let testnetDNSName = configuredValue("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET")
+
+    static func signingKeyId(for network: NetworkType) -> String {
+        let suffix = network == .mainnet ? "MAINNET" : "TESTNET"
+        let hex = Array(configuredValue("ZODL_OHTTP_SIGNING_PUBKEY_\(suffix)"))
+        precondition(hex.count == 64, "Tests require a 32-byte signing public key")
+        let bytes = stride(from: 0, to: hex.count, by: 2).map { index -> UInt8 in
+            guard let byte = UInt8(String(hex[index...index + 1]), radix: 16) else {
+                preconditionFailure("Tests require a hexadecimal signing public key")
+            }
+            return byte
+        }
+        return SHA256.hash(data: Data(bytes)).prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// The body a mock serves for the signed key-configuration GET. Only the test verifier reads it.
     static let stubEnvelope = Data("{\"stub\":true}".utf8)
 
     /// A verifier that accepts any envelope and returns a usable gateway key (id 1 and a fresh X25519
-    /// public key), valid for an hour. The pinned signing keys have no private half to sign with, so the
+    /// public key), valid for an hour. Only public signing keys are supplied here, so the
     /// transport flow tests use this; the signed-envelope rules themselves are tested against the native
     /// verifier in `OHTTPSignedConfigTests`.
     static func makeKeyVerifier() -> OHTTPTransport.KeyVerifier {
@@ -56,7 +82,7 @@ enum OHTTPTestSupport {
         sender: @escaping OHTTPTransport.HTTPSender
     ) -> OHTTPTransport {
         OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: relayURL,
             clientTraceIdPrefix: clientTraceIdPrefix,
             testKeyVerifier: makeKeyVerifier(),

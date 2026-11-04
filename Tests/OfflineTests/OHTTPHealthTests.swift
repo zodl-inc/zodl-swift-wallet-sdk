@@ -431,7 +431,7 @@ final class OHTTPHealthTests: XCTestCase {
 
     func testOperationContextDoesNotLeakIntoSerializedRelayHeaders() async throws {
         let operation = OHTTPHealthOperation()
-        let transport = OHTTPTransport(gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://relay.test/")
+        let transport = OHTTPTransport(gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://relay.test/")
         let request = try await OHTTPHealthContext.withOperation(operation) {
             XCTAssertEqual(OHTTPHealthContext.operation, operation)
             return try await transport.relayPost(url: "https://relay.test/", body: Data([1, 2, 3]), timeoutMS: 2000)

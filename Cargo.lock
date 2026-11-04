@@ -1344,7 +1344,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98e02cd118058400797c74550dca132b57cf2e6af0e9ea0672a83eb186fd655e"
 dependencies = [
  "derive-deftly-macros",
- "heck 0.5.0",
+ "heck 0.4.1",
 ]
 
 [[package]]
@@ -1353,14 +1353,14 @@ version = "1.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba91f619216e76a5eb2515783f7ec2e271938b51aadac592f4930517f4626863"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "indexmap 2.14.0",
- "itertools 0.15.0",
+ "itertools 0.10.5",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
  "sha3",
- "strum 0.27.2",
+ "strum",
  "syn 3.0.3",
  "unicode-ident",
  "void",
@@ -2909,15 +2909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3390,12 +3381,6 @@ name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
-
-[[package]]
-name = "multimap"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "naga"
@@ -4406,7 +4391,7 @@ dependencies = [
  "itertools 0.10.5",
  "lazy_static",
  "log",
- "multimap 0.8.3",
+ "multimap",
  "petgraph 0.6.5",
  "prettyplease 0.1.25",
  "prost 0.11.9",
@@ -4423,10 +4408,10 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
- "multimap 0.10.1",
+ "multimap",
  "petgraph 0.8.3",
  "prettyplease 0.2.37",
  "prost 0.14.4",
@@ -4456,7 +4441,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4949,7 +4934,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5505,7 +5490,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5617,32 +5602,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "strum_macros 0.28.0",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
-dependencies = [
- "heck 0.5.0",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "strum_macros",
 ]
 
 [[package]]
@@ -6375,7 +6339,7 @@ dependencies = [
  "serde",
  "serde-value",
  "serde_ignored",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "toml 1.1.3+spec-1.1.0",
  "tor-basic-utils",
@@ -6498,7 +6462,7 @@ dependencies = [
  "serde_json",
  "signature",
  "static_assertions",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "time",
  "tor-async-utils",
@@ -6534,7 +6498,7 @@ dependencies = [
  "paste",
  "retry-error",
  "static_assertions",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "tracing",
  "void",
@@ -6576,7 +6540,7 @@ dependencies = [
  "rand 0.10.3",
  "safelog",
  "serde",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "tor-async-utils",
  "tor-basic-utils",
@@ -6615,7 +6579,7 @@ dependencies = [
  "retry-error",
  "safelog",
  "slotmap-careful",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "tor-async-utils",
  "tor-basic-utils",
@@ -6752,7 +6716,7 @@ dependencies = [
  "safelog",
  "serde",
  "serde_with",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "tor-basic-utils",
  "tor-bytes",
@@ -6881,7 +6845,7 @@ dependencies = [
  "num_enum",
  "rand 0.10.3",
  "serde",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "time",
  "tor-basic-utils",
@@ -6925,7 +6889,7 @@ dependencies = [
  "serde_with",
  "signature",
  "smallvec",
- "strum 0.28.0",
+ "strum",
  "subtle",
  "thiserror 2.0.19",
  "time",
@@ -7010,7 +6974,7 @@ dependencies = [
  "slotmap-careful",
  "smallvec",
  "static_assertions",
- "strum 0.28.0",
+ "strum",
  "subtle",
  "sync_wrapper",
  "thiserror 2.0.19",
@@ -7125,7 +7089,7 @@ dependencies = [
  "pin-project",
  "priority-queue",
  "slotmap-careful",
- "strum 0.28.0",
+ "strum",
  "thiserror 2.0.19",
  "tor-error",
  "tor-general-addr",
@@ -8857,8 +8821,8 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "0.1.0"
-source = "git+https://github.com/zodl-inc/ohttp.git?rev=b0b2087c9d867115f38ddfbd6021988b64abf8f9#b0b2087c9d867115f38ddfbd6021988b64abf8f9"
+version = "0.1.2"
+source = "git+https://github.com/zodl-inc/zodl-ohttp.git?rev=0324db3240adf00ea847aa0a93e8d765e32b61da#0324db3240adf00ea847aa0a93e8d765e32b61da"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -8877,7 +8841,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream"
 version = "0.4.0"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=86e9b4a6802074fdb7f6077595641fd76b22d6e3#86e9b4a6802074fdb7f6077595641fd76b22d6e3"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=60d69bfe143e08ebd53b60032356f89c9e88f9e3#60d69bfe143e08ebd53b60032356f89c9e88f9e3"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8932,7 +8896,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=86e9b4a6802074fdb7f6077595641fd76b22d6e3#86e9b4a6802074fdb7f6077595641fd76b22d6e3"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=60d69bfe143e08ebd53b60032356f89c9e88f9e3#60d69bfe143e08ebd53b60032356f89c9e88f9e3"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",

@@ -65,7 +65,7 @@ final class OHTTPHealthTorTests: XCTestCase {
         }
         native.freeResponse = { _ in response.free() }
         let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
-        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://buffered-pause.test/relay", viaTor: true)
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://buffered-pause.test/relay", viaTor: true)
         let session = try OHTTPHealthSession(route: route, generation: UUID())
         defer { session.close() }
         let transport = OHTTPTransport(

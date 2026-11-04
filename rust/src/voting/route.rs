@@ -33,17 +33,6 @@ use zcash_voting::{
 
 use super::errors::invalid_input;
 
-/// OHTTP gateway hostname for voting traffic (mainnet).
-///
-/// The relay for this gateway is chosen by the engine
-/// (`slipstream_core::ohttp::relay_for`), the same one the lightwalletd path
-/// uses.
-const OHTTP_GATEWAY_HOST_MAINNET: &str = "ohttp-gateway.example";
-
-/// OHTTP gateway hostname for voting traffic (testnet). The testnet gateway
-/// carries the same vote and PIR hosts as the mainnet one.
-const OHTTP_GATEWAY_HOST_TESTNET: &str = "ohttp-gateway-testnet.example";
-
 /// Exact vote and PIR hosts in the gateway's BACKENDS (mainnet).
 ///
 /// The gateway removed suffix routing and matches exact hosts only. MUST match
@@ -450,12 +439,29 @@ impl OhttpRoute {
 /// way round.
 fn gateway_for(network: zcash_voting::Network) -> Result<(&'static str, NetworkType), RouteError> {
     match network {
-        zcash_voting::Network::Mainnet => Ok((OHTTP_GATEWAY_HOST_MAINNET, NetworkType::Main)),
-        zcash_voting::Network::Testnet => Ok((OHTTP_GATEWAY_HOST_TESTNET, NetworkType::Test)),
+        zcash_voting::Network::Mainnet => {
+            configured_gateway(zodl_ohttp_client::Network::Mainnet, NetworkType::Main)
+        }
+        zcash_voting::Network::Testnet => {
+            configured_gateway(zodl_ohttp_client::Network::Testnet, NetworkType::Test)
+        }
         _ => Err(RouteError::before_dispatch(
             "no OHTTP gateway for this network".to_string(),
         )),
     }
+}
+
+fn configured_gateway(
+    network: zodl_ohttp_client::Network,
+    engine_network: NetworkType,
+) -> Result<(&'static str, NetworkType), RouteError> {
+    crate::ohttp::gateway_host(network)
+        .map(|host| (host, engine_network))
+        .map_err(|_| {
+            RouteError::before_dispatch(
+                "SDK invariant: missing OHTTP gateway configuration".to_string(),
+            )
+        })
 }
 
 /// Wraps `on_dispatch` so that `dispatched` records whether it fired.
@@ -811,9 +817,15 @@ mod tests {
     fn ohttp_route_uses_the_gateway_of_the_wallet_network() {
         let url = "https://vote.zodl.com";
         let mainnet = OhttpRoute::new(url, zcash_voting::Network::Mainnet).expect("mainnet");
-        assert_eq!(mainnet.gateway_host, OHTTP_GATEWAY_HOST_MAINNET);
+        assert_eq!(
+            mainnet.gateway_host,
+            env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
+        );
         let testnet = OhttpRoute::new(url, zcash_voting::Network::Testnet).expect("testnet");
-        assert_eq!(testnet.gateway_host, OHTTP_GATEWAY_HOST_TESTNET);
+        assert_eq!(
+            testnet.gateway_host,
+            env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
+        );
         let error = OhttpRoute::new(url, zcash_voting::Network::Regtest)
             .err()
             .expect("no regtest gateway");

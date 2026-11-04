@@ -2,7 +2,7 @@
 //  OHTTPEndpoints.swift
 //  ZODLSwiftWalletSDK
 //
-//  Static OHTTP (RFC 9458) endpoint mapping.
+//  Native-configured OHTTP (RFC 9458) endpoint mapping.
 //
 //  A LightWalletEndpoint whose host is one of the ZODL OHTTP gateways is served through an OHTTP
 //  relay instead of a direct gRPC connection:
@@ -22,6 +22,12 @@ import Foundation
 import CryptoKit
 
 public enum OHTTPEndpoints {
+    /// The native SDK's configured gateway host for the selected network.
+    /// Use this hostname when constructing a lightwalletd gateway endpoint.
+    public static func gatewayHost(for network: NetworkType) -> String {
+        OHTTPNative.gatewayHost(for: network)
+    }
+
     /// Optional client trace ID prefix for debug end-to-end tracking. When set, every outer OHTTP POST
     /// to the relay carries `X-Client-Trace-Id: <prefix>-<uuid>`.
     ///
@@ -42,7 +48,7 @@ public enum OHTTPEndpoints {
     /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
-    /// Derived from the native relay map for the mainnet gateway host `ohttp-gateway.example`.
+    /// Derived from the native relay map for the configured mainnet gateway host.
     private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: mainnetGatewayHost) }
 
     /// The alias hosts the gateway serves with its own credentials (cmc, near, vote, flexa). HTTP
@@ -103,7 +109,7 @@ public enum OHTTPEndpoints {
     /// Relay URLs come from the native zodl-ohttp-client library and can be overridden at build time
     /// via environment variables `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
     public static func isGateway(_ host: String) -> Bool {
-        OHTTPNative.relayURL(for: host.lowercased()) != nil
+        OHTTPNative.relayURL(for: host) != nil
     }
 
     /// True for an alias host the gateway serves with gateway-injected credentials (CMC, NEAR, voting,
@@ -116,7 +122,7 @@ public enum OHTTPEndpoints {
     public static func relayURL(for gatewayHost: String) throws -> String {
         let lowerHost = gatewayHost.lowercased()
         // Try native relay map first
-        if let relay = OHTTPNative.relayURL(for: lowerHost) {
+        if let relay = OHTTPNative.relayURL(for: gatewayHost) {
             return relay
         }
         // Alias hosts ride the mainnet gateway's relay
@@ -225,22 +231,22 @@ public enum OHTTPEndpoints {
         return comps.url
     }
 
-    static let mainnetGatewayHost = "ohttp-gateway.example"
-    static let testnetGatewayHost = "ohttp-gateway-testnet.example"
+    static var mainnetGatewayHost: String { gatewayHost(for: .mainnet) }
+    static var testnetGatewayHost: String { gatewayHost(for: .testnet) }
 
     /// The gateway and relay a request to `host` goes through for a wallet on `network`. A lightwalletd
     /// gateway host is its own gateway; every other host the gateways carry (the CMC and NEAR aliases,
     /// vote and PIR servers, the voting-config mirror) goes through the gateway of the wallet's network,
     /// never the other network's.
     static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String) {
-        if let relay = OHTTPNative.relayURL(for: host.lowercased()) {
+        if let relay = OHTTPNative.relayURL(for: host) {
             guard let gatewayNetwork = self.network(for: host) else {
                 throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
             }
             guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
                 throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
             }
-            return (host, relay)
+            return (gatewayHost(for: network), relay)
         }
         if network != .mainnet, mainnetOnlyAliases.contains(host.lowercased()) {
             throw OHTTPError.transportError("\(host) is served by the mainnet gateway only")
@@ -256,7 +262,7 @@ public enum OHTTPEndpoints {
     /// made to it: a testnet wallet never calls the mainnet gateway, nor the other way round. Any other
     /// host passes; its network is checked against the server's chain name when it is validated.
     public static func checkGatewayNetwork(host: String, network: NetworkType) throws {
-        guard OHTTPNative.relayURL(for: host.lowercased()) != nil else { return }
+        guard OHTTPNative.relayURL(for: host) != nil else { return }
         guard let gatewayNetwork = self.network(for: host) else {
             throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
         }
@@ -290,18 +296,23 @@ public enum OHTTPEndpoints {
         return !isIndependentRelayHost(relayHost, fingerprints: independentRelayHostFingerprints)
     }
 
-    /// Returns the network identifier ("mainnet" or "testnet") for a given gateway host.
-    /// ZIP #10 "Client configuration": the network is part of the static configuration and MUST NOT be
-    /// inferred from the gateway host name. Exactly `ohttp-gateway.example` is mainnet and
-    /// `ohttp-gateway-testnet.example` is testnet; any other host returns nil (unknown gateway).
+    /// Returns the network identifier ("mainnet" or "testnet") for a configured gateway host.
+    /// Network identity comes from native configuration, never from a hostname suffix or substring.
+    /// Caller host matching ignores ASCII case and leaves every unknown host unrecognized.
     public static func network(for gatewayHost: String) -> String? {
-        switch gatewayHost.lowercased() {
-        case "ohttp-gateway.example":
+        let normalized = asciiLowercased(gatewayHost)
+        if normalized == asciiLowercased(mainnetGatewayHost) {
             return "mainnet"
-        case "ohttp-gateway-testnet.example":
+        }
+        if normalized == asciiLowercased(testnetGatewayHost) {
             return "testnet"
-        default:
-            return nil
+        }
+        return nil
+    }
+
+    private static func asciiLowercased(_ host: String) -> [UInt8] {
+        host.utf8.map { byte in
+            (65...90).contains(byte) ? byte + 32 : byte
         }
     }
 }
