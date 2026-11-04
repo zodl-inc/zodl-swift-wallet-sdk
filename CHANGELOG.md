@@ -38,6 +38,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP requests lowercase ASCII letters in the wire authority while preserving its port and
+  the method, path, query and body. Mixed-case gateway hosts now reach the configured backend.
+  No call-site changes are required.
+
 - OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
   empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
   remain supported when split into valid chunks. Public function signatures are unchanged.

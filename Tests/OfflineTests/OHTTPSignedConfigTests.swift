@@ -118,12 +118,15 @@ final class OHTTPSignedConfigTests: XCTestCase {
     }
 
     func testWrongKeyIdFails() throws {
-        let message = try XCTUnwrap(failure(of: envelope(keyId: "deadbeef")))
-        XCTAssertTrue(message.contains("signed by key deadbeef, not \(Self.testnetKeyId)"), message)
-
-        // The other network's key id is wrong too.
-        let swapped = try XCTUnwrap(failure(of: envelope(keyId: Self.mainnetKeyId)))
-        XCTAssertTrue(swapped.contains("signed by key \(Self.mainnetKeyId)"), swapped)
+        for (network, host, expectedId) in [
+            ("mainnet", Self.mainnetHost, Self.mainnetKeyId),
+            ("testnet", Self.testnetHost, Self.testnetKeyId)
+        ] {
+            let firstDigit = try XCTUnwrap(expectedId.first)
+            let mismatchedId = "\(firstDigit == "0" ? "1" : "0")\(expectedId.dropFirst())"
+            let message = try XCTUnwrap(failure(of: envelope(network: network, keyId: mismatchedId), host: host))
+            XCTAssertTrue(message.contains("signed by key \(mismatchedId), not \(expectedId)"), message)
+        }
     }
 
     func testUnsupportedProtocolVersionFails() throws {

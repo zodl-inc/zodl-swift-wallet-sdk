@@ -13,6 +13,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_ohttp_encapsulate` lowercases ASCII authority letters before sealing a request,
+  preserving the port, method, scheme, path, query and body. Its signature is unchanged.
+
 - OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
   empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
   remain supported when split into valid chunks. Public function signatures are unchanged.

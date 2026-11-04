@@ -330,7 +330,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_encapsulate(
         let request = BhttpRequest {
             method: unsafe { bytes(method, method_len)? }.to_vec(),
             scheme: unsafe { bytes(scheme, scheme_len)? }.to_vec(),
-            authority: unsafe { bytes(authority, authority_len)? }.to_vec(),
+            authority: unsafe { bytes(authority, authority_len)? }.to_ascii_lowercase(),
             path: unsafe { bytes(path, path_len)? }.to_vec(),
             headers: unpack_fields(unsafe { bytes(headers, headers_len)? })?,
             body: unsafe { bytes(body, body_len)? }.to_vec(),
@@ -1293,6 +1293,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn encapsulated_request_lowercases_only_authority() {
+        use hpke::{Deserializable, Kem, Serializable};
+        type KemType = hpke::kem::X25519HkdfSha256;
+        let (private, public) = KemType::derive_keypair(&[42; 32]);
+        let mut key = [0; 33];
+        key[0] = 7;
+        key[1..].copy_from_slice(&public.to_bytes());
+        let method = b"CuStOm";
+        let scheme = b"hTtPs";
+        let authority = b"GaTeWaY.Example:8443";
+        let path = b"/MiXeD/Path?Query=VaLuE";
+        let body = b"MiXeD body\x00\xff";
+        let headers = pack_fields(&[(b"x-test".to_vec(), b"MiXeD".to_vec())]).unwrap();
+        let sealed = unsafe {
+            zcashlc_ohttp_encapsulate(
+                IOS,
+                key.as_ptr(),
+                method.as_ptr(),
+                method.len(),
+                scheme.as_ptr(),
+                scheme.len(),
+                authority.as_ptr(),
+                authority.len(),
+                path.as_ptr(),
+                path.len(),
+                headers.as_ptr(),
+                headers.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        let (opener, wire) = take_opener(sealed);
+        unsafe { zcashlc_ohttp_opener_free(opener) };
+        let enc = <KemType as Kem>::EncappedKey::from_bytes(&wire[7..39]).unwrap();
+        let mut info = b"message/bhttp chunked request\0".to_vec();
+        info.extend_from_slice(&wire[..7]);
+        let mut receiver = hpke::setup_receiver::<
+            hpke::aead::AesGcm128,
+            hpke::kdf::HkdfSha256,
+            KemType,
+        >(&hpke::OpModeR::Base, &private, &enc, &info)
+        .unwrap();
+        let mut chunks = &wire[39..];
+        let mut plaintext = Vec::new();
+        loop {
+            let length = read_wire_varint(&mut chunks);
+            if length == 0 {
+                plaintext.extend(receiver.open(chunks, b"final").unwrap());
+                break;
+            }
+            let (chunk, rest) = chunks.split_at(length);
+            plaintext.extend(receiver.open(chunk, b"").unwrap());
+            chunks = rest;
+        }
+        // Decode known-length Binary HTTP independently of the request encoder.
+        let mut message = plaintext.as_slice();
+        assert_eq!(read_wire_varint(&mut message), 0);
+        assert_eq!(read_wire_field(&mut message), method);
+        assert_eq!(read_wire_field(&mut message), scheme);
+        assert_eq!(read_wire_field(&mut message), b"gateway.example:8443");
+        assert_eq!(read_wire_field(&mut message), path);
+        let mut fields = read_wire_field(&mut message);
+        let mut found_header = false;
+        while !fields.is_empty() {
+            let name = read_wire_field(&mut fields);
+            let value = read_wire_field(&mut fields);
+            if name == b"x-test" {
+                assert_eq!(value, b"MiXeD");
+                found_header = true;
+            }
+        }
+        assert!(found_header);
+        assert_eq!(read_wire_field(&mut message), body);
+        assert!(read_wire_field(&mut message).is_empty());
+        assert!(message.iter().all(|byte| *byte == 0));
+    }
+
+    fn read_wire_varint(input: &mut &[u8]) -> usize {
+        let width = 1 << (input[0] >> 6);
+        let (encoded, rest) = input.split_at(width);
+        let mut value = usize::from(encoded[0] & 0x3f);
+        for byte in &encoded[1..] {
+            value = (value << 8) | usize::from(*byte);
+        }
+        *input = rest;
+        value
+    }
+
+    fn read_wire_field<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+        let length = read_wire_varint(input);
+        let (field, rest) = input.split_at(length);
+        *input = rest;
+        field
+    }
+
     /// Takes the opener out of `sealed`, as the Swift wrapper does, and frees the rest.
     fn take_opener(sealed: *mut OhttpSealed) -> (*mut OhttpOpener, Vec<u8>) {
         assert!(!sealed.is_null());
@@ -1756,11 +1852,25 @@ mod tests {
 
     #[test]
     fn a_doh_answer_for_another_name_or_an_unknown_gateway_is_refused() {
-        let body = doh_json(env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"), "aGVsbG8gd29ybGQ=");
-        for (host, error) in [
-            (env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"), "DoH response"),
-            ("gateway.example", "no OHTTP network configured"),
+        for (host, name, error) in [
+            (
+                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
+                env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"),
+                "DoH response",
+            ),
+            (
+                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
+                env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
+                "DoH response",
+            ),
+            (
+                "gateway.example",
+                "keys.example",
+                "no OHTTP network configured",
+            ),
         ] {
+            let unmatched_name = format!("unmatched.{name}");
+            let body = doh_json(&unmatched_name, "aGVsbG8gd29ybGQ=");
             zcashlc_clear_last_error();
             let mut len = 0usize;
             let envelope = unsafe {

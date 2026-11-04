@@ -349,6 +349,19 @@ final class OHTTPNativeTests: XCTestCase {
         ])
         let envelope = try OHTTPNative.envelopeFromDohJSON(dohBody: body, gatewayHost: OHTTPTestSupport.mainnetHost.uppercased())
         XCTAssertEqual(envelope, expected)
-        XCTAssertThrowsError(try OHTTPNative.envelopeFromDohJSON(dohBody: body, gatewayHost: OHTTPTestSupport.testnetHost))
+    }
+
+    func testDNSEnvelopeParsingRejectsAnUnmatchedOwnerForEachNetwork() throws {
+        for (host, configuredName) in [
+            (OHTTPTestSupport.mainnetHost, OHTTPTestSupport.mainnetDNSName),
+            (OHTTPTestSupport.testnetHost, OHTTPTestSupport.testnetDNSName)
+        ] {
+            let unmatchedName = "unmatched.\(configuredName)"
+            let body = try JSONSerialization.data(withJSONObject: [
+                "Status": 0,
+                "Answer": [["name": unmatchedName, "type": 16, "TTL": 300, "data": "aGVsbG8gd29ybGQ="]]
+            ])
+            XCTAssertThrowsError(try OHTTPNative.envelopeFromDohJSON(dohBody: body, gatewayHost: host))
+        }
     }
 }
