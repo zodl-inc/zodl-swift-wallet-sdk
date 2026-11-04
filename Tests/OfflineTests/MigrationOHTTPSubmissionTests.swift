@@ -17,7 +17,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
         admission.require(false)
         do {
             _ = try await broadcaster.broadcast(
-                to: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443),
+                to: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443),
                 useTor: false, onWillSubmit: { state.event("willSubmit") },
                 prepareTransaction: { _ in
                     state.event("prepare")
@@ -29,7 +29,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
         XCTAssertEqual(state.values.withLock { $0.events }, [])
     }
 
-    private let endpoint = LightWalletEndpoint(address: "ohttp-gateway.example", port: 443)
+    private let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.mainnetHost, port: 443)
 
     private final class State: Sendable {
         struct Values: Sendable {
@@ -111,7 +111,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
     func testRealMigrationKeyPreparationUsesIsolatedConfiguration() async throws {
         let calls = State()
         _ = try await realBroadcaster().preparedOHTTPClient(
-            for: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443),
+            for: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443),
             viaTor: false, keyCache: OHTTPKeyCache(), testKeyVerifier: OHTTPTestSupport.makeKeyVerifier()
         ) { request, _ in
             calls.event(request.httpMethod ?? "")
@@ -120,7 +120,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
         XCTAssertEqual(calls.values.withLock { $0.events }, ["GET"])
     }
 
-    private let preparationEndpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443)
+    private let preparationEndpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443)
 
     private func preparationRoute(viaTor: Bool) throws -> OHTTPHealthRoute {
         OHTTPHealthRoute(
@@ -212,7 +212,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
             let operation = OHTTPHealthOperation()
             let attempt = OHTTPHealthAttempt(operation: operation)
             let envelope = OHTTPTestSupport.stubEnvelope.base64EncodedString()
-            let dns = Data("{\"Status\":0,\"Answer\":[{\"name\":\"ohttp-keys-testnet.example\",\"type\":16,\"TTL\":300,\"data\":\"\\\"\(envelope)\\\"\"}]}".utf8)
+            let dns = Data("{\"Status\":0,\"Answer\":[{\"name\":\"\(OHTTPTestSupport.testnetDNSName)\",\"type\":16,\"TTL\":300,\"data\":\"\\\"\(envelope)\\\"\"}]}".utf8)
             let error = await prepare(
                 viaTor: viaTor, cache: cache, operation: operation, attempt: attempt,
                 verifier: OHTTPTestSupport.makeKeyVerifier()

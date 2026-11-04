@@ -5,7 +5,7 @@
 //  The Swift side of the shared OHTTP core: the request text encoding, the packed header lists, the
 //  single-use response handle, and the C functions behind them (`zcashlc_ohttp_*`, iOS profile).
 //  The protocol's own rules (signed envelope, key selection, Binary HTTP, HPKE) are tested in the core
-//  (`zodl-inc/ohttp`, `client/`) and in `rust/src/ohttp.rs`.
+//  (`zodl-inc/zodl-ohttp`, `client/`) and in `rust/src/ohttp.rs`.
 //
 
 import XCTest
@@ -13,6 +13,37 @@ import CryptoKit
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPNativeTests: XCTestCase {
+    func testGatewayHostsExposeTheNativeBuildConfiguration() {
+        XCTAssertEqual(OHTTPNative.gatewayHost(for: .mainnet), OHTTPTestSupport.mainnetHost)
+        XCTAssertEqual(OHTTPNative.gatewayHost(for: .testnet), OHTTPTestSupport.testnetHost)
+        XCTAssertEqual(OHTTPEndpoints.gatewayHost(for: .mainnet), OHTTPTestSupport.mainnetHost)
+        XCTAssertEqual(OHTTPEndpoints.gatewayHost(for: .testnet), OHTTPTestSupport.testnetHost)
+    }
+
+    func testConfiguredGatewayRoutingNormalizesCaseAndRejectsTheOtherNetwork() throws {
+        for (network, host, otherNetwork) in [
+            (NetworkType.mainnet, OHTTPTestSupport.mainnetHost, NetworkType.testnet),
+            (NetworkType.testnet, OHTTPTestSupport.testnetHost, NetworkType.mainnet)
+        ] {
+            let suffix = network == .mainnet ? "MAINNET" : "TESTNET"
+            let expectedRelay = OHTTPTestSupport.configuredValue("ZODL_OHTTP_RELAY_URL_\(suffix)")
+            for caller in [host, host.uppercased(), host.lowercased()] {
+                XCTAssertTrue(OHTTPEndpoints.isGateway(caller))
+                XCTAssertEqual(try OHTTPEndpoints.relayURL(for: caller), expectedRelay)
+                let route = try OHTTPEndpoints.proxyRoute(for: caller, network: network)
+                XCTAssertEqual(route.gatewayHost, host)
+                XCTAssertEqual(route.relayURL, expectedRelay)
+                XCTAssertNoThrow(try OHTTPEndpoints.checkGatewayNetwork(host: caller, network: network))
+                XCTAssertThrowsError(try OHTTPEndpoints.checkGatewayNetwork(host: caller, network: otherNetwork))
+                XCTAssertThrowsError(try OHTTPEndpoints.proxyRoute(for: caller, network: otherNetwork))
+            }
+            XCTAssertFalse(OHTTPEndpoints.isGateway("\(host).attacker.example"))
+            let aliasRoute = try OHTTPEndpoints.proxyRoute(for: "vote.zodl.com", network: network)
+            XCTAssertEqual(aliasRoute.gatewayHost, host)
+            XCTAssertEqual(aliasRoute.relayURL, expectedRelay)
+        }
+    }
+
     private func makeKey(id: UInt8 = 0x05) -> OHTTPVerifiedKey {
         var bytes = Data([id])
         bytes.append(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation)
@@ -294,59 +325,30 @@ final class OHTTPNativeTests: XCTestCase {
     // MARK: - DNS Fallback Helpers
 
     func testDNSQueryURLsFollowTheResolverOrderAndTheNetwork() throws {
-        let mainnet = try OHTTPNative.dohQueryURLs(gatewayHost: "ohttp-gateway.example")
+        let mainnet = try OHTTPNative.dohQueryURLs(gatewayHost: OHTTPTestSupport.mainnetHost)
         XCTAssertEqual(mainnet.count, 2)
         XCTAssertTrue(mainnet[0].hasPrefix("https://cloudflare-dns.com/dns-query?"), mainnet[0])
         XCTAssertTrue(mainnet[1].hasPrefix("https://dns.google/resolve?"), mainnet[1])
         XCTAssertTrue(mainnet[1].contains("edns_client_subnet=0.0.0.0/0"), mainnet[1])
-        XCTAssertTrue(mainnet.allSatisfy { $0.contains("ohttp-keys.example") && $0.contains("type=TXT") })
+        XCTAssertTrue(mainnet.allSatisfy { $0.contains("\(OHTTPTestSupport.mainnetDNSName)") && $0.contains("type=TXT") })
 
-        let testnet = try OHTTPNative.dohQueryURLs(gatewayHost: "OHTTP-GATEWAY-TESTNET.zodl.com")
-        XCTAssertTrue(testnet.allSatisfy { $0.contains("ohttp-keys-testnet.example") })
+        let testnet = try OHTTPNative.dohQueryURLs(gatewayHost: OHTTPTestSupport.testnetHost.uppercased())
+        XCTAssertTrue(testnet.allSatisfy { $0.contains("\(OHTTPTestSupport.testnetDNSName)") })
     }
 
     func testDNSQueryURLsRefuseAnUnknownGatewayHost() {
         XCTAssertThrowsError(try OHTTPNative.dohQueryURLs(gatewayHost: "gateway.example"))
     }
 
-    func testDNSEnvelopeParsingWithRealFixture() throws {
-        // Real captured Cloudflare mainnet DoH JSON response (2026-10-20)
-        let cloudflareJSON = """
-        {
-          "Status": 0,
-          "TC": false,
-          "RD": true,
-          "RA": true,
-          "AD": false,
-          "CD": false,
-          "Question": [
-            {
-              "name": "ohttp-keys.example",
-              "type": 16
-            }
-          ],
-          "Answer": [
-            {
-              "name": "ohttp-keys.example",
-              "type": 16,
-              "TTL": 300,
-              "data": "\\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\\" \\"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\\""
-            }
-          ]
-        }
-        """
-
-        let dohBody = Data(cloudflareJSON.utf8)
-        let envelope = try OHTTPNative.envelopeFromDohJSON(dohBody: dohBody, gatewayHost: "ohttp-gateway.example")
-
-        XCTAssertFalse(envelope.isEmpty, "Parsed envelope should not be empty")
-        XCTAssertEqual(envelope.count, 264, "Expected envelope length from fixture")
-
-        // Verify the envelope can be parsed as JSON and has expected fields
-        let json = try JSONSerialization.jsonObject(with: envelope) as? [String: Any]
-        XCTAssertNotNil(json, "Envelope should be valid JSON")
-        XCTAssertEqual(json?["v"] as? Int, 1, "Envelope version should be 1")
-        XCTAssertEqual(json?["network"] as? String, "mainnet", "Network should be mainnet")
-        XCTAssertEqual(json?["key_id"] as? String, "ba8a2dbd", "Key ID should match fixture")
+    func testDNSEnvelopeParsingUsesTheConfiguredName() throws {
+        let expected = Data("{\"v\":1,\"network\":\"mainnet\",\"fixture\":true}".utf8)
+        let record = "\"\(expected.base64EncodedString())\""
+        let body = try JSONSerialization.data(withJSONObject: [
+            "Status": 0,
+            "Answer": [["name": OHTTPTestSupport.mainnetDNSName, "type": 16, "TTL": 300, "data": record]]
+        ])
+        let envelope = try OHTTPNative.envelopeFromDohJSON(dohBody: body, gatewayHost: OHTTPTestSupport.mainnetHost.uppercased())
+        XCTAssertEqual(envelope, expected)
+        XCTAssertThrowsError(try OHTTPNative.envelopeFromDohJSON(dohBody: body, gatewayHost: OHTTPTestSupport.testnetHost))
     }
 }

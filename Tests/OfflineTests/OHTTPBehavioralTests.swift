@@ -279,9 +279,10 @@ final class OHTTPBehavioralTests: XCTestCase {
     /// A DoH JSON answer under the testnet record name whose TXT value is an envelope signed for `network`
     /// (as the test verifier reads it: the real signature check is `OHTTPSignedConfigTests`).
     private func dohAnswer(network: String) -> Data {
-        let envelope = Data("{\"v\":1,\"network\":\"\(network)\",\"key_id\":\"a3620fb6\"}".utf8).base64EncodedString()
+        let keyId = OHTTPTestSupport.signingKeyId(for: network == "mainnet" ? .mainnet : .testnet)
+        let envelope = Data("{\"v\":1,\"network\":\"\(network)\",\"key_id\":\"\(keyId)\"}".utf8).base64EncodedString()
         return Data(
-            "{\"Status\":0,\"Answer\":[{\"name\":\"ohttp-keys-testnet.example\",\"type\":16,\"TTL\":300,\"data\":\"\\\"\(envelope)\\\"\"}]}".utf8
+            "{\"Status\":0,\"Answer\":[{\"name\":\"\(OHTTPTestSupport.testnetDNSName)\",\"type\":16,\"TTL\":300,\"data\":\"\\\"\(envelope)\\\"\"}]}".utf8
         )
     }
 
@@ -300,7 +301,7 @@ final class OHTTPBehavioralTests: XCTestCase {
         }
 
         let transport = OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             testKeyVerifier: verifier,
             keyCache: OHTTPKeyCache(),

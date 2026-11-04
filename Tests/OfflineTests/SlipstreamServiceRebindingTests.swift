@@ -5,7 +5,7 @@ import os
 
 final class SlipstreamServiceRebindingTests: ZcashTestCase {
     private let publicEndpoint = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
-    private let gatewayEndpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+    private let gatewayEndpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
 
     // A successful engine switch must move Swift RPCs too. The old service answers with its route,
     // so this fails on an actual stale RPC rather than on missing factory or wrapper symbols.

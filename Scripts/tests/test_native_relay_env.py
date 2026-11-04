@@ -64,7 +64,7 @@ else:
         startup.mkdir()
         (startup / '.zshenv').write_text('')
         self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith('ZODL_OHTTP_') and key not in ('CI', 'GITHUB_ACTIONS', 'CARGO_HOME', 'RUSTUP_HOME')}
+                    if not key.startswith('ZODL_OHTTP_') and key not in ('CI', 'GITHUB_ACTIONS', 'CARGO_HOME', 'RUSTUP_HOME', 'OHTTP_ENV_RESOLVED')}
         gh = tools / 'gh'
         gh.write_text('''#!/usr/bin/env python3
 import json,os,pathlib,sys

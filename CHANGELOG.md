@@ -8,6 +8,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+- `OHTTPEndpoints.gatewayHost(for:)` returns the gateway configured into the native SDK for the
+  selected network. Use it when constructing gateway endpoints instead of a fixed hostname.
+
 - `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
   with the default timing, send every transaction that was submitted but that no server has accepted yet
   through the given server, once and right away, and add that server at the end of each transaction's retry
@@ -28,6 +31,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged; actor-isolated callers must add `await`.
 
 ## Fixed
+
+- Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
+  the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
+  gateways from the other wallet network remain rejected. No call-site changes are required.
 
 - `SlipstreamSynchronizer.start(retry:)` revalidates retained Tor intent after a stopped or failed startup.
   Failed required restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint

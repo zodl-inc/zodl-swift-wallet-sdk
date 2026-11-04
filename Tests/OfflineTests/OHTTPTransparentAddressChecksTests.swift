@@ -51,7 +51,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
     /// 503, so each check reaches the relay and fails there.
     private func makeService(recorder: Recorder) -> LightWalletOHTTPService {
         let service = LightWalletOHTTPService(
-            endpoint: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true),
+            endpoint: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true),
             singleCallTimeout: 1000,
             streamingCallTimeout: 1000,
             tor: TorClient(torDir: FileManager.default.temporaryDirectory),
@@ -97,7 +97,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
             XCTAssertEqual(code, 14)
         }
         // The key configuration may already sit in the process-wide cache from an earlier test; the POST is the proof.
-        let relay = try XCTUnwrap(OHTTPNative.relayURL(for: "ohttp-gateway-testnet.example"))
+        let relay = try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.testnetHost))
         XCTAssertEqual(recorder.posts.map { $0.url?.absoluteString }, [relay], "the GetTaddressTxids exchange is posted to the relay, sealed")
     }
 
@@ -194,7 +194,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
         )
         let tor = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
         let service = LightWalletOHTTPService(
-            endpoint: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true),
+            endpoint: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true),
             singleCallTimeout: 1000,
             streamingCallTimeout: 1000,
             tor: tor,

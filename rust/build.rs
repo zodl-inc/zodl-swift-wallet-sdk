@@ -118,6 +118,7 @@ fn main() {
             "zcashlc_ohttp_stream_decoder_free",
             "zcashlc_ohttp_signed_config_url",
             "zcashlc_ohttp_relay_url_for",
+            "zcashlc_ohttp_gateway_host",
             "zcashlc_ohttp_profile_info",
             "zcashlc_free_ohttp_profile_info",
             "zcashlc_ohttp_doh_resolver_count",

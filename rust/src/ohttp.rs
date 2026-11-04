@@ -34,11 +34,10 @@ use std::ptr;
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
-    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseDecoder, ChunkedResponseOpener, ClientProfile, KEY_BYTES, KeyConfig, Network,
-    OuterOutcome, OuterResponse, ResponseEvent, check_size, classify_outer_response,
-    encapsulate_chunked_request, encode_bhttp_request, pack_fields, signed_config_url,
-    unpack_fields, verify_signed_config,
+    BhttpRequest, BhttpResponse, ChunkedResponseDecoder, ChunkedResponseOpener, ClientProfile,
+    KEY_BYTES, KeyConfig, Network, OuterOutcome, OuterResponse, ResponseEvent, check_size,
+    classify_outer_response, encapsulate_chunked_request, encode_bhttp_request, pack_fields,
+    signed_config_url, unpack_fields, verify_signed_config,
 };
 
 /// Typed local metadata from the immediately preceding complete/push/finish call.
@@ -255,7 +254,9 @@ pub unsafe extern "C" fn zcashlc_ohttp_verify_key_config(
             .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
         let json = unsafe { bytes(json, json_len)? };
 
-        let network = profile.network_rule.network_for(host)?;
+        let network = profile
+            .network_rule
+            .network_for(canonical_gateway_host(host))?;
         let signed = verify_signed_config(json, network, now_secs, &profile.signed_config)?;
         let key = KeyConfig::select_with(&signed.document, &profile.key_selection)?;
 
@@ -984,9 +985,43 @@ pub unsafe extern "C" fn zcashlc_ohttp_signed_config_url(
     unwrap_exc_or_null(res)
 }
 
+/// The configured gateway host of `network`; required by the SDK native build guard.
+pub(crate) fn gateway_host(network: Network) -> anyhow::Result<&'static str> {
+    match network {
+        Network::Mainnet => zodl_ohttp_client::GATEWAY_HOST_MAINNET,
+        Network::Testnet => zodl_ohttp_client::GATEWAY_HOST_TESTNET,
+    }
+    .ok_or_else(|| anyhow!("SDK invariant: missing OHTTP gateway configuration"))
+}
+
+/// Restore the exact configured spelling expected by the core after ASCII-insensitive matching.
+/// Unknown hosts remain unknown to the core's exact-match network and relay maps.
+fn canonical_gateway_host(host: &str) -> &str {
+    [Network::Mainnet, Network::Testnet]
+        .into_iter()
+        .filter_map(|network| gateway_host(network).ok())
+        .find(|configured| configured.eq_ignore_ascii_case(host))
+        .unwrap_or(host)
+}
+
+/// Returns the configured mainnet (`false`) or testnet (`true`) gateway host.
+/// Each result is an independently allocated string freed with `zcashlc_string_free`.
+/// Returns null with the thread-local last error on an SDK configuration invariant failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_ohttp_gateway_host(is_testnet: bool) -> *mut c_char {
+    let res = catch_panic(|| {
+        let network = if is_testnet {
+            Network::Testnet
+        } else {
+            Network::Mainnet
+        };
+        Ok(CString::new(gateway_host(network)?)?.into_raw())
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Returns the relay URL for a given gateway host, or null if the host is not a known gateway.
-/// The built-in mapping can be overridden at build time via environment variables
-/// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
+/// The mapping is supplied at build time. Caller host matching ignores ASCII case.
 ///
 /// The string is freed with `zcashlc_string_free`.
 ///
@@ -1002,7 +1037,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_relay_url_for(
     let res = catch_panic(|| {
         let gateway_host = std::str::from_utf8(unsafe { bytes(gateway_host, gateway_host_len)? })
             .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
-        match zodl_ohttp_client::relay_for(gateway_host) {
+        match zodl_ohttp_client::relay_for(canonical_gateway_host(gateway_host)) {
             Some(relay_url) => Ok(CString::new(relay_url)?.into_raw()),
             None => Ok(ptr::null_mut()),
         }
@@ -1052,7 +1087,7 @@ pub unsafe extern "C" fn zcashlc_free_ohttp_profile_info(ptr: *mut OhttpProfileI
 }
 
 /// The network of a gateway host for the DNS source: the same static known-hosts rule as the
-/// key-config verification, on the lower-cased host.
+/// key-config verification, normalized to its exact configured spelling.
 ///
 /// # Safety
 ///
@@ -1060,7 +1095,7 @@ pub unsafe extern "C" fn zcashlc_free_ohttp_profile_info(ptr: *mut OhttpProfileI
 unsafe fn dns_network(host: *const u8, host_len: usize) -> anyhow::Result<Network> {
     let host = std::str::from_utf8(unsafe { bytes(host, host_len)? })
         .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
-    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&host.to_ascii_lowercase())?)
+    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(canonical_gateway_host(host))?)
 }
 
 /// The number of DNS-over-HTTPS resolvers of the signed Key Configuration DNS source, tried in
@@ -1091,7 +1126,9 @@ pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
         let resolver = zodl_ohttp_client::DOH_RESOLVERS
             .get(index as usize)
             .ok_or_else(|| anyhow!("no DoH resolver {index}"))?;
-        Ok(CString::new(zodl_ohttp_client::doh_query_url(resolver, network))?.into_raw())
+        let url = zodl_ohttp_client::doh_query_url(resolver, network)
+            .ok_or_else(|| anyhow!("SDK invariant: missing OHTTP DNS configuration"))?;
+        Ok(CString::new(url)?.into_raw())
     });
     unwrap_exc_or_null(res)
 }
@@ -1138,6 +1175,57 @@ pub unsafe extern "C" fn zcashlc_ohttp_free_bytes(ptr: *mut u8, len: usize) {
 mod tests {
     use super::*;
     use crate::{zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length};
+    use zodl_ohttp_client::{CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES};
+
+    #[test]
+    fn gateway_host_lookup_returns_independently_owned_configured_strings() {
+        for (testnet, expected) in [
+            (false, env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")),
+            (true, env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")),
+        ] {
+            let first = zcashlc_ohttp_gateway_host(testnet);
+            let second = zcashlc_ohttp_gateway_host(testnet);
+            assert!(!first.is_null());
+            assert!(!second.is_null());
+            assert_ne!(first, second);
+            unsafe { zcashlc_string_free(first) };
+            assert_eq!(
+                unsafe { CStr::from_ptr(second) }.to_str().unwrap(),
+                expected
+            );
+            unsafe { zcashlc_string_free(second) };
+        }
+    }
+
+    #[test]
+    fn configured_relay_lookup_normalizes_caller_case() {
+        for (host, expected) in [
+            (
+                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
+                env!("ZODL_OHTTP_RELAY_URL_MAINNET"),
+            ),
+            (
+                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
+                env!("ZODL_OHTTP_RELAY_URL_TESTNET"),
+            ),
+        ] {
+            for caller in [
+                host.to_owned(),
+                host.to_ascii_uppercase(),
+                host.to_ascii_lowercase(),
+            ] {
+                let relay = unsafe { zcashlc_ohttp_relay_url_for(caller.as_ptr(), caller.len()) };
+                assert!(!relay.is_null(), "configured gateway must have a relay");
+                assert_eq!(unsafe { CStr::from_ptr(relay) }.to_str().unwrap(), expected);
+                unsafe { zcashlc_string_free(relay) };
+            }
+            let lookalike = format!("{host}.attacker.example");
+            assert!(
+                unsafe { zcashlc_ohttp_relay_url_for(lookalike.as_ptr(), lookalike.len()) }
+                    .is_null()
+            );
+        }
+    }
 
     /// The thread's last error, which the Swift side maps by its prefix (`OHTTPError.native`).
     fn last_error_message() -> String {
@@ -1314,7 +1402,7 @@ mod tests {
 
     #[test]
     fn a_bad_envelope_is_an_error() {
-        let host = "ohttp-gateway-testnet.example";
+        let host = env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET");
         for json in [&b"not json"[..], b"{}", b""] {
             zcashlc_clear_last_error();
             let key = unsafe {
@@ -1591,10 +1679,13 @@ mod tests {
     fn the_doh_query_urls_follow_the_resolver_order_and_the_network() {
         assert_eq!(zcashlc_ohttp_doh_resolver_count(), 2);
         for (host, name) in [
-            ("ohttp-gateway.example", "ohttp-keys.example"),
             (
-                "OHTTP-GATEWAY-TESTNET.zodl.com",
-                "ohttp-keys-testnet.example",
+                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
+                env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"),
+            ),
+            (
+                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
+                env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
             ),
         ] {
             let urls: Vec<String> = (0..2)
@@ -1626,7 +1717,7 @@ mod tests {
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_doh_query_url(0, host.as_ptr(), host.len()) }.is_null());
         assert!(last_error_message().contains("no OHTTP network configured"));
-        let host = "ohttp-gateway.example";
+        let host = env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET");
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_doh_query_url(2, host.as_ptr(), host.len()) }.is_null());
         assert!(last_error_message().contains("no DoH resolver 2"));
@@ -1642,10 +1733,10 @@ mod tests {
 
     #[test]
     fn the_envelope_of_a_doh_answer_is_extracted_for_the_gateway_network() {
-        let host = "ohttp-gateway-testnet.example";
+        let host = env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET");
         // "hello world" in two quoted strings, as the record is published.
         let body = doh_json(
-            "ohttp-keys-testnet.example",
+            env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
             r#"\"aGVsbG8g\" \"d29ybGQ=\""#,
         );
         let mut len = 0usize;
@@ -1665,9 +1756,9 @@ mod tests {
 
     #[test]
     fn a_doh_answer_for_another_name_or_an_unknown_gateway_is_refused() {
-        let body = doh_json("ohttp-keys.example", "aGVsbG8gd29ybGQ=");
+        let body = doh_json(env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"), "aGVsbG8gd29ybGQ=");
         for (host, error) in [
-            ("ohttp-gateway-testnet.example", "DoH response"),
+            (env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"), "DoH response"),
             ("gateway.example", "no OHTTP network configured"),
         ] {
             zcashlc_clear_last_error();

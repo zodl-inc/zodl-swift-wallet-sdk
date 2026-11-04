@@ -918,7 +918,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
     func testLegacyFactoryRejectsBindingChangedDuringRealLookup() async throws {
         let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
         await fixture.synchronizer.updateStatus(.unprepared)
-        let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
         let config = await fixture.synchronizer.blockProcessor.config
         var info = LightdInfo()
         info.chainName = "test"

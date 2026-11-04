@@ -98,7 +98,7 @@ final class EndpointSubmitterTests: ZcashTestCase {
             }
             rustBackend.checkTransactionSubmittableSubmissionServerHeightReturnValue = scenario == "local" ? .expired : nil
             let tor = TorClient(torDir: try __torDirURL())
-            let endpoint = LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443)
+            let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443)
             let submitter = GRPCEndpointSubmitter(
                 torClient: tor, sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
                 rustBackend: rustBackend, logger: submissionLifecycleLogger(), networkType: .testnet,

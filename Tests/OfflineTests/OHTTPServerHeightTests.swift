@@ -7,7 +7,7 @@ final class OHTTPServerHeightTests: XCTestCase {
 
     private func makeService() -> LightWalletOHTTPService {
         let service = LightWalletOHTTPService(
-            endpoint: LightWalletEndpoint(address: "ohttp-gateway-testnet.example", port: 443, secure: true),
+            endpoint: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true),
             singleCallTimeout: 1000,
             streamingCallTimeout: 1000,
             tor: TorClient(torDir: FileManager.default.temporaryDirectory),

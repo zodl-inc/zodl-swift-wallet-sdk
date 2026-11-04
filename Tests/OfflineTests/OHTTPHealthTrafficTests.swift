@@ -6,7 +6,7 @@ import os
 
 final class OHTTPHealthTrafficTests: XCTestCase {
     private func route() -> OHTTPHealthRoute {
-        OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://\(UUID().uuidString.lowercased()).test/relay", viaTor: false)
+        OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString.lowercased()).test/relay", viaTor: false)
     }
 
     private func transport(_ route: OHTTPHealthRoute, error: Error, keyFailure: Bool = false) -> OHTTPTransport {
@@ -318,7 +318,7 @@ final class OHTTPHealthTrafficTests: XCTestCase {
 
     func testDiagnosticKeyHeadRejectionSurvivesBodyDeadlineAndBlocksRateLimitFallback() async throws {
         for status in [403, 426, 429] {
-            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://key-\(status).test/relay", viaTor: true)
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://key-\(status).test/relay", viaTor: true)
             let session = try OHTTPHealthSession(route: route, generation: UUID())
             defer { session.close() }
             var requests = 0
@@ -363,7 +363,7 @@ final class OHTTPHealthTrafficTests: XCTestCase {
     func testDirectAndStreamOuterRejectionsSurviveBodyFailure() async throws {
         for status in [404, 409, 422] {
             for streaming in [false, true] {
-                let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "ohttp-gateway-testnet.example", relayURL: "https://\(UUID().uuidString.lowercased()).test/\(status)", viaTor: false)
+                let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString.lowercased()).test/\(status)", viaTor: false)
                 let session = try OHTTPHealthSession(route: route, generation: UUID())
                 defer { session.close() }
                 let peer = try RejectedHealthPeer(status: status)

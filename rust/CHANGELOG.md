@@ -6,7 +6,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated configured gateway host
+  (`false` mainnet, `true` testnet). Free each result with `zcashlc_string_free`.
+
 ### Fixed
+
+- OHTTP relay lookup, signed-key verification and DNS helpers recognize configured gateway hosts
+  ignoring ASCII case, and voting uses the configured gateway for its network. Unknown gateway
+  hosts remain errors for key and DNS operations. Existing function signatures are unchanged.
 
 - OHTTP decoding failures preserve authenticated canonical gRPC status from HTTP 200
   application/grpc heads and trailers, with trailers taking precedence. Metadata is isolated

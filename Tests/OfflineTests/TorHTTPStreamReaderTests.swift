@@ -215,7 +215,7 @@ final class TorCappedErrorBodyClassificationTests: XCTestCase {
         streamSender: @escaping OHTTPTransport.StreamSender
     ) -> OHTTPTransport {
         OHTTPTransport(
-            gatewayHost: "ohttp-gateway-testnet.example",
+            gatewayHost: OHTTPTestSupport.testnetHost,
             relayURL: "https://testnet-operator-relay.example.invalid/relay",
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: OHTTPKeyCache(),

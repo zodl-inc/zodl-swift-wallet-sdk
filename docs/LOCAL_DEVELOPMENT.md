@@ -42,6 +42,15 @@ No manual `Package.swift` edits are needed.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
 
+## Configured gateway endpoints
+
+`OHTTPEndpoints.gatewayHost(for:)` exposes the native build's gateway hostname for each network.
+Use this getter to construct `LightWalletEndpoint` values. Gateway, relay, signed-configuration
+and DNS routing share this native configuration; caller host matching ignores ASCII case and
+returns the exact configured spelling. Unknown hosts are not recognized as gateways, and
+cross-network gateway requests are rejected. The gateway getter's native failure indicates an
+SDK invariant violation: every source build requires both network configurations below.
+
 ## Required OHTTP build inputs
 
 Every SDK native source build requires these eight nonempty exported values:
