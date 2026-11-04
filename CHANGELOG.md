@@ -32,6 +32,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
   Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
 
+- OHTTP relay connections detect silent calls from received traffic and per-call stall limits
+  without HTTP/2 keep-alive PINGs, so slow or Tor connections are not retired for a late PING
+  response. A connection whose response body stays silent past its timeout is no longer reused.
+
 - `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
   `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
   are unchanged; actor-isolated callers must add `await`.
