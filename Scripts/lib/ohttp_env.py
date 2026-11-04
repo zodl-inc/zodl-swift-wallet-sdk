@@ -32,7 +32,7 @@ def validate_relay_url(name: str, value: str | None, *, required: bool) -> None:
         if any(character.isspace() or unicodedata.category(character) in ('Cc', 'Cf') for character in value):
             raise ValueError()
         parsed = urlsplit(value)
-        if parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        if not value.startswith('https://') or parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None or parsed.password is not None:
             raise ValueError()
         # Older system Python accepts junk after a bracketed IPv6 host.
         if parsed.netloc.startswith('['):

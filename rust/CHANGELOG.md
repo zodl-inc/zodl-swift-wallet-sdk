@@ -13,6 +13,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
 - OHTTP relay lookup, signed-key verification and DNS helpers recognize configured gateway hosts
   ignoring ASCII case, and voting uses the configured gateway for its network. Unknown gateway
   hosts remain errors for key and DNS operations. Existing function signatures are unchanged.

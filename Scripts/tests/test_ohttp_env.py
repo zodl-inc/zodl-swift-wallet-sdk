@@ -149,6 +149,16 @@ class RelayEnvironmentTests(unittest.TestCase):
                 self.assertIn(MAINNET, str(error.exception))
                 self.assertNotIn(value, str(error.exception))
 
+    def test_relay_requires_literal_lowercase_scheme_without_disclosing_values(self):
+        for name in (MAINNET, TESTNET):
+            for value in ('HTTPS://private-canary.invalid/relay', 'hTtPs://private-canary.invalid/relay',
+                          'https://@private-canary.invalid/relay', 'https://:443/relay', 'https://[]/relay'):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        self.resolve(dict(VALUES, CI='1', **{name: value}))
+                    self.assertIn(name, str(caught.exception))
+                    self.assertNotIn(value, str(caught.exception))
+
     def test_ci_never_invokes_any_loader(self):
         def forbidden(*args):
             self.fail('CI tried an external loader')

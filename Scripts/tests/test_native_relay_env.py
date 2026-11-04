@@ -126,8 +126,11 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
     def test_malformed_hosts_stop_native_entrypoints_before_cargo(self):
         marker = self.root / 'cargo.jsonl'
         for command in (['bash', 'Scripts/init-local-ffi.sh', '--arm-macos'], ['make', 'ffi-ci']):
-            for name in (NAMES[0], NAMES[1], NAMES[6], NAMES[7]):
-                for value in ('https://private-canary.invalid/path', '_private-canary.invalid'):
+            for name in (NAMES[0], NAMES[1], NAMES[6], NAMES[7], MAINNET, TESTNET):
+                invalid = ('HTTPS://private-canary.invalid/relay', 'hTtPs://private-canary.invalid/relay',
+                           'https://@private-canary.invalid/relay', 'https://:443/relay', 'https://[]/relay') if name in (MAINNET, TESTNET) else (
+                               'https://private-canary.invalid/path', '_private-canary.invalid')
+                for value in invalid:
                     with self.subTest(command=command, name=name, value=value):
                         marker.unlink(missing_ok=True)
                         environment = dict(self.env, **VALUES, CI='1')

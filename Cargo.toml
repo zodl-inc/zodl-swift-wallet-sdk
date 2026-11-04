@@ -162,7 +162,7 @@ hex = "0.4"
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
 # fails loudly, a branch would follow a force-push. Both SDK and Slipstream share this source.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "61ba3dbb48f76276f84d9efa2e4539b52455a769", default-features = false }
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "650bb4ac5015dde96f22b67d7d77dc1020be9ed8", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -225,7 +225,7 @@ strip = false
 
 [patch.crates-io]
 # OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "d99bfb9a9d6060729064e54d014471308d6690d8" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "a1e01f1719139a7d3d4d9baf23e47aef66ce038b" }
 
 # DO NOT ALTER THIS COMMENT
 #

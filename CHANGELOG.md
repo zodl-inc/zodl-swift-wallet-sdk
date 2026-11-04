@@ -32,8 +32,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
-- Native source-build wrappers reject malformed OHTTP gateway and DNS names before starting
-  Cargo, without including configured values in validation errors. No call-site changes are required.
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
+- Native source-build wrappers reject malformed OHTTP gateway/DNS names and relay URL schemes
+  before starting Cargo, without including configured values in validation errors. No call-site changes are required.
 
 - Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
   the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
