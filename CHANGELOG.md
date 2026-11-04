@@ -164,13 +164,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For custom regtest snapshots at height 11 or later, the registered activation schedule must
   select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
 
-- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
-  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
-  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
-  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
-  the flood was previously processed without limit. lightwalletd's block streams, which send one
-  small frame per compact block, stay within the limit. No caller changes are required.
-
 ## Added
 
 - `OHTTPHealthContext.complete(_:failed:allFailedAttempts:)` accepts the complete finite set of
@@ -300,6 +293,35 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
   responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
   no longer used. See PR #4 in zodl-inc/ohttp.
+
+# 7.0.1 - 2026-11-02
+
+## Fixed
+
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3532500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3537500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4550000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4570000.json
+````
 
 # 7.0.0 - 2026-10-27
 
