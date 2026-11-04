@@ -20,6 +20,7 @@ OHTTP_NAMES = tuple('ZODL_OHTTP_' + suffix for suffix in (
 GITHUB_REPOSITORY = 'zodl-inc/zodl-swift-wallet-sdk-private'
 
 RELAY_NAMES = ('ZODL_OHTTP_RELAY_URL_MAINNET', 'ZODL_OHTTP_RELAY_URL_TESTNET')
+HOST_NAMES = OHTTP_NAMES[:2] + OHTTP_NAMES[6:]
 
 
 def validate_relay_url(name: str, value: str | None, *, required: bool) -> None:
@@ -142,6 +143,14 @@ def validate_configuration(environ: dict[str, str]) -> None:
             raise ValueError(f'{name} contains invalid data') from None
         if any(unicodedata.category(character) == 'Cc' for character in environ[name]):
             raise ValueError(f'{name} contains invalid data')
+        if name in HOST_NAMES:
+            value = environ[name]
+            # Match the core build script's bare ASCII DNS host grammar before Cargo starts.
+            if not (len(value) <= 253 and all(
+                    0 < len(label) <= 63 and not label.startswith('-') and not label.endswith('-')
+                    and all(character.isascii() and (character.isalnum() or character == '-') for character in label)
+                    for label in value.split('.'))):
+                raise ValueError(f'{name} must be a bare DNS host name (no scheme, port, path or trailing dot)')
     # Match Rust's eq_ignore_ascii_case rather than Unicode case folding.
     ascii_lower = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
     if environ[OHTTP_NAMES[0]].translate(ascii_lower) == environ[OHTTP_NAMES[1]].translate(ascii_lower):

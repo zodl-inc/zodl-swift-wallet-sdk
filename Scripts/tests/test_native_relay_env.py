@@ -20,7 +20,7 @@ COMPILER_ENVIRONMENT_NAMES = (
 )
 MAIN_URL = 'https://main.example.invalid/relay'
 TEST_URL = 'https://test.example.invalid/relay'
-VALUES = dict(zip(NAMES, ('main.example.invalid', 'test.example.invalid', MAIN_URL, TEST_URL, 'a'*64, 'b'*64, '_main.example.invalid', '_test.example.invalid')))
+VALUES = dict(zip(NAMES, ('main.example.invalid', 'test.example.invalid', MAIN_URL, TEST_URL, 'a'*64, 'b'*64, 'main.example.invalid', 'test.example.invalid')))
 
 
 class NativeRelayEnvironmentTests(unittest.TestCase):
@@ -122,6 +122,22 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
         self.assertEqual([call[2] for call in lookups], list(NAMES))
         self.assertTrue(all(call[3:] == ['--repo', 'zodl-inc/zodl-swift-wallet-sdk-private', '--json', 'name,value'] for call in lookups))
         return calls
+
+    def test_malformed_hosts_stop_native_entrypoints_before_cargo(self):
+        marker = self.root / 'cargo.jsonl'
+        for command in (['bash', 'Scripts/init-local-ffi.sh', '--arm-macos'], ['make', 'ffi-ci']):
+            for name in (NAMES[0], NAMES[1], NAMES[6], NAMES[7]):
+                for value in ('https://private-canary.invalid/path', '_private-canary.invalid'):
+                    with self.subTest(command=command, name=name, value=value):
+                        marker.unlink(missing_ok=True)
+                        environment = dict(self.env, **VALUES, CI='1')
+                        environment[name] = value
+                        result = subprocess.run(command, cwd=self.root, env=environment, text=True,
+                                                capture_output=True, timeout=30)
+                        self.assertFalse(marker.exists(), 'Cargo started before malformed host rejection')
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(name, result.stderr)
+                        self.assertNotIn(value, result.stdout + result.stderr)
 
     def test_ci_compiler_overrides_cannot_escape_fixture_tools(self):
         marker = self.root / 'escaped-compiler'

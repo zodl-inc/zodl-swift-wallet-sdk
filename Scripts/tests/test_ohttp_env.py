@@ -17,7 +17,7 @@ NAMES = tuple('ZODL_OHTTP_' + suffix for suffix in (
     'GATEWAY_HOST_MAINNET', 'GATEWAY_HOST_TESTNET', 'RELAY_URL_MAINNET', 'RELAY_URL_TESTNET',
     'SIGNING_PUBKEY_MAINNET', 'SIGNING_PUBKEY_TESTNET', 'KEYS_DNS_NAME_MAINNET', 'KEYS_DNS_NAME_TESTNET'))
 VALUES = dict(zip(NAMES, ('main.example.invalid', 'test.example.invalid', MAIN_URL, TEST_URL,
-                          'a' * 64, 'b' * 64, '_main.example.invalid', '_test.example.invalid')))
+                          'a' * 64, 'b' * 64, 'main.example.invalid', 'test.example.invalid')))
 
 
 class RelayEnvironmentTests(unittest.TestCase):
@@ -88,6 +88,32 @@ class RelayEnvironmentTests(unittest.TestCase):
             self.assertIn(name, str(error.exception))
             self.assertNotIn('private-input', str(error.exception))
 
+    def test_bare_host_grammar_rejects_invalid_inputs_without_values(self):
+        invalid = ('https://private-canary.invalid/path', 'private-canary.invalid:443',
+                   'private-canary.invalid/path', 'private-canary.invalid?query', 'private-canary.invalid#fragment',
+                   '.private-canary.invalid', 'private-canary.invalid.', 'private-canary..invalid',
+                   '-private-canary.invalid', 'private-canary-.invalid', '_private-canary.invalid',
+                   'private canary.invalid', 'private\\canary.invalid', 'prívate-canary.invalid',
+                   'private-canary.\u200b.invalid', 'a' * 64 + '.invalid',
+                   '.'.join(('a' * 63,) * 3 + ('b' * 62,)))
+        for name in (NAMES[0], NAMES[1], NAMES[6], NAMES[7]):
+            for value in invalid:
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        self.resolve(dict(VALUES, CI='1', **{name: value}))
+                    self.assertIn(name, str(caught.exception))
+                    self.assertIn('bare DNS host name', str(caught.exception))
+                    self.assertNotIn(value, str(caught.exception))
+
+    def test_bare_host_grammar_preserves_valid_boundary_values(self):
+        valid = ('a', '0', '127.0.0.1', 'A-1.example.INVALID', 'xn--bcher-kva.invalid',
+                 'a' * 63 + '.invalid', '.'.join(('a' * 63,) * 3 + ('b' * 61,)))
+        for name in (NAMES[0], NAMES[1], NAMES[6], NAMES[7]):
+            for value in valid:
+                with self.subTest(name=name, value=value):
+                    environment = dict(VALUES, CI='1', **{name: value})
+                    self.assertEqual(environment, self.resolve(environment))
+
     def test_duplicate_gateway_rejected_ignoring_ascii_case(self):
         values = dict(VALUES)
         values[NAMES[1]] = values[NAMES[0]].upper()
@@ -102,7 +128,8 @@ class RelayEnvironmentTests(unittest.TestCase):
             for field in (name, VALUES[name]):
                 encoded = field.encode('utf-8')
                 payload += len(encoded).to_bytes(8, 'big') + encoded
-        expected = hashlib.sha256(payload).hexdigest()
+        expected = 'a2bddd883cc977a28d0a01647b082acb5a15c3add9773f9e3330e0d5f9f17241'
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), expected)
         self.assertEqual(self.runner.configuration_hash(VALUES), expected)
         self.assertEqual(self.runner.configuration_hash(dict(reversed(list(VALUES.items())), OTHER='ignored')), expected)
         for name in NAMES:

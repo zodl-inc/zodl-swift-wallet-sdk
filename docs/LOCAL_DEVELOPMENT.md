@@ -64,9 +64,14 @@ Every SDK native source build requires these eight nonempty exported values:
 - `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
 - `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
 
-The gateway hosts must differ ignoring ASCII case. Relay URLs must be valid
-HTTPS URLs. The native OHTTP library owns host, DNS and public-key format
-validation. There is exactly one configured SDK product.
+The gateway hosts must differ ignoring ASCII case. Gateway hosts and key DNS
+names must be bare ASCII DNS names: at most 253 characters total, with nonempty
+dot-separated labels of at most 63 letters, digits or hyphens, and no leading or
+trailing label hyphen. Schemes, ports, paths, trailing dots and underscores are
+rejected before Cargo starts, with variable-name-only diagnostics. Relay URLs
+must be valid HTTPS URLs. The native OHTTP library remains authoritative for
+configuration formats, including public keys. There is exactly one configured
+SDK product.
 
 Local source-build entrypoints resolve once before architecture loops. Inherited
 values win, including explicitly empty strings (which fail validation). Absent

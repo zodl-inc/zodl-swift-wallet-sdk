@@ -29,7 +29,7 @@ _ffi_hash() {
     CI=1 ZODL_OHTTP_GATEWAY_HOST_MAINNET=main.example.invalid ZODL_OHTTP_GATEWAY_HOST_TESTNET=test.example.invalid \
     ZODL_OHTTP_RELAY_URL_MAINNET="${HASH_RELAY_MAINNET:-https://main.example.invalid/relay}" ZODL_OHTTP_RELAY_URL_TESTNET=https://test.example.invalid/relay \
     ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-    ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=_main.example.invalid ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=_test.example.invalid \
+    ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=main.example.invalid ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=test.example.invalid \
         "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$1"
 }
 
