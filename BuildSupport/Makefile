@@ -5,7 +5,7 @@ SHELL := bash
 MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
 
-# Internal re-entry and dry runs already have a safe build environment.
+# The marker prevents recursive wrappers; native boundaries still validate inputs.
 OHTTP_ENV_RESOLVED ?=
 OHTTP_BUILD_READY := $(filter 1,$(OHTTP_ENV_RESOLVED))$(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS))))
 
@@ -53,7 +53,10 @@ install:
 # Direct BuildSupport entrypoints need the same one-resolution boundary.
 # A dry run prints the complete graph without resolving any configuration.
 ifneq ($(OHTTP_BUILD_READY),)
-release: clean xcframework
+release:
+	python3 ../Scripts/lib/ohttp_env.py --required
+	$(MAKE) clean
+	$(MAKE) xcframework
 .PHONY: release
 
 # Discard assembled build products. ../target is deliberately preserved so that

@@ -27,7 +27,7 @@ CARGO ?= cargo
 BUILD_SUPPORT := BuildSupport
 SCRIPTS := Scripts
 
-# Internal re-entry and dry runs already have a safe build environment.
+# The marker prevents recursive wrappers; native boundaries still validate inputs.
 OHTTP_ENV_RESOLVED ?=
 OHTTP_BUILD_READY := $(filter 1,$(OHTTP_ENV_RESOLVED))$(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS))))
 
@@ -252,6 +252,7 @@ ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
 # $(MAKE), and the script tests dry-run this target.
 .PHONY: ffi-ci
 ffi-ci: require-macos ## Build the FFI the way CI does: arm64 macOS only, without fat LTO
+	python3 $(SCRIPTS)/lib/ohttp_env.py --required
 	rm -rf $(BUILD_SUPPORT)/products/macos
 	CARGO_PROFILE_RELEASE_LTO=false $(MAKE) ffi-macos MACOS_ARCHS=aarch64-apple-darwin
 

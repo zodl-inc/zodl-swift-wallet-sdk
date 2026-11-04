@@ -93,7 +93,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         let birthday: BlockHeight = Env.environment["OHTTP_E2E_SEND_BIRTHDAY"].flatMap { Int($0) } ?? 4_123_865
         let sendAmount = Zatoshi(Env.environment["OHTTP_E2E_SEND_ZATOSHI"].flatMap { Int64($0) } ?? 1_000_000)
 
-        log("scenario=send network=\(networkString) gateway=\(gatewayHost) birthday=\(birthday) amount=\(sendAmount.amount) recipient=\(recipientUA.prefix(20))...")
+        log("scenario=send network=\(networkString) birthday=\(birthday) amount=\(sendAmount.amount) recipient=\(recipientUA.prefix(20))...")
 
         // Leg A: OHTTP only (Tor off)
         try await sendLeg(seed: seed2, birthday: birthday, recipientUA: recipientUA, amount: sendAmount, network: network, gatewayHost: gatewayHost, tor: false)
@@ -104,7 +104,7 @@ final class OHTTPE2ETests: ZcashTestCase {
 
     private func sendLeg(seed: Data, birthday: BlockHeight, recipientUA: String, amount: Zatoshi, network: NetworkType, gatewayHost: String, tor: Bool) async throws {
         let mode = tor ? "tor" : "ohttp"
-        log("SEND LEG mode=\(mode) network=\(network) gateway=\(gatewayHost) birthday=\(birthday)")
+        log("SEND LEG mode=\(mode) network=\(network) birthday=\(birthday)")
 
         let endpoint = LightWalletEndpoint(
             address: gatewayHost,
@@ -300,8 +300,9 @@ final class OHTTPE2ETests: ZcashTestCase {
 
         let mode = tor ? "tor+ohttp" : "ohttp"
         let host = Env.gatewayHost
-        XCTAssertTrue(OHTTPEndpoints.isGateway(host), "\(host) must be a configured OHTTP gateway")
-        log("mode=\(mode) gateway=\(host) relay=\(try OHTTPEndpoints.relayURL(for: host)) birthday=\(Env.birthday)")
+        XCTAssertTrue(OHTTPEndpoints.isGateway(host), "the testnet gateway host must be a configured OHTTP gateway")
+        _ = try OHTTPEndpoints.relayURL(for: host)
+        log("mode=\(mode) birthday=\(Env.birthday)")
         log("host egress ip=\(await publicIP(via: nil) ?? "unknown")")
 
         let endpoint = LightWalletEndpoint(
@@ -716,7 +717,7 @@ extension OHTTPE2ETests {
         let environment = ProcessInfo.processInfo.environment
         let tor = environment["OHTTP_E2E_TOR"] == "1"
         let mode = tor ? "tor" : "ohttp"
-        log("mode=\(mode) network=mainnet gateway=\(OHTTPEndpoints.gatewayHost(for: .mainnet))")
+        log("mode=\(mode) network=mainnet")
 
         let gateway = LightWalletEndpoint(
             address: OHTTPEndpoints.gatewayHost(for: .mainnet),
@@ -795,8 +796,7 @@ extension OHTTPE2ETests {
         )
         let tier0End = DispatchTime.now()
         let tier0Seconds = Double(tier0End.uptimeNanoseconds - tier0Start.uptimeNanoseconds) / 1_000_000_000.0
-        let tier0Hosts = tier0Ranked.map { $0.host }
-        log("RESULT bench mode=\(mode) tier0_seconds=\(String(format: "%.2f", tier0Seconds)) tier0_ranked=\(tier0Hosts)")
+        log("RESULT bench mode=\(mode) tier0_seconds=\(String(format: "%.2f", tier0Seconds)) tier0_ranked=\(tier0Ranked.count)")
 
         // Tier 1: measure clearnet hosts, repeat 3 times
         var anyRunRanked = false
@@ -861,7 +861,7 @@ extension OHTTPE2ETests {
         )
         XCTAssertTrue(OHTTPEndpoints.isGateway(gateway.host))
         XCTAssertFalse(OHTTPEndpoints.isGateway(clearnet.host))
-        log("mode=\(mode) gateway=\(gateway.host) clearnet=\(clearnet.host)")
+        log("mode=\(mode) clearnet=\(clearnet.host)")
 
         let databases = TemporaryDbBuilder.build()
         let initializer = Initializer(

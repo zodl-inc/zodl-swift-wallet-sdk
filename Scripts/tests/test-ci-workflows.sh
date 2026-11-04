@@ -538,16 +538,16 @@ test_release_ffi_builds_never_enable_ohttp_trace() {
     assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
 }
 
-# Parse job-scoped Actions vars and ordering, rather than accepting stray text.
-test_configured_native_workflows_use_required_actions_vars_before_cache() {
+# Parse job-scoped Actions secrets and ordering, rather than accepting stray text.
+test_configured_native_workflows_use_required_actions_secrets_before_cache() {
     local workflow job
     for workflow in swift codeql ohttp-e2e build-ffi; do
         case "$workflow" in swift) job=build ;; codeql) job=analyze ;; ohttp-e2e) job=ffi ;; build-ffi) job=build-xcframework ;; esac
-        assert_succeeds "$workflow supplies all eight Actions vars before cache lookup" \
+        assert_succeeds "$workflow supplies all eight Actions secrets before cache lookup" \
             ruby -ryaml -e '
               job = YAML.load_file(ARGV[0]).fetch("jobs").fetch(ARGV[1])
               names = %w[GATEWAY_HOST_MAINNET GATEWAY_HOST_TESTNET RELAY_URL_MAINNET RELAY_URL_TESTNET SIGNING_PUBKEY_MAINNET SIGNING_PUBKEY_TESTNET KEYS_DNS_NAME_MAINNET KEYS_DNS_NAME_TESTNET].map { |n| "ZODL_OHTTP_" + n }
-              names.each { |n| abort "missing Actions var #{n}" unless job.fetch("env", {})[n] == "${{ vars.#{n} }}" }
+              names.each { |n| abort "missing Actions secret #{n}" unless job.fetch("env", {})[n] == "${{ secrets.#{n} }}" }
               steps = job.fetch("steps")
               abort "AWS OHTTP fetch remains" if steps.any? { |s| s.fetch("uses", "").include?("aws-secrets") }
               index = steps.index { |s| s["id"] == "ohttp-config" && s.fetch("run", "").include?("ohttp_env.py --hash") }
@@ -571,6 +571,10 @@ test_ohttp_source_capability_and_local_documentation() {
     for name in GATEWAY_HOST_MAINNET GATEWAY_HOST_TESTNET RELAY_URL_MAINNET RELAY_URL_TESTNET SIGNING_PUBKEY_MAINNET SIGNING_PUBKEY_TESTNET KEYS_DNS_NAME_MAINNET KEYS_DNS_NAME_TESTNET; do
         assert_file_contains "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" "ZODL_OHTTP_$name" 'docs list each required input'
     done
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'gh variable get' 'local docs promise no automatic GitHub acquisition'
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'login/interactive' 'local docs promise inherited inputs only'
+    assert_file_lacks "$REPO_ROOT/Scripts/lib/ohttp_env.py" 'def load_shell_exports' 'automatic shell loader removed'
+    assert_file_lacks "$REPO_ROOT/Scripts/lib/ohttp_env.py" 'def load_github_exports' 'automatic GitHub loader removed'
     assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'SDK builds accept absent' 'optional build documentation is removed'
     assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'no value-derived cache identity' 'stale cache guidance is removed'
 }
@@ -597,4 +601,15 @@ test_e2e_cache_identities_keep_toolchain_and_configuration_boundaries() {
           %w[needs.ffi.outputs.xcode-hash needs.ffi.outputs.source-hash].each { |field| abort "Swift product cache omits source/compiler identity" unless swift.fetch("key").include?(field) }
           abort "broad Swift cache fallback" unless swift.fetch("restore-keys", "").empty?
         ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+# Secret configuration must not be exposed by network-test diagnostics.
+test_ohttp_e2e_diagnostics_do_not_print_configured_endpoints() {
+    assert_succeeds 'E2E output keeps configured endpoint values private' python3 - "$REPO_ROOT/Tests/NetworkTests/OHTTPE2ETests.swift" <<'PYTHON'
+import pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+for line in source.splitlines():
+    if re.search(r'\b(log|XCTAssertTrue)\(', line):
+        assert not re.search(r'gateway=|relay=|tier0_ranked=\\\(tier0Hosts|\\\(host\\?\)', line), line
+PYTHON
 }

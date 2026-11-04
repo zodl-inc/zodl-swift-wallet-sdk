@@ -2,7 +2,7 @@ name: OHTTP E2E (testnet, macOS)
 
 # Live end-to-end verification of the OHTTP transport on Apple platforms: build the Rust FFI
 # and the Swift package on a macOS runner, run the offline OHTTP unit tests, then restore a
-# testnet wallet through ohttp-gateway-testnet.example twice — OHTTP only, and Tor + OHTTP.
+# testnet wallet through the testnet gateway twice — OHTTP only, and Tor + OHTTP.
 # The gateway/relay logs are checked out-of-band (see docs/ohttp.md in zodl-inc/infra): the
 # gateway must only ever see the relay pod, the relay must see this runner's egress IP (ohttp
 # job) or a Tor exit (tor job). Both IPs are printed in the job log and step summary.
@@ -53,14 +53,14 @@ concurrency:
 jobs:
   ffi:
     env:
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     outputs:
       configuration-hash: ${{ steps.ohttp-config.outputs.hash }}
       source-hash: ${{ steps.ffi-hash.outputs.hash }}
@@ -153,14 +153,14 @@ jobs:
 
   e2e:
     env:
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     name: E2E (${{ matrix.mode }})
     needs: ffi
     runs-on: xcode-27

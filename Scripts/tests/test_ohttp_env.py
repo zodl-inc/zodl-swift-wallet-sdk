@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 RUNNER = Path(__file__).resolve().parents[1] / 'lib/ohttp_env.py'
 MAINNET = 'ZODL_OHTTP_RELAY_URL_MAINNET'
@@ -30,44 +31,60 @@ class RelayEnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(RUNNER.exists(), 'relay environment runner is missing')
 
-    def resolve(self, values, shell_loader=lambda env: {}, github_loader=lambda env, names: {}):
-        return self.runner.resolve_ohttp_environment(values, shell_loader=shell_loader, github_loader=github_loader)
+    def resolve(self, values):
+        return self.runner.resolve_ohttp_environment(values)
 
-    def test_fixed_eight_order_and_complete_inputs_never_load(self):
-        def forbidden(*args):
-            self.fail('complete input tried an external loader')
-        self.assertEqual(self.runner.OHTTP_NAMES, NAMES)
-        self.assertEqual(self.resolve(VALUES, forbidden, forbidden), VALUES)
-
-    def test_inherited_values_win_including_empty(self):
+    def test_fixed_eight_order_and_complete_inputs_are_copied_without_subprocesses(self):
         inherited = dict(VALUES, OTHER='preserved')
-        inherited[MAINNET] = ''
-        with self.assertRaisesRegex(ValueError, MAINNET):
-            self.resolve(inherited, lambda env: VALUES)
-        self.assertEqual(inherited[MAINNET], '')
+        with patch.object(subprocess, 'Popen', side_effect=AssertionError('shell started')), \
+                patch.object(subprocess, 'run', side_effect=AssertionError('GitHub started')):
+            resolved = self.resolve(inherited)
+        self.assertEqual(self.runner.OHTTP_NAMES, NAMES)
+        self.assertEqual(resolved, inherited)
+        self.assertIsNot(resolved, inherited)
+        resolved['OTHER'] = 'changed'
+        self.assertEqual(inherited['OTHER'], 'preserved')
 
-    def test_each_missing_or_empty_name_is_required(self):
-        for name in NAMES:
-            for empty in (False, True):
-                values = dict(VALUES, CI='1')
-                if empty:
-                    values[name] = ''
-                else:
-                    del values[name]
-                with self.subTest(name=name, empty=empty), self.assertRaisesRegex(ValueError, name):
-                    self.resolve(values)
+    def test_each_missing_or_empty_name_fails_without_external_acquisition(self):
+        for context in ({}, {'CI': '1'}, {'GITHUB_ACTIONS': 'true'}, {'OHTTP_ENV_RESOLVED': '1'}):
+            for name in NAMES:
+                for empty in (False, True):
+                    values = dict(VALUES, **context)
+                    if empty:
+                        values[name] = ''
+                    else:
+                        del values[name]
+                    with self.subTest(context=context, name=name, empty=empty), \
+                            patch.object(subprocess, 'Popen', side_effect=AssertionError('shell started')), \
+                            patch.object(subprocess, 'run', side_effect=AssertionError('GitHub started')), \
+                            self.assertRaisesRegex(ValueError, name):
+                        self.resolve(values)
 
-    def test_missing_only_fetch_after_export_import(self):
+    def test_shared_relay_key_and_dns_values_are_accepted_unchanged(self):
         values = dict(VALUES)
-        del values[NAMES[-1]]
-        requests = []
-        def github(env, names):
-            requests.append(names)
-            return {NAMES[-1]: VALUES[NAMES[-1]]}
-        self.assertEqual(self.resolve(values, github_loader=github), VALUES)
-        self.assertEqual(requests, [[NAMES[-1]]])
-        self.assertEqual(self.resolve(values, shell_loader=lambda env: VALUES), VALUES)
-        self.assertEqual(values[MAINNET], MAIN_URL)
+        for first, second in ((NAMES[2], NAMES[3]), (NAMES[4], NAMES[5]), (NAMES[6], NAMES[7])):
+            values[second] = values[first]
+        self.assertEqual(self.resolve(values), values)
+
+    def test_missing_inputs_never_execute_filling_zshrc_or_gh_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'external-call'
+            exports = ''.join(f'export {name}={value}\n' for name, value in VALUES.items())
+            (root / '.zshrc').write_text(f'touch {marker}\n' + exports)
+            gh = root / 'gh'
+            gh.write_text(
+                '#!/usr/bin/env python3\nimport json, pathlib, sys\n'
+                f'pathlib.Path({str(marker)!r}).touch()\n'
+                'print(json.dumps({"name":sys.argv[3],"value":"test.example.invalid"}))\n'
+            )
+            gh.chmod(0o755)
+            env = dict(VALUES, PATH=directory + os.pathsep + os.environ['PATH'], ZDOTDIR=directory)
+            del env[NAMES[-1]]
+            result = self.cli([], env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(NAMES[-1], result.stderr)
+            self.assertFalse(marker.exists(), 'configuration acquisition executed')
 
     def test_controls_fail_with_name_only_diagnostics(self):
         for name in NAMES:
@@ -159,46 +176,6 @@ class RelayEnvironmentTests(unittest.TestCase):
                     self.assertIn(name, str(caught.exception))
                     self.assertNotIn(value, str(caught.exception))
 
-    def test_ci_never_invokes_any_loader(self):
-        def forbidden(*args):
-            self.fail('CI tried an external loader')
-        for key in ('CI', 'GITHUB_ACTIONS'):
-            self.assertEqual(self.resolve(dict(VALUES, **{key: '1'}), forbidden, forbidden), dict(VALUES, **{key: '1'}))
-            with self.assertRaises(ValueError):
-                self.resolve({key: '1'}, forbidden, forbidden)
-            self.assertEqual(self.runner.load_shell_exports({key: '1'}), {})
-            self.assertEqual(self.runner.load_github_exports({key: '1'}, list(NAMES)), {})
-
-    def shell_environment(self, directory):
-        return {'PATH': '/usr/bin:/bin', 'ZDOTDIR': str(directory)}
-
-    def test_shell_import_only_exports_and_discards_startup_chatter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / '.zshenv').write_text(f'print startup-secret\nprint stderr-secret >&2\nexport {MAINNET}="{MAIN_URL}"\n{TESTNET}="{TEST_URL}"\n')
-            result = self.runner.load_shell_exports(self.shell_environment(root))
-            self.assertEqual(result, {MAINNET: MAIN_URL})
-            completed = self.cli([], dict(VALUES, **self.shell_environment(root)))
-            self.assertEqual(completed.returncode, 0)
-            self.assertEqual(completed.stdout, '')
-            self.assertEqual(completed.stderr, '')
-
-    def test_shell_failure_is_private_and_fatal(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / '.zshenv').write_text('print startup-secret\nprint stderr-secret >&2\nexit 9\n')
-            completed = self.cli([], self.shell_environment(root))
-            self.assertNotEqual(completed.returncode, 0)
-            self.assertNotIn('startup-secret', completed.stdout + completed.stderr)
-            self.assertNotIn('stderr-secret', completed.stdout + completed.stderr)
-
-    def test_shell_startup_is_bounded(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / '.zshenv').write_text('sleep 30\n')
-            with self.assertRaisesRegex(ValueError, 'shell'):
-                self.runner.load_shell_exports(self.shell_environment(root))
-
     def cli(self, arguments, env, mode='--required'):
         return subprocess.run([sys.executable, str(RUNNER), mode, *arguments], env=env,
                               text=True, capture_output=True, timeout=12)
@@ -236,32 +213,6 @@ class RelayEnvironmentTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(value, result.stdout + result.stderr)
         self.assertIn(MAINNET, result.stderr)
-
-    def test_real_gh_boundary_structured_missing_only_and_private_errors(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            gh = root / 'gh'
-            gh.write_text("#!/usr/bin/env python3\nimport json,os,sys\nwith open(os.environ['CALLS'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nmode=os.environ.get('MODE','ok')\nif mode=='denied': print('secret value',file=sys.stderr); sys.exit(9)\nif mode=='malformed': print('not json'); sys.exit()\nname=sys.argv[3]\nprint(json.dumps({'name': name if mode!='wrong' else 'OTHER', 'value': 7 if mode=='type' else 'fetched-value'}))\n")
-            gh.chmod(0o755)
-            env = {'PATH': directory + os.pathsep + os.environ['PATH'], 'CALLS': str(root / 'calls'), 'GH_TOKEN': 'synthetic-token'}
-            missing = [NAMES[-1]]
-            self.assertEqual(self.runner.load_github_exports(env, missing), {NAMES[-1]: 'fetched-value'})
-            calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
-            self.assertEqual(calls, [['variable', 'get', NAMES[-1], '--repo', 'zodl-inc/zodl-swift-wallet-sdk-private', '--json', 'name,value']])
-            for mode in ('denied', 'malformed', 'wrong', 'type'):
-                with self.subTest(mode=mode), self.assertRaises(ValueError) as error:
-                    self.runner.load_github_exports(dict(env, MODE=mode), missing)
-                self.assertNotIn('secret value', str(error.exception))
-                self.assertNotIn('synthetic-token', str(error.exception))
-            with self.assertRaises(ValueError):
-                self.runner.load_github_exports(env, ['GH_TOKEN'])
-
-    def test_github_shared_deadline_and_os_errors_are_private(self):
-        from unittest.mock import patch
-        for failure in (subprocess.TimeoutExpired('gh secret', 1), PermissionError('token-secret')):
-            with patch.object(self.runner.subprocess, 'run', side_effect=failure), self.assertRaises(ValueError) as error:
-                self.runner.load_github_exports({}, list(NAMES))
-            self.assertNotIn('secret', str(error.exception))
 
     def test_removed_optional_mode_is_rejected(self):
         self.assertNotEqual(self.cli([], dict(VALUES, CI='1'), mode='--optional').returncode, 0)

@@ -74,27 +74,28 @@ HTTPS URLs. The native OHTTP library remains authoritative for
 configuration formats, including public keys. There is exactly one configured
 SDK product.
 
-Local source-build entrypoints resolve once before architecture loops. Inherited
-values win, including explicitly empty strings (which fail validation). Absent
-names are imported from exported login/interactive zsh parameters with bounded
-startup. Remaining absent names are read with `gh variable get` from
-`zodl-inc/zodl-swift-wallet-sdk-private`. Authenticate `gh` normally and ensure
-read access to that repository's Actions variables. The resolver never prints
-values or obtains a new credential, and never evaluates configuration as code.
+Export all eight values in the environment that launches a local source build.
+The build validates a copy of that inherited environment, preserves the original
+values and unrelated exports, and fails on absent or explicitly empty inputs.
+It does not start a shell or retrieve configuration from an external service.
+For workspace builds, launch Xcode from that configured environment or supply
+all eight values in its build environment so FFIBuilder inherits them. A GUI
+launch does not automatically inherit exports from a terminal session.
 
-`CI` or `GITHUB_ACTIONS` disables both shell startup and GitHub lookup. All four
-native workflows supply the eight Actions variables before configuration
-validation and cache lookup. Completed FFI cache identities include a digest of
-all eight exact values. `python3 Scripts/lib/ohttp_env.py --hash` prints that
-validated versioned digest, and `--required -- COMMAND ARG...` runs a child with
-the resolved environment. The helper also supports the system Python used by
-Xcode build phases. Direct Cargo compilation enforces the same required-input
-and distinct-gateway invariants without shell startup or network lookup.
+All four native CI workflows supply the eight values from GitHub repository
+Actions secrets before configuration validation and cache lookup. Completed FFI
+cache identities include a digest of all eight exact values.
+`python3 Scripts/lib/ohttp_env.py --hash` prints that validated versioned digest,
+and `--required -- COMMAND ARG...` runs a child with the validated inherited
+environment. The helper also supports the system Python used by Xcode build
+phases. Direct Cargo compilation enforces the same required-input and
+distinct-gateway invariants. Relay URLs, signing public keys and key DNS names
+may be shared between networks.
 
 A precompiled SDK retains its compiled configuration. Consuming it and running
-`init-local-ffi.sh --cached` do not fetch configuration. Rebuild native source
+`init-local-ffi.sh --cached` require no OHTTP configuration. Rebuild native source
 when its configuration must change. Native-sensitive tests must receive the
-same resolved environment as the artifact being tested.
+same inherited environment as the artifact being tested.
 
 ## Quick Start
 

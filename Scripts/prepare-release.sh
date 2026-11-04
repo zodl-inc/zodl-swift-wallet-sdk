@@ -463,6 +463,9 @@ produce_artifacts() {
             /bin/bash Scripts/prepare-release.sh "${config_args[@]}"
         return
     fi
+    if [ "$DRY_RUN" != "true" ]; then
+        python3 Scripts/lib/ohttp_env.py --required
+    fi
 
     if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
         [ "$verify" = "true" ] && [ "$DRY_RUN" = "false" ] || \

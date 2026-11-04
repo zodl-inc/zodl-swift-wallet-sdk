@@ -1,4 +1,5 @@
 """Exercise SDK-owned native entrypoints without compiling or downloading Rust."""
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 MAINNET = 'ZODL_OHTTP_RELAY_URL_MAINNET'
@@ -73,7 +75,8 @@ else:
             script.chmod(0o755)
         startup = self.root / 'shell'
         startup.mkdir()
-        (startup / '.zshenv').write_text('')
+        (startup / '.zshenv').write_text('touch "$FIXTURE_ROOT/zsh-called"\n')
+        (startup / '.zshrc').write_text('touch "$FIXTURE_ROOT/zsh-called"\n')
         # Real CI compiler selection belongs to the parent build, not this fake repository.
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith('ZODL_OHTTP_') and key not in COMPILER_ENVIRONMENT_NAMES
@@ -110,7 +113,7 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
     def run_native(self, command, cwd=None):
         (self.root / 'values.json').write_text(json.dumps(VALUES))
         (self.root / 'gh.jsonl').unlink(missing_ok=True)
-        result = subprocess.run(command, cwd=cwd or self.root, env=self.env, text=True, capture_output=True, timeout=30)
+        result = subprocess.run(command, cwd=cwd or self.root, env=dict(self.env, **VALUES), text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = [json.loads(line) for line in (self.root / 'cargo.jsonl').read_text().splitlines()]
         self.assertTrue(calls)
@@ -118,9 +121,8 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
             self.assertEqual(values, VALUES)
             self.assertNotIn(MAIN_URL, argv)
             self.assertNotIn(TEST_URL, argv)
-        lookups = [json.loads(line) for line in (self.root / 'gh.jsonl').read_text().splitlines()]
-        self.assertEqual([call[2] for call in lookups], list(NAMES))
-        self.assertTrue(all(call[3:] == ['--repo', 'zodl-inc/zodl-swift-wallet-sdk-private', '--json', 'name,value'] for call in lookups))
+        self.assertFalse((self.root / 'gh.jsonl').exists(), 'GitHub configuration lookup executed')
+        self.assertFalse((self.root / 'zsh-called').exists(), 'zsh startup executed')
         return calls
 
     def test_malformed_hosts_stop_native_entrypoints_before_cargo(self):
@@ -214,25 +216,69 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
                 (self.root / 'cargo.jsonl').unlink(missing_ok=True)
                 self.run_native(command)
 
-    def test_invalid_configuration_is_rejected_before_cleanup(self):
+    def test_missing_configuration_is_rejected_before_cleanup_even_with_recursion_marker(self):
         product = self.root / 'BuildSupport/products/macos/keep'
-        product.parent.mkdir(parents=True)
-        product.write_text('keep')
-        env = dict(self.env, CI='1')
-        result = subprocess.run(['make', 'ffi-ci'], cwd=self.root, env=env, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(product.exists())
-        self.assertFalse((self.root / 'cargo.jsonl').exists())
+        commands = (['make', 'ffi-ci'], ['make', '-C', 'BuildSupport', 'release'],
+                    ['bash', 'Scripts/init-local-ffi.sh', '--arm-macos'])
+        for command in commands:
+            for context in ({}, {'CI': '1'}, {'GITHUB_ACTIONS': 'true'}, {'OHTTP_ENV_RESOLVED': '1'}):
+                for name in NAMES:
+                    with self.subTest(command=command, context=context, name=name):
+                        for filename in ('cargo.jsonl', 'gh.jsonl', 'zsh-called'):
+                            (self.root / filename).unlink(missing_ok=True)
+                        (self.root / 'values.json').write_text(json.dumps(VALUES))
+                        product.parent.mkdir(parents=True, exist_ok=True)
+                        product.write_text('keep')
+                        release_record = product.parent.parent / 'release.env'
+                        release_record.write_text('keep')
+                        environment = dict(self.env, **VALUES, **context)
+                        del environment[name]
+                        result = subprocess.run(command, cwd=self.root, env=environment, capture_output=True, timeout=30)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertTrue(product.exists(), 'existing native product removed before validation')
+                        self.assertEqual(release_record.read_text(), 'keep')
+                        self.assertFalse((self.root / 'cargo.jsonl').exists())
+                        self.assertFalse((self.root / 'gh.jsonl').exists())
+                        self.assertFalse((self.root / 'zsh-called').exists())
 
-    def test_cached_initializer_never_imports_or_fetches_config(self):
-        # Stop at the ordinary precompiled release download boundary.
-        (self.root / 'Package.swift').write_text('https://github.com/example/sdk/releases/download/1/libzcashlc.xcframework.zip\nchecksum: "' + 'a'*64 + '"\n')
+    def test_release_recursion_marker_cannot_bypass_validation_before_cleanup(self):
+        (self.root / 'Cargo.toml').write_text('[package]\nversion = "7.0.0"\n')
+        subprocess.run(['git', 'init', '-q'], cwd=self.root, check=True)
+        product = self.root / 'BuildSupport/products/macos/keep'
+        for name in NAMES:
+            with self.subTest(name=name):
+                product.parent.mkdir(parents=True, exist_ok=True)
+                product.write_text('keep')
+                environment = dict(self.env, **VALUES, OHTTP_ENV_RESOLVED='1')
+                del environment[name]
+                result = subprocess.run(['bash', 'Scripts/prepare-release.sh', 'artifacts', '7.0.0'],
+                                        cwd=self.root, env=environment, capture_output=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(product.exists(), 'release cleanup preceded configuration validation')
+                self.assertFalse((self.root / 'cargo.jsonl').exists())
+
+    def test_cached_initializer_needs_no_configuration(self):
+        archive = self.root / 'fixture.zip'
+        with zipfile.ZipFile(archive, 'w') as bundle:
+            bundle.writestr('libzcashlc.xcframework/Info.plist', 'cached binary')
+        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (self.root / 'Package.swift').write_text(
+            'https://github.com/example/sdk/releases/download/1/libzcashlc.xcframework.zip\n'
+            f'checksum: "{checksum}"\n')
         gh = self.root / 'bin/gh'
-        gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$FIXTURE_ROOT/cached-gh"\nexit 42\n')
-        result = subprocess.run(['bash', 'Scripts/init-local-ffi.sh', '--cached'], cwd=self.root, env=self.env, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('release download', (self.root / 'cached-gh').read_text())
+        gh.write_text(
+            '#!/usr/bin/env python3\nimport os, pathlib, shutil, sys\n'
+            'assert sys.argv[1:4] == ["release", "download", "1"]\n'
+            'root=pathlib.Path(os.environ["FIXTURE_ROOT"])\n'
+            'shutil.copyfile(root/"fixture.zip", root/"LocalPackages/libzcashlc.xcframework.zip")\n')
+        result = subprocess.run(['bash', 'Scripts/init-local-ffi.sh', '--cached'], cwd=self.root,
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'LocalPackages/libzcashlc.xcframework/Info.plist').read_text(), 'cached binary')
+        self.assertTrue((self.root / 'LocalPackages/Package.swift').exists())
         self.assertFalse((self.root / 'cargo.jsonl').exists())
+        self.assertFalse((self.root / 'gh.jsonl').exists())
+        self.assertFalse((self.root / 'zsh-called').exists())
 
     def test_source_aggregate_builds_and_checks_share_one_environment(self):
         for target in ('build-all', 'build-all-release', 'check-all', 'check'):
