@@ -2962,6 +2962,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// `wasRunning` (the host calls this after a stall recovery gave up and stopped the pass, so
     /// nothing IS running by the time this runs).
     private func restartSyncImpl(at endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }

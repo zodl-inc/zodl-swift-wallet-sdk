@@ -126,7 +126,7 @@ public actor TorClient {
 
     /// Makes an HTTP request over Tor.
     ///
-    /// - Parameter maxBytes: Maximum allowed response size in bytes (defaults to 257 MiB)
+    /// - Parameter maxBytes: Nonnegative maximum allowed response size in bytes (defaults to 257 MiB)
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
     public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
@@ -146,6 +146,9 @@ public actor TorClient {
         retryLimit: UInt8,
         postOnce: Bool
     ) async throws -> (data: Data, response: HTTPURLResponse) {
+        guard maxBytes >= 0 else {
+            throw ZcashError.rustTorHttpRequest("`TorClient.httpRequest` requires a nonnegative response size limit")
+        }
         try await prepareRuntime()
         guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 

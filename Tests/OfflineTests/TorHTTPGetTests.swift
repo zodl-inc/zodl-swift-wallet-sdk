@@ -1,6 +1,7 @@
 import Foundation
 import libzcashlc
 import XCTest
+import os
 @testable import ZODLSwiftWalletSDK
 
 final class TorHTTPGetTests: XCTestCase {
@@ -27,6 +28,61 @@ final class TorHTTPGetTests: XCTestCase {
             XCTAssertEqual((error as? URLError)?.code, .timedOut)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testNegativeMaxBytesThrowsWithoutNativeCall() async throws {
+        for method in ["GET", "POST"] {
+            for maxBytes in [-1, Int.min] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let nativeCallCount = OSAllocatedUnfairLock(initialState: 0)
+                let native = TorHTTPGetNative(startup: TorRuntimeStartupNative.fixture { _, _ in
+                    nativeCallCount.withLock { $0 += 1 }
+                    return nil
+                })
+                let client = TorClient(torDir: directory, httpGetNative: native)
+                var request = URLRequest(url: URL(string: "https://example.com")!)
+                request.httpMethod = method
+                do {
+                    _ = try await client.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                    XCTFail("Negative response limit accepted for \(method)")
+                } catch {
+                    guard case ZcashError.rustTorHttpRequest = error else {
+                        XCTFail("Expected ordinary HTTP argument error for \(method), got \(type(of: error))")
+                        XCTAssertEqual(nativeCallCount.withLock { $0 }, 0)
+                        continue
+                    }
+                }
+                XCTAssertEqual(nativeCallCount.withLock { $0 }, 0)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+            }
+        }
+    }
+
+    func testZeroAndPositiveMaxBytesRetainNativeStartupForGETAndPOST() async throws {
+        for method in ["GET", "POST"] {
+            for maxBytes in [0, 1, Int.max] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let nativeCallCount = OSAllocatedUnfairLock(initialState: 0)
+                let native = TorHTTPGetNative(startup: TorRuntimeStartupNative.fixture { _, _ in
+                    nativeCallCount.withLock { $0 += 1 }
+                    return nil
+                })
+                let client = TorClient(torDir: directory, httpGetNative: native)
+                var request = URLRequest(url: URL(string: "https://example.com")!)
+                request.httpMethod = method
+                do {
+                    _ = try await client.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                    XCTFail("Expected fixture startup failure")
+                } catch {
+                    guard case ZcashError.rustTorClientInit = error else {
+                        return XCTFail("Nonnegative response limit rejected before native startup")
+                    }
+                }
+                XCTAssertEqual(nativeCallCount.withLock { $0 }, 1)
+            }
+        }
     }
 
     func testUnpreparedRuntimeFailsWithoutBootstrapping() async throws {
