@@ -14,8 +14,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
   with the default timing, send every transaction that was submitted but that no server has accepted yet
   through the given server, once and right away, and add that server at the end of each transaction's retry
-  plan; background resubmission keeps trying the recorded servers first. Meant for a wallet whose user moved
-  to another server while sends were stuck, such as during a private relay outage. Each report says whether
+  plan; Public and Manual background resubmission keeps trying the recorded servers first. Meant for a wallet
+  whose user moved to another server while sends were stuck, such as during a private relay outage. Each report says whether
   the server took the transaction. The server receives these transactions with the device's network address
   unless the route hides it (Tor). Custom `Broadcaster` conformers inherit a no-op and need no changes.
 - `TorTransitionProviding` exposes retained `TorTransitionState` and updates on `SlipstreamSynchronizer`.
@@ -41,6 +41,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged; actor-isolated callers must add `await`.
 
 ## Fixed
+
+- Pending transaction retries use only the selected Private gateway after an endpoint switch,
+  including transactions whose saved retry plans contain public servers. Switches wait for earlier
+  retries to finish, and stopped or wiped wallets discard stale queued retries. Stopping or changing servers
+  can wait for an already-running retry before the native engine is interrupted at its next block boundary. Submission consent,
+  accepted history, the five-minute retry policy and Public/Manual retry behavior are preserved.
 
 - `SlipstreamSynchronizer.restartSync(at:)` rejects gateways from the other wallet network before
   cancelling Tor transitions or stopping or reopening the engine. `TorClient.httpRequest` throws an

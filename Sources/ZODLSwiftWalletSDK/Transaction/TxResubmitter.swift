@@ -31,11 +31,13 @@ final class TxResubmitter {
         logger = container.resolve(Logger.self)
     }
 
-    func checkAndResubmit(latestBlockHeight: BlockHeight) async {
+    /// A selected Private gateway overrides retry destinations only after the existing consent checks.
+    /// Public and Manual callers omit it and retain their recorded endpoint policy.
+    func checkAndResubmit(latestBlockHeight: BlockHeight, privateEndpoint: LightWalletEndpoint? = nil) async {
         // Plans whose transactions are expired or gone are no longer retry
         // candidates; drop them. Mined transactions keep their plans until
-        // expiry so a reorg that un-mines one still retries through its
-        // recorded endpoints — findForResubmission excludes mined transactions,
+        // expiry so a reorg that un-mines one still retries through the
+        // currently allowed endpoints — findForResubmission excludes mined transactions,
         // so a retained plan costs nothing meanwhile. Decisions are made per
         // transaction from current repository state, so a transaction created
         // mid-pass can never be wrongly pruned.
@@ -60,7 +62,7 @@ final class TxResubmitter {
                     // transaction's dead endpoints can't starve the others
                     for transaction in transactions {
                         do {
-                            try await resubmit(transaction: transaction)
+                            try await resubmit(transaction: transaction, privateEndpoint: privateEndpoint)
                         } catch {
                             logger.error(
                                 "TxResubmissionAction failed to resubmit transaction \(transaction.rawID.toHexStringTxId()): \(error)"
@@ -78,15 +80,17 @@ final class TxResubmitter {
 }
 
 private extension TxResubmitter {
-    func resubmit(transaction: ZcashTransaction.Overview) async throws {
+    func resubmit(transaction: ZcashTransaction.Overview, privateEndpoint: LightWalletEndpoint?) async throws {
         if let routeAdmission {
-            try await routeAdmission.withLease { try await self.resubmitAdmitted(transaction: transaction) }
+            try await routeAdmission.withLease {
+                try await self.resubmitAdmitted(transaction: transaction, privateEndpoint: privateEndpoint)
+            }
         } else {
-            try await resubmitAdmitted(transaction: transaction)
+            try await resubmitAdmitted(transaction: transaction, privateEndpoint: privateEndpoint)
         }
     }
 
-    func resubmitAdmitted(transaction: ZcashTransaction.Overview) async throws {
+    func resubmitAdmitted(transaction: ZcashTransaction.Overview, privateEndpoint: LightWalletEndpoint?) async throws {
         // Captured before `plan(for:)` itself, not merely before the network round trip: the two
         // are separate awaits into the store's actor, and a `wipe()` can land between them. A
         // token captured only after `plan(for:)` returns could already reflect the post-wipe
@@ -109,7 +113,8 @@ private extension TxResubmitter {
             // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
-            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
+            let retryEndpoints = privateEndpoint.map { [$0] } ?? endpoints
+            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: retryEndpoints)
             if let acceptingEndpoint {
                 await submitPlanStore.markAccepted(
                     txId: transaction.rawID,
@@ -128,8 +133,13 @@ private extension TxResubmitter {
 
         case nil:
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()).")
-            let encodedTransaction = try transaction.encodedTransaction()
-            try await transactionEncoder.submit(transaction: encodedTransaction)
+            if let privateEndpoint {
+                let createdTransaction = try CreatedTransaction(overview: transaction)
+                try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: [privateEndpoint])
+            } else {
+                let encodedTransaction = try transaction.encodedTransaction()
+                try await transactionEncoder.submit(transaction: encodedTransaction)
+            }
         }
     }
 

@@ -124,6 +124,42 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
         XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
     }
 
+    func testPrivateLegacyRetryOverridesTheEncodersRetainedServiceAndChecksSubmittability() async throws {
+        let selected = try HeightReportingLightwalletd()
+        selected.latestBlockHeight = 3_543_404
+        defer { try? selected.stop() }
+        rustBackend.checkTransactionSubmittableSubmissionServerHeightClosure = { [firstRaw] raw, _ in
+            raw == firstRaw ? TransactionSubmissionRefusal.wrongConsensusBranch : nil
+        }
+        let resubmitter = try makeResubmitter()
+
+        // The caller has already recognized its Private gateway. A local server stands in for
+        // that selected destination here, while the encoder deliberately retains another service.
+        await resubmitter.checkAndResubmit(latestBlockHeight: 100_000, privateEndpoint: selected.endpoint)
+
+        XCTAssertEqual(selected.recordedTransactions(), [secondRaw])
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+        XCTAssertEqual(rustBackend.checkTransactionSubmittableSubmissionServerHeightCallsCount, 2)
+    }
+
+    func testPrivatePlannedRetryDoesNotFallbackWhenSelectedEndpointIsUnavailable() async throws {
+        let selected = try RecordingCompactTxStreamerService(sendResponse: SendResponse())
+        defer { try? selected.stop() }
+        let recorded = try HeightReportingLightwalletd()
+        recorded.latestBlockHeight = 3_543_404
+        defer { try? recorded.stop() }
+        await submitPlanStore.recordPlan(txId: firstId, endpoints: [recorded.endpoint])
+        await submitPlanStore.recordPlan(txId: secondId, endpoints: [recorded.endpoint])
+        rustBackend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
+        let resubmitter = try makeResubmitter()
+
+        await resubmitter.checkAndResubmit(latestBlockHeight: 100_000, privateEndpoint: selected.endpoint)
+
+        XCTAssertTrue(selected.recordedTransactions().isEmpty)
+        XCTAssertTrue(recorded.recordedTransactions().isEmpty)
+        XCTAssertEqual(rustBackend.checkTransactionSubmittableSubmissionServerHeightCallsCount, 0)
+    }
+
     // MARK: - Helpers
 
     /// A resubmitter over the two candidates, `firstId` before `secondId`. The encoder is the real single-server sink over the

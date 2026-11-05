@@ -300,8 +300,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // self-healing. Note the LIMIT of that cancellation: only the SUBMIT stage observes it
     // (`SubmitPlanExecutor.submit` checks `Task.checkCancellation`, and `TxResubmitter` catches
     // per transaction). The prune stage has no cancellation checks at all and runs to
-    // completion — which is why `wipeImpl` cancels AND joins (below), rather than trusting
-    // cancellation to stop a check that would otherwise write to files it is deleting.
+    // completion. The lifecycle queue therefore drains earlier checks before wipe can delete
+    // files, and generation/cancellation guards reject checks queued behind teardown.
     //
     // The driver is also gated on the CALLER's cancellation (`isCancelled`, defaulted to
     // `Task.isCancelled` so it is evaluated in the caller's task context). `stopPolling()`
@@ -803,9 +803,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // to tell "the app stopped me" from "another path took the engine over".
         stopRequestGeneration += 1
         stopPolling()
-        // [#1975] Cancel, don't join: nothing is being deleted here, so a check that runs a
-        //   moment longer is harmless, and `stop()` must stay prompt. Cancel ONLY — the fired
-        //   task clears the handle itself (see the driver block).
+        // Earlier checks have drained on this queue. Cancel any later queued check; the fired
+        // task remains the single owner that clears its handle (see the driver block).
         resubmissionTask?.cancel()
         // T8.3 (T5.5 wart fix): only emit .stopped if we were prepared. stop() on an
         // unprepared synchronizer (Zodl calls it unconditionally on didEnterBackground,
@@ -1479,20 +1478,33 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // check that takes a while must not push the next one further out.
         lastResubmissionCheckTime = now
         let latestBlockHeight = BlockHeight(chainTip)
+        let generation = passGeneration
         resubmissionTask = Task { [weak self] in
             guard let self else { return }
-            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight)
+            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight, generation: generation)
         }
     }
 
-    /// The actor-isolated body of one resubmission check: hops back onto the actor so
-    /// `txResubmitter` never leaves it, and clears the in-flight handle on every exit path.
-    private func runResubmissionCheck(latestBlockHeight: BlockHeight) async {
+    /// Retry execution and endpoint publication share the existing lifecycle boundary: a switch
+    /// cannot complete while an earlier retry can still send through the old public route.
+    private func runResubmissionCheck(latestBlockHeight: BlockHeight, generation: Int) async {
         defer { finishResubmissionCheck() }
-        // Non-throwing: `TxResubmitter` logs and swallows both the candidate lookup and every
-        // per-transaction submit failure (a cancelled submit included), so one dead endpoint —
-        // or a teardown mid-check — can never escape as an unhandled error here.
-        await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight)
+        let queued = lifecycle.enqueue {
+            await self.runResubmissionOnLifecycleQueue(latestBlockHeight: latestBlockHeight, generation: generation)
+        }
+        // Queue tasks are unstructured, so explicitly carry teardown cancellation across the boundary.
+        await withTaskCancellationHandler {
+            await queued.value
+        } onCancel: {
+            queued.cancel()
+        }
+    }
+
+    private func runResubmissionOnLifecycleQueue(latestBlockHeight: BlockHeight, generation: Int) async {
+        guard !Task.isCancelled, generation == passGeneration else { return }
+        let privateEndpoint = OHTTPEndpoints.isGateway(currentEndpoint.host) ? currentEndpoint : nil
+        // TxResubmitter retains eligibility, consent, throttling and per-transaction error handling.
+        await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight, privateEndpoint: privateEndpoint)
     }
 
     /// Clears the in-flight handle. THE single writer that nils `resubmissionTask` (teardown only
@@ -1514,6 +1526,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// completed check this must read false (the task's own `finishResubmissionCheck()` cleared
     /// the handle), and it must NOT be false merely because teardown nil'd it. `internal`.
     var resubmissionCheckInFlightForTesting: Bool { resubmissionTask != nil }
+
+    /// Controls the existing retry throttle in deterministic lifecycle tests.
+    func setResubmissionTimeForTesting(_ time: TimeInterval) {
+        txResubmitter.latestResolvedTime = time
+    }
 
     /// Pure gate for the background-resubmission driver. Static + pure so the truth table is
     /// unit-testable without an engine, mirroring `isSyncStalled`.
@@ -2375,8 +2392,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Wipes all wallet data managed by this synchronizer.
     ///
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
-    /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
-    ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
+    /// 1. Wait for earlier lifecycle work, including retries, then stop the poll loop and cancel
+    ///    later queued retry checks — none may access the files step 4 deletes.
     /// 2. `engine.stopForWalletChange()` — cancel any in-flight sync task, its scan at the next block.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
@@ -2427,18 +2444,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         stopPolling()
         // [MOB-1850] Every other teardown clears `isRunning` here too; wipe was the one path left standing.
         isRunning = false
-        // 1a. [#1975] Cancel AND JOIN any in-flight resubmission check — it reads and writes the
-        //     very database files about to be deleted. Cancel alone is not enough: only the
-        //     SUBMIT stage observes cancellation (`SubmitPlanExecutor.submit`), while the prune
-        //     stage has no cancellation checks and would run on to `deletePlans` after the plan
-        //     file was removed. Joining does not violate the single-writer rule (that forbids
-        //     nil'ing the handle here, not awaiting it): the task's own `finishResubmissionCheck()`
-        //     clears it, and has done so by the time `.value` returns. No deadlock — awaiting
-        //     suspends `wipeImpl` and frees the actor for that finish hop. A tick that resumes
-        //     during this wipe cannot start a new check: `pollTask` is cancelled, and the driver
-        //     is gated on the caller's cancellation.
+        // Earlier retries have already drained before this lifecycle turn. Cancel later queued
+        // retries, which also validate their pass generation before any store access. Joining here
+        // would deadlock waiting for a retry whose lifecycle turn is behind this wipe.
         resubmissionTask?.cancel()
-        await resubmissionTask?.value
 
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
         // [MOB-1850] A wipe is a deliberate stop that brings no pass of its own back up, so a
