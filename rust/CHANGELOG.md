@@ -13,6 +13,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_ohttp_health_subscribe_v1` returns null and sets the last error if subscription
+  construction panics, including notification-worker creation failure. Its C signature
+  and successful callback/unsubscribe lifetimes are unchanged; no caller changes are needed.
+
 - `zcashlc_tor_http_post`, `zcashlc_tor_http_post_bounded`,
   `zcashlc_tor_http_post_once_bounded`, and `zcashlc_tor_http_post_once_with_timeout`
   keep request bytes valid when sending continues after an early response or timeout.
