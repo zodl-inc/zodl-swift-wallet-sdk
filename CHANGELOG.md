@@ -42,6 +42,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one
+  throttled resolver does not prevent another resolver from restoring connectivity.
+
 - OHTTP requests lowercase ASCII letters in the wire authority while preserving its port and
   the method, path, query and body. Mixed-case gateway hosts now reach the configured backend.
   No call-site changes are required.

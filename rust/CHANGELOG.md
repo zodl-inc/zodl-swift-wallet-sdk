@@ -13,6 +13,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one
+  throttled resolver does not prevent another resolver from restoring connectivity.
+
 - `zcashlc_ohttp_encapsulate` lowercases ASCII authority letters before sealing a request,
   preserving the port, method, scheme, path, query and body. Its signature is unchanged.
 
