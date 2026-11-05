@@ -2934,6 +2934,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
     public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         torTransition.invalidate()
         torIntendedRunning = nil
         // A caller cancelled while this restart is still queued — the app backgrounding while a

@@ -43,8 +43,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Fixed
 
 - `SlipstreamSynchronizer.restartSync(at:)` rejects gateways from the other wallet network before
-  stopping or reopening the engine. `TorClient.httpRequest` throws an ordinary error for negative
-  response size limits before preparing Tor; zero and positive limits keep their existing behavior.
+  cancelling Tor transitions or stopping or reopening the engine. `TorClient.httpRequest` throws an
+  ordinary error for negative response size limits before preparing Tor; zero and positive limits
+  keep their existing behavior.
 
 - OHTTP health reports preserve relay failures when DNS key fallback fails. Third-party backend
   rate limits no longer pause lightwalletd health probes; relay rate limits still do.
