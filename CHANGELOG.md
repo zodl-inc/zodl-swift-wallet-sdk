@@ -42,6 +42,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP health reports preserve relay failures when DNS key fallback fails. Third-party backend
+  rate limits no longer pause lightwalletd health probes; relay rate limits still do.
+
 - OHTTP health probes that expire while waiting to dispatch report an inconclusive result instead of a network outage.
 
 - OHTTP requests remain reliable when relay connections rotate during request setup; no call-site changes are needed.

@@ -245,7 +245,7 @@ final class RotatingSession: Sendable {
 
     init(
         lifetime: TimeInterval,
-        makeSession: @escaping @Sendable () -> URLSession = OHTTPTransport.makeSession,
+        makeSession: @escaping @Sendable () -> URLSession = { @Sendable in OHTTPTransport.makeSession() },
         retireSession: @escaping @Sendable (URLSession) -> Void = { $0.finishTasksAndInvalidate() }
     ) {
         self.lifetime = lifetime
@@ -554,14 +554,6 @@ actor OHTTPTransport {
                 return verified
             } catch {
                 if error is CancellationError { throw error }
-                if OHTTPHealthProbe.budget != nil {
-                    let outcome = OHTTPHealthTraffic.outcome(error)
-                    if case .rateLimited = outcome {
-                        OHTTPHealthTraffic.current?.classify(outcome)
-                        throw error
-                    }
-                    if case .rateLimited = OHTTPHealthTraffic.current?.failure { throw error }
-                }
                 try OHTTPHealthProbe.budget?.check()
                 continue
             }
@@ -587,7 +579,11 @@ actor OHTTPTransport {
         request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = TimeInterval(timeoutMS) / 1000.0
 
-        let (data, response) = try await send(request, maxBytes: 64 * 1024) // 64 KiB limit for DoH
+        // Resolver responses are auxiliary key sources, not evidence about the selected relay.
+        // Keep the probe budget and dispatch tracking active while isolating health attribution.
+        let (data, response) = try await OHTTPHealthTraffic.$current.withValue(nil) {
+            try await send(request, maxBytes: 64 * 1024) // 64 KiB limit for DoH
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OHTTPError.transportError("DoH response is not HTTP")
@@ -766,7 +762,9 @@ actor OHTTPTransport {
     /// (ZIP "Outer response contract": a call made during the pause is failed locally, as a 429).
     func checkRelayBackoff() async throws {
         guard let remaining = await relayPauseRemaining() else { return }
-        OHTTPHealthTraffic.current?.classify(.rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(remaining * 1_000_000_000)))
+        OHTTPHealthTraffic.current?.relayRateLimited(
+            until: OHTTPHealthClock.nowNanoseconds + UInt64(remaining * 1_000_000_000)
+        )
         throw OHTTPError.httpStatusError(
             statusCode: 429,
             message: "relay rate limit: not sent, \(Int(remaining.rounded(.up)))s of the relay's pause left"

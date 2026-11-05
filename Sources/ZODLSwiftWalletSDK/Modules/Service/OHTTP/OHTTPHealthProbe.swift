@@ -121,6 +121,7 @@ enum OHTTPHealthProbe {
         defer { session.remove(budget) }
         let outcome: OHTTPHealthOutcome
         let pauses = session.snapshot().observations.compactMap { observation -> UInt64? in
+            guard observation.scope == .route || observation.scope == .lightwalletd else { return nil }
             if case .rateLimited(let deadline) = observation.outcome, deadline > OHTTPHealthClock.nowNanoseconds { return deadline }
             return nil
         }

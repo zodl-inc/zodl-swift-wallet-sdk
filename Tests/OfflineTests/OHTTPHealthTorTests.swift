@@ -1,9 +1,72 @@
 import Foundation
 import libzcashlc
 import XCTest
+import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthTorTests: XCTestCase {
+    func testDoH403DoesNotReplaceRelayFailure() async throws {
+        try await assertDNSFailureIsAuxiliary(status: 403)
+    }
+
+    func testDoH429DoesNotPauseRelay() async throws {
+        try await assertDNSFailureIsAuxiliary(status: 429)
+    }
+
+    private func assertDNSFailureIsAuxiliary(status: UInt16) async throws {
+        let runtimes = TorTestRuntimes()
+        let nativeCalls = OSAllocatedUnfairLock(initialState: 0)
+        let pause = OHTTPHealthClock.nowNanoseconds + 120_000_000_000
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: { runtimes.free($0) })
+        native.classifiedGet = { _, _, _, _, _, _, _, outcome in
+            nativeCalls.withLock { $0 += 1 }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 1, http_status: status, retry_not_before_ns: pause)
+            return nil
+        }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let route = OHTTPHealthRoute(
+            network: .testnet,
+            gatewayHost: OHTTPTestSupport.testnetHost,
+            relayURL: "https://\(UUID().uuidString.lowercased()).test/relay",
+            viaTor: true
+        )
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            walletNetwork: .testnet,
+            viaTor: true,
+            keyCache: OHTTPKeyCache(),
+            httpSender: { request, maxBytes in
+                if request.url?.host == URL(string: route.relayURL)?.host {
+                    try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+                    throw URLError(.cannotConnectToHost)
+                }
+                return try await client.httpRequestSentOnce(for: request, maxBytes: maxBytes, timeoutMilliseconds: 2000)
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            try budget.admit()
+            do {
+                _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 2000)
+                XCTFail("The original relay error must remain")
+            } catch {
+                XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost)
+                throw error
+            }
+            return .usable
+        }
+        XCTAssertEqual(result.outcome, .transportUnavailable)
+        XCTAssertEqual(nativeCalls.withLock { $0 }, 2)
+        XCTAssertFalse(session.snapshot().observations.contains { $0.outcome == .policyRejected })
+        XCTAssertFalse(session.snapshot().observations.contains {
+            if case .rateLimited = $0.outcome { return true }
+            return false
+        })
+        try await client.close()
+    }
+
     func testBoundedPostPassesRemainingBudgetAndRetainsTypedFailure() async throws {
         let runtimes = TorTestRuntimes()
         var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: { runtimes.free($0) })
@@ -79,6 +142,9 @@ final class OHTTPHealthTorTests: XCTestCase {
             return .usable
         }
         XCTAssertEqual(result.outcome, .rateLimited(retryNotBefore: 123))
+        XCTAssertTrue(session.snapshot().observations.contains {
+            $0.scope == .route && $0.outcome == .rateLimited(retryNotBefore: 123)
+        })
         try await client.close()
     }
 

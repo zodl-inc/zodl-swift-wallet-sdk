@@ -19,7 +19,11 @@ struct OHTTPHealthRequest: Sendable {
 
     /// An authenticated response also proves the route worked, independently of the backend result.
     func recordRouteUsable(stage: OHTTPHealthStage) {
-        OHTTPHealthCenter.shared.record(self, scope: .route, outcome: .usable, stage: stage)
+        recordRouteOutcome(outcome: .usable, stage: stage)
+    }
+
+    func recordRouteOutcome(outcome: OHTTPHealthOutcome, stage: OHTTPHealthStage) {
+        OHTTPHealthCenter.shared.record(self, scope: .route, outcome: outcome, stage: stage)
     }
 }
 

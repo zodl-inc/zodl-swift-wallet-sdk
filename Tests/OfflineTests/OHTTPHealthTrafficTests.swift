@@ -20,6 +20,125 @@ final class OHTTPHealthTrafficTests: XCTestCase {
         )
     }
 
+    func testDoH403DoesNotReplaceRelayFailure() async throws {
+        try await assertDNSFailureIsAuxiliary(status: 403)
+    }
+
+    func testDoH429DoesNotPauseRelay() async throws {
+        try await assertDNSFailureIsAuxiliary(status: 429)
+    }
+
+    private func assertDNSFailureIsAuxiliary(status: Int) async throws {
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HealthDNSURLProtocol.self]
+        let urlSession = URLSession(configuration: config)
+        defer { urlSession.invalidateAndCancel() }
+        let resolvers = OSAllocatedUnfairLock(initialState: [String]())
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            walletNetwork: .testnet,
+            keyCache: OHTTPKeyCache(),
+            httpSender: { request, maxBytes in
+                if request.url?.host == URL(string: route.relayURL)?.host {
+                    try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+                    throw URLError(.cannotConnectToHost)
+                }
+                resolvers.withLock { $0.append(request.url!.host!) }
+                var local = request
+                local.url = URL(string: "https://dns-fixture.test/\(status)")!
+                let (data, response) = try await OHTTPTransport.boundedData(for: local, maxBytes: maxBytes, session: urlSession)
+                return (data, response as! HTTPURLResponse)
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            try budget.admit()
+            do {
+                _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+                XCTFail("The original relay error must remain")
+            } catch {
+                XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost)
+                throw error
+            }
+            return .usable
+        }
+        XCTAssertEqual(result.outcome, .transportUnavailable)
+        XCTAssertEqual(resolvers.withLock { $0 }, ["cloudflare-dns.com", "dns.google"])
+        XCTAssertFalse(session.snapshot().observations.contains { $0.outcome == .policyRejected })
+        XCTAssertFalse(session.snapshot().observations.contains {
+            if case .rateLimited = $0.outcome { return true }
+            return false
+        })
+        let dispatches = OSAllocatedUnfairLock(initialState: 0)
+        let fresh = await OHTTPHealthProbe.run(session: session) { _ in
+            dispatches.withLock { $0 += 1 }
+            return .usable
+        }
+        XCTAssertEqual(dispatches.withLock { $0 }, 1)
+        XCTAssertEqual(fresh.outcome, .usable)
+    }
+
+    func testDNSFallbackSuccessPreservesRealRecovery() async throws {
+        let route = route()
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HealthDNSURLProtocol.self]
+        let urlSession = URLSession(configuration: config)
+        defer { urlSession.invalidateAndCancel() }
+        let posts = OSAllocatedUnfairLock(initialState: 0)
+        let verified = OSAllocatedUnfairLock(initialState: 0)
+        let verifier = OHTTPTestSupport.makeKeyVerifier()
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            walletNetwork: .testnet,
+            testKeyVerifier: { envelope, now in
+                verified.withLock { $0 += 1 }
+                return try verifier(envelope, now)
+            },
+            keyCache: OHTTPKeyCache(),
+            streamSender: { _, _ in
+                try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+                posts.withLock { $0 += 1 }
+                return OHTTPOuterStream(
+                    status: 200,
+                    contentType: "message/ohttp-chunked-res",
+                    retryAfter: nil,
+                    body: AsyncThrowingStream { continuation in
+                        continuation.yield(Data([1]))
+                        continuation.finish()
+                    }
+                )
+            },
+            streamDecoderFactory: { _ in PassThroughStreamDecoder() },
+            httpSender: { request, maxBytes in
+                if request.url?.host == URL(string: route.relayURL)?.host {
+                    try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+                    throw URLError(.cannotConnectToHost)
+                }
+                var local = request
+                local.url = URL(string: "https://dns-fixture.test/200")!
+                let (data, response) = try await OHTTPTransport.boundedData(for: local, maxBytes: maxBytes, session: urlSession)
+                return (data, response as! HTTPURLResponse)
+            }
+        )
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            try budget.admit()
+            let response = try await transport.stream(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
+            for try await _ in response.body { }
+            return .usable
+        }
+        XCTAssertEqual(result.outcome, .usable)
+        XCTAssertEqual(posts.withLock { $0 }, 1)
+        XCTAssertEqual(verified.withLock { $0 }, 1)
+        XCTAssertTrue(session.snapshot().observations.contains { $0.scope == .route && $0.outcome == .usable })
+        XCTAssertFalse(session.snapshot().observations.contains { $0.outcome == .transportUnavailable })
+    }
+
     private struct GRPCFailureCase {
         let status: String?
         let trailer: String?
@@ -459,7 +578,7 @@ final class OHTTPHealthTrafficTests: XCTestCase {
         XCTAssertLessThan(deadline, OHTTPHealthClock.nowNanoseconds, "Body completion must not restart an expired pause")
     }
 
-    func testDiagnosticDNSRateLimitStopsRemainingResolversAfterRelayPolicyFailure() async throws {
+    func testDiagnosticDNSRateLimitDoesNotOverrideRelayPolicyFailure() async throws {
         let route = route()
         let session = try OHTTPHealthSession(route: route, generation: UUID())
         defer { session.close() }
@@ -477,8 +596,8 @@ final class OHTTPHealthTrafficTests: XCTestCase {
             _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
             return .usable
         }
-        XCTAssertEqual(requests, 2, "A DNS pause prohibits the second resolver and POST")
-        XCTAssertEqual(result.outcome, .rateLimited(retryNotBefore: pause))
+        XCTAssertEqual(requests, 3, "Each resolver is auxiliary to the original relay failure")
+        XCTAssertEqual(result.outcome, .policyRejected)
     }
 
     func testSharedKeyFailureKeepsTypedProvenanceForEveryWaiter() async throws {
@@ -624,4 +743,25 @@ private final class NativePauseDecoder: OHTTPStreamDecoding {
         return try decoder.push(bytes)
     }
     func finish() throws -> OHTTPStreamEvents { try decoder.finish() }
+}
+
+private final class HealthDNSURLProtocol: URLProtocol {
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let status = Int(request.url!.lastPathComponent)!
+        let response = OHTTPTestSupport.response(for: request.url, status: status, headers: ["Retry-After": "120"])
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if status == 200 {
+            let keyID = OHTTPTestSupport.signingKeyId(for: .testnet)
+            let envelope = Data("{\"v\":1,\"network\":\"testnet\",\"key_id\":\"\(keyID)\"}".utf8).base64EncodedString()
+            let answer: [String: Any] = [
+                "name": OHTTPTestSupport.testnetDNSName, "type": 16, "TTL": 300, "data": "\"\(envelope)\""
+            ]
+            let body = try! JSONSerialization.data(withJSONObject: ["Status": 0, "Answer": [answer]])
+            client?.urlProtocol(self, didLoad: body)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() { }
 }

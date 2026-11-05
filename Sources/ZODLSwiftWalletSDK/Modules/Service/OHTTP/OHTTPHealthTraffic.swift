@@ -104,7 +104,7 @@ final class OHTTPHealthTraffic: Sendable {
     func outerResponse(status: Int, retryAfter: String?) {
         if status == 429 {
             let seconds = OHTTPTransport.retryAfter(retryAfter) ?? OHTTPTransport.defaultRateLimitPause
-            classify(.rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(seconds * 1_000_000_000)))
+            relayRateLimited(until: OHTTPHealthClock.nowNanoseconds + UInt64(seconds * 1_000_000_000))
         } else if [400, 401, 403, 404, 405, 409, 413, 415, 422, 426].contains(status) {
             classify(Self.statusOutcome(status))
         }
@@ -114,7 +114,18 @@ final class OHTTPHealthTraffic: Sendable {
         let status = Int(native.http_status)
         guard (400..<500).contains(status) else { return }
         if case .inconclusive = Self.statusOutcome(status) { return }
-        classify(OHTTPNativeHTTPFailure(native).outcome)
+        if status == 429 {
+            relayRateLimited(until: native.retry_not_before_ns)
+        } else {
+            classify(OHTTPNativeHTTPFailure(native).outcome)
+        }
+    }
+
+    func relayRateLimited(until deadline: UInt64) {
+        let outcome = OHTTPHealthOutcome.rateLimited(retryNotBefore: deadline)
+        classify(outcome)
+        // A later body/completion callback must not restart the head's original pause.
+        ticket.recordRouteOutcome(outcome: failure ?? outcome, stage: state.withLock { $0.stage })
     }
 
     static func scope(_ authority: String) -> OHTTPHealthScope {

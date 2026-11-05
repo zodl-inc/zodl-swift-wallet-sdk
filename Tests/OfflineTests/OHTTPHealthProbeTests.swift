@@ -8,6 +8,67 @@ final class OHTTPHealthProbeTests: XCTestCase {
         OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString.lowercased()).test/relay", viaTor: viaTor)
     }
 
+    func testInnerBackend429DoesNotPauseLightwalletProbe() async throws {
+        try await assertBackendPauseScope(outerStatus: 200, shouldPause: false)
+    }
+
+    func testOuterRelay429StillPausesProbe() async throws {
+        try await assertBackendPauseScope(outerStatus: 429, shouldPause: true)
+    }
+
+    private func assertBackendPauseScope(outerStatus: Int, shouldPause: Bool) async throws {
+        for viaTor in [false, true] {
+            let route = route(viaTor: viaTor)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let transport = OHTTPTransport(
+                gatewayHost: route.gatewayHost,
+                relayURL: route.relayURL,
+                walletNetwork: .testnet,
+                testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
+                viaTor: viaTor,
+                keyCache: OHTTPKeyCache(),
+                streamSender: { _, _ in self.outer(body: Data([1]), status: outerStatus) },
+                streamDecoderFactory: { _ in PassThroughStreamDecoder(status: 429, headers: [("retry-after", "120")]) },
+                httpSender: { request, _ in
+                    (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
+                }
+            )
+            let request = OHTTPRequest(method: "GET", scheme: "https", authority: "cmc.zodl.com", path: "/rates", headers: [], body: Data())
+            do {
+                let response = try await transport.stream(request: request, timeoutMS: 5000)
+                for try await _ in response.body { }
+            } catch {
+                guard shouldPause else { throw error }
+            }
+            let pauses = session.snapshot().observations.filter {
+                if case .rateLimited = $0.outcome { return true }
+                return false
+            }
+            XCTAssertTrue(pauses.contains { $0.scope == .exchangeRates })
+            XCTAssertEqual(pauses.contains { $0.scope == .route }, shouldPause)
+            let dispatches = OSAllocatedUnfairLock(initialState: 0)
+            let frame = try infoFrame()
+            let client = probeClient(
+                route: route,
+                decoder: { PassThroughStreamDecoder(headers: [("content-type", "application/grpc")], trailers: [("grpc-status", "0")]) },
+                sender: { _, _ in
+                    dispatches.withLock { $0 += 1 }
+                    return self.outer(body: frame)
+                }
+            )
+            let result = await OHTTPHealthProbe.run(session: session) { _ in
+                try await OHTTPHealthProbe.readInfo(client: client, network: .testnet)
+            }
+            XCTAssertEqual(dispatches.withLock { $0 }, shouldPause ? 0 : 1)
+            if shouldPause {
+                guard case .rateLimited = result.outcome else { return XCTFail("Outer relay pause must prohibit the probe") }
+            } else {
+                XCTAssertEqual(result.outcome, .usable)
+            }
+        }
+    }
+
     func testProbeBudgetsAreFiveAndTwentySeconds() {
         XCTAssertEqual(OHTTPHealthProbe.budgetMilliseconds(viaTor: false), 5000)
         XCTAssertEqual(OHTTPHealthProbe.budgetMilliseconds(viaTor: true), 20000)
