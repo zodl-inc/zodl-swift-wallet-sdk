@@ -303,11 +303,14 @@ extension OHTTPTransport {
     static func streamedData(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
+        session: URLSession? = nil
     ) async throws -> OHTTPOuterStream {
         let reader = OHTTPStreamReader(maxBytes: maxBytes)
-        let task = session.dataTask(with: oneShotBody(request))
-        task.delegate = reader
+        let task = try await withSessionForSetup(session) { session in
+            let task = session.dataTask(with: oneShotBody(request))
+            task.delegate = reader
+            return task
+        }
         return try await reader.start(task)
     }
 }

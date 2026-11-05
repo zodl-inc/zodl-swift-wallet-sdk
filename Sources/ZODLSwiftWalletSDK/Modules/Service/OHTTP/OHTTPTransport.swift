@@ -9,6 +9,7 @@
 //
 
 import Foundation
+import os
 
 /// Delegate that refuses HTTP redirects to prevent tracking and fingerprinting.
 /// A relay or key-config server attempting a redirect is an attack vector.
@@ -174,29 +175,101 @@ actor OHTTPKeyCache {
     }
 }
 
-/// The relay session in use, replaced by a fresh one (new connections) once it is `lifetime` old. The old
-/// one finishes the tasks it has and is then invalidated.
-final class RotatingSession: @unchecked Sendable {
-    private let lock = NSLock()
-    private let lifetime: TimeInterval
-    private var session: URLSession?
-    private var created = Date.distantPast
+/// Rotates relay connections while protecting senders that have not registered their tasks yet.
+final class RotatingSession: Sendable {
+    /// Protects task creation, not task completion. Registered tasks survive graceful retirement.
+    final class Lease: Sendable {
+        let session: URLSession
+        private let onRelease: OSAllocatedUnfairLock<(@Sendable () -> Void)?>
 
-    init(lifetime: TimeInterval) {
-        self.lifetime = lifetime
+        init(session: URLSession, onRelease: @escaping @Sendable () -> Void) {
+            self.session = session
+            self.onRelease = OSAllocatedUnfairLock(initialState: onRelease)
+        }
+
+        func release() {
+            let released = onRelease.withLock { onRelease in
+                defer { onRelease = nil }
+                return onRelease
+            }
+            released?()
+        }
+
+        deinit { release() }
     }
 
-    func current(now: Date = Date()) -> URLSession {
-        lock.lock()
-        defer { lock.unlock() }
-        if let session, now.timeIntervalSince(created) < lifetime {
-            return session
+    private final class Generation: Sendable {
+        private struct State {
+            var leases = 0
+            var retired = false
         }
-        session?.finishTasksAndInvalidate()
-        let fresh = OHTTPTransport.makeSession()
-        session = fresh
-        created = now
-        return fresh
+
+        let session: URLSession
+        let created: Date
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        private let retireSession: @Sendable (URLSession) -> Void
+
+        init(session: URLSession, created: Date, retireSession: @escaping @Sendable (URLSession) -> Void) {
+            self.session = session
+            self.created = created
+            self.retireSession = retireSession
+        }
+
+        func acquire() -> Lease {
+            state.withLock { $0.leases += 1 }
+            return Lease(session: session) { self.release() }
+        }
+
+        func release() {
+            let invalidate = state.withLock { state in
+                state.leases -= 1
+                return state.retired && state.leases == 0
+            }
+            if invalidate { retireSession(session) }
+        }
+
+        func retire() {
+            let invalidate = state.withLock { state in
+                guard !state.retired else { return false }
+                state.retired = true
+                return state.leases == 0
+            }
+            if invalidate { retireSession(session) }
+        }
+    }
+
+    private let current = OSAllocatedUnfairLock<Generation?>(initialState: nil)
+    private let lifetime: TimeInterval
+    private let makeSession: @Sendable () -> URLSession
+    private let retireSession: @Sendable (URLSession) -> Void
+
+    init(
+        lifetime: TimeInterval,
+        makeSession: @escaping @Sendable () -> URLSession = OHTTPTransport.makeSession,
+        retireSession: @escaping @Sendable (URLSession) -> Void = { $0.finishTasksAndInvalidate() }
+    ) {
+        self.lifetime = lifetime
+        self.makeSession = makeSession
+        self.retireSession = retireSession
+    }
+
+    func acquire(now: Date = Date()) -> Lease {
+        let (lease, retired) = current.withLock { current -> (Lease, Generation?) in
+            if let current, now.timeIntervalSince(current.created) < lifetime {
+                return (current.acquire(), nil)
+            }
+            let retired = current
+            let fresh = Generation(session: makeSession(), created: now, retireSession: retireSession)
+            current = fresh
+            return (fresh.acquire(), retired)
+        }
+        // Foundation callbacks must never run under an ownership lock.
+        retired?.retire()
+        return lease
+    }
+
+    deinit {
+        current.withLock { $0 }?.retire()
     }
 }
 
@@ -217,14 +290,13 @@ actor OHTTPTransport {
     ///
     /// The session is replaced every ``sessionLifetime``, so the relay does not see one connection for
     /// the whole life of the app: connection lifetime is linkable metadata.
-    internal static var session: URLSession {
-        sessionBox.current()
-    }
+    @TaskLocal static var sessionBox = RotatingSession(lifetime: sessionLifetime)
+
+    /// A task-scoped gate lets tests pause after acquisition without affecting unrelated requests.
+    @TaskLocal static var beforeSessionSetupForTesting: (@Sendable () async throws -> Void)?
 
     /// How long one relay session, and so its connections, is used before a new one replaces it.
     internal static let sessionLifetime: TimeInterval = 10 * 60
-
-    private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
 
     /// Makes the relay session. No resource timeout is set: non-streaming exchanges enforce
     /// their 100s deadline per task, while streaming exchanges (mempool long poll, SSE) last
@@ -243,7 +315,9 @@ actor OHTTPTransport {
 
     /// Test-only accessor for the session configuration.
     internal static var sessionConfigurationForTesting: URLSessionConfiguration {
-        session.configuration
+        let lease = sessionBox.acquire()
+        defer { lease.release() }
+        return lease.session.configuration
     }
 
     /// Fixed relay-facing `User-Agent` and `Accept-Language`, so URLSession does not add the app's name
@@ -762,6 +836,19 @@ extension OHTTPTransport {
 // MARK: - Bounded reading of the relay's answers
 
 extension OHTTPTransport {
+    /// Holds the generation until Foundation has registered the request, even across async setup.
+    static func withSessionForSetup<Result>(
+        _ session: URLSession?,
+        operation: (URLSession) async throws -> Result
+    ) async throws -> Result {
+        if let session { return try await operation(session) }
+        let lease = sessionBox.acquire()
+        defer { lease.release() }
+        try await beforeSessionSetupForTesting?()
+        try Task.checkCancellation()
+        return try await operation(lease.session)
+    }
+
     /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
     /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
     /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
@@ -772,15 +859,17 @@ extension OHTTPTransport {
     /// - Parameters:
     ///   - request: The URL request to execute
     ///   - maxBytes: Maximum allowed response size in bytes
-    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    ///   - session: An injected URLSession, or nil to lease the rotating relay session
     /// - Returns: The response data and URLResponse
     /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, or transport errors
     static func boundedData(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
+        session: URLSession? = nil
     ) async throws -> (Data, URLResponse) {
-        let (bytes, response) = try await session.bytes(for: oneShotBody(request))
+        let (bytes, response) = try await withSessionForSetup(session) { session in
+            try await session.bytes(for: oneShotBody(request))
+        }
         if let response = response as? HTTPURLResponse {
             OHTTPHealthTraffic.current?.outerResponse(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         }
@@ -826,13 +915,13 @@ extension OHTTPTransport {
     /// - Parameters:
     ///   - request: The URL request to execute
     ///   - maxBytes: Maximum allowed response size in bytes
-    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    ///   - session: An injected URLSession, or nil to lease the rotating relay session
     /// - Returns: The response data and URLResponse
     /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, `OHTTPError.transportError` if deadline exceeded, or other transport errors
     static func boundedDataWithDeadline(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session,
+        session: URLSession? = nil,
         deadlineSeconds: TimeInterval = 100
     ) async throws -> (Data, URLResponse) {
         return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
