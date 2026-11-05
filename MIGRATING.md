@@ -17,6 +17,77 @@ preserved in the compiled configuration and versioned digest. Rebuild native sou
 changing configuration. Consuming a precompiled SDK or running `init-local-ffi.sh --cached`
 requires no new environment variables or Swift call-site edits.
 
+Compiled OHTTP gateway/relay hosts, DNS names and signing public keys are observable in binaries.
+Keeping literals out of source does not make the compiled configuration confidential;
+CI secret storage does not change this property of the distributed binary.
+
+## OHTTP HTTP requirements
+
+Before, custom `Synchronizer` implementations could omit these members. After upgrading,
+conformers and test doubles must supply all three requirements; there is no default
+implementation. The SDK's concrete synchronizers already implement them:
+
+```swift
+func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
+func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
+func httpGetOverTor(
+    for request: URLRequest,
+    retryLimit: UInt8,
+    timeoutMilliseconds: UInt64
+) async throws -> (data: Data, response: HTTPURLResponse)
+```
+
+For OHTTP calls, map external URLs with `OHTTPEndpoints.proxyURL(for:)` and pass a supported
+alias or allowlisted destination. Unknown destinations fail instead of falling back to direct
+HTTP. Both OHTTP methods put the relay leg on Tor whenever Tor is enabled, even if `viaTor`
+is false. The streaming method returns the response head before the body finishes; consume
+its throwing body to detect an incomplete answer. The bounded GET contract is detailed below.
+
+The legacy `httpRequestOverTor(for:retryLimit:)` remains Tor-only and does not select OHTTP
+for external services. Call the appropriate OHTTP member when that service requires gateway
+routing, independently of the wallet's lightwalletd server mode.
+
+## Voting custom-server selection
+
+`makeVotingRoundSession` now requires `isCustomServer: Bool` between `route` and `epoch`.
+Calls that omit it no longer compile. Carry the user's actual server selection into the call:
+
+```swift
+// Before: no custom-server selection.
+let session = try await synchronizer.makeVotingRoundSession(
+    backend: backend,
+    inputs: inputs,
+    binding: binding,
+    route: route,
+    epoch: epoch
+)
+
+// After: choose explicitly from the user's server selection.
+let session = try await synchronizer.makeVotingRoundSession(
+    backend: backend,
+    inputs: inputs,
+    binding: binding,
+    route: route,
+    isCustomServer: userSelectedCustomServers,
+    epoch: epoch
+)
+```
+
+With `.direct`, predefined servers (`false`) use OHTTP and unsupported chain/PIR endpoints
+fail with `VotingErrorKind.invalidInput`, without a direct fallback. Custom servers (`true`)
+use direct HTTPS. With `.tor`, either selection reaches servers directly through Tor and
+never falls back to a direct connection. Every service, including PIR, shares the session's
+route. Custom conformers overriding this method must add the same `isCustomServer: Bool`
+parameter; the protocol's default implementation already forwards it.
+
+## Sapling parameter mirror and routing
+
+`SaplingParamsSourceURL.default` downloads from
+`https://raw.githubusercontent.com/zodl-inc/zcash-sapling-params/main/`.
+Existing callers using the default need no edits. Private, Public and Manual wallet modes
+all use direct HTTPS with Tor off and Tor with Tor on. Sapling parameter downloads do not
+use OHTTP or require a gateway alias. Parameter caching and SHA-256 verification are retained.
+
 ## Slipstream Tor choices and engine calls
 
 `tor(enabled:)` remains the standalone async convenience. Hosts with a transaction guard may

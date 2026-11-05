@@ -614,3 +614,14 @@ for line in source.splitlines():
         assert not re.search(r'gateway=|relay=|tier0_ranked=\\\(tier0Hosts|\\\(host\\?\)', line), line
 PYTHON
 }
+
+# Validate the parsed trigger, not a matching branch name elsewhere in the file.
+test_ohttp_e2e_push_trigger_tracks_integration_branch() {
+    assert_succeeds 'OHTTP E2E push trigger follows feature/ohttp' \
+        ruby -ryaml -e '
+          workflow = YAML.load_file(ARGV[0])
+          trigger = workflow.fetch("on") { workflow.fetch(true) }
+          abort "wrong integration branch" unless trigger.fetch("push").fetch("branches") == ["feature/ohttp"]
+          abort "manual dispatch removed" unless trigger.key?("workflow_dispatch")
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
