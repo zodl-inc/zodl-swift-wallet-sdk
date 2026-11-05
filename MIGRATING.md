@@ -75,7 +75,8 @@ let session = try await synchronizer.makeVotingRoundSession(
 
 With `.direct`, predefined servers (`false`) use OHTTP and unsupported chain/PIR endpoints
 fail with `VotingErrorKind.invalidInput`, without a direct fallback. Custom servers (`true`)
-use direct HTTPS. With `.tor`, either selection reaches servers directly through Tor and
+use direct HTTP(S) according to the endpoint URL, subject to existing network and endpoint
+validation. With `.tor`, either selection reaches servers directly through Tor and
 never falls back to a direct connection. Every service, including PIR, shares the session's
 route. Custom conformers overriding this method must add the same `isCustomServer: Bool`
 parameter; the protocol's default implementation already forwards it.

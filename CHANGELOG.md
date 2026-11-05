@@ -84,7 +84,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)`
   requires `isCustomServer` before `epoch`; existing call sites must pass it explicitly.
   With `.direct`, pass `false` for predefined servers to use OHTTP (unsupported chain/PIR
-  destinations fail closed), or `true` for voter-supplied servers to use direct HTTPS.
+  destinations fail closed), or `true` for voter-supplied servers to use direct HTTP(S) according to
+  the endpoint URL, subject to existing network and endpoint validation.
   With `.tor`, both choices use Tor to reach the servers directly. PIR shares the session route.
 
 - The default Sapling parameter mirror is
