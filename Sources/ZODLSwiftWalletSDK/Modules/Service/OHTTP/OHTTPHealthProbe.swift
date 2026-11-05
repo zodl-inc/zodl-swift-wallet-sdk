@@ -209,6 +209,22 @@ final class OHTTPHealthProbeBudget: Sendable {
         }
     }
 
+    /// A completed key leg cannot supply dispatch evidence for the following sealed request.
+    func completedKeyConfiguration() {
+        state.withLock {
+            $0.networkAttempt = false
+            $0.evidence = nil
+        }
+    }
+
+    func failureOutcome(_ error: Error) -> OHTTPHealthOutcome {
+        if let error = error as? URLError, error.code == .timedOut,
+           !state.withLock({ $0.networkAttempt }) {
+            return .inconclusive
+        }
+        return OHTTPHealthTraffic.outcome(error)
+    }
+
     func record(_ evidence: OHTTPHealthOutcome) { state.withLock { $0.evidence = evidence } }
 
     func run(_ operation: @escaping @Sendable () async throws -> OHTTPHealthOutcome) async -> OHTTPHealthOutcome {
@@ -229,7 +245,7 @@ final class OHTTPHealthProbeBudget: Sendable {
                         try check()
                         result = try await operation()
                     } catch {
-                        result = state.withLock { $0.evidence } ?? OHTTPHealthTraffic.outcome(error)
+                        result = state.withLock { $0.evidence } ?? failureOutcome(error)
                     }
                     finish(result)
                 }

@@ -5,6 +5,181 @@ import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthTorTests: XCTestCase {
+    func testSuccessfulKeyFetchDoesNotAuthorizeQueuedPostExpiry() async throws {
+        try await assertPostTimeoutAfterSuccessfulKeys(queued: true)
+    }
+
+    func testSuccessfulKeyFetchPreservesDispatchedPostTimeout() async throws {
+        try await assertPostTimeoutAfterSuccessfulKeys(queued: false)
+    }
+
+    private func assertPostTimeoutAfterSuccessfulKeys(queued: Bool) async throws {
+        let clock = TorTestClock()
+        clock.advance(to: DispatchTime.now().uptimeNanoseconds)
+        let executor = TorHTTPRequestExecutor(now: { clock.now }, sleepUntil: { try await clock.sleepUntil($0) })
+        let first = TorWorkerGate()
+        let second = TorWorkerGate()
+        defer {
+            first.release()
+            second.release()
+        }
+        let runtimes = TorTestRuntimes()
+        let fixture = TorResponseFixture()
+        fixture.pointer.pointee.status = 200
+        let calls = OSAllocatedUnfairLock(initialState: [0, 0, 0])
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: {
+            calls.withLock { $0[2] += 1 }
+            runtimes.free($0)
+        })
+        native.classifiedGet = { _, _, _, _, _, _, _, outcome in
+            calls.withLock { $0[0] += 1 }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 0, http_status: 200, retry_not_before_ns: 0)
+            return fixture.pointer
+        }
+        native.freeResponse = { _ in fixture.free() }
+        native.postOnce = { _, _, _, _, _, _, _, _, outcome in
+            calls.withLock { $0[1] += 1 }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 2, http_status: 0, retry_not_before_ns: 0)
+            return nil
+        }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native, httpExecutor: executor)
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString).test/relay", viaTor: true)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let downloads = OSAllocatedUnfairLock(initialState: [Task<TorHTTPRequestExecutor.Response, Error>]())
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(), viaTor: true, keyCache: OHTTPKeyCache(),
+            httpSender: { request, maxBytes in
+                if queued && request.httpMethod == "POST" {
+                    let tasks = [first, second].map { gate in
+                        Task { try await executor.execute(deadlineUptime: UInt64.max, operation: { try gate.run($0) }) }
+                    }
+                    downloads.withLock { $0 = tasks }
+                    await self.fulfillment(of: [first.entered, second.entered], timeout: 3)
+                }
+                return try await client.httpRequestSentOnce(for: request, maxBytes: maxBytes, timeoutMilliseconds: 60_000)
+            }
+        )
+        let probe = Task {
+            await OHTTPHealthProbe.run(session: session, timeoutMilliseconds: 60_000) { budget in
+                try budget.admit()
+                _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 60_000)
+                return .usable
+            }
+        }
+        if queued {
+            await clock.waitForSleepers(1)
+            clock.advance(to: UInt64.max)
+        }
+        let result = await probe.value
+        XCTAssertEqual(result.outcome, queued ? .inconclusive : .transportUnavailable)
+        XCTAssertEqual(calls.withLock { Array($0.prefix(2)) }, queued ? [1, 0] : [1, 1])
+        XCTAssertEqual(session.snapshot().observations.contains { $0.purpose == .diagnostic && $0.outcome == .transportUnavailable }, !queued)
+        first.release()
+        second.release()
+        for task in downloads.withLock({ $0 }) { _ = try await task.value }
+        try await client.close()
+        XCTAssertEqual(calls.withLock { $0[2] }, 3, "Key, queued POST and parent each dispose once")
+    }
+
+    func testSuccessfulKeyFetchDoesNotAuthorizeLocalPostKeyExpiry() async throws {
+        let clock = TorTestClock()
+        let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, nativeDeadline: true, now: { clock.now })
+        let runtimes = TorTestRuntimes()
+        let fixture = TorResponseFixture()
+        fixture.pointer.pointee.status = 200
+        let calls = OSAllocatedUnfairLock(initialState: [0, 0])
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: { runtimes.free($0) })
+        native.classifiedGet = { _, _, _, _, _, _, _, outcome in
+            calls.withLock { $0[0] += 1 }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 0, http_status: 200, retry_not_before_ns: 0)
+            return fixture.pointer
+        }
+        native.freeResponse = { _ in fixture.free() }
+        native.postOnce = { _, _, _, _, _, _, _, _, _ in
+            calls.withLock { $0[1] += 1 }
+            return nil
+        }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString).test/relay", viaTor: true)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let verifier = OHTTPTestSupport.makeKeyVerifier()
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost, relayURL: route.relayURL, walletNetwork: .testnet,
+            testKeyVerifier: { data, date in
+                let key = try verifier(data, date)
+                clock.advance(to: budget.deadline)
+                return key
+            }, viaTor: true, keyCache: OHTTPKeyCache(),
+            httpSender: { request, maxBytes in
+                try await client.httpRequestSentOnce(for: request, maxBytes: maxBytes, timeoutMilliseconds: 60_000)
+            }
+        )
+        let outcome = await OHTTPHealthProbe.$recipient.withValue(session.diagnosticRecipient) {
+            await budget.run {
+                try budget.admit()
+                return try await OHTTPHealthProbe.$budget.withValue(budget) {
+                    _ = try await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 60_000)
+                    return .usable
+                }
+            }
+        }
+        XCTAssertEqual(outcome, .inconclusive)
+        XCTAssertEqual(calls.withLock { $0 }, [1, 0])
+        XCTAssertFalse(session.snapshot().observations.contains { $0.purpose == .diagnostic && $0.outcome == .transportUnavailable })
+        try await client.close()
+    }
+
+    func testPreparationExpiryBeforeNativeEntryIsInconclusive() async throws {
+        let entered = expectation(description: "Final request preparation held")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let runtimes = TorTestRuntimes()
+        let calls = OSAllocatedUnfairLock(initialState: [0, 0])
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: {
+            calls.withLock { $0[1] += 1 }
+            runtimes.free($0)
+        })
+        native.now = {
+            entered.fulfill()
+            XCTAssertEqual(release.wait(timeout: .now() + 3), .success)
+            return UInt64.max
+        }
+        native.classifiedGet = { _, _, _, _, _, _, _, _ in
+            calls.withLock { $0[0] += 1 }
+            return nil
+        }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: OHTTPTestSupport.testnetHost, relayURL: "https://\(UUID().uuidString).test/relay", viaTor: true)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let probe = Task {
+            await OHTTPHealthProbe.run(session: session, timeoutMilliseconds: 60_000) { budget in
+                try budget.admit()
+                let health = OHTTPHealthTraffic(route: route, request: OHTTPTestSupport.simpleRequest)
+                return try await OHTTPHealthTraffic.$current.withValue(health) {
+                    do {
+                        _ = try await client.httpRequestSentOnce(for: URLRequest(url: URL(string: route.relayURL)!), maxBytes: 100, timeoutMilliseconds: 60_000)
+                        return .usable
+                    } catch {
+                        health.failed(error)
+                        throw error
+                    }
+                }
+            }
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        release.signal()
+        let result = await probe.value
+        XCTAssertEqual(result.outcome, .inconclusive)
+        XCTAssertEqual(calls.withLock { $0[0] }, 0)
+        XCTAssertFalse(session.snapshot().observations.contains { $0.purpose == .diagnostic && $0.outcome == .transportUnavailable })
+        try await client.close()
+        XCTAssertEqual(calls.withLock { $0[1] }, 2, "Prepared child and parent each dispose once")
+    }
+
     func testDoH403DoesNotReplaceRelayFailure() async throws {
         try await assertDNSFailureIsAuxiliary(status: 403)
     }

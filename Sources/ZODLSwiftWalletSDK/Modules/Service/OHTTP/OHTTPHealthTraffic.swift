@@ -32,7 +32,7 @@ final class OHTTPHealthTraffic: Sendable {
 
     func failed(_ error: Error) {
         let value = state.withLock { $0 }
-        let outcome = Self.outcome(error)
+        let outcome = OHTTPHealthProbe.budget?.failureOutcome(error) ?? Self.outcome(error)
         let resolved = outcome == .cancelled && OHTTPHealthProbe.budget == nil ? outcome : value.failure ?? outcome
         OHTTPHealthProbe.budget?.record(resolved)
         ticket.record(outcome: resolved, stage: value.stage)

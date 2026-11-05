@@ -437,7 +437,9 @@ actor OHTTPTransport {
         // cancel another consumer's shared real-request fetch or leave a probe-only fetch alive.
         if let budget = OHTTPHealthProbe.budget {
             try budget.check()
-            return try await fetchKeyConfig(profile: profile)
+            let key = try await fetchKeyConfig(profile: profile)
+            budget.completedKeyConfiguration()
+            return key
         }
 
         // The cached key is used while the profile says it is fresh.

@@ -207,7 +207,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OHTTP health reports preserve relay failures when DNS key fallback fails. Third-party backend
   rate limits no longer pause lightwalletd health probes; relay rate limits still do.
 
-- OHTTP health probes that expire while waiting to dispatch report an inconclusive result instead of a network outage.
+- OHTTP health probes that expire while waiting to dispatch or preparing a request report an inconclusive
+  result instead of a network outage, including after a successful key fetch. No call-site changes are needed.
+
+- `SlipstreamSynchronizer.wipe()` cancels an active background transaction retry before waiting for it
+  to finish, so a retry awaiting cancellation cannot block cleanup. Wallet files remain protected until
+  that retry finishes. No call-site changes are needed.
 
 - OHTTP requests remain reliable when relay connections rotate during request setup; no call-site changes are needed.
 
@@ -1248,7 +1253,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4480000.json
 ### NU7 pre-release crates
 
 - The SDK now builds on the NU7 pre-release generation of the underlying Zcash Rust crates and the
-  `zodl-slipstream` 0.4.0 engine, pinned to `zodl-inc/slipstream-internal@4c123a0c`.
+  `zodl-slipstream` 0.4.0-pre.1 engine.
 - Every unified address, unified full viewing key and unified incoming viewing key string the SDK
   returns is ZIP 316 revision 0, with every receiver or item it carries. Revision 2 is used only
   for a value revision 0 cannot represent (one with expiry metadata, a P2SH viewing-key item, or

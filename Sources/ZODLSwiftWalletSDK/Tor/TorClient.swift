@@ -848,8 +848,6 @@ extension TorClient {
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         let deadline = try TorHTTPRequestExecutor.deadline(timeoutMilliseconds: timeoutMilliseconds, now: DispatchTime.now().uptimeNanoseconds)
         let context = TorHTTPRequestContext(deadlineUptime: deadline, preserveHTTPFailure: true)
-        // DispatchQueue workers do not inherit the caller's task-local probe context.
-        let probeBudget = OHTTPHealthProbe.budget
         return try await context.run { context in
             let owned = try await self.prepareBoundedOHTTP(for: request, maxBytes: maxBytes, context: context)
             return try await self.httpExecutor.execute(
@@ -859,7 +857,6 @@ extension TorClient {
                 preserveHTTPFailure: true,
                 onStart: {
                     try context.checkCancellation()
-                    try probeBudget?.beginNetworkAttempt()
                 }
             )
         }

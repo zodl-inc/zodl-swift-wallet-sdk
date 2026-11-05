@@ -2428,6 +2428,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// reopening a handle onto a database this method has just removed would recreate it (SQLite
     /// recreates a file on connect) and leave the wallet half-wiped.
     private func wipeImpl(_ subject: PassthroughSubject<Void, Error>) async {
+        // An earlier retry can be waiting for cancellation while it owns the lifecycle turn.
+        // Cancel before queueing, then let that turn drain before closing or deleting its wallet.
+        resubmissionTask?.cancel()
         await lifecycle.enqueue {
             await self.wipeOnLifecycleQueue(subject)
         }.value
