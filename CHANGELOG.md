@@ -42,6 +42,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- OHTTP health probes that expire while waiting to dispatch report an inconclusive result instead of a network outage.
+
 - OHTTP requests remain reliable when relay connections rotate during request setup; no call-site changes are needed.
 
 - OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one

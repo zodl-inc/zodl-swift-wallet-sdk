@@ -868,7 +868,8 @@ extension OHTTPTransport {
         session: URLSession? = nil
     ) async throws -> (Data, URLResponse) {
         let (bytes, response) = try await withSessionForSetup(session) { session in
-            try await session.bytes(for: oneShotBody(request))
+            try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+            return try await session.bytes(for: oneShotBody(request))
         }
         if let response = response as? HTTPURLResponse {
             OHTTPHealthTraffic.current?.outerResponse(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))

@@ -153,6 +153,7 @@ final class OHTTPHealthProbeBudget: Sendable {
     private let now: @Sendable () -> UInt64
     private struct State {
         var admitted = false
+        var networkAttempt = false
         var stop: OHTTPHealthOutcome?
         var result: OHTTPHealthOutcome?
         var evidence: OHTTPHealthOutcome?
@@ -194,6 +195,16 @@ final class OHTTPHealthProbeBudget: Sendable {
         try state.withLock {
             guard $0.stop == nil else { throw CancellationError() }
             $0.admitted = true
+        }
+    }
+
+    /// Provider admission owns cleanup; only dispatch supplies evidence about the network.
+    func beginNetworkAttempt() throws {
+        try Task.checkCancellation()
+        try state.withLock {
+            guard now() < deadline else { throw URLError(.timedOut) }
+            guard $0.stop == nil else { throw CancellationError() }
+            $0.networkAttempt = true
         }
     }
 
@@ -273,7 +284,10 @@ final class OHTTPHealthProbeBudget: Sendable {
             if state.stop == .cancelled {
                 resolved = .cancelled
             } else if state.stop != nil, result == .cancelled || result == .usable || result == .inconclusive {
-                resolved = .transportUnavailable
+                resolved = state.networkAttempt ? .transportUnavailable : .inconclusive
+            } else if !state.networkAttempt, result == .transportUnavailable {
+                // Queue expiry, including a budget below one whole millisecond, is not network evidence.
+                resolved = .inconclusive
             } else {
                 resolved = result
             }

@@ -20,7 +20,7 @@ final class OHTTPHealthProbeTests: XCTestCase {
             try await Task.sleep(nanoseconds: 1_000_000_000)
             return .usable
         }
-        XCTAssertEqual(expired.outcome, .transportUnavailable)
+        XCTAssertEqual(expired.outcome, .inconclusive)
         let task = Task {
             await OHTTPHealthProbe.run(session: session, timeoutMilliseconds: 1000) { _ in
                 try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -31,6 +31,150 @@ final class OHTTPHealthProbeTests: XCTestCase {
         let cancelled = await task.value
         XCTAssertEqual(cancelled.outcome, .cancelled)
         XCTAssertEqual(cancelled.generation, session.generation)
+    }
+
+    func testQueuedProbeExpiryIsInconclusive() async throws {
+        let clock = TorTestClock()
+        let executor = TorHTTPRequestExecutor(now: { clock.now }, sleepUntil: { try await clock.sleepUntil($0) })
+        let first = TorWorkerGate()
+        let second = TorWorkerGate()
+        defer {
+            first.release()
+            second.release()
+        }
+        let downloads = [first, second].map { gate in
+            Task { try await executor.execute(deadlineUptime: UInt64.max, operation: { try gate.run($0) }) }
+        }
+        await fulfillment(of: [first.entered, second.entered], timeout: 3)
+        let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, nativeDeadline: true, now: { clock.now })
+        let nativeCalls = OSAllocatedUnfairLock(initialState: 0)
+        let disposals = OSAllocatedUnfairLock(initialState: 0)
+        let probe = Task {
+            await budget.run {
+                try budget.admit()
+                _ = try await executor.execute(
+                    deadlineUptime: budget.deadline,
+                    operation: { _ in
+                        nativeCalls.withLock { $0 += 1 }
+                        return TorWorkerGate.response
+                    },
+                    dispose: { disposals.withLock { $0 += 1 } },
+                    onStart: { try budget.beginNetworkAttempt() }
+                )
+                return .usable
+            }
+        }
+        await clock.waitForSleepers(1)
+        clock.advance(to: budget.deadline)
+        let outcome = await probe.value
+        XCTAssertEqual(outcome, .inconclusive)
+        XCTAssertEqual(nativeCalls.withLock { $0 }, 0)
+        XCTAssertEqual(disposals.withLock { $0 }, 1)
+        first.release()
+        second.release()
+        for task in downloads { _ = try await task.value }
+        XCTAssertEqual(nativeCalls.withLock { $0 }, 0, "Expired work cannot dispatch after a slot becomes free")
+        XCTAssertEqual(disposals.withLock { $0 }, 1)
+    }
+
+    func testExpiredBetweenAdmissionAndWorkerNeverDispatches() async throws {
+        let clock = TorTestClock()
+        let queue = DispatchQueue(label: "probe.delayed.worker", attributes: .concurrent)
+        let blocked = expectation(description: "Worker queue blocked")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        queue.async(flags: .barrier) {
+            blocked.fulfill()
+            XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+        }
+        await fulfillment(of: [blocked], timeout: 3)
+        let admitted = expectation(description: "Executor admission read")
+        let executor = TorHTTPRequestExecutor(workerQueue: queue, now: {
+            if clock.now == 0 { admitted.fulfill() }
+            return clock.now
+        })
+        let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, nativeDeadline: true, now: { clock.now })
+        let nativeCalls = OSAllocatedUnfairLock(initialState: 0)
+        let disposals = OSAllocatedUnfairLock(initialState: 0)
+        let probe = Task {
+            await budget.run {
+                try budget.admit()
+                _ = try await executor.execute(
+                    deadlineUptime: budget.deadline,
+                    operation: { _ in
+                        nativeCalls.withLock { $0 += 1 }
+                        return TorWorkerGate.response
+                    },
+                    dispose: { disposals.withLock { $0 += 1 } },
+                    onStart: { try budget.beginNetworkAttempt() }
+                )
+                return .usable
+            }
+        }
+        await fulfillment(of: [admitted], timeout: 3)
+        clock.advance(to: budget.deadline)
+        release.signal()
+        let outcome = await probe.value
+        XCTAssertEqual(outcome, .inconclusive)
+        XCTAssertEqual(nativeCalls.withLock { $0 }, 0)
+        XCTAssertEqual(disposals.withLock { $0 }, 1)
+    }
+
+    func testSubmillisecondQueuedBudgetIsInconclusive() async {
+        let clock = TorTestClock()
+        let executor = TorHTTPRequestExecutor(now: { clock.now })
+        let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, nativeDeadline: true, now: { clock.now })
+        let outcome = await budget.run {
+            try budget.admit()
+            clock.advance(to: budget.deadline - 1)
+            _ = try await executor.execute(deadlineUptime: budget.deadline, operation: { _ in
+                XCTFail("No whole millisecond remains for native dispatch")
+                return TorWorkerGate.response
+            }, onStart: { try budget.beginNetworkAttempt() })
+            return .usable
+        }
+        XCTAssertEqual(outcome, .inconclusive)
+    }
+
+    func testDispatchedFailureRemainsUnavailable() async throws {
+        try await assertDispatchedOutcome(status: nil, expected: .transportUnavailable)
+    }
+
+    func testResponseStatusWinsDeadlineRace() async throws {
+        try await assertDispatchedOutcome(status: 403, expected: .policyRejected)
+    }
+
+    private func assertDispatchedOutcome(status: UInt16?, expected: OHTTPHealthOutcome) async throws {
+        let clock = TorTestClock()
+        let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, nativeDeadline: true, now: { clock.now })
+        let runtimes = TorTestRuntimes()
+        let nativeCalls = OSAllocatedUnfairLock(initialState: 0)
+        let disposals = OSAllocatedUnfairLock(initialState: 0)
+        var native = TorHTTPGetNative(isolateRuntime: { runtimes.clone($0) }, freeRuntime: {
+            disposals.withLock { $0 += 1 }
+            runtimes.free($0)
+        })
+        native.classifiedGet = { _, _, _, _, _, _, _, outcome in
+            nativeCalls.withLock { $0 += 1 }
+            clock.advance(to: budget.deadline)
+            outcome?.pointee = FfiTorHttpOutcome(kind: status == nil ? 2 : 1, http_status: status ?? 0, retry_not_before_ns: 0)
+            return nil
+        }
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: FileManager.default.temporaryDirectory, httpGetNative: native)
+        let outcome = await budget.run {
+            try budget.admit()
+            return try await OHTTPHealthProbe.$budget.withValue(budget) {
+                _ = try await client.httpRequestSentOnce(
+                    for: URLRequest(url: URL(string: "https://probe.test/keys")!), maxBytes: 100, timeoutMilliseconds: 60_000
+                )
+                return .usable
+            }
+        }
+        XCTAssertEqual(outcome, expected)
+        XCTAssertEqual(nativeCalls.withLock { $0 }, 1)
+        XCTAssertEqual(disposals.withLock { $0 }, 1)
+        try await client.close()
+        XCTAssertEqual(disposals.withLock { $0 }, 2, "Child and parent each dispose once")
     }
 
     func testNativeExplicitPausePreventsProbeDispatch() async throws {
@@ -309,9 +453,13 @@ final class OHTTPHealthProbeTests: XCTestCase {
             walletNetwork: .testnet,
             testKeyVerifier: OHTTPTestSupport.makeKeyVerifier(),
             keyCache: OHTTPKeyCache(),
-            streamSender: sender,
+            streamSender: { request, maxBytes in
+                try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+                return try await sender(request, maxBytes)
+            },
             streamDecoderFactory: { _ in decoder() },
             httpSender: { request, _ in
+                try OHTTPHealthProbe.budget?.beginNetworkAttempt()
                 keyFetch()
                 return (OHTTPTestSupport.stubEnvelope, OHTTPTestSupport.response(for: request.url, status: 200))
             }

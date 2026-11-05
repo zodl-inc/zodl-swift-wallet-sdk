@@ -108,6 +108,63 @@ final class OHTTPRotatingSessionTests: XCTestCase {
         }
     }
 
+    func testDispatchedProbeDeadlineRemainsUnavailable() async throws {
+        for streaming in [false, true] {
+            let fixture = SessionFixture()
+            let sessions = fixture.makePool()
+            let clock = TorTestClock()
+            let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, now: { clock.now })
+            let request = request
+            let outcome = await budget.run {
+                try budget.admit()
+                return try await OHTTPHealthProbe.$budget.withValue(budget) {
+                    try await OHTTPTransport.$sessionBox.withValue(sessions) {
+                        if streaming {
+                            let response = try await OHTTPTransport.streamedData(for: request, maxBytes: 100)
+                            for try await _ in response.body { }
+                        } else {
+                            _ = try await OHTTPTransport.boundedData(for: request, maxBytes: 100)
+                        }
+                        clock.advance(to: budget.deadline)
+                        throw URLError(.timedOut)
+                    }
+                }
+            }
+            XCTAssertEqual(outcome, .transportUnavailable)
+        }
+    }
+
+    func testExpiredProbeSetupRetiresWithoutDispatching() async throws {
+        for streaming in [false, true] {
+            let fixture = SessionFixture()
+            let sessions = fixture.makePool()
+            let clock = TorTestClock()
+            let budget = OHTTPHealthProbeBudget(milliseconds: 60_000, now: { clock.now })
+            do {
+                try await OHTTPHealthProbe.$budget.withValue(budget) {
+                    try await OHTTPTransport.$sessionBox.withValue(sessions) {
+                        try await OHTTPTransport.$beforeSessionSetupForTesting.withValue({
+                            sessions.acquire(now: Date().addingTimeInterval(20)).release()
+                            clock.advance(to: budget.deadline)
+                        }) {
+                            if streaming {
+                                _ = try await OHTTPTransport.streamedData(for: request, maxBytes: 100)
+                            } else {
+                                _ = try await OHTTPTransport.boundedData(for: request, maxBytes: 100)
+                            }
+                        }
+                    }
+                }
+                XCTFail("Expired probe must not dispatch after setup")
+            } catch {
+                XCTAssertEqual((error as? URLError)?.code, .timedOut)
+            }
+            let first = fixture.record(0)
+            XCTAssertEqual(first.retirementCount, 1)
+            await fulfillment(of: [first.invalidated], timeout: 5)
+        }
+    }
+
     func testRetiredSessionFinishesExistingTask() async throws {
         let fixture = SessionFixture()
         let sessions = fixture.makePool()
