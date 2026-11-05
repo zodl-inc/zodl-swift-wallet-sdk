@@ -1208,7 +1208,7 @@ Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4480000.json
 ### NU7 pre-release crates
 
 - The SDK now builds on the NU7 pre-release generation of the underlying Zcash Rust crates and the
-  `zodl-slipstream` 0.4.0-pre.1 engine.
+  `zodl-slipstream` 0.4.0 engine, pinned to `zodl-inc/slipstream-internal@4c123a0c`.
 - Every unified address, unified full viewing key and unified incoming viewing key string the SDK
   returns is ZIP 316 revision 0, with every receiver or item it carries. Revision 2 is used only
   for a value revision 0 cannot represent (one with expiry metadata, a P2SH viewing-key item, or

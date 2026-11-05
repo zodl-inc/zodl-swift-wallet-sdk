@@ -647,7 +647,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The crate builds against the NU7 `librustzcash` releases and the OHTTP-enabled
-  `zodl-slipstream` 0.4.0 engine, pinned to `zodl-inc/slipstream-internal@539b447c` through
+  `zodl-slipstream` 0.4.0 engine, pinned to `zodl-inc/slipstream-internal@4c123a0c` through
   `[patch.crates-io]`. Building `libzcashlc` from source requires Rust 1.97 or newer and access
   to the private dependency. This engine retains the NU7 block cadence,
   `WalletWrite::set_account_name`, the restore-anchor handling for out-of-range server heights,
