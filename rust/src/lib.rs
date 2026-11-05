@@ -4738,7 +4738,7 @@ unsafe fn tor_http_post_bounded_impl(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let body = unsafe { tor::http::post_body(body, body_len) };
         let retry_filter =
             |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| (*retry_filter)(res);
 
@@ -4755,7 +4755,7 @@ unsafe fn tor_http_post_bounded_impl(
                                 builder.header(*key, *value)
                             })
                         },
-                        http_body_util::Full::new(body_data),
+                        body,
                         |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),
@@ -5141,11 +5141,7 @@ unsafe fn tor_http_classified_impl(
         let client = runtime.client();
         let (result, evidence) = if let Some((body, length)) = post {
             anyhow::ensure!(length == 0 || !body.is_null(), "A request body is required");
-            let body = if length == 0 {
-                &[]
-            } else {
-                unsafe { slice::from_raw_parts(body, length) }
-            };
+            let body = unsafe { tor::http::post_body(body, length) };
             runtime.runtime().block_on(tor_http_classified_response(
                 max_bytes,
                 timeout_ms,
@@ -5155,7 +5151,7 @@ unsafe fn tor_http_classified_impl(
                         .http_post(
                             url,
                             add_headers,
-                            http_body_util::Full::new(body),
+                            body,
                             |body| guard.parse_get(body, true),
                             TOR_HTTP_UNSENT_RETRIES,
                             |result| guard.filter(result),
@@ -5533,7 +5529,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let body = unsafe { tor::http::post_body(body, body_len) };
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
             res.is_err()
                 .then_some(zcash_client_backend::tor::http::Retry::Same)
@@ -5552,7 +5548,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                                 builder.header(*key, *value)
                             })
                         },
-                        http_body_util::Full::new(body_data),
+                        body,
                         |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),

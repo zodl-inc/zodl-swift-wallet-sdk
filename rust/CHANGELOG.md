@@ -13,6 +13,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_tor_http_post`, `zcashlc_tor_http_post_bounded`,
+  `zcashlc_tor_http_post_once_bounded`, and `zcashlc_tor_http_post_once_with_timeout`
+  keep request bytes valid when sending continues after an early response or timeout.
+  Callers may release their input buffer when the function returns, as documented;
+  signatures and retry policies are unchanged.
+
 - OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one
   throttled resolver does not prevent another resolver from restoring connectivity.
 
