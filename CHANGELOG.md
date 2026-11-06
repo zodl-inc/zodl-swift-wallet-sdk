@@ -377,6 +377,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For custom regtest snapshots at height 11 or later, the registered activation schedule must
   select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
 
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3540000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3545000.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4580000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4590000.json
+````
+
 # 7.0.1 - 2026-11-02
 
 ## Fixed
