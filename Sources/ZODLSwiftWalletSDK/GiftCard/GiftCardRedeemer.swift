@@ -443,7 +443,8 @@ public actor GiftCardRedeemer {
     /// completion, even when the caller cancels. Cleanup joins that work before deleting the wallet.
     /// A later stream error is rethrown after accepted receipts are attempted in the destination.
     public func redeem(to recipient: UnifiedAddress, memo: Memo?, recordIn destination: Synchronizer?) async throws -> Redemption {
-        try await serialized { redeemer, admission in
+        OHTTPHealthContext.attempt?.beginDelegation()
+        return try await serialized { redeemer, admission in
             try await redeemer.performRedeem(to: recipient, memo: memo, recordIn: destination, admission: admission)
         }
     }

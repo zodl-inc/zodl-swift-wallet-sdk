@@ -8,10 +8,13 @@
 
 import Foundation
 import Combine
+import os
 
 /// Synchronizer implementation for UIKit and iOS 16+
 // swiftlint:disable type_body_length file_length
 public class SDKSynchronizer: AwaitableStopSynchronizer {
+    private nonisolated let healthOwner: OHTTPHealthBinding
+
     public var alias: ZcashSynchronizerAlias { initializer.alias }
 
     private lazy var streamsUpdateQueue = { DispatchQueue(label: "streamsUpdateQueue_\(initializer.alias.description)") }()
@@ -98,6 +101,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     ) {
         self.connectionState = .idle
         self.underlyingStatus = GenericActor(status)
+        self.healthOwner = OHTTPHealthBinding(endpoint: initializer.endpoint)
         self.initializer = initializer
         self.transactionEncoder = transactionEncoder
         self.transactionRepository = transactionRepository
@@ -133,6 +137,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             eventSubject: eventSubject,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
+            transactionRepository: transactionRepository,
+            chainTip: { [weak self] in self?.latestState.latestBlockHeight ?? 0 },
             statusCheck: { [weak self] in
                 guard let self else {
                     throw ZcashError.synchronizerNotPrepared
@@ -151,6 +157,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     deinit {
+        healthOwner.retire()
         Task { [blockProcessor] in
             await blockProcessor.stop()
         }
@@ -183,6 +190,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
         guard await status == .unprepared else { return .success }
+        try OHTTPEndpoints.checkGatewayNetwork(host: initializer.endpoint.host, network: initializer.network.networkType)
 
         if let error = checkIfCanContinueInitialisation() {
             throw error
@@ -556,6 +564,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
@@ -565,28 +574,38 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
+                let attempt = health.makeAttempt()
                 do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    try await health.withAttempt(attempt) {
+                        try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                    }
                     return TransactionSubmitResult.success(txId: transaction.txId)
                 } catch ZcashError.serviceSubmitFailed(let error) {
                     // The server could not be reached. That includes its height not being readable, the first request of a submission.
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
                 } catch TransactionEncoderError.submitError(let code, let message) {
                     // Trust the network over the submit-side error: if the server confirms
                     // it has this tx, the broadcast already landed (e.g. Zebra's
                     // MempoolError::InMempool / AlreadyQueued, zcashd's "already in chain",
                     // or any future variant). Treat as success and skip the failure screen.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                    if await health.withAttempt(health.makeAttempt(), operation: {
+                        await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                    }) {
                         return TransactionSubmitResult.success(txId: transaction.txId)
                     }
                     submitFailed = true
+                    health.adoptFailure(from: attempt)
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
                 } catch TransactionEncoderError.notSubmittable(let refusal) {
                     // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
                     // network, so there is no server to ask whether it knows the transaction.
                     submitFailed = true
                     return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                } catch {
+                    health.adoptFailure(from: attempt)
+                    throw error
                 }
             }
         })
@@ -616,12 +635,17 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // TODO [#1724]: zcash_client_backend: Make Sapling parameters optional for extract_and_store_transaction
         // TODO [#1724]: https://github.com/zcash/librustzcash/issues/1724
 //        if await initializer.rustBackend.PCZTRequiresSaplingProofs(pczt: pczt) {
+        let container = initializer.container
         try await SaplingParameterDownloader.downloadParamsIfnotPresent(
             spendURL: initializer.spendParamsURL,
             spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
             outputURL: initializer.outputParamsURL,
             outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
+            logger: logger,
+            torClientProvider: {
+                let isTorEnabled = await self.sdkFlags.torEnabled
+                return isTorEnabled ? container.resolve(TorClient.self) : nil
+            }
         )
 //        }
 
@@ -882,16 +906,23 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 return
             }
 
+            let healthTransition = OSAllocatedUnfairLock<UUID?>(initialState: nil)
             let context = AfterSyncHooksManager.WipeContext(
                 prewipe: { [weak self] in
-                    self?.transactionEncoder.closeDBConnection()
-                    self?.transactionRepository.closeDBConnection()
+                    guard let self else { return }
+                    let transition = self.healthOwner.beginTransition(walletReset: true)
+                    healthTransition.withLock { $0 = transition }
+                    self.transactionEncoder.closeDBConnection()
+                    self.transactionRepository.closeDBConnection()
                 },
                 completion: { [weak self] possibleError in
                     if possibleError == nil {
                         await self?.submitPlanStore.wipe()
                     }
                     await self?.updateStatus(.unprepared)
+                    if let self, let transition = healthTransition.withLock({ $0 }) {
+                        self.healthOwner.settle(transition: transition, endpoint: self.initializer.endpoint)
+                    }
                     if let error = possibleError {
                         subject.send(completion: .failure(error))
                     } else {
@@ -903,6 +934,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             do {
                 try await blockProcessor.wipe(context: context)
             } catch {
+                if let transition = healthTransition.withLock({ $0 }) {
+                    healthOwner.settle(transition: transition, endpoint: initializer.endpoint)
+                }
                 subject.send(completion: .failure(error))
             }
         }
@@ -912,6 +946,43 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
     public func isSeedRelevantToAnyDerivedAccount(seed: [UInt8]) async throws -> Bool {
         try await initializer.rustBackend.isSeedRelevantToAnyDerivedAccount(seed: seed)
+    }
+
+    /// The service for any endpoint: OHTTP gateways get the RFC 9458 transport, everything else the
+    /// grpc-swift / Tor service — the same choice `Dependencies.setupForNewInstance` makes for the main
+    /// service. `evaluateBestOf`/`evaluateServerSwitch` and `switchTo` used to build a plain
+    /// `LightWalletGRPCServiceOverTor` here, which speaks plain gRPC to a gateway that refuses it
+    /// (426), so a healthy gateway failed validation and could never be a switch target.
+    static func makeService(
+        endpoint: LightWalletEndpoint,
+        tor: TorClient,
+        singleCallTimeout: Int64? = nil,
+        sdkFlags: SDKFlags? = nil,
+        networkType: NetworkType
+    ) -> LightWalletGRPCServiceOverTor {
+        if OHTTPEndpoints.isGateway(endpoint.host) {
+            let service: LightWalletOHTTPService
+            if let sdkFlags {
+                if let singleCallTimeout {
+                    service = LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: singleCallTimeout, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+                } else {
+                    service = LightWalletOHTTPService(endpoint: endpoint, singleCallTimeout: 30_000, streamingCallTimeout: 100_000, tor: tor, sdkFlags: sdkFlags)
+                }
+            } else {
+                if let singleCallTimeout {
+                    service = LightWalletOHTTPService(endpoint: endpoint, tor: tor, singleCallTimeout: singleCallTimeout)
+                } else {
+                    service = LightWalletOHTTPService(endpoint: endpoint, tor: tor)
+                }
+            }
+            service.walletNetwork = networkType
+            return service
+        }
+        let service = singleCallTimeout.map {
+            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor, singleCallTimeout: $0)
+        } ?? LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+        service.sdkFlags = sdkFlags
+        return service
     }
 
     /// Takes the list of endpoints and runs it through a series of checks to evaluate its performance.
@@ -997,12 +1068,13 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Initialize services for the endpoints
         let services = endpoints.map {
             Service(
                 originalEndpoint: $0,
-                service: LightWalletGRPCServiceOverTor(endpoint: $0, tor: torClient),
+                service: Self.makeService(endpoint: $0, tor: torClient, sdkFlags: sdkFlags, networkType: network),
                 // The scheme-qualified form so endpoints differing only in the TLS flag —
                 // distinct servers under `isSameServer` — cannot collide on one key.
                 url: $0.urlString
@@ -1280,16 +1352,24 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    // swiftlint:disable function_parameter_count
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let torEnabled = await sdkFlags.torEnabled
             let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
@@ -1304,12 +1384,25 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
+    /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+    }
+
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
+        try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from, bootstrapped on first use. Throws
+    /// unless Tor or the exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
 
@@ -1319,7 +1412,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         if httpTor == nil {
             logger.info("Bootstrapping Tor client for making http requests")
-            if let torService = initializer.container.resolve(LightWalletService.self) as? LightWalletGRPCServiceOverTor {
+            let service = initializer.container.resolve(LightWalletService.self)
+            let concreteService = (service as? RebindingLightWalletService)?.currentService ?? service
+            if let torService = concreteService as? LightWalletGRPCServiceOverTor {
                 httpTor = try await torService.tor.isolatedClient()
             }
         }
@@ -1327,8 +1422,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         guard let httpTor else {
             throw ZcashError.torClientUnavailable
         }
-
-        return try await httpTor.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+        return httpTor
     }
 
     public func httpGetOverTor(
@@ -1361,6 +1455,100 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
         let torClient = initializer.container.resolve(TorClient.self)
         return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+    }
+
+    /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
+    /// destination service. The request URL must use a hostname registered in `OHTTPEndpoints`
+    /// (e.g. `cmc.zodl.com`, `near.zodl.com`). Use `OHTTPEndpoints.proxyURL(for:)` to convert a
+    /// real API URL to its OHTTP proxy counterpart before calling this method.
+    ///
+    /// Tor/OHTTP matrix:
+    ///   - Tor OFF: call this method → OHTTP → gateway → destination (IP hidden from destination)
+    ///   - Tor ON:  call this method with `viaTor: true` → Tor → relay → gateway → destination
+    ///              (the relay POST rides a Tor circuit; the gateway injects secrets for mapped hosts)
+    ///
+    /// Gateway-injected secrets: external APIs that need a secret (CMC, NEAR) must NOT receive the
+    /// app's secret when Tor is ON. With `viaTor: true`, the gateway injects the secret on behalf
+    /// of the client after decrypting the OHTTP-encapsulated request.
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+        // and the path-restricted voting-config mirror.
+        guard let host = request.url?.host,
+              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await sdkFlags.torEnabled
+        let viaTor = viaTor || torMode
+
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            httpSender = { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            }
+        } else {
+            httpSender = { request, maxBytes in
+                // S4: use boundedDataWithDeadline for 100s timeout
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
+                    for: request,
+                    maxBytes: maxBytes
+                )
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        let transport = OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: initializer.network.networkType,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
+
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttpRequest = try OHTTPExternalHTTP.innerRequest(for: request)
+        let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
+
+        guard let httpResponse = HTTPURLResponse(
+            url: request.url!,
+            statusCode: bhttpResponse.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(bhttpResponse.headers.map { $0 }, uniquingKeysWith: { _, last in last })
+        ) else {
+            throw ZcashError.ohttpResponseError
+        }
+        return (bhttpResponse.body, httpResponse)
+    }
+
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await sdkFlags.torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
     }
 
     public func debugDatabase(sql: String) -> String {
@@ -1708,18 +1896,23 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     // MARK: Server switch
 
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+
         // Stop synchronization
         let status = await self.status
         if status != .stopped && status != .disconnected {
-            await blockProcessor.stop()
+            await blockProcessor.stopAndWait()
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
 
         // Validation of the server is first because any custom endpoint can be passed here
         // Extra instance of the service is created with lower timeout for a single call
+        // S6: capture network value to avoid retain cycle
+        let networkType = initializer.network.networkType
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000)
+            Self.makeService(endpoint: endpoint, tor: torClient, singleCallTimeout: 5000, sdkFlags: sdkFlags, networkType: networkType)
         }
 
         let validateSever = ValidateServerAction(
@@ -1730,6 +1923,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         do {
             _ = try await validateSever.run(with: ActionContextImpl(state: .idle)) { _ in }
         } catch {
+            // Validation is provisional; keep future dependency resolutions on the active service.
+            let previousService = initializer.lightWalletService
+            initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in previousService }
             throw ZcashError.synchronizerServerSwitch
         }
 
@@ -1737,10 +1933,15 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // final instance of the service will be instantiated and propagated to the all parties
 
         // SWITCH TO NEW ENDPOINT
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: initializer.endpoint) }
+
+        initializer.container.register(type: LightWalletEndpoint.self, isSingleton: true) { _ in endpoint }
 
         // LightWalletService dependency update
+        // S6: use captured networkType (already declared above)
         initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in
-            LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: torClient)
+            Self.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags, networkType: networkType)
         }
 
         // DEPENDENCIES
@@ -1797,6 +1998,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         initializer.lightWalletService = initializer.container.resolve(LightWalletService.self)
         initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
         initializer.endpoint = endpoint
+        healthOwner.recordPublishedEndpoint(endpoint)
 
         // SELF
         self.latestBlocksDataProvider = initializer.container.resolve(LatestBlocksDataProvider.self)
@@ -1953,3 +2155,55 @@ extension SessionTicker {
 }
 
 extension SDKSynchronizer: TrustedTransactionRecording {}
+
+extension SDKSynchronizer: OHTTPHealthProviding {
+    public nonisolated var ohttpHealthBinding: OHTTPHealthBinding? { healthOwner }
+
+    public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
+        try await makeOHTTPHealthSession(route: route, generation: generation) { await self.healthBinding() }
+    }
+
+    func makeOHTTPHealthSession(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        lookup: @Sendable () async -> OHTTPHealthProbeBinding
+    ) async throws -> OHTTPHealthSession {
+        let token = try healthOwner.readyToken()
+        let binding = await lookup()
+        guard try healthOwner.readyToken() == token else { throw OHTTPHealthError.bindingUnavailable }
+        try binding.validate(route)
+        let session = try OHTTPHealthSession(route: route, generation: generation, bindingID: token, ownerID: healthOwner.ownerID)
+        try healthOwner.admit(session)
+        return session
+    }
+
+    public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
+        await probeOHTTPHealth(session: session) { await self.healthBinding() }
+    }
+
+    nonisolated func probeOHTTPHealth(
+        session: OHTTPHealthSession,
+        lookup: @escaping @Sendable () async -> OHTTPHealthProbeBinding
+    ) async -> OHTTPHealthProbeResult {
+        guard healthOwner.accepts(session) else { return OHTTPHealthProbe.cancelled(session: session) }
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await lookup()
+            guard self.healthOwner.accepts(session) else { throw CancellationError() }
+            return try await binding.probe(session: session, budget: budget)
+        }
+        guard healthOwner.accepts(session) else {
+            return OHTTPHealthProbe.cancelled(session: session, startedAt: result.startedAtNanoseconds)
+        }
+        return result
+    }
+
+    func healthBinding() async -> OHTTPHealthProbeBinding {
+        let viaTor = await sdkFlags.torEnabled
+        return OHTTPHealthProbeBinding(
+            endpoint: initializer.endpoint,
+            network: initializer.network.networkType,
+            viaTor: viaTor,
+            tor: initializer.container.resolve(TorClient.self)
+        )
+    }
+}

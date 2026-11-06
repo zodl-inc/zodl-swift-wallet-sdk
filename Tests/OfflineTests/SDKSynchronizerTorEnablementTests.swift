@@ -20,6 +20,27 @@ final class SDKSynchronizerTorEnablementTests: ZcashTestCase {
         try await assertPreparationFailure(.exchangeRate)
     }
 
+    func testLegacyEnableDoesNotPublishBeforeReady() async throws {
+        let entered = expectation(description: "legacy bootstrap waiting")
+        let release = DispatchSemaphore(value: 0)
+        let fixture = TorEnablementFixture(beforeCreation: {
+            entered.fulfill()
+            _ = release.wait(timeout: .now() + 5)
+        })
+        let client = TorClient(torDir: testTempDirectory, httpGetNative: fixture.native)
+        let synchronizer = try makeSynchronizer(client: client, torEnabled: false, exchangeRateEnabled: false)
+        let enable = Task { try await synchronizer.tor(enabled: true) }
+        await fulfillment(of: [entered], timeout: 2)
+        let beforeReady = await synchronizer.sdkFlags.torEnabled
+        XCTAssertFalse(beforeReady)
+        release.signal()
+        try await enable.value
+        let afterReady = await synchronizer.sdkFlags.torEnabled
+        XCTAssertTrue(afterReady)
+        await assertBoundedGETSucceeds(synchronizer)
+        try await client.close()
+    }
+
     func testRepeatedEnablementReusesAnAlreadyPreparedRuntime() async throws {
         let fixture = TorEnablementFixture()
         let client = TorClient(runtimePtr: fixture.runtimes.parent, torDir: testTempDirectory, httpGetNative: fixture.native)
@@ -154,9 +175,11 @@ private final class TorEnablementFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var creations = 0
     private let failCreation: Bool
+    private let beforeCreation: @Sendable () -> Void
     private let response = TorResponseFixture()
 
-    init(failCreation: Bool = false) {
+    init(failCreation: Bool = false, beforeCreation: @escaping @Sendable () -> Void = {}) {
+        self.beforeCreation = beforeCreation
         self.failCreation = failCreation
     }
 
@@ -176,8 +199,9 @@ private final class TorEnablementFixture: @unchecked Sendable {
             freeResponse: { _ in },
             isolateRuntime: { runtimes.clone($0) },
             freeRuntime: { runtimes.free($0) },
-            createRuntime: { [self] _, _ in
+            startup: TorRuntimeStartupNative.fixture { [self] _, _ in
                 lock.withLock { creations += 1 }
+                beforeCreation()
                 return failCreation ? nil : runtimes.parent
             }
         )

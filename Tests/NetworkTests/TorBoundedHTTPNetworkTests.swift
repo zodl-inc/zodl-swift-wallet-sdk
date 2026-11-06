@@ -314,13 +314,13 @@ private final class TorNativeObserver: @unchecked Sendable {
                 zcashlc_free_tor_runtime(pointer)
                 record(isParent ? "parent-free-end" : "clone-free-end")
             },
-            createRuntime: { [self] path, length in
-                let runtime = zcashlc_create_tor_runtime(path, length)
+            startup: TorRuntimeStartupNative(take: { [self] job in
+                let result = zcashlc_tor_startup_take_v1(job)
                 lock.lock()
-                parent = runtime
+                parent = result.runtime
                 lock.unlock()
-                return runtime
-            }
+                return result
+            })
         )
     }
 }

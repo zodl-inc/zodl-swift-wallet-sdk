@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ["clean-ffi", "ffi-all", "configure-local-ffi", "build", "test-offline"]
@@ -35,9 +36,11 @@ if name == "make":
     if target == "ffi-all":
         slices = {
             "ios-arm64": ("ios", None, ["arm64"]),
-            "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]),
-            "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"]),
+            "ios-arm64-simulator": ("ios", "simulator", ["arm64"]),
+            "macos-arm64": ("macos", None, ["arm64"]),
         }
+        if os.environ.get("OLD_UNIVERSAL"):
+            slices = {"ios-arm64": ("ios", None, ["arm64"]), "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]), "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"])}
         libraries = []
         for identifier, (platform, variant, arches) in slices.items():
             if os.environ.get("MISSING_SLICE") == identifier:
@@ -65,6 +68,10 @@ if name == "make":
             (framework / "Modules/module.modulemap").write_text("module wrong {}")
         if broken == "plist":
             (framework / "Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "999"}))
+        if os.environ.get("FAT_ARCH"):
+            (product / "macos-arm64/libzcashlc.framework/libzcashlc").write_text("arm64 x86_64")
+        if os.environ.get("STALE_EXTRA"):
+            (product / "macos-arm64_x86_64").mkdir()
         if os.environ.get("WRONG_ARCH"):
             (product / "ios-arm64/libzcashlc.framework/libzcashlc").write_text("x86_64")
         if os.environ.get("MUTATE_SOURCE") == target:
@@ -121,7 +128,7 @@ class NativeRecordTests(unittest.TestCase):
             path = self.tools / tool
             path.write_text(GH_DOUBLE if tool == "gh" else NATIVE_DOUBLE)
             path.chmod(0o755)
-        for relative in ("Makefile", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/ci/sdk_build_record.py"):
+        for relative in ("Makefile", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/lib/ohttp_env.py", "Scripts/ci/sdk_build_record.py"):
             source = ROOT / relative
             if source.exists():
                 target = self.source / relative
@@ -151,6 +158,7 @@ class NativeRecordTests(unittest.TestCase):
 
     def artifacts(self, *flags, record=True, expected_source=None, **env):
         environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
+        environment.update(VALUES)
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog))
         if record:
             environment["ZODL_SDK_BUILD_RECORD"] = "1"
@@ -200,6 +208,7 @@ if sys.argv[1:] == ["--version"]:
 
     def policy_environment(self):
         environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k != "GH_REPO"}
+        environment.update(VALUES)
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog), GH_REPO="owner/sdk")
         real_git = shutil.which("git")
         sentinel = self.tools / "git"
@@ -289,7 +298,8 @@ if sys.argv[1:] == ["--version"]:
         self.assertEqual(self.make_calls(), [[target] for target in TARGETS])
         self.assertEqual(proof["commands"], [["make", target] for target in TARGETS])
         self.assertEqual(proof["component_versions"], dict(cargo="5.0.0", lock="5.0.0", plist_short="5.0.0", plist_build="42"))
-        self.assertEqual(len(proof["slices"]), 3)
+        self.assertEqual({s["identifier"] for s in proof["slices"]}, {"ios-arm64", "ios-arm64-simulator", "macos-arm64"})
+        self.assertTrue(all(s["architectures"] == ["arm64"] for s in proof["slices"]))
         self.assertEqual(proof["execution"], dict(backend="local", request_id="c"*32, workflow=None))
         self.assertTrue(all(proof["toolchains"].values()))
         self.assertFalse((self.source / "LocalPackages").exists())
@@ -410,6 +420,14 @@ if sys.argv[1:] == ["--version"]:
         result = self.artifacts(WRONG_ARCH="1")
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_release_write()
+
+    def test_universal_fat_and_stale_extra_products_are_rejected(self):
+        for variable in ("OLD_UNIVERSAL", "FAT_ARCH", "STALE_EXTRA"):
+            with self.subTest(variable=variable):
+                self.ghlog.unlink(missing_ok=True)
+                result = self.artifacts(**{variable: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_no_release_write()
 
     def test_symlink_product_is_rejected(self):
         result = self.artifacts(SYMLINK_PRODUCT="1")

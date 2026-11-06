@@ -197,13 +197,16 @@ public protocol CombineSynchronizer {
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>
 
+    // swiftlint:disable function_parameter_count
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) -> SinglePublisher<VotingRoundSession, Error>
+    // swiftlint:enable function_parameter_count
 
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 

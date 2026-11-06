@@ -34,6 +34,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
                 inputs: environment.inputs,
                 binding: environment.binding,
                 route: .tor,
+                isCustomServer: true,
                 epoch: 1
             )
             XCTFail("a synchronizer with Tor disabled cannot open a round on Tor")
@@ -59,6 +60,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             route: .direct,
+            isCustomServer: true,
             epoch: 1
         )
 
@@ -66,6 +68,29 @@ final class VotingSessionFactoryTests: ZcashTestCase {
         XCTAssertEqual(try session.plan().roundId, environment.roundId)
 
         await session.close()
+    }
+
+    /// A predefined server with Tor off rides OHTTP, which only carries the gateway's own hosts.
+    /// The fixture's endpoints are not among them, so opening is refused up front and typed,
+    /// never falling back to the direct connection a custom server gets.
+    func testDirectRouteWithPredefinedServersFailsClosedOutsideTheGateway() async throws {
+        let environment = try await makeVotingSessionEnvironment(tag: 0x57, walletId: walletId)
+        let synchronizer = try makeSynchronizer()
+
+        do {
+            _ = try await synchronizer.makeVotingRoundSession(
+                backend: environment.backend,
+                inputs: environment.inputs,
+                binding: environment.binding,
+                route: .direct,
+                isCustomServer: false,
+                epoch: 1
+            )
+            XCTFail("a predefined server the gateway does not carry cannot be reached directly")
+        } catch let error as VotingError {
+            XCTAssertEqual(error.kind, .invalidInput)
+        }
+        XCTAssertEqual(try environment.backend.listRounds(), [])
     }
 
     // MARK: - Slipstream
@@ -84,6 +109,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
                 inputs: environment.inputs,
                 binding: environment.binding,
                 route: .tor,
+                isCustomServer: true,
                 epoch: 1
             )
             XCTFail("a synchronizer with Tor disabled cannot open a round on Tor")
@@ -105,6 +131,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             route: .direct,
+            isCustomServer: true,
             epoch: 1
         )
 
@@ -127,6 +154,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             route: .tor,
+            isCustomServer: true,
             epoch: 1
         ) { result in
             if case .failure(let error) = result, case ZcashError.torNotEnabled = error {
@@ -141,6 +169,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             route: .direct,
+            isCustomServer: true,
             epoch: 1
         ) { result in
             guard case .success(let session) = result else { return }
@@ -164,6 +193,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
                     inputs: environment.inputs,
                     binding: environment.binding,
                     route: .tor,
+                    isCustomServer: true,
                     epoch: 1
                 )
             )
@@ -180,6 +210,7 @@ final class VotingSessionFactoryTests: ZcashTestCase {
                 inputs: environment.inputs,
                 binding: environment.binding,
                 route: .direct,
+                isCustomServer: true,
                 epoch: 1
             )
         )

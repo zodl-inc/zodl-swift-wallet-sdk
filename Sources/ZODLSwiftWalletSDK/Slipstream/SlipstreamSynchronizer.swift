@@ -58,8 +58,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     // ── Shared infrastructure ──────────────────────────────────────────────────
     // `private` reaches the same-file private extension (Swift 4+ file-scope rule).
+    private nonisolated let healthOwner: OHTTPHealthBinding
+    deinit { healthOwner.retire() }
+
     private let initializer: Initializer
     private let transactionRepository: TransactionRepository
+    private let endpointService: RebindingLightWalletService
+    private let makeEndpointService: (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService
     private let transactionEncoder: TransactionEncoder
     private let broadcasterStorage: Broadcaster
     /// [#1976] Resolved once in `init` from the container (same singleton `broadcasterStorage`'s
@@ -95,9 +100,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     public nonisolated var broadcaster: Broadcaster { broadcasterStorage }
 
     // ── Endpoint (mutable for switchTo) ───────────────────────────────────────
-    // Tracks the endpoint currently in use.  `engine.reopen(server:network:)` uses
-    // this value; `initializer.endpoint` is the initial value.
+    // Tracks the endpoint currently in use — or, between a wipe and the next `prepare`, the one that
+    // `prepare` will use. Successful endpoint changes publish this value together with
+    // `initializer.endpoint` and the retained Swift service binding.
     private var currentEndpoint: LightWalletEndpoint
+    // A published endpoint whose restart failed has not become an accepted route. Retain the
+    // previous wallet route until a lifecycle owner restores it or a newer explicit switch succeeds.
+    private var pendingEndpointReconciliation: LightWalletEndpoint?
+    /// Whether a completed `wipe()` closed the engine and no `prepare` has opened it since. In that window
+    /// the wallet database does not exist, and opening an engine handle opens the database, which SQLite
+    /// would recreate before `prepare` has initialized it. So while this is set `switchTo(endpoint:)` only
+    /// records the server, and `prepare` opens the engine at whatever was recorded.
+    private var engineClosedByWipe = false
+    /// Health tracks actual destruction even when a wipe or reopen subsequently fails.
+    private var healthEngineClosed = false
 
     // ── Running state (for switchTo restart decision) ──────────────────────────
     private var isRunning: Bool = false
@@ -275,17 +291,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // (`Constants.thresholdToTrigger`, shared with the old pipeline). The prune runs on every
     // check. This host duplicates neither number.
     //
-    // Teardown (`stopImpl`, `wipeImpl`) only CANCELS `resubmissionTask`; it never nils the
-    // handle. The fired task clears it itself, as its last step, through the actor-isolated
-    // `finishResubmissionCheck()` — a single writer. If teardown also nil'd the handle, a fast
-    // stop→start could let a stale task's finish clear a NEWER task's handle and re-open the
-    // spawn guard while that new task still runs (double-spawn). Cancel-only teardown keeps
-    // the guard closed until the cancelled task's own finish clears it, which is benign and
-    // self-healing. Note the LIMIT of that cancellation: only the SUBMIT stage observes it
-    // (`SubmitPlanExecutor.submit` checks `Task.checkCancellation`, and `TxResubmitter` catches
-    // per transaction). The prune stage has no cancellation checks at all and runs to
-    // completion — which is why `wipeImpl` cancels AND joins (below), rather than trusting
-    // cancellation to stop a check that would otherwise write to files it is deleting.
+    // Every lifecycle request (start, stop, switch, restart, wipe, prepare's engine step, account
+    // import and delete, rewind, stall recovery, Tor retirement) cancels through the nonisolated
+    // owner before it joins the queue. A Tor transition cancels when it is requested; its route
+    // fence makes later passes fail admission quickly. The lifecycle turn still drains actual
+    // retry work before it may publish a new route or remove files.
+    // Generation ownership also covers cancellation between task creation and installation.
+    // Only the fired task clears its actor handle after its queued work has unwound.
     //
     // The driver is also gated on the CALLER's cancellation (`isCancelled`, defaulted to
     // `Task.isCancelled` so it is evaluated in the caller's task context). `stopPolling()`
@@ -299,6 +311,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The in-flight check, if any. Doubles as the "one at a time" guard: a slow submit round
     /// must never be joined by a second concurrent pass over the same transactions.
     private var resubmissionTask: Task<Void, Never>?
+    private nonisolated let retryCancellation: RetryCancellationOwner
     /// How often the poll loop may run a resubmission check: 60 s (the poll tick is 2 s).
     /// `internal` so tests can reference the constant, like `stallWatchdogThresholdSeconds`.
     static let resubmissionCheckInterval: TimeInterval = 60
@@ -313,6 +326,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // A plain `let` of a Sendable lock-guarded object — reachable from the nonisolated `stop()`,
     // `rewind()` and `wipe()` as well as from the actor.
     private let lifecycle = LifecycleQueue()
+    private let torTransition: TorRouteTransition
+    private nonisolated let routeAdmission: TorNetworkAdmission
+    private var torIntendedRunning: Bool?
+    private var retiredTorRouteGeneration: UInt64?
     /// [#1755] Mirrors the wallet's deep-recovery state. Seeded from the persisted summary at
     /// prepare()/start(); ENGINE-OWNED during a run (tickPoll adopts `snap.isRecovering`, which embeds
     /// the terminal fail-safe latch — Done/Error force it 0). Drives the "Restoring"
@@ -406,6 +423,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         initializer: Initializer,
         alternateEndpoints: [LightWalletEndpoint],
         engine: any SlipstreamEngineControlling,
+        torTransition: TorRouteTransition = TorRouteTransition(),
+        retryCancellation: RetryCancellationOwner = RetryCancellationOwner(),
+        makeEndpointService: @escaping (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService = Dependencies.makeLightWalletService,
         torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         restoreAnchor: @escaping SlipstreamAnchorResolver = { isRestore, birthday, fallbackCheckpoint, server, network, torDirPath in
             await SlipstreamEngine.restoreAnchor(
@@ -418,14 +438,32 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             )
         }
     ) {
+        // Dependencies installs the binding before Initializer eagerly captures its downloader.
+        // Adopt it before constructing the encoder, broadcaster, or resubmitter. An injected raw
+        // service is wrapped here as well, and its initializer downloader is rebound to it.
+        let endpointService = initializer.lightWalletService as? RebindingLightWalletService
+            ?? RebindingLightWalletService(service: initializer.lightWalletService)
+        self.retryCancellation = retryCancellation
+        self.endpointService = endpointService
+        self.makeEndpointService = makeEndpointService
+        initializer.lightWalletService = endpointService
+        initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in endpointService }
+        initializer.container.register(type: BlockDownloaderService.self, isSingleton: true) { di in
+            BlockDownloaderServiceImpl(service: endpointService, storage: di.resolve(CompactBlockRepository.self))
+        }
+        initializer.blockDownloaderService = initializer.container.resolve(BlockDownloaderService.self)
+        self.torTransition = torTransition
+        self.routeAdmission = initializer.container.resolve(SDKFlags.self).routeAdmission
         self.engine = engine
         self.torHTTPUptime = torHTTPUptime
         self.restoreAnchor = restoreAnchor
+        self.healthOwner = OHTTPHealthBinding(endpoint: initializer.endpoint)
         self.initializer = initializer
         self.currentEndpoint = initializer.endpoint
         self.transactionRepository = initializer.transactionRepository
         self.transactionEncoder = WalletTransactionEncoder(initializer: initializer)
         let eventSubjectRef = eventSubject
+        let stateSubjectRef = stateSubject
 
         let logger = initializer.logger
 
@@ -451,7 +489,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         self.submitPlanStore = initializer.container.resolve(SubmitPlanStoring.self)
         // [#1975] Same container, same singletons the old pipeline's `TxResubmissionAction`
         // resolves — so both synchronizers resubmit through one implementation.
-        self.txResubmitter = TxResubmitter(container: initializer.container)
+        self.txResubmitter = TxResubmitter(
+            container: initializer.container, routeAdmission: routeAdmission
+        )
         // [#1755] zcash #1757 (multiserver submission) reworked SDKBroadcaster's init: it now
         // takes submitPlanStore + multiEndpointSubmitter (resolved from the container, same as
         // SDKSynchronizer) and no longer takes sdkFlags. Mirror SDKSynchronizer exactly.
@@ -462,6 +502,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             eventSubject: eventSubjectRef,
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
+            transactionRepository: initializer.transactionRepository,
+            chainTip: { stateSubjectRef.value.latestBlockHeight },
             statusCheck: {}
         )
     }
@@ -470,39 +512,72 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Initialises the wallet database (same as `SDKSynchronizer.prepare`) and opens the
     /// engine handle.  Handles `SeedRequired` migrations identically to `SDKSynchronizer`.
+    ///
+    /// After a `wipe()`, provisioning uses the server a `switchTo(endpoint:)` recorded since the wipe and
+    /// before this call, or without one the server in use before the wipe. The engine is opened in turn
+    /// with switches, at the server recorded when its turn comes: a switch made during provisioning still
+    /// decides the server it opens at, and one made while it is opening waits for it and then moves the
+    /// engine.
     public func prepare(
         with seed: [UInt8]?,
         walletBirthday: BlockHeight?,
         name: String,
         keySource: String?
     ) async throws -> Initializer.InitializationResult {
-        // [v2.1 E-6] Route init-time provisioning (restore recover_until / new-wallet tree
-        // state) through the engine's `restore_anchor` primitive — the offline fallback
-        // policy and Tor privacy live ENGINE-side, one implementation for every host. The
-        // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
-        let anchorServer = currentEndpoint
-        let anchorNetwork = initializer.network
-        let anchorTorDir = await slipstreamTorDirPath()
-        let resolveAnchor = restoreAnchor
-        initializer.slipstreamAnchorSource = { isRestore, birthday, fallbackCheckpoint in
-            await resolveAnchor(
-                isRestore,
-                birthday,
-                fallbackCheckpoint,
-                anchorServer,
-                anchorNetwork,
-                anchorTorDir
+        // Parity with `SDKSynchronizer.prepare`: an Initializer whose storage URLs were refused cannot
+        // be prepared.
+        if let initialisationError = initializer.urlsParsingError {
+            throw initialisationError
+        }
+        torTransition.invalidate()
+        torIntendedRunning = nil
+        // Provisioning owns a route before capture, but releases it before entering the lifecycle
+        // queue: a Tor transition in that queue must be able to drain this already-admitted work.
+        let initialized = try await routeAdmission.withLease {
+            // [v2.1 E-6] Route init-time provisioning (restore recover_until / new-wallet tree
+            // state) through the engine's `restore_anchor` primitive — the offline fallback
+            // policy and Tor privacy live ENGINE-side, one implementation for every host. The
+            // legacy `SDKSynchronizer` path never sets this and keeps its frozen inline fetch.
+            //
+            // Read here, before the engine step takes its turn on the lifecycle queue, on purpose: the
+            // anchor is wanted by `initializer.initialize` below, which runs outside the queue. A switch
+            // that lands between this read and the engine step therefore provisions from the server
+            // recorded when `prepare` began and opens the engine at the one recorded when the step's turn
+            // comes (`SlipstreamWipeEndpointTests`). Queueing the anchor fetch as well would hold every
+            // switch for the whole of provisioning; the two servers differing in that window is accepted.
+            let anchorServer = currentEndpoint
+            try OHTTPEndpoints.checkGatewayNetwork(host: anchorServer.host, network: initializer.network.networkType)
+            let anchorNetwork = initializer.network
+            let anchorTorDir = await slipstreamTorDirPath()
+            let resolveAnchor = restoreAnchor
+            initializer.slipstreamAnchorSource = { isRestore, birthday, fallbackCheckpoint in
+                await resolveAnchor(
+                    isRestore,
+                    birthday,
+                    fallbackCheckpoint,
+                    anchorServer,
+                    anchorNetwork,
+                    anchorTorDir
+                )
+            }
+            return try await initializer.initialize(
+                with: seed,
+                walletBirthday: walletBirthday,
+                name: name,
+                keySource: keySource
             )
         }
-        if case .seedRequired = try await initializer.initialize(
-            with: seed,
-            walletBirthday: walletBirthday,
-            name: name,
-            keySource: keySource
-        ) {
-            return .seedRequired
-        }
-        try await engine.open(network: initializer.network)
+        if case .seedRequired = initialized { return .seedRequired }
+        // The engine step is one lifecycle operation, in turn with every switch. A switch queued before
+        // it has already recorded its server, and the step opens the engine at what is recorded when
+        // its turn comes. A switch made while it runs waits for it and then moves the engine, so the
+        // engine ends on the server of the last switch. Were the step to run outside the queue, a
+        // switch overlapping its reopen would only record its server, because the engine counts as
+        // closed until the reopen returns, and `prepare` would end with the engine on a server other
+        // than the recorded one.
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }
+        }.value
         // [v2.1 E-3] The snapshot is truthful FROM OPEN: the engine seeds `isRecovering`,
         // the permille floor, the persisted chain tip and spendability from the wallet DB
         // (the same inputs the first suggest round would use), so the cold-launch emission
@@ -528,18 +603,41 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         return .success
     }
 
+    /// The queued body of `prepare`'s engine step. It reads `currentEndpoint` and `engineClosedByWipe`
+    /// here, in its own turn, so what it sees is what every switch queued before it left behind.
+    private func openEngineOnLifecycleQueue() async throws {
+        let healthTransition = healthEngineClosed ? healthOwner.beginTransition() : nil
+        defer {
+            if let healthTransition { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        }
+        if engineClosedByWipe {
+            // The engine still holds the server it had before the wipe: a switch since then only
+            // recorded the next one. `reopen` binds the fresh handle to the recorded server; the
+            // close it starts with has nothing to free, because the wipe already closed the handle.
+            try await engine.reopen(server: currentEndpoint, network: initializer.network)
+            // Only a reopen that returned ends the window. One that threw leaves the engine closed
+            // and the flag set, so the next `prepare` reopens it and a switch still only records.
+            engineClosedByWipe = false
+        } else {
+            try await engine.open(network: initializer.network)
+        }
+        healthEngineClosed = false
+    }
+
     // ── start ──────────────────────────────────────────────────────────────────
 
     /// Starts a Slipstream sync pass.
     /// The account is already imported in `data.db` from `prepare`, so UFVK is passed as `nil`
     /// (keyless update — engine calls `ensure_account` only when `ufvk=Some`).
-    public func start(retry: Bool = false) async throws {
+    public nonisolated func start(retry: Bool = false) async throws {
         // [MOB-1850] On the lifecycle queue, like every other pass-owning operation. A start that
         // follows a stop therefore runs after that stop's teardown has finished — the stop-before-start
         // ordering contract `pendingStop` used to hold up by hand — and, more importantly, a start
         // cannot land in the middle of a switch, a wipe or an account mutation's stopped interval.
-        try await lifecycle.enqueueThrowing {
-            try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+            }
         }.value
     }
 
@@ -555,7 +653,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///     True when the app is starting a run of its own or a takeover is bringing up a new handle;
     ///     false for the `startImpl` a recovery restart performs, because that budget is what bounds
     ///     the restart calling it, and clearing it would make the cap unreachable.
-    private func startImpl(retry: Bool, resetRecoveryBudget: Bool) async throws {
+    private func startImpl(
+        retry: Bool,
+        resetRecoveryBudget: Bool,
+        routeTransition: Bool = false,
+        torRequest: TorTransitionRequest? = nil,
+        torStartup: (any SlipstreamTorStartupControlling)? = nil
+    ) async throws {
         // T8.3 (T5.5 wart fix): a start() before prepare() must throw
         // .synchronizerNotPrepared — parity with SDKSynchronizer.start
         // (SDKSynchronizer.swift:189-192). Without this guard, start() reached
@@ -565,6 +669,27 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // direct SlipstreamEngine misuse, covered by its own test).
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
+        }
+        if !routeTransition,
+           routeAdmission.selectedTor || routeAdmission.isFenced || pendingEndpointReconciliation != nil {
+            let request = makeTorTransition(
+                enabled: routeAdmission.selectedTor,
+                startsSync: true,
+                resetRecoveryBudget: resetRecoveryBudget
+            )
+            guard request.startsSync else { throw TorTransitionState.Failure.routeUnavailable }
+            do {
+                try await request.apply()
+            } catch {
+                await request.waitUntilOwnerFinishes()
+                throw error
+            }
+            return
+        }
+        // A stopped or failed route request retains its fail-closed fence. Ordinary resume
+        // above revalidates the latest intent under a fresh owner before networking is admitted.
+        guard routeTransition || !routeAdmission.isFenced else {
+            throw TorTransitionState.Failure.routeUnavailable
         }
         // Migration privacy gate — parity with SDKSynchronizer.start's `.stopped, .synced,
         // .disconnected, .error` branch: a sync session must not start while a migration
@@ -597,9 +722,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         //   idempotency. Current strategy: ufvk=nil (keyless) since prepare() already
         //   imported the account and stored its birthday treestate.
         let slipstreamTorDir = await slipstreamTorDirPath()
-        try await engine.start(ufvk: nil, birthday: birthday, torDir: slipstreamTorDir)
-        isRunning = true
-        startPolling()
+        if let torStartup, let torDir = slipstreamTorDir, let torEngine = engine as? any SlipstreamTorStarting {
+            try await torEngine.startTor(birthday: birthday, torDir: torDir, startup: torStartup)
+            try await torStartup.waitUntilReady()
+        } else {
+            try await engine.start(ufvk: nil, birthday: birthday, torDir: slipstreamTorDir)
+        }
+        if torStartup != nil { return }
+        try await publishStartedPass(request: torRequest)
+    }
+
+    private func publishStartedPass(request: TorTransitionRequest? = nil) async throws {
+        if let request { try torTransition.check(request) }
         // [v2.1 E-3] Warm start emission straight off the truthful snapshot: the engine
         // seeded the permille floor / recovery flag / persisted tip at open(), so a
         // cold-launch catch-up reads its real near-100% position (never 0%) with no
@@ -608,6 +742,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // which the reentrant actor may have already moved past this snapshot's balances (e.g. a
         // concurrent `getAccountsBalances()` call between the `await` above and here).
         let snap = await engine.snapshot()
+        if let request { try torTransition.check(request) }
+        isRunning = true
+        startPolling()
         currentlyRecovering = snap?.isRecovering == 1
         stateSubject.send(SynchronizerState(
             syncSessionID: UUID(),
@@ -633,7 +770,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Waits for earlier lifecycle operations and this stop's teardown to finish.
     /// A returned engine stop may still report non-quiescence, as for `stop()`.
     public nonisolated func stopAndWait() async {
-        await lifecycle.enqueue { await self.stopImpl() }.value
+        await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueue { await self.stopImpl() }
+        }.value
     }
 
     /// Stops the in-flight sync.
@@ -650,11 +790,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// competing one. This also keeps `stopRequestGeneration`'s bump where the stop actually
     /// happens, so a recovery still in the queue behind it sees the request and abandons instead.
     public nonisolated func stop() {
-        lifecycle.enqueue { await self.stopImpl() }
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            lifecycle.enqueue { await self.stopImpl() }
+        }
     }
 
     /// The queued body of `stop()`.
     private func stopImpl() async {
+        torIntendedRunning = nil
         // [MOB-1850] This teardown owns the engine now: retire every tick decided for the pass it
         // is taking down, before anything else happens.
         passGeneration += 1
@@ -666,9 +810,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // to tell "the app stopped me" from "another path took the engine over".
         stopRequestGeneration += 1
         stopPolling()
-        // [#1975] Cancel, don't join: nothing is being deleted here, so a check that runs a
-        //   moment longer is harmless, and `stop()` must stay prompt. Cancel ONLY — the fired
-        //   task clears the handle itself (see the driver block).
+        // Earlier checks have drained on this queue. Cancel any later queued check; the fired
+        // task remains the single owner that clears its handle (see the driver block).
         resubmissionTask?.cancel()
         // T8.3 (T5.5 wart fix): only emit .stopped if we were prepared. stop() on an
         // unprepared synchronizer (Zodl calls it unconditionally on didEnterBackground,
@@ -677,6 +820,28 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // next foreground start(). The sdkStopped()/engine.stop() side effects below
         // stay unconditional (engine.stop() on a nil handle is a no-op). Mirrors
         // SDKSynchronizer.stop ordering (SDKSynchronizer.swift:243-249).
+        publishStoppedState()
+        // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
+        // moment, and a start() more than 1.6 target block intervals later (120 s before NU7,
+        // 40 s from it) re-masks via snapshot.tipFresh (E-2).
+        // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
+        // non-quiescent one changes nothing here beyond what a reader of the logs should know:
+        // the pass is stopped either way, and an engine writer that outlives it has only the
+        // engine's own file to finish with. [MOB-2184] This uses the ordinary stop because the
+        // host is not changing the wallet. Both stops request interruption between blocks and
+        // leave unfinished scan work for the next session to retry.
+        let report = await engine.stop()
+        if let reason = report.refusalReason {
+            initializer.logger.warn(
+                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop: \(reason)",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+        }
+    }
+
+    private func publishStoppedState() {
         if latestState.internalSyncStatus.isPrepared {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
@@ -689,24 +854,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 // rather than silently reading as authoritative.
                 isSpendableMasked: latestState.isSpendableMasked
             ))
-        }
-        // [v2.1 Phase 2] Re-masking after a stop is ENGINE-OWNED: the FFI stop() stamps the
-        // moment, and a start() more than 1.6 target block intervals later (120 s before NU7,
-        // 40 s from it) re-masks via snapshot.tipFresh (E-2).
-        // [MOB-1850] Nothing is stacked on this stop — no wallet write, no second handle — so a
-        // non-quiescent one changes nothing here beyond what a reader of the logs should know:
-        // the pass is stopped either way, and an engine writer that outlives it has only the
-        // engine's own file to finish with. [MOB-2184] For the same reason this is the plain stop,
-        // not `stopForWalletChange()`: nothing about the wallet changes, so a scan call in progress
-        // may run to the end of its chunk rather than leave its blocks for the next pass.
-        let report = await engine.stop()
-        if let reason = report.refusalReason {
-            initializer.logger.warn(
-                "SlipstreamSynchronizer.stop: the engine reported a non-quiescent stop: \(reason)",
-                file: #file,
-                function: #function,
-                line: #line
-            )
         }
     }
 
@@ -1029,9 +1176,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// [MOB-1850] Asks for a stall recovery on behalf of the tick that decided one is due.
     ///
-    /// Synchronous and side-effect-free beyond the two flags: it appends the restart to the
-    /// lifecycle queue and returns, so the tick that called it goes on to finish its own work
-    /// rather than performing a teardown inside the poll task the teardown is about to cancel.
+    /// Synchronous. Beyond the two flags it only cancels a background retry pass and appends the
+    /// restart to the lifecycle queue, then returns, so the tick that called it goes on to finish
+    /// its own work rather than performing a teardown inside the poll task the teardown is about
+    /// to cancel.
     ///
     /// The two flags are set HERE, at request time, not when the restart runs:
     ///
@@ -1048,12 +1196,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     func requestStallRecovery(observedPassGeneration: Int, observedStopRequestGeneration: Int, attempt: Int) {
         stallRecoveryInFlight = true
         stallRecoveryStopRequestGeneration = observedStopRequestGeneration
-        lifecycle.enqueue {
-            await self.runStallRecovery(
-                expectedPassGeneration: observedPassGeneration,
-                expectedStopRequestGeneration: observedStopRequestGeneration,
-                attempt: attempt
-            )
+        retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.runStallRecovery(
+                    expectedPassGeneration: observedPassGeneration,
+                    expectedStopRequestGeneration: observedStopRequestGeneration,
+                    attempt: attempt
+                )
+            }
         }
     }
 
@@ -1126,15 +1276,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // collision the recovery exists to clear. Thrown into the reopen's own failure handling,
         // so the attempt counts as spent and the host hears the give-up exactly as it would from
         // an endpoint that could not be reopened at all. [MOB-2184] Reopening a handle onto the same
-        // wallet is a wallet change to the engine, so this is its stop for one: the scan ends at its
-        // next block instead of finishing its chunk inside the budget the proof needs.
+        // wallet identifies wallet-change intent, so it uses that stop entry point. Both stops
+        // request interruption between blocks; reopening still requires proof of quiescence.
         let report = await engine.stopForWalletChange()
 
+        var healthTransition: UUID?
+        defer {
+            if let healthTransition { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        }
         do {
             guard report.isQuiescent else {
                 throw ZcashError.slipstreamEngineNotQuiescent(report)
             }
+            healthTransition = healthOwner.beginTransition()
+            healthEngineClosed = true
             try await engine.reopen(server: currentEndpoint, network: initializer.network)
+            healthEngineClosed = false
         } catch {
             // A reopen that failed still spent an attempt. Not counting it would leave the backoff
             // unarmed and the cap unreachable, so an endpoint that cannot be reopened at all would
@@ -1218,6 +1375,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// [MOB-1850] Test seam: `isRunning` as `wasRunning` would sample it from the lifecycle queue.
     func isRunningForTesting() -> Bool {
         isRunning
+    }
+
+    /// Test seam: how many lifecycle operations are on the queue, running or waiting, so a test can tell
+    /// that an operation it started has joined the queue behind one it holds, instead of guessing with a sleep.
+    nonisolated func lifecycleQueueDepthForTesting() -> Int {
+        lifecycle.depth
     }
 
     /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.
@@ -1325,20 +1488,41 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // check that takes a while must not push the next one further out.
         lastResubmissionCheckTime = now
         let latestBlockHeight = BlockHeight(chainTip)
-        resubmissionTask = Task { [weak self] in
+        let generation = passGeneration
+        let id = retryCancellation.begin()
+        let task = Task { [weak self] in
             guard let self else { return }
-            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight)
+            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight, generation: generation, id: id)
+        }
+        resubmissionTask = task
+        retryCancellation.install(task, id: id)
+    }
+
+    /// Retry execution and endpoint publication share the existing lifecycle boundary: a switch
+    /// cannot complete while an earlier retry can still send through the old public route.
+    private func runResubmissionCheck(latestBlockHeight: BlockHeight, generation: Int, id: UUID) async {
+        defer {
+            retryCancellation.finish(id: id)
+            finishResubmissionCheck()
+        }
+        let queued = lifecycle.enqueue {
+            await self.runResubmissionOnLifecycleQueue(latestBlockHeight: latestBlockHeight, generation: generation)
+        }
+        // Queue tasks are unstructured, so explicitly carry teardown cancellation across the boundary.
+        await withTaskCancellationHandler {
+            await queued.value
+        } onCancel: {
+            queued.cancel()
         }
     }
 
-    /// The actor-isolated body of one resubmission check: hops back onto the actor so
-    /// `txResubmitter` never leaves it, and clears the in-flight handle on every exit path.
-    private func runResubmissionCheck(latestBlockHeight: BlockHeight) async {
-        defer { finishResubmissionCheck() }
-        // Non-throwing: `TxResubmitter` logs and swallows both the candidate lookup and every
-        // per-transaction submit failure (a cancelled submit included), so one dead endpoint —
-        // or a teardown mid-check — can never escape as an unhandled error here.
-        await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight)
+    private func runResubmissionOnLifecycleQueue(latestBlockHeight: BlockHeight, generation: Int) async {
+        guard !Task.isCancelled, generation == passGeneration else { return }
+        let privateEndpoint = OHTTPEndpoints.isGateway(currentEndpoint.host) ? currentEndpoint : nil
+        // TxResubmitter retains eligibility, consent, throttling and per-transaction error handling.
+        await SubmissionBudget.$legacyTimeoutMilliseconds.withValue(currentEndpoint.singleCallTimeoutInMillis) {
+            await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight, privateEndpoint: privateEndpoint)
+        }
     }
 
     /// Clears the in-flight handle. THE single writer that nils `resubmissionTask` (teardown only
@@ -1360,6 +1544,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// completed check this must read false (the task's own `finishResubmissionCheck()` cleared
     /// the handle), and it must NOT be false merely because teardown nil'd it. `internal`.
     var resubmissionCheckInFlightForTesting: Bool { resubmissionTask != nil }
+
+    /// Controls the existing retry throttle in deterministic lifecycle tests.
+    func setResubmissionTimeForTesting(_ time: TimeInterval) {
+        txResubmitter.latestResolvedTime = time
+    }
+
+    /// Test-only seam: lets the driver fire again at once, as it would once its 60 s cadence has
+    /// elapsed after a pass a lifecycle request cancelled. `internal`, never called by production.
+    func elapseResubmissionCadenceForTesting() {
+        lastResubmissionCheckTime = 0
+    }
 
     /// Pure gate for the background-resubmission driver. Static + pure so the truth table is
     /// unit-testable without an engine, mirroring `isSyncStalled`.
@@ -1491,14 +1686,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // resolver a shipped synchronizer is built with is exactly that primitive, and a test can
         // hand in one that needs no server.
         let fallbackCheckpoint = checkpointSource.birthday(for: BlockHeight.max).height
-        let anchor = await restoreAnchor(
-            true, // a restore: the anchor is the account's recover-until height
-            birthday ?? 0,
-            fallbackCheckpoint,
-            currentEndpoint,
-            initializer.network,
-            await slipstreamTorDirPath()
-        )
+        let anchor = try await routeAdmission.withLease {
+            await restoreAnchor(
+                true, // a restore: the anchor is the account's recover-until height
+                birthday ?? 0,
+                fallbackCheckpoint,
+                currentEndpoint,
+                initializer.network,
+                await slipstreamTorDirPath()
+            )
+        }
         let chainTipHeight = anchor.map { UInt32($0.height) }
         let effectiveBirthday = birthday ?? (chainTipHeight.map { BlockHeight($0) } ?? initializer.walletBirthday)
 
@@ -1506,19 +1703,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // stays OUTSIDE it deliberately: it is a network round trip with the engine still live and
         // no wallet write of its own, and holding the queue across it would make an unrelated
         // `stop()` wait on a server.
-        return try await lifecycle.enqueueThrowing {
-            try await self.importAccountOnLifecycleQueue(
-                request: AccountImportRequest(
-                    ufvk: ufvk,
-                    seedFingerprint: seedFingerprint,
-                    zip32AccountIndex: zip32AccountIndex,
-                    purpose: purpose,
-                    name: name,
-                    keySource: keySource
-                ),
-                effectiveBirthday: effectiveBirthday,
-                recoverUntil: chainTipHeight
-            )
+        return try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.importAccountOnLifecycleQueue(
+                    request: AccountImportRequest(
+                        ufvk: ufvk,
+                        seedFingerprint: seedFingerprint,
+                        zip32AccountIndex: zip32AccountIndex,
+                        purpose: purpose,
+                        name: name,
+                        keySource: keySource
+                    ),
+                    effectiveBirthday: effectiveBirthday,
+                    recoverUntil: chainTipHeight
+                )
+            }
         }.value
     }
 
@@ -1571,10 +1770,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // proceed on the assumption: an orphan commit landing after the force-re-queue is exactly
         // the silent scope loss this serialization exists to prevent. Leave the wallet untouched,
         // put the pass back the way it was found, and tell the caller.
-        // [MOB-2184] The stop for a wallet change, as in every operation below that changes the
-        // wallet or reopens a handle onto it: a plain stop lets the scan finish its whole chunk
-        // first, which outlasted the ten-second budget when accounts were added in quick
-        // succession, and every one of those imports was refused.
+        // [MOB-2184] Every operation below that changes the wallet or reopens a handle onto it
+        // identifies that intent with the wallet-change stop. Both stops interrupt between blocks,
+        // and unfinished scan work is retried. Mutation still requires a quiescent report.
         let report = await engine.stopForWalletChange()
         guard report.isQuiescent else {
             await restartAfterARefusedOperation(wasRunning: wasRunning)
@@ -1638,8 +1836,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] One lifecycle operation: the stopped interval below exists so that no pass
         // scans across the deletion, and only the queue can make that interval real — a recovery
         // restart used to complete its `engine.start()` inside it.
-        try await lifecycle.enqueueThrowing {
-            try await self.deleteAccountOnLifecycleQueue(accountUUID)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.deleteAccountOnLifecycleQueue(accountUUID)
+            }
         }.value
     }
 
@@ -1859,14 +2059,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func addProofsToPCZT(pczt: Pczt) async throws -> Pczt {
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: initializer.logger
-        )
-        return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let container = initializer.container
+            try await SaplingParameterDownloader.downloadParamsIfnotPresent(
+                spendURL: initializer.spendParamsURL,
+                spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
+                outputURL: initializer.outputParamsURL,
+                outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
+                logger: initializer.logger,
+                torClientProvider: {
+                    let isTorEnabled = await sdkFlags.torEnabled
+                    return isTorEnabled ? container.resolve(TorClient.self) : nil
+                }
+            )
+            return try await initializer.rustBackend.addProofsToPCZT(pczt: pczt)
+        }
     }
 
     public func createTransactionFromPCZT(pcztWithProofs: Pczt, pcztWithSigs: Pczt) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
@@ -1998,19 +2206,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func enhanceTransactionBy(txId: TxId) async throws {
-        let txIdData = txId.id.data
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let response = try await initializer.blockDownloaderService.fetchTransaction(
-            txId: txIdData,
-            mode: await sdkFlags.ifTor(ServiceMode.txIdGroup(prefix: "fetch", txId: txIdData))
-        )
-        if response.status == .txidNotRecognized {
-            try await initializer.rustBackend.setTransactionStatus(txId: txIdData, status: .txidNotRecognized)
-        } else if let fetchedTransaction = response.tx {
-            _ = try await initializer.rustBackend.decryptAndStoreTransaction(
-                txBytes: fetchedTransaction.raw.bytes,
-                minedHeight: fetchedTransaction.minedHeight
+        return try await routeAdmission.withLease {
+            let txIdData = txId.id.data
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let response = try await initializer.blockDownloaderService.fetchTransaction(
+                txId: txIdData,
+                mode: await sdkFlags.ifTor(ServiceMode.txIdGroup(prefix: "fetch", txId: txIdData))
             )
+            if response.status == .txidNotRecognized {
+                try await initializer.rustBackend.setTransactionStatus(txId: txIdData, status: .txidNotRecognized)
+            } else if let fetchedTransaction = response.tx {
+                _ = try await initializer.rustBackend.decryptAndStoreTransaction(
+                    txBytes: fetchedTransaction.raw.bytes,
+                    minedHeight: fetchedTransaction.minedHeight
+                )
+            }
         }
     }
 
@@ -2036,40 +2246,45 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // ── Height queries ────────────────────────────────────────────────────────
 
     public func latestHeight() async throws -> BlockHeight {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor))
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.latestBlockHeight(mode: await sdkFlags.ifTor(.uniqueTor))
+        }
     }
 
     // ── UTXO refresh ──────────────────────────────────────────────────────────
 
     public func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) async throws -> RefreshedUTXOs {
-        // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
-        let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
-            tAddress: address.stringEncoded,
-            startHeight: height,
-            mode: .direct
-        )
-        var utxos: [UnspentTransactionOutputEntity] = []
-        for try await utxo in stream {
-            utxos.append(utxo)
-        }
-        var inserted: [UnspentTransactionOutputEntity] = []
-        var skipped: [UnspentTransactionOutputEntity] = []
-        for utxo in utxos {
-            do {
-                try await initializer.rustBackend.putUnspentTransparentOutput(
-                    txid: utxo.txid.bytes,
-                    index: utxo.index,
-                    script: utxo.script.bytes,
-                    value: Int64(utxo.valueZat),
-                    height: utxo.height
-                )
-                inserted.append(utxo)
-            } catch {
-                skipped.append(utxo)
+        return try await routeAdmission.withLease {
+            // Delegate via blockDownloaderService — same path as CompactBlockProcessor.refreshUTXOs.
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let stream = try initializer.blockDownloaderService.fetchUnspentTransactionOutputs(
+                tAddress: address.stringEncoded,
+                startHeight: height,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+            var utxos: [UnspentTransactionOutputEntity] = []
+            for try await utxo in stream {
+                utxos.append(utxo)
             }
+            var inserted: [UnspentTransactionOutputEntity] = []
+            var skipped: [UnspentTransactionOutputEntity] = []
+            for utxo in utxos {
+                do {
+                    try await initializer.rustBackend.putUnspentTransparentOutput(
+                        txid: utxo.txid.bytes,
+                        index: utxo.index,
+                        script: utxo.script.bytes,
+                        value: Int64(utxo.valueZat),
+                        height: utxo.height
+                    )
+                    inserted.append(utxo)
+                } catch {
+                    skipped.append(utxo)
+                }
+            }
+            return RefreshedUTXOs(inserted: inserted, skipped: skipped)
         }
-        return RefreshedUTXOs(inserted: inserted, skipped: skipped)
     }
 
     // ── Exchange rate ─────────────────────────────────────────────────────────
@@ -2080,8 +2295,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             guard await sdkFlags.exchangeRateEnabled else { return }
             let torClient = initializer.container.resolve(TorClient.self)
             do {
-                let isolatedClient = try await torClient.isolatedClient()
-                exchangeRateSubject.send(try await isolatedClient.getExchangeRateUSD())
+                try await sdkFlags.routeAdmission.withLease {
+                    let isolatedClient = try await torClient.isolatedClient()
+                    exchangeRateSubject.send(try await isolatedClient.getExchangeRateUSD())
+                }
             } catch {
                 // swallow exchange rate fetch errors (best-effort)
             }
@@ -2130,8 +2347,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         // [MOB-1850] The stop/truncate/restart below is one lifecycle operation. The policy→height
         // resolution above is not: it touches no engine state and can fail the publisher outright.
-        await lifecycle.enqueue {
-            await self.rewindOnLifecycleQueue(to: height, subject)
+        await retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.rewindOnLifecycleQueue(to: height, subject)
+            }
         }.value
     }
 
@@ -2203,8 +2422,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Wipes all wallet data managed by this synchronizer.
     ///
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
-    /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
-    ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
+    /// 1. Wait for earlier lifecycle work, including retries, then stop the poll loop and cancel
+    ///    later queued retry checks — none may access the files step 4 deletes.
     /// 2. `engine.stopForWalletChange()` — cancel any in-flight sync task, its scan at the next block.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
@@ -2213,37 +2432,29 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 6. Delete the submit-plan-store database file (`submitPlanStore.wipe()`) — restores the
     ///    documented `Synchronizer.wipe()` contract ("`Synchronizer.wipe()` deletes the plan
     ///    database file", MIGRATING.md) that only `SDKSynchronizer` used to honor ([#1976]).
-    /// 7. Reset the state subject to `.zero` (status `.unprepared`).
+    /// 7. Reset the state subject to `.zero` (status `.unprepared`), and keep the engine closed until
+    ///    the next `prepare` opens it: a `switchTo(endpoint:)` before that only records the server.
     /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
-    /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
-    /// mirroring the `SDKSynchronizer.wipe()` idiom.
+    /// The publisher uses a `PassthroughSubject` driven by the lifecycle queue task.
     public nonisolated func wipe() -> AnyPublisher<Void, Error> {
-        let subject = PassthroughSubject<Void, Error>()
-        Task(priority: .high) { [weak self] in
-            guard let self else {
-                subject.send(completion: .finished)
-                return
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            let subject = PassthroughSubject<Void, Error>()
+            lifecycle.enqueue { [weak self] in
+                guard let self else {
+                    subject.send(completion: .finished)
+                    return
+                }
+                await self.wipeOnLifecycleQueue(subject)
             }
-            await self.wipeImpl(subject)
+            return subject.eraseToAnyPublisher()
         }
-        return subject.eraseToAnyPublisher()
-    }
-
-    /// The actor-isolated body of `wipe()`.
-    ///
-    /// [MOB-1850] The whole of it is one lifecycle operation. A wipe deletes the files every other
-    /// operation reads and writes, so it is the one that most needs the queue: a recovery restart
-    /// reopening a handle onto a database this method has just removed would recreate it (SQLite
-    /// recreates a file on connect) and leave the wallet half-wiped.
-    private func wipeImpl(_ subject: PassthroughSubject<Void, Error>) async {
-        await lifecycle.enqueue {
-            await self.wipeOnLifecycleQueue(subject)
-        }.value
     }
 
     /// The queued body of `wipe()`.
     private func wipeOnLifecycleQueue(_ subject: PassthroughSubject<Void, Error>) async {
+        torIntendedRunning = nil
         passGeneration += 1
         // [MOB-1850] Captured before `isRunning` is cleared, for the same reason every account
         // mutation captures it: a wipe this method refuses must leave the pass as it found it.
@@ -2252,18 +2463,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         stopPolling()
         // [MOB-1850] Every other teardown clears `isRunning` here too; wipe was the one path left standing.
         isRunning = false
-        // 1a. [#1975] Cancel AND JOIN any in-flight resubmission check — it reads and writes the
-        //     very database files about to be deleted. Cancel alone is not enough: only the
-        //     SUBMIT stage observes cancellation (`SubmitPlanExecutor.submit`), while the prune
-        //     stage has no cancellation checks and would run on to `deletePlans` after the plan
-        //     file was removed. Joining does not violate the single-writer rule (that forbids
-        //     nil'ing the handle here, not awaiting it): the task's own `finishResubmissionCheck()`
-        //     clears it, and has done so by the time `.value` returns. No deadlock — awaiting
-        //     suspends `wipeImpl` and frees the actor for that finish hop. A tick that resumes
-        //     during this wipe cannot start a new check: `pollTask` is cancelled, and the driver
-        //     is gated on the caller's cancellation.
+        // Earlier retries have already drained before this lifecycle turn. Cancel later queued
+        // retries, which also validate their pass generation before any store access. Joining here
+        // would deadlock waiting for a retry whose lifecycle turn is behind this wipe.
         resubmissionTask?.cancel()
-        await resubmissionTask?.value
 
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
         // [MOB-1850] A wipe is a deliberate stop that brings no pass of its own back up, so a
@@ -2282,6 +2485,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         // 3. Free the engine handle (exact-once — close() guards against double-free).
+        let healthTransition = healthOwner.beginTransition(walletReset: true)
+        pendingEndpointReconciliation = nil
+        healthEngineClosed = true
         await engine.close()
 
         // 3a. Reset the per-handle tx-set-version mirror: the engine handle is being
@@ -2323,12 +2529,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             //    wallet wipe succeeded (this `do` block only reaches here on success).
             await submitPlanStore.wipe()
 
-            // 7. Reset state to unprepared/zero.
+            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`
+            //    opens it: a switch before that only records its server (`engineClosedByWipe`).
+            engineClosedByWipe = true
             stateSubject.send(.zero)
 
-            // 8. Signal completion.
+            // 8. Signal completion after the selected route has settled.
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .finished)
         } catch {
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .failure(error))
         }
     }
@@ -2419,8 +2629,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         usk: UnifiedSpendingKey,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        return try await routeAdmission.withLease {
+            try throwIfSyncingForMigrationBroadcast()
+            return try await migrationHost.migration(for: accountUUID).submitNoteSplit(proposal: proposal, usk: usk, options: options)
+        }
     }
 
     public func proposeMigrationTransfers(accountUUID: AccountUUID) async throws -> MigrationSchedule {
@@ -2460,8 +2672,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         _ instruction: MigrationBroadcastInstruction,
         options: MigrationNetworkPrivacyOptions
     ) async throws -> MigrationTransferResult {
-        try throwIfSyncingForMigrationBroadcast()
-        return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        return try await routeAdmission.withLease {
+            try throwIfSyncingForMigrationBroadcast()
+            return try await migrationHost.migration(for: accountUUID).performBroadcast(instruction, options: options)
+        }
     }
 
     public func isMigrationSyncBlocked() async -> Bool {
@@ -2587,34 +2801,61 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 1. F2: No-op immediately if `endpoint` equals `currentEndpoint` (same host + port + secure).
     ///    Prevents AutoServerSelection from restarting a sync pass when the benchmark selects the
     ///    same server already in use.
-    /// 2. Snapshot whether the sync was running (to decide whether to restart).
-    /// 3. F3: If a sync is active, log a warning — the pass will restart from the current scan
+    /// 2. Between a completed `wipe()` and the moment the next `prepare` opens the engine: store
+    ///    `endpoint` in `currentEndpoint` and return. Reopening the engine there would recreate the
+    ///    deleted wallet database before `prepare` has initialized it; `prepare` instead provisions the
+    ///    next wallet from the server recorded when it began and opens the engine at the one recorded
+    ///    when its turn on the lifecycle queue comes. This is how a host names the server a reset wallet
+    ///    uses. A switch made while `prepare` is opening the engine waits for it and is then an ordinary
+    ///    switch, from step 1, so the engine ends on the server of the last switch.
+    /// 3. Snapshot whether the sync was running (to decide whether to restart).
+    /// 4. F3: If a sync is active, log a warning — the pass will restart from the current scan
     ///    queue position (no data loss, but a brief latency cost until the engine reconnects).
-    /// 4. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
+    /// 5. Stop polling + await `engine.stopForWalletChange()` — cancel any in-flight sync task, its
     ///    scan at the next block.
-    /// 5. `engine.reopen(server:network:)` — close old handle + open new one bound
+    /// 6. `engine.reopen(server:network:)` — close old handle + open new one bound
     ///    to the new endpoint (frees Rust-side tokio runtime, then allocates a fresh one).
-    /// 6. Store `endpoint` in `currentEndpoint`.
-    /// 7. If the engine was running before the switch, restart via `start(retry: false)`.
-    public func switchTo(endpoint: LightWalletEndpoint) async throws {
+    /// 7. Store `endpoint` in `currentEndpoint`.
+    /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
+    public nonisolated func switchTo(endpoint: LightWalletEndpoint) async throws {
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
         // comparison belongs in this operation's own turn rather than before it.
-        try await lifecycle.enqueueThrowing {
-            try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+        try await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueueThrowing {
+                try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+            }
         }.value
     }
 
     /// The queued body of `switchTo(endpoint:)`.
     private func switchToOnLifecycleQueue(endpoint: LightWalletEndpoint) async throws {
+        torIntendedRunning = nil
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
         // host, port and TLS flag must all match (`isSameServer`). [MOB-1850] Checked BEFORE the
         // generation bump: a switch that turns out to be a no-op changes nothing about who owns the
         // engine, so it must not retire the running pass's in-flight tick.
-        if endpoint.isSameServer(as: currentEndpoint) {
+        if endpoint.isSameServer(as: currentEndpoint), pendingEndpointReconciliation == nil {
             initializer.logger.debug(
                 "switchTo: endpoint unchanged (\(endpoint.host):\(endpoint.port)) — no-op",
                 file: #file, function: #function, line: #line
+            )
+            return
+        }
+
+        // After a wipe the engine stays closed until `prepare`, which opens it at this server. Nothing
+        // runs and no handle exists, so the switch changes no owner and moves no generation.
+        if engineClosedByWipe {
+            let healthTransition = healthOwner.beginTransition()
+            rebindEndpointServices(to: endpoint)
+            healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
+            initializer.logger.debug(
+                "switchTo after wipe: \(endpoint.host):\(endpoint.port) recorded for the next prepare, engine stays closed",
+                file: #file,
+                function: #function,
+                line: #line
             )
             return
         }
@@ -2651,10 +2892,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         }
 
         // Re-open the engine handle against the new endpoint.
+        let previousEndpoint = pendingEndpointReconciliation ?? currentEndpoint
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
         try await engine.reopen(server: endpoint, network: initializer.network)
+        healthEngineClosed = false
 
-        // Record the new endpoint.
-        currentEndpoint = endpoint
+        // Publish the engine and Swift RPC route in the same lifecycle turn.
+        rebindEndpointServices(to: endpoint)
 
         // Also reset the tx-set-version mirror: the new handle's counter starts from zero.
         lastTxSetVersion = 0
@@ -2663,16 +2909,61 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         resetStallWatchdog()
 
         // Restart if the engine was previously running.
-        if wasRunning {
+        try await startAfterPublishingEndpoint(previousEndpoint: previousEndpoint, startsSync: wasRunning)
+    }
+
+    /// Publication is accepted only after its required restart succeeds. Subsequent route choices
+    /// and ordinary resumes must restore the prior endpoint after a failed host rollback.
+    private func startAfterPublishingEndpoint(previousEndpoint: LightWalletEndpoint, startsSync: Bool) async throws {
+        pendingEndpointReconciliation = nil
+        guard startsSync else { return }
+        do {
             try await startImpl(retry: false, resetRecoveryBudget: true)
+        } catch {
+            pendingEndpointReconciliation = previousEndpoint
+            // Off may have arrived during reopen, before this restart even began. Preserve it
+            // while withholding the unaccepted endpoint from both Tor and Direct requests.
+            routeAdmission.fence()
+            throw error
         }
+    }
+
+    /// Called only after this lifecycle owner proves the engine stopped. Failure leaves the
+    /// original target retained and networking fenced, including for the next ordinary resume.
+    private func reconcileEndpointBeforeTorStart() async throws {
+        guard let endpoint = pendingEndpointReconciliation else { return }
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
+        try await engine.reopen(server: endpoint, network: initializer.network)
+        healthEngineClosed = false
+        rebindEndpointServices(to: endpoint)
+        lastTxSetVersion = 0
+        lastRevealRecovering = false
+        resetStallWatchdog()
+        pendingEndpointReconciliation = nil
+    }
+
+    /// Called only after a successful reopen, or while a wipe keeps the engine closed. No
+    /// suspension separates replacement from endpoint publication or the subsequent restart.
+    private func rebindEndpointServices(to endpoint: LightWalletEndpoint) {
+        let service = makeEndpointService(
+            endpoint,
+            initializer.container.resolve(TorClient.self),
+            initializer.container.resolve(SDKFlags.self),
+            initializer.network.networkType
+        )
+        endpointService.replace(with: service)
+        currentEndpoint = endpoint
+        initializer.endpoint = endpoint
+        healthOwner.recordPublishedEndpoint(endpoint)
     }
 
     // ── Bounded rebuild (restartSync) ───────────────────────────────────────────
 
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
-    public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+    public nonisolated func restartSync(at endpoint: LightWalletEndpoint) async throws {
         // A caller cancelled while this restart is still queued — the app backgrounding while a
         // terminal rebuild waits its turn — must not have the restart run behind the stop that
         // background enqueued: the queued task is unstructured and inherits no cancellation, so the
@@ -2680,11 +2971,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // begun executing it completes; a stop queued behind it then has the final word.
         let callerCancelled = CancellationFlag()
         try await withTaskCancellationHandler {
-            try await lifecycle.enqueueThrowing {
-                if callerCancelled.isCancelled {
-                    throw CancellationError()
+            try await retryCancellation.cancel {
+                try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+                torTransition.invalidate()
+                return lifecycle.enqueueThrowing {
+                    if callerCancelled.isCancelled {
+                        throw CancellationError()
+                    }
+                    try await self.restartSyncImpl(at: endpoint)
                 }
-                try await self.restartSyncImpl(at: endpoint)
             }.value
         } onCancel: {
             callerCancelled.markCancelled()
@@ -2699,6 +2994,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// `wasRunning` (the host calls this after a stall recovery gave up and stopped the pass, so
     /// nothing IS running by the time this runs).
     private func restartSyncImpl(at endpoint: LightWalletEndpoint) async throws {
+        torIntendedRunning = nil
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
@@ -2718,8 +3015,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             throw ZcashError.slipstreamEngineNotQuiescent(report)
         }
 
+        let previousEndpoint = pendingEndpointReconciliation ?? currentEndpoint
+        let healthTransition = healthOwner.beginTransition()
+        defer { healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint) }
+        healthEngineClosed = true
         try await engine.reopen(server: endpoint, network: initializer.network)
-        currentEndpoint = endpoint
+        healthEngineClosed = false
+        rebindEndpointServices(to: endpoint)
 
         // The new handle's engine-side counters start at zero, so the emission mirrors must too —
         // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.
@@ -2732,7 +3034,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // `if wasRunning`, this is the one lifecycle operation that starts a pass regardless of
         // whether one was running, which is the whole point of a "restart after nothing is left
         // running" API.
-        try await startImpl(retry: false, resetRecoveryBudget: true)
+        try await startAfterPublishingEndpoint(previousEndpoint: previousEndpoint, startsSync: true)
     }
 
     /// [v0.7 P1b] Replaces the alternate-server list at runtime — the host calls this
@@ -2759,6 +3061,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// is fine for a real request but far too slow for a benchmark that must return promptly.
     /// Matches the app-side `evaluationTimeoutSeconds`. `internal` so tests can reference it.
     static let serverProbeTimeoutSeconds: Double = 5
+    /// Probe bound with Tor enabled: a fresh circuit plus a TLS handshake through it routinely
+    /// takes longer than the direct bound, and a benchmark that times out every clearnet fallback
+    /// leaves the wallet with nowhere to go when the gateway is down.
+    static let serverProbeTimeoutSecondsOverTor: Double = 20
 
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
@@ -2801,11 +3107,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     static func probe(
         _ endpoint: LightWalletEndpoint,
         timeoutSeconds: Double,
-        using service: LightWalletService
+        using service: LightWalletService,
+        mode: ServiceMode = .direct
     ) async -> (roundTrip: TimeInterval, info: LightWalletdInfo)? {
         let start = DispatchTime.now()
         let info = try? await withTaskTimeout(UInt64(timeoutSeconds * 1_000_000_000)) {
-            try await service.getInfo(mode: .direct)
+            try await service.getInfo(mode: mode)
         }
         let elapsed = DispatchTime.now().secondsSince(start)
         await service.closeConnections()
@@ -2819,19 +3126,42 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// identify with a different base chain and report a nonstandard consensus branch id, so
     /// only the chain-name and branch-id checks are skipped for it, mirroring
     /// `ValidateServerAction`; the synced-height check runs for every network. Delegates to
-    /// ephemeral gRPC connections.
-    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    /// ephemeral connections from `SDKSynchronizer.makeService`, retaining OHTTP gateway routing
+    /// and Tor privacy for every probe.
     private func measureEndpoints(
         endpoints: [LightWalletEndpoint],
         network: NetworkType
     ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
+        do {
+            return try await routeAdmission.withLease {
+                await self.measureAdmittedEndpoints(endpoints: endpoints, network: network)
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private func measureAdmittedEndpoints(
+        endpoints: [LightWalletEndpoint],
+        network: NetworkType
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+        let torClient = initializer.container.resolve(TorClient.self)
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let probeTimeout = await sdkFlags.torEnabled ? Self.serverProbeTimeoutSecondsOverTor : Self.serverProbeTimeoutSeconds
 
         await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
-                    let service = LightWalletGRPCService(endpoint: endpoint)
-                    guard let probed = await Self.probe(endpoint, timeoutSeconds: Self.serverProbeTimeoutSeconds, using: service) else {
+                    // S7: pass wallet network on every production path
+                    let service = SDKSynchronizer.makeService(endpoint: endpoint, tor: torClient, sdkFlags: sdkFlags, networkType: network)
+                    let mode = await sdkFlags.ifTor(ServiceMode.torInGroup("SlipstreamSynchronizer.evaluateBestOf(\(endpoint))"))
+                    guard let probed = await Self.probe(
+                        endpoint,
+                        timeoutSeconds: probeTimeout,
+                        using: service,
+                        mode: mode
+                    ) else {
                         return nil
                     }
                     return (endpoint, probed.roundTrip, probed.info)
@@ -2891,18 +3221,182 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     // ── Tor ───────────────────────────────────────────────────────────────────
 
-    public func tor(enabled: Bool) async throws {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let torClient = initializer.container.resolve(TorClient.self)
-        if enabled {
-            try await torClient.prepare()
-        } else {
-            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
-            if !exchangeRateEnabled {
-                try await torClient.close()
+    public nonisolated var torTransitionState: TorTransitionState? { torTransition.snapshot }
+
+    public nonisolated func torTransitionUpdates() -> AsyncStream<TorTransitionState> { torTransition.updates() }
+
+    public nonisolated func requestTorTransition(enabled: Bool) -> TorTransitionRequest {
+        makeTorTransition(enabled: enabled)
+    }
+
+    private nonisolated func makeTorTransition(
+        enabled: Bool,
+        startsSync: Bool = false,
+        resetRecoveryBudget: Bool = true
+    ) -> TorTransitionRequest {
+        return retryCancellation.cancel {
+            torTransition.begin(
+                enabled: enabled,
+                health: healthOwner,
+                startsSync: startsSync,
+                resetRecoveryBudget: resetRecoveryBudget
+            ) { request in
+                self.routeAdmission.require(enabled)
+                request.configure(
+                    activate: { [weak self, weak request] in
+                        guard let self, let request else { return Task { throw CancellationError() } }
+                        if startsSync {
+                            return Task { try await self.applyTorMode(request) }
+                        }
+                        return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
+                    },
+                    cancellation: { [weak self, weak request] in
+                        guard let self, let request, !request.hasAcquired else { return }
+                        self.scheduleTorRetirement(request)
+                    },
+                    dormantCancelled: { [weak self, weak request] in
+                        guard let self, let request else { return }
+                        self.torTransition.publish(request, phase: .cancelled)
+                        self.scheduleTorRetirement(request)
+                    }
+                )
             }
         }
-        await sdkFlags.torFlagUpdate(enabled)
+    }
+
+    /// Owns native-only cleanup independently of the already-completed request observer.
+    /// Also used by tests to deliver a delayed retirement through the real lifecycle boundary.
+    ///
+    /// First cancels the background retry pass, then queues the retirement. This may run under
+    /// `TorRouteTransition`'s lock, so retry-path cancellation handlers must never call back into
+    /// the Tor coordinator.
+    @discardableResult
+    nonisolated func scheduleTorRetirement(_ request: TorTransitionRequest) -> Task<Void, Never> {
+        retryCancellation.cancel {
+            lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+        }
+    }
+
+    private func retireNativePassAfterFailedAcquisition(_ request: TorTransitionRequest) async {
+        guard request.isCancelled, !request.hasAcquired,
+              routeAdmission.isFenced,
+              torTransition.canRetirePredecessor(of: request),
+              retiredTorRouteGeneration != request.retiringRouteGeneration else { return }
+        retiredTorRouteGeneration = request.retiringRouteGeneration
+        guard passIntendedRunning else { return }
+        torIntendedRunning = torIntendedRunning ?? passIntendedRunning
+        passGeneration += 1
+        isRunning = false
+        stopPolling()
+        // This stops only the native sync loop. Broadcasts the app already admitted keep their
+        // HTTP/runtime resources and original route: no close, rebind or free. The background
+        // retry pass was cancelled when `scheduleTorRetirement` queued this turn.
+        let report = await engine.stop()
+        publishStoppedState()
+        if let reason = report.refusalReason {
+            initializer.logger.warn(
+                "Tor acquisition retirement could not prove native quiescence: \(reason)",
+                file: #file,
+                function: #function,
+                line: #line
+            )
+        }
+    }
+
+    public nonisolated func tor(enabled: Bool) async throws {
+        try await requestTorTransition(enabled: enabled).apply()
+    }
+
+    private func applyTorMode(_ request: TorTransitionRequest) async throws {
+        let sdkFlags = initializer.container.resolve(SDKFlags.self)
+        let torClient = initializer.container.resolve(TorClient.self)
+        var ownsEngine = false
+        do {
+            try torTransition.check(request)
+            try await sdkFlags.routeAdmission.drain(deadline: request.acquisitionDeadline)
+            try torTransition.check(request)
+            try torTransition.acquired(request)
+            ownsEngine = true
+            let wasRunning = request.startsSync || (torIntendedRunning ?? passIntendedRunning)
+            torIntendedRunning = wasRunning
+            passGeneration += 1
+            isRunning = false
+            stopPolling()
+            let report = await engine.stop()
+            try torTransition.check(request)
+            publishStoppedState()
+            await sdkFlags.torFlagUpdate(request.enabled)
+            try torTransition.check(request)
+            guard report.isQuiescent else { throw TorTransitionState.Failure.nonquiescent }
+            try await reconcileEndpointBeforeTorStart()
+            try torTransition.check(request)
+            torTransition.publish(request, phase: .starting)
+            let deadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+            if request.enabled {
+                // Cancelling the owned task cancels its structured preparation waiter immediately.
+                // Runtime close stays in awaited cleanup so no delayed close can retire a successor.
+                try torTransition.check(request)
+                let native = wasRunning ? try (engine as? any SlipstreamTorStarting)?.makeTorStartup(deadline: deadline) : nil
+                if wasRunning && native == nil { throw TorTransitionState.Failure.startupFailed }
+                if let native { request.onCancellation { native.cancel() } }
+                do {
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask { try await torClient.prepare(deadline: deadline) }
+                        if let native {
+                            group.addTask {
+                                try await self.startImpl(
+                                    retry: false,
+                                    resetRecoveryBudget: request.resetRecoveryBudget,
+                                    routeTransition: true,
+                                    torStartup: native
+                                )
+                            }
+                        }
+                        do {
+                            while try await group.next() != nil {}
+                        } catch {
+                            native?.cancel()
+                            group.cancelAll()
+                            try? await torClient.close()
+                            throw error
+                        }
+                    }
+                } catch {
+                    native?.cancel()
+                    throw error
+                }
+            } else {
+                if !(await sdkFlags.exchangeRateEnabled) { try await torClient.close() }
+                try torTransition.check(request)
+                if wasRunning { try await startImpl(retry: false, resetRecoveryBudget: true, routeTransition: true, torRequest: request) }
+            }
+            try torTransition.check(request)
+            torTransition.publish(request, phase: .applying)
+            if request.enabled && wasRunning { try await publishStartedPass(request: request) }
+            try torTransition.commit(request, health: healthOwner, endpoint: currentEndpoint) {
+                rebindEndpointServices(to: currentEndpoint)
+                sdkFlags.routeAdmission.install(request.enabled)
+            }
+            torIntendedRunning = nil
+            retiredTorRouteGeneration = nil
+        } catch {
+            if ownsEngine {
+                stopPolling()
+                isRunning = false
+                _ = await engine.stop()
+                try? await torClient.close()
+            }
+            if error is CancellationError {
+                torTransition.publish(request, phase: .cancelled)
+                if !ownsEngine { request.cancel(error: error) }
+                throw error
+            }
+            let failure = error as? TorTransitionState.Failure
+                ?? ((error as? URLError)?.code == .timedOut ? .startupTimedOut : .startupFailed)
+            torTransition.publish(request, phase: .failed, failure: failure)
+            if !ownsEngine { request.cancel(error: failure) }
+            throw failure
+        }
     }
 
     public func exchangeRateOverTor(enabled: Bool) async throws {
@@ -2921,10 +3415,103 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func isTorSuccessfullyInitialized() async -> Bool? {
+        if routeAdmission.selectedTor, let state = torTransition.snapshot, state.requestedEnabled {
+            switch state.phase {
+            case .ready: return true
+            case .failed: return false
+            default: return nil
+            }
+        }
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        return try await routeAdmission.withLease {
+            // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
+            // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
+            // and the path-restricted voting-config mirror.
+            guard let host = request.url?.host,
+                  OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
+                    || OHTTPEndpoints.isProxyAllowlisted(host: host)
+                    || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+                throw ZcashError.ohttpUnsupportedHost
+            }
+            let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+            // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+            let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+            let viaTor = viaTor || torMode
+
+            // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+            let httpSender: OHTTPTransport.HTTPSender
+            if viaTor {
+                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+                // tried again, on a new circuit, only when it failed before any of it was sent.
+                httpSender = { [weak self] request, maxBytes in
+                    guard let self else { throw ZcashError.ohttpTransportError }
+                    return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+                }
+            } else {
+                httpSender = { request, maxBytes in
+                    // S4: use boundedDataWithDeadline for 100s timeout
+                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
+                        for: request,
+                        maxBytes: maxBytes
+                    )
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        throw OHTTPError.transportError("Invalid response type")
+                    }
+                    return (data, httpResponse)
+                }
+            }
+
+            let transport = OHTTPTransport(
+                gatewayHost: route.gatewayHost,
+                relayURL: route.relayURL,
+                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+                walletNetwork: initializer.network.networkType,
+                viaTor: viaTor,
+                httpSender: httpSender
+            )
+            // The inner request: the caller's fields without the connection's own, the alias credentials the
+            // gateway injects stripped, the body read out of its stream when it has one.
+            let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
+            let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+            guard let httpResp = HTTPURLResponse(
+                url: request.url!,
+                statusCode: response.status,
+                httpVersion: "HTTP/1.1",
+                headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
+            ) else { throw ZcashError.ohttpResponseError }
+            return (response.body, httpResp)
+        }
+    }
+
+    public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        let admission = routeAdmission
+        let lease = try admission.acquire()
+        let streamed = try await TorNetworkAdmission.$current.withValue(lease) {
+        // Tor mode puts every relay leg on Tor, whatever the caller asked for.
+        let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+        return try await OHTTPExternalHTTP.stream(
+            request,
+            network: initializer.network.networkType,
+            viaTor: viaTor || torMode,
+            torSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            },
+            torStreamSender: { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpPostStream(for: request, maxBytes: maxBytes)
+            }
+        )
+        }
+        let body = TorAdmittedResponseBody(body: streamed.body, lease: lease)
+        return OHTTPStreamedResponse(response: streamed.response, body: AsyncThrowingStream(unfolding: { try await body.next() }))
+    }
+
+    // swiftlint:disable function_parameter_count
     /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
     /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
@@ -2934,11 +3521,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             let sdkFlags = initializer.container.resolve(SDKFlags.self)
             let torEnabled = await sdkFlags.torEnabled
@@ -2954,20 +3548,36 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 backend: backend,
                 inputs: inputs,
                 binding: binding,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
+    /// `Synchronizer.httpRequestOverTor` (public API, unchanged): bounded at the relay response limit.
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        return try await routeAdmission.withLease {
+            try await httpRequestOverTor(for: request, maxBytes: OHTTPTransport.maxRelayResponseBytes, retryLimit: retryLimit)
+        }
+    }
+
+    public func httpRequestOverTor(for request: URLRequest, maxBytes: Int, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
+        return try await routeAdmission.withLease {
+            try await httpTorClient().isolatedClient().httpRequest(for: request, maxBytes: maxBytes, retryLimit: retryLimit)
+        }
+    }
+
+    /// The Tor client the HTTP requests over Tor isolate theirs from. Throws unless Tor or the
+    /// exchange-rate Tor client is enabled.
+    private func httpTorClient() async throws -> TorClient {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
         guard torEnabled || exchangeRateEnabled else {
             throw ZcashError.torNotEnabled
         }
-        let torClient = initializer.container.resolve(TorClient.self)
-        return try await torClient.isolatedClient().httpRequest(for: request, retryLimit: retryLimit)
+        return initializer.container.resolve(TorClient.self)
     }
 
     public nonisolated func httpGetOverTor(
@@ -2981,8 +3591,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         )
         let context = TorHTTPRequestContext(deadlineUptime: deadline, now: torHTTPUptime)
         return try await context.run { context in
-            let torClient = try await self.httpGetClient(context: context)
-            return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+            try await self.routeAdmission.withLease {
+                let torClient = try await self.httpGetClient(context: context)
+                return try await torClient.httpGet(for: request, retryLimit: retryLimit, context: context)
+            }
         }
     }
 
@@ -3006,50 +3618,58 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // to `ifTor(.uniqueTor)` old-SDK parity 2026-07-08.
 
     public func checkSingleUseTransparentAddresses(accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.checkSingleUseTransparentAddresses(
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            accountUUID: accountUUID,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.checkSingleUseTransparentAddresses(
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                accountUUID: accountUUID,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     public func updateTransparentAddressTransactions(address: String) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.updateTransparentAddressTransactions(
-            address: address,
-            start: 0,
-            end: -1,
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.updateTransparentAddressTransactions(
+                address: address,
+                start: 0,
+                end: -1,
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     public func fetchUTXOsBy(address: String, accountUUID: AccountUUID) async throws -> TransparentAddressCheckResult {
-        let dbData = initializer.dataDbURL.osStr()
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        return try await initializer.lightWalletService.fetchUTXOsByAddress(
-            address: address,
-            dbData: dbData,
-            networkType: initializer.network.networkType,
-            accountUUID: accountUUID,
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
+        return try await routeAdmission.withLease {
+            let dbData = initializer.dataDbURL.osStr()
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            return try await initializer.lightWalletService.fetchUTXOsByAddress(
+                address: address,
+                dbData: dbData,
+                networkType: initializer.network.networkType,
+                accountUUID: accountUUID,
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+        }
     }
 
     // ── Tree state ────────────────────────────────────────────────────────────
 
     public func getTreeState(height: UInt64) async throws -> Data {
-        let sdkFlags = initializer.container.resolve(SDKFlags.self)
-        let treeState = try await initializer.lightWalletService.getTreeState(
-            BlockID(height: height),
-            mode: await sdkFlags.ifTor(.uniqueTor)
-        )
-        return try treeState.serializedData()
+        return try await routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let treeState = try await initializer.lightWalletService.getTreeState(
+                BlockID(height: height),
+                mode: await sdkFlags.ifTor(.uniqueTor)
+            )
+            return try treeState.serializedData()
+        }
     }
 
     // ── Database debug ────────────────────────────────────────────────────────
@@ -3057,7 +3677,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     public nonisolated func debugDatabase(sql: String) -> String {
         transactionRepository.debugDatabase(sql: sql)
     }
-
 }
 
 // MARK: - Private helpers
@@ -3071,46 +3690,62 @@ private extension SlipstreamSynchronizer {
         try await enhanceWithState(transactionRepository.findReceived(offset: 0, limit: Int.max))
     }
 
-
     // [#1755] Mirrors SDKSynchronizer.submitTransactions after zcash #1757 (multiserver
     // submission): consumes [CreatedTransaction] (was [ZcashTransaction.Overview]) and adopts the
     // "trust the network over the submit-side error" recovery branch. Submission is shared SDK
     // logic — slipstream only owns the sync path — so this stays byte-for-byte the SDK behaviour.
+}
+
+extension SlipstreamSynchronizer {
     func submitTransactions(_ transactions: [CreatedTransaction]) -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        let health = OHTTPHealthFailureOwner()
         var iterator = transactions.makeIterator()
         var submitFailed = false
 
+        let admission = routeAdmission
         return AsyncThrowingStream(unfolding: {
             guard let transaction = iterator.next() else { return nil }
 
             if submitFailed {
                 return .notAttempted(txId: transaction.txId)
             } else {
-                do {
-                    try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
-                    // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
-                    // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
-                    // ring event for ring consumers) — the poll loop's version compare re-fetches
-                    // and emits on the next tick (≤ the poll cadence). One path for every host.
-                    // Fire-and-forget; never delays the submit stream.
-                    Task { await self.engine.notifyTxChange() }
-                    return TransactionSubmitResult.success(txId: transaction.txId)
-                } catch ZcashError.serviceSubmitFailed(let error) {
-                    // The server could not be reached. That includes its height not being readable, the first request of a submission.
-                    submitFailed = true
-                    return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
-                } catch TransactionEncoderError.submitError(let code, let message) {
-                    // If the server already has this tx, the broadcast landed — treat as success.
-                    if await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId) {
+                return try await admission.withLease {
+                    let attempt = health.makeAttempt()
+                    do {
+                        try await health.withAttempt(attempt) {
+                            try await self.transactionEncoder.submit(transaction: transaction.encodedTransaction)
+                        }
+                        // [Engine API v2 §4.5 / E-4] Surface the just-broadcast tx: poke the engine
+                        // (`notify_tx_change`), which bumps the snapshot's `txSetVersion` (+ a tag-5
+                        // ring event for ring consumers) — the poll loop's version compare re-fetches
+                        // and emits on the next tick (≤ the poll cadence). One path for every host.
+                        // Fire-and-forget; never delays the submit stream.
+                        Task { await self.engine.notifyTxChange() }
                         return TransactionSubmitResult.success(txId: transaction.txId)
+                    } catch ZcashError.serviceSubmitFailed(let error) {
+                        // The server could not be reached. That includes its height not being readable, the first request of a submission.
+                        submitFailed = true
+                        health.adoptFailure(from: attempt)
+                        return TransactionSubmitResult.grpcFailure(txId: transaction.txId, error: error)
+                    } catch let TransactionEncoderError.submitError(code, message) {
+                        // If the server already has this tx, the broadcast landed — treat as success.
+                        if await health.withAttempt(health.makeAttempt(), operation: {
+                            await self.transactionEncoder.isTransactionKnownToServer(txId: transaction.txId)
+                        }) {
+                            return TransactionSubmitResult.success(txId: transaction.txId)
+                        }
+                        submitFailed = true
+                        health.adoptFailure(from: attempt)
+                        return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
+                    } catch TransactionEncoderError.notSubmittable(let refusal) {
+                        // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
+                        // network, so there is no server to ask whether it knows the transaction.
+                        submitFailed = true
+                        return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
+                    } catch {
+                        health.adoptFailure(from: attempt)
+                        throw error
                     }
-                    submitFailed = true
-                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: code, description: message)
-                } catch TransactionEncoderError.notSubmittable(let refusal) {
-                    // The SDK refused to submit the transaction because it cannot be valid in the next block. Nothing reached the
-                    // network, so there is no server to ask whether it knows the transaction.
-                    submitFailed = true
-                    return TransactionSubmitResult.submitFailure(txId: transaction.txId, code: refusal.code, description: refusal.description)
                 }
             }
         })
@@ -3118,3 +3753,57 @@ private extension SlipstreamSynchronizer {
 }
 
 extension SlipstreamSynchronizer: TrustedTransactionRecording {}
+
+extension SlipstreamSynchronizer: OHTTPHealthProviding {
+    public nonisolated var ohttpHealthBinding: OHTTPHealthBinding? { healthOwner }
+
+    public func makeOHTTPHealthSession(route: OHTTPHealthRoute, generation: UUID) async throws -> OHTTPHealthSession {
+        try await makeOHTTPHealthSession(route: route, generation: generation) { await self.healthBinding() }
+    }
+
+    func makeOHTTPHealthSession(
+        route: OHTTPHealthRoute,
+        generation: UUID,
+        lookup: @Sendable () async -> OHTTPHealthProbeBinding
+    ) async throws -> OHTTPHealthSession {
+        let token = try healthOwner.readyToken()
+        let binding = await lookup()
+        guard try healthOwner.readyToken() == token else { throw OHTTPHealthError.bindingUnavailable }
+        try binding.validate(route)
+        let session = try OHTTPHealthSession(route: route, generation: generation, bindingID: token, ownerID: healthOwner.ownerID)
+        try healthOwner.admit(session)
+        return session
+    }
+
+    public nonisolated func probeOHTTPHealth(session: OHTTPHealthSession) async -> OHTTPHealthProbeResult {
+        await probeOHTTPHealth(session: session) { await self.healthBinding() }
+    }
+
+    nonisolated func probeOHTTPHealth(
+        session: OHTTPHealthSession,
+        lookup: @escaping @Sendable () async -> OHTTPHealthProbeBinding
+    ) async -> OHTTPHealthProbeResult {
+        guard healthOwner.accepts(session) else { return OHTTPHealthProbe.cancelled(session: session) }
+        let result = await OHTTPHealthProbe.run(session: session) { budget in
+            let binding = await lookup()
+            guard self.healthOwner.accepts(session) else { throw CancellationError() }
+            return try await binding.probe(session: session, budget: budget)
+        }
+        guard healthOwner.accepts(session) else {
+            return OHTTPHealthProbe.cancelled(session: session, startedAt: result.startedAtNanoseconds)
+        }
+        return result
+    }
+
+    func healthBinding() async -> OHTTPHealthProbeBinding {
+        let viaTor = await initializer.container.resolve(SDKFlags.self).torEnabled
+        return OHTTPHealthProbeBinding(
+            endpoint: currentEndpoint,
+            network: initializer.network.networkType,
+            viaTor: viaTor,
+            tor: initializer.container.resolve(TorClient.self)
+        )
+    }
+}
+
+extension SlipstreamSynchronizer: TorTransitionProviding {}

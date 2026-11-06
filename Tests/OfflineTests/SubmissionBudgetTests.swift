@@ -1,0 +1,366 @@
+import Foundation
+import os
+import libzcashlc
+import GRPC
+import NIO
+import SwiftProtobuf
+import XCTest
+@testable import TestUtils
+@testable import ZODLSwiftWalletSDK
+
+final class SubmissionBudgetTests: ZcashTestCase {
+    override func setUp() async throws {
+        try await super.setUp()
+        await clearGatewayKey()
+    }
+
+    override func tearDown() async throws {
+        await clearGatewayKey()
+        try await super.tearDown()
+    }
+
+    private func clearGatewayKey() async {
+        let host = OHTTPTestSupport.testnetHost
+        let relay = try! OHTTPEndpoints.relayURL(for: host)
+        await OHTTPKeyCache.shared.store(nil, for: "\(relay)|\(host)|tor")
+    }
+
+    func testHeightReadConsumesSendBudget() async throws {
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        service.latestBlockHeightModeClosure = { _ in
+            try await Task.sleep(nanoseconds: 80_000_000)
+            return 100_000
+        }
+        service.submitSpendTransactionModeReturnValue = SendResponse()
+        let submitter = try makeSubmitter(service: service)
+        do {
+            try await submitter.submit(transaction: transaction(), to: endpoint(milliseconds: 30))
+            XCTFail("An exhausted height budget must not allow a fresh send timeout")
+        } catch {}
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+        XCTAssertEqual(service.closeConnectionsCallsCount, 1)
+    }
+
+    func testRejectedSendCannotStartKnownLookupAfterBudgetExpires() async throws {
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        service.latestBlockHeightModeReturnValue = 100_000
+        service.submitSpendTransactionModeClosure = { _, _ in
+            try await Task.sleep(nanoseconds: 80_000_000)
+            return SendResponse.with { $0.errorCode = -1 }
+        }
+        service.fetchTransactionTxIdModeReturnValue = (nil, .txidNotRecognized)
+        let submitter = try makeSubmitter(service: service)
+        do {
+            try await submitter.submit(transaction: transaction(), to: endpoint(milliseconds: 30))
+            XCTFail("Expected rejection")
+        } catch {}
+        XCTAssertEqual(service.fetchTransactionTxIdModeCallsCount, 0)
+        XCTAssertEqual(service.closeConnectionsCallsCount, 1)
+    }
+
+    func testProductionOHTTPTorKeyAndHeightShareRemainingNativeDeadline() async throws {
+        let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let timeouts = OSAllocatedUnfairLock(initialState: [UInt64]())
+        let envelope = NativeKeyEnvelope()
+        var native = TorHTTPGetNative(
+            freeResponse: { _ in envelope.free() },
+            isolateRuntime: { runtimes.clone($0) },
+            freeRuntime: { runtimes.free($0) }
+        )
+        native.classifiedGet = { _, _, _, _, _, _, timeout, outcome in
+            timeouts.withLock { $0.append(timeout) }
+            clock.withLock { $0 += 10_000_000_000 }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 0, http_status: 200, retry_not_before_ns: 0)
+            return envelope.pointer
+        }
+        native.postOnce = { _, _, _, _, _, _, _, timeout, outcome in
+            timeouts.withLock { $0.append(timeout) }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_not_before_ns: 0)
+            return nil
+        }
+        let tor = TorClient(runtimePtr: runtimes.parent, torDir: try __torDirURL(), httpGetNative: native)
+        let submitter = makeOHTTPSubmitter(tor: tor)
+        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 30_000)
+        do {
+            try await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: gateway)
+            }
+            XCTFail("The height request is deliberately rejected")
+        } catch {}
+        let observed = timeouts.withLock { $0 }
+        XCTAssertEqual(observed.count, 2, "Key GET and height POST must use the bounded production sender")
+        if observed.count == 2 {
+            // Executor admission and request-buffer preparation can only reduce these caps.
+            XCTAssertGreaterThan(observed[0], 0)
+            XCTAssertLessThanOrEqual(observed[0], 30_000)
+            XCTAssertLessThanOrEqual(observed[1], 20_000, "Key fetch time must be deducted before the height POST")
+            XCTAssertGreaterThan(observed[1], 0)
+        }
+        try await tor.close()
+    }
+
+    func testProductionOHTTPTorCancellationDrainsActiveNativeKeyFetch() async throws {
+        let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let entered = expectation(description: "native key GET entered")
+        let exited = OSAllocatedUnfairLock(initialState: false)
+        let returned = OSAllocatedUnfairLock(initialState: false)
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let completedWhileHeld = expectation(description: "submission cannot complete while native GET is held")
+        completedWhileHeld.isInverted = true
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        var native = TorHTTPGetNative(
+            isolateRuntime: { runtimes.clone($0) },
+            freeRuntime: { runtimes.free($0) }
+        )
+        native.classifiedGet = { _, _, _, _, _, _, timeout, outcome in
+            XCTAssertGreaterThan(timeout, 0)
+            XCTAssertLessThanOrEqual(timeout, 30_000)
+            entered.fulfill()
+            release.wait()
+            exited.withLock { $0 = true }
+            outcome?.pointee = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_not_before_ns: 0)
+            return nil
+        }
+        native.postOnce = { _, _, _, _, _, _, _, _, _ in
+            XCTFail("Cancelled key work cannot proceed to a POST")
+            return nil
+        }
+        let tor = TorClient(runtimePtr: runtimes.parent, torDir: try __torDirURL(), httpGetNative: native)
+        let submitter = makeOHTTPSubmitter(tor: tor)
+        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 30_000)
+        let task = Task {
+            defer {
+                XCTAssertTrue(exited.withLock { $0 }, "Submission completion must follow native exit")
+                if !released.withLock({ $0 }) { completedWhileHeld.fulfill() }
+                returned.withLock { $0 = true }
+            }
+            try? await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: gateway)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 10)
+        task.cancel()
+        await fulfillment(of: [completedWhileHeld], timeout: 0.1)
+        XCTAssertFalse(returned.withLock { $0 }, "Native owner must remain admitted until it exits")
+        released.withLock { $0 = true }
+        release.signal()
+        await task.value
+        XCTAssertTrue(exited.withLock { $0 })
+        try await tor.close()
+    }
+
+    private func makeOHTTPSubmitter(tor: TorClient) -> GRPCEndpointSubmitter {
+        let flags = SDKFlags(torEnabled: true, exchangeRateEnabled: false)
+        let backend = ZcashRustBackendWeldingMock()
+        backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
+        return GRPCEndpointSubmitter(
+            torClient: tor, sdkFlags: flags, rustBackend: backend, logger: NullLogger(), networkType: .testnet,
+            serviceFactory: { endpoint, isolated in
+                let service = LightWalletOHTTPService(endpoint: endpoint, tor: isolated)
+                service.sdkFlags = flags
+                service.walletNetwork = .testnet
+                service.testKeyVerifier = OHTTPTestSupport.makeKeyVerifier()
+                return service
+            }
+        )
+    }
+
+    private final class NativeKeyEnvelope: @unchecked Sendable {
+        let pointer = UnsafeMutablePointer<FfiHttpResponseBytes>.allocate(capacity: 1)
+        let body: UnsafeMutablePointer<UInt8>
+        let headers = UnsafeMutablePointer<FfiHttpResponseHeader>.allocate(capacity: 1)
+        let version = strdup("HTTP/1.1")!
+        init() {
+            let bytes = OHTTPTestSupport.stubEnvelope
+            body = UnsafeMutablePointer<UInt8>.allocate(capacity: bytes.count)
+            _ = bytes.copyBytes(to: UnsafeMutableBufferPointer(start: body, count: bytes.count))
+            pointer.initialize(to: FfiHttpResponseBytes(status: 200, version: version, headers_ptr: headers, headers_len: 0,
+                                                       body_ptr: body, body_len: UInt(bytes.count)))
+        }
+        func free() {
+            pointer.deallocate()
+            headers.deallocate()
+            body.deallocate()
+            Darwin.free(version)
+        }
+    }
+
+    func testDirectAdmissionHeightSendAndKnownLookupShareOneDeadline() async throws {
+        let server = try BudgetSubmissionServer(sendResponse: SendResponse.with { $0.errorCode = -1 })
+        defer { try? server.stop() }
+        let clock = server.clock
+        let options = OSAllocatedUnfairLock(initialState: [TimeLimit]())
+        let backend = ZcashRustBackendWeldingMock()
+        backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
+        let tor = TorClient(torDir: try __torDirURL())
+        let flags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        let submitter = GRPCEndpointSubmitter(
+            torClient: tor, sdkFlags: flags, rustBackend: backend, logger: NullLogger(), networkType: .testnet,
+            serviceFactory: { endpoint, tor in
+                clock.withLock { $0 += 6_000_000_000 }
+                let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
+                service.sdkFlags = flags
+                let client = service.resolveLazyConnect()
+                let channel = BudgetRecordingChannel(channel: client.channel, options: options)
+                service.channel = channel
+                service.compactTxStreamerInternal = CompactTxStreamerAsyncClient(
+                    channel: channel, defaultCallOptions: client.defaultCallOptions
+                )
+                return service
+            }
+        )
+        // Real localhost RPCs retain operational deadlines, but clock advances rather than
+        // scheduler latency determine the exact deadline contract asserted below.
+        let endpoint = LightWalletEndpoint(address: server.endpoint.host, port: server.endpoint.port, secure: false,
+                                           singleCallTimeoutInMillis: 30_000)
+        try await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+            try await submitter.submit(transaction: transaction(), to: endpoint)
+        }
+        XCTAssertEqual(server.stages.withLock { $0 }, ["height", "send", "known"])
+        XCTAssertEqual(
+            options.withLock { $0 },
+            [
+                TimeLimit.timeout(.seconds(24)),
+                TimeLimit.timeout(.seconds(16)),
+                TimeLimit.timeout(.seconds(8))
+            ],
+            "Admission, height and rejected send must consume the same attempt budget before known acceptance"
+        )
+    }
+
+    private final class BudgetSubmissionServer: HeightReportingLightwalletd {
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let stages = OSAllocatedUnfairLock(initialState: [String]())
+
+        override func getLatestBlock(request: ChainSpec, context: StatusOnlyCallContext) -> EventLoopFuture<BlockID> {
+            stages.withLock { $0.append("height") }
+            clock.withLock { $0 += 8_000_000_000 }
+            return context.eventLoop.makeSucceededFuture(BlockID(height: 100_000))
+        }
+
+        override func sendTransaction(request: RawTransaction, context: StatusOnlyCallContext) -> EventLoopFuture<SendResponse> {
+            stages.withLock { $0.append("send") }
+            clock.withLock { $0 += 8_000_000_000 }
+            return context.eventLoop.makeSucceededFuture(SendResponse.with { $0.errorCode = -1 })
+        }
+
+        override func getTransaction(request: TxFilter, context: StatusOnlyCallContext) -> EventLoopFuture<RawTransaction> {
+            stages.withLock { $0.append("known") }
+            return context.eventLoop.makeSucceededFuture(RawTransaction.with { $0.height = 100_000 })
+        }
+    }
+
+    /// Observes the production client's options and forwards them unchanged to real gRPC.
+    private final class BudgetRecordingChannel: GRPCChannel, @unchecked Sendable {
+        let channel: GRPCChannel
+        let options: OSAllocatedUnfairLock<[TimeLimit]>
+
+        init(channel: GRPCChannel, options: OSAllocatedUnfairLock<[TimeLimit]>) {
+            self.channel = channel
+            self.options = options
+        }
+
+        func makeCall<Request: SwiftProtobuf.Message, Response: SwiftProtobuf.Message>(
+            path: String, type: GRPCCallType, callOptions: CallOptions, interceptors: [ClientInterceptor<Request, Response>]
+        ) -> Call<Request, Response> {
+            options.withLock { $0.append(callOptions.timeLimit) }
+            return channel.makeCall(path: path, type: type, callOptions: callOptions, interceptors: interceptors)
+        }
+
+        func makeCall<Request: GRPCPayload, Response: GRPCPayload>(
+            path: String, type: GRPCCallType, callOptions: CallOptions, interceptors: [ClientInterceptor<Request, Response>]
+        ) -> Call<Request, Response> {
+            options.withLock { $0.append(callOptions.timeLimit) }
+            return channel.makeCall(path: path, type: type, callOptions: callOptions, interceptors: interceptors)
+        }
+
+        func close() -> EventLoopFuture<Void> {
+            channel.close()
+        }
+    }
+
+    func testProductionPublicTorConnectorUsesRemainingBudgetAndDrainsOnCancellation() async throws {
+        let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
+        let entered = expectation(description: "bounded Tor gRPC connector entered")
+        let exited = OSAllocatedUnfairLock(initialState: false)
+        let returned = OSAllocatedUnfairLock(initialState: false)
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let completedWhileHeld = expectation(description: "submission cannot complete while native connector is held")
+        completedWhileHeld.isInverted = true
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        var native = TorHTTPGetNative(
+            isolateRuntime: {
+                clock.withLock { $0 += 5_000_000_000 }
+                return runtimes.clone($0)
+            },
+            freeRuntime: { runtimes.free($0) },
+            connectLightwalletd: { _, _ in
+                XCTFail("Submission must not enter the ordinary unbounded connector")
+                return nil
+            }
+        )
+        native.connectLightwalletdWithTimeout = { _, _, timeout in
+            calls.withLock { $0 += 1 }
+            XCTAssertEqual(timeout, 25_000, "Runtime admission must consume the original attempt budget")
+            entered.fulfill()
+            release.wait()
+            exited.withLock { $0 = true }
+            return nil
+        }
+        let tor = TorClient(runtimePtr: runtimes.parent, torDir: try __torDirURL(), httpGetNative: native)
+        let backend = ZcashRustBackendWeldingMock()
+        let submitter = GRPCEndpointSubmitter(
+            torClient: tor, sdkFlags: SDKFlags(torEnabled: true, exchangeRateEnabled: false),
+            rustBackend: backend, logger: NullLogger(), networkType: .testnet
+        )
+        let task = Task {
+            defer {
+                XCTAssertTrue(exited.withLock { $0 }, "Submission completion must follow native exit")
+                if !released.withLock({ $0 }) { completedWhileHeld.fulfill() }
+                returned.withLock { $0 = true }
+            }
+            try? await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: endpoint(milliseconds: 30_000))
+            }
+        }
+        await fulfillment(of: [entered], timeout: 10)
+        task.cancel()
+        await fulfillment(of: [completedWhileHeld], timeout: 0.1)
+        XCTAssertFalse(returned.withLock { $0 })
+        released.withLock { $0 = true }
+        release.signal()
+        await task.value
+        XCTAssertEqual(calls.withLock { $0 }, 1)
+        XCTAssertTrue(exited.withLock { $0 })
+        try await tor.close()
+    }
+
+    private func endpoint(milliseconds: Int64) -> LightWalletEndpoint {
+        LightWalletEndpoint(address: "budget.example.com", port: 443, secure: true, singleCallTimeoutInMillis: milliseconds)
+    }
+
+    private func transaction() -> CreatedTransaction {
+        CreatedTransaction(txId: Data(repeating: 1, count: 32), raw: Data([5, 0, 0, 128, 1]), expiryHeight: 200_000)
+    }
+
+    private func makeSubmitter(service: LightWalletService) throws -> GRPCEndpointSubmitter {
+        let backend = ZcashRustBackendWeldingMock()
+        backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
+        return GRPCEndpointSubmitter(
+            torClient: TorClient(torDir: try __torDirURL()),
+            sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+            rustBackend: backend,
+            logger: NullLogger(),
+            networkType: .testnet,
+            serviceFactory: { _, _ in service }
+        )
+    }
+}

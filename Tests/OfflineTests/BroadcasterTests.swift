@@ -796,6 +796,30 @@ final class BroadcasterTests: ZcashTestCase {
         ))
     }
 
+    func testEmptySubmissionDoesNotAttributeEarlierTraffic() async throws {
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        let result = await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                return await synchronizer.broadcaster.submit(transaction: self.makeCreatedTransaction(), to: [])
+            }
+        }
+        XCTAssertEqual(result, .unreachable)
+        let updates = session.updates()
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        for await update in updates {
+            if case .operationCompleted(_, _, let observations) = update {
+                XCTAssertTrue(observations.isEmpty)
+                break
+            }
+        }
+    }
+
     func testSubmitWithEmptyEndpointsIsUnreachableAndRecordsNoPlan() async throws {
         let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
         let transaction = makeCreatedTransaction()
@@ -909,7 +933,118 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "Legacy path must not register submit plans")
     }
 
+    // MARK: - Unaccepted transactions after the user moves to another server
+
+    /// A transaction stuck because its recorded server cannot be reached goes out once through the server the
+    /// user moved to. Its plan keeps the recorded server first and gains the new one last, and the acceptance is
+    /// recorded, so background resubmission prefers the recorded server again once it is back.
+    func testResubmitUnacceptedSendsAStuckTransactionThroughTheNewServer() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x01, 0x02]), rawID: Data(repeating: 0x11, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [TransactionSubmissionReport(txId: stuck.rawID, outcome: .accepted(by: publicServer))])
+        XCTAssertEqual(endpointSubmitterMock.recordedSubmissions(), [publicServer], "Sent once, through the new server only")
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: "public.example.com:443"))
+    }
+
+    /// Only stuck transactions follow the user to the new server: one a server already accepted, one the host
+    /// created but never released, and one without a plan are neither sent nor changed.
+    func testResubmitUnacceptedLeavesAcceptedAwaitingAndUnplannedTransactionsAlone() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let accepted = makeTransaction(raw: Data([0x01]), rawID: Data(repeating: 0x21, count: 32))
+        let awaiting = makeTransaction(raw: Data([0x02]), rawID: Data(repeating: 0x22, count: 32))
+        let unplanned = makeTransaction(raw: Data([0x03]), rawID: Data(repeating: 0x23, count: 32))
+        try reportPending([accepted, awaiting, unplanned])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let lifecycle = await store.recordPlan(txId: accepted.rawID, endpoints: [gateway])
+        await store.markAccepted(txId: accepted.rawID, host: "gateway.example.com:443", lifecycle: lifecycle)
+        await store.markAwaitingSubmission(txIds: [awaiting.rawID], lifecycle: await store.currentLifecycle())
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [])
+        XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
+        let acceptedPlan = await store.plan(for: accepted.rawID)
+        XCTAssertEqual(acceptedPlan, StoredSubmitPlan.ready([gateway], acceptedBy: "gateway.example.com:443"))
+        let awaitingPlan = await store.plan(for: awaiting.rawID)
+        XCTAssertEqual(awaitingPlan, StoredSubmitPlan.awaiting)
+        let unplannedPlan = await store.plan(for: unplanned.rawID)
+        XCTAssertNil(unplannedPlan)
+    }
+
+    /// A transaction the new server does not take does not keep the next one from being sent, and both keep
+    /// the new server in their plans for background resubmission.
+    func testResubmitUnacceptedSendsEveryStuckTransactionWhenOneIsNotAccepted() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "rejected"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let first = makeTransaction(raw: Data([0x04]), rawID: Data(repeating: 0x41, count: 32))
+        let second = makeTransaction(raw: Data([0x05]), rawID: Data(repeating: 0x42, count: 32))
+        try reportPending([first, second])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: first.rawID, endpoints: [gateway])
+        await store.recordPlan(txId: second.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports.map(\.txId), [first.rawID, second.rawID])
+        XCTAssertEqual(endpointSubmitterMock.recordedSubmissions(), [publicServer, publicServer])
+        for transaction in [first, second] {
+            let plan = await store.plan(for: transaction.rawID)
+            XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: nil))
+        }
+    }
+
+    /// With nothing stuck there is nothing to send: no network attempt, and an empty report.
+    func testResubmitUnacceptedWithNothingStuckMakesNoNetworkAttempt() async throws {
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        try reportPending([])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [])
+        XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
+    }
+
     // MARK: - Helpers
+
+    /// What the repository reports as neither mined nor expired. Call it after `makeSynchronizer`, which
+    /// registers the repository double this sets up.
+    private func reportPending(_ overviews: [ZcashTransaction.Overview]) throws {
+        let repository = try XCTUnwrap(mockContainer.resolve(TransactionRepository.self) as? TransactionRepositoryMock)
+        repository.findForResubmissionUpToReturnValue = overviews
+    }
 
     /// A synchronizer for the tests that submit to the local servers. Its rust backend is a double that lets every transaction through,
     /// because what these tests are about is the outcome of the submission; the check that comes before it has suites of its own

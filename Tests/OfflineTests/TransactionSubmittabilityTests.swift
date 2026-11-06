@@ -157,6 +157,90 @@ final class TransactionSubmittabilityTests: ZcashTestCase {
         }
     }
 
+    func testEncoderLocalRefusalDoesNotAttributeEarlierOptionalFailure() async throws {
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        let encoder = try makeEncoder()
+        backend.checkTransactionSubmittableSubmissionServerHeightReturnValue = .expired
+        await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                do {
+                    try await encoder.submit(transaction: EncodedTransaction(transactionId: self.txId, raw: self.raw))
+                    XCTFail("Expected local refusal")
+                } catch TransactionEncoderError.notSubmittable(let refusal) {
+                    XCTAssertEqual(refusal, .expired)
+                } catch {
+                    XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+        let updates = session.updates()
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        for await update in updates {
+            if case .operationCompleted(_, _, let observations) = update {
+                XCTAssertTrue(observations.isEmpty, "Local refusal must not adopt an incidental earlier request")
+                break
+            }
+        }
+        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 1)
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+    }
+
+    func testEncoderAttributesOnlyTheFinalSubmitRequest() async throws {
+        try await assertEncoderFailureEvidence(heightFails: false)
+    }
+
+    func testEncoderAttributesTheFailedPreflightRead() async throws {
+        try await assertEncoderFailureEvidence(heightFails: true)
+    }
+
+    private func assertEncoderFailureEvidence(heightFails: Bool) async throws {
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        service.latestBlockHeightModeClosure = { _ in
+            let request = OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd)
+            request.record(outcome: heightFails ? .transportUnavailable : .usable, stage: .complete)
+            if heightFails { throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut) }
+            return 3_543_404
+        }
+        service.submitSpendTransactionModeClosure = { _, _ in
+            OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .policyRejected, stage: .responseHead)
+            throw ZcashError.serviceSubmitFailed(LightWalletServiceError.timeOut)
+        }
+        let encoder = try makeEncoder()
+        await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
+                do {
+                    try await encoder.submit(transaction: EncodedTransaction(transactionId: self.txId, raw: self.raw))
+                    XCTFail("Expected service failure")
+                } catch ZcashError.serviceSubmitFailed(let error) {
+                    XCTAssertEqual(error, .timeOut)
+                } catch {
+                    XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+        let updates = session.updates()
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        for await update in updates {
+            if case .operationCompleted(_, _, let observations) = update {
+                XCTAssertEqual(observations.map(\.outcome), [heightFails ? .transportUnavailable : .policyRejected])
+                XCTAssertEqual(observations.map(\.scope), [.lightwalletd])
+                break
+            }
+        }
+        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 1)
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, heightFails ? 0 : 1)
+    }
+
     // MARK: - The streams built on the sink
 
     func testSubmitTransactionsMapsARefusalToSubmitFailure() async throws {
@@ -318,6 +402,90 @@ final class TransactionSubmittabilityTests: ZcashTestCase {
 
         XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
         XCTAssertEqual(service.fetchTransactionTxIdModeCallsCount, 0)
+    }
+
+    func testBothPublicCreationBoundariesExcludeLocalFailures() async throws {
+        for slipstream in [false, true] {
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let sdk = try makeSDKSynchronizer()
+            let other = try makeSlipstreamSynchronizer(creating: [makeCreatedTransaction(seed: 1)])
+            backend.createProposedTransactionsProposalUskOvkPolicyThrowableError = ZcashError.rustCheckTransactionSubmittable("local proof")
+            let operation = OHTTPHealthOperation()
+            let attempt = OHTTPHealthAttempt(operation: operation)
+            await OHTTPHealthContext.withOperation(operation) {
+                await OHTTPHealthContext.withAttempt(attempt) {
+                    OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                    do {
+                        let synchronizer: any Synchronizer = slipstream ? other : sdk
+                        _ = try await synchronizer.createProposedTransactions(
+                            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                            spendingKey: TestsData(networkType: .testnet).spendingKey
+                        )
+                        XCTFail("Expected original local failure")
+                    } catch let error as ZcashError {
+                        XCTAssertEqual(error, slipstream ? ZcashError.rustCheckTransactionSubmittable("local proof") : ZcashError.synchronizerNotPrepared)
+                    } catch { XCTFail("Unexpected error: \(error)") }
+                }
+            }
+            let updates = session.updates()
+            await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+            for await update in updates {
+                if case .operationCompleted(_, _, let observations) = update {
+                    XCTAssertTrue(observations.isEmpty, "slipstream: \(slipstream)")
+                    break
+                }
+            }
+        }
+    }
+
+    func testBothStreamsRetainOriginWhenConsumedUnderAnotherContext() async throws {
+        for slipstream in [false, true] {
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let operation = OHTTPHealthOperation()
+            let attempt = OHTTPHealthAttempt(operation: operation)
+            let foreign = OHTTPHealthOperation()
+            let first = makeCreatedTransaction(seed: 1)
+            let second = makeCreatedTransaction(seed: 2)
+            let transactions = [first, second]
+            service.latestBlockHeightModeClosure = { _ in
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut)
+            }
+            let sdk = try makeSDKSynchronizer()
+            let other = try makeSlipstreamSynchronizer(creating: transactions)
+            let proposal = Proposal.testOnlyFakeProposal(totalFee: 10)
+            let spendingKey = TestsData(networkType: .testnet).spendingKey
+            let results = try await OHTTPHealthContext.withOperation(operation) {
+                try await OHTTPHealthContext.withAttempt(attempt) {
+                    let stream: AsyncThrowingStream<TransactionSubmitResult, Error>
+                    if slipstream {
+                        stream = try await other.createProposedTransactions(proposal: proposal, spendingKey: spendingKey)
+                    } else {
+                        stream = sdk.submitTransactions(transactions)
+                    }
+                    return try await OHTTPHealthContext.withOperation(foreign) {
+                        try await self.collect(stream)
+                    }
+                }
+            }
+            XCTAssertEqual(results, [.grpcFailure(txId: first.txId, error: .timeOut), .notAttempted(txId: second.txId)])
+            await OHTTPHealthContext.withOperation(operation) {
+                _ = OHTTPHealthCenter.shared.begin(route: route, scope: .other)
+            }
+            let updates = session.updates()
+            await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+            for await update in updates {
+                if case .operationCompleted(_, _, let observations) = update {
+                    XCTAssertEqual(observations.map(\.outcome), [.transportUnavailable], "slipstream: \(slipstream)")
+                    XCTAssertEqual(observations.map(\.operation), [operation])
+                    break
+                }
+            }
+        }
     }
 
     // MARK: - Helpers

@@ -52,7 +52,8 @@ final class TxResubmissionActionTests: ZcashTestCase {
     private func setupAction(
         candidates: [ZcashTransaction.Overview],
         encoderTransactions: [ZcashTransaction.Overview] = [],
-        submitPlanStoreOverride: SubmitPlanStoring? = nil
+        submitPlanStoreOverride: SubmitPlanStoring? = nil,
+        endpoint: LightWalletEndpoint = LightWalletEndpointBuilder.default
     ) -> TxResubmissionAction {
         transactionRepository = TransactionRepositoryMock()
         transactionRepository.findForResubmissionUpToClosure = { _ in candidates }
@@ -70,6 +71,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
             SubmitPlanExecutor(endpointSubmitter: self.endpointSubmitter, logger: submissionLifecycleLogger())
         }
 
+        mockContainer.register(type: LightWalletEndpoint.self, isSingleton: true) { _ in endpoint }
         let action = TxResubmissionAction(container: mockContainer)
         // Push the throttle back so tests exercise the resubmit branch.
         // The first-invocation throttle is covered by its own test.
@@ -88,10 +90,67 @@ final class TxResubmissionActionTests: ZcashTestCase {
         return context
     }
 
+    private var gateway: LightWalletEndpoint {
+        LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
+    }
+
+    func testPrivateRetryOverridesPublicHistoryWithoutReplacingIt() async throws {
+        let rawID = Data(repeating: 0x31, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate], endpoint: gateway)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions(), [gateway])
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty)
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "\(gateway.host):443"))
+    }
+
+    func testPrivateLegacyRetryUsesOnlyGatewayWithoutCreatingConsent() async throws {
+        let rawID = Data(repeating: 0x32, count: 32)
+        let action = setupAction(candidates: [makeOverview(rawID: rawID)], endpoint: gateway)
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions(), [gateway])
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty)
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertNil(plan)
+    }
+
+    func testLegacyRetryHonorsCustomEndpointTimeout() async throws {
+        let rawID = Data(repeating: 0x34, count: 32)
+        let endpoint = LightWalletEndpoint(address: "manual.example.com", port: 443, secure: true, singleCallTimeoutInMillis: 0)
+        let action = setupAction(candidates: [makeOverview(rawID: rawID)], endpoint: endpoint)
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "An expired endpoint budget must prevent the legacy send")
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+    }
+
+    func testManualRetryPreservesPublicHistory() async throws {
+        let rawID = Data(repeating: 0x33, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let manual = LightWalletEndpoint(address: "manual.example.com", port: 443, secure: true)
+        let action = setupAction(candidates: [candidate], endpoint: manual)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions(), [endpointA])
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, .ready([endpointA], acceptedBy: "a.example.com:443"))
+    }
+
     func testAwaitingTransactionIsSkipped() async throws {
         let rawID = Data(repeating: 0x01, count: 32)
         let candidate = makeOverview(rawID: rawID)
-        let action = setupAction(candidates: [candidate])
+        let action = setupAction(candidates: [candidate], endpoint: gateway)
         await submitPlanStore.markAwaitingSubmission(txIds: [rawID], lifecycle: await submitPlanStore.currentLifecycle())
         // Make the repository confirm the candidate is alive so pruning keeps it.
         transactionRepository.findRawIDClosure = { _ in candidate }
@@ -185,17 +244,17 @@ final class TxResubmissionActionTests: ZcashTestCase {
     func testWipeParkedDuringResubmissionDropsTheAcceptance() async throws {
         let rawID = Data(repeating: 0x15, count: 32)
         let candidate = makeOverview(rawID: rawID)
-        let action = setupAction(candidates: [candidate])
+        let action = setupAction(candidates: [candidate], endpoint: gateway)
         transactionRepository.findRawIDClosure = { _ in candidate }
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
 
         let gate = Gate()
-        endpointSubmitter.set(behavior: .gated(gate, then: .succeed), for: endpointA)
+        endpointSubmitter.set(behavior: .gated(gate, then: .succeed), for: gateway)
 
         let resubmission = Task {
             _ = try await action.run(with: makeContext()) { _ in }
         }
-        await endpointSubmitter.awaitSubmissionStarted(to: endpointA)
+        await endpointSubmitter.awaitSubmissionStarted(to: gateway)
 
         // The plan has already been read as `.ready` and the submission is parked in the
         // executor; a wipe landing now must not let the eventual acceptance recreate state for a
@@ -219,7 +278,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
     func testWipeParkedDuringPlanReadCatchesAWipeInsideTheRead() async throws {
         let rawID = Data(repeating: 0x16, count: 32)
         let candidate = makeOverview(rawID: rawID)
-        let action = setupAction(candidates: [candidate])
+        let action = setupAction(candidates: [candidate], endpoint: gateway)
         transactionRepository.findRawIDClosure = { _ in candidate }
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
 
@@ -239,7 +298,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         try await resubmission.value
 
         XCTAssertEqual(submitPlanStore.wipeCallsCount, 1)
-        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"], "the stale read is still resubmitted")
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), [gateway.host], "the stale read is still resubmitted")
         let plan = await submitPlanStore.plan(for: rawID)
         XCTAssertNil(plan, "A wipe landing while the plan was being read must not be undone by the acceptance that read produced")
     }
@@ -264,7 +323,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let nilExpiryTxId = Data(repeating: 0x08, count: 32)
         let aliveTxId = Data(repeating: 0x07, count: 32)
 
-        let action = setupAction(candidates: [])
+        let action = setupAction(candidates: [], endpoint: gateway)
         await submitPlanStore.recordPlan(txId: minedUnexpiredTxId, endpoints: [endpointA])
         await submitPlanStore.recordPlan(txId: expiredTxId, endpoints: [endpointA])
         await submitPlanStore.recordPlan(txId: minedExpiredTxId, endpoints: [endpointA])
@@ -302,7 +361,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
     func testStoreUnavailableSkipsResubmission() async throws {
         let rawID = Data(repeating: 0x0C, count: 32)
         let candidate = makeOverview(rawID: rawID)
-        let action = setupAction(candidates: [candidate])
+        let action = setupAction(candidates: [candidate], endpoint: gateway)
         submitPlanStore.storeUnavailable = true
         transactionRepository.findRawIDClosure = { _ in candidate }
 

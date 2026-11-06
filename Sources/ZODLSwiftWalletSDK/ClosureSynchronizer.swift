@@ -215,6 +215,7 @@ public protocol ClosureSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64,
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     )

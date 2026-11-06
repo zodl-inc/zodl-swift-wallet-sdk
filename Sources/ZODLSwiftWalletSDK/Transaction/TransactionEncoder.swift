@@ -185,9 +185,12 @@ extension LightWalletService {
         mode: ServiceMode,
         using rustBackend: ZcashRustBackendWelding
     ) async throws -> TransactionSubmissionRefusal? {
+        let health = OHTTPHealthFailureOwner()
         let serverHeight: BlockHeight
         do {
-            serverHeight = try await latestBlockHeight(mode: mode)
+            serverHeight = try await health.request {
+                try await latestBlockHeight(mode: mode)
+            }
         } catch ZcashError.serviceLatestBlockHeightFailed(let error) {
             throw ZcashError.serviceSubmitFailed(error)
         } catch {

@@ -226,7 +226,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
                 return nil
             },
             freeRuntime: { _ in XCTFail("Unused cleanup must not free a runtime it never opened") },
-            createRuntime: { _, _ in
+            startup: TorRuntimeStartupNative.fixture { _, _ in
                 XCTFail("Unused cleanup must not create a runtime")
                 return nil
             }
@@ -571,7 +571,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
         let root = testTempDirectory.appendingPathComponent(card.synchronizerAlias.description)
         let marker = root.appendingPathComponent("cached-tor-owner")
         var native = TorHTTPGetNative()
-        native.createRuntime = { _, _ in
+        native.startup = TorRuntimeStartupNative.fixture { _, _ in
             XCTFail("Gift cleanup must not create a runtime")
             return nil
         }
@@ -677,7 +677,7 @@ final class GiftCardCleanupTests: ZcashTestCase {
     func testUnusedCleanupWithActualServiceCreatesNoRuntimeOrConnection() async throws {
         let events = CleanupEvents()
         var native = TorHTTPGetNative()
-        native.createRuntime = { _, _ in
+        native.startup = TorRuntimeStartupNative.fixture { _, _ in
             events.append("create")
             return nil
         }

@@ -3,6 +3,71 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class GiftCardSlipstreamRedemptionTests: ZcashTestCase {
+    func testRedemptionFinalizationRetainsOnlyFailedTransactionAfterAnAcceptedReceipt() async throws {
+        let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)
+        _ = try await fixture.redeemer.check()
+        let first = Data(repeating: 0xA1, count: 32)
+        let second = Data(repeating: 0xB2, count: 32)
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [first, second]
+        fixture.backend.getTransactionTxIdClosure = { id in
+            TransactionData(txId: id, raw: Data([id[0]]), expiryHeight: 3_000_100)
+        }
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        fixture.service.submitSpendTransactionModeClosure = { raw, _ in
+            let request = OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd)
+            request.record(outcome: raw == Data([0xB2]) ? .transportUnavailable : .usable, stage: .complete)
+            if raw == Data([0xB2]) { throw ZcashError.serviceSubmitFailed(LightWalletServiceError.timeOut) }
+            return SendResponse()
+        }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        let redemption = try await OHTTPHealthContext.withOperation(operation) {
+            try await OHTTPHealthContext.withAttempt(attempt) {
+                try await fixture.redeemer.redeem(to: fixture.card.fundingAddress, memo: nil, recordIn: nil)
+            }
+        }
+        XCTAssertEqual(redemption.results, [.success(txId: first), .grpcFailure(txId: second, error: .timeOut)])
+        XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 2)
+        let evidence = attempt.evidence(route: route, generation: session.generation)
+        XCTAssertEqual(evidence.map(\.outcome), [.transportUnavailable])
+        XCTAssertEqual(evidence.map(\.operation), [operation])
+        try await fixture.redeemer.cleanup()
+    }
+
+    func testLocalRedemptionFailureDoesNotAttributeEarlierOptionalTraffic() async throws {
+        let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)
+        _ = try await fixture.redeemer.check()
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicyThrowableError = ZcashError.rustCheckTransactionSubmittable("proof failed")
+        let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+        let session = try OHTTPHealthSession(route: route, generation: UUID())
+        defer { session.close() }
+        let operation = OHTTPHealthOperation()
+        let attempt = OHTTPHealthAttempt(operation: operation)
+        await OHTTPHealthContext.withOperation(operation) {
+            await OHTTPHealthContext.withAttempt(attempt) {
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                do {
+                    _ = try await fixture.redeemer.redeem(to: fixture.card.fundingAddress, memo: nil, recordIn: nil)
+                    XCTFail("Expected original proof failure")
+                } catch let error as ZcashError {
+                    XCTAssertEqual(error, ZcashError.rustCheckTransactionSubmittable("proof failed"))
+                } catch { XCTFail("Unexpected error: \(error)") }
+            }
+        }
+        let updates = session.updates()
+        await OHTTPHealthContext.complete(operation, failed: true, failedAttempt: attempt)
+        for await update in updates {
+            if case .operationCompleted(_, _, let observations) = update {
+                XCTAssertTrue(observations.isEmpty)
+                break
+            }
+        }
+        XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 0)
+        try await fixture.redeemer.cleanup()
+    }
+
     // Returning an empty claim as a successful redemption would hide a missing submission.
     func testEmptyCompletionReportsIncompleteRedemption() async throws {
         let fixture = try await GiftCardCancellationFixture.make(storageDirectory: testTempDirectory)

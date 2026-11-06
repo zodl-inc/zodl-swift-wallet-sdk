@@ -2711,6 +2711,54 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - httpRequestOverOHTTP
+
+    var httpRequestOverOHTTPForThrowableError: Error?
+    var httpRequestOverOHTTPForCallsCount = 0
+    var httpRequestOverOHTTPForCalled: Bool {
+        return httpRequestOverOHTTPForCallsCount > 0
+    }
+    var httpRequestOverOHTTPForReceivedArguments: (request: URLRequest, viaTor: Bool)?
+    var httpRequestOverOHTTPForReturnValue: (data: Data, response: HTTPURLResponse)!
+    var httpRequestOverOHTTPForClosure: ((URLRequest, Bool) async throws -> (data: Data, response: HTTPURLResponse))?
+
+    func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
+        if let error = httpRequestOverOHTTPForThrowableError {
+            throw error
+        }
+        httpRequestOverOHTTPForCallsCount += 1
+        httpRequestOverOHTTPForReceivedArguments = (request: request, viaTor: viaTor)
+        if let closure = httpRequestOverOHTTPForClosure {
+            return try await closure(request, viaTor)
+        } else {
+            return httpRequestOverOHTTPForReturnValue
+        }
+    }
+
+    // MARK: - httpStreamOverOHTTP
+
+    var httpStreamOverOHTTPForThrowableError: Error?
+    var httpStreamOverOHTTPForCallsCount = 0
+    var httpStreamOverOHTTPForCalled: Bool {
+        return httpStreamOverOHTTPForCallsCount > 0
+    }
+    var httpStreamOverOHTTPForReceivedArguments: (request: URLRequest, viaTor: Bool)?
+    var httpStreamOverOHTTPForReturnValue: OHTTPStreamedResponse!
+    var httpStreamOverOHTTPForClosure: ((URLRequest, Bool) async throws -> OHTTPStreamedResponse)?
+
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
+        if let error = httpStreamOverOHTTPForThrowableError {
+            throw error
+        }
+        httpStreamOverOHTTPForCallsCount += 1
+        httpStreamOverOHTTPForReceivedArguments = (request: request, viaTor: viaTor)
+        if let closure = httpStreamOverOHTTPForClosure {
+            return try await closure(request, viaTor)
+        } else {
+            return httpStreamOverOHTTPForReturnValue
+        }
+    }
+
     // MARK: - httpRequestOverTor
 
     var httpRequestOverTorForRetryLimitThrowableError: Error?
@@ -2761,25 +2809,25 @@ class SynchronizerMock: Synchronizer {
 
     // MARK: - makeVotingRoundSession
 
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError: Error?
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount = 0
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochCalled: Bool {
-        return makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount > 0
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochThrowableError: Error?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount = 0
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCalled: Bool {
+        return makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount > 0
     }
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64)?
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue: VotingRoundSession!
-    var makeVotingRoundSessionBackendInputsBindingRouteEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, UInt64) async throws -> VotingRoundSession)?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, isCustomServer: Bool, epoch: UInt64)?
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReturnValue: VotingRoundSession!
+    var makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, Bool, UInt64) async throws -> VotingRoundSession)?
 
-    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64) async throws -> VotingRoundSession {
-        if let error = makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError {
+    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, isCustomServer: Bool, epoch: UInt64) async throws -> VotingRoundSession {
+        if let error = makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochThrowableError {
             throw error
         }
-        makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount += 1
-        makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch)
-        if let closure = makeVotingRoundSessionBackendInputsBindingRouteEpochClosure {
-            return try await closure(backend, inputs, binding, route, epoch)
+        makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochCallsCount += 1
+        makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, isCustomServer: isCustomServer, epoch: epoch)
+        if let closure = makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochClosure {
+            return try await closure(backend, inputs, binding, route, isCustomServer, epoch)
         } else {
-            return makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue
+            return makeVotingRoundSessionBackendInputsBindingRouteIsCustomServerEpochReturnValue
         }
     }
 

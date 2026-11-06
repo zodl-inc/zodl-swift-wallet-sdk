@@ -9,6 +9,26 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class EndpointSubmitterTests: ZcashTestCase {
+    func testTransitionFenceRejectsBeforeHeightOrBroadcast() async throws {
+        let flags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        service.latestBlockHeightModeReturnValue = 3_543_404
+        service.submitSpendTransactionModeReturnValue = SendResponse()
+        let submitter = GRPCEndpointSubmitter(
+            torClient: TorClient(torDir: testTempDirectory), sdkFlags: flags,
+            rustBackend: rustBackend, logger: submissionLifecycleLogger(), networkType: .testnet,
+            serviceFactory: { _, _ in service }
+        )
+        flags.routeAdmission.require(false)
+        do {
+            try await submitter.submit(transaction: makeTransaction(), to: LightWalletEndpointBuilder.default)
+            XCTFail("Retired route must reject a new endpoint broadcast")
+        } catch {}
+        XCTAssertEqual(service.latestBlockHeightModeCallsCount, 0)
+        XCTAssertEqual(service.submitSpendTransactionModeCallsCount, 0)
+    }
+
     /// The check every submission passes. It lets everything through unless a test says otherwise.
     private var rustBackend: ZcashRustBackendWeldingMock!
 
@@ -22,7 +42,8 @@ final class EndpointSubmitterTests: ZcashTestCase {
             torClient: TorClient(torDir: try __torDirURL()),
             sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
             rustBackend: rustBackend,
-            logger: submissionLifecycleLogger()
+            logger: submissionLifecycleLogger(),
+            networkType: .testnet
         )
     }
 
@@ -51,6 +72,78 @@ final class EndpointSubmitterTests: ZcashTestCase {
         server.latestBlockHeight = height
         addTeardownBlock { try? server.stop() }
         return server
+    }
+
+    func testEndpointSelectsFinalSubmitAndIgnoresRecoveryTraffic() async throws {
+        for scenario in ["height", "submit", "rejected", "known", "local"] {
+            let route = OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString).test", relayURL: "https://relay.test/", viaTor: false)
+            let session = try OHTTPHealthSession(route: route, generation: UUID())
+            defer { session.close() }
+            let service = LightWalletServiceMock()
+            service.closeConnectionsClosure = {}
+            service.latestBlockHeightModeClosure = { _ in
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: scenario == "height" ? .transportUnavailable : .usable, stage: .complete)
+                if scenario == "height" { throw ZcashError.serviceLatestBlockHeightFailed(LightWalletServiceError.timeOut) }
+                return 3_543_404
+            }
+            service.submitSpendTransactionModeClosure = { _, _ in
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: scenario == "submit" ? .transportUnavailable : .backendUnavailable, stage: .complete)
+                if scenario == "submit" { throw ZcashError.serviceSubmitFailed(LightWalletServiceError.timeOut) }
+                return self.makeSendResponse(errorCode: -25, errorMessage: "rejected")
+            }
+            service.fetchTransactionTxIdModeClosure = { _, _ in
+                OHTTPHealthCenter.shared.begin(route: route, scope: .lightwalletd).record(outcome: .transportUnavailable, stage: .connection)
+                if scenario == "known" { return (tx: nil, status: .mined(3_543_404)) }
+                throw LightWalletServiceError.timeOut
+            }
+            rustBackend.checkTransactionSubmittableSubmissionServerHeightReturnValue = scenario == "local" ? .expired : nil
+            let tor = TorClient(torDir: try __torDirURL())
+            let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443)
+            let submitter = GRPCEndpointSubmitter(
+                torClient: tor, sdkFlags: SDKFlags(torEnabled: false, exchangeRateEnabled: false),
+                rustBackend: rustBackend, logger: submissionLifecycleLogger(), networkType: .testnet,
+                serviceFactory: { receivedEndpoint, receivedTor in
+                    XCTAssertEqual(receivedEndpoint, endpoint)
+                    XCTAssertTrue(receivedTor === tor)
+                    return service
+                }
+            )
+            let operation = OHTTPHealthOperation()
+            let attempt = OHTTPHealthAttempt(operation: operation)
+            await OHTTPHealthContext.withOperation(operation) {
+                await OHTTPHealthContext.withAttempt(attempt) {
+                    OHTTPHealthCenter.shared.begin(route: route, scope: .swaps).record(outcome: .transportUnavailable, stage: .connection)
+                    do {
+                        try await submitter.submit(transaction: self.makeTransaction(), to: endpoint)
+                        XCTAssertEqual(scenario, "known")
+                    } catch ZcashError.serviceSubmitFailed(let error) {
+                        XCTAssertTrue(scenario == "height" || scenario == "submit")
+                        XCTAssertEqual(error, .timeOut)
+                    } catch TransactionEncoderError.submitError(let code, let message) {
+                        XCTAssertEqual(scenario, "rejected")
+                        XCTAssertEqual(code, -25)
+                        XCTAssertEqual(message, "rejected")
+                    } catch TransactionEncoderError.notSubmittable(let refusal) {
+                        XCTAssertEqual(scenario, "local")
+                        XCTAssertEqual(refusal, .expired)
+                    } catch { XCTFail("Unexpected error: \(error)") }
+                }
+            }
+            let updates = session.updates()
+            await OHTTPHealthContext.complete(operation, failed: scenario != "known", failedAttempt: attempt)
+            for await update in updates {
+                if case .operationCompleted(_, _, let observations) = update {
+                    let expected: [OHTTPHealthOutcome] = scenario == "height" || scenario == "submit" ? [.transportUnavailable] : []
+                    XCTAssertEqual(observations.map(\.outcome), expected, scenario)
+                    XCTAssertFalse(observations.contains { $0.scope == .swaps })
+                    break
+                }
+            }
+            XCTAssertEqual(service.latestBlockHeightModeCallsCount, 1)
+            XCTAssertEqual(service.submitSpendTransactionModeCallsCount, scenario == "height" || scenario == "local" ? 0 : 1)
+            XCTAssertEqual(service.fetchTransactionTxIdModeCallsCount, scenario == "known" || scenario == "rejected" ? 1 : 0)
+            XCTAssertEqual(service.closeConnectionsCallsCount, 1)
+        }
     }
 
     func testSubmitDeliversRawBytesToEndpoint() async throws {
