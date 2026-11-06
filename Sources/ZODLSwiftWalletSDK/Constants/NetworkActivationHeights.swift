@@ -59,9 +59,9 @@ public struct NetworkActivationHeights: Equatable, Hashable, Sendable {
 
     /// Every network upgrade through NU6.3 active from height 1, and NU7 not activated — the default set
     /// used when a regtest network is built without explicit heights
-    /// (``ZcashNetworkBuilder/network(for:)`` with ``NetworkType/regtest``). NU7 stays off to match the
-    /// regtest schedule that coinholder voting follows; voting refuses a network whose consensus branch
-    /// differs from that schedule.
+    /// (``ZcashNetworkBuilder/network(for:)`` with ``NetworkType/regtest``). Coinholder voting's built-in
+    /// regtest schedule activates NU6.3 at height 10 and NU7 at height 11, so this default agrees only
+    /// at snapshot 10; voting refuses snapshots 1–9 and 11+ unless custom heights select the same branch.
     public static let allActiveFromGenesis = NetworkActivationHeights(
         overwinter: 1,
         sapling: 1,
