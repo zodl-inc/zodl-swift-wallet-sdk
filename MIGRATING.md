@@ -1,5 +1,17 @@
 # Migrating from previous versions to _Unreleased_
 
+## ARM64-only platform support
+
+The FFI XCFramework previously included x86_64 macOS and iOS simulator binaries. It now
+contains only `ios-arm64`, `ios-arm64-simulator`, and `macos-arm64`. Intel Macs and x86_64
+simulator destinations cannot build or run the SDK. Move development and CI to Apple Silicon
+and select an ARM64 simulator destination. The minimum OS versions remain macOS 14 and iOS 16.
+Reinitialize existing local FFI installations to remove the old universal slices.
+For generic macOS or iOS Simulator destinations, add `ARCHS=arm64` to `xcodebuild`
+build and archive commands. An Apple Silicon host alone may still request x86_64 for a
+generic destination. Keep `-skipMacroValidation` and an explicit `-derivedDataPath`
+outside the Xcode app's DerivedData directory on these commands.
+
 ## Native OHTTP source-build configuration
 
 Previously, mainnet and testnet could share relay URLs, signing keys and key DNS names.

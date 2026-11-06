@@ -18,8 +18,8 @@ WORKFLOW_PATH = ".github/workflows/build-ffi.yml"
 TARGETS = ("clean-ffi", "ffi-all", "configure-local-ffi", "build", "test-offline")
 SLICES = {
     "ios-arm64": ("ios", None, {"arm64"}),
-    "ios-arm64_x86_64-simulator": ("ios", "simulator", {"arm64", "x86_64"}),
-    "macos-arm64_x86_64": ("macos", None, {"arm64", "x86_64"}),
+    "ios-arm64-simulator": ("ios", "simulator", {"arm64"}),
+    "macos-arm64": ("macos", None, {"arm64"}),
 }
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
 
@@ -121,6 +121,8 @@ def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
     libraries = info.get("AvailableLibraries")
     if info.get("XCFrameworkFormatVersion") != "1.0" or info.get("CFBundlePackageType") != "XFWK" or not isinstance(libraries, list) or len(libraries) != 3:
         raise BuildError("invalid full XCFramework manifest")
+    if {path.name for path in product.iterdir() if path.is_dir()} != set(SLICES):
+        raise BuildError("undeclared or missing native slice directories")
     verified = []
     seen = set()
     for item in libraries:
