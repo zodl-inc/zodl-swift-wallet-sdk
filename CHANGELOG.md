@@ -6,12 +6,67 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
+  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
+- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
+  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
+  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
+- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
+  stops compiling until they are handled.
+- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
+  more notes than one transaction can spend within the block size limit is now refused when the
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
+  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
+  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
+  None of the new cases carries the recipient, the memo or an amount.
+- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
+  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
+  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
+  `rustProposeTransfer` or `rustProposeTransferFromURI`.
+
 ## Fixed
 
-- Refused stale migration submissions now persist recovery state: `advanceStep()` returns `.reevaluate`
-  until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
-  or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
-  are unchanged.
+- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
+  For custom regtest snapshots at height 11 or later, the registered activation schedule must
+  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
+# 7.0.1 - 2026-11-02
+
+## Fixed
+
+- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
+  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
+  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
+  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
+  the flood was previously processed without limit. lightwalletd's block streams, which send one
+  small frame per compact block, stay within the limit. No caller changes are required.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3532500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3537500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4550000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4570000.json
+````
+
+# 7.0.0 - 2026-10-27
 
 ## Added
 
@@ -143,8 +198,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails is neither submitted nor recorded in the wallet, and the call throws
   `ZcashError.migrationSubmissionRefused(_:)` with the reason: sync, then crank `migrationAdvanceStep(accountUUID:)`
   again to learn what becomes of the run (for `submitNoteSplit` the run it committed stays). The crank judges the
-  run at the wallet's own chain tip and the check at the higher of that and the server's height, so a wallet that
-  is behind the server is offered the same transaction again until it has synced. The wallet is now touched
+  run at the wallet's own chain tip and the check at the higher of that and the server's height. A refusal of
+  active proved work persists that observed tip, so the crank returns `.reevaluate` until scanning reaches it,
+  then resumes interruption or rebuild handling. A failure to persist that state throws the store error instead.
+  The wallet is now touched
   only once the connection is up and the height is read, so `ZcashError.migrationTorUnavailable`, which these
   calls threw after the transaction was taken, is thrown before it, and `submitNoteSplit` no longer commits and
   signs a run before it knows the server can be reached. That makes `submitNoteSplit` contact the submission
@@ -213,6 +270,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Refused stale migration submissions now persist recovery state:
+  `Synchronizer.migrationAdvanceStep(accountUUID:)` returns `.reevaluate` until scanning reaches the higher
+  observed wallet/server tip, then resumes interruption or rebuild handling. No transaction is submitted or
+  recorded in the wallet, and caller signatures are unchanged.
 - `performMigrationBroadcast(accountUUID:_:options:)` and `takeMigrationPreparation(accountUUID:byTxid:)` no
   longer serve a transaction of a run that has ended. An instruction a crank issued before
   `cancelMigrationRun(accountUUID:)` (or before the run completed, failed or was superseded) could still be
@@ -298,12 +359,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mempool or mined on a fork: it is stored without a mined height, and a mempool transaction at such
   a height produces no `foundTransactions` event. Apart from handling the new `ZcashError` case
   listed under Changed, no caller changes are required.
-- The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
-  which carry `SlipstreamSynchronizer`'s sync and every lightwalletd request sent over Tor
-  (`TorClient.connectToLightwalletd(endpoint:)`), and the voting crate's HTTPS requests. It closes a
-  connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
-  the flood was previously processed without limit. lightwalletd's block streams, which send one
-  small frame per compact block, stay within the limit. No caller changes are required.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3527500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3530000.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4530000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4540000.json
+````
 
 # 6.0.0 - 2026-10-15
 
@@ -337,20 +410,6 @@ Changes are relative to `5.2.2`.
 - `PaymentURIParser` reports missing, retyped, or unknown fields in the Rust result envelope as
   `invalidEnvelope` rather than `invalidURI`. Callers can distinguish an SDK/core mismatch from a
   bad scanned URI without asking the user to rescan.
-- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
-  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
-  more notes than one transaction can spend within the block size limit is now refused when the
-  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
-  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
-  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
-  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
-  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
-  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
-  None of the new cases carries the recipient, the memo or an amount.
-- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
-  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
-  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
-  `rustProposeTransfer` or `rustProposeTransferFromURI`.
 - `DerivationTool.describeUnifiedFullViewingKey(_:)` reports which items a `UnifiedFullViewingKey`
   carries, as a `UnifiedFullViewingKeyComponents` with `hasP2pkh`, `hasP2sh`, `hasSapling`,
   `hasOrchard`, `hasUnknownItems` and `hasTransparent` (a P2PKH or a P2SH item). A wallet can use it
@@ -422,14 +481,6 @@ Changes are relative to `5.2.2`.
   as `proposalInvalid`, and a wallet could only tell them apart by the upstream error text, which
   redaction now removes; the new case lets it say "scan further and retry". An exhaustive `switch`
   over `RustErrorKind` stops compiling until the new case is handled.
-- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
-  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
-  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
-- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
-  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
-  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
-- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
-  stops compiling until they are handled.
 - `migrationProgress(accountUUID:)` and `recordImmediateMigration(accountUUID:txid:)` use a record
   that `prepare()` now creates, so on a wallet upgraded from an earlier SDK version they throw until
   the synchronizer has been prepared with this version.

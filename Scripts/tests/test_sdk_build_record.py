@@ -150,7 +150,7 @@ class NativeRecordTests(unittest.TestCase):
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
 
     def artifacts(self, *flags, record=True, expected_source=None, **env):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k not in ("GH_REPO", "SWIFT", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog))
         if record:
             environment["ZODL_SDK_BUILD_RECORD"] = "1"
@@ -295,6 +295,37 @@ if sys.argv[1:] == ["--version"]:
         self.assertFalse((self.source / "LocalPackages").exists())
         self.assertTrue(any(c[:2] == ["release", "upload"] and any("sdk-build-record.json" in a for a in c) for c in self.gh_calls()))
         self.assertTrue((self.products / "release.env").is_file())
+
+    def rust_identity_fixtures(self, *, bound):
+        directory = self.root / "selected-rust" if bound else self.tools
+        directory.mkdir(exist_ok=True)
+        for name in ("cargo", "rustc"):
+            executable = directory / name
+            expected = ["--version", "--verbose"] if bound else ["+stable", "--version", "--verbose"]
+            executable.write_text("#!/usr/bin/env python3\nimport sys\n"
+                                  + "if sys.argv[1:] != " + repr(expected) + ": sys.exit(9)\n"
+                                  + "print(" + repr(("selected" if bound else "fallback") + " " + name + " identity") + ")\n")
+            executable.chmod(0o755)
+        return {name.upper(): str(directory / name) for name in ("cargo", "rustc")} if bound else {}
+
+    def test_record_uses_selected_real_rust_binaries_without_proxy_arguments(self):
+        result = self.artifacts(**self.rust_identity_fixtures(bound=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["toolchains"]["cargo"], "selected cargo identity")
+        self.assertEqual(self.record()["toolchains"]["rustc"], "selected rustc identity")
+
+    def test_record_keeps_stable_proxy_fallback_without_selected_rust_binaries(self):
+        result = self.artifacts(**self.rust_identity_fixtures(bound=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["toolchains"]["cargo"], "fallback cargo identity")
+        self.assertEqual(self.record()["toolchains"]["rustc"], "fallback rustc identity")
+
+    def test_record_rejects_invalid_selected_rust_without_echoing_raw_override(self):
+        raw = "/invalid/private-secret\nVALUE=1"
+        result = self.artifacts(CARGO=raw)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("private-secret", result.stdout + result.stderr)
+        self.assert_no_release_write()
 
     def test_make_swift_identity_target_is_quiet_and_read_only(self):
         environment = {key: value for key, value in os.environ.items() if key not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")}

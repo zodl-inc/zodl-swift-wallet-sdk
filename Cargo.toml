@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "5.0.0"
+version = "7.0.1"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -136,12 +136,12 @@ xz2 = { version = "0.1", features = ["static"] }
 # Coinholder voting core: the zcash_voting 5.x round driver. The `lrz` feature
 # selects the librustzcash backend so the crate shares this package's
 # zcash_client_sqlite / orchard family instead of pulling the zakura forks.
-# Pinned exactly, like every voting release this package has taken: the sidecar
-# schema and the wire views move with the crate, so an upgrade is a reviewed change.
+# Allow SemVer-compatible stable releases; Cargo.lock records the exact version
+# used by SDK builds.
 #
-# 5.2.0-rc.2 is the crates.io release built on the librustzcash release. With `lrz` it shares
-# this package's librustzcash crates, so the graph keeps a single copy of each.
-zcash_voting = { version = "=5.2.0-rc.2", default-features = false, features = ["lrz"] }
+# 5.3.0 accepts NU7 round snapshots while retaining the fixed V6 / NU6.3 TX1
+# signing profile. With `lrz` it shares this package's stable librustzcash crates.
+zcash_voting = { version = "5.3.0", default-features = false, features = ["lrz"] }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
@@ -150,8 +150,7 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The `[patch.crates-io]` entry below pins the 0.4.0 release until registry publication.
-slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
+slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -204,11 +203,6 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# Pin the signed zodl_slipstream-0.4.0 release tag by immutable commit hash.
-# Keep the Git patch until 0.4.0 is published to crates.io. This release uses the same
-# librustzcash generation as the versions above, keeping a single family instance.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream.git", rev = "8591b758ca0919058035a2453b41e035f84b2402" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress
