@@ -193,6 +193,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `SlipstreamSynchronizer.start`, `stop`, `stopAndWait`, `switchTo`, `restartSync`, Tor transitions
+  and `wipe` now cancel pending background transaction retries before waiting for lifecycle work.
+  A route switch or completed stop still waits for an active sender to finish. Cancellation retains
+  already-known acceptance and submission consent, stops later transactions/endpoints and does not
+  advance the completed retry cadence. No call-site changes are needed.
+- `SlipstreamSynchronizer` retries and per-endpoint submissions share one `LightWalletEndpoint.singleCallTimeoutInMillis`
+  budget (30 seconds by default) across route admission, OHTTP key fetch, height check, send and
+  known-transaction lookup, including native Tor requests. Expiry fails closed; resource cleanup
+  finishes before lifecycle work proceeds and can extend completion beyond the network budget.
+
 - Pending transaction retries use only the selected Private gateway after an endpoint switch,
   including transactions whose saved retry plans contain public servers. Switches wait for earlier
   retries to finish, and stopped or wiped wallets discard stale queued retries. Stopping or changing servers

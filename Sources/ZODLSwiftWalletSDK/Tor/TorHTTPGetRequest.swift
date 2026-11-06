@@ -13,6 +13,9 @@ struct TorHTTPGetNative: Sendable {
     var connectLightwalletd: @Sendable (OpaquePointer?, UnsafePointer<CChar>?) -> OpaquePointer? = {
         zcashlc_tor_connect_to_lightwalletd($0, $1)
     }
+    var connectLightwalletdWithTimeout: @Sendable (OpaquePointer?, UnsafePointer<CChar>?, UInt64) -> OpaquePointer? = {
+        zcashlc_tor_connect_to_lightwalletd_with_timeout($0, $1, $2)
+    }
     var freeLightwalletd: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_lwd_conn($0) }
     var startup = TorRuntimeStartupNative()
     var postOnce: @Sendable (

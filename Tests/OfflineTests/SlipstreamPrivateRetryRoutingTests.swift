@@ -203,6 +203,86 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.storeURL.path))
     }
 
+    func testLifecycleRequestCancelsRetryBeforeQueueAdmission() async throws {
+        for operation in ["start", "stop", "stopAndWait", "switch", "restart", "tor", "wipe"] {
+            let entered = expectation(description: "retry entered before \(operation)")
+            let cancelled = expectation(description: "retry cancelled before \(operation) queue admission")
+            entered.assertForOverFulfill = false
+            cancelled.assertForOverFulfill = false
+            let fixture = try makeFixture(
+                onSend: { entered.fulfill() },
+                cancellableSend: { cancelled.fulfill() },
+                twoCandidates: true
+            )
+            let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
+            for id in [txId, Data(repeating: 8, count: 32)] {
+                await fixture.store.recordPlan(txId: id, endpoints: [publicEndpoint, other])
+            }
+            await fireRetry(fixture)
+            await fulfillment(of: [entered], timeout: 3)
+            let lifecycle = Task {
+                switch operation {
+                case "start": try? await fixture.sync.start()
+                case "stop": fixture.sync.stop()
+                case "stopAndWait": await fixture.sync.stopAndWait()
+                case "switch": try? await fixture.sync.switchTo(endpoint: gateway)
+                case "restart": try? await fixture.sync.restartSync(at: gateway)
+                case "tor": try? await fixture.sync.requestTorTransition(enabled: false).apply()
+                default:
+                    fixture.sync.wipe().sink(receiveCompletion: { _ in }, receiveValue: { _ in })
+                        .store(in: &cancellables)
+                }
+            }
+            await fulfillment(of: [cancelled], timeout: 0.5)
+            await lifecycle.value
+            _ = await fixture.sync.awaitResubmissionCheckForTesting()
+            await fixture.sync.stopAndWait()
+            XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, operation)
+        }
+    }
+
+    func testLifecycleRequestCancelsQueuedRetryBeforeCandidateRead() async throws {
+        for operation in ["start", "stop", "stopAndWait", "switch", "restart", "tor", "wipe"] {
+            let fixture = try makeFixture(twoCandidates: true)
+            let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
+            for id in [txId, Data(repeating: 8, count: 32)] {
+                await fixture.store.recordPlan(txId: id, endpoints: [publicEndpoint, other])
+            }
+            let switching = await heldSwitch(fixture)
+            await fireRetry(fixture)
+            await waitUntil { fixture.sync.lifecycleQueueDepthForTesting() >= 2 }
+            let request = Task {
+                switch operation {
+                case "start": try? await fixture.sync.start()
+                case "stop": fixture.sync.stop()
+                case "stopAndWait": await fixture.sync.stopAndWait()
+                case "switch": try? await fixture.sync.switchTo(endpoint: gateway)
+                case "restart": try? await fixture.sync.restartSync(at: gateway)
+                case "tor": try? await fixture.sync.requestTorTransition(enabled: false).apply()
+                default:
+                    fixture.sync.wipe().sink(receiveCompletion: { _ in }, receiveValue: { _ in })
+                        .store(in: &cancellables)
+                }
+            }
+            await waitUntil { fixture.sync.lifecycleQueueDepthForTesting() >= 3 }
+            fixture.engine.reopenGate.open()
+            _ = try? await switching.value
+            await request.value
+            _ = await fixture.sync.awaitResubmissionCheckForTesting()
+            await fixture.sync.stopAndWait()
+            XCTAssertEqual(fixture.reads.withLock { $0 }, 0, operation)
+            XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, operation)
+        }
+    }
+
+    func testLegacyRetryInheritsSelectedManualEndpointTimeout() async throws {
+        let fixture = try makeFixture(validationDelay: 80_000_000)
+        let manual = LightWalletEndpoint(address: "manual.example.com", port: 443, secure: true, singleCallTimeoutInMillis: 50)
+        try await fixture.sync.switchTo(endpoint: manual)
+        await retry(fixture)
+        XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, "The selected endpoint budget includes local validation before a legacy send")
+    }
+
     private func heldSwitch(_ fixture: Fixture) async -> Task<Void, Error> {
         let entered = expectation(description: "switch holds lifecycle turn during reopen")
         fixture.engine.reopenGate.close()
@@ -240,20 +320,26 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
     private func makeFixture(
         store: SubmitPlanStoring? = nil,
         sendGate: Gate? = nil,
-        onSend: @escaping @Sendable () -> Void = {}
+        onSend: @escaping @Sendable () -> Void = {},
+        cancellableSend: (@Sendable () -> Void)? = nil,
+        twoCandidates: Bool = false,
+        validationDelay: UInt64 = 0
     ) throws -> Fixture {
         let sends = OSAllocatedUnfairLock(initialState: [String]())
         let reads = OSAllocatedUnfairLock(initialState: 0)
         let backend = ZcashRustBackendWeldingMock()
         backend.listAccountsReturnValue = []
         backend.migrationBlockRateSamplesWindowReturnValue = []
-        backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
+        backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in
+            if validationDelay > 0 { try await Task.sleep(nanoseconds: validationDelay) }
+            return nil
+        }
         let candidate = CreatedTransactionTests.makeTransaction(raw: Data([5, 0, 0, 128, 1]), rawID: txId)
         let repository = TransactionRepositoryMock()
         repository.closeDBConnectionClosure = {}
         repository.findForResubmissionUpToClosure = { _ in
             reads.withLock { $0 += 1 }
-            return [candidate]
+            return twoCandidates ? [candidate, CreatedTransactionTests.makeTransaction(raw: Data([5, 0, 0, 128, 2]), rawID: Data(repeating: 8, count: 32))] : [candidate]
         }
         repository.findRawIDClosure = { _ in candidate }
         let storeURL = testGeneralStorageDirectory.appendingPathComponent("private-retry.db")
@@ -267,6 +353,13 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
             service.latestBlockHeightModeReturnValue = 100_000
             service.submitSpendTransactionModeClosure = { _, _ in
                 onSend()
+                if let cancellableSend {
+                    try await withTaskCancellationHandler {
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                    } onCancel: {
+                        cancellableSend()
+                    }
+                }
                 await sendGate?.wait()
                 sends.withLock { $0.append(endpoint.host) }
                 return SendResponse()

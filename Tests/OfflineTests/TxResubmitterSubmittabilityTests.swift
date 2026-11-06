@@ -160,11 +160,61 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
         XCTAssertEqual(rustBackend.checkTransactionSubmittableSubmissionServerHeightCallsCount, 0)
     }
 
+    func testCancelledRetryDoesNotReadCandidatesOrStampCadence() async throws {
+        let resubmitter = try makeResubmitter()
+        let gate = Gate()
+        let task = Task {
+            await gate.wait()
+            await resubmitter.checkAndResubmit(latestBlockHeight: 100_000)
+        }
+        task.cancel()
+        gate.open()
+        await task.value
+        XCTAssertEqual(transactionRepository.findForResubmissionUpToCallsCount, 0)
+        XCTAssertEqual(resubmitter.latestResolvedTime, 0)
+    }
+
+    func testCancelledRetryPreservesCadenceAndKnownAcceptance() async throws {
+        let endpoint = LightWalletEndpoint(address: "accepted.example.com", port: 443, secure: true)
+        await submitPlanStore.recordPlan(txId: firstId, endpoints: [endpoint])
+        await submitPlanStore.recordPlan(txId: secondId, endpoints: [endpoint])
+        let entered = expectation(description: "accepted response pending")
+        let gate = Gate()
+        let submitter = AcceptanceSubmitter(entered: entered, gate: gate)
+        let resubmitter = try makeResubmitter(endpointSubmitter: submitter)
+        let task = Task { await resubmitter.checkAndResubmit(latestBlockHeight: 100_000) }
+        await fulfillment(of: [entered], timeout: 3)
+        task.cancel()
+        gate.open()
+        await task.value
+        let first = await submitPlanStore.plan(for: firstId)
+        let second = await submitPlanStore.plan(for: secondId)
+        XCTAssertEqual(first, .ready([endpoint], acceptedBy: "accepted.example.com:443"))
+        XCTAssertEqual(second, .ready([endpoint], acceptedBy: nil))
+        XCTAssertEqual(resubmitter.latestResolvedTime, 0)
+        XCTAssertEqual(submitter.sent.withLock { $0 }, [firstId])
+    }
+
+    private final class AcceptanceSubmitter: EndpointSubmitter {
+        let entered: XCTestExpectation
+        let gate: Gate
+        let sent = OSAllocatedUnfairLock(initialState: [Data]())
+        init(entered: XCTestExpectation, gate: Gate) {
+            self.entered = entered
+            self.gate = gate
+        }
+        func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+            sent.withLock { $0.append(transaction.txId) }
+            entered.fulfill()
+            await gate.wait()
+        }
+    }
+
     // MARK: - Helpers
 
     /// A resubmitter over the two candidates, `firstId` before `secondId`. The encoder is the real single-server sink over the
     /// stubbed service and check. A transaction with a submit plan goes through `GRPCEndpointSubmitter` over the same check.
-    private func makeResubmitter(flags: SDKFlags = SDKFlags(torEnabled: false, exchangeRateEnabled: false)) throws -> TxResubmitter {
+    private func makeResubmitter(flags: SDKFlags = SDKFlags(torEnabled: false, exchangeRateEnabled: false), endpointSubmitter override: EndpointSubmitter? = nil) throws -> TxResubmitter {
         let candidates = [
             CreatedTransactionTests.makeTransaction(raw: firstRaw, rawID: firstId),
             CreatedTransactionTests.makeTransaction(raw: secondRaw, rawID: secondId)
@@ -198,7 +248,7 @@ final class TxResubmitterSubmittabilityTests: ZcashTestCase {
         mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in self.submitPlanStore }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in submissionLifecycleLogger() }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
-            SubmitPlanExecutor(endpointSubmitter: endpointSubmitter, logger: submissionLifecycleLogger())
+            SubmitPlanExecutor(endpointSubmitter: override ?? endpointSubmitter, logger: submissionLifecycleLogger())
         }
 
         let resubmitter = TxResubmitter(container: mockContainer)

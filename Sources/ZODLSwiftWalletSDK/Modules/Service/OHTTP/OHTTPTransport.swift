@@ -81,6 +81,19 @@ actor OHTTPKeyCache {
         }
     }
 
+    /// Bounded submissions own uncached work, so cancellation cannot leave a shared fetch sending.
+    func submissionKey(
+        for cacheKey: String,
+        accept: (OHTTPVerifiedKey) -> Bool,
+        fetch: () async throws -> OHTTPVerifiedKey
+    ) async throws -> OHTTPVerifiedKey {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
+        if let cached = keys[cacheKey], accept(cached) { return cached }
+        let key = try await fetch()
+        keys[cacheKey] = key
+        return key
+    }
+
     private struct KeyFetchFailure: Error {
         let underlying: Error
         let outcome: OHTTPHealthOutcome
@@ -442,6 +455,14 @@ actor OHTTPTransport {
             return key
         }
 
+        if SubmissionBudget.current != nil {
+            return try await keyCache.submissionKey(
+                for: cacheKey,
+                accept: { !forceRefresh && profile.isFresh($0, at: Date()) },
+                fetch: { [self] in try await self.fetchKeyConfig(profile: profile) }
+            )
+        }
+
         // The cached key is used while the profile says it is fresh.
         return try await keyCache.key(
             for: cacheKey,
@@ -708,14 +729,6 @@ actor OHTTPTransport {
         let (data, response) = try await send(request, maxBytes: Self.maxRelayResponseBytes)
         await noteRelayAnswer(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         return (data, response)
-    }
-
-    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
-        var request = request
-        if let budget = OHTTPHealthProbe.budget {
-            request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000
-        }
-        return try await httpSender(request, maxBytes)
     }
 
     /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
@@ -992,5 +1005,18 @@ extension OHTTPTransport {
                 throw error
             }
         }
+    }
+}
+
+private extension OHTTPTransport {
+    func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        var request = request
+        if let budget = SubmissionBudget.current {
+            request.timeoutInterval = min(request.timeoutInterval, Double(try budget.remainingMilliseconds()) / 1000)
+        }
+        if let budget = OHTTPHealthProbe.budget {
+            request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000
+        }
+        return try await httpSender(request, maxBytes)
     }
 }

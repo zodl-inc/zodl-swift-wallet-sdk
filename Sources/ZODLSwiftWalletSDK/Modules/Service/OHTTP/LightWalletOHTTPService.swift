@@ -144,7 +144,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         }
 
         let viaTor = mode == .uniqueTor || circuit != nil
-        if mode == .uniqueTor {
+        if mode == .uniqueTor || SubmissionBudget.current != nil {
             return try await makeClient(host: host, relayURL: relayURL, viaTor: viaTor)
         }
         return try await clients.client(for: circuit) {
@@ -158,7 +158,7 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
         let httpSender: OHTTPTransport.HTTPSender
         let streamSender: OHTTPTransport.StreamSender
         if viaTor {
-            let isolated = OHTTPHealthProbe.budget != nil ? torClient : try await torClient.isolatedClient()
+            let isolated = (OHTTPHealthProbe.budget != nil || SubmissionBudget.current != nil) ? torClient : try await torClient.isolatedClient()
             if let testTorSender {
                 httpSender = testTorSender(isolated)
             } else {
@@ -166,6 +166,13 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
                 // tried again, on a new circuit, only when it failed before any of it was sent.
                 // Rely on the native Tor timeout (the wrapper cannot interrupt a synchronous FFI call).
                 httpSender = { request, maxBytes in
+                    if let budget = SubmissionBudget.current {
+                        return try await isolated.httpRequestSentOnce(
+                            for: request,
+                            maxBytes: maxBytes,
+                            timeoutMilliseconds: budget.remainingMilliseconds()
+                        )
+                    }
                     if let budget = OHTTPHealthProbe.budget {
                         return try await isolated.httpRequestSentOnce(
                             for: request,
@@ -200,7 +207,8 @@ final class LightWalletOHTTPService: LightWalletGRPCServiceOverTor {
             httpSender = { request, maxBytes in
                 let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
                     for: request,
-                    maxBytes: maxBytes
+                    maxBytes: maxBytes,
+                    deadlineSeconds: Double(try SubmissionBudget.current?.remainingMilliseconds() ?? 100_000) / 1000
                 )
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw OHTTPError.transportError("Invalid response type")

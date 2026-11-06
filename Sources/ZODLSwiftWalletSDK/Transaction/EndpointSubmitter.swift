@@ -41,12 +41,15 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
     }
 
     func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
-        try await sdkFlags.routeAdmission.withLease {
-            try await self.submitAdmitted(transaction: transaction, to: endpoint)
+        try await SubmissionBudget.withBudget(milliseconds: endpoint.singleCallTimeoutInMillis) {
+            try await self.sdkFlags.routeAdmission.withLease {
+                try await self.submitAdmitted(transaction: transaction, to: endpoint)
+            }
         }
     }
 
     private func submitAdmitted(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         let health = OHTTPHealthFailureOwner()
         let mode: ServiceMode
         let serviceTorClient: TorClient
@@ -104,6 +107,7 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
                 throw TransactionEncoderError.notSubmittable(refusal)
             }
 
+            _ = try SubmissionBudget.current?.remainingMilliseconds()
             response = try await health.request {
                 try await service.submit(spendTransaction: transaction.raw, mode: mode)
             }
@@ -113,6 +117,12 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
         }
 
         guard response.errorCode >= 0 else {
+            do {
+                _ = try SubmissionBudget.current?.remainingMilliseconds()
+            } catch {
+                await service.closeConnections()
+                throw error
+            }
             let isKnown = await health.withAttempt(health.makeAttempt()) {
                 await service.isTransactionKnownToServer(txId: transaction.txId, mode: mode)
             }

@@ -8,6 +8,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_tor_connect_to_lightwalletd_with_timeout` creates an isolated submission connection using
+  one remaining timeout in milliseconds for connection setup, latest-block reads, submission and
+  transaction lookup. A zero timeout fails without connecting. Free the result with
+  `zcashlc_free_tor_lwd_conn`, which retires its connection work before returning. Existing
+  `zcashlc_tor_connect_to_lightwalletd` callers and streaming calls need no changes.
+
 - `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated configured gateway host
   (`false` mainnet, `true` testnet). Free each result with `zcashlc_string_free`.
 

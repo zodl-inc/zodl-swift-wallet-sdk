@@ -6126,6 +6126,35 @@ pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd(
     unwrap_exc_or_null(res)
 }
 
+/// Creates an isolated submission connection with one remaining monotonic budget in milliseconds.
+/// Setup, latest-block reads, submission and transaction lookup share that deadline. The connection
+/// owns the executor of its writer tasks: freeing it retires those tasks before returning.
+/// Ordinary connections and streaming calls keep their existing timeout behavior.
+///
+/// # Safety
+///
+/// The pointer, string and exclusive-access requirements of
+/// [`zcashlc_tor_connect_to_lightwalletd`] apply. Free the result with
+/// [`zcashlc_free_tor_lwd_conn`]. A zero timeout fails without connecting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    endpoint: *const c_char,
+    timeout_ms: u64,
+) -> *mut tor::LwdConn {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let result = catch_panic(|| {
+        let runtime =
+            unsafe { tor_runtime.as_ref() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+        let endpoint = unsafe { CStr::from_ptr(endpoint).to_str()? }
+            .try_into()
+            .map_err(|error| anyhow!("Invalid lightwalletd endpoint: {error}"))?;
+        let connection = runtime.connect_to_lightwalletd_with_timeout(endpoint, timeout_ms)?;
+        Ok(Box::into_raw(Box::new(connection)))
+    });
+    unwrap_exc_or_null(result)
+}
+
 /// Frees a Tor lightwalletd connection.
 ///
 /// # Safety

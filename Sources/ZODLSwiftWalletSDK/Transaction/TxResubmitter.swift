@@ -41,12 +41,15 @@ final class TxResubmitter {
         // so a retained plan costs nothing meanwhile. Decisions are made per
         // transaction from current repository state, so a transaction created
         // mid-pass can never be wrongly pruned.
+        guard !Task.isCancelled else { return }
         await pruneStalePlans(latestBlockHeight: latestBlockHeight)
+        guard !Task.isCancelled else { return }
 
         // find all candidates for the resubmission
         do {
             logger.info("TxResubmissionAction check started at \(latestBlockHeight) height.")
             let transactions = try await transactionRepository.findForResubmission(upTo: latestBlockHeight)
+            try Task.checkCancellation()
             logger.debug("TxResubmissionAction found \(transactions.count) resubmission candidate(s).")
 
             // no candidates, update the time and continue with the next action
@@ -61,6 +64,7 @@ final class TxResubmitter {
                     // resubmission; per-transaction error handling so one
                     // transaction's dead endpoints can't starve the others
                     for transaction in transactions {
+                        try Task.checkCancellation()
                         do {
                             try await resubmit(transaction: transaction, privateEndpoint: privateEndpoint)
                         } catch {
@@ -70,6 +74,7 @@ final class TxResubmitter {
                         }
                     }
 
+                    try Task.checkCancellation()
                     latestResolvedTime = Date().timeIntervalSince1970
                 }
             }
@@ -91,6 +96,7 @@ private extension TxResubmitter {
     }
 
     func resubmitAdmitted(transaction: ZcashTransaction.Overview, privateEndpoint: LightWalletEndpoint?) async throws {
+        try Task.checkCancellation()
         // Captured before `plan(for:)` itself, not merely before the network round trip: the two
         // are separate awaits into the store's actor, and a `wipe()` can land between them. A
         // token captured only after `plan(for:)` returns could already reflect the post-wipe
@@ -100,6 +106,7 @@ private extension TxResubmitter {
         let lifecycle = await submitPlanStore.currentLifecycle()
         let plan = await submitPlanStore.plan(for: transaction.rawID)
 
+        try Task.checkCancellation()
         switch plan {
         case .awaiting:
             // Created through Broadcaster but never submitted by the app —
@@ -138,7 +145,9 @@ private extension TxResubmitter {
                 try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: [privateEndpoint])
             } else {
                 let encodedTransaction = try transaction.encodedTransaction()
-                try await transactionEncoder.submit(transaction: encodedTransaction)
+                try await SubmissionBudget.withBudget(milliseconds: SubmissionBudget.legacyTimeoutMilliseconds) {
+                    try await self.transactionEncoder.submit(transaction: encodedTransaction)
+                }
             }
         }
     }
@@ -149,6 +158,7 @@ private extension TxResubmitter {
 
         var staleTxIds: [Data] = []
         for txId in plannedTxIds {
+            guard !Task.isCancelled else { return }
             do {
                 let transaction = try await transactionRepository.find(rawID: txId)
                 // Stale only once expired: pruning at "mined" would lose the
@@ -160,6 +170,7 @@ private extension TxResubmitter {
                     staleTxIds.append(txId)
                 }
             } catch ZcashError.transactionRepositoryEntityNotFound {
+                guard !Task.isCancelled else { return }
                 do {
                     guard let created = try await transactionEncoder.createdTransactions(forTxIds: [txId]).first,
                           let expiryHeight = created.expiryHeight,
@@ -191,6 +202,7 @@ private extension TxResubmitter {
             }
         }
 
+        guard !Task.isCancelled else { return }
         if !staleTxIds.isEmpty {
             logger.info("TxResubmissionAction pruning \(staleTxIds.count) stale submit plan(s).")
             await submitPlanStore.deletePlans(txIds: staleTxIds)
