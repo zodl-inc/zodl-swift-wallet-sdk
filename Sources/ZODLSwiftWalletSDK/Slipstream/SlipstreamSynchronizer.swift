@@ -291,10 +291,11 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // (`Constants.thresholdToTrigger`, shared with the old pipeline). The prune runs on every
     // check. This host duplicates neither number.
     //
-    // Every lifecycle admission (start, stop, switch, restart, wipe, prepare's engine step, account
-    // import and delete, rewind, stall recovery and Tor transitions and their retirement) cancels through
-    // the nonisolated owner before queueing. The lifecycle
-    // turn still drains actual retry work before it may publish a new route or remove files.
+    // Every lifecycle request (start, stop, switch, restart, wipe, prepare's engine step, account
+    // import and delete, rewind, stall recovery, Tor retirement) cancels through the nonisolated
+    // owner before it joins the queue. A Tor transition cancels when it is requested; its route
+    // fence makes later passes fail admission quickly. The lifecycle turn still drains actual
+    // retry work before it may publish a new route or remove files.
     // Generation ownership also covers cancellation between task creation and installation.
     // Only the fired task clears its actor handle after its queued work has unwound.
     //
@@ -1175,9 +1176,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// [MOB-1850] Asks for a stall recovery on behalf of the tick that decided one is due.
     ///
-    /// Synchronous and side-effect-free beyond the two flags: it appends the restart to the
-    /// lifecycle queue and returns, so the tick that called it goes on to finish its own work
-    /// rather than performing a teardown inside the poll task the teardown is about to cancel.
+    /// Synchronous. Beyond the two flags it only cancels a background retry pass and appends the
+    /// restart to the lifecycle queue, then returns, so the tick that called it goes on to finish
+    /// its own work rather than performing a teardown inside the poll task the teardown is about
+    /// to cancel.
     ///
     /// The two flags are set HERE, at request time, not when the restart runs:
     ///
@@ -3264,6 +3266,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Owns native-only cleanup independently of the already-completed request observer.
     /// Also used by tests to deliver a delayed retirement through the real lifecycle boundary.
+    ///
+    /// First cancels the background retry pass, then queues the retirement. This may run under
+    /// `TorRouteTransition`'s lock, so retry-path cancellation handlers must never call back into
+    /// the Tor coordinator.
     @discardableResult
     nonisolated func scheduleTorRetirement(_ request: TorTransitionRequest) -> Task<Void, Never> {
         retryCancellation.cancel {
@@ -3282,8 +3288,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         passGeneration += 1
         isRunning = false
         stopPolling()
-        // This stops only the native sync loop. Admitted broadcasts keep their HTTP/runtime
-        // resources and original route; no close, rebind, free, or resubmission cancellation.
+        // This stops only the native sync loop. Broadcasts the app already admitted keep their
+        // HTTP/runtime resources and original route: no close, rebind or free. The background
+        // retry pass was cancelled when `scheduleTorRetirement` queued this turn.
         let report = await engine.stop()
         publishStoppedState()
         if let reason = report.refusalReason {
