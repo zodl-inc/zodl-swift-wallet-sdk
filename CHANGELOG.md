@@ -193,6 +193,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Source-built macOS FFI frameworks use the versioned bundle layout required when embedding
+  in macOS apps. No caller changes are required.
+
 - `SDKSynchronizer` background transaction retries use only the selected Private gateway,
   retaining recorded retry plans for later Public or Manual use. Awaiting transactions and
   unavailable consent records remain unsent. Legacy retries honor the selected endpoint's

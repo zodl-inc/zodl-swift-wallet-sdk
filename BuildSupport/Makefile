@@ -105,6 +105,9 @@ products/%/frameworks/libzcashlc.framework: products/%/universal/libzcashlc.a
 	# Workaround for a bug in the XCode 15.3 build system.
 	# https://github.com/Electric-Coin-Company/zashi-ios/issues/1166
 	cp platform-Info.plist $@/Info.plist
+	if [ "$*" = "macos" ]; then \
+		cd .. && ./Scripts/version-macos-framework.sh "BuildSupport/$@"; \
+	fi
 
 products/macos/universal/libzcashlc.a: $(MACOS_ARCHS)
 	mkdir -p $(@D)

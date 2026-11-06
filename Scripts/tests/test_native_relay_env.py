@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import plistlib
 import re
 from pathlib import Path
 import shutil
@@ -236,6 +237,40 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
             with self.subTest(command=command):
                 (self.root / 'cargo.jsonl').unlink(missing_ok=True)
                 self.run_native(command)
+
+    def test_make_packaging_versions_only_macos_and_preserves_ios(self):
+        self.run_native(['make', 'ffi-all'])
+        xcframework = self.root / 'BuildSupport/products/libzcashlc.xcframework'
+        macos = xcframework / 'macos-arm64_x86_64/libzcashlc.framework'
+        self.assertTrue((macos / 'Versions/A/Resources/Info.plist').is_file())
+        self.assertEqual(os.readlink(macos / 'Versions/Current'), 'A')
+        for name in ('libzcashlc', 'Headers', 'Modules', 'Resources'):
+            self.assertEqual(os.readlink(macos / name), f'Versions/Current/{name}')
+        self.assertFalse((macos / 'Info.plist').exists())
+        metadata = plistlib.loads((macos / 'Resources/Info.plist').read_bytes())
+        self.assertEqual(metadata['CFBundlePackageType'], 'FMWK')
+        self.assertEqual(metadata['CFBundleSupportedPlatforms'], ['MacOSX'])
+        minimum = re.search(r'^MACOSX_DEPLOYMENT_TARGET = (.+)$',
+                            (self.root / 'BuildSupport/Makefile').read_text(), re.MULTILINE).group(1)
+        self.assertEqual(metadata['LSMinimumSystemVersion'], minimum)
+        ios_metadata = (self.root / 'BuildSupport/platform-Info.plist').read_bytes()
+        version = plistlib.loads(ios_metadata)['CFBundleVersion']
+        self.assertEqual(metadata['CFBundleVersion'], version)
+        self.assertEqual(metadata['CFBundleShortVersionString'], version)
+        self.assertEqual((macos / 'libzcashlc').read_text(), 'library')
+        self.assertEqual((macos / 'Headers/zcashlc.h').read_text(), 'header')
+        self.assertEqual((macos / 'Modules/module.modulemap').read_bytes(),
+                         (self.root / 'BuildSupport/module.modulemap').read_bytes())
+        for identifier in ('ios-arm64', 'ios-arm64_x86_64-simulator'):
+            ios = xcframework / identifier / 'libzcashlc.framework'
+            self.assertEqual({path.name for path in ios.iterdir()},
+                             {'libzcashlc', 'Headers', 'Modules', 'Info.plist'})
+            self.assertFalse((ios / 'Versions').exists())
+            self.assertEqual((ios / 'Info.plist').read_bytes(), ios_metadata)
+            self.assertEqual((ios / 'libzcashlc').read_text(), 'library')
+            self.assertEqual((ios / 'Headers/zcashlc.h').read_text(), 'header')
+            self.assertEqual((ios / 'Modules/module.modulemap').read_bytes(),
+                             (self.root / 'BuildSupport/module.modulemap').read_bytes())
 
     def test_missing_configuration_is_rejected_before_cleanup_even_with_recursion_marker(self):
         product = self.root / 'BuildSupport/products/macos/keep'
