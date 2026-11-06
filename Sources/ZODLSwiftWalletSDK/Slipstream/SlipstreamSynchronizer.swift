@@ -308,7 +308,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The in-flight check, if any. Doubles as the "one at a time" guard: a slow submit round
     /// must never be joined by a second concurrent pass over the same transactions.
     private var resubmissionTask: Task<Void, Never>?
-    private nonisolated let retryCancellation = RetryCancellationOwner()
+    private nonisolated let retryCancellation: RetryCancellationOwner
     /// How often the poll loop may run a resubmission check: 60 s (the poll tick is 2 s).
     /// `internal` so tests can reference the constant, like `stallWatchdogThresholdSeconds`.
     static let resubmissionCheckInterval: TimeInterval = 60
@@ -421,6 +421,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         alternateEndpoints: [LightWalletEndpoint],
         engine: any SlipstreamEngineControlling,
         torTransition: TorRouteTransition = TorRouteTransition(),
+        retryCancellation: RetryCancellationOwner = RetryCancellationOwner(),
         makeEndpointService: @escaping (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService = Dependencies.makeLightWalletService,
         torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         restoreAnchor: @escaping SlipstreamAnchorResolver = { isRestore, birthday, fallbackCheckpoint, server, network, torDirPath in
@@ -439,6 +440,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // service is wrapped here as well, and its initializer downloader is rebound to it.
         let endpointService = initializer.lightWalletService as? RebindingLightWalletService
             ?? RebindingLightWalletService(service: initializer.lightWalletService)
+        self.retryCancellation = retryCancellation
         self.endpointService = endpointService
         self.makeEndpointService = makeEndpointService
         initializer.lightWalletService = endpointService
@@ -623,13 +625,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The account is already imported in `data.db` from `prepare`, so UFVK is passed as `nil`
     /// (keyless update — engine calls `ensure_account` only when `ufvk=Some`).
     public nonisolated func start(retry: Bool = false) async throws {
-        retryCancellation.cancel()
         // [MOB-1850] On the lifecycle queue, like every other pass-owning operation. A start that
         // follows a stop therefore runs after that stop's teardown has finished — the stop-before-start
         // ordering contract `pendingStop` used to hold up by hand — and, more importantly, a start
         // cannot land in the middle of a switch, a wipe or an account mutation's stopped interval.
-        try await lifecycle.enqueueThrowing {
-            try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+            }
         }.value
     }
 
@@ -762,9 +765,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Waits for earlier lifecycle operations and this stop's teardown to finish.
     /// A returned engine stop may still report non-quiescence, as for `stop()`.
     public nonisolated func stopAndWait() async {
-        retryCancellation.cancel()
-        torTransition.invalidate()
-        await lifecycle.enqueue { await self.stopImpl() }.value
+        await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueue { await self.stopImpl() }
+        }.value
     }
 
     /// Stops the in-flight sync.
@@ -781,9 +785,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// competing one. This also keeps `stopRequestGeneration`'s bump where the stop actually
     /// happens, so a recovery still in the queue behind it sees the request and abandons instead.
     public nonisolated func stop() {
-        retryCancellation.cancel()
-        torTransition.invalidate()
-        lifecycle.enqueue { await self.stopImpl() }
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            lifecycle.enqueue { await self.stopImpl() }
+        }
     }
 
     /// The queued body of `stop()`.
@@ -2411,35 +2416,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///    the next `prepare` opens it: a `switchTo(endpoint:)` before that only records the server.
     /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
-    /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
-    /// mirroring the `SDKSynchronizer.wipe()` idiom.
+    /// The publisher uses a `PassthroughSubject` driven by the lifecycle queue task.
     public nonisolated func wipe() -> AnyPublisher<Void, Error> {
-        retryCancellation.cancel()
-        torTransition.invalidate()
-        let subject = PassthroughSubject<Void, Error>()
-        Task(priority: .high) { [weak self] in
-            guard let self else {
-                subject.send(completion: .finished)
-                return
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            let subject = PassthroughSubject<Void, Error>()
+            lifecycle.enqueue { [weak self] in
+                guard let self else {
+                    subject.send(completion: .finished)
+                    return
+                }
+                await self.wipeOnLifecycleQueue(subject)
             }
-            await self.wipeImpl(subject)
+            return subject.eraseToAnyPublisher()
         }
-        return subject.eraseToAnyPublisher()
-    }
-
-    /// The actor-isolated body of `wipe()`.
-    ///
-    /// [MOB-1850] The whole of it is one lifecycle operation. A wipe deletes the files every other
-    /// operation reads and writes, so it is the one that most needs the queue: a recovery restart
-    /// reopening a handle onto a database this method has just removed would recreate it (SQLite
-    /// recreates a file on connect) and leave the wallet half-wiped.
-    private func wipeImpl(_ subject: PassthroughSubject<Void, Error>) async {
-        // An earlier retry can be waiting for cancellation while it owns the lifecycle turn.
-        // Cancel before queueing, then let that turn drain before closing or deleting its wallet.
-        resubmissionTask?.cancel()
-        await lifecycle.enqueue {
-            await self.wipeOnLifecycleQueue(subject)
-        }.value
     }
 
     /// The queued body of `wipe()`.
@@ -2808,13 +2798,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// 7. Store `endpoint` in `currentEndpoint`.
     /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
     public nonisolated func switchTo(endpoint: LightWalletEndpoint) async throws {
-        retryCancellation.cancel()
-        torTransition.invalidate()
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
         // comparison belongs in this operation's own turn rather than before it.
-        try await lifecycle.enqueueThrowing {
-            try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+        try await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueueThrowing {
+                try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+            }
         }.value
     }
 
@@ -2953,9 +2944,6 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
     public nonisolated func restartSync(at endpoint: LightWalletEndpoint) async throws {
-        retryCancellation.cancel()
-        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
-        torTransition.invalidate()
         // A caller cancelled while this restart is still queued — the app backgrounding while a
         // terminal rebuild waits its turn — must not have the restart run behind the stop that
         // background enqueued: the queued task is unstructured and inherits no cancellation, so the
@@ -2963,11 +2951,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // begun executing it completes; a stop queued behind it then has the final word.
         let callerCancelled = CancellationFlag()
         try await withTaskCancellationHandler {
-            try await lifecycle.enqueueThrowing {
-                if callerCancelled.isCancelled {
-                    throw CancellationError()
+            try await retryCancellation.cancel {
+                try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+                torTransition.invalidate()
+                return lifecycle.enqueueThrowing {
+                    if callerCancelled.isCancelled {
+                        throw CancellationError()
+                    }
+                    try await self.restartSyncImpl(at: endpoint)
                 }
-                try await self.restartSyncImpl(at: endpoint)
             }.value
         } onCancel: {
             callerCancelled.markCancelled()
@@ -3222,32 +3214,33 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         startsSync: Bool = false,
         resetRecoveryBudget: Bool = true
     ) -> TorTransitionRequest {
-        retryCancellation.cancel()
-        return torTransition.begin(
-            enabled: enabled,
-            health: healthOwner,
-            startsSync: startsSync,
-            resetRecoveryBudget: resetRecoveryBudget
-        ) { request in
-            self.routeAdmission.require(enabled)
-            request.configure(
-                activate: { [weak self, weak request] in
-                    guard let self, let request else { return Task { throw CancellationError() } }
-                    if startsSync {
-                        return Task { try await self.applyTorMode(request) }
+        return retryCancellation.cancel {
+            torTransition.begin(
+                enabled: enabled,
+                health: healthOwner,
+                startsSync: startsSync,
+                resetRecoveryBudget: resetRecoveryBudget
+            ) { request in
+                self.routeAdmission.require(enabled)
+                request.configure(
+                    activate: { [weak self, weak request] in
+                        guard let self, let request else { return Task { throw CancellationError() } }
+                        if startsSync {
+                            return Task { try await self.applyTorMode(request) }
+                        }
+                        return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
+                    },
+                    cancellation: { [weak self, weak request] in
+                        guard let self, let request, !request.hasAcquired else { return }
+                        self.scheduleTorRetirement(request)
+                    },
+                    dormantCancelled: { [weak self, weak request] in
+                        guard let self, let request else { return }
+                        self.torTransition.publish(request, phase: .cancelled)
+                        self.scheduleTorRetirement(request)
                     }
-                    return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
-                },
-                cancellation: { [weak self, weak request] in
-                    guard let self, let request, !request.hasAcquired else { return }
-                    self.scheduleTorRetirement(request)
-                },
-                dormantCancelled: { [weak self, weak request] in
-                    guard let self, let request else { return }
-                    self.torTransition.publish(request, phase: .cancelled)
-                    self.scheduleTorRetirement(request)
-                }
-            )
+                )
+            }
         }
     }
 

@@ -283,6 +283,50 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, "The selected endpoint budget includes local validation before a legacy send")
     }
 
+    func testLifecycleCancellationBeforeRetryRegistrationCannotBeErased() async throws {
+        for operation in ["start", "stop", "stopAndWait", "switch", "restart", "tor", "wipe"] {
+            let cancelled = expectation(description: "\(operation) cancelled before queue admission")
+            let resume = DispatchSemaphore(value: 0)
+            defer { resume.signal() }
+            let first = OSAllocatedUnfairLock(initialState: true)
+            let owner = RetryCancellationOwner(onCancellation: {
+                guard first.withLock({ value in
+                    let result = value
+                    value = false
+                    return result
+                }) else { return }
+                cancelled.fulfill()
+                XCTAssertEqual(resume.wait(timeout: .now() + 5), .success)
+            })
+            let fixture = try makeFixture(twoCandidates: true, retryCancellation: owner)
+            let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
+            for id in [txId, Data(repeating: 8, count: 32)] {
+                await fixture.store.recordPlan(txId: id, endpoints: [publicEndpoint, other])
+            }
+            let request = Task {
+                switch operation {
+                case "start": try? await fixture.sync.start()
+                case "stop": fixture.sync.stop()
+                case "stopAndWait": await fixture.sync.stopAndWait()
+                case "switch": try? await fixture.sync.switchTo(endpoint: gateway)
+                case "restart": try? await fixture.sync.restartSync(at: gateway)
+                case "tor": try? await fixture.sync.requestTorTransition(enabled: false).apply()
+                default:
+                    fixture.sync.wipe().sink(receiveCompletion: { _ in }, receiveValue: { _ in })
+                        .store(in: &cancellables)
+                }
+            }
+            await fulfillment(of: [cancelled], timeout: 3)
+            await fireRetry(fixture)
+            _ = await fixture.sync.awaitResubmissionCheckForTesting()
+            XCTAssertEqual(fixture.reads.withLock { $0 }, 0, operation)
+            XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, operation)
+            resume.signal()
+            await request.value
+            await fixture.sync.stopAndWait()
+        }
+    }
+
     private func heldSwitch(_ fixture: Fixture) async -> Task<Void, Error> {
         let entered = expectation(description: "switch holds lifecycle turn during reopen")
         fixture.engine.reopenGate.close()
@@ -323,7 +367,8 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         onSend: @escaping @Sendable () -> Void = {},
         cancellableSend: (@Sendable () -> Void)? = nil,
         twoCandidates: Bool = false,
-        validationDelay: UInt64 = 0
+        validationDelay: UInt64 = 0,
+        retryCancellation: RetryCancellationOwner = RetryCancellationOwner()
     ) throws -> Fixture {
         let sends = OSAllocatedUnfairLock(initialState: [String]())
         let reads = OSAllocatedUnfairLock(initialState: 0)
@@ -402,6 +447,7 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
             initializer: initializer,
             alternateEndpoints: [],
             engine: engine,
+            retryCancellation: retryCancellation,
             makeEndpointService: { endpoint, _, _, _ in service(endpoint) }
         )
         return Fixture(sync: sync, engine: engine, store: store, storeURL: storeURL, sends: sends, reads: reads)

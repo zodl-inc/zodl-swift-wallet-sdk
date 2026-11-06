@@ -195,6 +195,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `SlipstreamSynchronizer.start`, `stop`, `stopAndWait`, `switchTo`, `restartSync`, Tor transitions
   and `wipe` now cancel pending background transaction retries before waiting for lifecycle work.
+  Retries registering while a lifecycle request is still joining the queue remain cancelled.
   A route switch or completed stop still waits for an active sender to finish. Cancellation retains
   already-known acceptance and submission consent, stops later transactions/endpoints and does not
   advance the completed retry cadence. No call-site changes are needed.
