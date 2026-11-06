@@ -1737,6 +1737,102 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
     }
 
+    /// A transaction recorded as rejected is never sent again, through the new server or otherwise, and its plan
+    /// does not change.
+    func testResubmitUnacceptedNeverResendsARejectedTransaction() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let rejected = makeTransaction(raw: Data([0x06]), rawID: Data(repeating: 0x51, count: 32))
+        try reportPending([rejected])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let lifecycle = await store.recordPlan(txId: rejected.rawID, endpoints: [gateway])
+        await store.markRejected(txId: rejected.rawID, code: -26, reason: "bad-txns-vout-negative", lifecycle: lifecycle)
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [])
+        XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
+        let plan = await store.plan(for: rejected.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    /// The new server's refusal for good is recorded like a submission's: when it is the plan's only endpoint, its
+    /// answer completes the verdict and the transaction is rejected, as reported.
+    func testResubmitUnacceptedRecordsATerminalRefusalAsTheRejectionVerdict() async throws {
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x07]), rawID: Data(repeating: 0x52, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [publicServer])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(
+            reports,
+            [TransactionSubmissionReport(txId: stuck.rawID, outcome: .rejected(code: -26, message: "bad-txns-vout-negative"))]
+        )
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    /// The verdict needs every planned endpoint's answer: a refusal for good from the new server alone, while a
+    /// recorded server (such as an unreachable Private endpoint) has not answered, leaves the transaction pending.
+    func testResubmitUnacceptedTerminalRefusalWithAnUnansweredPlannedEndpointStaysPending() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x08]), rawID: Data(repeating: 0x53, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        // Pending, as a submission whose refusal for good the store did not record is reported.
+        XCTAssertEqual(reports, [TransactionSubmissionReport(txId: stuck.rawID, outcome: .timedOut)])
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: nil))
+    }
+
+    /// A new server that already holds the transaction has accepted it: recorded as an acceptance.
+    func testResubmitUnacceptedCountsAlreadyInMempoolAsAcceptance() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "18: txn-already-in-mempool"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x09]), rawID: Data(repeating: 0x54, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [TransactionSubmissionReport(txId: stuck.rawID, outcome: .accepted(by: publicServer))])
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: "public.example.com:443"))
+    }
+
     // MARK: - Helpers
 
     /// What the repository reports as neither mined nor expired. Call it after `makeSynchronizer`, which

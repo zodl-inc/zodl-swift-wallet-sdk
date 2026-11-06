@@ -140,8 +140,12 @@ public protocol Broadcaster: AnyObject {
     /// Only transactions that are neither mined nor expired, as of the last chain tip the SDK
     /// knows, are considered. Transactions a server has already accepted, transactions created
     /// through this broadcaster that the host has not submitted or released yet, and transactions
-    /// without a recorded plan are left alone. A transaction `endpoint` does not accept stays
-    /// with background resubmission like any other.
+    /// without a recorded plan are left alone, and so are transactions recorded as rejected: a
+    /// node refused them for good. What `endpoint` answers is recorded as a submission's answers
+    /// are: an acceptance (including "already in its mempool") marks the transaction accepted, and
+    /// a refusal for good counts toward the rejection verdict, which needs an explicit answer from
+    /// every endpoint in the transaction's plan. A transaction `endpoint` does not accept, and
+    /// that is not thereby rejected, stays with background resubmission like any other.
     ///
     /// Privacy: `endpoint` receives each of these transactions together with the network address
     /// they come from, unless the route hides it (Tor), as it would for any submission to it.

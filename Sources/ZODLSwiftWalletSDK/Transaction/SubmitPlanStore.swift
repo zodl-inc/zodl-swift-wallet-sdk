@@ -78,8 +78,8 @@ protocol SubmitPlanStoring {
     /// Touches no other plan and never creates a row or the database file.
     ///
     /// - Returns: The lifecycle token for a later `markAccepted(txId:host:lifecycle:)` when the
-    ///   transaction has such a plan; `nil` when it is awaiting submission, accepted, unknown, or
-    ///   the store cannot be read.
+    ///   transaction has such a plan; `nil` when it is awaiting submission, accepted, recorded as
+    ///   rejected, unknown, or the store cannot be read.
     @discardableResult
     func addEndpointToUnacceptedPlan(txId: Data, endpoint: LightWalletEndpoint) async -> SubmitPlanLifecycle?
     /// Records that `host` (`host:port`) took the transaction into its mempool, clearing any
@@ -257,10 +257,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
         do {
             let row = table.filter(txIdColumn == Blob(bytes: txId.bytes))
             // An accepted transaction is in a mempool already, and one with no servers is still awaiting the
-            // host's submission: neither is stuck, so neither changes.
+            // host's submission: neither is stuck, so neither changes. Nor does one recorded as rejected (as
+            // `plan(for:)` reads it: never a migration transaction): a node refused it for good, and sending it
+            // again could only repeat that refusal.
             guard
                 let stored = try connection.pluck(row),
                 stored[acceptedHostColumn] == nil,
+                stored[rejectedCodeColumn] == nil || stored[migrationPreparationColumn] == true,
                 let data = stored[endpointsColumn].data(using: .utf8),
                 let storedEndpoints = try? JSONDecoder().decode([StoredEndpoint].self, from: data),
                 !storedEndpoints.isEmpty

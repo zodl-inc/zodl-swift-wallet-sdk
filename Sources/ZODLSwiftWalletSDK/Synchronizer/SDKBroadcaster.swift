@@ -510,24 +510,60 @@ extension SDKBroadcaster {
             }
             // Each transaction on its own: one that the server does not take must not keep the next one waiting,
             // unlike a batch, whose later transactions may depend on the earlier ones.
-            let outcome: TransactionSubmissionOutcome
+            let result: MultiEndpointSubmitter.RaceResult
             do {
-                outcome = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
-                    await self.multiEndpointSubmitter.submit(transaction: transaction, to: [endpoint], timing: timing)
+                result = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                    await self.multiEndpointSubmitter.submitClassifyingRejection(transaction: transaction, to: [endpoint], timing: timing)
                 }
             } catch {
-                outcome = .unreachable
+                result = MultiEndpointSubmitter.RaceResult(outcome: .unreachable, endpointOutcomes: [:], race: nil)
             }
-            if case .accepted(by: let acceptingEndpoint) = outcome {
-                await submitPlanStore.markAccepted(
-                    txId: overview.rawID,
-                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
-                    lifecycle: lifecycle
-                )
-            }
+            let outcome = await recordResubmissionAnswer(
+                result,
+                txId: overview.rawID,
+                endpoint: endpoint,
+                lifecycle: lifecycle
+            )
             logger.debug("Transaction \(txId) resubmission through \(server) \(outcome.logDescription).")
             reports.append(TransactionSubmissionReport(txId: overview.rawID, outcome: outcome))
         }
         return reports
+    }
+
+    /// Records what `endpoint` answered to a resubmission as the foreground `submit` records its
+    /// race: an acceptance (an "already held" refusal included) marks the transaction accepted;
+    /// otherwise the rejection verdict over the plan's endpoints applies, and an endpoint still in
+    /// flight when the caller is released is reconciled once it settles.
+    ///
+    /// The verdict needs an explicit answer from every endpoint in the transaction's plan, which
+    /// now ends with `endpoint`. An answer from `endpoint` alone therefore completes a rejection
+    /// only when it is the plan's sole endpoint; otherwise the transaction stays pending. The same
+    /// holds for background resubmission through a selected Private endpoint, which contacts that
+    /// endpoint only: such a retry cannot complete a rejection on its own (a follow-up for the
+    /// OHTTP route owners).
+    ///
+    /// - Returns: The outcome to report, consistent with what the store recorded.
+    private func recordResubmissionAnswer(
+        _ result: MultiEndpointSubmitter.RaceResult,
+        txId: Data,
+        endpoint: LightWalletEndpoint,
+        lifecycle: SubmitPlanLifecycle
+    ) async -> TransactionSubmissionOutcome {
+        switch result.outcome {
+        case .accepted(by: let acceptingEndpoint):
+            await submitPlanStore.markAccepted(txId: txId, host: endpointKey(acceptingEndpoint), lifecycle: lifecycle)
+            return result.outcome
+        case .rejected, .unreachable:
+            await recordRejectionVerdict(txId: txId, endpoints: [endpoint], outcomes: result.endpointOutcomes, lifecycle: lifecycle)
+            if case .rejected = result.outcome {
+                return await outcomeMatchingStoredPlan(result.outcome, txId: txId, endpoints: [endpoint])
+            }
+            return result.outcome
+        case .timedOut, .cancelled:
+            await reconcileWhenSettled(txId: txId, endpoints: [endpoint], result: result, lifecycle: lifecycle)
+            return result.outcome
+        case .notAttempted:
+            return result.outcome
+        }
     }
 }
