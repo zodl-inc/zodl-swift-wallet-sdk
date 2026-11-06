@@ -193,8 +193,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
-- Source-built macOS FFI frameworks use the versioned bundle layout required when embedding
-  in macOS apps. No caller changes are required.
+- `make configure-local-ffi` gives the local FFI's macOS framework the versioned bundle layout
+  required when embedding in macOS apps, as `Scripts/init-local-ffi.sh` already did. The release
+  XCFramework keeps its existing layout. No caller changes are required.
 
 - `SDKSynchronizer` background transaction retries use only the selected Private gateway,
   retaining recorded retry plans for later Public or Manual use. Awaiting transactions and
