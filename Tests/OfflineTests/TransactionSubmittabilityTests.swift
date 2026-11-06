@@ -411,7 +411,7 @@ final class TransactionSubmittabilityTests: ZcashTestCase {
             defer { session.close() }
             let sdk = try makeSDKSynchronizer()
             let other = try makeSlipstreamSynchronizer(creating: [makeCreatedTransaction(seed: 1)])
-            backend.createProposedTransactionsProposalUskOvkPolicyThrowableError = ZcashError.rustCheckTransactionSubmittable("local proof")
+            backend.createProposedTransactionsProposalUskOvkPolicySizeBoundThrowableError = ZcashError.rustCheckTransactionSubmittable("local proof")
             let operation = OHTTPHealthOperation()
             let attempt = OHTTPHealthAttempt(operation: operation)
             await OHTTPHealthContext.withOperation(operation) {
