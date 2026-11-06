@@ -289,6 +289,9 @@ print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
         self.assertEqual(metadata['LSMinimumSystemVersion'], minimum)
         version = plistlib.loads((self.root / 'BuildSupport/platform-Info.plist').read_bytes())['CFBundleVersion']
         self.assertEqual(metadata['CFBundleVersion'], version)
+        self.assertEqual(metadata['CFBundleShortVersionString'], version)
+        for relative in ('libzcashlc', 'Headers/zcashlc.h', 'Modules/module.modulemap'):
+            self.assertEqual((macos / relative).read_bytes(), (shallow / relative).read_bytes())
         for identifier in ('ios-arm64', 'ios-arm64_x86_64-simulator'):
             ios = local / identifier / 'libzcashlc.framework'
             original = product / identifier / 'libzcashlc.framework'

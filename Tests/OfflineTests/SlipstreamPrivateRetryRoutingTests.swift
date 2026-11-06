@@ -283,8 +283,11 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         _ = try await importing.value
         _ = await fixture.sync.awaitResubmissionCheckForTesting()
         XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, "The cancelled pass must not have broadcast")
+        // Elapse only the driver's 60 s cadence. Deliberately NOT `retry(_:)`: its `fireRetry` resets
+        // the 300 s retry throttle, which would hide a cancelled pass that advanced it.
         await fixture.sync.elapseResubmissionCadenceForTesting()
-        await retry(fixture)
+        await fixture.sync.maybeRunTxResubmission(state: 3, chainTip: 100_000, isCancelled: false)
+        _ = await fixture.sync.awaitResubmissionCheckForTesting()
         XCTAssertEqual(fixture.sends.withLock { $0 }, [publicEndpoint.host], "The same pending transaction is re-broadcast exactly once")
         await fixture.sync.stopAndWait()
     }
