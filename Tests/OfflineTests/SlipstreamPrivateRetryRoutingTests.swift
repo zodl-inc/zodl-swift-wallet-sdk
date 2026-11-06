@@ -204,7 +204,11 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
     }
 
     func testLifecycleRequestCancelsRetryBeforeQueueAdmission() async throws {
-        for operation in ["start", "stop", "stopAndWait", "switch", "restart", "tor", "wipe"] {
+        let operations = [
+            "start", "stop", "stopAndWait", "switch", "restart", "tor", "wipe",
+            "prepare", "importAccount", "deleteAccount", "rewind", "stallRecovery", "torRetirement"
+        ]
+        for operation in operations {
             let entered = expectation(description: "retry entered before \(operation)")
             let cancelled = expectation(description: "retry cancelled before \(operation) queue admission")
             entered.assertForOverFulfill = false
@@ -228,6 +232,30 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
                 case "switch": try? await fixture.sync.switchTo(endpoint: gateway)
                 case "restart": try? await fixture.sync.restartSync(at: gateway)
                 case "tor": try? await fixture.sync.requestTorTransition(enabled: false).apply()
+                case "prepare":
+                    _ = try? await fixture.sync.prepare(with: nil, walletBirthday: nil, name: "", keySource: nil)
+                case "importAccount": _ = try? await importAccount(fixture)
+                case "deleteAccount": try? await fixture.sync.deleteAccount(TestsData.mockedAccountUUID)
+                case "rewind":
+                    fixture.sync.rewind(.quick).sink(receiveCompletion: { _ in }, receiveValue: { _ in })
+                        .store(in: &cancellables)
+                case "stallRecovery":
+                    await fixture.sync.requestStallRecovery(
+                        observedPassGeneration: 0,
+                        observedStopRequestGeneration: 0,
+                        attempt: 1
+                    )
+                case "torRetirement":
+                    await fixture.sync.scheduleTorRetirement(
+                        TorTransitionRequest(
+                            generation: 1,
+                            retiringRouteGeneration: 0,
+                            enabled: false,
+                            acquisitionDeadline: 0,
+                            startsSync: false,
+                            resetRecoveryBudget: false
+                        )
+                    ).value
                 default:
                     fixture.sync.wipe().sink(receiveCompletion: { _ in }, receiveValue: { _ in })
                         .store(in: &cancellables)
@@ -239,6 +267,26 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
             await fixture.sync.stopAndWait()
             XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, operation)
         }
+    }
+
+    func testCancelledPassKeepsTransactionEligibleForNextPass() async throws {
+        let entered = expectation(description: "first pass entered the send")
+        let cancelled = expectation(description: "first pass cancelled by the import")
+        entered.assertForOverFulfill = false
+        cancelled.assertForOverFulfill = false
+        let fixture = try makeFixture(onSend: { entered.fulfill() }, cancellableSend: { cancelled.fulfill() })
+        await fixture.store.recordPlan(txId: txId, endpoints: [publicEndpoint])
+        await fireRetry(fixture)
+        await fulfillment(of: [entered], timeout: 3)
+        let importing = Task { try await importAccount(fixture) }
+        await fulfillment(of: [cancelled], timeout: 0.5)
+        _ = try await importing.value
+        _ = await fixture.sync.awaitResubmissionCheckForTesting()
+        XCTAssertTrue(fixture.sends.withLock { $0.isEmpty }, "The cancelled pass must not have broadcast")
+        await fixture.sync.elapseResubmissionCadenceForTesting()
+        await retry(fixture)
+        XCTAssertEqual(fixture.sends.withLock { $0 }, [publicEndpoint.host], "The same pending transaction is re-broadcast exactly once")
+        await fixture.sync.stopAndWait()
     }
 
     func testLifecycleRequestCancelsQueuedRetryBeforeCandidateRead() async throws {
@@ -327,6 +375,18 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         }
     }
 
+    private func importAccount(_ fixture: Fixture) async throws -> AccountUUID {
+        try await fixture.sync.importAccount(
+            ufvk: "not-a-viewing-key",
+            seedFingerprint: nil,
+            zip32AccountIndex: nil,
+            purpose: .viewOnly,
+            name: "Imported",
+            keySource: nil,
+            birthday: 1_000_000
+        )
+    }
+
     private func heldSwitch(_ fixture: Fixture) async -> Task<Void, Error> {
         let entered = expectation(description: "switch holds lifecycle turn during reopen")
         fixture.engine.reopenGate.close()
@@ -375,6 +435,13 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
         let backend = ZcashRustBackendWeldingMock()
         backend.listAccountsReturnValue = []
         backend.migrationBlockRateSamplesWindowReturnValue = []
+        backend.initBlockMetadataDbClosure = {}
+        backend.deleteAccountClosure = { _ in }
+        backend.truncateToChainStateChainStateClosure = { _ in }
+        backend.initDataDbSeedReturnValue = DbInitResult.success
+        backend.importAccountUfvkSeedFingerprintZip32AccountIndexTreeStateRecoverUntilPurposeNameKeySourceClosure = { _, _, _, _, _, _, _, _ in
+            TestsData.mockedAccountUUID
+        }
         backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in
             if validationDelay > 0 { try await Task.sleep(nanoseconds: validationDelay) }
             return nil
@@ -448,7 +515,8 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
             alternateEndpoints: [],
             engine: engine,
             retryCancellation: retryCancellation,
-            makeEndpointService: { endpoint, _, _, _ in service(endpoint) }
+            makeEndpointService: { endpoint, _, _, _ in service(endpoint) },
+            restoreAnchor: { _, _, _, _, _, _ in nil }
         )
         return Fixture(sync: sync, engine: engine, store: store, storeURL: storeURL, sends: sends, reads: reads)
     }

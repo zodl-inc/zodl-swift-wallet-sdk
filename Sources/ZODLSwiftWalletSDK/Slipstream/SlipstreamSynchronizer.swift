@@ -291,7 +291,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // (`Constants.thresholdToTrigger`, shared with the old pipeline). The prune runs on every
     // check. This host duplicates neither number.
     //
-    // Lifecycle requests cancel through the nonisolated owner before queueing. The lifecycle
+    // Every lifecycle admission (start, stop, switch, restart, wipe, prepare's engine step, account
+    // import and delete, rewind, stall recovery and Tor transitions and their retirement) cancels through
+    // the nonisolated owner before queueing. The lifecycle
     // turn still drains actual retry work before it may publish a new route or remove files.
     // Generation ownership also covers cancellation between task creation and installation.
     // Only the fired task clears its actor handle after its queued work has unwound.
@@ -572,7 +574,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // switch overlapping its reopen would only record its server, because the engine counts as
         // closed until the reopen returns, and `prepare` would end with the engine on a server other
         // than the recorded one.
-        try await lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }.value
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }
+        }.value
         // [v2.1 E-3] The snapshot is truthful FROM OPEN: the engine seeds `isRecovering`,
         // the permille floor, the persisted chain tip and spendability from the wallet DB
         // (the same inputs the first suggest round would use), so the cold-launch emission
@@ -1190,12 +1194,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     func requestStallRecovery(observedPassGeneration: Int, observedStopRequestGeneration: Int, attempt: Int) {
         stallRecoveryInFlight = true
         stallRecoveryStopRequestGeneration = observedStopRequestGeneration
-        lifecycle.enqueue {
-            await self.runStallRecovery(
-                expectedPassGeneration: observedPassGeneration,
-                expectedStopRequestGeneration: observedStopRequestGeneration,
-                attempt: attempt
-            )
+        retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.runStallRecovery(
+                    expectedPassGeneration: observedPassGeneration,
+                    expectedStopRequestGeneration: observedStopRequestGeneration,
+                    attempt: attempt
+                )
+            }
         }
     }
 
@@ -1542,6 +1548,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         txResubmitter.latestResolvedTime = time
     }
 
+    /// Test-only seam: lets the driver fire again at once, as it would once its 60 s cadence has
+    /// elapsed after a pass a lifecycle request cancelled. `internal`, never called by production.
+    func elapseResubmissionCadenceForTesting() {
+        lastResubmissionCheckTime = 0
+    }
+
     /// Pure gate for the background-resubmission driver. Static + pure so the truth table is
     /// unit-testable without an engine, mirroring `isSyncStalled`.
     ///
@@ -1689,19 +1701,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // stays OUTSIDE it deliberately: it is a network round trip with the engine still live and
         // no wallet write of its own, and holding the queue across it would make an unrelated
         // `stop()` wait on a server.
-        return try await lifecycle.enqueueThrowing {
-            try await self.importAccountOnLifecycleQueue(
-                request: AccountImportRequest(
-                    ufvk: ufvk,
-                    seedFingerprint: seedFingerprint,
-                    zip32AccountIndex: zip32AccountIndex,
-                    purpose: purpose,
-                    name: name,
-                    keySource: keySource
-                ),
-                effectiveBirthday: effectiveBirthday,
-                recoverUntil: chainTipHeight
-            )
+        return try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.importAccountOnLifecycleQueue(
+                    request: AccountImportRequest(
+                        ufvk: ufvk,
+                        seedFingerprint: seedFingerprint,
+                        zip32AccountIndex: zip32AccountIndex,
+                        purpose: purpose,
+                        name: name,
+                        keySource: keySource
+                    ),
+                    effectiveBirthday: effectiveBirthday,
+                    recoverUntil: chainTipHeight
+                )
+            }
         }.value
     }
 
@@ -1820,8 +1834,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] One lifecycle operation: the stopped interval below exists so that no pass
         // scans across the deletion, and only the queue can make that interval real — a recovery
         // restart used to complete its `engine.start()` inside it.
-        try await lifecycle.enqueueThrowing {
-            try await self.deleteAccountOnLifecycleQueue(accountUUID)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.deleteAccountOnLifecycleQueue(accountUUID)
+            }
         }.value
     }
 
@@ -2329,8 +2345,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         // [MOB-1850] The stop/truncate/restart below is one lifecycle operation. The policy→height
         // resolution above is not: it touches no engine state and can fail the publisher outright.
-        await lifecycle.enqueue {
-            await self.rewindOnLifecycleQueue(to: height, subject)
+        await retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.rewindOnLifecycleQueue(to: height, subject)
+            }
         }.value
     }
 
@@ -3248,7 +3266,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Also used by tests to deliver a delayed retirement through the real lifecycle boundary.
     @discardableResult
     nonisolated func scheduleTorRetirement(_ request: TorTransitionRequest) -> Task<Void, Never> {
-        lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+        retryCancellation.cancel {
+            lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+        }
     }
 
     private func retireNativePassAfterFailedAcquisition(_ request: TorTransitionRequest) async {
