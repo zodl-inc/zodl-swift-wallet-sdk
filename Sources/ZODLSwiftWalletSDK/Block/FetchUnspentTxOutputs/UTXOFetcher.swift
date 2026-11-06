@@ -28,6 +28,7 @@ struct UTXOFetcherImpl {
     let rustBackend: ZcashRustBackendWelding
     let metrics: SDKMetrics
     let logger: Logger
+    let sdkFlags: SDKFlags
 }
 
 extension UTXOFetcherImpl: UTXOFetcher {
@@ -44,11 +45,11 @@ extension UTXOFetcherImpl: UTXOFetcher {
         }
 
         var utxos: [UnspentTransactionOutputEntity] = []
-        // ServiceMode to resolve
+        // Wallet-identifying: its own Tor circuit when Tor is on.
         let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddresses: tAddresses.map { $0.stringEncoded },
             startHeight: BlockHeight(0),
-            mode: .direct
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
 
         do {

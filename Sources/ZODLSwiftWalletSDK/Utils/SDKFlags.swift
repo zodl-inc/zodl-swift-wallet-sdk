@@ -13,7 +13,8 @@ actor SDKFlags {
     /// When disabled, the `ServiceMode.direct` (GRPC) is enforced.
     /// When enabled, all Tor cases in `ServiceMode` are allowed.
     /// Accessible only internally inside the SDK to control the connection
-    var torEnabled: Bool
+    nonisolated let routeAdmission: TorNetworkAdmission
+    var torEnabled: Bool { routeAdmission.selectedTor }
 
     /// `exchangeRateEnabled` controls whether fetch of exnchage rate is enabled or disabled.
     /// When enabled, the `TorClient` is initialized but is not used for lwdService calls.
@@ -33,7 +34,7 @@ actor SDKFlags {
         torEnabled: Bool,
         exchangeRateEnabled: Bool
     ) {
-        self.torEnabled = torEnabled
+        self.routeAdmission = TorNetworkAdmission(enabled: torEnabled)
         self.exchangeRateEnabled = exchangeRateEnabled
     }
 
@@ -45,7 +46,7 @@ actor SDKFlags {
 
     /// Use to update the `torEnabled` flag
     func torFlagUpdate(_ newFlag: Bool) {
-        torEnabled = newFlag
+        routeAdmission.updateEffective(newFlag)
     }
 
     // Use to update the `exchangeRateEnabled` flag

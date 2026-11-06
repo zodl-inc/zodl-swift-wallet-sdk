@@ -6,25 +6,105 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Fixed
-
-- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
-  For custom regtest snapshots at height 11 or later, the registered activation schedule must
-  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
-
-- Refused stale migration submissions now persist recovery state: `zcashlc_migration_advance_step` returns Reevaluate
-  until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
-  or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
-  are unchanged.
-
 ### Added
+
+- `zcashlc_tor_connect_to_lightwalletd_with_timeout` creates an isolated submission connection using
+  one remaining timeout in milliseconds for connection setup, latest-block reads, submission and
+  transaction lookup. A zero timeout fails without connecting. Free the result with
+  `zcashlc_free_tor_lwd_conn`, which retires its connection work before returning. Existing
+  `zcashlc_tor_connect_to_lightwalletd` callers and streaming calls need no changes.
+
+- `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated configured gateway host
+  (`false` mainnet, `true` testnet). Free each result with `zcashlc_string_free`.
+
+- `zcashlc_tor_startup_begin_v1` adds owned Tor runtime creation under a caller-supplied
+  remaining monotonic budget. Use `zcashlc_tor_startup_cancel_v1` to cancel bootstrap,
+  `zcashlc_tor_startup_wait_v1` to await its typed status, `zcashlc_tor_startup_take_v1` to
+  transfer the runtime at most once, and `zcashlc_tor_startup_free_v1` to release the job.
+  Status is independent of thread-local errors. Existing `zcashlc_create_tor_runtime`
+  callers need no changes.
+- `zcashlc_slipstream_start_v2` accepts a one-shot generation/deadline capability from
+  `zcashlc_slipstream_tor_startup_begin_v1`. Use `zcashlc_slipstream_tor_startup_cancel_v1`
+  during startup, `zcashlc_slipstream_tor_startup_snapshot_v1` to read retained typed status,
+  and `zcashlc_slipstream_tor_startup_free_v1` to release caller ownership. Stop/free cancel
+  pending startup. Terminal status, including timeout before native admission, remains retained
+  across cancellation and engine cleanup; legacy start and snapshot layouts remain unchanged.
+
+- `zcashlc_ohttp_last_grpc_status` returns the immediately preceding decode call's authenticated
+  canonical status (0 through 16), or -1 when absent or invalid. Copy it immediately on the same
+  thread alongside `zcashlc_ohttp_last_decode_outcome`, before cleanup or another native call.
+  Zero describes an authenticated status and does not establish complete-body success.
+
+- `zcashlc_tor_http_post_once_with_timeout` and `zcashlc_tor_http_get_classified_with_timeout`
+  provide additive bounded HTTP calls with `FfiTorHttpOutcome` metadata for deadline, transport,
+  configuration, and size failures. The deadline covers sending and response collection; POST
+  retains the existing unsent-only retry rule. Known HTTP rejection and Retry-After metadata survive
+  body failure and deadline expiry. Existing HTTP APIs and their error text remain unchanged.
+- `zcashlc_tor_http_last_outcome` exposes the typed outcome of legacy GET, POST, and streaming
+  operations; `zcashlc_ohttp_last_failure_kind` exposes typed complete/push/finish codec failures.
+  Both getters are thread-local. Read immediately after the corresponding call on that thread,
+  before cleanup or another FFI operation. Unknown kinds must not be treated as relay outages.
+
+- `zcashlc_ohttp_health_api_version` reports additive health ABI version 1.
+  `zcashlc_ohttp_health_subscribe_v1` observes a configured route independently of the wallet engine;
+  its callback borrows at most 126 fixed-layout observations, which callers must copy before returning.
+  `zcashlc_ohttp_health_snapshot_v1` copies retained evidence without partial writes, returning the
+  required count when capacity is insufficient or `SIZE_MAX` for invalid arguments. Preserve historical
+  flags, source versions, original generations and monotonic timestamps when interpreting replay.
+  `zcashlc_ohttp_health_unsubscribe_v1` fences callbacks before releasing the caller-owned context.
+  Existing snapshot layouts and exported signatures are unchanged.
+
+- The Oblivious HTTP (RFC 9458) exchange of the iOS client, on the shared `zodl-ohttp-client` core
+  (`ClientProfile::IOS`, profile `2`). Headers cross as one byte array (for each name and value a 4-byte
+  big-endian length and the bytes), text arguments as bytes, and every failure returns null with the
+  thread's last error set; the message does not quote the request.
+  - `zcashlc_ohttp_verify_key_config(profile, host, host_len, json, json_len, now_secs)` checks a signed
+    key-configuration envelope for a gateway host against the pinned signing key of the host's network and
+    returns the gateway key as an `OhttpKey` (33 public bytes, `not_after`, network), freed with
+    `zcashlc_free_ohttp_key`.
+  - `zcashlc_ohttp_encapsulate(profile, key, method, scheme, authority, path, headers, body)` encodes a
+    request as Binary HTTP and seals it to the key, with a fresh ephemeral key: call it again for every attempt,
+    a retry included. It returns an `OhttpSealed` (the body to post and an opaque `OhttpOpener`), freed with
+    `zcashlc_free_ohttp_sealed`, which also frees an `opener` that is still set. A caller that takes the
+    opener out sets the field to null first.
+  - `zcashlc_ohttp_complete(profile, opener, outer_status, content_type, body, body_len, attempt)` classifies the
+    relay's answer and opens a sealed one. It takes the opener by value and consumes it in every case, errors
+    included. An `OhttpOutcome` says whether the response opened (`kind` 0), the key configuration must be
+    fetched again (1), the request was refused (2, with the outer status and the start of its body in `detail`)
+    or the success status was not labelled `message/ohttp-chunked-res` (3). Free it with `zcashlc_free_ohttp_outcome`.
+  - `zcashlc_ohttp_opener_free` releases an opener whose post failed before `zcashlc_ohttp_complete`.
+  - `zcashlc_ohttp_signed_config_url` derives the signed-configuration URL from the relay URL (free the string
+    with `zcashlc_string_free`); `zcashlc_ohttp_profile_info` returns the profile's request headers and
+    key-cache rules as an `OhttpProfileInfo`, freed with `zcashlc_free_ohttp_profile_info`.
+
+- The wallet half of the transparent-address checks, for a host whose server half rides the OHTTP transport
+  (the Tor gRPC path keeps doing both inside `zcashlc_tor_lwd_conn_*`):
+  - `zcashlc_single_use_taddr_to_check(db_data, db_data_len, network_id, account_uuid_bytes)` returns a
+    `TransparentAddressCheck`: `tag` 0 when no single-use address of the account is due, else the address
+    most overdue and the block range to ask the server for (`due.address`, `due.start_height`,
+    `due.end_height`); null with the last error set on failure. Free it with
+    `zcashlc_free_transparent_address_check`, which also frees the address string.
+  - `zcashlc_schedule_single_use_taddr_check(db_data, db_data_len, network_id, account_uuid_bytes, address)`
+    reschedules the check of a single-use address whose check found nothing, with the same exposure-age
+    back-off (proportional to `log2` of the blocks since exposure) as the Tor path; returns false with the
+    last error set on failure.
+  - `zcashlc_transparent_address_utxo_start_height(db_data, db_data_len, network_id, account_uuid_bytes,
+    address)` returns the height from which the UTXOs of `address` are looked for (its exposure height,
+    else the account's birthday), `-1` when the address is not one of the account's, and a value below
+    `-1` with the last error set on failure.
+
+- `zcashlc_tor_http_post_once_bounded(tor_runtime, url, headers, headers_len, body, body_len,
+  max_bytes)` posts a body that must never be resent (a sealed OHTTP request) with the retry rule of
+  `zcashlc_tor_http_post_stream`: tried again on a new isolated circuit, twice at most, only when
+  opening the Tor stream or the TLS session failed, before any of the request was sent.
 
 - `zcashlc_slipstream_stop_for_wallet_change(handle)`, the stop to call right before changing the
   wallet (adding or removing an account, a rewind, a wipe, or reopening a handle on the same
   wallet). It asks the running session to end its scan at the next block, then stops exactly as
   `zcashlc_slipstream_stop` does and returns the same `FfiSlipstreamStopReport`. Refuse the change
-  unless `settled` and `drained` are both 1. `zcashlc_slipstream_stop` lets a scan call in progress
-  run to the end of its chunk first, which can outlast its ten-second budget.
+  unless `settled` and `drained` are both 1. Both entry points request interruption between blocks;
+  unfinished scan work is retried by the next session. The wallet-change entry point identifies
+  host intent, and a quiescent report is still required before mutation. No caller changes are needed.
 - `zcashlc_check_transaction_submittable(db_data, db_data_len, network_id, tx, tx_len,
   submission_server_height)` reports whether a raw transaction can be valid in the next block, so that nothing is
   submitted that no block can include. The next block is the one after the higher of the wallet's chain tip and
@@ -159,7 +239,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_voting_delete_round`, `zcashlc_voting_retry_blocked_combined_cast` and
     `zcashlc_voting_clear_ballot_intents`.
   - Round sessions. `zcashlc_voting_session_open` takes the handle, the round inputs and binding
-    as JSON, an optional `TorRuntime` and the host's operation epoch, and returns a
+    as JSON, an optional `TorRuntime`, `is_custom_server: bool` and the host's operation epoch, and returns a
     `VotingSessionHandle` freed with `zcashlc_voting_session_free`. It performs no network I/O,
     so a bad round configuration is reported immediately rather than through a timeout. The
     session then drives the round: `zcashlc_voting_session_{plan, set_ballot_intents,
@@ -189,9 +269,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it cannot build a signer from. Nothing rolls that merge back; a caller that wants a later call
     driven against the values the session was opened with names those values on it.
   - The route a session is opened on governs every service it touches for the session's whole
-    life — chain and helper traffic, PIR queries and vote-tree sync: a null `TorRuntime` is the
-    direct HTTP route, and a Tor runtime is used through an isolated client, never falling back
-    to a direct connection when Tor cannot connect. A PIR query hides which rows are fetched, not
+    life — chain and helper traffic, PIR queries and vote-tree sync. With a null `TorRuntime`,
+    `is_custom_server` selects OHTTP for predefined servers or direct HTTP for custom servers.
+    A Tor runtime is used through an isolated client, never falling back to a direct connection
+    when Tor cannot connect. A PIR query hides which rows are fetched, not
     who fetches them, so a Tor session fails closed for all four rather than letting any of them
     show the PIR server or the tree node the device's address.
   - Delegation signing is stated per run. A software wallet passes its seed, which reaches the
@@ -523,6 +604,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The crate builds against the NU7 `librustzcash` releases. Building `libzcashlc` from
+  source requires Rust 1.97 or newer and access to its private dependencies. FFI callers
+  need no changes for these dependency requirements.
+
+- OHTTP FFI updated to use Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08). `zcashlc_ohttp_encapsulate`
+  now uses `encapsulate_chunked_request` internally. `zcashlc_ohttp_complete` decodes responses with
+  `ChunkedResponseDecoder`. Content-Type constants updated to `message/ohttp-chunked-req` and
+  `message/ohttp-chunked-res`. See zodl-inc/ohttp PR #4.
+
+- `zcashlc_tor_connect_to_lightwalletd` refuses a configured OHTTP gateway host with an
+  error: a gateway is reached only through its relay, by the host's OHTTP transport, and is never dialled
+  over Tor. This is the FFI contract from here on; a host that still passes a gateway host gets the error
+  instead of a connection. The Tor-over-OHTTP connector the Rust side used to keep for that case
+  (`SharedOhttpTor`, `connect_ohttp_over_tor`) is gone with it.
+
+- **Breaking: `zcashlc_voting_session_open` gains an `is_custom_server: bool`
+  argument (after `tor`, before `epoch`).** With `tor` non-null the session rides Tor as before.
+  With `tor` null it rides OHTTP through the relay and gateway when `is_custom_server` is false
+  (every chain and PIR endpoint must be one of the gateway's exact hosts, otherwise the open fails
+  with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
+  when it is true. PIR queries share the session's route.
+
 - `libzcashlc` is built for minimum iOS 16 and macOS 14 on every slice (the iOS simulator included);
   its C objects previously claimed the building Xcode SDK's version.
 - `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other
@@ -587,9 +690,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the run completes the remaining dust is now reported where `-1` was returned before, and a
   balance whose canonical split the notes cannot fund now reports the whole spendable balance where
   the call used to fail. It costs one planning pass per remaining run, like the estimate.
-- Coinholder voting hosts the `zcash_voting` 5.x native round driver with the `lrz` (librustzcash)
-  backend, pinned to the published `=5.2.0-rc.2` release. Opening a voting
-  database migrates schema 13 to 24 in place; older cores cannot reopen it.
+- Coinholder voting hosts the `zcash_voting` 5.3.0 native round driver with the `lrz` (librustzcash)
+  backend. Opening a voting database migrates schema 13 to 24 in place; older cores cannot reopen it.
   The step-by-step entry points a host used to drive are gone (see Removed) and the session surface
   that replaces them is new (see Added); what changed for the entry points that survive is:
   - `zcashlc_voting_db_open` takes a network id, fixing the voting network for the lifetime of
@@ -620,18 +722,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `zcashlc_set_custom_network` selects a different consensus branch at the round's snapshot
     height than the base network does. The message names both branches and the height. Note
     selection resolves its note version through the registered activation heights, but delegation
-    derives its branch from the base network alone and refuses any other. Voting runs on NU6.3 on
-    both sides, so where the two differ at least one has not reached NU6.3 at that height, and at
-    least one half refuses the round on its own; the check reports that as one clear refusal at
-    open rather than as an unsupported note version or an unsupported branch id from deeper in.
-    A caller on a standard network id is unaffected: the two schedules are then the same one. On a
-    regtest base they are not — the crate's regtest schedule activates NU6.3 at height 10, so a
-    round whose snapshot height is below 10 is refused unless the registered heights say the same.
+    validates the snapshot branch against the base network's schedule and refuses any other.
+    NU6.3 and NU7 snapshots are supported while TX1 retains its fixed NU6.3 signing profile.
+    A standard network is unaffected because both schedules agree. The voting crate's regtest
+    schedule activates NU6.3 at height 10 and NU7 at height 11; registered custom heights must
+    select the same branch at the round's snapshot height. See `MIGRATING.md`.
   - Every voting service a session touches rides the route the session was opened on: chain and
     helper traffic, PIR queries and vote-tree sync alike. A PIR query hides which rows are
-    fetched, not who fetches them — the PIR server and the tree node see the device's address,
-    the round and one fetch burst per bundle — so a Tor session fails closed for all four rather
-    than letting any of them out some other way. Vote-tree sync is a session call
+    fetched, not who fetches them — on the direct custom-server route, those servers see the
+    device's address, the round and one fetch burst per bundle — so a Tor session fails closed
+    for all four rather than letting any of them out some other way. Vote-tree sync is a session call
     (`zcashlc_voting_session_sync_vote_tree`) rather than a store call, because only a session
     carries a route to take it on.
     The vote-tree client follows the route rather than the round, which costs bandwidth and
@@ -662,8 +762,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     as long as what is dropped stays within 1% of the selected value and 1,000 ZEC. Any number of
     bundles can go that way, so a wallet with a long dust tail loses the whole tail rather than two
     of it. A round that already has a persisted policy keeps it.
-- Migrated to `zcash_protocol 0.10.4`, `zcash_client_backend 0.24.0-rc.7`,
-  `zcash_client_sqlite 0.22.0-rc.7`, `pczt 0.9.2`.
+- Migrated to `zcash_protocol 0.11.0`, `zcash_client_backend 0.25.0`,
+  `zcash_client_sqlite 0.23.0`, `pczt 0.10.0`.
 - The migration engine's wallet adapter is UPSTREAM's (`zcash_pool_migration::wallet::WalletMigration`
   plus `zcash_client_sqlite`'s account-scoped `PoolMigrations` store); the SDK's own fork of it is
   deleted. Three consequences reach behaviour rather than just code:
@@ -789,9 +889,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live run drives at least once per open-lane pass, sync edge, and UI refresh; a read can
   therefore trail a just-mined broadcast by at most one such pass. Reads no longer contend with
   proving.
-- The crate now builds against the NU7 release of the `librustzcash` crates and the `zodl-slipstream`
-  0.4.1 engine. Its `rust-version` is 1.97, up from 1.91: building `libzcashlc` from source needs
-  Rust 1.97 or newer.
 - Every unified address, UFVK and UIVK string a `zcashlc_*` function returns is ZIP 316
   revision 0, with every receiver or item the value carries, as before the NU7 move. Revision 2
   is used only for a value revision 0 cannot represent (one with expiry metadata, a P2SH
@@ -799,14 +896,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `zcashlc_init_data_database` applies one more wallet-database migration. It changes stored data only, not
   the schema, and cannot be reverted. No address that `zcashlc_get_current_address` or
   `zcashlc_get_next_available_address` returns changes, and an older build can still open the database.
-- `zodl-slipstream` is now required as `=0.4.1` from crates.io. No FFI caller change is required.
-  This release includes the NU7 block cadence,
-  the move to the librustzcash release, the engine facades' implementation of
-  `WalletWrite::set_account_name`, and the restore anchor's resolution of a server tip or
-  tree-state height above `i32::MAX` like an unreachable server (see the
-  `zcashlc_slipstream_restore_anchor` entry under Fixed). It also fixes stale graft-buffer rows
-  that could put commitment-tree leaves at the wrong position, or keep a shard out of the tree,
-  after a stopped pass, a reorg or an account import.
 - `zcashlc_slipstream_stop` and `zcashlc_slipstream_start` now call the engine for the bounded
   stop that proves the wallet file quiescent, which zodl-inc/slipstream#28 moved into the engine;
   that change also adds the stop for a wallet change.
@@ -898,6 +987,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     bypasses submission validity; branch, expiry and server-height checks apply on every network.
 
 ### Removed
+
 - The step-by-step coinholder-voting C surface is gone: `zcash_voting` absorbed the
   orchestration this crate used to drive one call at a time, and a host now opens a session and
   lets the round driver run (see Changed). What each group is replaced by:
@@ -998,6 +1088,62 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+
+- `zcashlc_ohttp_health_subscribe_v1` returns null and sets the last error if subscription
+  construction panics, including notification-worker creation failure. Its C signature
+  and successful callback/unsubscribe lifetimes are unchanged; no caller changes are needed.
+
+- `zcashlc_tor_http_post`, `zcashlc_tor_http_post_bounded`,
+  `zcashlc_tor_http_post_once_bounded`, and `zcashlc_tor_http_post_once_with_timeout`
+  keep request bytes valid when sending continues after an early response or timeout.
+  Callers may release their input buffer when the function returns, as documented;
+  signatures and retry policies are unchanged.
+
+- OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one
+  throttled resolver does not prevent another resolver from restoring connectivity.
+
+- `zcashlc_ohttp_encapsulate` lowercases ASCII authority letters before sealing a request,
+  preserving the port, method, scheme, path, query and body. Its signature is unchanged.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
+- OHTTP relay lookup, signed-key verification and DNS helpers recognize configured gateway hosts
+  ignoring ASCII case, and voting uses the configured gateway for its network. Unknown gateway
+  hosts remain errors for key and DNS operations. Existing function signatures are unchanged.
+
+- OHTTP decoding failures preserve authenticated canonical gRPC status from HTTP 200
+  application/grpc heads and trailers, with trailers taking precedence. Metadata is isolated
+  per decoder and thread and resets with each complete/push/finish call. Legacy failure kinds
+  and the 16-byte `FfiOhttpDecodeOutcome` layout are unchanged.
+
+- OHTTP complete/push/finish retain authenticated inner rejection metadata across truncated or rejected
+  later chunks. `zcashlc_ohttp_last_decode_outcome` exposes the kind, HTTP status and absolute
+  CLOCK_MONOTONIC `retry_not_before_ns`; read it immediately on the same thread before cleanup.
+  `FfiTorHttpOutcome` uses the same absolute deadline field, preserving actual
+  Retry-After values through legacy and bounded HTTP body errors. Legacy buffered collection keeps
+  its existing 60-second deadline from parser admission; retry, dispatch and public errors are unchanged.
+
+- `zcashlc_tor_http_get_with_timeout` collects response bodies under the caller's total
+  deadline after returning from the backend parser, so its default 60-second body timer
+  cannot truncate a longer explicit budget. Untimed GET behavior, retry policy, body-size
+  guards, and all exported signatures are unchanged.
+
+- `zcashlc_single_use_taddr_to_check` and `zcashlc_schedule_single_use_taddr_check` follow the network's
+  target-spacing schedule, including custom NU7 activation heights. The OHTTP wallet path retains a
+  24-hour exposure window and uses 25-second blocks for recheck delays after NU7, matching the Tor path.
+  Exported signatures are unchanged.
+
+- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
+  For custom regtest snapshots at height 11 or later, the registered activation schedule must
+  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
+- Refused stale migration submissions now persist recovery state: `zcashlc_migration_advance_step` returns Reevaluate
+  until scanning reaches the higher observed wallet/server tip, then resumes the existing interruption
+  or rebuild handling. No transaction is submitted or recorded in the wallet, and caller signatures
+  are unchanged.
+
 - `zcashlc_migration_take_broadcast_transaction` and `zcashlc_migration_take_preparation_by_txid`
   refuse a run that has ended (completed, failed, superseded or cancelled) with a bare error, before
   any other check. An instruction issued before `zcashlc_migration_cancel_run` could previously still

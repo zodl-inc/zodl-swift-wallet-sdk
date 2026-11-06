@@ -27,6 +27,16 @@ permissions: {}
 
 jobs:
   build-xcframework:
+    env:
+      ZODL_OHTTP_REQUIRE: '1'
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     # Xcode 27 ships only on this image, which GitHub still marks as a public
     # preview (https://github.com/actions/runner-images/issues/14404). If it
     # misbehaves, macos-26 with Xcode 26.6 is the fallback.
@@ -47,6 +57,12 @@ jobs:
           cat "$xcode_version_file"
           echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      - name: Authorize cargo against the private slipstream repository
+        uses: ./.github/actions/authorize-slipstream
+        with:
+          app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
       # Release builds retain every existing Apple target.
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -62,6 +78,12 @@ jobs:
         id: toolchain
         run: |
           python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
+
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+          echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -84,9 +106,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
 
       - name: Build and upload draft release
         env:

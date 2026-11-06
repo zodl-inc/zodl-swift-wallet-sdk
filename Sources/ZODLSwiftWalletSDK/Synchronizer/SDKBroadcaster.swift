@@ -13,6 +13,9 @@ final class SDKBroadcaster: Broadcaster {
     private let eventSubject: PassthroughSubject<SynchronizerEvent, Never>
     private let submitPlanStore: SubmitPlanStoring
     private let multiEndpointSubmitter: MultiEndpointSubmitter
+    private let transactionRepository: TransactionRepository
+    /// The last chain tip the synchronizer knows; `0` before it knows one.
+    private let chainTip: () -> BlockHeight
     private let statusCheck: () throws -> Void
 
     init(
@@ -22,6 +25,8 @@ final class SDKBroadcaster: Broadcaster {
         eventSubject: PassthroughSubject<SynchronizerEvent, Never>,
         submitPlanStore: SubmitPlanStoring,
         multiEndpointSubmitter: MultiEndpointSubmitter,
+        transactionRepository: TransactionRepository,
+        chainTip: @escaping () -> BlockHeight,
         statusCheck: @escaping () throws -> Void
     ) {
         self.transactionEncoder = transactionEncoder
@@ -30,6 +35,8 @@ final class SDKBroadcaster: Broadcaster {
         self.eventSubject = eventSubject
         self.submitPlanStore = submitPlanStore
         self.multiEndpointSubmitter = multiEndpointSubmitter
+        self.transactionRepository = transactionRepository
+        self.chainTip = chainTip
         self.statusCheck = statusCheck
     }
 
@@ -62,6 +69,24 @@ final class SDKBroadcaster: Broadcaster {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> TransactionSubmissionOutcome {
+        do {
+            return try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                await self.submitAdmitted(transaction: transaction, to: endpoints, timing: timing)
+            }
+        } catch {
+            // Admission refusal is still a pending submission result. Preserve the caller's
+            // intended endpoints only for transactions belonging to the live wallet lifecycle.
+            await releaseForResubmission(transactions: [transaction], to: endpoints)
+            return .unreachable
+        }
+    }
+
+    private func submitAdmitted(
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> TransactionSubmissionOutcome {
+        OHTTPHealthContext.attempt?.beginDelegation()
         let txId = transaction.txId.toHexStringTxId()
 
         guard !endpoints.isEmpty else {
@@ -123,6 +148,7 @@ final class SDKBroadcaster: Broadcaster {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> [TransactionSubmissionReport] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         logger.debug("Batch submitting \(transactions.count) transaction(s).")
         var reports: [TransactionSubmissionReport] = []
         var stopped = false
@@ -156,6 +182,7 @@ final class SDKBroadcaster: Broadcaster {
         ovkPolicy: OvkPolicy = .sender,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         try statusCheck()
 
         // Captured before the (potentially slow) sapling-parameter download and proving work so a
@@ -189,6 +216,7 @@ final class SDKBroadcaster: Broadcaster {
         pcztWithSigs: Pczt,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
+        OHTTPHealthContext.attempt?.beginDelegation()
         try statusCheck()
 
         // Captured before the (potentially slow) sapling-parameter download and PCZT extraction so
@@ -222,13 +250,21 @@ final class SDKBroadcaster: Broadcaster {
     // MARK: - Private
 
     private func downloadSaplingParamsIfNeeded() async throws {
-        try await SaplingParameterDownloader.downloadParamsIfnotPresent(
-            spendURL: initializer.spendParamsURL,
-            spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
-            outputURL: initializer.outputParamsURL,
-            outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
-            logger: logger
-        )
+        return try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let container = initializer.container
+            try await SaplingParameterDownloader.downloadParamsIfnotPresent(
+                spendURL: initializer.spendParamsURL,
+                spendSourceURL: initializer.saplingParamsSourceURL.spendParamFileURL,
+                outputURL: initializer.outputParamsURL,
+                outputSourceURL: initializer.saplingParamsSourceURL.outputParamFileURL,
+                logger: logger,
+                torClientProvider: {
+                    let isTorEnabled = await sdkFlags.torEnabled
+                    return isTorEnabled ? container.resolve(TorClient.self) : nil
+                }
+            )
+        }
     }
 
     private func overviewsForEvent(txIds: [Data]) async -> [ZcashTransaction.Overview] {
@@ -269,5 +305,61 @@ final class SDKBroadcaster: Broadcaster {
         }
 
         return createdTransactions
+    }
+}
+
+// MARK: - Unaccepted transactions after a server change
+
+extension SDKBroadcaster {
+    func resubmitUnacceptedTransactions(
+        through endpoint: LightWalletEndpoint,
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport] {
+        let server = "\(endpoint.host):\(endpoint.port)"
+        let candidates: [ZcashTransaction.Overview]
+        do {
+            // Like `submit`, no prepared synchronizer is required: a wallet database that cannot be read yet only
+            // means there is nothing to list. The same selection background resubmission makes: sent, not mined,
+            // not expired as of the last tip.
+            // Before any tip is known that is every unmined send; the submitter refuses an expired one itself.
+            candidates = try await transactionRepository.findForResubmission(upTo: chainTip())
+        } catch {
+            logger.warn("Unaccepted transactions could not be listed for \(server); nothing sent: \(error.localizedDescription)")
+            return []
+        }
+
+        var reports: [TransactionSubmissionReport] = []
+        for overview in candidates {
+            // The store decides whether the transaction is stuck (submitted, not accepted) and extends its plan in
+            // the same step. Its token makes an acceptance that arrives after a `wipe()` provably stale.
+            guard let lifecycle = await submitPlanStore.addEndpointToUnacceptedPlan(txId: overview.rawID, endpoint: endpoint) else {
+                continue
+            }
+            let txId = overview.rawID.toHexStringTxId()
+            guard let transaction = try? CreatedTransaction(overview: overview) else {
+                logger.warn("Transaction \(txId) has no raw bytes to send through \(server).")
+                continue
+            }
+            // Each transaction on its own: one that the server does not take must not keep the next one waiting,
+            // unlike a batch, whose later transactions may depend on the earlier ones.
+            let outcome: TransactionSubmissionOutcome
+            do {
+                outcome = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                    await self.multiEndpointSubmitter.submit(transaction: transaction, to: [endpoint], timing: timing)
+                }
+            } catch {
+                outcome = .unreachable
+            }
+            if case .accepted(by: let acceptingEndpoint) = outcome {
+                await submitPlanStore.markAccepted(
+                    txId: overview.rawID,
+                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
+                    lifecycle: lifecycle
+                )
+            }
+            logger.debug("Transaction \(txId) resubmission through \(server) \(outcome.logDescription).")
+            reports.append(TransactionSubmissionReport(txId: overview.rawID, outcome: outcome))
+        }
+        return reports
     }
 }

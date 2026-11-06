@@ -105,6 +105,15 @@ enum ZcashErrorDefinition {
     /// TorClient is nil
     // sourcery: code="ZTSRV0004"
     case torClientUnavailable
+    // sourcery: code="ZTSRV0006"
+    /// Request URL host is not registered in OHTTPEndpoints — cannot route over OHTTP.
+    case ohttpUnsupportedHost
+    // sourcery: code="ZTSRV0007"
+    /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.
+    case ohttpResponseError
+    // sourcery: code="ZTSRV0008"
+    /// OHTTP transport error (e.g., self reference lost in httpSender closure).
+    case ohttpTransportError
     /// TorClient is called but SDKFlags are set as Tor disabled
     // sourcery: code="ZTSRV0005"
     case torNotEnabled

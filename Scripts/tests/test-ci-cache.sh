@@ -7,12 +7,12 @@ _ffi_fixture() {
     git -C "$repo" init -q
     git -C "$repo" config user.name 'Cache Tests'
     git -C "$repo" config user.email 'cache-tests@example.invalid'
-    mkdir -p "$repo/rust" "$repo/BuildSupport" "$repo/Scripts"
+    mkdir -p "$repo/rust" "$repo/BuildSupport" "$repo/Scripts/lib"
     local input
     for input in Cargo.toml Cargo.lock Makefile rust/lib.rs BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py BuildSupport/ohttp-config-version; do
         printf 'fixture\n' > "$repo/$input"
     done
     printf 'BuildSupport/products/\n' > "$repo/.gitignore"
@@ -25,7 +25,13 @@ _ffi_commit() {
     git -C "$1" -c commit.gpgsign=false commit -qm fixture
 }
 
-_ffi_hash() { "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$1"; }
+_ffi_hash() {
+    CI=1 ZODL_OHTTP_GATEWAY_HOST_MAINNET=main.example.invalid ZODL_OHTTP_GATEWAY_HOST_TESTNET=test.example.invalid \
+    ZODL_OHTTP_RELAY_URL_MAINNET="${HASH_RELAY_MAINNET:-https://main.example.invalid/relay}" ZODL_OHTTP_RELAY_URL_TESTNET=https://test.example.invalid/relay \
+    ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=main.example.invalid ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=test.example.invalid \
+        "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$1"
+}
 
 _assert_hash_changed() {
     local before="$1" repo="$2" label="$3" after
@@ -102,7 +108,7 @@ test_ffi_hash_rejects_invalid_inputs() {
     for input in Cargo.toml Cargo.lock Makefile rust BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py BuildSupport/ohttp-config-version; do
         copy="$(mktemp -d "$SCRATCH/ffi-missing.XXXXXX")"
         git clone -q "$repo" "$copy"
         git -C "$copy" rm -qr "$input"
@@ -116,7 +122,7 @@ test_ffi_hash_rejects_invalid_inputs() {
 _locked_entrypoint_flags() {
     local target="$1"
     if [ "$target" = initializer ]; then
-        grep '^[[:space:]]*cargo build ' "$REPO_ROOT/Scripts/init-local-ffi.sh"
+        grep '^[[:space:]]*.*cargo build ' "$REPO_ROOT/Scripts/init-local-ffi.sh"
     else
         cat "$(_dry_run "$target")"
     fi | grep -E 'cargo (build|test)' | head -1 | grep -o -- '--locked' || true
@@ -183,4 +189,15 @@ test_swift_dependency_archive_excludes_products_and_credentials() {
         tar -tf "$SCRATCH/swift-dependencies.tar" | sed '/\/$/d' | sort > "$SCRATCH/swift-archive.txt"
         assert_eq "$(printf '.build/artifacts/library/library.zip\n.build/checkouts/package/Package.swift\n.build/repositories/repo.git/HEAD')" "$(cat "$SCRATCH/swift-archive.txt")" "$step archives only dependency content, excluding compiled output tests and credentials"
     done
+}
+
+# A changed runner changes native build semantics even when Rust is unchanged.
+test_ffi_hash_covers_relay_runner_source() {
+    local repo before
+    repo="$(_ffi_fixture)"
+    before="$(_ffi_hash "$repo")"
+    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py"
+    _assert_hash_changed "$before" "$repo" 'runner source invalidates committed native input hash'
+    before="$(_ffi_hash "$repo")"
+    assert_succeeds 'relay values fingerprint cache identity' test "$before" != "$(HASH_RELAY_MAINNET=https://synthetic.example.invalid _ffi_hash "$repo")"
 }

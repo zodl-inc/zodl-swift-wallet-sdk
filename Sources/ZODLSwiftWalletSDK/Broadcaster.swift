@@ -114,6 +114,29 @@ public protocol Broadcaster: AnyObject {
         transactions: [CreatedTransaction],
         to endpoints: [LightWalletEndpoint]
     ) async
+
+    /// Sends every transaction that was submitted but that no server has accepted yet through
+    /// `endpoint`, once and right away, and adds `endpoint` at the end of its retry plan.
+    ///
+    /// For a host whose user moved the wallet to `endpoint` while transactions were stuck because
+    /// the servers recorded for them could not be reached, such as an outage of a private relay.
+    /// Background resubmission keeps trying the recorded servers first and `endpoint` last, so a
+    /// recorded server that is reachable again is preferred again.
+    ///
+    /// Only transactions that are neither mined nor expired, as of the last chain tip the SDK
+    /// knows, are considered. Transactions a server has already accepted, transactions created
+    /// through this broadcaster that the host has not submitted or released yet, and transactions
+    /// without a recorded plan are left alone. A transaction `endpoint` does not accept stays
+    /// with background resubmission like any other.
+    ///
+    /// Privacy: `endpoint` receives each of these transactions together with the network address
+    /// they come from, unless the route hides it (Tor), as it would for any submission to it.
+    ///
+    /// - Returns: One report per transaction sent, empty when none qualified (then nothing is sent).
+    func resubmitUnacceptedTransactions(
+        through endpoint: LightWalletEndpoint,
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport]
 }
 
 extension Broadcaster {
@@ -160,6 +183,22 @@ extension Broadcaster {
         transactions: [CreatedTransaction],
         to endpoints: [LightWalletEndpoint]
     ) async {
+    }
+
+    /// Default implementation so adding `resubmitUnacceptedTransactions(through:timing:)` to the
+    /// protocol is not a source-breaking change for downstream conformers: custom `Broadcaster`
+    /// conformers without submit-plan bookkeeping have no recorded plans to follow a new server,
+    /// so they inherit this no-op unless they choose to override it.
+    public func resubmitUnacceptedTransactions(
+        through endpoint: LightWalletEndpoint,
+        timing: SubmissionTiming
+    ) async -> [TransactionSubmissionReport] {
+        []
+    }
+
+    /// Forwards with `SubmissionTiming.default`.
+    public func resubmitUnacceptedTransactions(through endpoint: LightWalletEndpoint) async -> [TransactionSubmissionReport] {
+        await resubmitUnacceptedTransactions(through: endpoint, timing: SubmissionTiming.default)
     }
 }
 

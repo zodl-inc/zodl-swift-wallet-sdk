@@ -39,6 +39,16 @@ permissions:
 
 jobs:
   analyze:
+    env:
+      ZODL_OHTTP_REQUIRE: '1'
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -126,11 +136,18 @@ jobs:
       run: |
         python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
 
+    - name: Validate OHTTP configuration
+      id: ohttp-config
+      if: matrix.language == 'swift'
+      run: |
+        OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+        echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
+
     - name: Generate FFI source hash
       if: matrix.language == 'swift'
       id: ffi-hash
       run: |
-        FFI_HASH=$(find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f \( -name "*.rs" -o -name "*.toml" -o -name "*.lock" -o -name "Makefile" -o -name "*.h" -o -name "*.c" -o -name "*.plist" -o -name "*.modulemap" \) -exec shasum {} \; | sort | shasum | cut -d' ' -f1)
+        FFI_HASH=$(Scripts/ci/ffi-input-hash.sh)
         echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
         echo "FFI source hash: $FFI_HASH"
 
@@ -140,7 +157,14 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: codeql-ffi-xcframework-macos-arm64-nolto-v2-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+        key: codeql-ffi-xcframework-macos-arm64-nolto-v3-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+
+    - name: Authorize cargo against the private slipstream repository
+      if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
+      uses: ./.github/actions/authorize-slipstream
+      with:
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
     - name: Cache Cargo
       if: matrix.language == 'swift' && steps.cache-ffi.outputs.cache-hit != 'true'
@@ -166,9 +190,9 @@ jobs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-
+          codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
 
     # The arm64 macOS slice without fat LTO is all the Swift build needs for
     # analysis; the universal LTO build used to run into the 30-minute limit.

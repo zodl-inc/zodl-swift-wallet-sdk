@@ -149,6 +149,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
         try await sync.switchTo(endpoint: other)
         let callsAfterSwitch = await Self.lifecycleCalls(engine.calls)
+        let healthBefore = sync.ohttpHealthBinding?.snapshot()
 
         await sync.runStallRecovery(
             expectedPassGeneration: generation,
@@ -156,6 +157,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
             attempt: 1
         )
 
+        XCTAssertEqual(sync.ohttpHealthBinding?.snapshot(), healthBefore)
         let callsAfterTheStaleRecovery = await Self.lifecycleCalls(engine.calls)
         XCTAssertEqual(callsAfterTheStaleRecovery, callsAfterSwitch, "a stale recovery must not call the engine at all")
         XCTAssertTrue(events.syncStalledEvents.isEmpty, "nor announce a stall it is not going to act on")
@@ -444,6 +446,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         await sync.setInternalSyncStatusForTesting(.disconnected)
         try await sync.start(retry: false)
 
+        let healthBefore = sync.ohttpHealthBinding?.snapshot()
         engine.stopGate.close() // the next stop parks inside the fake
         sync.stop() // the host's background stop holds the queue
         let stopped = await waitUntil { await engine.calls.contains("stop") }
@@ -465,6 +468,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
             // expected
         }
 
+        XCTAssertEqual(sync.ohttpHealthBinding?.snapshot(), healthBefore)
         let calls = await engine.calls
         let afterStop = calls.drop(while: { $0 != "stop" }).dropFirst()
         XCTAssertFalse(
