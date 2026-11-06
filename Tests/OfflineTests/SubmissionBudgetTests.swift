@@ -62,6 +62,7 @@ final class SubmissionBudgetTests: ZcashTestCase {
 
     func testProductionOHTTPTorKeyAndHeightShareRemainingNativeDeadline() async throws {
         let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
         let timeouts = OSAllocatedUnfairLock(initialState: [UInt64]())
         let envelope = NativeKeyEnvelope()
         var native = TorHTTPGetNative(
@@ -71,7 +72,7 @@ final class SubmissionBudgetTests: ZcashTestCase {
         )
         native.classifiedGet = { _, _, _, _, _, _, timeout, outcome in
             timeouts.withLock { $0.append(timeout) }
-            Thread.sleep(forTimeInterval: 0.06)
+            clock.withLock { $0 += 10_000_000_000 }
             outcome?.pointee = FfiTorHttpOutcome(kind: 0, http_status: 200, retry_not_before_ns: 0)
             return envelope.pointer
         }
@@ -82,16 +83,20 @@ final class SubmissionBudgetTests: ZcashTestCase {
         }
         let tor = TorClient(runtimePtr: runtimes.parent, torDir: try __torDirURL(), httpGetNative: native)
         let submitter = makeOHTTPSubmitter(tor: tor)
-        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 180)
+        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 30_000)
         do {
-            try await submitter.submit(transaction: transaction(), to: gateway)
+            try await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: gateway)
+            }
             XCTFail("The height request is deliberately rejected")
         } catch {}
         let observed = timeouts.withLock { $0 }
         XCTAssertEqual(observed.count, 2, "Key GET and height POST must use the bounded production sender")
         if observed.count == 2 {
-            XCTAssertLessThanOrEqual(observed[0], 180)
-            XCTAssertLessThanOrEqual(observed[1], 120, "Key fetch time must be deducted before the height POST")
+            // Executor admission and request-buffer preparation can only reduce these caps.
+            XCTAssertGreaterThan(observed[0], 0)
+            XCTAssertLessThanOrEqual(observed[0], 30_000)
+            XCTAssertLessThanOrEqual(observed[1], 20_000, "Key fetch time must be deducted before the height POST")
             XCTAssertGreaterThan(observed[1], 0)
         }
         try await tor.close()
@@ -99,9 +104,13 @@ final class SubmissionBudgetTests: ZcashTestCase {
 
     func testProductionOHTTPTorCancellationDrainsActiveNativeKeyFetch() async throws {
         let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
         let entered = expectation(description: "native key GET entered")
         let exited = OSAllocatedUnfairLock(initialState: false)
         let returned = OSAllocatedUnfairLock(initialState: false)
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let completedWhileHeld = expectation(description: "submission cannot complete while native GET is held")
+        completedWhileHeld.isInverted = true
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
         var native = TorHTTPGetNative(
@@ -109,9 +118,10 @@ final class SubmissionBudgetTests: ZcashTestCase {
             freeRuntime: { runtimes.free($0) }
         )
         native.classifiedGet = { _, _, _, _, _, _, timeout, outcome in
-            XCTAssertLessThanOrEqual(timeout, 500)
+            XCTAssertGreaterThan(timeout, 0)
+            XCTAssertLessThanOrEqual(timeout, 30_000)
             entered.fulfill()
-            _ = release.wait(timeout: .now() + .milliseconds(Int(timeout)))
+            release.wait()
             exited.withLock { $0 = true }
             outcome?.pointee = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_not_before_ns: 0)
             return nil
@@ -122,14 +132,22 @@ final class SubmissionBudgetTests: ZcashTestCase {
         }
         let tor = TorClient(runtimePtr: runtimes.parent, torDir: try __torDirURL(), httpGetNative: native)
         let submitter = makeOHTTPSubmitter(tor: tor)
-        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 500)
+        let gateway = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true, singleCallTimeoutInMillis: 30_000)
         let task = Task {
-            defer { returned.withLock { $0 = true } }
-            try? await submitter.submit(transaction: transaction(), to: gateway)
+            defer {
+                XCTAssertTrue(exited.withLock { $0 }, "Submission completion must follow native exit")
+                if !released.withLock({ $0 }) { completedWhileHeld.fulfill() }
+                returned.withLock { $0 = true }
+            }
+            try? await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: gateway)
+            }
         }
-        await fulfillment(of: [entered], timeout: 3)
+        await fulfillment(of: [entered], timeout: 10)
         task.cancel()
+        await fulfillment(of: [completedWhileHeld], timeout: 0.1)
         XCTAssertFalse(returned.withLock { $0 }, "Native owner must remain admitted until it exits")
+        released.withLock { $0 = true }
         release.signal()
         await task.value
         XCTAssertTrue(exited.withLock { $0 })
@@ -268,15 +286,19 @@ final class SubmissionBudgetTests: ZcashTestCase {
 
     func testProductionPublicTorConnectorUsesRemainingBudgetAndDrainsOnCancellation() async throws {
         let runtimes = TorTestRuntimes()
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
         let entered = expectation(description: "bounded Tor gRPC connector entered")
         let exited = OSAllocatedUnfairLock(initialState: false)
         let returned = OSAllocatedUnfairLock(initialState: false)
+        let released = OSAllocatedUnfairLock(initialState: false)
+        let completedWhileHeld = expectation(description: "submission cannot complete while native connector is held")
+        completedWhileHeld.isInverted = true
         let calls = OSAllocatedUnfairLock(initialState: 0)
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
         var native = TorHTTPGetNative(
             isolateRuntime: {
-                Thread.sleep(forTimeInterval: 0.05)
+                clock.withLock { $0 += 5_000_000_000 }
                 return runtimes.clone($0)
             },
             freeRuntime: { runtimes.free($0) },
@@ -287,10 +309,9 @@ final class SubmissionBudgetTests: ZcashTestCase {
         )
         native.connectLightwalletdWithTimeout = { _, _, timeout in
             calls.withLock { $0 += 1 }
-            XCTAssertGreaterThan(timeout, 0)
-            XCTAssertLessThanOrEqual(timeout, 150, "Runtime admission must consume the original 200 ms budget")
+            XCTAssertEqual(timeout, 25_000, "Runtime admission must consume the original attempt budget")
             entered.fulfill()
-            _ = release.wait(timeout: .now() + .milliseconds(Int(timeout)))
+            release.wait()
             exited.withLock { $0 = true }
             return nil
         }
@@ -301,12 +322,20 @@ final class SubmissionBudgetTests: ZcashTestCase {
             rustBackend: backend, logger: NullLogger(), networkType: .testnet
         )
         let task = Task {
-            defer { returned.withLock { $0 = true } }
-            try? await submitter.submit(transaction: transaction(), to: endpoint(milliseconds: 200))
+            defer {
+                XCTAssertTrue(exited.withLock { $0 }, "Submission completion must follow native exit")
+                if !released.withLock({ $0 }) { completedWhileHeld.fulfill() }
+                returned.withLock { $0 = true }
+            }
+            try? await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
+                try await submitter.submit(transaction: transaction(), to: endpoint(milliseconds: 30_000))
+            }
         }
-        await fulfillment(of: [entered], timeout: 3)
+        await fulfillment(of: [entered], timeout: 10)
         task.cancel()
+        await fulfillment(of: [completedWhileHeld], timeout: 0.1)
         XCTAssertFalse(returned.withLock { $0 })
+        released.withLock { $0 = true }
         release.signal()
         await task.value
         XCTAssertEqual(calls.withLock { $0 }, 1)
