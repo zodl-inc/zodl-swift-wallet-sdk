@@ -1901,7 +1901,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // Stop synchronization
         let status = await self.status
         if status != .stopped && status != .disconnected {
-            await blockProcessor.stop()
+            await blockProcessor.stopAndWait()
         }
 
         let torClient = initializer.container.resolve(TorClient.self)
@@ -1923,6 +1923,9 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         do {
             _ = try await validateSever.run(with: ActionContextImpl(state: .idle)) { _ in }
         } catch {
+            // Validation is provisional; keep future dependency resolutions on the active service.
+            let previousService = initializer.lightWalletService
+            initializer.container.register(type: LightWalletService.self, isSingleton: true) { _ in previousService }
             throw ZcashError.synchronizerServerSwitch
         }
 
@@ -1932,6 +1935,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         // SWITCH TO NEW ENDPOINT
         let healthTransition = healthOwner.beginTransition()
         defer { healthOwner.settle(transition: healthTransition, endpoint: initializer.endpoint) }
+
+        initializer.container.register(type: LightWalletEndpoint.self, isSingleton: true) { _ in endpoint }
 
         // LightWalletService dependency update
         // S6: use captured networkType (already declared above)

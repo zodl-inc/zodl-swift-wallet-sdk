@@ -24,24 +24,22 @@ CI secret storage does not change this property of the distributed binary.
 ## OHTTP HTTP requirements
 
 Before, custom `Synchronizer` implementations could omit these members. After upgrading,
-conformers and test doubles must supply all three requirements; there is no default
+conformers and test doubles must supply these two requirements; there is no default
 implementation. The SDK's concrete synchronizers already implement them:
 
 ```swift
 func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
 func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
-func httpGetOverTor(
-    for request: URLRequest,
-    retryLimit: UInt8,
-    timeoutMilliseconds: UInt64
-) async throws -> (data: Data, response: HTTPURLResponse)
 ```
 
 For OHTTP calls, map external URLs with `OHTTPEndpoints.proxyURL(for:)` and pass a supported
 alias or allowlisted destination. Unknown destinations fail instead of falling back to direct
 HTTP. Both OHTTP methods put the relay leg on Tor whenever Tor is enabled, even if `viaTor`
 is false. The streaming method returns the response head before the body finishes; consume
-its throwing body to detect an incomplete answer. The bounded GET contract is detailed below.
+its throwing body to detect an incomplete answer.
+
+`httpGetOverTor(for:retryLimit:timeoutMilliseconds:)` was already required before this change;
+its bounded GET contract is detailed below.
 
 The legacy `httpRequestOverTor(for:retryLimit:)` remains Tor-only and does not select OHTTP
 for external services. Call the appropriate OHTTP member when that service requires gateway

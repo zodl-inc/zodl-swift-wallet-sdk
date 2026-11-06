@@ -74,8 +74,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Changed
 
 - Custom `Synchronizer` conformers and test doubles must implement
-  `httpRequestOverOHTTP(for:viaTor:)`, `httpStreamOverOHTTP(for:viaTor:)`, and
-  `httpGetOverTor(for:retryLimit:timeoutMilliseconds:)`; existing conformances without these
+  `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)`;
+  existing conformances without these
   members no longer compile. The SDK's concrete synchronizers already supply them.
   OHTTP HTTP calls require a supported gateway destination and fail without a direct fallback.
   The legacy `httpRequestOverTor(for:retryLimit:)` remains Tor-only, including for supported
@@ -192,6 +192,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer used. See PR #4 in zodl-inc/ohttp.
 
 ## Fixed
+
+- `SDKSynchronizer` background transaction retries use only the selected Private gateway,
+  retaining recorded retry plans for later Public or Manual use. Awaiting transactions and
+  unavailable consent records remain unsent. Legacy retries honor the selected endpoint's
+  custom single-call timeout, including after server switches; failed validation retains the
+  previous route and timeout. No caller changes are required.
 
 - `SlipstreamSynchronizer.start`, `stop`, `stopAndWait`, `switchTo`, `restartSync`, Tor transitions
   and `wipe` now cancel pending background transaction retries before waiting for lifecycle work.
