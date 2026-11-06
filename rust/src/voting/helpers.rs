@@ -139,18 +139,15 @@ pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network>
 /// `params` is the chain the wallet really runs on — for the custom slot, the
 /// activation heights a host registered — and `network` is the flattened
 /// identity `voting_network` handed `zcash_voting`. Note selection resolves the
-/// voting note version through `params`, while everything the crate builds for
-/// delegation resolves its consensus branch from `network` alone (and rejects
-/// any branch id supplied from outside, in three separate validators).
+/// voting note version through `params`, while the crate validates a supplied
+/// delegation snapshot branch against the schedule for `network`.
 ///
-/// Voting lives on one branch: each side accepts the snapshot height only
-/// where its own schedule has reached NU6.3. Two schedules that select
-/// different branches there therefore include at least one that has not, so
-/// such a round ends in a refusal from note selection or from the PCZT builder
-/// whatever this check does. What this adds is when the refusal comes and what
-/// it says: the first thing the session open does once its inputs have
-/// decoded, naming both branches and the height, rather than something obscure
-/// from inside a delegation step.
+/// Snapshot branches may be NU6.3 or NU7, while TX1 keeps its fixed NU6.3
+/// signing profile. Both schedules must still agree on the snapshot branch:
+/// a custom activation schedule must not silently select notes under a
+/// different branch from the voting crate's round validation. This guard
+/// refuses such a round as soon as the session inputs have decoded, naming
+/// both branches and the height rather than failing inside a delegation step.
 ///
 /// Standard networks are unaffected: `params` and `network` are then the same
 /// schedule and agree at every height. So is a custom chain that agrees at the
@@ -253,7 +250,8 @@ mod tests {
     /// wallet registers for it is every upgrade through NU6.3 active from
     /// genesis, with NU7 not activated — the schedule
     /// `NetworkActivationHeights.allActiveFromGenesis` describes on the Swift
-    /// side, and the one `zcash_voting`'s regtest schedule agrees with.
+    /// side. The voting crate's regtest schedule instead activates NU6.3 at
+    /// height 10 and NU7 at height 11.
     fn standard(base: NetworkType) -> crate::NetworkParams {
         match base {
             NetworkType::Main => crate::NetworkParams::Standard(Network::MainNetwork),
@@ -456,12 +454,12 @@ mod tests {
 
     /// A regtest chain reaches voting through the same custom slot, and the two
     /// schedules there are not the same one: the SDK's default regtest has
-    /// every upgrade active from genesis, while the voting crate holds its own
-    /// regtest NU6.3 back to height 10. So a round whose snapshot falls in that
-    /// window is refused, and one at or after it is accepted — which is what
-    /// makes a local test chain's early blocks unusable for voting.
+    /// upgrades through NU6.3 active from genesis and NU7 disabled, while the
+    /// voting crate activates NU6.3 at height 10 and NU7 at height 11. The
+    /// default agrees only at height 10; a custom schedule selecting NU7 at
+    /// height 11 agrees again from that height onward.
     #[test]
-    fn a_regtest_base_is_refused_below_the_crates_own_nu6_3_height_and_accepted_from_it() {
+    fn a_regtest_base_must_agree_at_the_crates_nu6_3_and_nu7_boundaries() {
         let params = standard(NetworkType::Regtest);
         let network = voting_identity(NetworkType::Regtest);
 
@@ -473,9 +471,25 @@ mod tests {
             assert!(message.contains("Nu6_2"), "assumed branch: {message}");
         }
 
-        for height in [10u64, 11, 1_000] {
-            require_branch_agreement(&params, network, height)
-                .unwrap_or_else(|e| panic!("regtest at {height} must agree: {e}"));
+        require_branch_agreement(&params, network, 10).expect("regtest agrees at NU6.3");
+
+        for height in [11u64, 1_000] {
+            let err = require_branch_agreement(&params, network, height)
+                .expect_err("the SDK default has not activated NU7");
+            let message = invalid_input_message(&err);
+            assert!(message.contains("Nu6_3"), "registered branch: {message}");
+            assert!(message.contains("Nu7"), "assumed branch: {message}");
+        }
+
+        let mut aligned = params;
+        if let crate::NetworkParams::Custom { local, .. } = &mut aligned {
+            local.nu7 = Some(BlockHeight::from_u32(11));
+        } else {
+            panic!("regtest fixture must use a custom schedule");
+        }
+        for height in [11u64, 1_000] {
+            require_branch_agreement(&aligned, network, height)
+                .unwrap_or_else(|e| panic!("NU7 regtest at {height} must agree: {e}"));
         }
     }
 
