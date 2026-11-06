@@ -1,0 +1,297 @@
+name: OHTTP E2E (testnet, macOS)
+
+# Live end-to-end verification of the OHTTP transport on Apple platforms: build the Rust FFI
+# and the Swift package on a macOS runner, run the offline OHTTP unit tests, then restore a
+# testnet wallet through the testnet gateway twice — OHTTP only, and Tor + OHTTP.
+# The gateway/relay logs are checked out-of-band (see docs/ohttp.md in zodl-inc/infra): the
+# gateway must only ever see the relay pod, the relay must see this runner's egress IP (ohttp
+# job) or a Tor exit (tor job). Both IPs are printed in the job log and step summary.
+
+on:
+  push:
+    branches:
+      - feature/ohttp
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: >-
+          e2e = restore+sync over OHTTP / Tor+OHTTP (default);
+          fallback-up = gateway reachable, policy stays on OHTTP;
+          fallback-down = operator scaled the testnet gateway to 0, SDK falls back to testnet.zec.rocks;
+          bench-mainnet = mainnet clearnet fallback tier benchmark;
+          send = testnet SEND E2E (Wallet 2 sends to Wallet 1, both legs sequentially);
+          send-mainnet = mainnet SEND E2E (0.0005 ZEC)
+        type: choice
+        default: e2e
+        options:
+          - e2e
+          - fallback-up
+          - fallback-down
+          - bench-mainnet
+          - send
+          - send-mainnet
+      recipient:
+        description: 'Recipient unified address for send scenario (default: Wallet 1 UA)'
+        type: string
+        default: 'utest1wkj0qj7q0nlnvtl0gywf0zvgh86ssmdypqp4y560phrx5edu52hnn4cjhkcszjnx4mkumtd32z2sqmhvrwk5cl2y9my46kuu3ceta4ef45vps67jur8l2qsn4mqn0kj8gz5sl90t63l4wwcvdw284dla46s985jf7vgaplfhaqjzjm8s'
+      mainnet_recipient:
+        description: 'Recipient unified address for send-mainnet scenario'
+        type: string
+        default: 'u1gnkh8m8xfg4gn9gzlsuf3kpu0ylgr2szzj9prmh9cqxckt6uv9pps7rt5lwccytkrheups52l7z4jpfwurk2ux9x3rhwjczt8qezzj2whgp7wcfur58ew4vkd4sv8ppc7tmqf2ar9sqzmznwsw5em0lx48484nhdc4d27syypyzcn07gypkcvkl3yuj7a3crna0vsq8gx6ly7wwkluz'
+      client_trace_prefix:
+        description: 'Client trace ID prefix for debugging (empty = disabled)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ohttp-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ffi:
+    env:
+      ZODL_OHTTP_REQUIRE: '1'
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+    outputs:
+      configuration-hash: ${{ steps.ohttp-config.outputs.hash }}
+      source-hash: ${{ steps.ffi-hash.outputs.hash }}
+      xcode-hash: ${{ steps.xcode-cache-key.outputs.hash }}
+    name: Build FFI (macOS arm64)
+    runs-on: xcode-27
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Authorize cargo against the private slipstream repository
+        uses: ./.github/actions/authorize-slipstream
+        with:
+          app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Report Xcode and compute cache identity
+        id: xcode-cache-key
+        run: |
+          xcode_version_file=$(mktemp)
+          trap 'rm -f "$xcode_version_file"' EXIT
+          xcodebuild -version -skipMacroValidation -derivedDataPath "${RUNNER_TEMP}/DerivedData" > "$xcode_version_file"
+          echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+
+      - name: Validate Rust
+        id: toolchain
+        run: |
+          python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
+
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+          echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: FFI source hash
+        id: ffi-hash
+        run: |
+          FFI_HASH=$(Scripts/ci/ffi-input-hash.sh)
+          echo "hash=$FFI_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache XCFramework
+        id: cache-ffi
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: BuildSupport/products/libzcashlc.xcframework
+          key: ohttp-e2e-xcframework-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+
+      - name: Cache Cargo
+        if: steps.cache-ffi.outputs.cache-hit != 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+          key: ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
+
+      # arm64 only: the runner is arm64 and nothing here links an x86_64 slice.
+      # ohttp-trace: client trace ids (client_trace_prefix input) work only in such a build.
+      - name: Build FFI for macOS
+        if: steps.cache-ffi.outputs.cache-hit != 'true'
+        timeout-minutes: 75
+        run: make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace
+
+      - name: Verify XCFramework
+        run: make verify-ffi
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libzcashlc-xcframework-macos
+          path: BuildSupport/products/libzcashlc.xcframework
+          retention-days: 3
+          if-no-files-found: error
+
+  e2e:
+    env:
+      ZODL_OHTTP_REQUIRE: '1'
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+    name: E2E (${{ matrix.mode }})
+    needs: ffi
+    runs-on: xcode-27
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ohttp, tor]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: libzcashlc-xcframework-macos
+          path: BuildSupport/products/libzcashlc.xcframework
+
+      - name: Configure local FFI
+        run: make configure-local-ffi
+
+      - name: Cache SwiftPM
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build
+          key: ohttp-e2e-swiftpm-v2-${{ runner.os }}-${{ runner.arch }}-${{ needs.ffi.outputs.xcode-hash }}-${{ needs.ffi.outputs.source-hash }}-${{ needs.ffi.outputs.configuration-hash }}-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
+
+      - name: Build Swift package
+        timeout-minutes: 30
+        run: make build
+
+      - name: Offline OHTTP unit tests (every OHTTP* class of OfflineTests)
+        if: matrix.mode == 'ohttp'
+        timeout-minutes: 20
+        run: swift test --filter 'OfflineTests\.OHTTP' 2>&1 | tee offline-ohttp-tests.log
+
+      - name: Runner egress IP
+        if: ${{ !cancelled() }}
+        run: |
+          IP=$(curl -fsS --max-time 15 https://api.ipify.org || echo unknown)
+          echo "runner egress ip: $IP"
+          echo "### OHTTP E2E — ${{ matrix.mode }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- runner egress IP: \`$IP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore + sync over ${{ matrix.mode == 'tor' && 'Tor + OHTTP' || 'OHTTP' }}
+        if: ${{ !cancelled() && (inputs.scenario == '' || inputs.scenario == 'e2e') }}
+        timeout-minutes: 75
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
+          OHTTP_E2E_MIN_BALANCE_ZAT: ${{ vars.OHTTP_E2E_MIN_BALANCE_ZAT || '9000000000' }}
+          OHTTP_E2E_TIMEOUT_SECONDS: '3600'
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+          TEST: ${{ matrix.mode == 'tor' && 'testRestoreAndSyncOverTorAndOHTTP' || 'testRestoreAndSyncOverOHTTP' }}
+        run: |
+          set -o pipefail
+          # Run LWD sync test
+          swift test --filter "OHTTPE2ETests/${TEST}" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+          # External API proxy test (CMC key/info + NEAR tokens + voting): OHTTP on the ohttp leg,
+          # Tor -> OHTTP with gateway-injected secrets on the tor leg (OHTTP_E2E_TOR=1).
+          OHTTP_E2E_TOR="${{ matrix.mode == 'tor' && '1' || '0' }}" \
+            swift test --filter "OHTTPE2ETests/testExternalAPIsViaOHTTP" 2>&1 | tee -a "e2e-${{ matrix.mode }}.log"
+
+      - name: OHTTP -> clearnet fallback primitives (${{ inputs.scenario }})
+        if: ${{ !cancelled() && startsWith(inputs.scenario, 'fallback-') }}
+        timeout-minutes: 30
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
+          OHTTP_E2E_GATEWAY_STATE: ${{ inputs.scenario == 'fallback-down' && 'down' || 'up' }}
+          OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testFallbackPrimitives" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Mainnet clearnet fallback tier benchmark
+        if: ${{ !cancelled() && inputs.scenario == 'bench-mainnet' }}
+        timeout-minutes: 30
+        env:
+          OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
+          OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testMainnetFallbackTierBenchmark" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Testnet SEND E2E (Wallet 2 → Wallet 1, both legs)
+        if: ${{ !cancelled() && inputs.scenario == 'send' && matrix.mode == 'tor' }}
+        timeout-minutes: 45
+        env:
+          OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
+          OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Mainnet SEND E2E (0.0005 ZEC, Wallet 2 → Wallet 1, both legs)
+        if: ${{ !cancelled() && inputs.scenario == 'send-mainnet' && matrix.mode == 'tor' }}
+        timeout-minutes: 90
+        env:
+          OHTTP_E2E_NETWORK: mainnet
+          OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_MAINNET_SEED2_HEX }}
+          OHTTP_E2E_SEND_BIRTHDAY: 3427084
+          OHTTP_E2E_SEND_ZATOSHI: 50000
+          OHTTP_E2E_RECIPIENT_UA: ${{ inputs.mainnet_recipient }}
+          OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
+        run: |
+          set -o pipefail
+          swift test --filter "OHTTPE2ETests/testSendOverOHTTP" 2>&1 | tee "e2e-${{ matrix.mode }}.log"
+
+      - name: Evidence summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo '```'
+            grep -h 'OHTTP-E2E' offline-ohttp-tests.log e2e-*.log 2>/dev/null | grep -E 'mode=|ip=|RESULT|synced|error|failed' || echo "no OHTTP-E2E lines captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ohttp-e2e-logs-${{ matrix.mode }}
+          path: |
+            offline-ohttp-tests.log
+            e2e-*.log
+          if-no-files-found: ignore

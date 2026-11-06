@@ -122,7 +122,15 @@ actor OrchardMigrationHost {
 
         self.init(
             welding: initializer.rustBackend,
-            sharedBroadcaster: MigrationBroadcaster(torDirURL: torDirURL, logger: logger),
+            // S7: pass network to broadcaster
+            sharedBroadcaster: MigrationBroadcaster(
+                torDirURL: torDirURL,
+                logger: logger,
+                networkType: network.networkType,
+                admission: initializer.container.resolve(SDKFlags.self).routeAdmission
+            ) { [container = initializer.container] in
+                await container.resolve(SDKFlags.self).torEnabled
+            },
             generalStorageURL: generalStorageURL,
             tickInterval: 15,
             now: { Date() },

@@ -44,7 +44,8 @@ extension ZcashTestCase {
         endpoint: LightWalletEndpoint = LightWalletEndpointBuilder.default,
         network: ZcashNetwork = ZcashNetworkBuilder.network(for: .testnet),
         alternateEndpoints: [LightWalletEndpoint] = [],
-        restoreAnchor: SlipstreamAnchorResolver? = nil
+        restoreAnchor: SlipstreamAnchorResolver? = nil,
+        torTransition: TorRouteTransition = TorRouteTransition()
     ) throws -> SlipstreamSynchronizer {
         let container = container ?? mockContainer!
         let welding = welding ?? ZcashRustBackendWeldingMock()
@@ -56,7 +57,9 @@ extension ZcashTestCase {
         }
 
         container.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in welding }
-        container.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        container.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
         // `wipe()` closes the repository's database connection before deleting the files, and the
         // generated mock force-unwraps that closure — an un-stubbed call is a crash rather than a
         // failure, exactly like the welding defaults above.
@@ -85,13 +88,15 @@ extension ZcashTestCase {
                 initializer: initializer,
                 alternateEndpoints: alternateEndpoints,
                 engine: engine,
+                torTransition: torTransition,
                 restoreAnchor: restoreAnchor
             )
         }
         return SlipstreamSynchronizer(
             initializer: initializer,
             alternateEndpoints: alternateEndpoints,
-            engine: engine
+            engine: engine,
+            torTransition: torTransition
         )
     }
 }

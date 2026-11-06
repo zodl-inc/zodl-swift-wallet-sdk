@@ -150,12 +150,29 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
+# The OHTTP engine patch below still identifies itself as 0.4.0.
+slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
 
+# Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
+# key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
+# status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
+# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
+# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
+# fails loudly, a branch would follow a force-push. Both SDK and Slipstream share this source.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0324db3240adf00ea847aa0a93e8d765e32b61da", default-features = false }
+
 [dev-dependencies]
+# Authenticated response fixtures exercise the real OHTTP decoder.
+aes-gcm = "0.10"
+hkdf = "0.12"
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+sha2 = "0.10"
+futures = "0.3"
+http-body = "1"
+http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Plays the device in the Ledger signing tests (`rust/src/ledger/tests.rs`). Matches the engine's
@@ -182,6 +199,15 @@ default = []
 # builds via Scripts/init-local-ffi.sh --gpu / rebuild-local-ffi.sh --gpu.
 gpu = ["slipstream-core/gpu"]
 
+# Lets zcashlc_set_default_ohttp_client_trace_prefix set OHTTP client trace ids;
+# without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
+# init-local-ffi.sh / rebuild-local-ffi.sh --trace,
+# make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
+# release builds (build-ffi.yml, prepare-release.sh) never enable it. It turns on
+# the engine's own `client-trace` feature, so Slipstream OHTTP requests carry the
+# prefix too.
+ohttp-trace = ["slipstream-core/client-trace"]
+
 [lib]
 name = "zcashlc"
 path = "rust/src/lib.rs"
@@ -203,6 +229,9 @@ lto = true
 strip = false
 
 [patch.crates-io]
+# OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "44d821779e96fb9f8ee9e2147cb1b1536a662941" }
+
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress

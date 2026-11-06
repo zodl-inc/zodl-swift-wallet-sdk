@@ -219,8 +219,8 @@ extension BlockEnhancerImpl: BlockEnhancer {
                                 BlockRange(startHeight: Int(tia.blockRangeStart))
                             }
 
-                            // ServiceMode to resolve
-                            let stream = try service.getTaddressTransactions(filter, mode: .direct)
+                            // Wallet-identifying: its own Tor circuit when Tor is on.
+                            let stream = try service.getTaddressTransactions(filter, mode: await sdkFlags.ifTor(.uniqueTor))
 
                             for try await rawTransaction in stream {
                                 let minedHeight = BlockHeight(minedServerHeight: rawTransaction.height).map { UInt32($0) }

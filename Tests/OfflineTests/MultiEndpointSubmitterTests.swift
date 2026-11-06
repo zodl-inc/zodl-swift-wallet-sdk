@@ -50,6 +50,9 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
             return
         }
         XCTAssertTrue(endpoints.contains(winner))
+        // Acceptance may return before the propagation tail enters every endpoint.
+        // Observe the existing submission handshake instead of racing task scheduling.
+        for endpoint in endpoints { await mock.awaitSubmissionStarted(to: endpoint) }
         XCTAssertEqual(mock.recordedSubmissions().count, 3)
     }
 

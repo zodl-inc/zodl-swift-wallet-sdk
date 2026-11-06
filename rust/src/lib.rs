@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![recursion_limit = "256"]
 
 use std::collections::HashSet;
 use std::convert::{Infallible, TryFrom, TryInto};
@@ -121,11 +122,14 @@ mod migration_gate;
 mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
+mod ohttp;
+mod ohttp_health;
 mod payment_uri;
 mod retained_marks;
 mod sapling_prover;
 mod send_max;
 mod tor;
+use tor::startup::*;
 mod voting;
 
 #[cfg(target_vendor = "apple")]
@@ -4559,7 +4563,17 @@ pub unsafe extern "C" fn zcashlc_tor_http_get(
     headers_len: usize,
     retry_limit: u8,
 ) -> *mut ffi::HttpResponseBytes {
-    unsafe { tor_http_get_impl(tor_runtime, url, headers, headers_len, retry_limit, None) }
+    unsafe {
+        tor_http_get_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            retry_limit,
+            None,
+            None,
+        )
+    }
 }
 
 /// Makes an HTTP GET request over Tor with a whole-operation timeout.
@@ -4609,8 +4623,188 @@ pub unsafe extern "C" fn zcashlc_tor_http_get_with_timeout(
             headers_len,
             retry_limit,
             Some(timeout_ms),
+            None,
         )
     }
+}
+
+/// Makes an HTTP GET request over Tor with a bounded response size.
+///
+/// `max_bytes` is the maximum allowed response body size in bytes. The body is counted
+/// incrementally as frames arrive, and the request is aborted as soon as the limit is exceeded.
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_get`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_get_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    retry_limit: u8,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_get_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            retry_limit,
+            None,
+            Some(max_bytes),
+        )
+    }
+}
+
+/// Makes an HTTP POST request over Tor with a bounded response size.
+///
+/// `max_bytes` is the maximum allowed response body size in bytes. The body is counted
+/// incrementally as frames arrive, and the request is aborted as soon as the limit is exceeded.
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    retry_limit: u8,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_post_bounded_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            body,
+            body_len,
+            max_bytes,
+            retry_limit,
+            |res| {
+                res.is_err()
+                    .then_some(zcash_client_backend::tor::http::Retry::Same)
+            },
+        )
+    }
+}
+
+/// Makes an HTTP POST request over Tor with a bounded response size, sent once: the retry rule
+/// of [`zcashlc_tor_http_post_stream`] ([`retry_if_unsent`]), for a body that must never be
+/// resent, such as a sealed OHTTP request.
+///
+/// `max_bytes` is as in [`zcashlc_tor_http_post_bounded`].
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_once_bounded(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_post_bounded_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            body,
+            body_len,
+            max_bytes,
+            TOR_HTTP_UNSENT_RETRIES,
+            retry_if_unsent,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn tor_http_post_bounded_impl(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+    retry_limit: u8,
+    retry_filter: impl Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+) -> *mut ffi::HttpResponseBytes {
+    set_tor_http_outcome(FfiTorHttpOutcome {
+        kind: 3,
+        ..Default::default()
+    });
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let retry_filter = AssertUnwindSafe(retry_filter);
+
+    let res = catch_panic(|| {
+        let tor_runtime =
+            unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+
+        let url = unsafe { CStr::from_ptr(url).to_str()? }
+            .try_into()
+            .map_err(|e| anyhow!("Invalid URL: {e}"))?;
+
+        let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
+            .iter()
+            .map(|header| {
+                anyhow::Ok((
+                    unsafe { CStr::from_ptr(header.name) }.to_str()?,
+                    unsafe { CStr::from_ptr(header.value) }.to_str()?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let body = unsafe { tor::http::post_body(body, body_len) };
+        let retry_filter =
+            |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| (*retry_filter)(res);
+
+        let client = tor_runtime.client();
+        let response = tor_runtime.runtime().block_on(tor_http_with_body_guard(
+            max_bytes,
+            retry_filter,
+            |guard| async move {
+                client
+                    .http_post(
+                        url,
+                        |builder| {
+                            headers.iter().fold(builder, |builder, (key, value)| {
+                                builder.header(*key, *value)
+                            })
+                        },
+                        body,
+                        |body| guard.parse_get(body, false),
+                        retry_limit,
+                        |res| guard.filter(res),
+                    )
+                    .await
+            },
+        ))?;
+
+        ffi::HttpResponseBytes::from_rust(response)
+    });
+    if res.is_ok() {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
+    }
+    unwrap_exc_or_null(res)
 }
 
 unsafe fn tor_http_get_impl(
@@ -4620,11 +4814,16 @@ unsafe fn tor_http_get_impl(
     headers_len: usize,
     retry_limit: u8,
     timeout_ms: Option<u64>,
+    max_bytes: Option<usize>,
 ) -> *mut ffi::HttpResponseBytes {
     // SAFETY: Callers would have to do the following for unwind safety (#194):
     // - using `*mut TorRuntime` and respecting mutability rules on the Swift side, to
     //   avoid observing the effects of a panic in another thread.
     // - discarding the `TorRuntime` whenever we get an error that is due to a panic.
+    set_tor_http_outcome(FfiTorHttpOutcome {
+        kind: 3,
+        ..Default::default()
+    });
     let tor_runtime = AssertUnwindSafe(tor_runtime);
 
     let res = catch_panic(|| {
@@ -4654,7 +4853,7 @@ unsafe fn tor_http_get_impl(
                 builder.header(*key, *value)
             })
         };
-        let collect_response_body = |body| collect_http_response_body(body);
+        let max_response_bytes = max_bytes.unwrap_or(TOR_HTTP_MAX_RESPONSE_BYTES);
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
             #[cfg(test)]
             crate::tor::http::network_tests::observe_retry(
@@ -4664,42 +4863,633 @@ unsafe fn tor_http_get_impl(
                 .then_some(zcash_client_backend::tor::http::Retry::Same)
         };
 
-        let response = tor_runtime.runtime().block_on(async {
-            let operation = async {
-                let response = tor_runtime
-                    .client()
+        let client = tor_runtime.client();
+        let response = tor_runtime.runtime().block_on(tor_http_get_response(
+            max_response_bytes,
+            timeout_ms,
+            retry_filter,
+            |guard, explicit_deadline| async move {
+                client
                     .http_get(
                         url,
                         request_headers,
-                        collect_response_body,
+                        |body| guard.parse_get(body, explicit_deadline),
                         retry_limit,
-                        retry_filter,
+                        |res| guard.filter(res),
                     )
-                    .await?;
-                anyhow::Ok(response)
-            };
-
-            match timeout_ms {
-                Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
-                None => operation.await,
-            }
-        })?;
+                    .await
+            },
+        ))?;
 
         ffi::HttpResponseBytes::from_rust(response)
+    });
+    if res.is_ok() {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
+    }
+    unwrap_exc_or_null(res)
+}
+
+/// Structured result of a bounded Tor HTTP operation. HTTP rejection metadata remains
+/// available even when reading its body fails. Kind: 0 success, 1 deadline, 2 transport,
+/// 3 configuration, 4 size limit, 5 inconclusive. No error text is used for classification.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FfiTorHttpOutcome {
+    pub kind: u32,
+    pub http_status: u16,
+    pub retry_not_before_ns: u64,
+}
+
+thread_local! {
+    static TOR_HTTP_OUTCOME: std::cell::Cell<FfiTorHttpOutcome> = const {
+        std::cell::Cell::new(FfiTorHttpOutcome { kind: 5, http_status: 0, retry_not_before_ns: 0 })
+    };
+}
+
+fn set_tor_http_outcome(outcome: FfiTorHttpOutcome) {
+    TOR_HTTP_OUTCOME.set(outcome);
+}
+
+/// Typed provenance of the immediately preceding Tor HTTP call on this thread.
+/// Read before any other HTTP FFI call. Legacy signatures, errors and retry policies are unchanged.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_tor_http_last_outcome() -> FfiTorHttpOutcome {
+    TOR_HTTP_OUTCOME.get()
+}
+
+fn tor_http_error_outcome(
+    error: &zcash_client_backend::tor::Error,
+    status: u16,
+) -> FfiTorHttpOutcome {
+    use zcash_client_backend::tor::Error;
+    let kind = match error {
+        Error::Http(HttpError::NonHttpUrl | HttpError::Http(_)) | Error::MissingTorDirectory => 3,
+        Error::Http(HttpError::Timeout(_)) => 1,
+        Error::Http(HttpError::Json(_) | HttpError::Spawn(_)) => 5,
+        _ => 2,
+    };
+    FfiTorHttpOutcome {
+        kind,
+        http_status: status,
+        retry_not_before_ns: 0,
+    }
+}
+
+fn retry_not_before_ns(status: u16, value: Option<&str>, observed_at_ns: u64) -> u64 {
+    if status != 429 {
+        return 0;
+    }
+    let seconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(30)
+        .min(120);
+    observed_at_ns.saturating_add(seconds.saturating_mul(1_000_000_000))
+}
+
+fn http_head_outcome(parts: &http::response::Parts, observed_at_ns: u64) -> FfiTorHttpOutcome {
+    FfiTorHttpOutcome {
+        kind: 0,
+        http_status: parts.status.as_u16(),
+        retry_not_before_ns: retry_not_before_ns(
+            parts.status.as_u16(),
+            parts
+                .headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            observed_at_ns,
+        ),
+    }
+}
+
+fn note_tor_http_error(
+    error: zcash_client_backend::tor::Error,
+    status: u16,
+) -> zcash_client_backend::tor::Error {
+    let mut outcome = tor_http_error_outcome(&error, status);
+    let previous = zcashlc_tor_http_last_outcome();
+    if previous.http_status == status {
+        outcome.retry_not_before_ns = previous.retry_not_before_ns;
+    }
+    set_tor_http_outcome(outcome);
+    error
+}
+
+async fn tor_http_classified_response<R, Fut, B>(
+    max_bytes: usize,
+    timeout_ms: u64,
+    retry_filter: R,
+    request: impl FnOnce(TorHttpBodyGuard<R>) -> Fut,
+) -> (
+    anyhow::Result<http::Response<bytes::Bytes>>,
+    FfiTorHttpOutcome,
+)
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+    Fut: std::future::Future<
+            Output = Result<http::Response<TorHttpGetBody<B>>, zcash_client_backend::tor::Error>,
+        >,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
+{
+    let mut outcome = FfiTorHttpOutcome::default();
+    let operation = async {
+        let guard = TorHttpBodyGuard {
+            status: std::sync::Arc::new(SeenStatus::default()),
+            max_bytes,
+            retry_filter,
+        };
+        let head = guard.status.clone();
+        let response = request(guard).await.map_err(|error| {
+            outcome.kind = tor_http_error_outcome(&error, 0).kind;
+            error
+        })?;
+        let (parts, body) = response.into_parts();
+        outcome = http_head_outcome(
+            &parts,
+            head.observed_at_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let limit = if parts.status.is_success() {
+            max_bytes
+        } else {
+            TOR_HTTP_MAX_ERROR_BODY_BYTES
+        };
+        let body = match body {
+            TorHttpGetBody::Incoming(body) => collect_http_response_body_limited(body, limit)
+                .await
+                .inspect_err(|_| outcome.kind = 2)?,
+            TorHttpGetBody::Legacy { .. } => {
+                unreachable!("classified calls use the explicit native deadline")
+            }
+        };
+        if body.is_none() && parts.status.is_success() {
+            outcome.kind = 4;
+        }
+        within_response_limit(http::Response::from_parts(parts, body))
+    };
+    let result = with_http_timeout(timeout_ms, operation).await;
+    if let Err(error) = &result {
+        if error.is::<crate::tor::http::HttpDeadline>() {
+            outcome.kind = 1;
+        } else if outcome.kind == 0 {
+            outcome.kind = 3;
+        }
+    }
+    (result, outcome)
+}
+
+/// Makes a bounded, deadline-limited Tor POST with the existing unsent-only retry rule.
+///
+/// # Safety
+/// The runtime, URL, headers and body follow `zcashlc_tor_http_post_once_bounded`'s
+/// ownership rules. `outcome` must point to writable storage for one FfiTorHttpOutcome.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_once_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+    timeout_ms: u64,
+    outcome: *mut FfiTorHttpOutcome,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_classified_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            Some((body, body_len)),
+            0,
+            max_bytes,
+            timeout_ms,
+            outcome,
+        )
+    }
+}
+
+/// The bounded GET's additive structured-outcome companion; legacy GET APIs are unchanged.
+///
+/// # Safety
+/// Same ownership rules as `zcashlc_tor_http_get_with_timeout`. `outcome` must point
+/// to writable storage for one FfiTorHttpOutcome. `max_bytes` must not exceed isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_get_classified_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    retry_limit: u8,
+    max_bytes: usize,
+    timeout_ms: u64,
+    outcome: *mut FfiTorHttpOutcome,
+) -> *mut ffi::HttpResponseBytes {
+    unsafe {
+        tor_http_classified_impl(
+            tor_runtime,
+            url,
+            headers,
+            headers_len,
+            None,
+            retry_limit,
+            max_bytes,
+            timeout_ms,
+            outcome,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn tor_http_classified_impl(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    post: Option<(*const u8, usize)>,
+    retry_limit: u8,
+    max_bytes: usize,
+    timeout_ms: u64,
+    outcome: *mut FfiTorHttpOutcome,
+) -> *mut ffi::HttpResponseBytes {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let res = catch_panic(|| {
+        let outcome =
+            unsafe { outcome.as_mut() }.ok_or_else(|| anyhow!("Missing Tor HTTP outcome"))?;
+        *outcome = FfiTorHttpOutcome {
+            kind: 3,
+            ..Default::default()
+        };
+        anyhow::ensure!(timeout_ms > 0, "Tor HTTP timeout must be positive");
+        anyhow::ensure!(
+            max_bytes <= isize::MAX as usize,
+            "Invalid Tor HTTP response bound"
+        );
+        let runtime =
+            unsafe { tor_runtime.as_mut() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+        anyhow::ensure!(!url.is_null(), "A URL is required");
+        let url = unsafe { CStr::from_ptr(url) }
+            .to_str()?
+            .parse::<http::Uri>()?;
+        anyhow::ensure!(
+            matches!(url.scheme_str(), Some("http" | "https")),
+            "An HTTP URL is required"
+        );
+        anyhow::ensure!(
+            headers_len == 0 || !headers.is_null(),
+            "Headers are required"
+        );
+        let headers = if headers_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(headers, headers_len) }
+        };
+        let headers = headers
+            .iter()
+            .map(|header| {
+                anyhow::ensure!(
+                    !header.name.is_null() && !header.value.is_null(),
+                    "Invalid HTTP header"
+                );
+                Ok((
+                    http::header::HeaderName::from_bytes(
+                        unsafe { CStr::from_ptr(header.name) }.to_bytes(),
+                    )?,
+                    http::header::HeaderValue::from_bytes(
+                        unsafe { CStr::from_ptr(header.value) }.to_bytes(),
+                    )?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let add_headers = |builder: http::request::Builder| {
+            headers.iter().fold(builder, |builder, (name, value)| {
+                builder.header(name, value)
+            })
+        };
+        let client = runtime.client();
+        let (result, evidence) = if let Some((body, length)) = post {
+            anyhow::ensure!(length == 0 || !body.is_null(), "A request body is required");
+            let body = unsafe { tor::http::post_body(body, length) };
+            runtime.runtime().block_on(tor_http_classified_response(
+                max_bytes,
+                timeout_ms,
+                retry_if_unsent,
+                |guard| async move {
+                    client
+                        .http_post(
+                            url,
+                            add_headers,
+                            body,
+                            |body| guard.parse_get(body, true),
+                            TOR_HTTP_UNSENT_RETRIES,
+                            |result| guard.filter(result),
+                        )
+                        .await
+                },
+            ))
+        } else {
+            runtime.runtime().block_on(tor_http_classified_response(
+                max_bytes,
+                timeout_ms,
+                |result: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+                    result
+                        .is_err()
+                        .then_some(zcash_client_backend::tor::http::Retry::Same)
+                },
+                |guard| async move {
+                    client
+                        .http_get(
+                            url,
+                            add_headers,
+                            |body| guard.parse_get(body, true),
+                            retry_limit,
+                            |result| guard.filter(result),
+                        )
+                        .await
+                },
+            ))
+        };
+        *outcome = evidence;
+        ffi::HttpResponseBytes::from_rust(result?)
     });
     unwrap_exc_or_null(res)
 }
 
-async fn collect_http_response_body<B>(
-    body: B,
-) -> Result<bytes::Bytes, zcash_client_backend::tor::Error>
+/// Upper bound on a Tor HTTP response body, equal to `OHTTPTransport.maxRelayResponseBytes`
+/// (256 MiB sealed OHTTP response + 1 MiB framing overhead). The largest legitimate body on
+/// these calls is an OHTTP relay response; Sapling parameters (~48 MB) stay well below it.
+const TOR_HTTP_MAX_RESPONSE_BYTES: usize = (256 * 1024 * 1024) + (1024 * 1024);
+
+/// Bound on a non-2xx Tor HTTP response body (an error page), whatever the caller's limit; equal to
+/// `OHTTPTransport.maxErrorBodyBytes` on the clearnet path.
+const TOR_HTTP_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// The status of the last response the retry filter saw. `zcash_client_backend` hands the body
+/// collector the body only, but calls the retry filter with every response's status first, the
+/// final one included, so the collector can pick its bound from the status through this.
+#[derive(Default)]
+struct SeenStatus {
+    code: std::sync::atomic::AtomicU16,
+    observed_at_ns: std::sync::atomic::AtomicU64,
+}
+
+impl SeenStatus {
+    fn see(&self, res: &Result<http::StatusCode, &zcash_client_backend::tor::Error>) {
+        let code = res.as_ref().map_or(0, |status| status.as_u16());
+        self.code.store(code, std::sync::atomic::Ordering::Relaxed);
+        self.observed_at_ns.store(
+            slipstream_core::transport_health::monotonic_time_nanoseconds(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `max_bytes` for a 2xx answer (or when no status was seen), the fixed
+    /// [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] for any other status.
+    fn body_limit(&self, max_bytes: usize) -> usize {
+        match self.code.load(std::sync::atomic::Ordering::Relaxed) {
+            0 | 200..=299 => max_bytes,
+            _ => TOR_HTTP_MAX_ERROR_BODY_BYTES,
+        }
+    }
+}
+
+/// The response-body guard of a Tor HTTP call: the `retry_filter` and `parse_response` arguments
+/// every `zcashlc_tor_http_*` call hands `zcash_client_backend`, wired to one [`SeenStatus`].
+///
+/// The crate's `http_request` calls `retry_filter` with every response's status, the final one
+/// included, and only then hands that response's body to `parse_response`: [`Self::filter`]
+/// records the original head time. The parser returns the body immediately; collection
+/// below keeps that head metadata and the original body deadline. Backend retries finish
+/// before parse_response, so relocating body collection cannot change dispatch counts.
+struct TorHttpBodyGuard<R> {
+    status: std::sync::Arc<SeenStatus>,
+    max_bytes: usize,
+    retry_filter: R,
+}
+
+impl<R> TorHttpBodyGuard<R>
 where
-    B: BodyExt,
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+{
+    /// The crate's `retry_filter`: records the attempt's status, then applies the caller's retry
+    /// policy to it.
+    fn filter(
+        &self,
+        res: Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry> {
+        self.status.see(&res);
+        (self.retry_filter)(res)
+    }
+}
+
+enum TorHttpGetBody<B> {
+    Incoming(B),
+    Legacy {
+        body: B,
+        deadline: tokio::time::Instant,
+        limit: usize,
+    },
+}
+
+impl<R> TorHttpBodyGuard<R>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+{
+    async fn parse_get<B>(
+        &self,
+        body: B,
+        explicit_deadline: bool,
+    ) -> Result<TorHttpGetBody<B>, zcash_client_backend::tor::Error>
+    where
+        B: BodyExt<Data = bytes::Bytes> + Unpin,
+        HttpError: From<B::Error>,
+    {
+        if explicit_deadline {
+            // Return immediately from the backend's parser: its 60s timer must not own
+            // a body whose caller supplied a longer total deadline.
+            Ok(TorHttpGetBody::Incoming(body))
+        } else {
+            // Preserve the backend's 60s response-body deadline from parser admission.
+            // Returning the unread body keeps authenticated headers available on body failure.
+            Ok(TorHttpGetBody::Legacy {
+                body,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                limit: self.status.body_limit(self.max_bytes),
+            })
+        }
+    }
+}
+
+/// GET's parser boundary and total timer, shared by the native entry point and local transport tests.
+async fn tor_http_get_response<R, Fut, B>(
+    max_bytes: usize,
+    timeout_ms: Option<u64>,
+    retry_filter: R,
+    request: impl FnOnce(TorHttpBodyGuard<R>, bool) -> Fut,
+) -> anyhow::Result<http::Response<bytes::Bytes>>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+    Fut: std::future::Future<
+            Output = Result<http::Response<TorHttpGetBody<B>>, zcash_client_backend::tor::Error>,
+        >,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
+{
+    let operation = async {
+        let guard = TorHttpBodyGuard {
+            status: std::sync::Arc::new(SeenStatus::default()),
+            max_bytes,
+            retry_filter,
+        };
+        let status = guard.status.clone();
+        let (parts, body) = request(guard, timeout_ms.is_some())
+            .await
+            .map_err(|error| {
+                note_tor_http_error(
+                    error,
+                    status.code.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })?
+            .into_parts();
+        set_tor_http_outcome(http_head_outcome(
+            &parts,
+            status
+                .observed_at_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
+        let limit = if parts.status.is_success() {
+            max_bytes
+        } else {
+            TOR_HTTP_MAX_ERROR_BODY_BYTES
+        };
+        let collected = match body {
+            TorHttpGetBody::Incoming(body) => collect_http_response_body_limited(body, limit).await,
+            TorHttpGetBody::Legacy {
+                body,
+                deadline,
+                limit,
+            } => tokio::time::timeout_at(deadline, collect_http_response_body_limited(body, limit))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HttpError::Timeout(
+                        zcash_client_backend::tor::http::TimeoutPhase::ResponseBody,
+                    )
+                    .into())
+                }),
+        };
+        let body = collected.map_err(|error| note_tor_http_error(error, parts.status.as_u16()))?;
+        within_response_limit(http::Response::from_parts(parts, body))
+    };
+    let result = match timeout_ms {
+        Some(timeout_ms) => with_http_timeout(timeout_ms, operation).await,
+        None => operation.await,
+    };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<crate::tor::http::HttpDeadline>())
+    {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 1;
+        set_tor_http_outcome(outcome);
+    }
+    result
+}
+
+/// Runs one Tor HTTP request with the response-body guard shared by every `zcashlc_tor_http_*`
+/// call. `request` makes the call on `zcash_client_backend` with the guard it is given: it passes
+/// [`TorHttpBodyGuard::filter`] as the crate's `retry_filter` and [`TorHttpBodyGuard::parse_get`]
+/// as its `parse_response`, and returns the crate's response. A body that ran past its bound
+/// ([`collect_http_response_body_limited`] returned `None`) comes back as an empty body for a
+/// non-2xx answer and as an error for a 2xx one ([`within_response_limit`]).
+async fn tor_http_with_body_guard<R, Fut, B>(
+    max_bytes: usize,
+    retry_filter: R,
+    request: impl FnOnce(TorHttpBodyGuard<R>) -> Fut,
+) -> anyhow::Result<http::Response<bytes::Bytes>>
+where
+    R: Fn(
+        Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+    ) -> Option<zcash_client_backend::tor::http::Retry>,
+    Fut: std::future::Future<
+            Output = Result<http::Response<TorHttpGetBody<B>>, zcash_client_backend::tor::Error>,
+        >,
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
+    HttpError: From<B::Error>,
+{
+    tor_http_get_response(max_bytes, None, retry_filter, |guard, _| request(guard)).await
+}
+
+/// Reads a response body, counting bytes as frames arrive. Returns `Ok(None)` as soon as the
+/// body exceeds `max_bytes`, without reading the rest, so a hostile relay or server cannot
+/// make the device buffer an unbounded response.
+async fn collect_http_response_body_limited<B>(
+    body: B,
+    max_bytes: usize,
+) -> Result<Option<bytes::Bytes>, zcash_client_backend::tor::Error>
+where
+    B: BodyExt<Data = bytes::Bytes> + Unpin,
     HttpError: From<B::Error>,
 {
     #[cfg(test)]
-    crate::tor::http::network_tests::observe_body();
-    Ok(body.collect().await.map_err(HttpError::from)?.to_bytes())
+    crate::tor::http::network_tests::observe_body(max_bytes);
+    Ok(collect_body_limited(body, max_bytes)
+        .await
+        .map_err(HttpError::from)?)
+}
+
+async fn collect_body_limited<B, E>(
+    mut body: B,
+    max_bytes: usize,
+) -> Result<Option<bytes::Bytes>, E>
+where
+    B: BodyExt<Data = bytes::Bytes, Error = E> + Unpin,
+{
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if data.len() > max_bytes - out.len() {
+                return Ok(None);
+            }
+            out.extend_from_slice(data);
+        }
+    }
+    Ok(Some(bytes::Bytes::from(out)))
+}
+
+/// Fails the call when [`collect_http_response_body_limited`] stopped at the size limit, unless the
+/// answer is a non-2xx one (an error page): that answer stands by its status, and is returned with an
+/// empty body, as the Swift clearnet reader returns one it cut at its 64 KiB guard. The collector
+/// reads a non-2xx body up to [`TOR_HTTP_MAX_ERROR_BODY_BYTES`] only ([`SeenStatus`]).
+fn within_response_limit(
+    response: http::Response<Option<bytes::Bytes>>,
+) -> anyhow::Result<http::Response<bytes::Bytes>> {
+    let (parts, body) = response.into_parts();
+    let body = match body {
+        Some(body) => body,
+        None if !parts.status.is_success() => bytes::Bytes::new(),
+        None => {
+            set_tor_http_outcome(FfiTorHttpOutcome {
+                kind: 4,
+                http_status: parts.status.as_u16(),
+                retry_not_before_ns: 0,
+            });
+            anyhow::bail!("Tor HTTP response body exceeds {TOR_HTTP_MAX_RESPONSE_BYTES} bytes");
+        }
+    };
+    Ok(http::Response::from_parts(parts, body))
 }
 
 /// Makes an HTTP POST request over Tor.
@@ -4748,6 +5538,10 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
     // - using `*mut TorRuntime` and respecting mutability rules on the Swift side, to
     //   avoid observing the effects of a panic in another thread.
     // - discarding the `TorRuntime` whenever we get an error that is due to a panic.
+    set_tor_http_outcome(FfiTorHttpOutcome {
+        kind: 3,
+        ..Default::default()
+    });
     let tor_runtime = AssertUnwindSafe(tor_runtime);
 
     let res = catch_panic(|| {
@@ -4768,32 +5562,381 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body = unsafe { slice::from_raw_parts(body, body_len) };
+        let body = unsafe { tor::http::post_body(body, body_len) };
+        let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
+            res.is_err()
+                .then_some(zcash_client_backend::tor::http::Retry::Same)
+        };
 
-        let response = tor_runtime.runtime().block_on(async {
-            tor_runtime
-                .client()
-                .http_post(
-                    url,
-                    |builder| {
-                        headers.iter().fold(builder, |builder, (key, value)| {
-                            builder.header(*key, *value)
-                        })
-                    },
-                    http_body_util::Full::new(body),
-                    |body| async { Ok(body.collect().await.map_err(HttpError::from)?.to_bytes()) },
-                    retry_limit,
-                    |res| {
-                        res.is_err()
-                            .then_some(zcash_client_backend::tor::http::Retry::Same)
-                    },
-                )
-                .await
-        })?;
+        let client = tor_runtime.client();
+        let response = tor_runtime.runtime().block_on(tor_http_with_body_guard(
+            TOR_HTTP_MAX_RESPONSE_BYTES,
+            retry_filter,
+            |guard| async move {
+                client
+                    .http_post(
+                        url,
+                        |builder| {
+                            headers.iter().fold(builder, |builder, (key, value)| {
+                                builder.header(*key, *value)
+                            })
+                        },
+                        body,
+                        |body| guard.parse_get(body, false),
+                        retry_limit,
+                        |res| guard.filter(res),
+                    )
+                    .await
+            },
+        ))?;
 
         ffi::HttpResponseBytes::from_rust(response)
     });
+    if res.is_ok() {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
+    }
     unwrap_exc_or_null(res)
+}
+
+/// A response to an HTTP POST over Tor, read as it arrives.
+///
+/// Obtained from [`zcashlc_tor_http_post_stream`] and freed with
+/// [`zcashlc_free_tor_http_stream`], which closes the stream.
+pub struct TorHttpStream {
+    retry_not_before_ns: u64,
+    runtime: tor_rtcompat::PreferredRuntime,
+    status: u16,
+    headers: http::HeaderMap,
+    body: http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, HttpError>,
+    read: usize,
+    max_bytes: usize,
+}
+
+/// How often a request sent once ([`retry_if_unsent`]) tries again to reach the server.
+const TOR_HTTP_UNSENT_RETRIES: u8 = 2;
+
+/// Whether `error` came before any of the request was sent: opening the Tor stream (the only
+/// arti call of a request) or the TLS session to the server. Trying again then cannot replay it.
+fn failed_before_sending(error: &zcash_client_backend::tor::Error) -> bool {
+    use zcash_client_backend::tor::{
+        Error,
+        http::{HttpError, TimeoutPhase},
+    };
+    matches!(
+        error,
+        Error::Tor(_)
+            | Error::Http(HttpError::Timeout(TimeoutPhase::Connect))
+            | Error::Http(HttpError::Tls(_))
+    )
+}
+
+/// The retry rule of a request that must never be resent: a new isolated circuit when it failed
+/// before any of it was sent ([`failed_before_sending`]), no retry otherwise, whatever the answer.
+fn retry_if_unsent(
+    res: Result<http::StatusCode, &zcash_client_backend::tor::Error>,
+) -> Option<zcash_client_backend::tor::http::Retry> {
+    match res {
+        Err(e) if failed_before_sending(e) => {
+            Some(zcash_client_backend::tor::http::Retry::Isolated)
+        }
+        _ => None,
+    }
+}
+
+/// [`zcashlc_tor_http_stream_next`] returned body bytes.
+const TOR_HTTP_STREAM_DATA: u8 = 0;
+/// [`zcashlc_tor_http_stream_next`] waited and no body bytes came.
+const TOR_HTTP_STREAM_PENDING: u8 = 1;
+/// [`zcashlc_tor_http_stream_next`]: the body has ended.
+const TOR_HTTP_STREAM_END: u8 = 2;
+
+/// Makes an HTTP POST request over Tor and returns as soon as the response head has arrived,
+/// with the body still to be read by [`zcashlc_tor_http_stream_next`].
+///
+/// The request is sent once: never resent, since a resent body may be a replay. Only a failure
+/// to open the Tor stream or the TLS session to the server, before any of the request has left
+/// the device, is tried again, twice at most, each time on a new isolated circuit. The client's
+/// connect and request timeouts bound the wait for the head; the body has no overall deadline,
+/// the caller decides how long it reads. The body may be at most `max_bytes` long: a read
+/// beyond it fails.
+///
+/// Returns null on failure; the result is freed with [`zcashlc_free_tor_http_stream`].
+///
+/// # Safety
+///
+/// Same safety requirements as `zcashlc_tor_http_post`, plus:
+/// - `max_bytes` must not exceed `isize::MAX`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_post_stream(
+    tor_runtime: *mut TorRuntime,
+    url: *const c_char,
+    headers: *const ffi::HttpRequestHeader,
+    headers_len: usize,
+    body: *const u8,
+    body_len: usize,
+    max_bytes: usize,
+) -> *mut TorHttpStream {
+    set_tor_http_outcome(FfiTorHttpOutcome {
+        kind: 3,
+        ..Default::default()
+    });
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+
+    let res =
+        catch_panic(|| {
+            let tor_runtime = unsafe { tor_runtime.as_mut() }
+                .ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+
+            let url = unsafe { CStr::from_ptr(url).to_str()? }
+                .try_into()
+                .map_err(|e| anyhow!("Invalid URL: {e}"))?;
+
+            let headers = unsafe { slice::from_raw_parts(headers, headers_len) }
+                .iter()
+                .map(|header| {
+                    anyhow::Ok((
+                        unsafe { CStr::from_ptr(header.name) }.to_str()?,
+                        unsafe { CStr::from_ptr(header.value) }.to_str()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let body_data = if body_len == 0 {
+                bytes::Bytes::new()
+            } else {
+                bytes::Bytes::copy_from_slice(unsafe { slice::from_raw_parts(body, body_len) })
+            };
+
+            let head = SeenStatus::default();
+            let response =
+                tor_runtime
+                    .runtime()
+                    .block_on(async {
+                        tor_runtime
+                    .client()
+                    .http_post(
+                        url,
+                        |builder| {
+                            headers.iter().fold(builder, |builder, (key, value)| {
+                                builder.header(*key, *value)
+                            })
+                        },
+                        http_body_util::Full::new(body_data),
+                        |body| async move { Ok(body.map_err(HttpError::from).boxed_unsync()) },
+                        TOR_HTTP_UNSENT_RETRIES,
+                        |result| { head.see(&result); retry_if_unsent(result) },
+                    )
+                    .await
+                    })
+                    .map_err(|error| note_tor_http_error(error, 0))?;
+
+            let (parts, body) = response.into_parts();
+            set_tor_http_outcome(http_head_outcome(
+                &parts,
+                head.observed_at_ns
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            Ok(Box::into_raw(Box::new(TorHttpStream {
+                retry_not_before_ns: http_head_outcome(
+                    &parts,
+                    head.observed_at_ns
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .retry_not_before_ns,
+                runtime: tor_runtime.runtime().clone(),
+                status: parts.status.as_u16(),
+                headers: parts.headers,
+                body,
+                read: 0,
+                max_bytes,
+            })))
+        });
+    if res.is_ok() {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
+    }
+    unwrap_exc_or_null(res)
+}
+
+/// The status of the response `stream` reads.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_status(stream: *const TorHttpStream) -> u16 {
+    unsafe { stream.as_ref() }.map_or(0, |stream| stream.status)
+}
+
+/// The value of the response header `name` (NUL-terminated, case-insensitive) of `stream`, or
+/// null when the response has none or it is not text. The string is freed with
+/// `zcashlc_string_free`.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+/// - `name` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_header(
+    stream: *const TorHttpStream,
+    name: *const c_char,
+) -> *mut c_char {
+    let stream = AssertUnwindSafe(stream);
+
+    let res = catch_panic(|| {
+        let stream =
+            unsafe { stream.as_ref() }.ok_or_else(|| anyhow!("A Tor HTTP stream is required"))?;
+        let name = unsafe { CStr::from_ptr(name) }.to_str()?;
+        match stream
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) => Ok(CString::new(value)?.into_raw()),
+            None => Ok(std::ptr::null_mut()),
+        }
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Waits up to `wait_ms` milliseconds for the next body bytes of `stream`.
+///
+/// Sets `*state` to 0 and returns the bytes when some came, to 1 with an empty slice when none
+/// came in time (the stream is still open), and to 2 with an empty slice when the body has
+/// ended. Returns null on failure (the connection broke or a 2xx body went beyond its limit);
+/// the stream must then only be freed. A non-2xx body ends at 64 KiB: the read that reaches that
+/// size returns its bytes with state 2, and no further frame is awaited. The result is freed
+/// with `zcashlc_free_boxed_slice`.
+///
+/// # Safety
+///
+/// - `stream` must be a non-null pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed, and must not be passed to two calls at the same time.
+/// - `state` must be non-null and valid for writes of one byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_http_stream_next(
+    stream: *mut TorHttpStream,
+    wait_ms: u64,
+    state: *mut u8,
+) -> *mut ffi::BoxedSlice {
+    set_tor_http_outcome(FfiTorHttpOutcome {
+        kind: 3,
+        ..Default::default()
+    });
+    let stream = AssertUnwindSafe(stream);
+    let state = AssertUnwindSafe(state);
+
+    let res = catch_panic(|| {
+        let stream =
+            unsafe { stream.as_mut() }.ok_or_else(|| anyhow!("A Tor HTTP stream is required"))?;
+        let state =
+            unsafe { state.as_mut() }.ok_or_else(|| anyhow!("A stream state is required"))?;
+
+        let TorHttpStream {
+            retry_not_before_ns,
+            runtime,
+            status,
+            body,
+            read,
+            max_bytes,
+            ..
+        } = stream;
+        let is_error = *status < 200 || *status >= 300;
+        let effective_limit = if is_error {
+            TOR_HTTP_MAX_ERROR_BODY_BYTES
+        } else {
+            *max_bytes
+        };
+        if is_error && *read >= effective_limit {
+            // An error body that has reached the 64 KiB guard has ended: no further frame is
+            // awaited, so a peer that pauses at the cap cannot hold the classifier back.
+            *state = TOR_HTTP_STREAM_END;
+            return Ok(ffi::BoxedSlice::none());
+        }
+        let next = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(wait_ms), body.frame()).await
+        });
+        match next {
+            Err(_) => {
+                *state = TOR_HTTP_STREAM_PENDING;
+                Ok(ffi::BoxedSlice::none())
+            }
+            Ok(None) => {
+                *state = TOR_HTTP_STREAM_END;
+                Ok(ffi::BoxedSlice::none())
+            }
+            Ok(Some(frame)) => {
+                let frame = frame.map_err(|error| {
+                    set_tor_http_outcome(FfiTorHttpOutcome {
+                        kind: 2,
+                        http_status: *status,
+                        retry_not_before_ns: *retry_not_before_ns,
+                    });
+                    error
+                })?;
+                match frame.into_data() {
+                    Ok(data) if !data.is_empty() => {
+                        let remaining = effective_limit.saturating_sub(*read);
+                        if data.len() > remaining && !is_error {
+                            // A success body past the caller's ceiling fails the call: the
+                            // client must not accept a truncated sealed response.
+                            set_tor_http_outcome(FfiTorHttpOutcome {
+                                kind: 4,
+                                http_status: *status,
+                                retry_not_before_ns: *retry_not_before_ns,
+                            });
+                            return Err(anyhow!(
+                                "Tor HTTP response body exceeds {max_bytes} bytes"
+                            ));
+                        }
+                        if is_error && data.len() >= remaining {
+                            // An error body (non-2xx) ends at the 64 KiB guard: return the bytes
+                            // up to the cap and mark END in the same call, also when a frame fills
+                            // the cap exactly, so the status and headers reach the classifier (key
+                            // refetch on 400/422, HTTP status on 429/503) without waiting for a
+                            // frame that may never come, and without a size error (ZIP #10).
+                            let truncated = &data[..remaining];
+                            *read += truncated.len();
+                            *state = TOR_HTTP_STREAM_END;
+                            Ok(ffi::BoxedSlice::some(truncated.to_vec()))
+                        } else {
+                            *read += data.len();
+                            *state = TOR_HTTP_STREAM_DATA;
+                            Ok(ffi::BoxedSlice::some(data.to_vec()))
+                        }
+                    }
+                    _ => {
+                        *state = TOR_HTTP_STREAM_PENDING;
+                        Ok(ffi::BoxedSlice::none())
+                    }
+                }
+            }
+        }
+    });
+    if res.is_ok() {
+        let mut outcome = zcashlc_tor_http_last_outcome();
+        outcome.kind = 0;
+        set_tor_http_outcome(outcome);
+    }
+    unwrap_exc_or_null(res)
+}
+
+/// Frees a [`TorHttpStream`], closing it if its body has not ended.
+///
+/// # Safety
+///
+/// - `stream` must be null or a pointer returned by [`zcashlc_tor_http_post_stream`] that has
+///   not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_free_tor_http_stream(stream: *mut TorHttpStream) {
+    if !stream.is_null() {
+        drop(unsafe { Box::from_raw(stream) });
+    }
 }
 
 /// Fetches the current ZEC-USD exchange rate over Tor.
@@ -5014,6 +6157,35 @@ pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd(
         Ok(Box::into_raw(Box::new(lwd_conn)))
     });
     unwrap_exc_or_null(res)
+}
+
+/// Creates an isolated submission connection with one remaining monotonic budget in milliseconds.
+/// Setup, latest-block reads, submission and transaction lookup share that deadline. The connection
+/// owns the executor of its writer tasks: freeing it retires those tasks before returning.
+/// Ordinary connections and streaming calls keep their existing timeout behavior.
+///
+/// # Safety
+///
+/// The pointer, string and exclusive-access requirements of
+/// [`zcashlc_tor_connect_to_lightwalletd`] apply. Free the result with
+/// [`zcashlc_free_tor_lwd_conn`]. A zero timeout fails without connecting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    endpoint: *const c_char,
+    timeout_ms: u64,
+) -> *mut tor::LwdConn {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let result = catch_panic(|| {
+        let runtime =
+            unsafe { tor_runtime.as_ref() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+        let endpoint = unsafe { CStr::from_ptr(endpoint).to_str()? }
+            .try_into()
+            .map_err(|error| anyhow!("Invalid lightwalletd endpoint: {error}"))?;
+        let connection = runtime.connect_to_lightwalletd_with_timeout(endpoint, timeout_ms)?;
+        Ok(Box::into_raw(Box::new(connection)))
+    });
+    unwrap_exc_or_null(result)
 }
 
 /// Frees a Tor lightwalletd connection.
@@ -5491,6 +6663,206 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
     });
 
     unwrap_exc_or_null(res)
+}
+
+/// Selects the single-use transparent address most overdue for a check: exposed in the past day,
+/// not yet funded, with no check scheduled in the future. The caller fetches its transactions over
+/// its own transport, stores them with [`zcashlc_decrypt_and_store_transaction`] and, when there
+/// were none, calls [`zcashlc_schedule_single_use_taddr_check`]. This is the wallet half of
+/// [`zcashlc_tor_lwd_conn_check_single_use_taddr`].
+///
+/// Returns a [`ffi::TransparentAddressCheck`] if successful, or a null pointer in the case of an
+/// error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - Call [`ffi::zcashlc_free_transparent_address_check`] to free the memory associated with the
+///   returned pointer when done using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_single_use_taddr_to_check(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+) -> *mut ffi::TransparentAddressCheck {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        // The look-back is measured from the chain tip across target-spacing changes.
+        let cur_height = db_data
+            .chain_height()?
+            .ok_or(SqliteClientError::ChainHeightUnknown)?;
+        let max_exposure_depth = single_use_taddr_exposure_depth(&network, cur_height);
+        let addrs =
+            db_data.get_ephemeral_transparent_receivers(account_uuid, max_exposure_depth, true)?;
+
+        // pick the address with the minimum check time that is less than or equal to now (or
+        // absent)
+        let now = SystemTime::now();
+        let selected_addr_meta = addrs
+            .into_iter()
+            .filter(|(_, meta)| {
+                meta.next_check_time().iter().all(|t| t <= &now)
+                    && matches!(meta.exposure(), Exposure::Exposed { .. })
+            })
+            .min_by_key(|(_, meta)| meta.next_check_time());
+
+        let Some((addr, meta)) = selected_addr_meta else {
+            return Ok(ffi::TransparentAddressCheck::from_rust(&network, None));
+        };
+        let start = match meta.exposure() {
+            Exposure::Exposed { at_height, .. } => at_height,
+            Exposure::Unknown | Exposure::CannotKnow => {
+                panic!("unexposed addresses should have already been filtered out");
+            }
+        };
+
+        Ok(ffi::TransparentAddressCheck::from_rust(
+            &network,
+            Some((addr, u32::from(start), u32::from(cur_height + 1))),
+        ))
+    });
+
+    unwrap_exc_or_null(res)
+}
+
+/// Schedules the next check of a single-use transparent address whose check found nothing, after
+/// approximately log2(blocks since exposure) additional blocks (exponential back-off).
+///
+/// Returns `true` on success, `false` on error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_schedule_single_use_taddr_check(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> bool {
+    let res = catch_panic(|| unsafe {
+        schedule_single_use_taddr_check_with_rng(
+            system_rng(),
+            db_data,
+            db_data_len,
+            network_id,
+            account_uuid_bytes,
+            address,
+        )
+    });
+    unwrap_exc_or(res, false)
+}
+
+/// The OHTTP wallet scheduling operation, with randomness supplied at the FFI boundary.
+///
+/// # Safety
+///
+/// The pointer arguments follow `zcashlc_schedule_single_use_taddr_check`'s contract.
+unsafe fn schedule_single_use_taddr_check_with_rng(
+    rng: impl rand::CryptoRng,
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> anyhow::Result<bool> {
+    let network = parse_network(network_id)?;
+    let mut db_data = unsafe { wallet_db(rng, db_data, db_data_len, network)? };
+    let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+    let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+    let addr = TransparentAddress::decode(&network, addr_str)?;
+
+    let cur_height = db_data
+        .chain_height()?
+        .ok_or(SqliteClientError::ChainHeightUnknown)?;
+    let meta = db_data
+        .get_transparent_address_metadata(account_uuid, &addr)?
+        .ok_or_else(|| anyhow!("{addr_str} is not an address of the account"))?;
+
+    let blocks_since_exposure = match meta.exposure() {
+        Exposure::Exposed { at_height, .. } => f64::from(std::cmp::max(cur_height - at_height, 1)),
+        Exposure::Unknown => 1.0,
+        Exposure::CannotKnow => 1.0,
+    };
+
+    // We will schedule the next check to occur after approximately
+    // log2(blocks_since_exposure) additional blocks.
+    let offset_blocks = blocks_since_exposure.log2();
+    let offset_seconds = single_use_taddr_check_offset_seconds(&network, cur_height, offset_blocks);
+    db_data.schedule_next_check(&addr, offset_seconds)?;
+
+    Ok(true)
+}
+
+/// The height from which UTXOs of `address` are looked for: its exposure height when known, else
+/// the birthday of the account. This is the wallet half of [`zcashlc_tor_lwd_conn_fetch_utxos_by_address`];
+/// the UTXOs found are stored with [`zcashlc_put_utxo`].
+///
+/// Returns the height, `-1` when `address` is not one of the account's, or `-2` in the case of an
+/// error.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`. See the safety
+///   documentation of pointer::offset.
+/// - `account_uuid_bytes` must be non-null and valid for reads for 16 bytes, and it must have an
+///   alignment of `1`.
+/// - `address` must be non-null and must point to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_transparent_address_utxo_start_height(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    account_uuid_bytes: *const u8,
+    address: *const c_char,
+) -> i64 {
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
+        let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
+
+        let addr_str = unsafe { CStr::from_ptr(address).to_str()? };
+        let addr = TransparentAddress::decode(&network, addr_str)?;
+
+        let Some(meta) = db_data.get_transparent_address_metadata(account_uuid, &addr)? else {
+            return Ok(-1);
+        };
+        let start = match meta.exposure() {
+            Exposure::Exposed { at_height, .. } => at_height,
+            Exposure::Unknown | Exposure::CannotKnow => {
+                db_data.get_account_birthday(account_uuid)?
+            }
+        };
+
+        Ok(i64::from(u32::from(start)))
+    });
+
+    unwrap_exc_or(res, -2)
 }
 
 //
@@ -5987,59 +7359,60 @@ mod tests {
         );
     }
 
-    /// [MOB-2184] Only the stop a host makes right before it changes the wallet asks the running
-    /// session to end at its next block; a plain stop leaves that request alone. Both stamp the
-    /// stop for tip freshness, and both are quiescent on a handle with no pass running.
+    /// Both FFI stops request interruption, preserve that request across passes, and can stop
+    /// again after a new session re-arms the engine. Neither needs a network session to prove it.
     #[test]
-    fn only_the_wallet_change_stop_asks_the_scan_to_stop() {
-        let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
-        // A handle dials nothing until a pass is spawned. Port 9 is the discard port, so a stray
-        // connection would fail fast.
-        let host = "127.0.0.1";
-        let handle = unsafe {
-            zcashlc_slipstream_open(
-                db_path.as_ptr(),
-                db_path.len(),
-                host.as_ptr(),
-                host.len(),
-                9,
-                false,
-                NETWORK_ID_TESTNET,
-                0, // unknown physical memory
-            )
-        };
-        assert!(!handle.is_null(), "the handle must open");
-        // Each look at the handle is a fresh shared borrow, taken only while no FFI call has it.
-        let stop_requested = || unsafe { &*handle }.inner.progress.stop_requested();
-        let stamped = || unsafe { &*handle }.last_stop_at.lock().unwrap().is_some();
+    fn both_stop_entry_points_request_interruption_and_rearm_for_restart() {
+        let stops: [unsafe extern "C" fn(*mut SlipstreamHandle) -> FfiSlipstreamStopReport; 2] = [
+            zcashlc_slipstream_stop,
+            zcashlc_slipstream_stop_for_wallet_change,
+        ];
+        for stop in stops {
+            let (_dir, db_path) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+            // A handle dials nothing until a pass is spawned. Port 9 makes a stray connection fail.
+            let host = "127.0.0.1";
+            let handle = unsafe {
+                zcashlc_slipstream_open(
+                    db_path.as_ptr(),
+                    db_path.len(),
+                    host.as_ptr(),
+                    host.len(),
+                    9,
+                    false,
+                    NETWORK_ID_TESTNET,
+                    0,
+                )
+            };
+            assert!(!handle.is_null(), "the handle must open");
+            // Each look is a fresh shared borrow, never held across an FFI call's mutable borrow.
+            assert!(!unsafe { &*handle }.inner.progress.stop_requested());
 
-        let report = unsafe { zcashlc_slipstream_stop(handle) };
-        assert_eq!((report.settled, report.drained), (1, 1), "{report:?}");
-        assert!(
-            !stop_requested(),
-            "a plain stop must not ask the scan to stop early"
-        );
-        assert!(stamped(), "the plain stop stamps the stop");
+            let report = unsafe { stop(handle) };
+            assert_eq!((report.settled, report.drained), (1, 1));
+            assert!(unsafe { &*handle }.inner.progress.stop_requested());
+            assert!(unsafe { &*handle }.last_stop_at.lock().unwrap().is_some());
 
-        *unsafe { &*handle }.last_stop_at.lock().unwrap() = None;
-        let report = unsafe { zcashlc_slipstream_stop_for_wallet_change(handle) };
-        assert_eq!((report.settled, report.drained), (1, 1), "{report:?}");
-        assert!(
-            stop_requested(),
-            "a stop for a wallet change must ask the running session to stop at its next block"
-        );
-        assert!(
-            stamped(),
-            "the stop for a wallet change stamps the stop too"
-        );
+            unsafe { &*handle }.inner.progress.begin_pass();
+            assert!(
+                unsafe { &*handle }.inner.progress.stop_requested(),
+                "a new pass must preserve the session's stop request"
+            );
+            unsafe { &*handle }.inner.progress.begin_session();
+            assert!(
+                !unsafe { &*handle }.inner.progress.stop_requested(),
+                "a new session must clear the effect of the previous stop"
+            );
 
-        unsafe { zcashlc_slipstream_free(handle) };
+            *unsafe { &*handle }.last_stop_at.lock().unwrap() = None;
+            let report = unsafe { stop(handle) };
+            assert_eq!((report.settled, report.drained), (1, 1));
+            assert!(unsafe { &*handle }.inner.progress.stop_requested());
+            assert!(unsafe { &*handle }.last_stop_at.lock().unwrap().is_some());
 
-        assert_eq!(
-            unsafe { zcashlc_slipstream_stop_for_wallet_change(std::ptr::null_mut()) },
-            FfiSlipstreamStopReport::default(),
-            "a stop that cannot run reports neither wait as finished"
-        );
+            unsafe { zcashlc_slipstream_free(handle) };
+            let null_report = unsafe { stop(std::ptr::null_mut()) };
+            assert_eq!(null_report, FfiSlipstreamStopReport::default());
+        }
     }
 
     /// A transaction the wallet never stored, such as one `decrypt_and_store_transaction` skipped
@@ -7374,6 +8747,191 @@ mod tests {
 
 use slipstream_core::ffi_handle::SyncState;
 
+/// One-shot startup capability, independent of the exclusively borrowed Slipstream handle.
+/// Retain until start returns; cancel/snapshot may race start and each other. Free is exclusive.
+pub struct FfiSlipstreamTorStartupV1 {
+    control: slipstream_core::TorStartupControl,
+    claimed: std::sync::atomic::AtomicBool,
+    terminal_status: std::sync::Mutex<Option<u32>>,
+}
+
+/// Retained startup status for one immutable generation. Status values match ZCASHLC_TOR_STARTUP_*.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiSlipstreamTorStartupSnapshotV1 {
+    pub generation: u64,
+    pub status: u32,
+}
+
+impl FfiSlipstreamTorStartupV1 {
+    fn observe_terminal(&self, terminal: &mut Option<u32>) -> u32 {
+        use slipstream_core::TorStartupPhase;
+        if let Some(status) = *terminal {
+            return status;
+        }
+        let mut snapshot = self.control.snapshot();
+        let expired = tokio::time::Instant::now() >= self.control.deadline();
+        if snapshot.phase == TorStartupPhase::Starting && expired {
+            // A native completion before the deadline takes precedence over an older read.
+            snapshot = self.control.snapshot();
+        }
+        let status = match snapshot.phase {
+            TorStartupPhase::Starting if expired => ZCASHLC_TOR_STARTUP_TIMED_OUT,
+            TorStartupPhase::Starting => ZCASHLC_TOR_STARTUP_PENDING,
+            TorStartupPhase::Ready => ZCASHLC_TOR_STARTUP_READY,
+            TorStartupPhase::Failed => ZCASHLC_TOR_STARTUP_FAILED,
+            TorStartupPhase::TimedOut => ZCASHLC_TOR_STARTUP_TIMED_OUT,
+            TorStartupPhase::Cancelled => ZCASHLC_TOR_STARTUP_CANCELLED,
+        };
+        if status != ZCASHLC_TOR_STARTUP_PENDING {
+            *terminal = Some(status);
+        }
+        status
+    }
+
+    fn snapshot(&self) -> FfiSlipstreamTorStartupSnapshotV1 {
+        let mut terminal = self
+            .terminal_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        FfiSlipstreamTorStartupSnapshotV1 {
+            generation: self.control.snapshot().generation,
+            status: self.observe_terminal(&mut terminal),
+        }
+    }
+
+    fn claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn fail_admission(&self) {
+        // Commit includes the decision: cancellation cannot publish between the read and write.
+        #[cfg(test)]
+        tor_startup_ffi_tests::before_admission_commit();
+        let mut terminal = self
+            .terminal_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.observe_terminal(&mut terminal) == ZCASHLC_TOR_STARTUP_PENDING {
+            *terminal = Some(ZCASHLC_TOR_STARTUP_FAILED);
+        }
+    }
+}
+
+/// Establishes a monotonic deadline before admission. Null indicates an unrepresentable budget.
+/// Free the returned capability with zcashlc_slipstream_tor_startup_free_v1.
+#[unsafe(no_mangle)]
+pub extern "C" fn zcashlc_slipstream_tor_startup_begin_v1(
+    generation: u64,
+    remaining_ms: u64,
+) -> *mut FfiSlipstreamTorStartupV1 {
+    let now = tokio::time::Instant::now();
+    let Some(deadline) = now.checked_add(std::time::Duration::from_millis(remaining_ms)) else {
+        return std::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(FfiSlipstreamTorStartupV1 {
+        control: slipstream_core::TorStartupControl::new(generation, deadline),
+        claimed: std::sync::atomic::AtomicBool::new(false),
+        terminal_status: std::sync::Mutex::new(None),
+    }))
+}
+
+/// Immediately wakes native bootstrap/admission. A Ready session still requires ordinary stop.
+/// # Safety
+/// Capability must be null or live. May race snapshot/start/cancel; never free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_cancel_v1(
+    startup: *const FfiSlipstreamTorStartupV1,
+) {
+    if let Some(startup) = unsafe { startup.as_ref() } {
+        let mut terminal = startup
+            .terminal_status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match startup.observe_terminal(&mut terminal) {
+            ZCASHLC_TOR_STARTUP_PENDING => {
+                startup.control.cancel();
+                startup.observe_terminal(&mut terminal);
+            }
+            ZCASHLC_TOR_STARTUP_TIMED_OUT => {
+                // Wake unfinished native work without reclassifying an exposed timeout.
+                startup.control.cancel();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read retained status without touching the exclusively borrowed engine handle.
+/// # Safety
+/// Capability must be null or live. May race snapshot/start/cancel; never free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_snapshot_v1(
+    startup: *const FfiSlipstreamTorStartupV1,
+) -> FfiSlipstreamTorStartupSnapshotV1 {
+    unsafe { startup.as_ref() }.map_or(
+        FfiSlipstreamTorStartupSnapshotV1 {
+            generation: 0,
+            status: ZCASHLC_TOR_STARTUP_INVALID,
+        },
+        FfiSlipstreamTorStartupV1::snapshot,
+    )
+}
+
+/// Releases caller ownership. The engine keeps its clone until replaced/freed; this does not stop it.
+/// # Safety
+/// Capability must be null or live; no other capability call or start may use it during/after free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_free_v1(
+    startup: *mut FfiSlipstreamTorStartupV1,
+) {
+    if !startup.is_null() {
+        drop(unsafe { Box::from_raw(startup) });
+    }
+}
+
+/// Opt-in bounded Tor start. The capability supplies generation and deadline; each is one-shot.
+/// Returns false for reused/stale/cancelled/expired capabilities without disturbing the active pass.
+/// Retained capability status reports startup, independently of legacy progress/error snapshots.
+/// # Safety
+/// Same handle/directory/UFVK rules as zcashlc_slipstream_start. Capability must be live through
+/// this call; only capability cancel/snapshot may run concurrently. Handle calls remain exclusive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_slipstream_start_v2(
+    handle: *mut SlipstreamHandle,
+    ufvk: *const u8,
+    ufvk_len: usize,
+    birthday_height: u64,
+    tor_dir: *const u8,
+    tor_dir_len: usize,
+    startup: *const FfiSlipstreamTorStartupV1,
+) -> bool {
+    let Some(startup) = (unsafe { startup.as_ref() }) else {
+        return false;
+    };
+    if !startup.claim() {
+        return false;
+    }
+    unsafe {
+        start_slipstream(
+            handle,
+            ufvk,
+            ufvk_len,
+            birthday_height,
+            tor_dir,
+            tor_dir_len,
+            Some(startup),
+        )
+    }
+}
+
 /// Opaque handle to a Slipstream engine instance.
 ///
 /// Wraps [`slipstream_core::ffi_handle::SlipstreamHandle`] as a crate-local newtype so
@@ -7383,6 +8941,8 @@ use slipstream_core::ffi_handle::SyncState;
 /// All state is stored in `inner`; the six `zcashlc_slipstream_*` functions delegate
 /// directly to it.
 pub struct SlipstreamHandle {
+    tor_startup: Option<slipstream_core::TorStartupControl>,
+    tor_startup_generation: Option<u64>,
     inner: slipstream_core::ffi_handle::SlipstreamHandle,
     /// [API v2.1 E-1] Upstream-summary cache: the expensive `get_wallet_summary` walk is
     /// rationed HERE (engine-side), so hosts may call the unified summary whenever they
@@ -7742,6 +9302,8 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
         tracing::info!(total_memory_bytes, "slipstream handle opened");
 
         Ok(Box::into_raw(Box::new(SlipstreamHandle {
+            tor_startup: None,
+            tor_startup_generation: None,
             inner,
             summary_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             summary_refresh_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
@@ -7899,11 +9461,56 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
     tor_dir: *const u8,
     tor_dir_len: usize,
 ) -> bool {
+    unsafe {
+        start_slipstream(
+            handle,
+            ufvk,
+            ufvk_len,
+            birthday_height,
+            tor_dir,
+            tor_dir_len,
+            None,
+        )
+    }
+}
+
+unsafe fn start_slipstream(
+    handle: *mut SlipstreamHandle,
+    ufvk: *const u8,
+    ufvk_len: usize,
+    birthday_height: u64,
+    tor_dir: *const u8,
+    tor_dir_len: usize,
+    startup: Option<&FfiSlipstreamTorStartupV1>,
+) -> bool {
     // SAFETY: callers must respect mutability rules on the Swift side so that observing
     // a panic from another thread does not leave the handle in an inconsistent state.
     let handle = AssertUnwindSafe(handle);
     let res = catch_panic(|| {
         let handle = unsafe { handle.as_mut() }.ok_or_else(|| anyhow!("null handle"))?;
+
+        if let Some(startup) = startup {
+            if startup.snapshot().status != ZCASHLC_TOR_STARTUP_PENDING
+                || tor_dir.is_null()
+                || tor_dir_len == 0
+            {
+                return Ok(false);
+            }
+            if handle
+                .tor_startup_generation
+                .is_some_and(|generation| startup.control.snapshot().generation <= generation)
+            {
+                startup.control.cancel();
+                return Ok(false);
+            }
+        }
+        if let Some(previous) = handle.tor_startup.take() {
+            previous.cancel();
+        }
+        if let Some(startup) = startup {
+            handle.tor_startup = Some(startup.control.clone());
+            handle.tor_startup_generation = Some(startup.control.snapshot().generation);
+        }
 
         // [API v2.1 E-2] Tip-freshness bookkeeping (shouldMarkChainTipUpdated parity):
         // capture the refresh-counter baseline BEFORE the pass starts — a later advance
@@ -8101,19 +9708,30 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         // + a tag=4/value=2 event instead of a silent death stuck at "Syncing" forever.
         let sup_state = std::sync::Arc::clone(&h.state);
         let sup_events = std::sync::Arc::clone(&h.events);
+        if startup.is_some_and(|startup| startup.snapshot().status != ZCASHLC_TOR_STARTUP_PENDING) {
+            *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Error(2);
+            return Ok(false);
+        }
         h.task = Some(slipstream_core::ffi_handle::spawn_supervised(
             &h.runtime,
-            slipstream_core::session::run_session(
+            slipstream_core::session::run_session_with_tor_startup(
                 session_config,
                 reporter,
                 std::sync::Arc::clone(&h.pass_lock),
+                handle.tor_startup.clone(),
             ),
             sup_state,
             sup_events,
         ));
         Ok(true)
     });
-    unwrap_exc_or(res, false)
+    let success = unwrap_exc_or(res, false);
+    if !success {
+        if let Some(startup) = startup {
+            startup.fail_admission();
+        }
+    }
+    success
 }
 
 /// Stops any in-flight Slipstream sync and waits, bounded, for the wallet file to fall quiet.
@@ -8128,9 +9746,9 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
 /// instance, returns all zeros, which is not quiescent. The handle remains live; poll
 /// [`zcashlc_slipstream_snapshot`] to confirm state transitions to idle.
 ///
-/// This is the plain stop (backgrounding, shutdown): a scan call in progress runs to its end, by
-/// default the end of its chunk, before the abort reaches it. Right before changing the wallet,
-/// stop with [`zcashlc_slipstream_stop_for_wallet_change`] instead.
+/// Both stop entry points request scan interruption between blocks. Unfinished scan work is
+/// retried by the next session. This entry point expresses backgrounding or shutdown intent;
+/// right before changing the wallet, use [`zcashlc_slipstream_stop_for_wallet_change`].
 ///
 /// # Safety
 ///
@@ -8151,10 +9769,10 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(
 ///
 /// [MOB-2184] Call this, not [`zcashlc_slipstream_stop`], right before changing the wallet (adding
 /// or removing an account, a rewind, a wipe, or reopening a handle on the same wallet), and refuse
-/// the change unless `settled` and `drained` are both 1. A plain stop lets a scan call in progress
-/// run to the end of its chunk first, which can outlast the ten-second budget when accounts are
-/// added in quick succession. This one ends the scan at its next block, without writing anything
-/// for the scan call it interrupted, and the next session scans those blocks again.
+/// the change unless `settled` and `drained` are both 1. Both entry points request interruption
+/// between blocks, without writing unfinished scan work, which the next session retries. This
+/// entry point identifies the host's intent to change the wallet; interruption alone does not
+/// prove quiescence.
 ///
 /// # Safety
 ///
@@ -8191,6 +9809,9 @@ unsafe fn stop_slipstream(
     let handle = AssertUnwindSafe(handle);
     let res = catch_panic(|| {
         let handle = unsafe { handle.as_mut() }.ok_or_else(|| anyhow!("null handle"))?;
+        if let Some(startup) = &handle.tor_startup {
+            startup.cancel();
+        }
         // [API v2.1 E-2] Stamp the stop: a start() within `tip_fresh_stop_window` keeps tip
         // freshness (quick background hop; parity with `SDKFlags.sdkStarted()` before NU7, which
         // keeps a flat 120 s window); a longer gap re-masks.
@@ -8416,7 +10037,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_restore_anchor(
         let anchor = runtime.block_on(async {
             let tor_conn = match &tor_dir_opt {
                 Some(dir) => {
-                    match slipstream_core::connector::TorConn::bootstrap(dir, false).await {
+                    match slipstream_core::connector::TorConn::bootstrap(dir, false, None).await {
                         Ok(t) => Some(t),
                         Err(e) => {
                             tracing::warn!(
@@ -9163,6 +10784,9 @@ pub unsafe extern "C" fn zcashlc_slipstream_free(handle: *mut SlipstreamHandle) 
         // SAFETY: handle is non-null and was returned by zcashlc_slipstream_open (caller
         // contract). We take ownership here and drop it at end of scope.
         let mut h: Box<SlipstreamHandle> = unsafe { Box::from_raw(handle) };
+        if let Some(startup) = &h.tor_startup {
+            startup.cancel();
+        }
         // Abort the in-flight task before dropping the runtime; dropping a Runtime with
         // live tasks causes a panic on some platforms.
         if let Some(task) = h.inner.task.take() {
@@ -9706,6 +11330,85 @@ mod legacy_wallet_migration_tests {
 }
 
 #[cfg(test)]
+mod tor_http_body_limit_tests {
+    #[test]
+    fn a_body_within_the_limit_is_returned_whole() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
+        let out = rt
+            .block_on(super::collect_body_limited(body, 10))
+            .unwrap()
+            .expect("exactly at the limit");
+        assert_eq!(&out[..], b"0123456789");
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(b"0123456789"));
+        let out = rt.block_on(super::collect_body_limited(body, 9)).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn an_error_status_bounds_the_body_at_64_kib_whatever_the_callers_limit() {
+        let status = super::SeenStatus::default();
+        status.see(&Ok(http::StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(
+            status.body_limit(usize::MAX),
+            super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+        );
+        assert_eq!(status.body_limit(10), super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        status.see(&Ok(http::StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            status.body_limit(1 << 20),
+            super::TOR_HTTP_MAX_ERROR_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn a_success_status_or_none_keeps_the_callers_limit() {
+        let status = super::SeenStatus::default();
+        assert_eq!(status.body_limit(1 << 20), 1 << 20);
+        status.see(&Ok(http::StatusCode::SERVICE_UNAVAILABLE));
+        status.see(&Ok(http::StatusCode::OK));
+        assert_eq!(
+            status.body_limit(1 << 20),
+            1 << 20,
+            "the last status seen is the final one"
+        );
+    }
+
+    #[test]
+    fn an_error_page_past_64_kib_is_cut_and_kept_by_its_status() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let status = super::SeenStatus::default();
+        status.see(&Ok(http::StatusCode::TOO_MANY_REQUESTS));
+        let page = bytes::Bytes::from(vec![b'x'; super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1]);
+        let body = rt
+            .block_on(super::collect_body_limited(
+                http_body_util::Full::new(page),
+                status.body_limit(super::TOR_HTTP_MAX_RESPONSE_BYTES),
+            ))
+            .unwrap();
+        assert!(body.is_none());
+        let response = http::Response::builder()
+            .status(http::StatusCode::TOO_MANY_REQUESTS)
+            .body(body)
+            .unwrap();
+        let response = super::within_response_limit(response).unwrap();
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.body().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod block_spacing_ffi_tests {
     use super::*;
 
@@ -9841,6 +11544,400 @@ mod block_spacing_ffi_tests {
         assert_eq!((start, spacing), (0, 0));
         let mut target = 0u32;
         assert!(!unsafe { zcashlc_default_tx_target_height_for_expiry(7, 1_000, &mut target) });
+    }
+}
+
+#[cfg(test)]
+mod tor_http_stream_tests {
+    use zcash_client_backend::tor::{
+        Error,
+        http::{HttpError, TimeoutPhase},
+    };
+
+    use super::{failed_before_sending, retry_if_unsent};
+
+    #[test]
+    fn only_a_failure_to_reach_the_server_is_tried_again() {
+        assert!(failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::Connect
+        ))));
+        assert!(failed_before_sending(&Error::Http(HttpError::Tls(
+            std::io::Error::other("handshake")
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::Request
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::Timeout(
+            TimeoutPhase::ResponseBody
+        ))));
+        assert!(!failed_before_sending(&Error::Http(HttpError::NonHttpUrl)));
+    }
+
+    #[test]
+    fn a_request_sent_once_is_retried_only_when_unsent() {
+        use zcash_client_backend::tor::http::Retry;
+
+        assert!(matches!(
+            retry_if_unsent(Err(&Error::Http(HttpError::Timeout(TimeoutPhase::Connect)))),
+            Some(Retry::Isolated)
+        ));
+        assert!(matches!(
+            retry_if_unsent(Err(&Error::Http(HttpError::Tls(std::io::Error::other(
+                "handshake"
+            ))))),
+            Some(Retry::Isolated)
+        ));
+        for sent in [
+            Error::Http(HttpError::Timeout(TimeoutPhase::Request)),
+            Error::Http(HttpError::Timeout(TimeoutPhase::ResponseBody)),
+            Error::Io(std::io::Error::other("broken pipe")),
+        ] {
+            assert!(retry_if_unsent(Err(&sent)).is_none());
+        }
+        for status in [
+            http::StatusCode::OK,
+            http::StatusCode::CONFLICT,
+            http::StatusCode::BAD_GATEWAY,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(retry_if_unsent(Ok(status)).is_none());
+        }
+    }
+
+    #[test]
+    fn streaming_tor_error_response_body_capped_at_64_kib() {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
+
+        // Create a 429 response with a body larger than 64 KiB, emitted in 1 KiB chunks
+        let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 1024;
+        let chunk_size = 1024;
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..total_size)
+            .step_by(chunk_size)
+            .map(|i| {
+                let remaining = total_size - i;
+                let size = if remaining < chunk_size {
+                    remaining
+                } else {
+                    chunk_size
+                };
+                Ok(bytes::Bytes::from(vec![b'x'; size]))
+            })
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
+            .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+            .boxed_unsync();
+
+        // Create a runtime with the timer driver (required for tokio::time::timeout)
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
+
+        let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
+            runtime,
+            status: 429,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024, // 257 MiB relay response limit
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
+
+        let mut state: u8 = 0;
+
+        // Read via the FFI entry point until we hit END
+        loop {
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            assert!(!slice_ptr.is_null(), "stream read should not fail");
+
+            if state == super::TOR_HTTP_STREAM_END {
+                unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+                break;
+            }
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+        }
+
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
+        // The stream's internal `read` field tracks total bytes read.
+        assert_eq!(stream_box.read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        assert_eq!(stream_box.status, 429);
+
+        // Don't free the stream (stream_box drops it)
+    }
+
+    #[test]
+    fn streaming_tor_503_response_body_capped_at_64_kib() {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
+
+        // Create a 503 response with a body larger than 64 KiB, emitted in 1 KiB chunks
+        let total_size = super::TOR_HTTP_MAX_ERROR_BODY_BYTES + 2048;
+        let chunk_size = 1024;
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..total_size)
+            .step_by(chunk_size)
+            .map(|i| {
+                let remaining = total_size - i;
+                let size = if remaining < chunk_size {
+                    remaining
+                } else {
+                    chunk_size
+                };
+                Ok(bytes::Bytes::from(vec![b'y'; size]))
+            })
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = http_body_util::StreamBody::new(stream.map(|chunk| chunk.map(Frame::data)))
+            .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+            .boxed_unsync();
+
+        // Create a runtime with the timer driver (required for tokio::time::timeout)
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
+
+        let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
+            runtime,
+            status: 503,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024,
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
+
+        let mut state: u8 = 0;
+
+        // Read via the FFI entry point until we hit END
+        loop {
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            assert!(!slice_ptr.is_null(), "stream read should not fail");
+
+            if state == super::TOR_HTTP_STREAM_END {
+                unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+                break;
+            }
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+        }
+
+        // Verify we read exactly 64 KiB (the cap), then got END with status preserved.
+        // The stream's internal `read` field tracks total bytes read.
+        assert_eq!(stream_box.read, super::TOR_HTTP_MAX_ERROR_BODY_BYTES);
+        assert_eq!(stream_box.status, 503);
+
+        // Don't free the stream (stream_box drops it)
+    }
+
+    /// A stream over an error body made of `frames` (bytes per frame) that then either ends or,
+    /// with `pause`, stays open without sending anything more.
+    fn error_stream(status: u16, frames: &[usize], pause: bool) -> Box<super::TorHttpStream> {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use tor_rtcompat::Runtime as _;
+
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = frames
+            .iter()
+            .map(|size| Ok(bytes::Bytes::from(vec![b'e'; *size])))
+            .collect();
+        let tail = if pause {
+            futures::stream::pending().boxed()
+        } else {
+            futures::stream::empty().boxed()
+        };
+        let body = http_body_util::StreamBody::new(
+            futures::stream::iter(chunks)
+                .chain(tail)
+                .map(|chunk| chunk.map(Frame::data)),
+        )
+        .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+        .boxed_unsync();
+
+        Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
+            runtime: tor_rtcompat::PreferredRuntime::create().unwrap(),
+            status,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 257 * 1024 * 1024,
+        })
+    }
+
+    /// Reads `stream` through `zcashlc_tor_http_stream_next` until END or `max_calls` calls, and
+    /// returns the state and byte count of every call.
+    fn drive(stream: &mut super::TorHttpStream, max_calls: usize) -> Vec<(u8, usize)> {
+        let stream_ptr: *mut super::TorHttpStream = stream;
+        let mut calls = Vec::new();
+        for _ in 0..max_calls {
+            let mut state: u8 = 0xff;
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 50, &mut state) };
+            assert!(!slice_ptr.is_null(), "an error body read must not fail");
+            let len = unsafe { (*slice_ptr).as_slice() }.len();
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+            calls.push((state, len));
+            if state == super::TOR_HTTP_STREAM_END {
+                break;
+            }
+        }
+        calls
+    }
+
+    const CAP: usize = super::TOR_HTTP_MAX_ERROR_BODY_BYTES;
+    const STATUSES: [u16; 4] = [400, 422, 429, 503];
+
+    #[test]
+    fn error_body_of_exactly_64_kib_then_a_pause_ends_at_the_cap() {
+        assert_eq!(CAP, 65_536);
+        for status in STATUSES {
+            // One frame that fills the cap exactly, then the peer goes quiet.
+            let mut stream = error_stream(status, &[CAP], true);
+            let calls = drive(&mut stream, 8);
+            assert_eq!(
+                calls,
+                vec![(super::TOR_HTTP_STREAM_END, CAP)],
+                "status {status}: the bytes up to the cap come with END, no PENDING"
+            );
+            assert_eq!(stream.read, CAP);
+            assert_eq!(stream.status, status);
+
+            // A further read after END stays at END without awaiting the paused body.
+            assert_eq!(
+                drive(&mut stream, 1),
+                vec![(super::TOR_HTTP_STREAM_END, 0)],
+                "status {status}"
+            );
+
+            // The cap reached by the last of many frames ends just the same.
+            let mut stream = error_stream(status, &[1024; 64], true);
+            let calls = drive(&mut stream, 128);
+            assert_eq!(calls.len(), 64, "status {status}: {calls:?}");
+            assert_eq!(
+                calls.last(),
+                Some(&(super::TOR_HTTP_STREAM_END, 1024)),
+                "status {status}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|(state, _)| *state != super::TOR_HTTP_STREAM_PENDING),
+                "status {status}: no PENDING before END"
+            );
+            assert_eq!(stream.read, CAP);
+        }
+    }
+
+    #[test]
+    fn error_body_one_byte_short_of_64_kib_stays_open_until_it_ends() {
+        for status in STATUSES {
+            // Below the cap a paused body is still open: the caller's idle timeout bounds it.
+            let mut stream = error_stream(status, &[CAP - 1], true);
+            let calls = drive(&mut stream, 2);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_PENDING, 0)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP - 1);
+
+            // The same body, ended by the peer, ends normally with all of it.
+            let mut stream = error_stream(status, &[CAP - 1], false);
+            let calls = drive(&mut stream, 4);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_END, 0)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP - 1);
+
+            // One more byte, then a pause: the frame that reaches the cap ends the body.
+            let mut stream = error_stream(status, &[CAP - 1, 1], true);
+            let calls = drive(&mut stream, 4);
+            assert_eq!(
+                calls,
+                vec![
+                    (super::TOR_HTTP_STREAM_DATA, CAP - 1),
+                    (super::TOR_HTTP_STREAM_END, 1)
+                ],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP);
+        }
+    }
+
+    #[test]
+    fn error_body_one_byte_past_64_kib_then_a_pause_is_cut_at_the_cap() {
+        for status in STATUSES {
+            let mut stream = error_stream(status, &[CAP + 1], true);
+            let calls = drive(&mut stream, 8);
+            assert_eq!(
+                calls,
+                vec![(super::TOR_HTTP_STREAM_END, CAP)],
+                "status {status}"
+            );
+            assert_eq!(stream.read, CAP);
+            assert_eq!(stream.status, status);
+        }
+    }
+
+    #[test]
+    fn streaming_tor_success_body_past_the_ceiling_fails() {
+        use futures::StreamExt as _;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+
+        // A 200 whose body exceeds the caller's ceiling must fail the read (the 64 KiB
+        // truncation is only for error statuses): 8 chunks of 1 KiB against a 4 KiB ceiling.
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..8)
+            .map(|_| Ok(bytes::Bytes::from(vec![b'z'; 1024])))
+            .collect();
+        let body = http_body_util::StreamBody::new(
+            futures::stream::iter(chunks).map(|chunk| chunk.map(Frame::data)),
+        )
+        .map_err(|_: std::io::Error| unreachable!("test chunks are all Ok"))
+        .boxed_unsync();
+
+        let runtime = tor_rtcompat::PreferredRuntime::create().unwrap();
+        let mut stream_box = Box::new(super::TorHttpStream {
+            retry_not_before_ns: 0,
+            runtime,
+            status: 200,
+            headers: http::HeaderMap::new(),
+            body,
+            read: 0,
+            max_bytes: 4 * 1024,
+        });
+        let stream_ptr: *mut super::TorHttpStream = &mut *stream_box;
+        let mut state: u8 = 0;
+
+        let mut failed = false;
+        for _ in 0..16 {
+            let slice_ptr =
+                unsafe { super::zcashlc_tor_http_stream_next(stream_ptr, 1000, &mut state) };
+            if slice_ptr.is_null() {
+                failed = true;
+                break;
+            }
+            let ended = state == super::TOR_HTTP_STREAM_END;
+            unsafe { crate::ffi::zcashlc_free_boxed_slice(slice_ptr) };
+            assert!(
+                !ended,
+                "a success body past the ceiling must not end normally"
+            );
+        }
+        assert!(failed, "the read past the ceiling must fail");
+        assert_eq!(stream_box.read, 4 * 1024);
     }
 }
 
@@ -10047,5 +12144,709 @@ mod single_use_taddr_timing_tests {
             ),
             83
         );
+    }
+}
+
+#[cfg(test)]
+mod ohttp_single_use_taddr_timing_tests {
+    use super::*;
+
+    const TESTNET_NU7: u32 = 4_465_026;
+
+    struct Wallet {
+        _dir: tempfile::TempDir,
+        path: String,
+        account: [u8; 16],
+        address: TransparentAddress,
+        network_id: u32,
+    }
+
+    impl Wallet {
+        fn new(network_id: u32, exposed_at: u32, tip: u32) -> Self {
+            let (dir, path, account) =
+                crate::voting::test_support::temp_wallet_db_with_account(network_id);
+            let account = Uuid::parse_str(&account).unwrap().into_bytes();
+            let network = parse_network(network_id).unwrap();
+            let mut db = WalletDb::for_path(&path, network, SystemClock, system_rng()).unwrap();
+            db.update_chain_tip(BlockHeight::from_u32(exposed_at))
+                .unwrap();
+            let account_id = account_uuid_from_bytes(account.as_ptr()).unwrap();
+            let address = db
+                .reserve_next_n_ephemeral_addresses(account_id, 1)
+                .unwrap()[0]
+                .0;
+            db.schedule_next_check(&address, 0).unwrap();
+            db.update_chain_tip(BlockHeight::from_u32(tip)).unwrap();
+            Self {
+                _dir: dir,
+                path,
+                account,
+                address,
+                network_id,
+            }
+        }
+
+        fn assert_due(&self, exposed_at: u32, tip: u32, expected_due: bool) {
+            let result = unsafe {
+                zcashlc_single_use_taddr_to_check(
+                    self.path.as_ptr(),
+                    self.path.len(),
+                    self.network_id,
+                    self.account.as_ptr(),
+                )
+            };
+            assert!(!result.is_null(), "the OHTTP wallet check must succeed");
+            match unsafe { &*result } {
+                ffi::TransparentAddressCheck::Due {
+                    address,
+                    start_height,
+                    end_height,
+                } => {
+                    assert!(
+                        expected_due,
+                        "an address outside one day must not be selected"
+                    );
+                    assert_eq!(*start_height, exposed_at);
+                    assert_eq!(*end_height, tip + 1);
+                    let expected = self
+                        .address
+                        .encode(&parse_network(self.network_id).unwrap());
+                    assert_eq!(
+                        unsafe { CStr::from_ptr(*address) }.to_str().unwrap(),
+                        expected
+                    );
+                }
+                ffi::TransparentAddressCheck::None => {
+                    assert!(
+                        !expected_due,
+                        "an address exposed within one day must still be checked"
+                    );
+                }
+            }
+            unsafe { ffi::zcashlc_free_transparent_address_check(result) };
+        }
+    }
+
+    fn assert_look_back(network_id: u32, tip: u32, expected_depth: u32) {
+        for (age, due) in [(expected_depth - 1, true), (expected_depth + 1, false)] {
+            let exposed_at = tip - age;
+            Wallet::new(network_id, exposed_at, tip).assert_due(exposed_at, tip, due);
+        }
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_before_nu7_covers_1152_blocks() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 - 2, 1_152);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_across_nu7_covers_the_full_day() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 + 1_000, 1_819);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_after_nu7_covers_3456_blocks() {
+        assert_look_back(NETWORK_ID_TESTNET, TESTNET_NU7 + 5_000, 3_456);
+    }
+
+    #[test]
+    fn ohttp_ffi_look_back_uses_custom_nu7_activation() {
+        let _custom = lock_custom_network();
+        assert!(zcashlc_set_custom_network(
+            NETWORK_ID_TESTNET,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            100,
+            4_500_000,
+        ));
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 - 2, 1_152);
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 + 1_000, 1_819);
+        assert_look_back(NETWORK_ID_REGTEST, 4_500_000 + 5_000, 3_456);
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock(SystemTime);
+
+    impl zcash_client_sqlite::util::Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    fn assert_schedule(network_id: u32, tip: u32, expected_interval: u32) {
+        use rand::{SeedableRng, rngs::StdRng};
+        use std::time::Duration;
+        let fixture = Wallet::new(network_id, tip - 10, tip);
+        let network = parse_network(network_id).unwrap();
+        let account = account_uuid_from_bytes(fixture.account.as_ptr()).unwrap();
+        // Use the real backend's jitter with a literal, hand-derived interval as the oracle.
+        // Its old timestamp also ensures the production call replaces, rather than caps, it.
+        let epoch = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut reference = WalletDb::for_path(
+            &fixture.path,
+            network,
+            FixedClock(epoch),
+            StdRng::seed_from_u64(42),
+        )
+        .unwrap();
+        let sampled_delay = reference
+            .schedule_next_check(&fixture.address, expected_interval)
+            .unwrap()
+            .unwrap()
+            .duration_since(epoch)
+            .unwrap();
+        assert!(sampled_delay > Duration::ZERO);
+        drop(reference);
+
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let address = CString::new(fixture.address.encode(&network)).unwrap();
+        assert!(
+            unsafe {
+                schedule_single_use_taddr_check_with_rng(
+                    StdRng::seed_from_u64(42),
+                    fixture.path.as_ptr(),
+                    fixture.path.len(),
+                    network_id,
+                    fixture.account.as_ptr(),
+                    address.as_ptr(),
+                )
+            }
+            .unwrap()
+        );
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let db = WalletDb::for_path(&fixture.path, network, SystemClock, system_rng()).unwrap();
+        let scheduled = db
+            .get_transparent_address_metadata(account, &fixture.address)
+            .unwrap()
+            .unwrap()
+            .next_check_time()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            scheduled >= before + sampled_delay.as_secs(),
+            "tip {tip}: delay too short"
+        );
+        assert!(
+            scheduled <= after + sampled_delay.as_secs(),
+            "tip {tip}: wrong spacing delayed the recheck"
+        );
+        drop(db);
+
+        // Exercise the exported wrapper too; it delegates this same wallet operation with system entropy.
+        assert!(unsafe {
+            zcashlc_schedule_single_use_taddr_check(
+                fixture.path.as_ptr(),
+                fixture.path.len(),
+                network_id,
+                fixture.account.as_ptr(),
+                address.as_ptr(),
+            )
+        });
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_before_nu7_uses_75_second_blocks() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 - 2, 249);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_at_nu7_uses_the_next_blocks_25_second_spacing() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 - 1, 83);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_after_nu7_uses_25_second_blocks() {
+        assert_schedule(NETWORK_ID_TESTNET, TESTNET_NU7 + 5_000, 83);
+    }
+
+    #[test]
+    fn ohttp_wallet_recheck_uses_custom_nu7_activation() {
+        let _custom = lock_custom_network();
+        assert!(zcashlc_set_custom_network(
+            NETWORK_ID_TESTNET,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            100,
+            4_500_000,
+        ));
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 - 2, 249);
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 - 1, 83);
+        assert_schedule(NETWORK_ID_REGTEST, 4_500_000 + 5_000, 83);
+    }
+}
+
+#[cfg(test)]
+mod ohttp_health_tests;
+
+#[cfg(test)]
+mod tor_startup_ffi_tests {
+    use super::*;
+    use std::{ptr, sync::Arc, time::Duration};
+
+    thread_local! {
+        static ADMISSION_COMMIT_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_admission_commit() {
+        ADMISSION_COMMIT_GATE.with(|gate| {
+            if let Some((paused, resume)) = gate.borrow_mut().take() {
+                paused.send(()).unwrap();
+                resume.recv().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn tor_startup_cancel_before_failure_commit_remains_terminal() {
+        let startup = zcashlc_slipstream_tor_startup_begin_v1(19, 60_000);
+        let (paused, decision_paused) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let startup_ref = unsafe { &*startup };
+            let failure = scope.spawn(move || {
+                ADMISSION_COMMIT_GATE.with(|gate| *gate.borrow_mut() = Some((paused, resumed)));
+                startup_ref.fail_admission();
+            });
+            decision_paused
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            unsafe {
+                zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            }
+            assert_eq!(
+                unsafe { zcashlc_slipstream_tor_startup_snapshot_v1(startup) }.status,
+                4
+            );
+            resume.send(()).unwrap();
+            failure.join().unwrap();
+        });
+        let snapshot = unsafe { zcashlc_slipstream_tor_startup_snapshot_v1(startup) };
+        unsafe {
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+        }
+        assert_eq!((snapshot.generation, snapshot.status), (19, 4));
+    }
+
+    fn open() -> (tempfile::TempDir, *mut SlipstreamHandle) {
+        let (dir, db) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        let host = b"127.0.0.1";
+        let handle = unsafe {
+            zcashlc_slipstream_open(
+                db.as_ptr(),
+                db.len(),
+                host.as_ptr(),
+                host.len(),
+                9,
+                false,
+                NETWORK_ID_TESTNET,
+                0,
+            )
+        };
+        assert!(!handle.is_null());
+        (dir, handle)
+    }
+
+    fn wait_until_startup_deadline(startup: *const FfiSlipstreamTorStartupV1) {
+        let deadline = unsafe { &*startup }.control.deadline().into_std();
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        assert!(std::time::Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn tor_startup_zero_budget_timeout_remains_terminal_after_cancel() {
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(20, 0);
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((observed.generation, observed.status), (20, 3));
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((retained.generation, retained.status), (20, 3));
+        }
+    }
+
+    #[test]
+    fn tor_startup_delayed_admission_timeout_survives_failure_and_cleanup() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(21, 1);
+            wait_until_startup_deadline(startup);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            assert_eq!(zcashlc_slipstream_snapshot(handle).state, 0);
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((observed.generation, observed.status), (21, 3));
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_free(handle);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((retained.generation, retained.status), (21, 3));
+        }
+    }
+
+    #[test]
+    fn tor_startup_quiescence_timeout_survives_cancel_stop_and_free() {
+        struct BlockDrop(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (_dir, handle) = open();
+        let (entered, worker_entered) = std::sync::mpsc::channel();
+        let (unwinding, worker_unwinding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        unsafe {
+            (*handle).inner.task = Some(
+                (*handle)
+                    .inner
+                    .runtime
+                    .spawn(async move {
+                        let _guard = BlockDrop(unwinding, released);
+                        entered.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    })
+                    .abort_handle(),
+            );
+            worker_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(22, 1_000);
+            let handle_address = handle as usize;
+            let startup_address = startup as usize;
+            let start = std::thread::spawn(move || {
+                let path = b"/unused";
+                zcashlc_slipstream_start_v2(
+                    handle_address as *mut SlipstreamHandle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup_address as *const FfiSlipstreamTorStartupV1,
+                )
+            });
+            worker_unwinding
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            wait_until_startup_deadline(startup);
+            // Start still owns the handle: observe only its separate capability.
+            let observed = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            release.send(()).unwrap();
+            assert!(!start.join().unwrap());
+            assert!((*handle).inner.task.is_none());
+            zcashlc_slipstream_stop(handle);
+            let stopped = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_free(handle);
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let retained = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            assert_eq!((observed.generation, observed.status), (22, 3));
+            assert_eq!((stopped.generation, stopped.status), (22, 3));
+            assert_eq!((retained.generation, retained.status), (22, 3));
+        }
+    }
+
+    #[test]
+    fn tor_startup_admission_failure_remains_terminal_after_cancel() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        let ufvk = b"invalid viewing key";
+        unsafe {
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(17, 60_000);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ufvk.as_ptr(),
+                ufvk.len(),
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                2
+            );
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            let snapshot = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+            assert_eq!((snapshot.generation, snapshot.status), (17, 2));
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_cancel_during_exclusive_quiescence_never_launches_worker() {
+        struct BlockDrop(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for BlockDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (_dir, handle) = open();
+        let (entered, worker_entered) = std::sync::mpsc::channel();
+        let (unwinding, worker_unwinding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        unsafe {
+            (*handle).inner.task = Some(
+                (*handle)
+                    .inner
+                    .runtime
+                    .spawn(async move {
+                        let _guard = BlockDrop(unwinding, released);
+                        entered.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    })
+                    .abort_handle(),
+            );
+            worker_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(18, 60_000);
+            let handle_address = handle as usize;
+            let startup_address = startup as usize;
+            let start = std::thread::spawn(move || {
+                let path = b"/unused";
+                zcashlc_slipstream_start_v2(
+                    handle_address as *mut SlipstreamHandle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup_address as *const FfiSlipstreamTorStartupV1,
+                )
+            });
+            worker_unwinding
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            // Only the independent capability is touched while start owns the handle.
+            zcashlc_slipstream_tor_startup_cancel_v1(startup);
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                4
+            );
+            release.send(()).unwrap();
+            assert!(!start.join().unwrap());
+            assert!((*handle).inner.task.is_none());
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_ffi_expired_http_job_has_owned_timeout() {
+        let path = b"/unused";
+        unsafe {
+            let job = zcashlc_tor_startup_begin_v1(path.as_ptr(), path.len(), 0);
+            assert!(!job.is_null());
+            assert_eq!(zcashlc_tor_startup_wait_v1(job), 3);
+            let result = zcashlc_tor_startup_take_v1(job);
+            assert_eq!(result.status, 3);
+            assert!(result.runtime.is_null());
+            zcashlc_tor_startup_free_v1(job);
+        }
+    }
+
+    #[test]
+    fn tor_startup_expired_and_cancelled_capability_do_not_disturb_handle() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            for cancel in [false, true] {
+                let startup =
+                    zcashlc_slipstream_tor_startup_begin_v1(7, if cancel { 60_000 } else { 0 });
+                if cancel {
+                    zcashlc_slipstream_tor_startup_cancel_v1(startup);
+                }
+                assert!(!zcashlc_slipstream_start_v2(
+                    handle,
+                    ptr::null(),
+                    0,
+                    0,
+                    path.as_ptr(),
+                    path.len(),
+                    startup
+                ));
+                assert_eq!(zcashlc_slipstream_snapshot(handle).state, 0);
+                let snapshot = zcashlc_slipstream_tor_startup_snapshot_v1(startup);
+                assert_eq!(snapshot.generation, 7);
+                assert_eq!(snapshot.status, if cancel { 4 } else { 3 });
+                zcashlc_slipstream_tor_startup_free_v1(startup);
+            }
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_native_boundary_cancel_wakes_pass_lock_wait_and_retains_generation() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let pass_lock = Arc::clone(&(*handle).inner.pass_lock);
+            let guard = pass_lock.blocking_lock();
+            let old = zcashlc_slipstream_tor_startup_begin_v1(8, 60_000);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                old
+            ));
+            zcashlc_slipstream_tor_startup_cancel_v1(old);
+            let control = (*old).control.clone();
+            let result = (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), control.wait_for_terminal())
+                    .await
+                    .unwrap()
+            });
+            (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !(*handle).inner.task.as_ref().unwrap().is_finished() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(result.phase, slipstream_core::TorStartupPhase::Cancelled);
+            assert_eq!(result.generation, 8);
+            drop(guard);
+            let new = zcashlc_slipstream_tor_startup_begin_v1(9, 60_000);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                new
+            ));
+            let active_task = (*handle).inner.task.as_ref().unwrap().id();
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                new
+            ));
+            assert_eq!((*handle).inner.task.as_ref().unwrap().id(), active_task);
+            let stale = zcashlc_slipstream_tor_startup_begin_v1(8, 60_000);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                stale
+            ));
+            assert_eq!((*handle).inner.task.as_ref().unwrap().id(), active_task);
+            zcashlc_slipstream_tor_startup_free_v1(stale);
+            assert!(!zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                old
+            ));
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(new).generation,
+                9
+            );
+            zcashlc_slipstream_stop(handle);
+            assert_eq!(zcashlc_slipstream_tor_startup_snapshot_v1(new).status, 4);
+            zcashlc_slipstream_tor_startup_free_v1(old);
+            zcashlc_slipstream_tor_startup_free_v1(new);
+            zcashlc_slipstream_free(handle);
+        }
+    }
+
+    #[test]
+    fn tor_startup_native_boundary_timeout_bounds_pass_lock_wait_and_legacy_start_still_works() {
+        let (_dir, handle) = open();
+        let path = b"/unused";
+        unsafe {
+            let pass_lock = Arc::clone(&(*handle).inner.pass_lock);
+            let guard = pass_lock.blocking_lock();
+            let startup = zcashlc_slipstream_tor_startup_begin_v1(10, 100);
+            assert!(zcashlc_slipstream_start_v2(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                path.as_ptr(),
+                path.len(),
+                startup
+            ));
+            let control = (*startup).control.clone();
+            let result = (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), control.wait_for_terminal())
+                    .await
+                    .unwrap()
+            });
+            (*handle).inner.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !(*handle).inner.task.as_ref().unwrap().is_finished() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(result.phase, slipstream_core::TorStartupPhase::TimedOut);
+            assert_eq!(
+                zcashlc_slipstream_tor_startup_snapshot_v1(startup).status,
+                3
+            );
+            drop(guard);
+            zcashlc_slipstream_stop(handle);
+            assert!(zcashlc_slipstream_start(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                ptr::null(),
+                0
+            ));
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_tor_startup_free_v1(startup);
+            zcashlc_slipstream_free(handle);
+        }
     }
 }
