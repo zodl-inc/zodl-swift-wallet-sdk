@@ -126,7 +126,7 @@ public actor TorClient {
 
     /// Makes an HTTP request over Tor.
     ///
-    /// - Parameter maxBytes: Maximum allowed response size in bytes (defaults to 257 MiB)
+    /// - Parameter maxBytes: Nonnegative maximum allowed response size in bytes (defaults to 257 MiB)
     /// - Parameter retryLimit: the maximum number of times that a failed request should be retried.
     ///             Set this to 0 to disable retries.
     public func httpRequest(for request: URLRequest, maxBytes: Int = (256 * 1024 * 1024) + (1024 * 1024), retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
@@ -146,6 +146,9 @@ public actor TorClient {
         retryLimit: UInt8,
         postOnce: Bool
     ) async throws -> (data: Data, response: HTTPURLResponse) {
+        guard maxBytes >= 0 else {
+            throw ZcashError.rustTorHttpRequest("`TorClient.httpRequest` requires a nonnegative response size limit")
+        }
         try await prepareRuntime()
         guard let runtime = underlyingRuntime else { throw ZcashError.torClientUnavailable }
 
@@ -414,9 +417,14 @@ public actor TorClient {
             throw ZcashError.rustTorConnectToLightwalletd("endpoint string contains null bytes")
         }
 
-        let lwdConnPtr = httpGetNative.connectLightwalletd(
-            runtime, [CChar](endpoint.utf8CString)
-        )
+        let lwdConnPtr: OpaquePointer?
+        if let budget = SubmissionBudget.current {
+            lwdConnPtr = httpGetNative.connectLightwalletdWithTimeout(
+                runtime, [CChar](endpoint.utf8CString), try budget.remainingMilliseconds()
+            )
+        } else {
+            lwdConnPtr = httpGetNative.connectLightwalletd(runtime, [CChar](endpoint.utf8CString))
+        }
 
         guard let lwdConnPtr else {
             throw ZcashError.rustTorConnectToLightwalletd(
@@ -468,8 +476,9 @@ extension TorClient {
 
     private func prepareRuntime(deadline: UInt64? = nil) async throws {
         try Task.checkCancellation()
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         if underlyingRuntime != nil { return }
-        let deadline = try deadline ?? TorHTTPRequestExecutor.deadline(
+        let deadline = try deadline ?? SubmissionBudget.current?.deadline ?? TorHTTPRequestExecutor.deadline(
             timeoutMilliseconds: 60_000,
             now: DispatchTime.now().uptimeNanoseconds
         )
@@ -542,6 +551,7 @@ public class TorLwdConn {
     /// - Parameter spendTransaction: data representing the transaction to be sent
     /// - Throws: `serviceSubmitFailed` when GRPC call fails.
     func submit(spendTransaction: Data) throws -> LightWalletServiceResponse {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         let success = zcashlc_tor_lwd_conn_submit_transaction(
             conn,
             spendTransaction.bytes,
@@ -581,6 +591,7 @@ public class TorLwdConn {
     /// - Returns: LightWalletServiceResponse
     /// - Throws: `serviceFetchTransactionFailed` when GRPC call fails.
     func fetchTransaction(txId: Data) throws -> (tx: ZcashTransaction.Fetched?, status: TransactionStatus) {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         guard txId.count == TxId.byteLength else {
             throw ZcashError.rustGetMemoInvalidTxIdLength
         }
@@ -649,6 +660,7 @@ public class TorLwdConn {
     /// Gets a block at the chain tip of the blockchain
     /// - Returns: Block
     func latestBlock() throws -> BlockID {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         var height: UInt32 = 0
 
         let blockIDPtr = zcashlc_tor_lwd_conn_latest_block(conn, &height)
@@ -849,12 +861,12 @@ extension TorClient {
             let owned = try await self.prepareBoundedOHTTP(for: request, maxBytes: maxBytes, context: context)
             return try await self.httpExecutor.execute(
                 deadlineUptime: context.deadlineUptime,
-                operation: { remaining in
-                    try context.checkCancellation()
-                    return try owned.run(timeoutMilliseconds: remaining)
-                },
+                operation: { try owned.run(timeoutMilliseconds: $0) },
                 dispose: { owned.dispose() },
-                preserveHTTPFailure: true
+                preserveHTTPFailure: true,
+                onStart: {
+                    try context.checkCancellation()
+                }
             )
         }
     }

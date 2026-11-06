@@ -436,7 +436,8 @@ final class OHTTPTests: XCTestCase {
     func testSessionDelegateRefusesRedirects() {
         // Verify that the session's delegate refuses HTTP redirects.
         // A redirect from a relay or key-config server is an attack vector.
-        let session = OHTTPTransport.session
+        let session = OHTTPTransport.makeSession()
+        defer { session.invalidateAndCancel() }
         guard let delegate = session.delegate as? URLSessionTaskDelegate else {
             XCTFail("Session should have a URLSessionTaskDelegate")
             return

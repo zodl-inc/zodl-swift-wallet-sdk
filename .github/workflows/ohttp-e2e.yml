@@ -10,7 +10,7 @@ name: OHTTP E2E (testnet, macOS)
 on:
   push:
     branches:
-      - feature/ohttp-integration
+      - feature/ohttp
   workflow_dispatch:
     inputs:
       scenario:

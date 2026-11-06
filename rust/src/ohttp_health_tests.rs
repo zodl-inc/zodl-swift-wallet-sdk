@@ -440,3 +440,104 @@ fn ohttp_health_callback_can_unsubscribe_itself() {
         .record(HealthOutcome::TransportUnavailable, HealthStage::Connection);
     assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
 }
+
+#[test]
+fn subscription_construction_panic_returns_null() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    unsafe extern "C" fn callback(
+        _: *const FfiOHTTPHealthObservationV1,
+        _: usize,
+        _: u64,
+        _: u64,
+        context: *mut c_void,
+    ) {
+        unsafe { &*context.cast::<AtomicUsize>() }.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let gateway = CString::new("gateway.test").unwrap();
+    let relay = CString::new("https://relay.test/").unwrap();
+    let context = Arc::new(AtomicUsize::new(0));
+    let retained_notification = Mutex::new(None);
+    let result = std::panic::catch_unwind(|| unsafe {
+        subscribe_with_constructor(
+            gateway.as_ptr(),
+            relay.as_ptr(),
+            false,
+            43,
+            Some(callback),
+            Arc::as_ptr(&context).cast_mut().cast(),
+            |_, _, notify| {
+                *retained_notification.lock().unwrap() = Some(Arc::downgrade(&notify));
+                panic!("could not start OHTTP health notification worker");
+            },
+        )
+    });
+    assert!(
+        result.is_ok(),
+        "construction must not unwind out of the Rust FFI implementation"
+    );
+    assert!(result.unwrap().is_null());
+    assert_eq!(
+        retained_notification
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .strong_count(),
+        0
+    );
+    assert_eq!(context.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        Arc::strong_count(&context),
+        1,
+        "the context remains exclusively caller-owned"
+    );
+    let weak_context = Arc::downgrade(&context);
+    drop(context);
+    assert!(weak_context.upgrade().is_none());
+    assert!(
+        ffi_helpers::error_handling::take_last_error()
+            .unwrap()
+            .to_string()
+            .contains("could not start OHTTP health notification worker")
+    );
+}
+
+#[test]
+fn normal_subscription_still_fences_callbacks() {
+    unsafe extern "C" fn callback(
+        _: *const FfiOHTTPHealthObservationV1,
+        _: usize,
+        _: u64,
+        generation: u64,
+        context: *mut c_void,
+    ) {
+        let sender = unsafe { &*context.cast::<mpsc::Sender<u64>>() };
+        let _ = sender.send(generation);
+    }
+
+    let route = route();
+    let gateway = CString::new(route.gateway_host.clone()).unwrap();
+    let relay = CString::new(route.relay_url.clone()).unwrap();
+    let (sender, receiver) = mpsc::channel::<u64>();
+    let subscription = unsafe {
+        subscribe_with_constructor(
+            gateway.as_ptr(),
+            relay.as_ptr(),
+            false,
+            47,
+            Some(callback),
+            (&sender as *const mpsc::Sender<u64>).cast_mut().cast(),
+            transport_health::subscribe,
+        )
+    };
+    assert!(!subscription.is_null());
+    transport_health::begin_request(&route, HealthScope::Route)
+        .record(HealthOutcome::Usable, HealthStage::Complete);
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(3)).unwrap(), 47);
+    unsafe { zcashlc_ohttp_health_unsubscribe_v1(subscription) };
+    transport_health::begin_request(&route, HealthScope::Route)
+        .record(HealthOutcome::TransportUnavailable, HealthStage::Connection);
+    assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
+}

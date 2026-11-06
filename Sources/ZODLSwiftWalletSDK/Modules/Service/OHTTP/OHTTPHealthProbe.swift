@@ -121,6 +121,7 @@ enum OHTTPHealthProbe {
         defer { session.remove(budget) }
         let outcome: OHTTPHealthOutcome
         let pauses = session.snapshot().observations.compactMap { observation -> UInt64? in
+            guard observation.scope == .route || observation.scope == .lightwalletd else { return nil }
             if case .rateLimited(let deadline) = observation.outcome, deadline > OHTTPHealthClock.nowNanoseconds { return deadline }
             return nil
         }
@@ -153,6 +154,7 @@ final class OHTTPHealthProbeBudget: Sendable {
     private let now: @Sendable () -> UInt64
     private struct State {
         var admitted = false
+        var networkAttempt = false
         var stop: OHTTPHealthOutcome?
         var result: OHTTPHealthOutcome?
         var evidence: OHTTPHealthOutcome?
@@ -197,6 +199,32 @@ final class OHTTPHealthProbeBudget: Sendable {
         }
     }
 
+    /// Provider admission owns cleanup; only dispatch supplies evidence about the network.
+    func beginNetworkAttempt() throws {
+        try Task.checkCancellation()
+        try state.withLock {
+            guard now() < deadline else { throw URLError(.timedOut) }
+            guard $0.stop == nil else { throw CancellationError() }
+            $0.networkAttempt = true
+        }
+    }
+
+    /// A completed key leg cannot supply dispatch evidence for the following sealed request.
+    func completedKeyConfiguration() {
+        state.withLock {
+            $0.networkAttempt = false
+            $0.evidence = nil
+        }
+    }
+
+    func failureOutcome(_ error: Error) -> OHTTPHealthOutcome {
+        if let error = error as? URLError, error.code == .timedOut,
+           !state.withLock({ $0.networkAttempt }) {
+            return .inconclusive
+        }
+        return OHTTPHealthTraffic.outcome(error)
+    }
+
     func record(_ evidence: OHTTPHealthOutcome) { state.withLock { $0.evidence = evidence } }
 
     func run(_ operation: @escaping @Sendable () async throws -> OHTTPHealthOutcome) async -> OHTTPHealthOutcome {
@@ -217,7 +245,7 @@ final class OHTTPHealthProbeBudget: Sendable {
                         try check()
                         result = try await operation()
                     } catch {
-                        result = state.withLock { $0.evidence } ?? OHTTPHealthTraffic.outcome(error)
+                        result = state.withLock { $0.evidence } ?? failureOutcome(error)
                     }
                     finish(result)
                 }
@@ -273,7 +301,10 @@ final class OHTTPHealthProbeBudget: Sendable {
             if state.stop == .cancelled {
                 resolved = .cancelled
             } else if state.stop != nil, result == .cancelled || result == .usable || result == .inconclusive {
-                resolved = .transportUnavailable
+                resolved = state.networkAttempt ? .transportUnavailable : .inconclusive
+            } else if !state.networkAttempt, result == .transportUnavailable {
+                // Queue expiry, including a budget below one whole millisecond, is not network evidence.
+                resolved = .inconclusive
             } else {
                 resolved = result
             }

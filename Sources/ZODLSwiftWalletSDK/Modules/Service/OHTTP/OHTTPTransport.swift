@@ -9,6 +9,7 @@
 //
 
 import Foundation
+import os
 
 /// Delegate that refuses HTTP redirects to prevent tracking and fingerprinting.
 /// A relay or key-config server attempting a redirect is an attack vector.
@@ -78,6 +79,19 @@ actor OHTTPKeyCache {
             OHTTPHealthTraffic.current?.classify(failure.outcome)
             throw failure.underlying
         }
+    }
+
+    /// Bounded submissions own uncached work, so cancellation cannot leave a shared fetch sending.
+    func submissionKey(
+        for cacheKey: String,
+        accept: (OHTTPVerifiedKey) -> Bool,
+        fetch: () async throws -> OHTTPVerifiedKey
+    ) async throws -> OHTTPVerifiedKey {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
+        if let cached = keys[cacheKey], accept(cached) { return cached }
+        let key = try await fetch()
+        keys[cacheKey] = key
+        return key
     }
 
     private struct KeyFetchFailure: Error {
@@ -174,29 +188,101 @@ actor OHTTPKeyCache {
     }
 }
 
-/// The relay session in use, replaced by a fresh one (new connections) once it is `lifetime` old. The old
-/// one finishes the tasks it has and is then invalidated.
-final class RotatingSession: @unchecked Sendable {
-    private let lock = NSLock()
-    private let lifetime: TimeInterval
-    private var session: URLSession?
-    private var created = Date.distantPast
+/// Rotates relay connections while protecting senders that have not registered their tasks yet.
+final class RotatingSession: Sendable {
+    /// Protects task creation, not task completion. Registered tasks survive graceful retirement.
+    final class Lease: Sendable {
+        let session: URLSession
+        private let onRelease: OSAllocatedUnfairLock<(@Sendable () -> Void)?>
 
-    init(lifetime: TimeInterval) {
-        self.lifetime = lifetime
+        init(session: URLSession, onRelease: @escaping @Sendable () -> Void) {
+            self.session = session
+            self.onRelease = OSAllocatedUnfairLock(initialState: onRelease)
+        }
+
+        func release() {
+            let released = onRelease.withLock { onRelease in
+                defer { onRelease = nil }
+                return onRelease
+            }
+            released?()
+        }
+
+        deinit { release() }
     }
 
-    func current(now: Date = Date()) -> URLSession {
-        lock.lock()
-        defer { lock.unlock() }
-        if let session, now.timeIntervalSince(created) < lifetime {
-            return session
+    private final class Generation: Sendable {
+        private struct State {
+            var leases = 0
+            var retired = false
         }
-        session?.finishTasksAndInvalidate()
-        let fresh = OHTTPTransport.makeSession()
-        session = fresh
-        created = now
-        return fresh
+
+        let session: URLSession
+        let created: Date
+        private let state = OSAllocatedUnfairLock(initialState: State())
+        private let retireSession: @Sendable (URLSession) -> Void
+
+        init(session: URLSession, created: Date, retireSession: @escaping @Sendable (URLSession) -> Void) {
+            self.session = session
+            self.created = created
+            self.retireSession = retireSession
+        }
+
+        func acquire() -> Lease {
+            state.withLock { $0.leases += 1 }
+            return Lease(session: session) { self.release() }
+        }
+
+        func release() {
+            let invalidate = state.withLock { state in
+                state.leases -= 1
+                return state.retired && state.leases == 0
+            }
+            if invalidate { retireSession(session) }
+        }
+
+        func retire() {
+            let invalidate = state.withLock { state in
+                guard !state.retired else { return false }
+                state.retired = true
+                return state.leases == 0
+            }
+            if invalidate { retireSession(session) }
+        }
+    }
+
+    private let current = OSAllocatedUnfairLock<Generation?>(initialState: nil)
+    private let lifetime: TimeInterval
+    private let makeSession: @Sendable () -> URLSession
+    private let retireSession: @Sendable (URLSession) -> Void
+
+    init(
+        lifetime: TimeInterval,
+        makeSession: @escaping @Sendable () -> URLSession = { @Sendable in OHTTPTransport.makeSession() },
+        retireSession: @escaping @Sendable (URLSession) -> Void = { $0.finishTasksAndInvalidate() }
+    ) {
+        self.lifetime = lifetime
+        self.makeSession = makeSession
+        self.retireSession = retireSession
+    }
+
+    func acquire(now: Date = Date()) -> Lease {
+        let (lease, retired) = current.withLock { current -> (Lease, Generation?) in
+            if let current, now.timeIntervalSince(current.created) < lifetime {
+                return (current.acquire(), nil)
+            }
+            let retired = current
+            let fresh = Generation(session: makeSession(), created: now, retireSession: retireSession)
+            current = fresh
+            return (fresh.acquire(), retired)
+        }
+        // Foundation callbacks must never run under an ownership lock.
+        retired?.retire()
+        return lease
+    }
+
+    deinit {
+        current.withLock { $0 }?.retire()
     }
 }
 
@@ -217,14 +303,13 @@ actor OHTTPTransport {
     ///
     /// The session is replaced every ``sessionLifetime``, so the relay does not see one connection for
     /// the whole life of the app: connection lifetime is linkable metadata.
-    internal static var session: URLSession {
-        sessionBox.current()
-    }
+    @TaskLocal static var sessionBox = RotatingSession(lifetime: sessionLifetime)
+
+    /// A task-scoped gate lets tests pause after acquisition without affecting unrelated requests.
+    @TaskLocal static var beforeSessionSetupForTesting: (@Sendable () async throws -> Void)?
 
     /// How long one relay session, and so its connections, is used before a new one replaces it.
     internal static let sessionLifetime: TimeInterval = 10 * 60
-
-    private static let sessionBox = RotatingSession(lifetime: sessionLifetime)
 
     /// Makes the relay session. No resource timeout is set: non-streaming exchanges enforce
     /// their 100s deadline per task, while streaming exchanges (mempool long poll, SSE) last
@@ -243,7 +328,9 @@ actor OHTTPTransport {
 
     /// Test-only accessor for the session configuration.
     internal static var sessionConfigurationForTesting: URLSessionConfiguration {
-        session.configuration
+        let lease = sessionBox.acquire()
+        defer { lease.release() }
+        return lease.session.configuration
     }
 
     /// Fixed relay-facing `User-Agent` and `Accept-Language`, so URLSession does not add the app's name
@@ -363,7 +450,17 @@ actor OHTTPTransport {
         // cancel another consumer's shared real-request fetch or leave a probe-only fetch alive.
         if let budget = OHTTPHealthProbe.budget {
             try budget.check()
-            return try await fetchKeyConfig(profile: profile)
+            let key = try await fetchKeyConfig(profile: profile)
+            budget.completedKeyConfiguration()
+            return key
+        }
+
+        if SubmissionBudget.current != nil {
+            return try await keyCache.submissionKey(
+                for: cacheKey,
+                accept: { !forceRefresh && profile.isFresh($0, at: Date()) },
+                fetch: { [self] in try await self.fetchKeyConfig(profile: profile) }
+            )
         }
 
         // The cached key is used while the profile says it is fresh.
@@ -480,14 +577,6 @@ actor OHTTPTransport {
                 return verified
             } catch {
                 if error is CancellationError { throw error }
-                if OHTTPHealthProbe.budget != nil {
-                    let outcome = OHTTPHealthTraffic.outcome(error)
-                    if case .rateLimited = outcome {
-                        OHTTPHealthTraffic.current?.classify(outcome)
-                        throw error
-                    }
-                    if case .rateLimited = OHTTPHealthTraffic.current?.failure { throw error }
-                }
                 try OHTTPHealthProbe.budget?.check()
                 continue
             }
@@ -513,7 +602,11 @@ actor OHTTPTransport {
         request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = TimeInterval(timeoutMS) / 1000.0
 
-        let (data, response) = try await send(request, maxBytes: 64 * 1024) // 64 KiB limit for DoH
+        // Resolver responses are auxiliary key sources, not evidence about the selected relay.
+        // Keep the probe budget and dispatch tracking active while isolating health attribution.
+        let (data, response) = try await OHTTPHealthTraffic.$current.withValue(nil) {
+            try await send(request, maxBytes: 64 * 1024) // 64 KiB limit for DoH
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OHTTPError.transportError("DoH response is not HTTP")
@@ -638,14 +731,6 @@ actor OHTTPTransport {
         return (data, response)
     }
 
-    private func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
-        var request = request
-        if let budget = OHTTPHealthProbe.budget {
-            request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000
-        }
-        return try await httpSender(request, maxBytes)
-    }
-
     /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
     /// debug build with a prefix set, a trace id.
     func relayPost(url: String, body: Data, timeoutMS: Int) throws -> URLRequest {
@@ -692,7 +777,9 @@ actor OHTTPTransport {
     /// (ZIP "Outer response contract": a call made during the pause is failed locally, as a 429).
     func checkRelayBackoff() async throws {
         guard let remaining = await relayPauseRemaining() else { return }
-        OHTTPHealthTraffic.current?.classify(.rateLimited(retryNotBefore: OHTTPHealthClock.nowNanoseconds + UInt64(remaining * 1_000_000_000)))
+        OHTTPHealthTraffic.current?.relayRateLimited(
+            until: OHTTPHealthClock.nowNanoseconds + UInt64(remaining * 1_000_000_000)
+        )
         throw OHTTPError.httpStatusError(
             statusCode: 429,
             message: "relay rate limit: not sent, \(Int(remaining.rounded(.up)))s of the relay's pause left"
@@ -762,6 +849,19 @@ extension OHTTPTransport {
 // MARK: - Bounded reading of the relay's answers
 
 extension OHTTPTransport {
+    /// Holds the generation until Foundation has registered the request, even across async setup.
+    static func withSessionForSetup<Result>(
+        _ session: URLSession?,
+        operation: (URLSession) async throws -> Result
+    ) async throws -> Result {
+        if let session { return try await operation(session) }
+        let lease = sessionBox.acquire()
+        defer { lease.release() }
+        try await beforeSessionSetupForTesting?()
+        try Task.checkCancellation()
+        return try await operation(lease.session)
+    }
+
     /// Reads response data with a size bound, enforcing the limit while reading. ZIP MUST requirement
     /// for OHTTP relay responses: abort as soon as the limit is exceeded. Streams the body with
     /// `session.bytes(for:)` and counts it, rejecting early if `expectedContentLength > maxBytes`.
@@ -772,15 +872,18 @@ extension OHTTPTransport {
     /// - Parameters:
     ///   - request: The URL request to execute
     ///   - maxBytes: Maximum allowed response size in bytes
-    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    ///   - session: An injected URLSession, or nil to lease the rotating relay session
     /// - Returns: The response data and URLResponse
     /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, or transport errors
     static func boundedData(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
+        session: URLSession? = nil
     ) async throws -> (Data, URLResponse) {
-        let (bytes, response) = try await session.bytes(for: oneShotBody(request))
+        let (bytes, response) = try await withSessionForSetup(session) { session in
+            try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+            return try await session.bytes(for: oneShotBody(request))
+        }
         if let response = response as? HTTPURLResponse {
             OHTTPHealthTraffic.current?.outerResponse(status: response.statusCode, retryAfter: response.value(forHTTPHeaderField: "Retry-After"))
         }
@@ -826,13 +929,13 @@ extension OHTTPTransport {
     /// - Parameters:
     ///   - request: The URL request to execute
     ///   - maxBytes: Maximum allowed response size in bytes
-    ///   - session: The URLSession to use (defaults to OHTTPTransport.session)
+    ///   - session: An injected URLSession, or nil to lease the rotating relay session
     /// - Returns: The response data and URLResponse
     /// - Throws: `OHTTPError.responseTooLarge` if a 2xx response exceeds maxBytes, `OHTTPError.transportError` if deadline exceeded, or other transport errors
     static func boundedDataWithDeadline(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session,
+        session: URLSession? = nil,
         deadlineSeconds: TimeInterval = 100
     ) async throws -> (Data, URLResponse) {
         return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
@@ -902,5 +1005,18 @@ extension OHTTPTransport {
                 throw error
             }
         }
+    }
+}
+
+private extension OHTTPTransport {
+    func send(_ request: URLRequest, maxBytes: Int) async throws -> (Data, HTTPURLResponse) {
+        var request = request
+        if let budget = SubmissionBudget.current {
+            request.timeoutInterval = min(request.timeoutInterval, Double(try budget.remainingMilliseconds()) / 1000)
+        }
+        if let budget = OHTTPHealthProbe.budget {
+            request.timeoutInterval = Double(try budget.remainingMilliseconds()) / 1000
+        }
+        return try await httpSender(request, maxBytes)
     }
 }

@@ -20,6 +20,8 @@ enum Dependencies {
         isExchangeRateEnabled: Bool,
         regtestActivationHeights: NetworkActivationHeights? = nil
     ) {
+        container.register(type: LightWalletEndpoint.self, isSingleton: true) { _ in endpoint }
+
         container.register(type: SDKFlags.self, isSingleton: true) { _ in
             SDKFlags(
                 torEnabled: isTorEnabled,

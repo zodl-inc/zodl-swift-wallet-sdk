@@ -33,6 +33,70 @@ final class TorRouteTransitionTests: ZcashTestCase {
         await sync.stopAndWait()
     }
 
+    func testWrongNetworkRestartPreservesAcquiredTorTransitionAndRunningIntent() async throws {
+        let runtimes = TorTestRuntimes()
+        let runtimeFrees = OSAllocatedUnfairLock(initialState: 0)
+        let client = TorClient(
+            runtimePtr: runtimes.parent,
+            torDir: testTempDirectory,
+            httpGetNative: TorHTTPGetNative(freeRuntime: { pointer in
+                runtimeFrees.withLock { $0 += 1 }
+                runtimes.free(pointer)
+            })
+        )
+        mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
+        let engine = GatedFakeSlipstreamEngine()
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start()
+        let stopping = expectation(description: "Acquired Tor transition is held before stopping completes")
+        await engine.closeGate(.stop)
+        await engine.onCall("stop") { stopping.fulfill() }
+        let transition = sync.requestTorTransition(enabled: true)
+        let enable = Task { try await transition.apply() }
+        await fulfillment(of: [stopping], timeout: 2)
+        XCTAssertTrue(transition.hasAcquired)
+        let heldState = sync.torTransitionState
+        XCTAssertEqual(heldState?.phase, .stopping)
+        let callsBeforeRejection = await engine.calls
+        let rejected = expectation(description: "Invalid restart rejects while the valid transition remains held")
+        let wrongNetwork = LightWalletEndpoint(address: OHTTPTestSupport.mainnetHost, port: 443, secure: true)
+        let restart = Task {
+            do {
+                try await sync.restartSync(at: wrongNetwork)
+                XCTFail("Expected wrong-network rejection")
+            } catch let error as ZcashError {
+                XCTAssertEqual(error.code, .compactBlockProcessorChainName)
+            } catch {
+                XCTFail("Expected wrong-network error")
+            }
+            rejected.fulfill()
+        }
+        await fulfillment(of: [rejected], timeout: 0.5)
+        XCTAssertEqual(sync.torTransitionState, heldState)
+        XCTAssertFalse(transition.isCancelled)
+        let callsAfterRejection = await engine.calls
+        XCTAssertEqual(callsAfterRejection, callsBeforeRejection)
+        XCTAssertEqual(runtimeFrees.withLock { $0 }, 0)
+        await engine.openGate(.stop)
+        await restart.value
+        do {
+            try await enable.value
+        } catch {
+            XCTFail("Invalid restart interrupted the valid Tor transition")
+        }
+        XCTAssertEqual(sync.torTransitionState?.requestID, transition.id)
+        XCTAssertEqual(sync.torTransitionState?.phase, .ready)
+        XCTAssertEqual(sync.torTransitionState?.requestedEnabled, true)
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing, "Invalid restart must preserve running intent")
+        let callsAfterTransition = await engine.calls
+        XCTAssertEqual(callsAfterTransition.filter { GatedFakeSlipstreamEngine.isStop($0) }.count, 1)
+        XCTAssertEqual(callsAfterTransition.filter { $0.hasPrefix("reopen(") }.count, 0)
+        XCTAssertEqual(runtimeFrees.withLock { $0 }, 0)
+        await sync.stopAndWait()
+        try await client.close()
+    }
+
     func testFailedEnableRetainsRequiredRouting() async throws {
         let engine = GatedFakeSlipstreamEngine()
         let client = TorClient(torDir: testTempDirectory, httpGetNative: TorHTTPGetNative(

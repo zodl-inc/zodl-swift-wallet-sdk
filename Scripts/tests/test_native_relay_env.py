@@ -2,10 +2,12 @@
 import hashlib
 import json
 import os
+import plistlib
 import re
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -236,6 +238,84 @@ with (pathlib.Path(os.environ['FIXTURE_ROOT'])/'swift.jsonl').open('a') as f:
             with self.subTest(command=command):
                 (self.root / 'cargo.jsonl').unlink(missing_ok=True)
                 self.run_native(command)
+
+    def test_release_product_stays_shallow_and_archives_like_release(self):
+        self.run_native(['make', 'ffi-all'])
+        (self.root / 'Cargo.toml').write_text('[package]\nname = "libzcashlc"\nversion = "5.0.0"\n')
+        (self.root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "libzcashlc"\nversion = "5.0.0"\n')
+        shims = self.root / 'record-shims'
+        shims.mkdir()
+        lipo = shims / 'lipo'
+        lipo.write_text('''#!/usr/bin/env python3
+import sys
+print('arm64' if '/ios-arm64/' in sys.argv[-1] else 'arm64 x86_64')
+''')
+        lipo.chmod(0o755)
+        sys.path.insert(0, str(ROOT / 'Scripts/ci'))
+        self.addCleanup(sys.path.remove, str(ROOT / 'Scripts/ci'))
+        import sdk_build_record
+        products = self.root / 'BuildSupport/products'
+        product = products / 'libzcashlc.xcframework'
+        with mock.patch.dict(os.environ, {'PATH': str(shims) + os.pathsep + os.environ['PATH']}):
+            slices = sdk_build_record.verify_slices(product, sdk_build_record.component_versions(self.root), self.root)
+        self.assertEqual(len(slices), 3)
+        subprocess.run(['zip', '-qr', 'libzcashlc.xcframework.zip', 'libzcashlc.xcframework'], cwd=products, check=True)
+        expected = {str(path.relative_to(products)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in product.rglob('*') if path.is_file()}
+        with zipfile.ZipFile(products / 'libzcashlc.xcframework.zip') as bundle:
+            archived = {item.filename: hashlib.sha256(bundle.read(item)).hexdigest()
+                        for item in bundle.infolist() if not item.is_dir()}
+        self.assertEqual(archived, expected)
+
+    def assert_local_copy_versioned_and_product_shallow(self):
+        product = self.root / 'BuildSupport/products/libzcashlc.xcframework'
+        self.assertEqual([path for path in product.rglob('*') if path.is_symlink()], [])
+        shallow = product / 'macos-arm64_x86_64/libzcashlc.framework'
+        self.assertTrue((shallow / 'Info.plist').is_file())
+        self.assertFalse((shallow / 'Versions').exists())
+        local = self.root / 'LocalPackages/libzcashlc.xcframework'
+        macos = local / 'macos-arm64_x86_64/libzcashlc.framework'
+        self.assertTrue((macos / 'Versions/A/Resources/Info.plist').is_file())
+        self.assertFalse((macos / 'Versions/A/Versions').exists())
+        self.assertEqual(os.readlink(macos / 'Versions/Current'), 'A')
+        for name in ('libzcashlc', 'Headers', 'Modules', 'Resources'):
+            self.assertEqual(os.readlink(macos / name), f'Versions/Current/{name}')
+        self.assertFalse((macos / 'Info.plist').exists())
+        metadata = plistlib.loads((macos / 'Resources/Info.plist').read_bytes())
+        self.assertEqual(metadata['CFBundlePackageType'], 'FMWK')
+        self.assertEqual(metadata['CFBundleSupportedPlatforms'], ['MacOSX'])
+        minimum = re.search(r'^MACOSX_DEPLOYMENT_TARGET = (.+)$',
+                            (self.root / 'BuildSupport/Makefile').read_text(), re.MULTILINE).group(1)
+        self.assertEqual(metadata['LSMinimumSystemVersion'], minimum)
+        version = plistlib.loads((self.root / 'BuildSupport/platform-Info.plist').read_bytes())['CFBundleVersion']
+        self.assertEqual(metadata['CFBundleVersion'], version)
+        self.assertEqual(metadata['CFBundleShortVersionString'], version)
+        for relative in ('libzcashlc', 'Headers/zcashlc.h', 'Modules/module.modulemap'):
+            self.assertEqual((macos / relative).read_bytes(), (shallow / relative).read_bytes())
+        for identifier in ('ios-arm64', 'ios-arm64_x86_64-simulator'):
+            ios = local / identifier / 'libzcashlc.framework'
+            original = product / identifier / 'libzcashlc.framework'
+            self.assertEqual({path.name for path in ios.iterdir()},
+                             {'libzcashlc', 'Headers', 'Modules', 'Info.plist'})
+            for relative in ('libzcashlc', 'Headers/zcashlc.h', 'Modules/module.modulemap', 'Info.plist'):
+                self.assertEqual((ios / relative).read_bytes(), (original / relative).read_bytes())
+
+    def configure_local_ffi(self):
+        result = subprocess.run(['make', 'configure-local-ffi'], cwd=self.root, env=dict(self.env, **VALUES),
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_configure_local_ffi_versions_only_the_local_macos_copy(self):
+        self.run_native(['make', 'ffi-all'])
+        for _ in range(2):
+            self.configure_local_ffi()
+            self.assert_local_copy_versioned_and_product_shallow()
+
+    def test_configure_local_ffi_without_macos_slice(self):
+        self.run_native(['make', 'ffi-all'])
+        shutil.rmtree(self.root / 'BuildSupport/products/libzcashlc.xcframework/macos-arm64_x86_64')
+        self.configure_local_ffi()
+        self.assertFalse((self.root / 'LocalPackages/libzcashlc.xcframework/macos-arm64_x86_64').exists())
 
     def test_missing_configuration_is_rejected_before_cleanup_even_with_recursion_marker(self):
         product = self.root / 'BuildSupport/products/macos/keep'

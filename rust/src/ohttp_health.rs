@@ -110,7 +110,8 @@ pub extern "C" fn zcashlc_ohttp_health_api_version() -> u32 {
 }
 
 /// Subscribes to an exact configured route; no network request is performed.
-/// Returns null for missing/invalid strings, zero generation, or absent callback.
+/// Returns null for missing/invalid strings, zero generation, absent callback, or
+/// subscription construction failure. Construction panics set the last error.
 ///
 /// # Safety
 /// Strings must be valid NUL-terminated buffers. `context` must remain live until
@@ -124,49 +125,79 @@ pub unsafe extern "C" fn zcashlc_ohttp_health_subscribe_v1(
     callback: OHTTPHealthCallbackV1,
     context: *mut c_void,
 ) -> *mut OHTTPHealthSubscription {
-    if gateway.is_null() || relay.is_null() || generation == 0 {
-        return std::ptr::null_mut();
+    unsafe {
+        subscribe_with_constructor(
+            gateway,
+            relay,
+            via_tor,
+            generation,
+            callback,
+            context,
+            health::subscribe,
+        )
     }
-    let Some(callback) = callback else {
-        return std::ptr::null_mut();
-    };
-    let (Ok(gateway), Ok(relay)) = (
-        unsafe { CStr::from_ptr(gateway) }.to_str(),
-        unsafe { CStr::from_ptr(relay) }.to_str(),
-    ) else {
-        return std::ptr::null_mut();
-    };
-    if gateway.is_empty() || relay.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let route = health::HealthRoute {
-        gateway_host: gateway.to_owned(),
-        relay_url: relay.to_owned(),
-        via_tor,
-    };
-    // The caller owns the opaque context; its lifetime is protected by the subscription fence.
-    let context = context as usize;
-    let inner = health::subscribe(
-        route,
-        generation,
-        Arc::new(move |snapshot| {
-            let observations: Vec<_> = snapshot
-                .observations
-                .iter()
-                .map(FfiOHTTPHealthObservationV1::from)
-                .collect();
-            unsafe {
-                callback(
-                    observations.as_ptr(),
-                    observations.len(),
-                    snapshot.version,
-                    snapshot.generation,
-                    context as *mut c_void,
-                )
-            };
-        }),
-    );
-    Box::into_raw(Box::new(OHTTPHealthSubscription { inner }))
+}
+
+pub(super) unsafe fn subscribe_with_constructor(
+    gateway: *const c_char,
+    relay: *const c_char,
+    via_tor: bool,
+    generation: u64,
+    callback: OHTTPHealthCallbackV1,
+    context: *mut c_void,
+    construct: impl FnOnce(
+        health::HealthRoute,
+        u64,
+        Arc<dyn Fn(health::HealthSnapshot) + Send + Sync>,
+    ) -> health::HealthSubscription
+    + std::panic::UnwindSafe,
+) -> *mut OHTTPHealthSubscription {
+    let result = crate::catch_panic(|| {
+        if gateway.is_null() || relay.is_null() || generation == 0 {
+            return Ok(std::ptr::null_mut());
+        }
+        let Some(callback) = callback else {
+            return Ok(std::ptr::null_mut());
+        };
+        let (Ok(gateway), Ok(relay)) = (
+            unsafe { CStr::from_ptr(gateway) }.to_str(),
+            unsafe { CStr::from_ptr(relay) }.to_str(),
+        ) else {
+            return Ok(std::ptr::null_mut());
+        };
+        if gateway.is_empty() || relay.is_empty() {
+            return Ok(std::ptr::null_mut());
+        }
+        let route = health::HealthRoute {
+            gateway_host: gateway.to_owned(),
+            relay_url: relay.to_owned(),
+            via_tor,
+        };
+        // The caller owns the opaque context; its lifetime is protected by the subscription fence.
+        let context = context as usize;
+        let inner = construct(
+            route,
+            generation,
+            Arc::new(move |snapshot| {
+                let observations: Vec<_> = snapshot
+                    .observations
+                    .iter()
+                    .map(FfiOHTTPHealthObservationV1::from)
+                    .collect();
+                unsafe {
+                    callback(
+                        observations.as_ptr(),
+                        observations.len(),
+                        snapshot.version,
+                        snapshot.generation,
+                        context as *mut c_void,
+                    )
+                };
+            }),
+        );
+        Ok(Box::into_raw(Box::new(OHTTPHealthSubscription { inner })))
+    });
+    crate::unwrap_exc_or_null(result)
 }
 
 /// Copies an atomic snapshot. Returns the required element count (at most 126),

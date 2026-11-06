@@ -11,6 +11,7 @@ actor TorHTTPRequestExecutor {
         let deadline: UInt64
         let preserveHTTPFailure: Bool
         let cancellation: TorHTTPRequestCancellation
+        let onStart: (@Sendable () throws -> Void)?
         let operation: @Sendable (UInt64) throws -> Response
         let dispose: @Sendable () -> Void
         let continuation: CheckedContinuation<Response, Error>
@@ -49,7 +50,8 @@ actor TorHTTPRequestExecutor {
         deadlineUptime: UInt64,
         operation: @escaping @Sendable (UInt64) throws -> Response,
         dispose: @escaping @Sendable () -> Void = {},
-        preserveHTTPFailure: Bool = false
+        preserveHTTPFailure: Bool = false,
+        onStart: (@Sendable () throws -> Void)? = nil
     ) async throws -> Response {
         let id = UUID()
         let cancellation = TorHTTPRequestCancellation()
@@ -60,6 +62,7 @@ actor TorHTTPRequestExecutor {
                     deadline: deadlineUptime,
                     preserveHTTPFailure: preserveHTTPFailure,
                     cancellation: cancellation,
+                    onStart: onStart,
                     operation: operation,
                     dispose: dispose,
                     continuation: continuation
@@ -108,6 +111,7 @@ actor TorHTTPRequestExecutor {
                         let remaining = job.deadline > instant ? job.deadline - instant : 0
                         let milliseconds = remaining / 1_000_000
                         guard milliseconds > 0 else { throw URLError(.timedOut) }
+                        try job.onStart?()
                         return try job.operation(milliseconds)
                     }
                     Task { await self.complete(job.id, result: result) }

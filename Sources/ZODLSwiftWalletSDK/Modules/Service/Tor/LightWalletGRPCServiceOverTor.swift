@@ -23,6 +23,10 @@ actor ServiceConnections {
             throw ZcashError.torServiceMissingEndpoint
         }
 
+        if let budget = SubmissionBudget.current {
+            return try await budget.connections.connection(endpoint: endpointString, tor: tor)
+        }
+
         // uniqueTor
         if mode == .uniqueTor {
             return try await tor.connectToLightwalletd(endpoint: endpointString)

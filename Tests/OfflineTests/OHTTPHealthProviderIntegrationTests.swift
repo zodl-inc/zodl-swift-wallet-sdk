@@ -163,7 +163,7 @@ final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
             let before = OHTTPHealthClock.nowNanoseconds
             let result = await provider.probeOHTTPHealth(session: session)
             let elapsed = OHTTPHealthClock.nowNanoseconds - before
-            XCTAssertEqual(result.outcome, .transportUnavailable)
+            XCTAssertEqual(result.outcome, .inconclusive)
             XCTAssertGreaterThanOrEqual(elapsed, 19_000_000_000)
             XCTAssertLessThan(elapsed, 25_000_000_000)
             XCTAssertEqual(result.route, session.route)

@@ -203,6 +203,7 @@ class WalletTransactionEncoder: TransactionEncoder {
             throw TransactionEncoderError.notSubmittable(refusal)
         }
 
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
         let response = try await health.request {
             try await lightWalletService.submit(spendTransaction: transaction.raw, mode: mode)
         }

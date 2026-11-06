@@ -291,17 +291,13 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // (`Constants.thresholdToTrigger`, shared with the old pipeline). The prune runs on every
     // check. This host duplicates neither number.
     //
-    // Teardown (`stopImpl`, `wipeImpl`) only CANCELS `resubmissionTask`; it never nils the
-    // handle. The fired task clears it itself, as its last step, through the actor-isolated
-    // `finishResubmissionCheck()` — a single writer. If teardown also nil'd the handle, a fast
-    // stop→start could let a stale task's finish clear a NEWER task's handle and re-open the
-    // spawn guard while that new task still runs (double-spawn). Cancel-only teardown keeps
-    // the guard closed until the cancelled task's own finish clears it, which is benign and
-    // self-healing. Note the LIMIT of that cancellation: only the SUBMIT stage observes it
-    // (`SubmitPlanExecutor.submit` checks `Task.checkCancellation`, and `TxResubmitter` catches
-    // per transaction). The prune stage has no cancellation checks at all and runs to
-    // completion — which is why `wipeImpl` cancels AND joins (below), rather than trusting
-    // cancellation to stop a check that would otherwise write to files it is deleting.
+    // Every lifecycle request (start, stop, switch, restart, wipe, prepare's engine step, account
+    // import and delete, rewind, stall recovery, Tor retirement) cancels through the nonisolated
+    // owner before it joins the queue. A Tor transition cancels when it is requested; its route
+    // fence makes later passes fail admission quickly. The lifecycle turn still drains actual
+    // retry work before it may publish a new route or remove files.
+    // Generation ownership also covers cancellation between task creation and installation.
+    // Only the fired task clears its actor handle after its queued work has unwound.
     //
     // The driver is also gated on the CALLER's cancellation (`isCancelled`, defaulted to
     // `Task.isCancelled` so it is evaluated in the caller's task context). `stopPolling()`
@@ -315,6 +311,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// The in-flight check, if any. Doubles as the "one at a time" guard: a slow submit round
     /// must never be joined by a second concurrent pass over the same transactions.
     private var resubmissionTask: Task<Void, Never>?
+    private nonisolated let retryCancellation: RetryCancellationOwner
     /// How often the poll loop may run a resubmission check: 60 s (the poll tick is 2 s).
     /// `internal` so tests can reference the constant, like `stallWatchdogThresholdSeconds`.
     static let resubmissionCheckInterval: TimeInterval = 60
@@ -427,6 +424,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         alternateEndpoints: [LightWalletEndpoint],
         engine: any SlipstreamEngineControlling,
         torTransition: TorRouteTransition = TorRouteTransition(),
+        retryCancellation: RetryCancellationOwner = RetryCancellationOwner(),
         makeEndpointService: @escaping (LightWalletEndpoint, TorClient, SDKFlags, NetworkType) -> LightWalletService = Dependencies.makeLightWalletService,
         torHTTPUptime: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         restoreAnchor: @escaping SlipstreamAnchorResolver = { isRestore, birthday, fallbackCheckpoint, server, network, torDirPath in
@@ -445,6 +443,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // service is wrapped here as well, and its initializer downloader is rebound to it.
         let endpointService = initializer.lightWalletService as? RebindingLightWalletService
             ?? RebindingLightWalletService(service: initializer.lightWalletService)
+        self.retryCancellation = retryCancellation
         self.endpointService = endpointService
         self.makeEndpointService = makeEndpointService
         initializer.lightWalletService = endpointService
@@ -576,7 +575,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // switch overlapping its reopen would only record its server, because the engine counts as
         // closed until the reopen returns, and `prepare` would end with the engine on a server other
         // than the recorded one.
-        try await lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }.value
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing { try await self.openEngineOnLifecycleQueue() }
+        }.value
         // [v2.1 E-3] The snapshot is truthful FROM OPEN: the engine seeds `isRecovering`,
         // the permille floor, the persisted chain tip and spendability from the wallet DB
         // (the same inputs the first suggest round would use), so the cold-launch emission
@@ -628,13 +629,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Starts a Slipstream sync pass.
     /// The account is already imported in `data.db` from `prepare`, so UFVK is passed as `nil`
     /// (keyless update — engine calls `ensure_account` only when `ufvk=Some`).
-    public func start(retry: Bool = false) async throws {
+    public nonisolated func start(retry: Bool = false) async throws {
         // [MOB-1850] On the lifecycle queue, like every other pass-owning operation. A start that
         // follows a stop therefore runs after that stop's teardown has finished — the stop-before-start
         // ordering contract `pendingStop` used to hold up by hand — and, more importantly, a start
         // cannot land in the middle of a switch, a wipe or an account mutation's stopped interval.
-        try await lifecycle.enqueueThrowing {
-            try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.startImpl(retry: retry, resetRecoveryBudget: true)
+            }
         }.value
     }
 
@@ -767,8 +770,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Waits for earlier lifecycle operations and this stop's teardown to finish.
     /// A returned engine stop may still report non-quiescence, as for `stop()`.
     public nonisolated func stopAndWait() async {
-        torTransition.invalidate()
-        await lifecycle.enqueue { await self.stopImpl() }.value
+        await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueue { await self.stopImpl() }
+        }.value
     }
 
     /// Stops the in-flight sync.
@@ -785,8 +790,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// competing one. This also keeps `stopRequestGeneration`'s bump where the stop actually
     /// happens, so a recovery still in the queue behind it sees the request and abandons instead.
     public nonisolated func stop() {
-        torTransition.invalidate()
-        lifecycle.enqueue { await self.stopImpl() }
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            lifecycle.enqueue { await self.stopImpl() }
+        }
     }
 
     /// The queued body of `stop()`.
@@ -803,9 +810,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // to tell "the app stopped me" from "another path took the engine over".
         stopRequestGeneration += 1
         stopPolling()
-        // [#1975] Cancel, don't join: nothing is being deleted here, so a check that runs a
-        //   moment longer is harmless, and `stop()` must stay prompt. Cancel ONLY — the fired
-        //   task clears the handle itself (see the driver block).
+        // Earlier checks have drained on this queue. Cancel any later queued check; the fired
+        // task remains the single owner that clears its handle (see the driver block).
         resubmissionTask?.cancel()
         // T8.3 (T5.5 wart fix): only emit .stopped if we were prepared. stop() on an
         // unprepared synchronizer (Zodl calls it unconditionally on didEnterBackground,
@@ -1170,9 +1176,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// [MOB-1850] Asks for a stall recovery on behalf of the tick that decided one is due.
     ///
-    /// Synchronous and side-effect-free beyond the two flags: it appends the restart to the
-    /// lifecycle queue and returns, so the tick that called it goes on to finish its own work
-    /// rather than performing a teardown inside the poll task the teardown is about to cancel.
+    /// Synchronous. Beyond the two flags it only cancels a background retry pass and appends the
+    /// restart to the lifecycle queue, then returns, so the tick that called it goes on to finish
+    /// its own work rather than performing a teardown inside the poll task the teardown is about
+    /// to cancel.
     ///
     /// The two flags are set HERE, at request time, not when the restart runs:
     ///
@@ -1189,12 +1196,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     func requestStallRecovery(observedPassGeneration: Int, observedStopRequestGeneration: Int, attempt: Int) {
         stallRecoveryInFlight = true
         stallRecoveryStopRequestGeneration = observedStopRequestGeneration
-        lifecycle.enqueue {
-            await self.runStallRecovery(
-                expectedPassGeneration: observedPassGeneration,
-                expectedStopRequestGeneration: observedStopRequestGeneration,
-                attempt: attempt
-            )
+        retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.runStallRecovery(
+                    expectedPassGeneration: observedPassGeneration,
+                    expectedStopRequestGeneration: observedStopRequestGeneration,
+                    attempt: attempt
+                )
+            }
         }
     }
 
@@ -1479,20 +1488,41 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // check that takes a while must not push the next one further out.
         lastResubmissionCheckTime = now
         let latestBlockHeight = BlockHeight(chainTip)
-        resubmissionTask = Task { [weak self] in
+        let generation = passGeneration
+        let id = retryCancellation.begin()
+        let task = Task { [weak self] in
             guard let self else { return }
-            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight)
+            await self.runResubmissionCheck(latestBlockHeight: latestBlockHeight, generation: generation, id: id)
+        }
+        resubmissionTask = task
+        retryCancellation.install(task, id: id)
+    }
+
+    /// Retry execution and endpoint publication share the existing lifecycle boundary: a switch
+    /// cannot complete while an earlier retry can still send through the old public route.
+    private func runResubmissionCheck(latestBlockHeight: BlockHeight, generation: Int, id: UUID) async {
+        defer {
+            retryCancellation.finish(id: id)
+            finishResubmissionCheck()
+        }
+        let queued = lifecycle.enqueue {
+            await self.runResubmissionOnLifecycleQueue(latestBlockHeight: latestBlockHeight, generation: generation)
+        }
+        // Queue tasks are unstructured, so explicitly carry teardown cancellation across the boundary.
+        await withTaskCancellationHandler {
+            await queued.value
+        } onCancel: {
+            queued.cancel()
         }
     }
 
-    /// The actor-isolated body of one resubmission check: hops back onto the actor so
-    /// `txResubmitter` never leaves it, and clears the in-flight handle on every exit path.
-    private func runResubmissionCheck(latestBlockHeight: BlockHeight) async {
-        defer { finishResubmissionCheck() }
-        // Non-throwing: `TxResubmitter` logs and swallows both the candidate lookup and every
-        // per-transaction submit failure (a cancelled submit included), so one dead endpoint —
-        // or a teardown mid-check — can never escape as an unhandled error here.
-        await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight)
+    private func runResubmissionOnLifecycleQueue(latestBlockHeight: BlockHeight, generation: Int) async {
+        guard !Task.isCancelled, generation == passGeneration else { return }
+        let privateEndpoint = OHTTPEndpoints.isGateway(currentEndpoint.host) ? currentEndpoint : nil
+        // TxResubmitter retains eligibility, consent, throttling and per-transaction error handling.
+        await SubmissionBudget.$legacyTimeoutMilliseconds.withValue(currentEndpoint.singleCallTimeoutInMillis) {
+            await txResubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight, privateEndpoint: privateEndpoint)
+        }
     }
 
     /// Clears the in-flight handle. THE single writer that nils `resubmissionTask` (teardown only
@@ -1514,6 +1544,17 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// completed check this must read false (the task's own `finishResubmissionCheck()` cleared
     /// the handle), and it must NOT be false merely because teardown nil'd it. `internal`.
     var resubmissionCheckInFlightForTesting: Bool { resubmissionTask != nil }
+
+    /// Controls the existing retry throttle in deterministic lifecycle tests.
+    func setResubmissionTimeForTesting(_ time: TimeInterval) {
+        txResubmitter.latestResolvedTime = time
+    }
+
+    /// Test-only seam: lets the driver fire again at once, as it would once its 60 s cadence has
+    /// elapsed after a pass a lifecycle request cancelled. `internal`, never called by production.
+    func elapseResubmissionCadenceForTesting() {
+        lastResubmissionCheckTime = 0
+    }
 
     /// Pure gate for the background-resubmission driver. Static + pure so the truth table is
     /// unit-testable without an engine, mirroring `isSyncStalled`.
@@ -1662,19 +1703,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // stays OUTSIDE it deliberately: it is a network round trip with the engine still live and
         // no wallet write of its own, and holding the queue across it would make an unrelated
         // `stop()` wait on a server.
-        return try await lifecycle.enqueueThrowing {
-            try await self.importAccountOnLifecycleQueue(
-                request: AccountImportRequest(
-                    ufvk: ufvk,
-                    seedFingerprint: seedFingerprint,
-                    zip32AccountIndex: zip32AccountIndex,
-                    purpose: purpose,
-                    name: name,
-                    keySource: keySource
-                ),
-                effectiveBirthday: effectiveBirthday,
-                recoverUntil: chainTipHeight
-            )
+        return try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.importAccountOnLifecycleQueue(
+                    request: AccountImportRequest(
+                        ufvk: ufvk,
+                        seedFingerprint: seedFingerprint,
+                        zip32AccountIndex: zip32AccountIndex,
+                        purpose: purpose,
+                        name: name,
+                        keySource: keySource
+                    ),
+                    effectiveBirthday: effectiveBirthday,
+                    recoverUntil: chainTipHeight
+                )
+            }
         }.value
     }
 
@@ -1793,8 +1836,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [MOB-1850] One lifecycle operation: the stopped interval below exists so that no pass
         // scans across the deletion, and only the queue can make that interval real — a recovery
         // restart used to complete its `engine.start()` inside it.
-        try await lifecycle.enqueueThrowing {
-            try await self.deleteAccountOnLifecycleQueue(accountUUID)
+        try await retryCancellation.cancel {
+            lifecycle.enqueueThrowing {
+                try await self.deleteAccountOnLifecycleQueue(accountUUID)
+            }
         }.value
     }
 
@@ -2302,8 +2347,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         // [MOB-1850] The stop/truncate/restart below is one lifecycle operation. The policy→height
         // resolution above is not: it touches no engine state and can fail the publisher outright.
-        await lifecycle.enqueue {
-            await self.rewindOnLifecycleQueue(to: height, subject)
+        await retryCancellation.cancel {
+            lifecycle.enqueue {
+                await self.rewindOnLifecycleQueue(to: height, subject)
+            }
         }.value
     }
 
@@ -2375,8 +2422,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// Wipes all wallet data managed by this synchronizer.
     ///
     /// Mirrors `SDKSynchronizer.wipe()` + `CompactBlockProcessor.doWipe()`:
-    /// 1. Stop the poll loop, then cancel AND await any in-flight background resubmission
-    ///    check ([#1975]) — it must not still be reading or writing the files step 4 deletes.
+    /// 1. Wait for earlier lifecycle work, including retries, then stop the poll loop and cancel
+    ///    later queued retry checks — none may access the files step 4 deletes.
     /// 2. `engine.stopForWalletChange()` — cancel any in-flight sync task, its scan at the next block.
     /// 3. `engine.close()` — free the Rust handle so no Rust-side state survives file deletion.
     /// 4. Delete `data.db` + its WAL (`-wal`) and shared-memory (`-shm`) siblings.
@@ -2389,31 +2436,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///    the next `prepare` opens it: a `switchTo(endpoint:)` before that only records the server.
     /// 8. Complete the returned publisher — or fail it if any file-removal throws.
     ///
-    /// The publisher uses a `PassthroughSubject` driven from a `Task(priority: .high)`,
-    /// mirroring the `SDKSynchronizer.wipe()` idiom.
+    /// The publisher uses a `PassthroughSubject` driven by the lifecycle queue task.
     public nonisolated func wipe() -> AnyPublisher<Void, Error> {
-        torTransition.invalidate()
-        let subject = PassthroughSubject<Void, Error>()
-        Task(priority: .high) { [weak self] in
-            guard let self else {
-                subject.send(completion: .finished)
-                return
+        retryCancellation.cancel {
+            torTransition.invalidate()
+            let subject = PassthroughSubject<Void, Error>()
+            lifecycle.enqueue { [weak self] in
+                guard let self else {
+                    subject.send(completion: .finished)
+                    return
+                }
+                await self.wipeOnLifecycleQueue(subject)
             }
-            await self.wipeImpl(subject)
+            return subject.eraseToAnyPublisher()
         }
-        return subject.eraseToAnyPublisher()
-    }
-
-    /// The actor-isolated body of `wipe()`.
-    ///
-    /// [MOB-1850] The whole of it is one lifecycle operation. A wipe deletes the files every other
-    /// operation reads and writes, so it is the one that most needs the queue: a recovery restart
-    /// reopening a handle onto a database this method has just removed would recreate it (SQLite
-    /// recreates a file on connect) and leave the wallet half-wiped.
-    private func wipeImpl(_ subject: PassthroughSubject<Void, Error>) async {
-        await lifecycle.enqueue {
-            await self.wipeOnLifecycleQueue(subject)
-        }.value
     }
 
     /// The queued body of `wipe()`.
@@ -2427,18 +2463,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         stopPolling()
         // [MOB-1850] Every other teardown clears `isRunning` here too; wipe was the one path left standing.
         isRunning = false
-        // 1a. [#1975] Cancel AND JOIN any in-flight resubmission check — it reads and writes the
-        //     very database files about to be deleted. Cancel alone is not enough: only the
-        //     SUBMIT stage observes cancellation (`SubmitPlanExecutor.submit`), while the prune
-        //     stage has no cancellation checks and would run on to `deletePlans` after the plan
-        //     file was removed. Joining does not violate the single-writer rule (that forbids
-        //     nil'ing the handle here, not awaiting it): the task's own `finishResubmissionCheck()`
-        //     clears it, and has done so by the time `.value` returns. No deadlock — awaiting
-        //     suspends `wipeImpl` and frees the actor for that finish hop. A tick that resumes
-        //     during this wipe cannot start a new check: `pollTask` is cancelled, and the driver
-        //     is gated on the caller's cancellation.
+        // Earlier retries have already drained before this lifecycle turn. Cancel later queued
+        // retries, which also validate their pass generation before any store access. Joining here
+        // would deadlock waiting for a retry whose lifecycle turn is behind this wipe.
         resubmissionTask?.cancel()
-        await resubmissionTask?.value
 
         // 2. Stop the in-flight sync (non-blocking cancel in Rust).
         // [MOB-1850] A wipe is a deliberate stop that brings no pass of its own back up, so a
@@ -2789,19 +2817,21 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ///    to the new endpoint (frees Rust-side tokio runtime, then allocates a fresh one).
     /// 7. Store `endpoint` in `currentEndpoint`.
     /// 8. If the engine was running before the switch, restart via `start(retry: false)`.
-    public func switchTo(endpoint: LightWalletEndpoint) async throws {
-        torTransition.invalidate()
-        torIntendedRunning = nil
+    public nonisolated func switchTo(endpoint: LightWalletEndpoint) async throws {
         // [MOB-1850] One lifecycle operation, the no-op check included: `currentEndpoint` is what
         // the check reads and what a queued switch ahead of this one may be about to change, so the
         // comparison belongs in this operation's own turn rather than before it.
-        try await lifecycle.enqueueThrowing {
-            try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+        try await retryCancellation.cancel {
+            torTransition.invalidate()
+            return lifecycle.enqueueThrowing {
+                try await self.switchToOnLifecycleQueue(endpoint: endpoint)
+            }
         }.value
     }
 
     /// The queued body of `switchTo(endpoint:)`.
     private func switchToOnLifecycleQueue(endpoint: LightWalletEndpoint) async throws {
+        torIntendedRunning = nil
         try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
         // host, port and TLS flag must all match (`isSameServer`). [MOB-1850] Checked BEFORE the
@@ -2933,9 +2963,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
-    public func restartSync(at endpoint: LightWalletEndpoint) async throws {
-        torTransition.invalidate()
-        torIntendedRunning = nil
+    public nonisolated func restartSync(at endpoint: LightWalletEndpoint) async throws {
         // A caller cancelled while this restart is still queued — the app backgrounding while a
         // terminal rebuild waits its turn — must not have the restart run behind the stop that
         // background enqueued: the queued task is unstructured and inherits no cancellation, so the
@@ -2943,11 +2971,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // begun executing it completes; a stop queued behind it then has the final word.
         let callerCancelled = CancellationFlag()
         try await withTaskCancellationHandler {
-            try await lifecycle.enqueueThrowing {
-                if callerCancelled.isCancelled {
-                    throw CancellationError()
+            try await retryCancellation.cancel {
+                try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
+                torTransition.invalidate()
+                return lifecycle.enqueueThrowing {
+                    if callerCancelled.isCancelled {
+                        throw CancellationError()
+                    }
+                    try await self.restartSyncImpl(at: endpoint)
                 }
-                try await self.restartSyncImpl(at: endpoint)
             }.value
         } onCancel: {
             callerCancelled.markCancelled()
@@ -2962,6 +2994,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// `wasRunning` (the host calls this after a stall recovery gave up and stopped the pass, so
     /// nothing IS running by the time this runs).
     private func restartSyncImpl(at endpoint: LightWalletEndpoint) async throws {
+        torIntendedRunning = nil
+        try OHTTPEndpoints.checkGatewayNetwork(host: endpoint.host, network: initializer.network.networkType)
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
@@ -3200,39 +3234,47 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         startsSync: Bool = false,
         resetRecoveryBudget: Bool = true
     ) -> TorTransitionRequest {
-        return torTransition.begin(
-            enabled: enabled,
-            health: healthOwner,
-            startsSync: startsSync,
-            resetRecoveryBudget: resetRecoveryBudget
-        ) { request in
-            self.routeAdmission.require(enabled)
-            request.configure(
-                activate: { [weak self, weak request] in
-                    guard let self, let request else { return Task { throw CancellationError() } }
-                    if startsSync {
-                        return Task { try await self.applyTorMode(request) }
+        return retryCancellation.cancel {
+            torTransition.begin(
+                enabled: enabled,
+                health: healthOwner,
+                startsSync: startsSync,
+                resetRecoveryBudget: resetRecoveryBudget
+            ) { request in
+                self.routeAdmission.require(enabled)
+                request.configure(
+                    activate: { [weak self, weak request] in
+                        guard let self, let request else { return Task { throw CancellationError() } }
+                        if startsSync {
+                            return Task { try await self.applyTorMode(request) }
+                        }
+                        return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
+                    },
+                    cancellation: { [weak self, weak request] in
+                        guard let self, let request, !request.hasAcquired else { return }
+                        self.scheduleTorRetirement(request)
+                    },
+                    dormantCancelled: { [weak self, weak request] in
+                        guard let self, let request else { return }
+                        self.torTransition.publish(request, phase: .cancelled)
+                        self.scheduleTorRetirement(request)
                     }
-                    return self.lifecycle.enqueueThrowing { try await self.applyTorMode(request) }
-                },
-                cancellation: { [weak self, weak request] in
-                    guard let self, let request, !request.hasAcquired else { return }
-                    self.scheduleTorRetirement(request)
-                },
-                dormantCancelled: { [weak self, weak request] in
-                    guard let self, let request else { return }
-                    self.torTransition.publish(request, phase: .cancelled)
-                    self.scheduleTorRetirement(request)
-                }
-            )
+                )
+            }
         }
     }
 
     /// Owns native-only cleanup independently of the already-completed request observer.
     /// Also used by tests to deliver a delayed retirement through the real lifecycle boundary.
+    ///
+    /// First cancels the background retry pass, then queues the retirement. This may run under
+    /// `TorRouteTransition`'s lock, so retry-path cancellation handlers must never call back into
+    /// the Tor coordinator.
     @discardableResult
     nonisolated func scheduleTorRetirement(_ request: TorTransitionRequest) -> Task<Void, Never> {
-        lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+        retryCancellation.cancel {
+            lifecycle.enqueue { await self.retireNativePassAfterFailedAcquisition(request) }
+        }
     }
 
     private func retireNativePassAfterFailedAcquisition(_ request: TorTransitionRequest) async {
@@ -3246,8 +3288,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         passGeneration += 1
         isRunning = false
         stopPolling()
-        // This stops only the native sync loop. Admitted broadcasts keep their HTTP/runtime
-        // resources and original route; no close, rebind, free, or resubmission cancellation.
+        // This stops only the native sync loop. Broadcasts the app already admitted keep their
+        // HTTP/runtime resources and original route: no close, rebind or free. The background
+        // retry pass was cancelled when `scheduleTorRetirement` queued this turn.
         let report = await engine.stop()
         publishStoppedState()
         if let reason = report.refusalReason {

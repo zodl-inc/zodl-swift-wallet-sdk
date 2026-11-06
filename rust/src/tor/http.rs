@@ -1,3 +1,23 @@
+// The caller guarantees that nonempty input is valid for reads during this call.
+pub(crate) unsafe fn post_body(
+    body: *const u8,
+    length: usize,
+) -> http_body_util::Full<bytes::Bytes> {
+    // Hyper drives the connection in a detached task that may still be sending
+    // after an early response or deadline returns control to the FFI caller.
+    // Full clones retain the owned bytes for every backend retry.
+    let data = if length == 0 {
+        bytes::Bytes::new()
+    } else {
+        bytes::Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body, length) })
+    };
+    http_body_util::Full::new(data)
+}
+
+#[cfg(test)]
+#[path = "http_post_body_tests.rs"]
+mod post_body_tests;
+
 use std::future::Future;
 
 #[cfg(test)]

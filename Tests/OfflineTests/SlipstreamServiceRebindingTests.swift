@@ -70,6 +70,25 @@ final class SlipstreamServiceRebindingTests: ZcashTestCase {
         await fixture.synchronizer.stopAndWait()
     }
 
+    func testWrongNetworkRestartDoesNotTouchEngine() async throws {
+        let fixture = try makeFixture()
+        await fixture.synchronizer.setInternalSyncStatusForTesting(.stopped)
+        let wrongNetwork = LightWalletEndpoint(address: OHTTPTestSupport.mainnetHost, port: 443, secure: true)
+        do {
+            try await fixture.synchronizer.restartSync(at: wrongNetwork)
+            XCTFail("Expected wrong-network gateway rejection")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code, .compactBlockProcessorChainName)
+        }
+        let engineCalls = await fixture.engine.calls
+        XCTAssertEqual(engineCalls.filter { $0 == "stopForWalletChange" || $0 == "stop" }.count, 0)
+        XCTAssertEqual(engineCalls.filter { $0.hasPrefix("reopen(") }.count, 0)
+        XCTAssertEqual(fixture.factoryCalls.withLockUnchecked { $0.count }, 0)
+        XCTAssertEqual(fixture.initializer.endpoint, publicEndpoint)
+        try await assertTreeRoute(fixture.initializer.lightWalletService, host: publicEndpoint.host)
+        await fixture.synchronizer.stopAndWait()
+    }
+
     func testRefusedStopDoesNotBuildOrPublishAReplacement() async throws {
         let fixture = try makeFixture()
         fixture.engine.stopQuiescent = false

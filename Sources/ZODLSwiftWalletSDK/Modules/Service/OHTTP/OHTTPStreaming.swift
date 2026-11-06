@@ -303,11 +303,14 @@ extension OHTTPTransport {
     static func streamedData(
         for request: URLRequest,
         maxBytes: Int,
-        session: URLSession = OHTTPTransport.session
+        session: URLSession? = nil
     ) async throws -> OHTTPOuterStream {
         let reader = OHTTPStreamReader(maxBytes: maxBytes)
-        let task = session.dataTask(with: oneShotBody(request))
-        task.delegate = reader
+        let task = try await withSessionForSetup(session) { session in
+            let task = session.dataTask(with: oneShotBody(request))
+            task.delegate = reader
+            return task
+        }
         return try await reader.start(task)
     }
 }
@@ -339,7 +342,15 @@ private final class OHTTPStreamReader: NSObject, URLSessionDataDelegate, @unchec
     func start(_ task: URLSessionDataTask) async throws -> OHTTPOuterStream {
         bodyContinuation.onTermination = { _ in task.cancel() }
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            do {
+                try OHTTPHealthProbe.budget?.beginNetworkAttempt()
+            } catch {
+                // Setup already registered this task; retirement must not wait for an unresumed task.
+                task.cancel()
+                bodyContinuation.finish(throwing: error)
+                throw error
+            }
+            return try await withCheckedThrowingContinuation { continuation in
                 lock.withLock { head = continuation }
                 task.resume()
             }

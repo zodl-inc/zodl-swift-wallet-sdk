@@ -3,6 +3,7 @@ import libzcashlc
 
 /// Synchronous native operations. All request operations run together on one worker.
 struct TorHTTPGetNative: Sendable {
+    var now: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     var get: @Sendable (
         OpaquePointer?, UnsafePointer<CChar>?, UnsafePointer<FfiHttpRequestHeader>?, UInt, UInt8, UInt64
     ) -> UnsafeMutablePointer<FfiHttpResponseBytes>? = { zcashlc_tor_http_get_with_timeout($0, $1, $2, $3, $4, $5) }
@@ -11,6 +12,9 @@ struct TorHTTPGetNative: Sendable {
     var freeRuntime: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_runtime($0) }
     var connectLightwalletd: @Sendable (OpaquePointer?, UnsafePointer<CChar>?) -> OpaquePointer? = {
         zcashlc_tor_connect_to_lightwalletd($0, $1)
+    }
+    var connectLightwalletdWithTimeout: @Sendable (OpaquePointer?, UnsafePointer<CChar>?, UInt64) -> OpaquePointer? = {
+        zcashlc_tor_connect_to_lightwalletd_with_timeout($0, $1, $2)
     }
     var freeLightwalletd: @Sendable (OpaquePointer?) -> Void = { zcashlc_free_tor_lwd_conn($0) }
     var startup = TorRuntimeStartupNative()
@@ -36,9 +40,11 @@ final class TorHTTPGetRequest: @unchecked Sendable {
     private let bounded: Int?
     private let postBody: Data?
     private let health: OHTTPHealthTraffic?
+    private let probeBudget: OHTTPHealthProbeBudget?
 
     init(runtime: OpaquePointer, request: URLRequest, url: URL, retryLimit: UInt8, deadline: UInt64, native: TorHTTPGetNative, bounded: Int? = nil) {
         self.health = OHTTPHealthTraffic.current
+        self.probeBudget = OHTTPHealthProbe.budget
         self.runtime = runtime
         self.url = url
         self.headers = request.allHTTPHeaderFields ?? [:]
@@ -84,15 +90,19 @@ final class TorHTTPGetRequest: @unchecked Sendable {
         var outcome = FfiTorHttpOutcome(kind: 5, http_status: 0, retry_not_before_ns: 0)
         let responsePointer = try nativeHeaders.withUnsafeBufferPointer { buffer in
             try url.absoluteString.withCString { urlPointer in
-                // Header/string allocation consumes the same deadline. Floor immediately
-                // before native entry, so neither queue wait nor allocation extends it.
-                let now = DispatchTime.now().uptimeNanoseconds
-                let remaining = deadline > now ? deadline - now : 0
-                let milliseconds = min(timeoutMilliseconds, remaining / 1_000_000)
-                guard milliseconds > 0 else { throw URLError(.timedOut) }
+                // Evaluate the remaining budget after every request buffer is ready, then mark
+                // dispatch immediately before native entry. Worker admission is not network evidence.
+                func nativeTimeout() throws -> UInt64 {
+                    let now = native.now()
+                    let remaining = deadline > now ? deadline - now : 0
+                    let milliseconds = min(timeoutMilliseconds, remaining / 1_000_000)
+                    guard milliseconds > 0 else { throw URLError(.timedOut) }
+                    try probeBudget?.beginNetworkAttempt()
+                    return milliseconds
+                }
                 if let bounded {
                     if let postBody {
-                        return postBody.withUnsafeBytes { body in
+                        return try postBody.withUnsafeBytes { body in
                             native.postOnce(
                                 runtime,
                                 urlPointer,
@@ -101,7 +111,7 @@ final class TorHTTPGetRequest: @unchecked Sendable {
                                 body.bindMemory(to: UInt8.self).baseAddress,
                                 UInt(body.count),
                                 UInt(bounded),
-                                milliseconds,
+                                try nativeTimeout(),
                                 &outcome
                             )
                         }
@@ -113,11 +123,11 @@ final class TorHTTPGetRequest: @unchecked Sendable {
                         UInt(headers.count),
                         retryLimit,
                         UInt(bounded),
-                        milliseconds,
+                        try nativeTimeout(),
                         &outcome
                     )
                 }
-                return native.get(runtime, urlPointer, buffer.baseAddress, UInt(headers.count), retryLimit, milliseconds)
+                return native.get(runtime, urlPointer, buffer.baseAddress, UInt(headers.count), retryLimit, try nativeTimeout())
             }
         }
         if bounded != nil { health?.outerResponse(outcome) }

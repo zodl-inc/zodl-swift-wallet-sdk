@@ -31,20 +31,25 @@ final class TxResubmitter {
         logger = container.resolve(Logger.self)
     }
 
-    func checkAndResubmit(latestBlockHeight: BlockHeight) async {
+    /// A selected Private gateway overrides retry destinations only after the existing consent checks.
+    /// Public and Manual callers omit it and retain their recorded endpoint policy.
+    func checkAndResubmit(latestBlockHeight: BlockHeight, privateEndpoint: LightWalletEndpoint? = nil) async {
         // Plans whose transactions are expired or gone are no longer retry
         // candidates; drop them. Mined transactions keep their plans until
-        // expiry so a reorg that un-mines one still retries through its
-        // recorded endpoints — findForResubmission excludes mined transactions,
+        // expiry so a reorg that un-mines one still retries through the
+        // currently allowed endpoints — findForResubmission excludes mined transactions,
         // so a retained plan costs nothing meanwhile. Decisions are made per
         // transaction from current repository state, so a transaction created
         // mid-pass can never be wrongly pruned.
+        guard !Task.isCancelled else { return }
         await pruneStalePlans(latestBlockHeight: latestBlockHeight)
+        guard !Task.isCancelled else { return }
 
         // find all candidates for the resubmission
         do {
             logger.info("TxResubmissionAction check started at \(latestBlockHeight) height.")
             let transactions = try await transactionRepository.findForResubmission(upTo: latestBlockHeight)
+            try Task.checkCancellation()
             logger.debug("TxResubmissionAction found \(transactions.count) resubmission candidate(s).")
 
             // no candidates, update the time and continue with the next action
@@ -59,8 +64,9 @@ final class TxResubmitter {
                     // resubmission; per-transaction error handling so one
                     // transaction's dead endpoints can't starve the others
                     for transaction in transactions {
+                        try Task.checkCancellation()
                         do {
-                            try await resubmit(transaction: transaction)
+                            try await resubmit(transaction: transaction, privateEndpoint: privateEndpoint)
                         } catch {
                             logger.error(
                                 "TxResubmissionAction failed to resubmit transaction \(transaction.rawID.toHexStringTxId()): \(error)"
@@ -68,6 +74,7 @@ final class TxResubmitter {
                         }
                     }
 
+                    try Task.checkCancellation()
                     latestResolvedTime = Date().timeIntervalSince1970
                 }
             }
@@ -78,15 +85,18 @@ final class TxResubmitter {
 }
 
 private extension TxResubmitter {
-    func resubmit(transaction: ZcashTransaction.Overview) async throws {
+    func resubmit(transaction: ZcashTransaction.Overview, privateEndpoint: LightWalletEndpoint?) async throws {
         if let routeAdmission {
-            try await routeAdmission.withLease { try await self.resubmitAdmitted(transaction: transaction) }
+            try await routeAdmission.withLease {
+                try await self.resubmitAdmitted(transaction: transaction, privateEndpoint: privateEndpoint)
+            }
         } else {
-            try await resubmitAdmitted(transaction: transaction)
+            try await resubmitAdmitted(transaction: transaction, privateEndpoint: privateEndpoint)
         }
     }
 
-    func resubmitAdmitted(transaction: ZcashTransaction.Overview) async throws {
+    func resubmitAdmitted(transaction: ZcashTransaction.Overview, privateEndpoint: LightWalletEndpoint?) async throws {
+        try Task.checkCancellation()
         // Captured before `plan(for:)` itself, not merely before the network round trip: the two
         // are separate awaits into the store's actor, and a `wipe()` can land between them. A
         // token captured only after `plan(for:)` returns could already reflect the post-wipe
@@ -96,6 +106,7 @@ private extension TxResubmitter {
         let lifecycle = await submitPlanStore.currentLifecycle()
         let plan = await submitPlanStore.plan(for: transaction.rawID)
 
+        try Task.checkCancellation()
         switch plan {
         case .awaiting:
             // Created through Broadcaster but never submitted by the app —
@@ -109,7 +120,8 @@ private extension TxResubmitter {
             // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
-            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
+            let retryEndpoints = privateEndpoint.map { [$0] } ?? endpoints
+            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: retryEndpoints)
             if let acceptingEndpoint {
                 await submitPlanStore.markAccepted(
                     txId: transaction.rawID,
@@ -128,8 +140,15 @@ private extension TxResubmitter {
 
         case nil:
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()).")
-            let encodedTransaction = try transaction.encodedTransaction()
-            try await transactionEncoder.submit(transaction: encodedTransaction)
+            if let privateEndpoint {
+                let createdTransaction = try CreatedTransaction(overview: transaction)
+                try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: [privateEndpoint])
+            } else {
+                let encodedTransaction = try transaction.encodedTransaction()
+                try await SubmissionBudget.withBudget(milliseconds: SubmissionBudget.legacyTimeoutMilliseconds) {
+                    try await self.transactionEncoder.submit(transaction: encodedTransaction)
+                }
+            }
         }
     }
 
@@ -139,6 +158,7 @@ private extension TxResubmitter {
 
         var staleTxIds: [Data] = []
         for txId in plannedTxIds {
+            guard !Task.isCancelled else { return }
             do {
                 let transaction = try await transactionRepository.find(rawID: txId)
                 // Stale only once expired: pruning at "mined" would lose the
@@ -150,6 +170,7 @@ private extension TxResubmitter {
                     staleTxIds.append(txId)
                 }
             } catch ZcashError.transactionRepositoryEntityNotFound {
+                guard !Task.isCancelled else { return }
                 do {
                     guard let created = try await transactionEncoder.createdTransactions(forTxIds: [txId]).first,
                           let expiryHeight = created.expiryHeight,
@@ -181,6 +202,7 @@ private extension TxResubmitter {
             }
         }
 
+        guard !Task.isCancelled else { return }
         if !staleTxIds.isEmpty {
             logger.info("TxResubmissionAction pruning \(staleTxIds.count) stale submit plan(s).")
             await submitPlanStore.deletePlans(txIds: staleTxIds)

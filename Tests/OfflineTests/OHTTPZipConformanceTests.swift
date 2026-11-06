@@ -313,11 +313,14 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let sessions = RotatingSession(lifetime: lifetime)
         let start = Date()
 
-        let first = sessions.current(now: start)
-        XCTAssertTrue(first === sessions.current(now: start.addingTimeInterval(lifetime - 1)), "within its lifetime the session is reused")
-        let second = sessions.current(now: start.addingTimeInterval(lifetime))
-        XCTAssertFalse(first === second, "once it is as old as its lifetime a fresh session replaces it")
-        XCTAssertTrue(second === sessions.current(now: start.addingTimeInterval(lifetime + 1)))
+        let first = sessions.acquire(now: start)
+        XCTAssertTrue(
+            first.session === sessions.acquire(now: start.addingTimeInterval(lifetime - 1)).session,
+            "within its lifetime the session is reused"
+        )
+        let second = sessions.acquire(now: start.addingTimeInterval(lifetime))
+        XCTAssertFalse(first.session === second.session, "once it is as old as its lifetime a fresh session replaces it")
+        XCTAssertTrue(second.session === sessions.acquire(now: start.addingTimeInterval(lifetime + 1)).session)
     }
 
     // MARK: - gRPC status of a failed exchange

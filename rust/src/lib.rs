@@ -4738,7 +4738,7 @@ unsafe fn tor_http_post_bounded_impl(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let body = unsafe { tor::http::post_body(body, body_len) };
         let retry_filter =
             |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| (*retry_filter)(res);
 
@@ -4755,7 +4755,7 @@ unsafe fn tor_http_post_bounded_impl(
                                 builder.header(*key, *value)
                             })
                         },
-                        http_body_util::Full::new(body_data),
+                        body,
                         |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),
@@ -5141,11 +5141,7 @@ unsafe fn tor_http_classified_impl(
         let client = runtime.client();
         let (result, evidence) = if let Some((body, length)) = post {
             anyhow::ensure!(length == 0 || !body.is_null(), "A request body is required");
-            let body = if length == 0 {
-                &[]
-            } else {
-                unsafe { slice::from_raw_parts(body, length) }
-            };
+            let body = unsafe { tor::http::post_body(body, length) };
             runtime.runtime().block_on(tor_http_classified_response(
                 max_bytes,
                 timeout_ms,
@@ -5155,7 +5151,7 @@ unsafe fn tor_http_classified_impl(
                         .http_post(
                             url,
                             add_headers,
-                            http_body_util::Full::new(body),
+                            body,
                             |body| guard.parse_get(body, true),
                             TOR_HTTP_UNSENT_RETRIES,
                             |result| guard.filter(result),
@@ -5533,7 +5529,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let body_data = unsafe { slice::from_raw_parts(body, body_len) };
+        let body = unsafe { tor::http::post_body(body, body_len) };
         let retry_filter = |res: Result<http::StatusCode, &zcash_client_backend::tor::Error>| {
             res.is_err()
                 .then_some(zcash_client_backend::tor::http::Retry::Same)
@@ -5552,7 +5548,7 @@ pub unsafe extern "C" fn zcashlc_tor_http_post(
                                 builder.header(*key, *value)
                             })
                         },
-                        http_body_util::Full::new(body_data),
+                        body,
                         |body| guard.parse_get(body, false),
                         retry_limit,
                         |res| guard.filter(res),
@@ -6128,6 +6124,35 @@ pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd(
         Ok(Box::into_raw(Box::new(lwd_conn)))
     });
     unwrap_exc_or_null(res)
+}
+
+/// Creates an isolated submission connection with one remaining monotonic budget in milliseconds.
+/// Setup, latest-block reads, submission and transaction lookup share that deadline. The connection
+/// owns the executor of its writer tasks: freeing it retires those tasks before returning.
+/// Ordinary connections and streaming calls keep their existing timeout behavior.
+///
+/// # Safety
+///
+/// The pointer, string and exclusive-access requirements of
+/// [`zcashlc_tor_connect_to_lightwalletd`] apply. Free the result with
+/// [`zcashlc_free_tor_lwd_conn`]. A zero timeout fails without connecting.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_tor_connect_to_lightwalletd_with_timeout(
+    tor_runtime: *mut TorRuntime,
+    endpoint: *const c_char,
+    timeout_ms: u64,
+) -> *mut tor::LwdConn {
+    let tor_runtime = AssertUnwindSafe(tor_runtime);
+    let result = catch_panic(|| {
+        let runtime =
+            unsafe { tor_runtime.as_ref() }.ok_or_else(|| anyhow!("A Tor runtime is required"))?;
+        let endpoint = unsafe { CStr::from_ptr(endpoint).to_str()? }
+            .try_into()
+            .map_err(|error| anyhow!("Invalid lightwalletd endpoint: {error}"))?;
+        let connection = runtime.connect_to_lightwalletd_with_timeout(endpoint, timeout_ms)?;
+        Ok(Box::into_raw(Box::new(connection)))
+    });
+    unwrap_exc_or_null(result)
 }
 
 /// Frees a Tor lightwalletd connection.
