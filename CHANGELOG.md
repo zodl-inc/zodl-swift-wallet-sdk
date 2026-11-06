@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 8.0.0 - 2026-11-06
+
 ## Added
 
 - `OHTTPEndpoints.gatewayHost(for:)` returns the gateway configured into the native SDK for the
