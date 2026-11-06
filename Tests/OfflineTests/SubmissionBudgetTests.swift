@@ -3,6 +3,7 @@ import os
 import libzcashlc
 import GRPC
 import NIO
+import SwiftProtobuf
 import XCTest
 @testable import TestUtils
 @testable import ZODLSwiftWalletSDK
@@ -172,8 +173,10 @@ final class SubmissionBudgetTests: ZcashTestCase {
     }
 
     func testDirectAdmissionHeightSendAndKnownLookupShareOneDeadline() async throws {
-        let server = try DelayedSubmissionServer(sendResponse: SendResponse.with { $0.errorCode = -1 })
+        let server = try BudgetSubmissionServer(sendResponse: SendResponse.with { $0.errorCode = -1 })
         defer { try? server.stop() }
+        let clock = server.clock
+        let options = OSAllocatedUnfairLock(initialState: [TimeLimit]())
         let backend = ZcashRustBackendWeldingMock()
         backend.checkTransactionSubmittableSubmissionServerHeightClosure = { _, _ in nil }
         let tor = TorClient(torDir: try __torDirURL())
@@ -181,39 +184,85 @@ final class SubmissionBudgetTests: ZcashTestCase {
         let submitter = GRPCEndpointSubmitter(
             torClient: tor, sdkFlags: flags, rustBackend: backend, logger: NullLogger(), networkType: .testnet,
             serviceFactory: { endpoint, tor in
-                Thread.sleep(forTimeInterval: 0.06)
+                clock.withLock { $0 += 6_000_000_000 }
                 let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: tor)
                 service.sdkFlags = flags
+                let client = service.resolveLazyConnect()
+                let channel = BudgetRecordingChannel(channel: client.channel, options: options)
+                service.channel = channel
+                service.compactTxStreamerInternal = CompactTxStreamerAsyncClient(
+                    channel: channel, defaultCallOptions: client.defaultCallOptions
+                )
                 return service
             }
         )
+        // Real localhost RPCs retain operational deadlines, but clock advances rather than
+        // scheduler latency determine the exact deadline contract asserted below.
         let endpoint = LightWalletEndpoint(address: server.endpoint.host, port: server.endpoint.port, secure: false,
-                                           singleCallTimeoutInMillis: 400)
-        let start = DispatchTime.now().uptimeNanoseconds
-        do {
+                                           singleCallTimeoutInMillis: 30_000)
+        try await SubmissionBudget.$monotonicNow.withValue({ clock.withLock { $0 } }) {
             try await submitter.submit(transaction: transaction(), to: endpoint)
-            XCTFail("The delayed known-transaction reply is outside the original attempt budget")
-        } catch {}
-        let elapsed = DispatchTime.now().uptimeNanoseconds - start
-        XCTAssertLessThan(elapsed, 650_000_000, "Admission and both earlier RPCs must reduce the known-lookup deadline")
+        }
         XCTAssertEqual(server.stages.withLock { $0 }, ["height", "send", "known"])
+        XCTAssertEqual(
+            options.withLock { $0 },
+            [
+                TimeLimit.timeout(.seconds(24)),
+                TimeLimit.timeout(.seconds(16)),
+                TimeLimit.timeout(.seconds(8))
+            ],
+            "Admission, height and rejected send must consume the same attempt budget before known acceptance"
+        )
     }
 
-    private final class DelayedSubmissionServer: HeightReportingLightwalletd {
+    private final class BudgetSubmissionServer: HeightReportingLightwalletd {
+        let clock = OSAllocatedUnfairLock(initialState: UInt64(1_000_000_000))
         let stages = OSAllocatedUnfairLock(initialState: [String]())
+
         override func getLatestBlock(request: ChainSpec, context: StatusOnlyCallContext) -> EventLoopFuture<BlockID> {
             stages.withLock { $0.append("height") }
-            return context.eventLoop.scheduleTask(in: .milliseconds(80)) { BlockID(height: 100_000) }.futureResult
+            clock.withLock { $0 += 8_000_000_000 }
+            return context.eventLoop.makeSucceededFuture(BlockID(height: 100_000))
         }
+
         override func sendTransaction(request: RawTransaction, context: StatusOnlyCallContext) -> EventLoopFuture<SendResponse> {
             stages.withLock { $0.append("send") }
-            return context.eventLoop.scheduleTask(in: .milliseconds(80)) { SendResponse.with { $0.errorCode = -1 } }.futureResult
+            clock.withLock { $0 += 8_000_000_000 }
+            return context.eventLoop.makeSucceededFuture(SendResponse.with { $0.errorCode = -1 })
         }
+
         override func getTransaction(request: TxFilter, context: StatusOnlyCallContext) -> EventLoopFuture<RawTransaction> {
             stages.withLock { $0.append("known") }
-            return context.eventLoop.scheduleTask(in: .milliseconds(500)) {
-                RawTransaction.with { $0.height = 100_000 }
-            }.futureResult
+            return context.eventLoop.makeSucceededFuture(RawTransaction.with { $0.height = 100_000 })
+        }
+    }
+
+    /// Observes the production client's options and forwards them unchanged to real gRPC.
+    private final class BudgetRecordingChannel: GRPCChannel, @unchecked Sendable {
+        let channel: GRPCChannel
+        let options: OSAllocatedUnfairLock<[TimeLimit]>
+
+        init(channel: GRPCChannel, options: OSAllocatedUnfairLock<[TimeLimit]>) {
+            self.channel = channel
+            self.options = options
+        }
+
+        func makeCall<Request: SwiftProtobuf.Message, Response: SwiftProtobuf.Message>(
+            path: String, type: GRPCCallType, callOptions: CallOptions, interceptors: [ClientInterceptor<Request, Response>]
+        ) -> Call<Request, Response> {
+            options.withLock { $0.append(callOptions.timeLimit) }
+            return channel.makeCall(path: path, type: type, callOptions: callOptions, interceptors: interceptors)
+        }
+
+        func makeCall<Request: GRPCPayload, Response: GRPCPayload>(
+            path: String, type: GRPCCallType, callOptions: CallOptions, interceptors: [ClientInterceptor<Request, Response>]
+        ) -> Call<Request, Response> {
+            options.withLock { $0.append(callOptions.timeLimit) }
+            return channel.makeCall(path: path, type: type, callOptions: callOptions, interceptors: interceptors)
+        }
+
+        func close() -> EventLoopFuture<Void> {
+            channel.close()
         }
     }
 

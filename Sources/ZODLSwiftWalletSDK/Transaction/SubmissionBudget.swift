@@ -4,21 +4,25 @@ import Foundation
 /// recovery. Resource disposal drains before the budget scope returns, even after cancellation.
 final class SubmissionBudget: Sendable {
     @TaskLocal static var current: SubmissionBudget?
+    @TaskLocal static var monotonicNow: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     @TaskLocal static var legacyTimeoutMilliseconds: Int64 = 30_000
 
     let deadline: UInt64
+    private let now: @Sendable () -> UInt64
     let connections = SubmissionConnections()
 
     init(milliseconds: Int64) throws {
+        let now = Self.monotonicNow
+        self.now = now
         deadline = try TorHTTPRequestExecutor.deadline(
             timeoutMilliseconds: UInt64(max(0, milliseconds)),
-            now: DispatchTime.now().uptimeNanoseconds
+            now: now()
         )
     }
 
     func remainingMilliseconds() throws -> UInt64 {
         try Task.checkCancellation()
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = now()
         let remaining = deadline > now ? (deadline - now) / 1_000_000 : 0
         guard remaining > 0 else { throw URLError(.timedOut) }
         return remaining
