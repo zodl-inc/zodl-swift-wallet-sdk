@@ -44,6 +44,50 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
     }
 
+    /// A submitted transaction no server has accepted gains the new server at the end of its plan.
+    /// One a server accepted and one still awaiting submission are left exactly as they were.
+    func testAddingAnEndpointExtendsOnlyAnUnacceptedSubmittedPlan() async {
+        let store = makeStore()
+        let stuck = Data(repeating: 0x31, count: 32)
+        let accepted = Data(repeating: 0x32, count: 32)
+        let awaiting = Data(repeating: 0x33, count: 32)
+        await store.recordPlan(txId: stuck, endpoints: [endpointA])
+        let lifecycle = await store.recordPlan(txId: accepted, endpoints: [endpointA])
+        await store.markAccepted(txId: accepted, host: "a.example.com:443", lifecycle: lifecycle)
+        await store.markAwaitingSubmission(txIds: [awaiting], lifecycle: await store.currentLifecycle())
+
+        let stuckToken = await store.addEndpointToUnacceptedPlan(txId: stuck, endpoint: endpointB)
+        let acceptedToken = await store.addEndpointToUnacceptedPlan(txId: accepted, endpoint: endpointB)
+        let awaitingToken = await store.addEndpointToUnacceptedPlan(txId: awaiting, endpoint: endpointB)
+
+        XCTAssertNotNil(stuckToken)
+        XCTAssertNil(acceptedToken)
+        XCTAssertNil(awaitingToken)
+        let stuckPlan = await store.plan(for: stuck)
+        XCTAssertEqual(stuckPlan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
+        let acceptedPlan = await store.plan(for: accepted)
+        XCTAssertEqual(acceptedPlan, StoredSubmitPlan.ready([endpointA], acceptedBy: "a.example.com:443"))
+        let awaitingPlan = await store.plan(for: awaiting)
+        XCTAssertEqual(awaitingPlan, StoredSubmitPlan.awaiting)
+    }
+
+    /// A server the plan lists already is not added twice, and a transaction the store never saw gets
+    /// no row: the store's file is not even created for it.
+    func testAddingAnEndpointNeitherDuplicatesNorCreates() async {
+        let store = makeStore()
+        let unknownToken = await store.addEndpointToUnacceptedPlan(txId: Data(repeating: 0x34, count: 32), endpoint: endpointB)
+        XCTAssertNil(unknownToken)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path))
+
+        let stuck = Data(repeating: 0x35, count: 32)
+        await store.recordPlan(txId: stuck, endpoints: [endpointA, endpointB])
+        let againToken = await store.addEndpointToUnacceptedPlan(txId: stuck, endpoint: endpointB)
+
+        XCTAssertNotNil(againToken)
+        let plan = await store.plan(for: stuck)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
+    }
+
     func testRecordPlanTransitionsToReady() async {
         let store = makeStore()
         let txId = Data(repeating: 0x03, count: 32)

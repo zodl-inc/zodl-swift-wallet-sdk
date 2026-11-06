@@ -464,7 +464,8 @@ public actor GiftCardRedeemer {
         recordIn destination: Synchronizer?,
         sizeBound: TransactionSizeBound
     ) async throws -> Redemption {
-        try await serialized { redeemer, admission in
+        OHTTPHealthContext.attempt?.beginDelegation()
+        return try await serialized { redeemer, admission in
             try await redeemer.performRedeem(to: recipient, memo: memo, recordIn: destination, sizeBound: sizeBound, admission: admission)
         }
     }

@@ -45,6 +45,15 @@ final class SubmitPlanExecutor {
         transaction: CreatedTransaction,
         endpoints: [LightWalletEndpoint]
     ) async throws -> SubmitPlanAttempt {
+        try await OHTTPHealthContext.withBackground {
+            try await self.submitRecordingAnswersInBackground(transaction: transaction, endpoints: endpoints)
+        }
+    }
+
+    private func submitRecordingAnswersInBackground(
+        transaction: CreatedTransaction,
+        endpoints: [LightWalletEndpoint]
+    ) async throws -> SubmitPlanAttempt {
         let txId = transaction.txId.toHexStringTxId()
         logger.debug("Transaction \(txId) background retry across \(endpoints.count) recorded endpoint(s).")
         var lastError: Error?

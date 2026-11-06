@@ -37,17 +37,17 @@ import Foundation
 /// `SlipstreamEngine.restoreAnchor` stays outside: it is `static` and handle-less by design (it
 /// runs before `open()`), so it is not part of the instance surface a fake would stand in for.
 protocol SlipstreamEngineControlling: Actor {
-    func open(network: ZcashNetwork) throws
-    func setAlternates(_ endpoints: [LightWalletEndpoint])
+    func open(network: ZcashNetwork) async throws
+    func setAlternates(_ endpoints: [LightWalletEndpoint]) async
     func start(ufvk: String?, birthday: BlockHeight, torDir: String?) async throws
     func stop() async -> SlipstreamStopReport
     func stopForWalletChange() async -> SlipstreamStopReport
-    func notifyTxChange()
-    func close()
+    func notifyTxChange() async
+    func close() async
     func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) async throws
-    func walletSummary(confirmationsPolicy: ConfirmationsPolicy) -> WalletSummary?
+    func walletSummary(confirmationsPolicy: ConfirmationsPolicy) async -> WalletSummary?
     func snapshot() async -> SlipstreamSnapshot?
-    func drainEvents(capacity: Int) -> [SlipstreamEngineEvent]
+    func drainEvents(capacity: Int) async -> [SlipstreamEngineEvent]
 }
 
 extension SlipstreamEngine: SlipstreamEngineControlling {}

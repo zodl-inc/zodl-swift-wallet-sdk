@@ -62,6 +62,16 @@ jobs:
       run: make check-format-rust
 
   build:
+    env:
+      ZODL_OHTTP_REQUIRE: '1'
+      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     permissions:
       contents: read
 
@@ -105,6 +115,12 @@ jobs:
       run: make test-scripts
 
     # Hash every input of the FFI build for the XCFramework cache key.
+    - name: Validate OHTTP configuration
+      id: ohttp-config
+      run: |
+        OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
+        echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
+
     - name: Generate FFI source hash
       id: ffi-hash
       run: |
@@ -120,7 +136,19 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+        key: ffi-xcframework-macos-arm64-nolto-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+
+    # This branch fetches private git dependencies (see Cargo.lock), so every
+    # cargo invocation needs this token: an FFI cache miss (the FFI build below)
+    # and the Rust test step, which runs on every event. `~/.cargo/git` is
+    # deliberately left out of the cache, see `Cache Cargo`. Fork PRs get no
+    # secrets; the action then does nothing and their fetches of the private
+    # repositories fail.
+    - name: Authorize cargo against the private slipstream repository
+      uses: ./.github/actions/authorize-slipstream
+      with:
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
     # Used by both the FFI build and the Rust tests, so it is not conditional on
     # the FFI cache.
@@ -147,10 +175,9 @@ jobs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-
-
+          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
     # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
     # the Swift build and the offline tests need. Releases still build every
     # slice with LTO.

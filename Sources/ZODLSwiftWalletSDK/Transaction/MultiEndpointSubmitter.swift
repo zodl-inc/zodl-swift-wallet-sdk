@@ -50,6 +50,7 @@ final class MultiEndpointSubmitter {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> RaceResult {
+        let health = OHTTPHealthFailureOwner()
         guard !endpoints.isEmpty else {
             logger.warn("Multi-endpoint submission requested with an empty endpoint list.")
             return RaceResult(outcome: .unreachable, endpointOutcomes: [:], race: nil)
@@ -60,7 +61,8 @@ final class MultiEndpointSubmitter {
             endpoints: endpoints,
             timing: timing,
             endpointSubmitter: endpointSubmitter,
-            logger: logger
+            logger: logger,
+            health: health
         )
 
         // The worker is created before the cancellation handler is installed and
@@ -101,6 +103,8 @@ actor SubmissionRace {
     private var raceFinishedContinuation: CheckedContinuation<Void, Never>?
     private var winner: LightWalletEndpoint?
     private var firstRejection: (code: Int, message: String)?
+    private let health: OHTTPHealthFailureOwner
+    private var failedAttempts: [OHTTPHealthAttempt?]
     private var completedCount = 0
     private var answers: [String: EndpointSubmission] = [:]
     private var graceTask: Task<Void, Never>?
@@ -112,13 +116,16 @@ actor SubmissionRace {
         endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming,
         endpointSubmitter: EndpointSubmitter,
-        logger: Logger
+        logger: Logger,
+        health: OHTTPHealthFailureOwner
     ) {
         self.transaction = transaction
         self.endpoints = endpoints
         self.timing = timing
         self.endpointSubmitter = endpointSubmitter
         self.logger = logger
+        self.health = health
+        failedAttempts = Array(repeating: nil, count: endpoints.count)
     }
 
     /// Runs the whole race. Returns only when every child task has ended.
@@ -130,9 +137,9 @@ actor SubmissionRace {
             """
         )
         await withTaskGroup(of: Void.self) { group in
-            for endpoint in endpoints {
+            for (index, endpoint) in endpoints.enumerated() {
                 group.addTask {
-                    await self.submit(to: endpoint)
+                    await self.submit(to: endpoint, index: index)
                 }
             }
             group.addTask {
@@ -192,9 +199,12 @@ actor SubmissionRace {
 
     // MARK: - Child tasks
 
-    private func submit(to endpoint: LightWalletEndpoint) async {
+    private func submit(to endpoint: LightWalletEndpoint, index: Int) async {
+        let attempt = health.makeAttempt()
         do {
-            try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
+            try await health.withAttempt(attempt) {
+                try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
+            }
             submissionSucceeded(at: endpoint)
         } catch let TransactionEncoderError.submitError(code, message) where SubmitRefusal.meansAccepted(code: code, message: message) {
             // The server already holds the transaction: that is its acceptance.
@@ -213,6 +223,7 @@ actor SubmissionRace {
             if Task.isCancelled {
                 submissionCancelled(at: endpoint)
             } else {
+                failedAttempts[index] = attempt
                 submissionFailed(at: endpoint, error: error)
             }
         }
@@ -291,6 +302,7 @@ actor SubmissionRace {
             resolve(.rejected(code: firstRejection.code, message: firstRejection.message))
         } else {
             logger.debug("Transaction \(txId) unreachable; all \(endpoints.count) endpoint(s) failed at the transport level.")
+            health.attempt?.adoptAllFailures(from: failedAttempts)
             resolve(.unreachable)
         }
         finishRace()

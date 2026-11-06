@@ -42,7 +42,7 @@ protocol LatestBlockHeightProvider {
 class LiveLatestBlockHeightProvider: LatestBlockHeightProvider {
     func latestBlockHeight(streamer: CompactTxStreamerAsyncClient) async throws -> BlockHeight {
         do {
-            let blockID = try await streamer.getLatestBlock(ChainSpec())
+            let blockID = try await streamer.getLatestBlock(ChainSpec(), callOptions: try LightWalletGRPCService.submissionCallOptions())
             guard let blockHeight = BlockHeight(serverHeight: blockID.height) else {
                 throw LightWalletServiceError.generalError(message: "The server reported a latest block with a height the SDK can't use.")
             }
@@ -193,11 +193,16 @@ class LightWalletGRPCService: LightWalletService {
         }
 
         do {
-            return try await compactTxStreamer.getLatestBlock(ChainSpec())
+            return try await compactTxStreamer.getLatestBlock(ChainSpec(), callOptions: try Self.submissionCallOptions())
         } catch {
             let serviceError = error.mapToServiceError()
             throw ZcashError.serviceLatestBlockFailed(serviceError)
         }
+    }
+
+    static func submissionCallOptions() throws -> CallOptions? {
+        guard let budget = SubmissionBudget.current else { return nil }
+        return callOptions(timeLimit: .timeout(.milliseconds(Int64(try budget.remainingMilliseconds()))))
     }
 
     static func callOptions(timeLimit: TimeLimit) -> CallOptions {
@@ -261,7 +266,7 @@ class LightWalletGRPCService: LightWalletService {
 
         do {
             let transaction = RawTransaction.with { $0.data = spendTransaction }
-            return try await compactTxStreamer.sendTransaction(transaction)
+            return try await compactTxStreamer.sendTransaction(transaction, callOptions: try Self.submissionCallOptions())
         } catch {
             let serviceError = error.mapToServiceError()
             throw ZcashError.serviceSubmitFailed(serviceError)
@@ -277,7 +282,7 @@ class LightWalletGRPCService: LightWalletService {
         txFilter.hash = txId
 
         do {
-            let rawTx = try await compactTxStreamer.getTransaction(txFilter)
+            let rawTx = try await compactTxStreamer.getTransaction(txFilter, callOptions: try Self.submissionCallOptions())
 
             return ZcashTransaction.Fetched.returned(rawID: txId, raw: rawTx.data, atServerHeight: rawTx.height)
         } catch let error as GRPCStatus {

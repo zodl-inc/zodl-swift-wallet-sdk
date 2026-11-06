@@ -32,6 +32,7 @@ final class VotingRoundSessionTests: XCTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             torRuntime: nil,
+            isCustomServer: true,
             epoch: 1
         )
 
@@ -318,6 +319,7 @@ final class VotingRoundSessionTests: XCTestCase {
             inputs: environment.inputs,
             binding: environment.binding,
             torRuntime: nil,
+            isCustomServer: true,
             epoch: 1
         )
 

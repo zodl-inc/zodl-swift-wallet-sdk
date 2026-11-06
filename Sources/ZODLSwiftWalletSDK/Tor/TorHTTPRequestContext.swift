@@ -21,6 +21,7 @@ final class TorHTTPRequestContext: @unchecked Sendable {
     }
 
     let deadlineUptime: UInt64
+    private let preserveHTTPFailure: Bool
     private let now: @Sendable () -> UInt64
     private let sleepUntil: @Sendable (UInt64) async throws -> Void
     // NSLock dates from the SDK's iOS 13 / macOS 12 floor, below OSAllocatedUnfairLock's
@@ -35,10 +36,12 @@ final class TorHTTPRequestContext: @unchecked Sendable {
 
     init(
         deadlineUptime: UInt64,
+        preserveHTTPFailure: Bool = false,
         now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
         sleepUntil: (@Sendable (UInt64) async throws -> Void)? = nil
     ) {
         self.deadlineUptime = deadlineUptime
+        self.preserveHTTPFailure = preserveHTTPFailure
         self.now = now
         self.sleepUntil = sleepUntil ?? { deadline in
             let instant = now()
@@ -140,7 +143,8 @@ final class TorHTTPRequestContext: @unchecked Sendable {
     private func finish(_ operationResult: Result<Response, Error>) {
         let removed = lock.withLock { () -> Completion? in
             guard phase != .terminal else { return nil }
-            let completed = reason.map { Result<Response, Error>.failure($0) } ?? operationResult
+            let keepHTTPFailure = preserveHTTPFailure && (reason as? URLError)?.code == .timedOut && operationResult.hasAuthoritativeHTTPFailure
+            let completed = keepHTTPFailure ? operationResult : reason.map { Result<Response, Error>.failure($0) } ?? operationResult
             phase = .terminal
             result = completed
             let effects = Completion(caller: continuation, admission: nil, timer: timer, result: completed)

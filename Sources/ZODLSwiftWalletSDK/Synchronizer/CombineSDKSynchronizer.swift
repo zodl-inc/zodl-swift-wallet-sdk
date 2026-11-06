@@ -376,11 +376,13 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         return subject.eraseToAnyPublisher()
     }
 
+    // swiftlint:disable function_parameter_count
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) -> SinglePublisher<VotingRoundSession, Error> {
         AsyncToCombineGateway.executeThrowingAction {
@@ -389,10 +391,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
                 inputs: inputs,
                 binding: binding,
                 route: route,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
     }
+    // swiftlint:enable function_parameter_count
 
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
@@ -407,6 +411,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
     ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
             try await self.synchronizer.httpGetOverTor(for: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        }
+    }
+
+    public func httpRequestOverOHTTP(for request: URLRequest) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
         }
     }
 

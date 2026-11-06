@@ -13,7 +13,7 @@
 # The dry run of `make <target>`, saved to a scratch file whose path is printed.
 _dry_run() {
     local out; out="$SCRATCH/dry-run-$1.txt"
-    make -C "$REPO_ROOT" -n "$1" > "$out" 2>/dev/null
+    OHTTP_ENV_RESOLVED=1 make -C "$REPO_ROOT" -n "$1" > "$out" 2>/dev/null
     printf '%s\n' "$out"
 }
 
@@ -42,9 +42,9 @@ test_ffi_ci_clears_the_macos_products_before_building() {
     assert_succeeds "the removal comes before the build" test "${rm_line:-0}" -lt "${make_line:-0}"
 }
 
-test_ffi_macos_still_builds_both_macos_architectures_with_lto() {
+test_ffi_macos_builds_only_arm64_with_lto() {
     local f; f="$(_dry_run ffi-macos)"
-    assert_file_contains "$f" "target x86_64-apple-darwin" "make ffi-macos still builds x86_64"
+    assert_file_lacks "$f" "target x86_64-apple-darwin" "make ffi-macos excludes x86_64"
     assert_file_contains "$f" "target aarch64-apple-darwin" "make ffi-macos still builds arm64"
     assert_file_lacks "$f" "CARGO_PROFILE_RELEASE_LTO" "make ffi-macos keeps the release profile's lto"
 }
@@ -62,13 +62,13 @@ _package_platforms() {
 
 test_ffi_builds_pass_the_deployment_targets() {
     local f; f="$(_dry_run ffi-ci)"
-    assert_file_contains "$f" "MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build" \
+    assert_file_contains "$f" "MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 python3 ../Scripts/lib/ohttp_env.py --required -- cargo build" \
         "make ffi-ci passes both deployment targets to cargo"
     f="$(_dry_run ffi-all)"
     local builds; builds="$(grep -c 'cargo build' "$f")"
     assert_succeeds "make ffi-all runs cargo at least once" test "$builds" -gt 0
     assert_eq "$builds" \
-        "$(grep -c 'MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build' "$f")" \
+        "$(grep -c 'MACOSX_DEPLOYMENT_TARGET=14.0 IPHONEOS_DEPLOYMENT_TARGET=16.0 python3 ../Scripts/lib/ohttp_env.py --required -- cargo build' "$f")" \
         "every cargo build in make ffi-all carries both deployment targets"
 }
 
@@ -167,7 +167,7 @@ test_swift_workflow_installs_only_the_arm64_macos_rust_target() {
 
 test_swift_workflow_cache_keys_name_the_ci_build() {
     assert_file_contains "$(_swift_workflow)" "key: ffi-xcframework-macos-arm64-nolto-" "the XCFramework key names the ffi-ci build"
-    assert_file_contains "$(_swift_workflow)" "cargo-ci-macos-arm64-nolto-v3-" "the cargo key isolates the CI build variant"
+    assert_file_contains "$(_swift_workflow)" "cargo-ci-macos-arm64-nolto-v4-" "the cargo key isolates the CI build variant"
     assert_file_lacks "$(_swift_workflow)" "cargo-v1-" "no v1 cargo key remains"
 }
 
@@ -241,10 +241,10 @@ test_codeql_swift_job_builds_with_ffi_ci() {
     assert_file_lacks "$(_codeql_workflow)" "run: make ffi-macos" "CodeQL no longer builds the universal slice"
     assert_file_contains "$(_codeql_workflow)" "key: codeql-ffi-xcframework-macos-arm64-nolto-" \
         "CodeQL's XCFramework key names the ffi-ci build"
-    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v3-${{ steps.toolchain.outputs.cachekey }}-' \
+    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-' \
         "CodeQL's cargo key carries the rustc version"
-    assert_file_contains "$(_codeql_workflow)" "find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f" \
-        "CodeQL's FFI hash covers the root Makefile"
+    assert_file_contains "$(_codeql_workflow)" "Scripts/ci/ffi-input-hash.sh" \
+        "CodeQL's FFI hash covers committed native build inputs including the runner"
     assert_file_contains "$(_codeql_workflow)" "id: toolchain" "CodeQL's Setup Rust step has an id"
     assert_file_contains "$(_codeql_workflow)" 'Scripts/ci/rust_toolchain.py' "CodeQL validates the compiler and exports its identity"
     assert_file_lacks "$(_codeql_workflow)" "x86_64-apple-darwin" "CodeQL installs no x86_64 target"
@@ -296,7 +296,7 @@ test_every_local_action_a_workflow_uses_exists() {
 test_swift_workflow_cargo_key_includes_the_toolchain() {
     assert_file_contains "$(_swift_workflow)" "id: toolchain" "the build job's Rust setup step has an id"
     assert_file_contains "$(_swift_workflow)" 'Scripts/ci/rust_toolchain.py' "the validator exports the cachekey output"
-    assert_file_contains "$(_swift_workflow)" 'cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-' \
+    assert_file_contains "$(_swift_workflow)" 'cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-' \
         "the cargo cache key carries the rustc identity and build variant"
 }
 
@@ -319,7 +319,7 @@ test_ci_cache_keys_include_complete_rust_identity() {
             assert_file_contains "$SCRATCH/rust-key.txt" '${{ steps.toolchain.outputs.cachekey }}' 'all compiled keys and fallbacks constrain Rust'
         done <<< "$lines"
     done
-    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
+    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
 }
 
 test_ci_cache_rust_identity_changes_for_verbose_fields() {
@@ -395,7 +395,7 @@ test_codeql_validation_is_required_on_ffi_cache_hits() {
 test_ci_cache_release_keeps_publication_and_targets() {
     local workflow
     workflow="$(_build_ffi_workflow)"
-    assert_file_contains "$workflow" 'target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin' 'release retains all five architecture targets'
+    assert_file_contains "$workflow" 'target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin' 'release installs all three ARM targets'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"' 'release force publication command is preserved'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts "$VERSION"' 'release publication command is preserved'
 }
@@ -510,4 +510,149 @@ test_swift_cache_identity_uses_actual_compiler_output() {
     PATH="$dir:$PATH" SWIFT_IDENTITY_FILE="$dir/identity" GITHUB_OUTPUT="$dir/output" bash -e -o pipefail "$script" > /dev/null
     second="$(sed -n 's/^hash=//p' "$dir/output")"
     assert_succeeds 'a compiler build change invalidates the Swift cache' test "$first" != "$second"
+}
+
+# The ohttp-trace feature turns OHTTP client trace ids on: QA/E2E builds only.
+test_ohttp_e2e_builds_the_ffi_with_ohttp_trace() {
+    assert_file_contains "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" \
+        "make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace" \
+        "ohttp-e2e.yml passes FFI_CARGO_FEATURES=ohttp-trace to make"
+    local out; out="$SCRATCH/dry-run-ffi-macos-trace.txt"
+    OHTTP_ENV_RESOLVED=1 make -C "$REPO_ROOT" -n ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace > "$out" 2>/dev/null
+    assert_file_contains "$out" "cargo build --locked --manifest-path ../Cargo.toml --release --features ohttp-trace" \
+        "FFI_CARGO_FEATURES turns into --features flag"
+}
+
+test_release_ffi_builds_never_enable_ohttp_trace() {
+    local f
+    for f in .github/workflows/build-ffi.yml Scripts/prepare-release.sh Scripts/release.sh; do
+        assert_file_lacks "$REPO_ROOT/$f" "ohttp-trace" "$f does not enable ohttp-trace"
+        assert_file_lacks "$REPO_ROOT/$f" "FFI_CARGO_FEATURES" "$f passes no extra Cargo features"
+    done
+    for f in ffi-all ffi-ci ffi-macos; do
+        assert_file_lacks "$(_dry_run "$f")" " --features" "make $f enables no Cargo feature"
+    done
+    local out; out="$SCRATCH/dry-run-ffi-all-env-trace.txt"
+    FFI_CARGO_FEATURES=ohttp-trace OHTTP_ENV_RESOLVED=1 make -C "$REPO_ROOT" -n ffi-all > "$out" 2>/dev/null
+    assert_file_lacks "$out" " --features" "make ffi-all ignores FFI_CARGO_FEATURES from the environment"
+    assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
+}
+
+# Parse job-scoped Actions secrets and ordering, rather than accepting stray text.
+test_configured_native_workflows_use_required_actions_secrets_before_cache() {
+    local workflow job
+    for workflow in swift codeql ohttp-e2e build-ffi; do
+        case "$workflow" in swift) job=build ;; codeql) job=analyze ;; ohttp-e2e) job=ffi ;; build-ffi) job=build-xcframework ;; esac
+        assert_succeeds "$workflow supplies all eight Actions secrets before cache lookup" \
+            ruby -ryaml -e '
+              job = YAML.load_file(ARGV[0]).fetch("jobs").fetch(ARGV[1])
+              names = %w[GATEWAY_HOST_MAINNET GATEWAY_HOST_TESTNET RELAY_URL_MAINNET RELAY_URL_TESTNET SIGNING_PUBKEY_MAINNET SIGNING_PUBKEY_TESTNET KEYS_DNS_NAME_MAINNET KEYS_DNS_NAME_TESTNET].map { |n| "ZODL_OHTTP_" + n }
+              names.each { |n| abort "missing Actions secret #{n}" unless job.fetch("env", {})[n] == "${{ secrets.#{n} }}" }
+              abort "native CI must require strict OHTTP" unless job.fetch("env", {})["ZODL_OHTTP_REQUIRE"] == "1"
+              steps = job.fetch("steps")
+              abort "AWS OHTTP fetch remains" if steps.any? { |s| s.fetch("uses", "").include?("aws-secrets") }
+              index = steps.index { |s| s["id"] == "ohttp-config" && s.fetch("run", "").include?("ohttp_env.py --hash") }
+              cache = steps.index { |s| s.fetch("uses", "").include?("actions/cache") }
+              abort "configuration validation does not precede cache" unless index && cache && index < cache
+              steps.select { |s| s.fetch("name", "").match?(/Cache (Cargo|FFI|XCFramework)/) }.each do |s|
+                key = s.fetch("with").fetch("key")
+                abort "cache misses configuration" unless key.include?("steps.ohttp-config.outputs.hash") || key.include?("steps.ffi-hash.outputs.hash")
+                if s["name"] == "Cache Cargo"
+                  s.fetch("with").fetch("restore-keys", "").lines.each { |line| abort "Cargo fallback omits configuration" unless line.include?("steps.ohttp-config.outputs.hash") }
+                end
+              end
+            ' "$REPO_ROOT/.github/workflows/$workflow.yml" "$job"
+    done
+}
+
+test_ohttp_source_capability_and_local_documentation() {
+    assert_eq '1' "$(cat "$REPO_ROOT/BuildSupport/ohttp-config-version" 2>/dev/null)" 'source capability has version one'
+    assert_succeeds 'marker has exact newline-terminated bytes' python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes() == b"1\n"' "$REPO_ROOT/BuildSupport/ohttp-config-version"
+    local name
+    for name in GATEWAY_HOST_MAINNET GATEWAY_HOST_TESTNET RELAY_URL_MAINNET RELAY_URL_TESTNET SIGNING_PUBKEY_MAINNET SIGNING_PUBKEY_TESTNET KEYS_DNS_NAME_MAINNET KEYS_DNS_NAME_TESTNET; do
+        assert_file_contains "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" "ZODL_OHTTP_$name" 'docs list each required input'
+    done
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'gh variable get' 'local docs promise no automatic GitHub acquisition'
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'login/interactive' 'local docs promise inherited inputs only'
+    assert_file_lacks "$REPO_ROOT/Scripts/lib/ohttp_env.py" 'def load_shell_exports' 'automatic shell loader removed'
+    assert_file_lacks "$REPO_ROOT/Scripts/lib/ohttp_env.py" 'def load_github_exports' 'automatic GitHub loader removed'
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'SDK builds accept absent' 'optional build documentation is removed'
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'no value-derived cache identity' 'stale cache guidance is removed'
+}
+
+test_e2e_cache_identities_keep_toolchain_and_configuration_boundaries() {
+    assert_succeeds 'E2E build and test caches retain full configuration and compiler identities' \
+        ruby -ryaml -e '
+          jobs = YAML.load_file(ARGV[0]).fetch("jobs")
+          ffi = jobs.fetch("ffi")
+          steps = ffi.fetch("steps")
+          cache = steps.index { |s| s.fetch("uses", "").include?("actions/cache") }
+          rust = steps.index { |s| s["id"] == "toolchain" }
+          abort "no toolchain validation before restore" unless rust && rust < cache
+          steps.select { |s| s.fetch("uses", "").include?("actions/cache") }.each do |s|
+            key = s.fetch("with").fetch("key")
+            %w[steps.toolchain.outputs.cachekey steps.xcode-cache-key.outputs.hash runner.arch].each { |field| abort "missing cache identity" unless key.include?(field) }
+            abort "private source cache" if s.fetch("with").fetch("path").include?("~/.cargo/git")
+          end
+          e2e = jobs.fetch("e2e")
+          ffi.fetch("env").each { |name, value| abort "test env differs" unless e2e.fetch("env", {})[name] == value }
+          abort "config digest not passed to consumer" unless ffi.fetch("outputs", {}).fetch("configuration-hash", "").include?("steps.ohttp-config.outputs.hash")
+          swift = e2e.fetch("steps").find { |s| s["name"] == "Cache SwiftPM" }.fetch("with")
+          abort "Swift product cache omits config" unless swift.fetch("key").include?("needs.ffi.outputs.configuration-hash")
+          %w[needs.ffi.outputs.xcode-hash needs.ffi.outputs.source-hash].each { |field| abort "Swift product cache omits source/compiler identity" unless swift.fetch("key").include?(field) }
+          abort "broad Swift cache fallback" unless swift.fetch("restore-keys", "").empty?
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+# Secret configuration must not be exposed by network-test diagnostics.
+test_ohttp_e2e_diagnostics_do_not_print_configured_endpoints() {
+    assert_succeeds 'E2E output keeps configured endpoint values private' python3 - "$REPO_ROOT/Tests/NetworkTests/OHTTPE2ETests.swift" <<'PYTHON'
+import pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+for line in source.splitlines():
+    if re.search(r'\b(log|XCTAssertTrue)\(', line):
+        assert not re.search(r'gateway=|relay=|tier0_ranked=\\\(tier0Hosts|\\\(host\\?\)', line), line
+PYTHON
+}
+
+# Validate the parsed trigger, not a matching branch name elsewhere in the file.
+test_ohttp_e2e_push_trigger_tracks_integration_branch() {
+    assert_succeeds 'OHTTP E2E push trigger follows feature/ohttp' \
+        ruby -ryaml -e '
+          workflow = YAML.load_file(ARGV[0])
+          trigger = workflow.fetch("on") { workflow.fetch(true) }
+          abort "wrong integration branch" unless trigger.fetch("push").fetch("branches") == ["feature/ohttp"]
+          abort "manual dispatch removed" unless trigger.key?("workflow_dispatch")
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+test_ci_full_build_excludes_intel_targets() {
+    assert_file_lacks "$(_dry_run ffi-all)" 'target x86_64-' 'full builds compile no Intel target'
+    assert_file_lacks "$(_build_ffi_workflow)" 'x86_64-apple-' 'release setup installs no Intel target'
+}
+
+# A newly added Python suite must be discovered by the same entrypoint CI runs.
+test_ci_make_test_scripts_discovers_python_regressions() {
+    local repo output
+    repo="$(mktemp -d "$SCRATCH/python-entrypoint.XXXXXX")"
+    mkdir -p "$repo/Scripts/tests"
+    cp "$REPO_ROOT/Makefile" "$repo/Makefile"
+    printf '#!/bin/sh\nexit 0\n' > "$repo/Scripts/tests/run-tests.sh"
+    chmod +x "$repo/Scripts/tests/run-tests.sh"
+    printf 'import unittest\nclass Regression(unittest.TestCase):\n    def test_future_regression(self):\n        self.fail("python discovery sentinel")\n' > "$repo/Scripts/tests/test_future.py"
+    output="$repo/output"
+    if make -C "$repo" test-scripts "PYTHON=${PYTHON:-python3}" > "$output" 2>&1; then
+        _fail 'make test-scripts must fail when a discovered Python regression fails'
+    fi
+    assert_file_contains "$output" 'python discovery sentinel' 'ordinary script test entrypoint reaches new Python suites'
+}
+
+test_ci_install_excludes_intel_rust_targets() {
+    local output
+    output="$SCRATCH/install-targets.txt"
+    make -C "$REPO_ROOT/BuildSupport" -n install > "$output" 2>/dev/null
+    assert_file_lacks "$output" 'x86_64-apple-' 'BuildSupport install sets up only ARM targets'
+    assert_file_contains "$output" 'aarch64-apple-ios' 'device target remains available'
+    assert_file_contains "$output" 'aarch64-apple-ios-sim' 'simulator target remains available'
+    assert_file_contains "$output" 'aarch64-apple-darwin' 'macOS target remains available'
 }

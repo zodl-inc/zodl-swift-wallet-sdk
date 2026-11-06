@@ -90,7 +90,7 @@ private let votingEventTrampoline: @convention(c) (
 ///
 /// A session is the round's whole working life: it plans, records the ballot,
 /// lays out bundles, precomputes, proves, and drives the round to quiescence.
-/// It is opened through ``VotingRustBackend/makeSession(inputs:binding:torRuntime:epoch:)``,
+/// It is opened through ``VotingRustBackend/makeSession(inputs:binding:torRuntime:isCustomServer:epoch:)``,
 /// holds its own reference to the sidecar, and keeps the route — Tor or direct
 /// — chosen at open for its whole life.
 ///

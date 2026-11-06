@@ -67,7 +67,9 @@ class SlipstreamOfflineTests: ZcashTestCase {
 
     private func makeStoppedSynchronizer(rustBackend: ZcashRustBackendWeldingMock) throws -> SlipstreamSynchronizer {
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in rustBackend }
-        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
+        let service = LightWalletServiceMock()
+        service.closeConnectionsClosure = {}
+        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in TransactionRepositoryMock() }
         let initializer = Initializer(
             container: mockContainer,

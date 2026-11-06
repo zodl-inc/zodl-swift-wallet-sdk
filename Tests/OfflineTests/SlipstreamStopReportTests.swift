@@ -11,6 +11,59 @@ import XCTest
 /// [MOB-2184] What a stop of the Slipstream engine reports, from the C struct the FFI returns by
 /// value to the `SlipstreamStopReport` the synchronizer acts on.
 final class SlipstreamStopReportTests: ZcashTestCase {
+    func testSnapshotAndSubmissionNotificationWaitForMutableHandleBorrow() async throws {
+        let dbURL = testTempDirectory.appendingPathComponent("exclusive.db")
+        let backend = ZcashRustBackend.makeForTests(dbData: dbURL, fsBlockDbRoot: testTempDirectory, networkType: .testnet)
+        _ = try await backend.initDataDb(seed: nil)
+        let borrowed = expectation(description: "blocking handle call admitted")
+        let release = DispatchSemaphore(value: 0)
+        let engine = SlipstreamEngine(dbURL: dbURL, server: LightWalletEndpointBuilder.default, beforeBlockingFFI: {
+            borrowed.fulfill()
+            _ = release.wait(timeout: .now() + 5)
+        })
+        try await engine.open(network: ZcashNetworkBuilder.network(for: .testnet))
+        let stop = Task { await engine.stop() }
+        await fulfillment(of: [borrowed], timeout: 2)
+        let overlapping = expectation(description: "another handle call returned while borrowed")
+        overlapping.isInverted = true
+        let snapshot = Task {
+            let result = await engine.snapshot()
+            overlapping.fulfill()
+            return result
+        }
+        let notification = Task { await engine.notifyTxChange() }
+        await fulfillment(of: [overlapping], timeout: 0.05)
+        release.signal()
+        _ = await stop.value
+        _ = await snapshot.value
+        await notification.value
+        await engine.close()
+    }
+
+    func testExpiredAndCancelledNativeStartupKeepTypedFailureThroughStartAdmission() async throws {
+        let dbURL = testTempDirectory.appendingPathComponent("startup-admission.db")
+        let backend = ZcashRustBackend.makeForTests(dbData: dbURL, fsBlockDbRoot: testTempDirectory, networkType: .testnet)
+        _ = try await backend.initDataDb(seed: nil)
+        let engine = SlipstreamEngine(dbURL: dbURL, server: LightWalletEndpointBuilder.default)
+        try await engine.open(network: ZcashNetworkBuilder.network(for: .testnet))
+        let expired = try SlipstreamTorStartup(generation: 1, remainingMilliseconds: 0)
+        do {
+            try await engine.startTor(birthday: 3_000_000, torDir: testTempDirectory.appendingPathComponent("expired-tor").path, startup: expired)
+            XCTFail("Expired startup must not enter networking")
+        } catch {
+            XCTAssertEqual(error as? TorTransitionState.Failure, .startupTimedOut)
+        }
+        let cancelled = try SlipstreamTorStartup(generation: 2, remainingMilliseconds: 60_000)
+        cancelled.cancel()
+        do {
+            try await engine.startTor(birthday: 3_000_000, torDir: testTempDirectory.appendingPathComponent("cancelled-tor").path, startup: cancelled)
+            XCTFail("Cancelled startup must not enter networking")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        await engine.close()
+    }
+
     /// Each verdict arrives as 1 or 0 and each wait as whole milliseconds; a wait the engine could
     /// not count in a `UInt64` of milliseconds arrives saturated, and must not trap on the way in.
     func testTheCReportBecomesTheSwiftReportFieldByField() {

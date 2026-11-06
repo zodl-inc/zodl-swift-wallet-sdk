@@ -7,6 +7,7 @@
 
 import Combine
 import Foundation
+import os
 @testable import TestUtils
 import XCTest
 @testable import ZODLSwiftWalletSDK
@@ -751,6 +752,294 @@ class SynchronizerOfflineTests: ZcashTestCase {
             latestBlockHeight: .zero,
             fullyScannedHeight: .zero
         )
+    }
+    private func healthSession(_ sync: SDKSynchronizer) throws -> OHTTPHealthSession {
+        let binding = try XCTUnwrap(sync.ohttpHealthBinding)
+        let session = try OHTTPHealthSession(
+            route: OHTTPHealthRoute(network: .testnet, gatewayHost: UUID().uuidString, relayURL: "https://health.test", viaTor: false),
+            generation: UUID(),
+            bindingID: binding.readyToken(),
+            ownerID: binding.ownerID
+        )
+        try binding.admit(session)
+        return session
+    }
+
+    func testLegacyPrewipeRetiresBeforeDatabaseClose() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        defer { fixture.repository.closeDBConnectionClosure = {} }
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let initial = binding.snapshot()
+        let closed = expectation(description: "database closed after health retirement")
+        fixture.repository.closeDBConnectionClosure = {
+            XCTAssertFalse(old.isValid)
+            XCTAssertEqual(binding.snapshot().phase, .replacing)
+            XCTAssertNotEqual(binding.snapshot().continuityID, initial.continuityID)
+            closed.fulfill()
+        }
+        try await GiftCardRedeemer.awaitCompletion(of: fixture.synchronizer.wipe())
+        await fulfillment(of: [closed], timeout: 2)
+        XCTAssertEqual(binding.snapshot().phase, .ready)
+        XCTAssertNotEqual(binding.snapshot().bindingID, initial.bindingID)
+        let current = try healthSession(fixture.synchronizer)
+        XCTAssertTrue(current.isValid)
+        current.close()
+        fixture.repository.closeDBConnectionClosure = {}
+        try await fixture.cleanup()
+    }
+
+    func testLegacyPostPrewipeFailureSettlesNewWallet() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let initial = binding.snapshot()
+        fixture.storage.clearClosure = {
+            XCTAssertFalse(old.isValid)
+            XCTAssertEqual(binding.snapshot().phase, .replacing)
+            throw URLError(.cannotWriteToFile)
+        }
+        do {
+            try await GiftCardRedeemer.awaitCompletion(of: fixture.synchronizer.wipe())
+            XCTFail("Original storage failure must propagate")
+        } catch { XCTAssertEqual((error as? URLError)?.code, .cannotWriteToFile) }
+        XCTAssertEqual(binding.snapshot().phase, .ready)
+        XCTAssertNotEqual(binding.snapshot().continuityID, initial.continuityID)
+        XCTAssertNotEqual(binding.snapshot().bindingID, initial.bindingID)
+        fixture.storage.clearClosure = {}
+        try await fixture.cleanup()
+    }
+
+    func testLegacyCommittedServiceChangeRotatesBinding() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        await fixture.synchronizer.updateStatus(.unprepared)
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let initial = binding.snapshot()
+        let config = await fixture.synchronizer.blockProcessor.config
+        var info = LightdInfo()
+        info.chainName = "test"
+        info.saplingActivationHeight = UInt64(config.saplingActivation)
+        info.blockHeight = 2_000_000
+        info.consensusBranchID = "c2d6d0b4"
+        fixture.backend.consensusBranchIdForHeightReturnValue = Int32(bitPattern: 0xc2d6d0b4)
+        fixture.service.getInfoModeClosure = { _ in
+            XCTAssertTrue(old.isValid, "Validation precedes committed replacement")
+            XCTAssertEqual(binding.snapshot(), initial)
+            return info
+        }
+        try await fixture.synchronizer.switchTo(endpoint: LightWalletEndpointBuilder.default)
+        XCTAssertFalse(old.isValid)
+        XCTAssertEqual(binding.snapshot().phase, .ready)
+        XCTAssertNotEqual(binding.snapshot().bindingID, initial.bindingID)
+        XCTAssertEqual(binding.snapshot().continuityID, initial.continuityID)
+        try await fixture.cleanup()
+    }
+
+    func testLegacyCommittedServiceChangeSettlesAfterStartFailure() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        await fixture.synchronizer.updateStatus(.stopped)
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let initial = binding.snapshot()
+        let config = await fixture.synchronizer.blockProcessor.config
+        var info = LightdInfo()
+        info.chainName = "test"
+        info.saplingActivationHeight = UInt64(config.saplingActivation)
+        info.blockHeight = 2_000_000
+        info.consensusBranchID = "c2d6d0b4"
+        fixture.backend.consensusBranchIdForHeightReturnValue = Int32(bitPattern: 0xc2d6d0b4)
+        fixture.service.getInfoModeClosure = { _ in
+            XCTAssertTrue(old.isValid, "Validation precedes committed replacement")
+            XCTAssertEqual(binding.snapshot(), initial)
+            await fixture.synchronizer.updateStatus(.unprepared)
+            return info
+        }
+        do {
+            try await fixture.synchronizer.switchTo(endpoint: LightWalletEndpointBuilder.default)
+            XCTFail("Post-publication start must still throw for an unprepared wallet")
+        } catch { XCTAssertEqual((error as? ZcashError)?.code, .synchronizerNotPrepared) }
+        XCTAssertFalse(old.isValid)
+        XCTAssertEqual(binding.snapshot().phase, .ready)
+        XCTAssertNotEqual(binding.snapshot().bindingID, initial.bindingID)
+        XCTAssertEqual(binding.snapshot().continuityID, initial.continuityID)
+        try await fixture.cleanup()
+    }
+
+    func testLegacyValidationFailureAndOrdinaryRestartKeepBinding() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let initial = binding.snapshot()
+        fixture.service.getInfoModeThrowableError = URLError(.cannotConnectToHost)
+        do {
+            try await fixture.synchronizer.switchTo(endpoint: LightWalletEndpoint(address: "other.test", port: 443, secure: true))
+            XCTFail("Validation must fail")
+        } catch { XCTAssertEqual((error as? ZcashError)?.code, .synchronizerServerSwitch) }
+        XCTAssertEqual(binding.snapshot(), initial)
+        XCTAssertTrue(old.isValid)
+        await fixture.synchronizer.updateStatus(.unprepared)
+        do {
+            try await fixture.synchronizer.restartSync(at: LightWalletEndpointBuilder.default)
+            XCTFail("Ordinary start still requires a prepared wallet")
+        } catch { XCTAssertEqual((error as? ZcashError)?.code, .synchronizerNotPrepared) }
+        XCTAssertEqual(binding.snapshot(), initial)
+        XCTAssertTrue(old.isValid)
+        try await fixture.cleanup()
+    }
+    func testLegacyRetiredProbeCannotDispatchAfterRealLookup() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let entered = expectation(description: "legacy provider lookup entered")
+        let release = Gate()
+        defer { release.open() }
+        let probe = Task {
+            await fixture.synchronizer.probeOHTTPHealth(session: old) {
+                entered.fulfill()
+                await release.wait()
+                return await fixture.synchronizer.healthBinding()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        try await GiftCardRedeemer.awaitCompletion(of: fixture.synchronizer.wipe())
+        release.open()
+        let result = await probe.value
+        XCTAssertEqual(result.outcome, .cancelled)
+        XCTAssertTrue(old.snapshot().observations.isEmpty)
+        try await fixture.cleanup()
+    }
+
+    func testLegacyFactoryRejectsBindingChangedDuringRealLookup() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        await fixture.synchronizer.updateStatus(.unprepared)
+        let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
+        let config = await fixture.synchronizer.blockProcessor.config
+        var info = LightdInfo()
+        info.chainName = "test"
+        info.saplingActivationHeight = UInt64(config.saplingActivation)
+        info.blockHeight = 2_000_000
+        info.consensusBranchID = "c2d6d0b4"
+        fixture.backend.consensusBranchIdForHeightReturnValue = Int32(bitPattern: 0xc2d6d0b4)
+        fixture.service.getInfoModeReturnValue = info
+        try await fixture.synchronizer.switchTo(endpoint: endpoint)
+        let route = OHTTPHealthRoute(
+            network: .testnet,
+            gatewayHost: endpoint.host,
+            relayURL: try OHTTPEndpoints.relayURL(for: endpoint.host),
+            viaTor: false
+        )
+        let entered = expectation(description: "legacy factory captured binding before lookup")
+        let release = Gate()
+        defer { release.open() }
+        let factory = Task {
+            try await fixture.synchronizer.makeOHTTPHealthSession(route: route, generation: UUID()) {
+                entered.fulfill()
+                await release.wait()
+                return await fixture.synchronizer.healthBinding()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        try await fixture.synchronizer.switchTo(endpoint: endpoint)
+        release.open()
+        do {
+            let stale = try await factory.value
+            stale.close()
+            XCTFail("Replaced service may not admit a session from its former binding")
+        } catch { XCTAssertEqual(error as? OHTTPHealthError, .bindingUnavailable) }
+        let current = try await fixture.synchronizer.makeOHTTPHealthSession(route: route, generation: UUID())
+        XCTAssertTrue(current.isValid)
+        current.close()
+        try await fixture.cleanup()
+    }
+    func testLegacyOverlappingReplacementsRemainReplacingThroughBothStartsAndPreservePublishedContinuity() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        await fixture.synchronizer.updateStatus(.stopped)
+        let binding = try XCTUnwrap(fixture.synchronizer.ohttpHealthBinding)
+        let old = try healthSession(fixture.synchronizer)
+        defer { old.close() }
+        let original = binding.snapshot()
+        let config = await fixture.synchronizer.blockProcessor.config
+        var info = LightdInfo()
+        info.chainName = "test"
+        info.saplingActivationHeight = UInt64(config.saplingActivation)
+        info.blockHeight = 2_000_000
+        info.consensusBranchID = "c2d6d0b4"
+        fixture.backend.consensusBranchIdForHeightReturnValue = Int32(bitPattern: 0xc2d6d0b4)
+        fixture.service.getInfoModeReturnValue = info
+        fixture.backend.getWalletSummaryReturnValue = WalletSummary(
+            accountBalances: [:],
+            chainTipHeight: 2_000_000,
+            fullyScannedHeight: 2_000_000,
+            recoveryProgress: nil,
+            scanProgress: ScanProgress(numerator: 2, denominator: 1),
+            nextSaplingSubtreeIndex: 0,
+            nextOrchardSubtreeIndex: 0,
+            nextIronwoodSubtreeIndex: 0
+        )
+        let firstStarted = expectation(description: "first actual post-publication start held")
+        let secondStarted = expectation(description: "second actual post-publication start held")
+        let firstRelease = Gate()
+        let secondRelease = Gate()
+        defer {
+            firstRelease.open()
+            secondRelease.open()
+        }
+        let starts = OSAllocatedUnfairLock(initialState: 0)
+        fixture.backend.listAccountsClosure = {
+            let index = starts.withLock { count in
+                count += 1
+                return count
+            }
+            if index == 1 {
+                firstStarted.fulfill()
+                await firstRelease.wait()
+            } else {
+                secondStarted.fulfill()
+                await secondRelease.wait()
+            }
+            return []
+        }
+        let first = Task {
+            do {
+                try await fixture.synchronizer.switchTo(endpoint: LightWalletEndpoint(address: "intermediate.test", port: 443, secure: true))
+                XCTFail("The scripted invalid progress must still fail start")
+            } catch { XCTAssertEqual((error as? ZcashError)?.code, .rustScanProgressOutOfRange) }
+        }
+        await fulfillment(of: [firstStarted], timeout: 2)
+        XCTAssertFalse(old.isValid)
+        XCTAssertEqual(binding.snapshot().phase, .replacing)
+        let intermediate = binding.snapshot()
+        XCTAssertNotEqual(intermediate.continuityID, original.continuityID, "Committed intermediate route must break continuity before start settles")
+        let second = Task {
+            do {
+                try await fixture.synchronizer.switchTo(endpoint: LightWalletEndpointBuilder.default)
+                XCTFail("The scripted invalid progress must still fail start")
+            } catch { XCTAssertEqual((error as? ZcashError)?.code, .rustScanProgressOutOfRange) }
+        }
+        await fulfillment(of: [secondStarted], timeout: 2)
+        let returnedRoute = binding.snapshot()
+        XCTAssertEqual(returnedRoute.phase, .replacing)
+        XCTAssertNotEqual(returnedRoute.continuityID, intermediate.continuityID)
+        XCTAssertNotEqual(returnedRoute.continuityID, original.continuityID)
+        secondRelease.open()
+        await second.value
+        XCTAssertEqual(binding.snapshot().phase, .replacing, "Newest replacement cannot settle an older active resource replacement")
+        XCTAssertThrowsError(try binding.readyToken())
+        firstRelease.open()
+        await first.value
+        XCTAssertEqual(binding.snapshot().phase, .ready)
+        XCTAssertEqual(binding.snapshot().continuityID, returnedRoute.continuityID)
+        let selected = await fixture.synchronizer.healthBinding()
+        XCTAssertTrue(selected.endpoint.isSameServer(as: LightWalletEndpointBuilder.default))
+        XCTAssertEqual(starts.withLock { $0 }, 2)
+        fixture.backend.listAccountsClosure = nil
+        try await fixture.cleanup()
     }
 }
 

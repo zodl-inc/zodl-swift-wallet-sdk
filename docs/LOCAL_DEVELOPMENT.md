@@ -34,13 +34,73 @@ No manual `Package.swift` edits are needed.
 
 2. **Apple platform targets** — Install the required Rust targets:
    ```bash
-   rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-   rustup target add aarch64-apple-darwin x86_64-apple-darwin
+   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+   rustup target add aarch64-apple-darwin
    ```
 
 3. **Python 3.11 or newer** — `make test-scripts` and the CI Rust validator use Python's standard-library TOML parser. CI selects Python 3.12 explicitly.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
+
+## Configured gateway endpoints
+
+`OHTTPEndpoints.gatewayHost(for:)` exposes the native build's gateway hostname for each network.
+Use this getter to construct `LightWalletEndpoint` values. Gateway, relay, signed-configuration
+and DNS routing share this native configuration; caller host matching ignores ASCII case and
+returns the exact configured spelling. Unknown hosts are not recognized as gateways, and
+cross-network gateway requests are rejected. The gateway getter's native failure indicates an
+SDK invariant violation: every source build requires both network configurations below.
+
+## Required OHTTP build inputs
+
+Every SDK native source build requires these eight nonempty exported values:
+
+- `ZODL_OHTTP_GATEWAY_HOST_MAINNET`
+- `ZODL_OHTTP_GATEWAY_HOST_TESTNET`
+- `ZODL_OHTTP_RELAY_URL_MAINNET`
+- `ZODL_OHTTP_RELAY_URL_TESTNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`
+- `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
+- `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
+
+Every corresponding mainnet/testnet pair must differ ignoring ASCII case: gateway
+hosts, relay URLs, signing public keys and key DNS names. Gateway hosts and key DNS
+names must be bare ASCII DNS names: at most 253 characters total, with nonempty
+dot-separated labels of at most 63 letters, digits or hyphens, and no leading or
+trailing label hyphen. Source-build wrappers reject schemes, ports, paths,
+trailing dots and underscores before Cargo starts, with variable-name-only
+diagnostics. Relay URLs must start with literal lowercase `https://` and be valid
+HTTPS URLs. The native OHTTP library remains authoritative for
+configuration formats. Signing public keys must contain exactly 64 ASCII hex digits;
+source-build wrappers validate this before starting Cargo. There is exactly one configured
+SDK product.
+
+Export all eight values in the environment that launches a local source build.
+The build validates a copy of that inherited environment, preserves the original
+values and unrelated exports, and fails on absent or explicitly empty inputs.
+It does not start a shell or retrieve configuration from an external service.
+For workspace builds, launch Xcode from that configured environment or supply
+all eight values in its build environment so FFIBuilder inherits them. A GUI
+launch does not automatically inherit exports from a terminal session.
+
+All four native CI workflows supply the eight values from GitHub repository
+Actions secrets before configuration validation and cache lookup. Completed FFI
+cache identities include a digest of all eight exact values.
+`python3 Scripts/lib/ohttp_env.py --hash` prints that validated versioned digest,
+and `--required -- COMMAND ARG...` runs a child with the validated inherited
+environment. The helper also supports the system Python used by Xcode build
+phases. The child environment always sets `ZODL_OHTTP_REQUIRE=1`, overriding
+an inherited `0`; all four native CI workflows also set it as build policy.
+This flag is not a ninth secret and is excluded from the configuration digest.
+All eight values retain their exact bytes, including their case. Direct Cargo
+compilation enforces required inputs and distinct values for all four network
+pairs through the SDK build guard and the native core.
+
+A precompiled SDK retains its compiled configuration. Consuming it and running
+`init-local-ffi.sh --cached` require no OHTTP configuration. Rebuild native source
+when its configuration must change. Native-sensitive tests must receive the
+same inherited environment as the artifact being tested.
 
 ## Quick Start
 
@@ -65,7 +125,7 @@ The `--cached` flag downloads a pre-built release instead of building from sourc
 
 **Warning:** Only use `--cached` if there have been no FFI changes on your branch since the last release. Using a stale pre-built binary with modified Swift bindings could cause silent data corruption and loss of funds. Additionally, `--cached` skips the Rust build entirely, so the first call to `rebuild-local-ffi.sh` will be a full (non-incremental) build.
 
-For faster iteration on Apple Silicon you can build only the arm64 slices you need, skipping the x86_64 simulator/Mac slices you can't run there anyway:
+The default source build contains all three ARM64 platform slices. For faster iteration you can select only the platforms you need:
 
 ```bash
 ./Scripts/init-local-ffi.sh --arm-macos     # macOS (swift build / swift test on the Mac)
@@ -75,6 +135,14 @@ For faster iteration on Apple Silicon you can build only the arm64 slices you ne
 ```
 
 Building for a slice you didn't include will fail until you build it (via `rebuild-local-ffi.sh` or a full `init-local-ffi.sh`).
+
+Cached installation verifies the pinned checksum, rejects unsafe archive members and validates all three canonical ARM64 slices before replacing the existing framework or wrapper. Older releases with Intel or legacy-named slices cannot be used with `--cached`; run a source initialization instead. Extraction and validation failures leave the previous installation intact.
+
+### ARM64 CLI destinations
+
+Compile and test on the CLI. Use an ARM64 iOS simulator/device or Apple Silicon Mac destination. Every `xcodebuild` build/test command must include `-skipMacroValidation` and an explicit `-derivedDataPath DerivedData` (or another path outside the Xcode app's DerivedData directory). If the testing scheme is unclear, ask before running it. Do not add Intel destinations to a build or archive.
+
+For generic macOS or iOS Simulator destinations, pass `ARCHS=arm64` to the `xcodebuild` build or archive command. An Apple Silicon host alone does not restrict a generic destination to ARM64; Xcode may also request x86_64. Keep `-skipMacroValidation` and an explicit `-derivedDataPath` outside the Xcode app's DerivedData directory on these commands too.
 
 ### Opening in Xcode
 
@@ -102,8 +170,9 @@ vim rust/src/lib.rs
 ./Scripts/rebuild-local-ffi.sh ios-device   # iOS Device
 ./Scripts/rebuild-local-ffi.sh macos        # macOS
 
-# 3. Build/test in Xcode
-#    Clean build folder if Xcode doesn't pick up changes: Cmd+Shift+K
+# 3. Build/test on the CLI (macOS on Apple Silicon)
+swift build
+swift test --filter OfflineTests
 ```
 
 ### Switching Back to Release Binary
@@ -121,7 +190,7 @@ If using Xcode, you may also need to reset package caches: File > Packages > Res
 One-time setup that creates the local development environment.
 
 ```bash
-./Scripts/init-local-ffi.sh                 # Build from source, all 5 architectures (recommended)
+./Scripts/init-local-ffi.sh                 # Build from source, all three ARM64 platform slices (recommended)
 ./Scripts/init-local-ffi.sh --arm-macos     # arm64 macOS slice only
 ./Scripts/init-local-ffi.sh --arm-ios       # arm64 iOS simulator + device slices
 ./Scripts/init-local-ffi.sh --arm-simulator # arm64 iOS simulator slice only
@@ -130,11 +199,11 @@ One-time setup that creates the local development environment.
 ```
 
 This script:
-- Builds the full XCFramework (all 5 architectures), an arm64-only subset (`--arm-*`, faster on Apple Silicon since it skips the x86_64 slices), or downloads a pre-built one
+- Builds the full XCFramework (all three ARM64 platform slices), a platform subset (`--arm-*`), or downloads a pre-built one
 - Creates `LocalPackages/` with an SPM wrapper package
 - `Package.swift` automatically detects `LocalPackages/` and switches to local mode
 
-The `--arm-*` flags always build the `aarch64-*` targets regardless of host architecture. They produce an XCFramework containing only the requested arm64 slices, so building for an x86_64 simulator/Mac (or a slice you didn't include) will fail until you build it — run `rebuild-local-ffi.sh <target>` or a full `init-local-ffi.sh` to add the missing slices. Any unrecognized flag prints usage and exits without building.
+All source paths build `aarch64-*` targets regardless of host architecture. Intel destinations are unsupported. To add a missing ARM64 platform, run `rebuild-local-ffi.sh <target>` or a full `init-local-ffi.sh`. Unrecognized flags fail before toolchain or download calls.
 
 ### `rebuild-local-ffi.sh`
 
@@ -145,13 +214,15 @@ Fast incremental rebuild for the current development target. Requires `init-loca
 ```
 
 Targets:
-- `ios-sim` (default) — iOS Simulator, auto-detects arm64 vs x86_64
+- `ios-sim` (default) — iOS Simulator (ARM64)
 - `ios-device` — iOS Device (arm64)
-- `macos` — macOS, auto-detects arm64 vs x86_64
+- `macos` — macOS (ARM64)
 
 **Why it's fast:** Only builds ONE architecture, and Cargo's incremental compilation means small changes rebuild in seconds.
 
-**Note:** This creates a single-architecture build. Run `init-local-ffi.sh` before submitting PRs to verify all architectures compile.
+The rebuilt slice is staged and validated before installation. Other canonical ARM64 slices are preserved with a staleness warning: check their `ENGINE_BUILD` tags after Rust changes. Unknown, legacy-named or Intel slices cause a failure before building; run `init-local-ffi.sh` to explicitly replace an incompatible installation. Failed builds and invalid staged products leave the installed framework and wrapper intact.
+
+Use `--gpu` to forward the Rust `gpu` feature. Run `init-local-ffi.sh` before submitting FFI changes to verify all three ARM64 platform slices compile.
 
 ### `reset-local-ffi.sh`
 
@@ -167,18 +238,16 @@ Removes `LocalPackages/` and switches back to the release binary.
 
 The XCFramework contains three platform slices:
 - `ios-arm64` — iOS devices
-- `ios-arm64_x86_64-simulator` — iOS Simulator (universal)
-- `macos-arm64_x86_64` — macOS (universal)
+- `ios-arm64-simulator` — iOS Simulator (ARM64)
+- `macos-arm64` — macOS (ARM64)
 
 ### Build Targets
 
 | Development Target | Rust Target | XCFramework Slice |
 |-------------------|-------------|-------------------|
-| iOS Simulator (Apple Silicon) | `aarch64-apple-ios-sim` | `ios-arm64_x86_64-simulator` |
-| iOS Simulator (Intel) | `x86_64-apple-ios` | `ios-arm64_x86_64-simulator` |
+| iOS Simulator (Apple Silicon) | `aarch64-apple-ios-sim` | `ios-arm64-simulator` |
 | iOS Device | `aarch64-apple-ios` | `ios-arm64` |
-| macOS (Apple Silicon) | `aarch64-apple-darwin` | `macos-arm64_x86_64` |
-| macOS (Intel) | `x86_64-apple-darwin` | `macos-arm64_x86_64` |
+| macOS (Apple Silicon) | `aarch64-apple-darwin` | `macos-arm64` |
 
 ### Local Package Override
 
@@ -205,17 +274,14 @@ This means `LocalPackages/` doesn't exist and SPM is trying to download the rele
 
 1. Clean the build folder: Cmd+Shift+K
 2. If that doesn't work, reset package caches: File > Packages > Reset Package Caches
-3. If that doesn't work, close Xcode and delete DerivedData:
-   ```bash
-   rm -rf ~/Library/Developer/Xcode/DerivedData
-   ```
+3. For CLI builds, remove only the repo-local `DerivedData/` you selected and build again. CLI builds must never depend on the Xcode app's DerivedData cache.
 
 ### Build fails with missing target
 
 Ensure all Rust targets are installed:
 ```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+rustup target add aarch64-apple-darwin
 ```
 
 ### Header changes not reflected
@@ -242,7 +308,7 @@ The Makefile (used by `init-local-ffi.sh`) and `rebuild-local-ffi.sh` invoke `ca
 
 ### `rustup: command not found` in Xcode build
 
-The scripts source `~/.cargo/env` to find the Rust toolchain. If you installed Rust via a non-standard method (e.g., Homebrew, Nix), you may need to ensure `cargo` and `rustup` are on the default PATH or add the appropriate source/export to `~/.zprofile`.
+The scripts fall back to `~/.cargo/bin` on PATH to find the Rust toolchain. If you installed Rust via a non-standard method (e.g., Homebrew, Nix), you may need to ensure `cargo` and `rustup` are on the default PATH or add the appropriate source/export to `~/.zprofile`.
 
 ## Full Rebuild
 
