@@ -195,6 +195,29 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
   no longer used. See PR #4 in zodl-inc/ohttp.
 
+- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
+  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
+- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
+  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
+  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
+- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
+  stops compiling until they are handled.
+- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
+  more notes than one transaction can spend within the block size limit is now refused when the
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
+  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
+  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
+  None of the new cases carries the recipient, the memo or an amount.
+- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
+  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
+  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
+  `rustProposeTransfer` or `rustProposeTransferFromURI`.
+
 ## Fixed
 
 - `make configure-local-ffi` gives the local FFI's macOS framework the versioned bundle layout

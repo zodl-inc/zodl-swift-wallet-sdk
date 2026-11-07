@@ -407,6 +407,32 @@ catch ZcashError.rustCreateToAddress(let error) {
 }
 ```
 
+## `ZcashError` gained cases — send-max
+
+`ZcashError` and `ZcashErrorCode` have three new cases, `rustProposalTransactionTooLarge`
+(`ZRUST0174`), `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress`
+(`ZRUST0176`), which `proposeSendMax` throws (the first also from `proposeTransfer` and
+`proposefulfillingPaymentURI`).
+An exhaustive `switch` over either type stops compiling until they are handled. They carry no
+payload. `RustErrorKind` likewise gains `transactionTooLarge` and `transparentMemo`.
+
+A wallet that treated every `rustProposeSendMaxTransfer` as one condition should handle the
+send-max cases it now sees instead:
+
+```swift
+do {
+    let proposal = try await synchronizer.proposeSendMax(accountUUID: account, recipient: recipient, memo: memo, mode: .maxSpendable)
+} catch ZcashError.rustProposalTransactionTooLarge {
+    // Too many notes for one transaction: offer to send a smaller amount.
+} catch ZcashError.rustProposalTransparentMemo {
+    // Drop the memo for this recipient.
+} catch ZcashError.rustProposalUnsupportedAddress {
+    // The address cannot be paid by this wallet.
+} catch ZcashError.rustProposeSendMaxTransfer(let failure) {
+    // Anything else; `failure.kind` names the condition.
+}
+```
+
 ## `ZcashError` gained a case — out-of-range server block height
 
 `ZcashError` and `ZcashErrorCode` have a new case, `compactBlockProcessorServerBlockHeightOutOfRange`

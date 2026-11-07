@@ -25,7 +25,9 @@ use std::os::raw::c_char;
 
 use tracing::debug;
 use zcash_client_backend::data_api::error::Error as WalletError;
+use zcash_client_backend::fees::ChangeError;
 use zcash_client_backend::proposal::ProposalError;
+use zcash_client_backend::zip321::{PaymentError, Zip321Error};
 use zcash_protocol::value::Zatoshis;
 
 /// Stable discriminants for the conditions a wallet is expected to render itself rather than
@@ -83,6 +85,12 @@ pub enum ErrorKind {
     /// The wallet has not scanned to a height it can anchor the transaction on: scan further,
     /// then retry.
     AnchorNotFound = 21,
+    /// The transaction would exceed the maximum size of a block, because it spends too many
+    /// notes. Raised when a proposal is made and again when its transactions are built.
+    TransactionTooLarge = 22,
+    /// A memo was given for a recipient that cannot receive one, such as a transparent or
+    /// ZIP 320 (TEX) address.
+    TransparentMemo = 23,
 }
 
 /// The two amounts describing an [`ErrorKind::InsufficientFunds`] condition.
@@ -138,6 +146,66 @@ impl ClassifiedError {
         }
     }
 
+    /// An [`ErrorKind::InsufficientFunds`] classification, carrying its amounts out of band.
+    pub fn insufficient_funds(
+        context: &'static str,
+        available: Zatoshis,
+        required: Zatoshis,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::InsufficientFunds,
+            message: "the spendable balance does not cover this payment and its fee",
+            context,
+            amounts: Some(Shortfall {
+                available,
+                required,
+            }),
+        }
+    }
+
+    /// Classifies a failure of the proposal itself, whether `zcash_client_backend` found it
+    /// while proposing, while building, or when [`Proposal::check_transaction_size`] was called
+    /// on a proposal directly.
+    ///
+    /// [`Proposal::check_transaction_size`]: zcash_client_backend::proposal::Proposal::check_transaction_size
+    pub fn classify_proposal(context: &'static str, e: &ProposalError) -> Self {
+        match e {
+            // The wallet has not scanned to a height it can anchor the proposal on. It is the one
+            // proposal failure the wallet treats as "scan further, then retry" rather than as a bad
+            // request, so it gets its own kind instead of disappearing into `ProposalInvalid` —
+            // the wallet used to recognise it by its upstream text, which redaction removes.
+            ProposalError::AnchorNotFound(_) => Self::new(
+                context,
+                ErrorKind::AnchorNotFound,
+                "the wallet has not scanned far enough to anchor this payment; retry once scanning catches up",
+            ),
+            // The input counts it carries describe the user's own wallet, but nothing in the
+            // FFI contract reports them yet, and they stay out of the message regardless.
+            ProposalError::TransactionTooLarge { .. } => Self::new(
+                context,
+                ErrorKind::TransactionTooLarge,
+                "the transaction would spend too many notes to fit in a block",
+            ),
+            ProposalError::Zip321(Zip321Error::TransparentMemo(_)) => {
+                Self::transparent_memo(context)
+            }
+            _ => Self::new(
+                context,
+                ErrorKind::ProposalInvalid,
+                "the transaction proposal was rejected as invalid",
+            ),
+        }
+    }
+
+    /// An [`ErrorKind::TransparentMemo`] classification, however upstream reported it.
+    fn transparent_memo(context: &'static str) -> Self {
+        Self::new(
+            context,
+            ErrorKind::TransparentMemo,
+            "the recipient cannot receive a memo",
+        )
+    }
+
     /// The condition this failure was classified as, for callers that branch on it.
     pub fn kind(&self) -> ErrorKind {
         self.kind
@@ -157,6 +225,32 @@ impl ClassifiedError {
     /// message and reporting these are not in tension.
     pub fn amounts(&self) -> Option<Shortfall> {
         self.amounts
+    }
+
+    /// Classifies a failure from proposing a payment (`propose_transfer`, a payment URI, or the
+    /// user's send-max), where the wallet explains the send-max categories to the user.
+    ///
+    /// On top of [`Self::classify`], it reports a transaction too large for a block as
+    /// [`ErrorKind::TransactionTooLarge`], a memo for a recipient that cannot receive one as
+    /// [`ErrorKind::TransparentMemo`], and a shortfall found during change selection as
+    /// [`ErrorKind::InsufficientFunds`] with its amounts. Building a proposal's transactions,
+    /// and the migration lanes, use [`Self::classify`] alone, so they report as they always have.
+    pub fn classify_proposing<DbE, CtE, SelE, FeeE, ChE, NoteRef>(
+        context: &'static str,
+        e: &WalletError<DbE, CtE, SelE, FeeE, ChE, NoteRef>,
+    ) -> Self {
+        match e {
+            // `ChangeError` has its own `InsufficientFunds` variant, which upstream does NOT lift
+            // into `Error::InsufficientFunds`, so a shortfall found during change selection is
+            // lifted here, with its amounts, into the same kind.
+            WalletError::Change(ChangeError::InsufficientFunds {
+                available,
+                required,
+            }) => Self::insufficient_funds(context, *available, *required),
+            WalletError::Proposal(e) => Self::classify_proposal(context, e),
+            WalletError::Payment(PaymentError::TransparentMemo) => Self::transparent_memo(context),
+            other => Self::classify(context, other),
+        }
     }
 
     /// Classifies a wallet error from proposal construction or transaction creation.
@@ -190,7 +284,8 @@ impl ClassifiedError {
             // Reachable as a second insufficient-funds path: `ChangeError` has its own
             // `InsufficientFunds` variant, which upstream does NOT lift into
             // `Error::InsufficientFunds`, so a shortfall found during change selection arrives
-            // here rather than as the classified amount-carrying kind.
+            // here rather than as the classified amount-carrying kind. Proposing lifts it; see
+            // [`Self::classify_proposing`].
             WalletError::Change(_) => (
                 ErrorKind::ChangeSelectionFailed,
                 "change selection failed, possibly for lack of spendable funds",
@@ -230,17 +325,7 @@ impl ClassifiedError {
             WalletError::InsufficientFunds {
                 available,
                 required,
-            } => {
-                return Self {
-                    kind: ErrorKind::InsufficientFunds,
-                    message: "the spendable balance does not cover this payment and its fee",
-                    context,
-                    amounts: Some(Shortfall {
-                        available: *available,
-                        required: *required,
-                    }),
-                };
-            }
+            } => return Self::insufficient_funds(context, *available, *required),
             WalletError::ScanRequired => (
                 ErrorKind::ScanRequired,
                 "the wallet must finish scanning before this payment can be prepared",
@@ -408,152 +493,4 @@ fn message_ptr(message: &'static str) -> *mut c_char {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::convert::Infallible;
-
-    type TestError = WalletError<Infallible, Infallible, Infallible, Infallible, Infallible, u32>;
-
-    #[test]
-    fn scan_required_is_classified_and_says_so() {
-        let e = ClassifiedError::classify("propose_transfer", &TestError::ScanRequired);
-
-        assert_eq!(e.kind(), ErrorKind::ScanRequired);
-        assert_eq!(e.amounts(), None);
-        assert!(e.to_string().contains("must finish scanning"));
-    }
-
-    #[test]
-    fn anchor_not_found_is_classified_and_says_so() {
-        let e = ClassifiedError::classify(
-            "propose_transfer",
-            &TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
-        );
-
-        assert_eq!(e.kind(), ErrorKind::AnchorNotFound);
-        assert_eq!(e.amounts(), None);
-        assert!(e.to_string().contains("anchor"));
-        // the height is a wallet-state detail; it must not reach the report
-        assert!(!e.to_string().contains("1000000"));
-    }
-
-    #[test]
-    fn insufficient_funds_reports_amounts_out_of_band() {
-        let available = Zatoshis::const_from_u64(120_000_000);
-        let required = Zatoshis::const_from_u64(200_000_000);
-        let e = ClassifiedError::classify(
-            "propose_transfer",
-            &TestError::InsufficientFunds {
-                available,
-                required,
-            },
-        );
-
-        assert_eq!(e.kind(), ErrorKind::InsufficientFunds);
-        assert_eq!(
-            e.amounts(),
-            Some(Shortfall {
-                available,
-                required
-            })
-        );
-
-        // The whole point: the wallet gets the numbers, the report does not.
-        let rendered = e.to_string();
-        assert!(!rendered.contains("120000000"));
-        assert!(!rendered.contains("200000000"));
-        assert!(!rendered.contains("1.2"));
-    }
-
-    fn take_report() -> Option<(u32, String, i64, i64)> {
-        let ptr = zcashlc_take_last_error_report();
-        if ptr.is_null() {
-            return None;
-        }
-
-        let report = unsafe { &*ptr };
-        let taken = (
-            report.kind,
-            unsafe { std::ffi::CStr::from_ptr(report.message) }
-                .to_string_lossy()
-                .into_owned(),
-            report.available,
-            report.required,
-        );
-
-        unsafe { zcashlc_free_error_report(ptr) };
-
-        Some(taken)
-    }
-
-    #[test]
-    fn no_error_reports_nothing() {
-        ffi_helpers::error_handling::clear_last_error();
-
-        assert!(take_report().is_none());
-    }
-
-    #[test]
-    fn a_classified_error_round_trips_its_kind_and_amounts() {
-        ffi_helpers::error_handling::update_last_error(anyhow::Error::from(
-            ClassifiedError::classify(
-                "propose_transfer",
-                &TestError::InsufficientFunds {
-                    available: Zatoshis::const_from_u64(120_000_000),
-                    required: Zatoshis::const_from_u64(200_000_000),
-                },
-            ),
-        ));
-
-        let (kind, message, available, required) = take_report().expect("an error was recorded");
-
-        assert_eq!(kind, ErrorKind::InsufficientFunds as u32);
-        assert_eq!(available, 120_000_000);
-        assert_eq!(required, 200_000_000);
-        assert!(!message.contains("120000000"));
-
-        // Taking is destructive, exactly as `zcashlc_clear_last_error` would be.
-        assert!(take_report().is_none());
-    }
-
-    /// An error that never passed through the classifier must not have its text forwarded: the
-    /// anyhow strings elsewhere in this crate have not been audited for amounts or addresses.
-    #[test]
-    fn an_unclassified_error_reports_a_generic_message() {
-        ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-            "Insufficient balance (have 1.2, need 2.0 including fee)"
-        ));
-
-        let (kind, message, available, required) = take_report().expect("an error was recorded");
-
-        assert_eq!(kind, ErrorKind::Unclassified as u32);
-        assert_eq!(message, "an unclassified error occurred");
-        assert_eq!((available, required), (NO_AMOUNT, NO_AMOUNT));
-    }
-
-    /// The regression guard for the leak this module exists to prevent. Every classification
-    /// must render to a message this file owns, so no upstream `Display` can reach a report.
-    #[test]
-    fn every_classification_renders_a_constant_message() {
-        let cases: Vec<TestError> = vec![
-            TestError::ProposalNotSupported,
-            TestError::AccountIdNotRecognized,
-            TestError::KeyNotRecognized,
-            TestError::AccountCannotSpend,
-            TestError::ScanRequired,
-            TestError::InsufficientFunds {
-                available: Zatoshis::const_from_u64(1),
-                required: Zatoshis::const_from_u64(2),
-            },
-            TestError::ExpiryHeightConflictsWithCanonicalCrossing {
-                requested: 1_000_000.into(),
-            },
-            TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
-        ];
-
-        for case in &cases {
-            let e = ClassifiedError::classify("ctx", case);
-            assert_eq!(e.to_string(), format!("ctx: {}", e.message()));
-        }
-    }
-}
+pub(crate) mod tests;

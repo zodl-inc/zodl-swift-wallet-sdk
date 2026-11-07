@@ -661,6 +661,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unredacted upstream text is logged on the device at `debug!` only. A caller that parsed the old
   text for a cause should take `zcashlc_take_last_error_report` and switch on `kind` instead.
   `zcashlc_propose_shielding` is unchanged and still reports a plain string.
+- `ErrorKind` gains `22` (`TransactionTooLarge`: the transaction would spend too many notes to fit
+  in a block) and `23` (`TransparentMemo`: a memo for a recipient that cannot receive one).
+  `zcashlc_propose_transfer` and `zcashlc_propose_transfer_from_uri` report an oversized proposal
+  as `22` rather than `17`. `zcashlc_propose_send_max_transfer` with `orchard_only` false now
+  refuses a send-max whose transaction would not fit in a block, reporting `22`, instead of
+  returning a proposal whose transaction creation then fails; it reports a recipient with no
+  payable receiver as `10` rather than `14`. These proposal calls report a memo for a recipient
+  that cannot receive one as `23` (previously `6` or `17`), and a shortfall found during change
+  selection as `2` with both amounts (previously `15`). Transaction and PCZT creation, and
+  `zcashlc_propose_send_max_transfer` with `orchard_only` true, report as before.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
