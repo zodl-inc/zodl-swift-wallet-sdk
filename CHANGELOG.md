@@ -17,6 +17,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finished still starts a fresh one. No change is needed at call sites.
 - `SlipstreamSynchronizer.getAccountsBalances()` no longer reads the local balances, which it never
   returned. Its result is unchanged, and it no longer pays for that read.
+- The local-balance read behind `SlipstreamSynchronizer.getLocalAccountBalances()` now runs off the
+  Swift concurrency thread pool. The caller suspends while the wallet database is read, instead of
+  holding one of the pool's threads for the whole read, so other async work in the app keeps
+  running. No change is needed at call sites.
 
 # 7.0.1 - 2026-11-02
 
