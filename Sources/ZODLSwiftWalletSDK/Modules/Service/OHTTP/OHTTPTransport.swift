@@ -363,15 +363,16 @@ actor OHTTPTransport {
     /// the call as soon as it is exceeded."
     internal static let maxRelayResponseBytes = (256 * 1024 * 1024) + (1024 * 1024)
 
-    /// The gateway host the requests are addressed to. It picks the network, and so the pinned key the
-    /// signed key configuration is checked against.
+    /// The gateway host the requests are addressed to. It picks the network, and so the installed signing key
+    /// the signed key configuration is checked against.
     private let gatewayHost: String
     nonisolated let healthRoute: OHTTPHealthRoute
     let relayURL: String
     private let connectTimeoutMS: Int
     private let keyFetchTimeoutMS: Int
     private let keyCache: OHTTPKeyCache
-    /// The key-configuration entry of this relay, gateway and sender kind in ``keyCache``.
+    /// The key-configuration entry of this relay, gateway and sender kind in ``keyCache``, under the OHTTP
+    /// configuration installed when the transport was made (``keyCacheKey(relayURL:gatewayHost:viaTor:)``).
     private let cacheKey: String
     /// The back-off entry of this relay and sender kind in ``keyCache``.
     private let backoffKey: String
@@ -434,11 +435,19 @@ actor OHTTPTransport {
         self.testNow = testNow
         self.testKeyVerifier = testKeyVerifier
         self.keyCache = keyCache
-        self.cacheKey = "\(relayURL)|\(gatewayHost.lowercased())|\(viaTor ? "tor" : "direct")"
+        self.cacheKey = Self.keyCacheKey(relayURL: relayURL, gatewayHost: gatewayHost, viaTor: viaTor)
         self.backoffKey = "\(relayURL)|\(viaTor ? "tor" : "direct")"
         self.httpSender = httpSender
         self.streamSender = streamSender
         self.streamDecoderFactory = streamDecoderFactory
+    }
+
+    /// The ``OHTTPKeyCache`` entry of the key of `gatewayHost` fetched through `relayURL` by a Tor (`viaTor`) or
+    /// a clearnet sender, under the OHTTP configuration installed now. A cached key is not checked again, so a key
+    /// verified under an earlier configuration, maybe for the other network or under another signing key, must
+    /// never be found under a later one.
+    static func keyCacheKey(relayURL: String, gatewayHost: String, viaTor: Bool) -> String {
+        "\(OHTTPEndpoints.configurationGeneration)|\(relayURL)|\(gatewayHost.lowercased())|\(viaTor ? "tor" : "direct")"
     }
 
     /// Fetches (or returns the cached) gateway key using the signed envelope.

@@ -10,8 +10,27 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
-- `OHTTPEndpoints.gatewayHost(for:)` returns the gateway configured into the native SDK for the
-  selected network. Use it when constructing gateway endpoints instead of a fixed hostname.
+- `OHTTPNetworkConfiguration` (gateway host, relay URL, key DNS name and signing public key of one network),
+  `OHTTPConfiguration` (mainnet and testnet) and `OHTTPEndpoints.configure(_:)` install the OHTTP configuration
+  at runtime. Call it once at launch, before any other SDK use. `OHTTPEndpoints.configuration` returns the
+  installed one. Passing `nil`, or never calling it, leaves OHTTP off. An invalid configuration throws the new
+  `ZcashError.ohttpConfigurationInvalid` (`ZTSRV0009`), whose message names the field and the rule but never
+  the value; descriptions and `dump` of the configuration types never show the values either. An exhaustive
+  `switch` over `ZcashError` must handle the new case.
+
+- `OHTTPEndpoints.gatewayHost(for:)` returns `String?`: the gateway host `configure` installed for the
+  network, or `nil` until it does. Use it when constructing gateway endpoints instead of a fixed hostname.
+
+- The binaries carry no OHTTP configuration, and a source build needs no OHTTP inputs. Whatever the app
+  passes to `configure` is in the app and subject to its own protection.
+
+- While OHTTP is off for a network, that network's gateway host is treated as a plain lightwalletd server,
+  requests to the proxied third-party hosts (the CoinMarketCap, NEAR and Flexa aliases) fail, and the
+  predefined voting servers are reached directly (Tor still applies). With a configuration for the
+  wallet's network they ride OHTTP and fail closed.
+
+- Public keys verified under one configuration are never reused under another; `configure` replaces the
+  previous configuration completely.
 
 - `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
   with the default timing, send every transaction that was submitted but that no server has accepted yet
@@ -99,16 +118,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In Private, Public and Manual modes, downloads use direct HTTPS with Tor off and Tor with
   Tor on. They do not use OHTTP. Existing parameter caching and SHA-256 verification remain;
   applications using `SaplingParamsSourceURL.default` need no call-site edits.
-
-- Compiled OHTTP gateway/relay hosts, DNS names and signing public keys are observable in binaries.
-  Keeping these configuration literals out of source does not make the compiled configuration
-  confidential. Treat them as observable public configuration, even when supplied through CI secrets.
-
-- Native SDK source builds reject shared mainnet/testnet gateway hosts, relay URLs, signing
-  keys or key DNS names, including case-only differences. Export all eight inputs with distinct
-  values for each corresponding network pair and 64 ASCII hex digits per signing key. Build
-  wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
-  Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
 
 - OHTTP relay connections detect silent calls from received traffic and per-call stall limits
   without HTTP/2 keep-alive PINGs, so slow or Tor connections are not retired for a late PING

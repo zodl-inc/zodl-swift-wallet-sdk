@@ -63,6 +63,11 @@ private final class RecordingDelegate: NSObject, URLSessionDataDelegate, @unchec
 }
 
 final class OHTTPURLProtocolTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     override func tearDown() {
         OHTTPURLProtocol.streamer = nil
         super.tearDown()

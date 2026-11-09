@@ -7,6 +7,11 @@ import libzcashlc
 final class OHTTPHealthProviderIntegrationTests: ZcashTestCase {
     private let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private func route(viaTor: Bool) throws -> OHTTPHealthRoute {
         OHTTPHealthRoute(
             network: .testnet,

@@ -338,20 +338,25 @@ public final class VotingRustBackend: @unchecked Sendable {
     ///   isolated client taken during this call, so the round's circuits are not
     ///   linkable to the rest of the wallet's Tor use. A session opened on Tor
     ///   never falls back to a direct connection.
-    /// - `nil` and `isCustomServer == false` (predefined servers): OHTTP through
-    ///   the relay and gateway, so no vote or PIR server sees the voter's
-    ///   address. Fails closed: when any chain or PIR endpoint is not one the
-    ///   gateway carries, opening throws ``VotingError`` with
-    ///   ``VotingErrorKind/invalidInput``; nothing falls back to a direct
-    ///   connection.
+    /// - `nil`, `isCustomServer == false` (predefined servers) and an OHTTP
+    ///   configuration for the wallet's network (`OHTTPEndpoints.configure(_:)`):
+    ///   OHTTP through the relay and gateway, so no vote or PIR server sees the
+    ///   voter's address. Fails closed: when any chain or PIR endpoint is not one
+    ///   the gateway carries, opening throws ``VotingError`` with
+    ///   ``VotingErrorKind/invalidInput``, and nothing falls back to a direct
+    ///   connection when the gateway is unavailable. The session keeps the
+    ///   configuration installed when it opened.
+    /// - `nil`, `isCustomServer == false` and no OHTTP configuration for the
+    ///   wallet's network: the direct HTTP route, like the rest of the wallet's
+    ///   traffic on that network, so the servers see the voter's address.
     /// - `nil` and `isCustomServer == true` (a server the voter added): the
     ///   direct HTTP route. Choosing one's own server is the voter's decision
     ///   to be reached directly.
     ///
-    /// `isCustomServer` is required and has no default: a caller that passed
-    /// `false` by accident would fail closed on a custom server, and one that
-    /// passed `true` by accident would leave the OHTTP route for a predefined
-    /// one.
+    /// `isCustomServer` is required and has no default: with OHTTP configured, a
+    /// caller that passed `false` by accident would fail closed on a custom
+    /// server, and one that passed `true` by accident would leave the OHTTP route
+    /// for a predefined one.
     ///
     /// The runtime is borrowed for this call only; the caller keeps ownership
     /// of it. Nothing here reaches the network: every failure is a decision

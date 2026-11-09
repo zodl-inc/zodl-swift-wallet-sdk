@@ -42,65 +42,43 @@ No manual `Package.swift` edits are needed.
 
 CI installs the latest stable Rust, validates it against the root `Cargo.toml` minimum, and binds later steps to that compiler without changing the global rustup default. Conflicting explicit `RUSTC` or `RUSTUP_TOOLCHAIN` overrides fail validation. FFI and Cargo caches include the full verbose compiler identity, including its commit, host and LLVM version.
 
-## Configured gateway endpoints
+## OHTTP configuration
 
-`OHTTPEndpoints.gatewayHost(for:)` exposes the native build's gateway hostname for each network.
-Use this getter to construct `LightWalletEndpoint` values. Gateway, relay, signed-configuration
-and DNS routing share this native configuration; caller host matching ignores ASCII case and
-returns the exact configured spelling. Unknown hosts are not recognized as gateways, and
-cross-network gateway requests are rejected. The gateway getter's native failure indicates an
-SDK invariant violation: every source build requires both network configurations below.
+The OHTTP gateway hosts, relay URLs, key DNS names and signing keys are not build inputs.
+Building the SDK, the FFI and the tests needs none of them, and a source build or a
+precompiled SDK behaves the same. The binaries carry no configuration.
 
-## Required OHTTP build inputs
+The app installs the configuration at runtime, once at launch and before any other SDK use:
 
-Every SDK native source build requires these eight nonempty exported values:
+```swift
+try OHTTPEndpoints.configure(
+    OHTTPConfiguration(
+        mainnet: OHTTPNetworkConfiguration(
+            gatewayHost: "ohttp-gateway.example",
+            relayURL: "https://relay-mainnet.example/relay",
+            keysDNSName: "mainnet.ohttp-keys.example",
+            signingPublicKey: "<64 hex digits: an Ed25519 public key>"
+        ),
+        testnet: OHTTPNetworkConfiguration(/* same four values for testnet */)
+    )
+)
+```
 
-- `ZODL_OHTTP_GATEWAY_HOST_MAINNET`
-- `ZODL_OHTTP_GATEWAY_HOST_TESTNET`
-- `ZODL_OHTTP_RELAY_URL_MAINNET`
-- `ZODL_OHTTP_RELAY_URL_TESTNET`
-- `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`
-- `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`
-- `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`
-- `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`
+Each network has all four values or none, and mainnet and testnet share no value. An invalid
+configuration throws `ZcashError.ohttpConfigurationInvalid`, naming the field and the rule but never the
+value. Until `configure` is called with a configuration, or after `configure(nil)`, OHTTP is off.
+The SDK never prints the values: descriptions and `dump` of the configuration types omit them.
 
-Every corresponding mainnet/testnet pair must differ ignoring ASCII case: gateway
-hosts, relay URLs, signing public keys and key DNS names. Gateway hosts and key DNS
-names must be bare ASCII DNS names: at most 253 characters total, with nonempty
-dot-separated labels of at most 63 letters, digits or hyphens, and no leading or
-trailing label hyphen. Source-build wrappers reject schemes, ports, paths,
-trailing dots and underscores before Cargo starts, with variable-name-only
-diagnostics. Relay URLs must start with literal lowercase `https://` and be valid
-HTTPS URLs. The native OHTTP library remains authoritative for
-configuration formats. Signing public keys must contain exactly 64 ASCII hex digits;
-source-build wrappers validate this before starting Cargo. There is exactly one configured
-SDK product.
+### Tests
 
-Export all eight values in the environment that launches a local source build.
-The build validates a copy of that inherited environment, preserves the original
-values and unrelated exports, and fails on absent or explicitly empty inputs.
-It does not start a shell or retrieve configuration from an external service.
-For workspace builds, launch Xcode from that configured environment or supply
-all eight values in its build environment so FFIBuilder inherits them. A GUI
-launch does not automatically inherit exports from a terminal session.
-
-All four native CI workflows supply the eight values from GitHub repository
-Actions secrets before configuration validation and cache lookup. Completed FFI
-cache identities include a digest of all eight exact values.
-`python3 Scripts/lib/ohttp_env.py --hash` prints that validated versioned digest,
-and `--required -- COMMAND ARG...` runs a child with the validated inherited
-environment. The helper also supports the system Python used by Xcode build
-phases. The child environment always sets `ZODL_OHTTP_REQUIRE=1`, overriding
-an inherited `0`; all four native CI workflows also set it as build policy.
-This flag is not a ninth secret and is excluded from the configuration digest.
-All eight values retain their exact bytes, including their case. Direct Cargo
-compilation enforces required inputs and distinct values for all four network
-pairs through the SDK build guard and the native core.
-
-A precompiled SDK retains its compiled configuration. Consuming it and running
-`init-local-ffi.sh --cached` require no OHTTP configuration. Rebuild native source
-when its configuration must change. Native-sensitive tests must receive the
-same inherited environment as the artifact being tested.
+- **Offline tests** need no real values. `OHTTPTestSupport.installExampleConfiguration()` (in
+  `Tests/OfflineTests`) installs the RFC 2606 example hosts with the RFC 8032 test public keys; a test that
+  needs OHTTP calls it in `setUp`.
+- **E2E tests** (`OHTTPE2ETests`, run by `ohttp-e2e.yml`) read the configuration from
+  `OHTTP_E2E_{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}_{MAINNET,TESTNET}` and install it through
+  `OHTTPEndpoints.configure(_:)` before each test. When any of the eight is unset or empty the test is skipped,
+  and the skip message names the missing variables. To run them locally, export the eight variables (and the
+  `OHTTP_E2E_SEED_HEX` seed) in your shell; the workflow maps them from repository secrets on its test steps only.
 
 ## Quick Start
 

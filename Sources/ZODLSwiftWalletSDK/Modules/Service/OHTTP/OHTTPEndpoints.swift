@@ -2,10 +2,11 @@
 //  OHTTPEndpoints.swift
 //  ZODLSwiftWalletSDK
 //
-//  Native-configured OHTTP (RFC 9458) endpoint mapping.
+//  OHTTP (RFC 9458) endpoint mapping, from the configuration the app installs at launch
+//  (`OHTTPEndpoints.configure(_:)`, see `OHTTPConfiguration.swift`).
 //
-//  A LightWalletEndpoint whose host is one of the ZODL OHTTP gateways is served through an OHTTP
-//  relay instead of a direct gRPC connection:
+//  A LightWalletEndpoint whose host is the gateway of a configured network is served through that network's
+//  OHTTP relay instead of a direct gRPC connection:
 //
 //    app ──HPKE-encrypted──▶ relay (sees IP, not content) ──▶ gateway (sees content, not IP) ──▶ lightwalletd
 //
@@ -17,14 +18,17 @@
 //  When Tor is OFF: OHTTP hides the client IP from all external services.
 //  When Tor is ON:  All calls use Tor→Relay→Gateway (voting goes Tor-direct as the ZIP mandates).
 //
+//  OHTTP is off for a network the installed configuration leaves out, and for both until one is installed:
+//  no host is that network's gateway, so its gateway host is a plain server, and the hosts its gateway
+//  carries have no route.
+//
 
 import Foundation
-import CryptoKit
 
 public enum OHTTPEndpoints {
-    /// The native SDK's configured gateway host for the selected network.
-    /// Use this hostname when constructing a lightwalletd gateway endpoint.
-    public static func gatewayHost(for network: NetworkType) -> String {
+    /// The gateway host the installed configuration (``configure(_:)``) has for `network`, or nil when OHTTP is
+    /// off for that network. Use this hostname when constructing a lightwalletd gateway endpoint.
+    public static func gatewayHost(for network: NetworkType) -> String? {
         OHTTPNative.gatewayHost(for: network)
     }
 
@@ -48,8 +52,8 @@ public enum OHTTPEndpoints {
     /// Mainnet relay URL (for external API proxies that aren't in the native map).
     /// External API proxy hosts (`cmc.zodl.com`, `near.zodl.com`, etc.) share the mainnet
     /// relay→gateway pair — the gateway routes them to the real backend by authority header.
-    /// Derived from the native relay map for the configured mainnet gateway host.
-    private static var mainnetRelayURL: String? { OHTTPNative.relayURL(for: mainnetGatewayHost) }
+    /// The relay of the installed mainnet gateway; nil while OHTTP is off for mainnet.
+    private static var mainnetRelayURL: String? { mainnetGatewayHost.flatMap { OHTTPNative.relayURL(for: $0) } }
 
     /// The alias hosts the gateway serves with its own credentials (cmc, near, vote, flexa). HTTP
     /// destinations only: none of them is a lightwalletd gateway (``isGateway(_:)`` is false).
@@ -102,12 +106,10 @@ public enum OHTTPEndpoints {
         proxyAllowedHosts.contains(host.lowercased())
     }
 
-    /// True only for the lightwalletd gateway hosts, those with a configured relay. Case-insensitive.
+    /// True only for the lightwalletd gateway hosts of the installed configuration (``configure(_:)``), those
+    /// with a relay; false for every host while OHTTP is off. Case-insensitive.
     /// Exact host match only, so custom LWD hosts are never forced through OHTTP, and the alias hosts
     /// (``isAliasHost(_:)``) can never become a lightwalletd endpoint.
-    ///
-    /// Relay URLs come from the native zodl-ohttp-client library and can be overridden at build time
-    /// via environment variables `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
     public static func isGateway(_ host: String) -> Bool {
         OHTTPNative.relayURL(for: host) != nil
     }
@@ -119,6 +121,10 @@ public enum OHTTPEndpoints {
         aliasHosts.contains(host.lowercased())
     }
 
+    /// The relay a request to `gatewayHost` is posted to: a configured lightwalletd gateway's own relay, or the
+    /// mainnet gateway's relay for the hosts that gateway carries (aliases, allowlisted and path-restricted
+    /// hosts). Throws for any other host: while OHTTP is off for a network, that includes its gateway host, and
+    /// while it is off for mainnet, the hosts the mainnet gateway carries.
     public static func relayURL(for gatewayHost: String) throws -> String {
         let lowerHost = gatewayHost.lowercased()
         // Try native relay map first
@@ -215,9 +221,10 @@ public enum OHTTPEndpoints {
     /// Rewrites `url` to go through the OHTTP proxy.
     /// For allowlisted hosts: returns the SAME URL (no hostname rewrite; gateway proxies by `:authority`).
     /// For static mappings: substitutes the proxy hostname.
-    /// Returns nil when the host has no proxy mapping (e.g. Tor is already active).
+    /// Returns nil when the host has no proxy mapping (e.g. Tor is already active), and for every URL while OHTTP
+    /// is off for both networks: no gateway would carry the request.
     public static func proxyURL(for url: URL) -> URL? {
-        guard let proxyHost = proxyHost(for: url) else { return nil }
+        guard isConfigured, let proxyHost = proxyHost(for: url) else { return nil }
 
         // Allowlisted hosts without a static mapping: return unchanged URL (proxyHost == original host)
         guard let originalHost = url.host else { return nil }
@@ -231,29 +238,31 @@ public enum OHTTPEndpoints {
         return comps.url
     }
 
-    static var mainnetGatewayHost: String { gatewayHost(for: .mainnet) }
-    static var testnetGatewayHost: String { gatewayHost(for: .testnet) }
+    static var mainnetGatewayHost: String? { gatewayHost(for: .mainnet) }
+    static var testnetGatewayHost: String? { gatewayHost(for: .testnet) }
 
     /// The gateway and relay a request to `host` goes through for a wallet on `network`. A lightwalletd
     /// gateway host is its own gateway; every other host the gateways carry (the CMC and NEAR aliases,
     /// vote and PIR servers, the voting-config mirror) goes through the gateway of the wallet's network,
-    /// never the other network's.
+    /// never the other network's. Throws, as for a host no gateway carries, while OHTTP is off for the
+    /// wallet's network.
     static func proxyRoute(for host: String, network: NetworkType) throws -> (gatewayHost: String, relayURL: String) {
         if let relay = OHTTPNative.relayURL(for: host) {
+            // `host` is a configured gateway, a value that never goes into an error: the errors name the condition.
             guard let gatewayNetwork = self.network(for: host) else {
-                throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
+                throw OHTTPError.transportError("No OHTTP network is configured for the gateway")
             }
-            guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
-                throw OHTTPError.transportError("Gateway \(host) does not serve the wallet's network")
+            guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet"), let gateway = gatewayHost(for: network) else {
+                throw OHTTPError.transportError("The gateway does not serve the wallet's network")
             }
-            return (gatewayHost(for: network), relay)
+            return (gateway, relay)
         }
         if network != .mainnet, mainnetOnlyAliases.contains(host.lowercased()) {
             throw OHTTPError.transportError("\(host) is served by the mainnet gateway only")
         }
-        let gateway = network == .mainnet ? mainnetGatewayHost : testnetGatewayHost
-        guard let relay = OHTTPNative.relayURL(for: gateway) else {
-            throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gateway)")
+        guard let gateway = network == .mainnet ? mainnetGatewayHost : testnetGatewayHost,
+              let relay = OHTTPNative.relayURL(for: gateway) else {
+            throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(host)")
         }
         return (gateway, relay)
     }
@@ -263,48 +272,25 @@ public enum OHTTPEndpoints {
     /// host passes; its network is checked against the server's chain name when it is validated.
     public static func checkGatewayNetwork(host: String, network: NetworkType) throws {
         guard OHTTPNative.relayURL(for: host) != nil else { return }
+        // `host` is a configured gateway from here on, so it is kept out of the errors.
         guard let gatewayNetwork = self.network(for: host) else {
-            throw OHTTPError.transportError("No OHTTP network configured for gateway host \(host)")
+            throw OHTTPError.transportError("No OHTTP network is configured for the gateway")
         }
         guard gatewayNetwork == (network == .mainnet ? "mainnet" : "testnet") else {
             throw ZcashError.compactBlockProcessorChainName(gatewayNetwork)
         }
     }
 
-    /// The relay hosts run by a party independent of the gateway operator: the production relays. Any
-    /// other relay (a build pointed at the relay simulator) is run by the gateway operator, which then
-    /// sees both the device address and the request, so it is not private.
-    static let independentRelayHostFingerprints: Set<String> = [
-        "f3aec311b948b8d86d88a0ffdfaf23c6a35ddc2c26beb410fe919dfc2eb69c87",
-        "54d9951ab67cea3f069555738dfce2722218bdd5501e4b6c1f4ad9ad3ff732c7"
-    ]
-
-    /// Match exact normalized hosts without publishing relay endpoint defaults.
-    static func isIndependentRelayHost(_ host: String, fingerprints: Set<String>) -> Bool {
-        let fingerprint = SHA256.hash(data: Data(host.lowercased().utf8)).map { String(format: "%02x", $0) }.joined()
-        return fingerprints.contains(fingerprint)
-    }
-
-    /// Whether requests to the gateway `gatewayHost` go through a relay that is not independent of the
-    /// gateway operator (a test relay): such a configuration gives no network privacy and is shown to the
-    /// user as not private. True as well for a host with no relay.
-    public static func usesOperatorRelay(gatewayHost: String) -> Bool {
-        guard let relay = try? relayURL(for: gatewayHost),
-              let relayHost = URL(string: relay)?.host?.lowercased() else {
-            return true
-        }
-        return !isIndependentRelayHost(relayHost, fingerprints: independentRelayHostFingerprints)
-    }
-
-    /// Returns the network identifier ("mainnet" or "testnet") for a configured gateway host.
-    /// Network identity comes from native configuration, never from a hostname suffix or substring.
+    /// Returns the network identifier ("mainnet" or "testnet") of a gateway host of the installed configuration,
+    /// and nil for every host while OHTTP is off.
+    /// Network identity comes from the configuration, never from a hostname suffix or substring.
     /// Caller host matching ignores ASCII case and leaves every unknown host unrecognized.
     public static func network(for gatewayHost: String) -> String? {
         let normalized = asciiLowercased(gatewayHost)
-        if normalized == asciiLowercased(mainnetGatewayHost) {
+        if let mainnet = mainnetGatewayHost, normalized == asciiLowercased(mainnet) {
             return "mainnet"
         }
-        if normalized == asciiLowercased(testnetGatewayHost) {
+        if let testnet = testnetGatewayHost, normalized == asciiLowercased(testnet) {
             return "testnet"
         }
         return nil

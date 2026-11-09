@@ -5,8 +5,9 @@
 //  A `URLProtocol` that sends every request of the sessions it is registered in through the OHTTP relay
 //  and gateway, for a third-party SDK whose `URLSession` can be replaced but whose requests cannot. The
 //  request's host is mapped to its gateway alias (`OHTTPEndpoints.proxyURL(for:)`, e.g. `api.flexa.co` to
-//  `flexa.zodl.com`); a host with none fails, it never goes out directly. The body reaches the session as
-//  the gateway sends it, so a server-sent event stream is delivered event by event.
+//  `flexa.zodl.com`); a host with none fails, as every host does while OHTTP is off, and never goes out
+//  directly. The body reaches the session as the gateway sends it, so a server-sent event stream is
+//  delivered event by event.
 //
 
 import Foundation

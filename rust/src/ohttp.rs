@@ -25,6 +25,10 @@
 //! Errors follow the crate's convention: a failed call returns null and leaves the error in the
 //! thread-local last error. The text is the core's fixed `Display` of the failure, which does not
 //! quote the request or the response body.
+//!
+//! Gateway hosts, relay URLs, keys DNS names and signing keys are the configuration the app
+//! installed with [`zcashlc_ohttp_configure`](crate::ohttp_config::zcashlc_ohttp_configure);
+//! nothing is compiled in. A host is matched against the configured gateways ignoring ASCII case.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -35,10 +39,12 @@ use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, ChunkedResponseDecoder, ChunkedResponseOpener, ClientProfile,
-    KEY_BYTES, KeyConfig, Network, OuterOutcome, OuterResponse, ResponseEvent, check_size,
-    classify_outer_response, encapsulate_chunked_request, encode_bhttp_request, pack_fields,
-    signed_config_url, unpack_fields, verify_signed_config,
+    KEY_BYTES, KeyConfig, Network, NetworkRule, OhttpNetworks, OuterOutcome, OuterResponse,
+    ResponseEvent, check_size, classify_outer_response, encapsulate_chunked_request,
+    encode_bhttp_request, pack_fields, signed_config_url, unpack_fields, verify_signed_config,
 };
+
+use crate::ohttp_config::installed_networks;
 
 /// Typed local metadata from the immediately preceding complete/push/finish call.
 /// Only an authenticated decoded head can populate http_status and retry_not_before_ns.
@@ -227,9 +233,11 @@ fn as_fields(list: Vec<(&'static str, String)>) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// Checks the signed key-configuration envelope `json` fetched for the gateway `host` under the
 /// profile `profile` (2 for iOS), and selects the gateway's key out of it.
 ///
-/// The network, and so the pinned signing key, follows from `host` under the profile's rule. The
-/// envelope is checked for its version, network, key id, validity window at `now_secs` (Unix
-/// seconds), size and signature, and refused if it repeats a field name.
+/// The network, and so the signing key, follows from `host`: the network whose gateway it is in
+/// the installed configuration, its letter case ignored. A host that is not the gateway of a
+/// configured network is refused. The envelope is checked for its version, network, key id,
+/// validity window at `now_secs` (Unix seconds), size and signature, and refused if it repeats a
+/// field name.
 ///
 /// Returns null on failure (see the module documentation); the result is freed with
 /// [`zcashlc_free_ohttp_key`].
@@ -254,10 +262,13 @@ pub unsafe extern "C" fn zcashlc_ohttp_verify_key_config(
             .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
         let json = unsafe { bytes(json, json_len)? };
 
+        // One configuration for both steps: the host's network and that network's signing key.
+        let networks = installed_networks();
         let network = profile
             .network_rule
-            .network_for(canonical_gateway_host(host))?;
-        let signed = verify_signed_config(json, network, now_secs, &profile.signed_config)?;
+            .network_for(&networks, &lookup_host(host))?;
+        let signed =
+            verify_signed_config(&networks, json, network, now_secs, &profile.signed_config)?;
         let key = KeyConfig::select_with(&signed.document, &profile.key_selection)?;
 
         Ok(Box::into_raw(Box::new(OhttpKey {
@@ -985,28 +996,16 @@ pub unsafe extern "C" fn zcashlc_ohttp_signed_config_url(
     unwrap_exc_or_null(res)
 }
 
-/// The configured gateway host of `network`; required by the SDK native build guard.
-pub(crate) fn gateway_host(network: Network) -> anyhow::Result<&'static str> {
-    match network {
-        Network::Mainnet => zodl_ohttp_client::GATEWAY_HOST_MAINNET,
-        Network::Testnet => zodl_ohttp_client::GATEWAY_HOST_TESTNET,
-    }
-    .ok_or_else(|| anyhow!("SDK invariant: missing OHTTP gateway configuration"))
+/// `host` as the configuration's lookups take it. A configured gateway host is lower-case (the
+/// configuration refuses any other) and is looked up exactly, while a caller may write a host in
+/// any letter case.
+fn lookup_host(host: &str) -> String {
+    host.to_ascii_lowercase()
 }
 
-/// Restore the exact configured spelling expected by the core after ASCII-insensitive matching.
-/// Unknown hosts remain unknown to the core's exact-match network and relay maps.
-fn canonical_gateway_host(host: &str) -> &str {
-    [Network::Mainnet, Network::Testnet]
-        .into_iter()
-        .filter_map(|network| gateway_host(network).ok())
-        .find(|configured| configured.eq_ignore_ascii_case(host))
-        .unwrap_or(host)
-}
-
-/// Returns the configured mainnet (`false`) or testnet (`true`) gateway host.
-/// Each result is an independently allocated string freed with `zcashlc_string_free`.
-/// Returns null with the thread-local last error on an SDK configuration invariant failure.
+/// Returns the gateway host the installed configuration has for mainnet (`false`) or testnet
+/// (`true`), or null when OHTTP is off for that network, which is not an error: no last error is
+/// set. Each result is an independently allocated string freed with `zcashlc_string_free`.
 #[unsafe(no_mangle)]
 pub extern "C" fn zcashlc_ohttp_gateway_host(is_testnet: bool) -> *mut c_char {
     let res = catch_panic(|| {
@@ -1015,13 +1014,16 @@ pub extern "C" fn zcashlc_ohttp_gateway_host(is_testnet: bool) -> *mut c_char {
         } else {
             Network::Mainnet
         };
-        Ok(CString::new(gateway_host(network)?)?.into_raw())
+        match installed_networks().get(network) {
+            Some(config) => Ok(CString::new(config.gateway_host())?.into_raw()),
+            None => Ok(ptr::null_mut()),
+        }
     });
     unwrap_exc_or_null(res)
 }
 
-/// Returns the relay URL for a given gateway host, or null if the host is not a known gateway.
-/// The mapping is supplied at build time. Caller host matching ignores ASCII case.
+/// Returns the relay URL the installed configuration has for a gateway host, or null if the host
+/// is not the gateway of a configured network. Caller host matching ignores ASCII case.
 ///
 /// The string is freed with `zcashlc_string_free`.
 ///
@@ -1037,7 +1039,7 @@ pub unsafe extern "C" fn zcashlc_ohttp_relay_url_for(
     let res = catch_panic(|| {
         let gateway_host = std::str::from_utf8(unsafe { bytes(gateway_host, gateway_host_len)? })
             .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
-        match zodl_ohttp_client::relay_for(canonical_gateway_host(gateway_host)) {
+        match installed_networks().relay_for(&lookup_host(gateway_host)) {
             Some(relay_url) => Ok(CString::new(relay_url)?.into_raw()),
             None => Ok(ptr::null_mut()),
         }
@@ -1086,16 +1088,20 @@ pub unsafe extern "C" fn zcashlc_free_ohttp_profile_info(ptr: *mut OhttpProfileI
     }
 }
 
-/// The network of a gateway host for the DNS source: the same static known-hosts rule as the
-/// key-config verification, normalized to its exact configured spelling.
+/// The network of a gateway host for the DNS source: the network whose gateway the host is in
+/// `networks`, its letter case ignored, as for the key-config verification.
 ///
 /// # Safety
 ///
 /// - `host` must be valid for reads for `host_len` bytes, or null when the length is zero.
-unsafe fn dns_network(host: *const u8, host_len: usize) -> anyhow::Result<Network> {
+unsafe fn dns_network(
+    networks: &OhttpNetworks,
+    host: *const u8,
+    host_len: usize,
+) -> anyhow::Result<Network> {
     let host = std::str::from_utf8(unsafe { bytes(host, host_len)? })
         .map_err(|_| anyhow!("the gateway host is not UTF-8"))?;
-    Ok(zodl_ohttp_client::NetworkRule::KnownHosts.network_for(canonical_gateway_host(host))?)
+    Ok(NetworkRule::KnownHosts.network_for(networks, &lookup_host(host))?)
 }
 
 /// The number of DNS-over-HTTPS resolvers of the signed Key Configuration DNS source, tried in
@@ -1105,8 +1111,9 @@ pub extern "C" fn zcashlc_ohttp_doh_resolver_count() -> u32 {
     zodl_ohttp_client::DOH_RESOLVERS.len() as u32
 }
 
-/// The DoH (JSON API) query URL of resolver `index` for the TXT record of `gateway_host`'s network.
-/// Send it with `accept: application/dns-json`, only after the relay source failed.
+/// The DoH (JSON API) query URL of resolver `index` for the TXT record of `gateway_host`'s network,
+/// the keys DNS name of the installed configuration. Send it with `accept: application/dns-json`,
+/// only after the relay source failed.
 ///
 /// Returns a NUL-terminated string to free with [`zcashlc_string_free`], or null with the error
 /// in the thread-local last error.
@@ -1122,19 +1129,22 @@ pub unsafe extern "C" fn zcashlc_ohttp_doh_query_url(
     gateway_host_len: usize,
 ) -> *mut c_char {
     let res = catch_panic(|| {
-        let network = unsafe { dns_network(gateway_host, gateway_host_len)? };
+        let networks = installed_networks();
+        let network = unsafe { dns_network(&networks, gateway_host, gateway_host_len)? };
         let resolver = zodl_ohttp_client::DOH_RESOLVERS
             .get(index as usize)
             .ok_or_else(|| anyhow!("no DoH resolver {index}"))?;
-        let url = zodl_ohttp_client::doh_query_url(resolver, network)
+        // The host's network came from `networks`, which therefore configures it.
+        let url = zodl_ohttp_client::doh_query_url(&networks, resolver, network)
             .ok_or_else(|| anyhow!("SDK invariant: missing OHTTP DNS configuration"))?;
         Ok(CString::new(url)?.into_raw())
     });
     unwrap_exc_or_null(res)
 }
 
-/// The signed envelope carried by a DoH JSON response (`doh_body`) for `gateway_host`'s network;
-/// verify it with [`zcashlc_ohttp_verify_key_config`] like one fetched through the relay.
+/// The signed envelope carried by a DoH JSON response (`doh_body`) for `gateway_host`'s network,
+/// under the keys DNS name of the installed configuration; verify it with
+/// [`zcashlc_ohttp_verify_key_config`] like one fetched through the relay.
 ///
 /// Returns the envelope bytes (length in `*envelope_len_out`) to free with
 /// [`zcashlc_ohttp_free_bytes`], or null with the error in the thread-local last error.
@@ -1153,8 +1163,11 @@ pub unsafe extern "C" fn zcashlc_ohttp_envelope_from_doh_json(
 ) -> *mut u8 {
     let res = catch_panic(|| {
         let body = unsafe { bytes(doh_body, doh_body_len)? };
-        let network = unsafe { dns_network(gateway_host, gateway_host_len)? };
-        let (ptr, len) = ptr_from_vec(zodl_ohttp_client::envelope_from_doh_json(body, network)?);
+        let networks = installed_networks();
+        let network = unsafe { dns_network(&networks, gateway_host, gateway_host_len)? };
+        let (ptr, len) = ptr_from_vec(zodl_ohttp_client::envelope_from_doh_json(
+            &networks, body, network,
+        )?);
         unsafe { *envelope_len_out = len };
         Ok(ptr)
     });
@@ -1174,14 +1187,19 @@ pub unsafe extern "C" fn zcashlc_ohttp_free_bytes(ptr: *mut u8, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ohttp_config::{example, install_for_test, lock_installed_networks};
     use crate::{zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length};
-    use zodl_ohttp_client::{CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES};
+    use zodl_ohttp_client::{
+        CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, OhttpConfigParams, OhttpNetworks,
+    };
 
     #[test]
     fn gateway_host_lookup_returns_independently_owned_configured_strings() {
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
         for (testnet, expected) in [
-            (false, env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")),
-            (true, env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")),
+            (false, example::MAINNET.gateway_host),
+            (true, example::TESTNET.gateway_host),
         ] {
             let first = zcashlc_ohttp_gateway_host(testnet);
             let second = zcashlc_ohttp_gateway_host(testnet);
@@ -1198,33 +1216,150 @@ mod tests {
     }
 
     #[test]
-    fn configured_relay_lookup_normalizes_caller_case() {
-        for (host, expected) in [
-            (
-                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
-                env!("ZODL_OHTTP_RELAY_URL_MAINNET"),
-            ),
-            (
-                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
-                env!("ZODL_OHTTP_RELAY_URL_TESTNET"),
-            ),
-        ] {
-            for caller in [
-                host.to_owned(),
-                host.to_ascii_uppercase(),
-                host.to_ascii_lowercase(),
-            ] {
-                let relay = unsafe { zcashlc_ohttp_relay_url_for(caller.as_ptr(), caller.len()) };
-                assert!(!relay.is_null(), "configured gateway must have a relay");
-                assert_eq!(unsafe { CStr::from_ptr(relay) }.to_str().unwrap(), expected);
-                unsafe { zcashlc_string_free(relay) };
-            }
-            let lookalike = format!("{host}.attacker.example");
-            assert!(
-                unsafe { zcashlc_ohttp_relay_url_for(lookalike.as_ptr(), lookalike.len()) }
-                    .is_null()
-            );
+    fn gateway_host_is_null_when_off() {
+        let _guard = lock_installed_networks();
+        install_for_test(
+            OhttpNetworks::new(Some(example::config(example::MAINNET)), None).expect("mainnet"),
+        );
+        zcashlc_clear_last_error();
+        assert!(zcashlc_ohttp_gateway_host(true).is_null());
+        assert_eq!(zcashlc_last_error_length(), 0, "off is not an error");
+        let mainnet = zcashlc_ohttp_gateway_host(false);
+        assert!(!mainnet.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(mainnet) }.to_str().unwrap(),
+            example::MAINNET.gateway_host
+        );
+        unsafe { zcashlc_string_free(mainnet) };
+
+        install_for_test(OhttpNetworks::default());
+        for testnet in [false, true] {
+            assert!(zcashlc_ohttp_gateway_host(testnet).is_null());
+            assert_eq!(zcashlc_last_error_length(), 0, "off is not an error");
         }
+    }
+
+    #[test]
+    fn relay_url_for_ignores_case() {
+        let relay_url_for = |host: &str| {
+            let relay = unsafe { zcashlc_ohttp_relay_url_for(host.as_ptr(), host.len()) };
+            if relay.is_null() {
+                return None;
+            }
+            let url = unsafe { CStr::from_ptr(relay) }
+                .to_str()
+                .unwrap()
+                .to_owned();
+            unsafe { zcashlc_string_free(relay) };
+            Some(url)
+        };
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
+        for params in [example::MAINNET, example::TESTNET] {
+            let host = params.gateway_host;
+            // The configured spelling, every other letter upper-cased, and all of them.
+            let mixed: String = host
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            for caller in [host.to_owned(), mixed, host.to_ascii_uppercase()] {
+                assert_eq!(
+                    relay_url_for(&caller).as_deref(),
+                    Some(params.relay_url),
+                    "{caller}"
+                );
+            }
+            assert_eq!(relay_url_for(&format!("{host}.attacker.example")), None);
+        }
+
+        // With OHTTP off for its network, a gateway host has no relay in any case.
+        install_for_test(OhttpNetworks::default());
+        for host in [example::MAINNET.gateway_host, example::TESTNET.gateway_host] {
+            assert_eq!(relay_url_for(host), None);
+            assert_eq!(relay_url_for(&host.to_ascii_uppercase()), None);
+        }
+    }
+
+    /// A public synthetic envelope for testnet, valid from 1_700_000_000 to 1_700_021_600, that
+    /// carries one key configuration (key id 1, an X25519 key of 32 `0xcd` bytes). It is signed by
+    /// [`FIXTURE_SIGNING_KEY`]; Slipstream's tests verify the same envelope.
+    const FIXTURE_ENVELOPE: &[u8] = br#"{"v":1,"network":"testnet","configs":"ACkBACDNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzQAEAAEAAQ==","not_before":1700000000,"not_after":1700021600,"key_id":"1325b850","sig":"l7xx3/Q7BNFQfnt79s+enN5Lk6KC8S9f1mE9ZhSjaYGxqeSLRyuwgddKLBhwz1boZ2y2q7oWwkmGuUd5GllVDg=="}"#;
+
+    /// The signer of [`FIXTURE_ENVELOPE`]: the public test key of the shared core's signed
+    /// key-configuration test vector (seed `0x22` × 32, key id `1325b850`).
+    const FIXTURE_SIGNING_KEY: &str =
+        "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0";
+
+    #[test]
+    fn verify_key_config_uses_installed_signing_key() {
+        let verify = |host: &str| unsafe {
+            zcashlc_ohttp_verify_key_config(
+                IOS,
+                host.as_ptr(),
+                host.len(),
+                FIXTURE_ENVELOPE.as_ptr(),
+                FIXTURE_ENVELOPE.len(),
+                1_700_000_060,
+            )
+        };
+        let _guard = lock_installed_networks();
+
+        // Testnet configured with the envelope's signer: it verifies, for the testnet gateway in
+        // any letter case.
+        install_for_test(
+            OhttpNetworks::new(
+                Some(example::config(example::MAINNET)),
+                Some(example::config(OhttpConfigParams {
+                    signing_pubkey: FIXTURE_SIGNING_KEY,
+                    ..example::TESTNET
+                })),
+            )
+            .expect("example networks"),
+        );
+        for host in [
+            example::TESTNET.gateway_host.to_owned(),
+            example::TESTNET.gateway_host.to_ascii_uppercase(),
+        ] {
+            zcashlc_clear_last_error();
+            let key = verify(&host);
+            assert!(!key.is_null(), "{host}: {}", last_error_message());
+            {
+                let key = unsafe { &*key };
+                assert_eq!(key.network, 1);
+                assert_eq!(key.not_after, 1_700_021_600);
+                assert_eq!(key.key[0], 1);
+                assert_eq!(key.key[1..], [0xcd; 32]);
+            }
+            unsafe { zcashlc_free_ohttp_key(key) };
+        }
+        // Signed for testnet, so not for the mainnet gateway.
+        zcashlc_clear_last_error();
+        assert!(verify(example::MAINNET.gateway_host).is_null());
+        assert!(last_error_message().contains("signed for testnet"));
+
+        // Another testnet signing key installed: the same envelope is refused by its signer.
+        install_for_test(example::networks());
+        zcashlc_clear_last_error();
+        assert!(verify(example::TESTNET.gateway_host).is_null());
+        assert!(
+            last_error_message().contains("signed by key 1325b850"),
+            "{}",
+            last_error_message()
+        );
+
+        // OHTTP off: the host is not a gateway, so there is no signing key to check against.
+        install_for_test(OhttpNetworks::default());
+        zcashlc_clear_last_error();
+        assert!(verify(example::TESTNET.gateway_host).is_null());
+        assert!(last_error_message().contains("no OHTTP network configured"));
+        zcashlc_clear_last_error();
     }
 
     /// The thread's last error, which the Swift side maps by its prefix (`OHTTPError.native`).
@@ -1498,7 +1633,9 @@ mod tests {
 
     #[test]
     fn a_bad_envelope_is_an_error() {
-        let host = env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET");
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
+        let host = example::TESTNET.gateway_host;
         for json in [&b"not json"[..], b"{}", b""] {
             zcashlc_clear_last_error();
             let key = unsafe {
@@ -1773,15 +1910,17 @@ mod tests {
 
     #[test]
     fn the_doh_query_urls_follow_the_resolver_order_and_the_network() {
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
         assert_eq!(zcashlc_ohttp_doh_resolver_count(), 2);
         for (host, name) in [
             (
-                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
-                env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"),
+                example::MAINNET.gateway_host,
+                example::MAINNET.keys_dns_name,
             ),
             (
-                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
-                env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
+                example::TESTNET.gateway_host,
+                example::TESTNET.keys_dns_name,
             ),
         ] {
             let urls: Vec<String> = (0..2)
@@ -1809,11 +1948,13 @@ mod tests {
 
     #[test]
     fn a_doh_query_url_needs_a_known_gateway_and_an_existing_resolver() {
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
         let host = "cmc.zodl.com";
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_doh_query_url(0, host.as_ptr(), host.len()) }.is_null());
         assert!(last_error_message().contains("no OHTTP network configured"));
-        let host = env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET");
+        let host = example::MAINNET.gateway_host;
         zcashlc_clear_last_error();
         assert!(unsafe { zcashlc_ohttp_doh_query_url(2, host.as_ptr(), host.len()) }.is_null());
         assert!(last_error_message().contains("no DoH resolver 2"));
@@ -1829,10 +1970,12 @@ mod tests {
 
     #[test]
     fn the_envelope_of_a_doh_answer_is_extracted_for_the_gateway_network() {
-        let host = env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET");
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
+        let host = example::TESTNET.gateway_host;
         // "hello world" in two quoted strings, as the record is published.
         let body = doh_json(
-            env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
+            example::TESTNET.keys_dns_name,
             r#"\"aGVsbG8g\" \"d29ybGQ=\""#,
         );
         let mut len = 0usize;
@@ -1852,15 +1995,17 @@ mod tests {
 
     #[test]
     fn a_doh_answer_for_another_name_or_an_unknown_gateway_is_refused() {
+        let _guard = lock_installed_networks();
+        install_for_test(example::networks());
         for (host, name, error) in [
             (
-                env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
-                env!("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET"),
+                example::MAINNET.gateway_host,
+                example::MAINNET.keys_dns_name,
                 "DoH response",
             ),
             (
-                env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
-                env!("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"),
+                example::TESTNET.gateway_host,
+                example::TESTNET.keys_dns_name,
                 "DoH response",
             ),
             (

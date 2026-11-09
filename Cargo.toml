@@ -150,8 +150,8 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The OHTTP engine patch below still identifies itself as 0.4.0.
-slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
+# The OHTTP engine patch below identifies itself as 0.4.1.
+slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -161,8 +161,10 @@ hex = "0.4"
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
 # `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
 # `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. Both SDK and Slipstream share this source.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0324db3240adf00ea847aa0a93e8d765e32b61da", default-features = false }
+# fails loudly, a branch would follow a force-push. The SDK and Slipstream pin the same source and
+# commit: the engine takes the OHTTP configuration as this crate's `OhttpNetworks`, which another
+# commit would make a different type.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0f3eeb54e7d0aa22557ed5404a14e952d2ad3172", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -224,8 +226,9 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "d667cc9fb24637930a64e3cb860d927eafcfd36c" }
+# OHTTP transport, with its configuration passed in at runtime, on the released NU7 dependency
+# family, pinned to its reviewed commit.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "0114e104ff7b90711e97e608e157e4b9e909b7bc" }
 
 # DO NOT ALTER THIS COMMENT
 #

@@ -23,6 +23,7 @@ final class OHTTPTransparentAddressChecksTests: XCTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
 
         dbData = try __dataDbURL()
         rustBackend = ZcashRustBackend.makeForTests(
