@@ -8,14 +8,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_ohttp_configure(const FfiOhttpNetworkConfigV1 *mainnet, const FfiOhttpNetworkConfigV1 *testnet)`
+  installs the OHTTP configuration of both networks, replacing the one installed before.
+  `FfiOhttpNetworkConfigV1` holds a network's gateway host, relay URL, keys DNS name and signing key
+  (64 hex digits), each as a UTF-8 pointer and length; a null network turns OHTTP off for it. All four
+  values are checked and the two networks must not share one. It returns `false` on a refused
+  configuration, keeps the one installed before, and leaves a last error naming the network, the field
+  and the rule, never the value. The values are copied. Call it at launch, before any OHTTP call.
+
 - `zcashlc_tor_connect_to_lightwalletd_with_timeout` creates an isolated submission connection using
   one remaining timeout in milliseconds for connection setup, latest-block reads, submission and
   transaction lookup. A zero timeout fails without connecting. Free the result with
   `zcashlc_free_tor_lwd_conn`, which retires its connection work before returning. Existing
   `zcashlc_tor_connect_to_lightwalletd` callers and streaming calls need no changes.
 
-- `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated configured gateway host
-  (`false` mainnet, `true` testnet). Free each result with `zcashlc_string_free`.
+- `zcashlc_ohttp_gateway_host(bool is_testnet)` returns an allocated copy of the gateway host installed for
+  the network (`false` mainnet, `true` testnet), or NULL when that network has no installed configuration.
+  Free each non-NULL result with `zcashlc_string_free`.
 
 - `zcashlc_tor_startup_begin_v1` adds owned Tor runtime creation under a caller-supplied
   remaining monotonic budget. Use `zcashlc_tor_startup_cancel_v1` to cancel bootstrap,
@@ -59,7 +68,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   big-endian length and the bytes), text arguments as bytes, and every failure returns null with the
   thread's last error set; the message does not quote the request.
   - `zcashlc_ohttp_verify_key_config(profile, host, host_len, json, json_len, now_secs)` checks a signed
-    key-configuration envelope for a gateway host against the pinned signing key of the host's network and
+    key-configuration envelope for a gateway host against the signing key installed for the host's network and
     returns the gateway key as an `OhttpKey` (33 public bytes, `not_after`, network), freed with
     `zcashlc_free_ohttp_key`.
   - `zcashlc_ohttp_encapsulate(profile, key, method, scheme, authority, path, headers, body)` encodes a
@@ -270,7 +279,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     driven against the values the session was opened with names those values on it.
   - The route a session is opened on governs every service it touches for the session's whole
     life — chain and helper traffic, PIR queries and vote-tree sync. With a null `TorRuntime`,
-    `is_custom_server` selects OHTTP for predefined servers or direct HTTP for custom servers.
+    `is_custom_server` selects the route for predefined servers: OHTTP when a configuration is installed for
+    the wallet's network, direct HTTP otherwise; custom servers always use direct HTTP.
     A Tor runtime is used through an isolated client, never falling back to a direct connection
     when Tor cannot connect. A PIR query hides which rows are fetched, not
     who fetches them, so a Tor session fails closed for all four rather than letting any of them
@@ -604,6 +614,23 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `zcashlc_ohttp_encapsulate` pads each request to a fixed size bucket (`zodl-ohttp-client` 1.0,
+  from crates.io). A `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of
+  32 KiB when larger. Every other request is padded to the next multiple of 4 KiB.
+- **Breaking:** the OHTTP configuration comes from `zcashlc_ohttp_configure` at runtime instead of the
+  eight OHTTP build variables (each network's gateway host, relay URL, keys DNS name and signing key),
+  which the build no longer reads or requires; `libzcashlc` carries no OHTTP endpoint or key. Call
+  `zcashlc_ohttp_configure` once at launch. Until it succeeds, and for a network passed as null, OHTTP
+  is off for that network: `zcashlc_ohttp_gateway_host` returns null without a last error,
+  `zcashlc_ohttp_relay_url_for` returns null for its gateway host, `zcashlc_ohttp_verify_key_config`,
+  `zcashlc_ohttp_doh_query_url` and `zcashlc_ohttp_envelope_from_doh_json` refuse that host,
+  `zcashlc_tor_connect_to_lightwalletd` and the Slipstream engine treat it as a plain server, and
+  `zcashlc_voting_session_open` with a null `tor` and `is_custom_server` false takes the direct route
+  instead of OHTTP. Signing keys, relays and keys DNS names come from the installed configuration.
+  `zcashlc_slipstream_start` reads it at each start and the pass keeps it;
+  `zcashlc_slipstream_restore_anchor` and `zcashlc_voting_session_open` read it per call, and a session
+  keeps the one it opened with.
+
 - The crate builds against the NU7 `librustzcash` releases. Building `libzcashlc` from
   source requires Rust 1.97 or newer and access to its private dependencies. FFI callers
   need no changes for these dependency requirements.
@@ -621,10 +648,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: `zcashlc_voting_session_open` gains an `is_custom_server: bool`
   argument (after `tor`, before `epoch`).** With `tor` non-null the session rides Tor as before.
-  With `tor` null it rides OHTTP through the relay and gateway when `is_custom_server` is false
-  (every chain and PIR endpoint must be one of the gateway's exact hosts, otherwise the open fails
-  with `invalid_input` and nothing falls back to a direct connection), and the direct HTTP route
-  when it is true. PIR queries share the session's route.
+  With `tor` null and `is_custom_server` false it rides OHTTP through the relay and gateway only when a
+  configuration is installed for the wallet's network (every chain and PIR endpoint must then be one of the
+  gateway's exact hosts, otherwise the open fails with `invalid_input` and nothing falls back to a direct
+  connection); with no configuration installed for that network it is reached directly. With
+  `is_custom_server` true it uses the direct HTTP route. PIR queries share the session's route.
 
 - `libzcashlc` is built for minimum iOS 16 and macOS 14 on every slice (the iOS simulator included);
   its C objects previously claimed the building Xcode SDK's version.
@@ -1088,6 +1116,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+
+- `zcashlc_tor_connect_to_lightwalletd` and `zcashlc_tor_connect_to_lightwalletd_with_timeout`
+  refuse a configured OHTTP gateway with a last error that no longer names the endpoint, so the
+  gateway host stays out of error text. The refusal itself and the signatures are unchanged.
 
 - `zcashlc_ohttp_health_subscribe_v1` returns null and sets the last error if subscription
   construction panics, including notification-worker creation failure. Its C signature

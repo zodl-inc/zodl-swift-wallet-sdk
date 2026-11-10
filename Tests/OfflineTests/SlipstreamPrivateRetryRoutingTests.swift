@@ -10,6 +10,11 @@ final class SlipstreamPrivateRetryRoutingTests: ZcashTestCase {
     private let txId = Data(repeating: 7, count: 32)
     private var cancellables = Set<AnyCancellable>()
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testPrivateRetryIgnoresRecordedPublicEndpoints() async throws {
         let fixture = try makeFixture()
         await fixture.store.recordPlan(txId: txId, endpoints: [publicEndpoint])

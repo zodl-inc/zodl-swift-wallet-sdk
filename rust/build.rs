@@ -2,16 +2,7 @@ extern crate cbindgen;
 
 use std::{env, path::PathBuf};
 
-#[path = "build_support/ohttp_config.rs"]
-mod ohttp_config;
-
 fn main() {
-    println!("cargo:rerun-if-changed=rust/build_support/ohttp_config.rs");
-    for name in ohttp_config::NAMES {
-        println!("cargo:rerun-if-env-changed={name}");
-    }
-    ohttp_config::validate(|name| env::var(name).ok()).unwrap_or_else(|error| panic!("{error}"));
-
     // The whole source tree feeds cbindgen (ffi.rs carries the #[repr(C)] types) —
     // watching only lib.rs left the generated header stale after ffi.rs-only edits.
     println!("cargo:rerun-if-changed=rust/src");
@@ -99,7 +90,9 @@ fn main() {
             "zcashlc_proving_interactive_begin",
             "zcashlc_proving_interactive_end",
             "zcashlc_proving_interactive_active",
-            // Every OHTTP symbol the Swift transport is built on (`rust/src/ohttp.rs`).
+            // Every OHTTP symbol the Swift transport is built on (`rust/src/ohttp.rs`), and the
+            // installation of its configuration (`rust/src/ohttp_config.rs`).
+            "zcashlc_ohttp_configure",
             "zcashlc_ohttp_verify_key_config",
             "zcashlc_free_ohttp_key",
             "zcashlc_ohttp_encapsulate",

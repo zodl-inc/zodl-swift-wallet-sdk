@@ -18,6 +18,11 @@ final class OHTTPSignedConfigTests: XCTestCase {
     private static let testnetKeyId = OHTTPTestSupport.signingKeyId(for: .testnet)
     private static let mainnetKeyId = OHTTPTestSupport.signingKeyId(for: .mainnet)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     /// Middle of the validity window the envelopes below use.
     private let now = Date(timeIntervalSince1970: 1_700_010_000)
     private let notBefore: Int64 = 1_700_000_000

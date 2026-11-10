@@ -3,17 +3,20 @@
 //  ZODLSwiftWalletSDK
 //
 //  Live end-to-end test of the OHTTP (RFC 9458) transport against the testnet gateway:
-//  restore a wallet from seed, sync to the chain tip through the native-configured testnet gateway
+//  restore a wallet from seed, sync to the chain tip through the runtime-configured testnet gateway
 //  and check the balance. Two variants: OHTTP only (`.direct` service mode), and Tor + OHTTP
 //  (every leg to the relay rides an arti circuit, so the relay sees a Tor exit).
 //
-//  Driven by environment variables (see .github/workflows/ohttp-e2e.yml); skipped when the seed
-//  is not provided so `swift test` on a developer machine stays offline:
+//  Driven by environment variables (see .github/workflows/ohttp-e2e.yml). Two skips apply:
+//    - OHTTP configuration: the eight OHTTP_E2E_* variables below are read in `setUpWithError` and
+//      installed through `OHTTPEndpoints.configure(_:)`. When any is unset or empty, the whole class is
+//      skipped (naming the missing variables), so `swift test` on a developer machine stays offline.
+//    OHTTP_E2E_{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}_{MAINNET,TESTNET}
+//    - Seed: a test that needs funds is skipped when its seed is not provided.
 //    OHTTP_E2E_SEED_HEX          64-byte BIP39 seed, hex (TESTNET wallet)
 //    OHTTP_E2E_BIRTHDAY          wallet birthday height
-//    OHTTP_E2E_MIN_BALANCE_ZAT   minimum expected total balance in zatoshi (default 90 TAZ)
+//    OHTTP_E2E_MIN_BALANCE_ZAT   minimum expected total balance in zatoshi (default 1 TAZ)
 //    OHTTP_E2E_TIMEOUT_SECONDS   sync deadline (default 3600)
-//    OHTTP_E2E_GATEWAY_HOST      default native-configured testnet gateway
 //
 //  Every log line is prefixed `OHTTP-E2E` so the CI job can grep the evidence.
 //
@@ -22,6 +25,49 @@ import XCTest
 @testable import TestUtils
 @testable import ZODLSwiftWalletSDK
 
+/// Reads the OHTTP configuration of the live tests from the `OHTTP_E2E_*` environment variables.
+/// Shared by every test that needs the runtime-configured gateway.
+enum OHTTPE2EConfiguration {
+    private static let configurationFields = ["GATEWAY_HOST", "RELAY_URL", "KEYS_DNS_NAME", "SIGNING_PUBKEY"]
+
+    private static func value(_ field: String, _ network: String) -> String? {
+        ProcessInfo.processInfo.environment["OHTTP_E2E_\(field)_\(network)"].flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Names of the `OHTTP_E2E_*` variables that are unset or empty. Names only, never values.
+    static var missingConfigurationVariables: [String] {
+        ["MAINNET", "TESTNET"].flatMap { network in
+            configurationFields.filter { value($0, network) == nil }.map { "OHTTP_E2E_\($0)_\(network)" }
+        }
+    }
+
+    static func networkConfiguration(_ network: String) -> OHTTPNetworkConfiguration? {
+        guard
+            let gatewayHost = value("GATEWAY_HOST", network),
+            let relayURL = value("RELAY_URL", network),
+            let keysDNSName = value("KEYS_DNS_NAME", network),
+            let signingPublicKey = value("SIGNING_PUBKEY", network)
+        else { return nil }
+        return OHTTPNetworkConfiguration(
+            gatewayHost: gatewayHost,
+            relayURL: relayURL,
+            keysDNSName: keysDNSName,
+            signingPublicKey: signingPublicKey
+        )
+    }
+
+    /// Installs the configuration from the environment, or skips the test naming the missing variables.
+    static func install() throws {
+        guard
+            let mainnet = networkConfiguration("MAINNET"),
+            let testnet = networkConfiguration("TESTNET")
+        else {
+            throw XCTSkip("OHTTP is not configured for the E2E tests; unset or empty: \(missingConfigurationVariables.joined(separator: ", "))")
+        }
+        try OHTTPEndpoints.configure(OHTTPConfiguration(mainnet: mainnet, testnet: testnet))
+    }
+}
+
 final class OHTTPE2ETests: ZcashTestCase {
     private enum Env {
         static let environment = ProcessInfo.processInfo.environment
@@ -29,19 +75,40 @@ final class OHTTPE2ETests: ZcashTestCase {
         static var birthday: BlockHeight { environment["OHTTP_E2E_BIRTHDAY"].flatMap { Int($0) } ?? 4_123_503 }
         static var minBalanceZatoshi: Int64 { environment["OHTTP_E2E_MIN_BALANCE_ZAT"].flatMap { Int64($0) } ?? 100_000_000 } // 1 TAZ default; balance varies with E2E sends
         static var timeoutSeconds: TimeInterval { environment["OHTTP_E2E_TIMEOUT_SECONDS"].flatMap { TimeInterval($0) } ?? 3600 }
-        static var gatewayHost: String { environment["OHTTP_E2E_GATEWAY_HOST"] ?? OHTTPEndpoints.gatewayHost(for: .testnet) }
+        static var gatewayHost: String {
+            get throws {
+                try XCTUnwrap(
+                    OHTTPEndpoints.gatewayHost(for: .testnet),
+                    "No OHTTP gateway is configured for testnet"
+                )
+            }
+        }
+
         static var clientTracePrefix: String? { environment["OHTTP_E2E_CLIENT_TRACE_PREFIX"].flatMap { $0.isEmpty ? nil : $0 } }
     }
 
-    func testDefaultGatewayFollowsTheNativeBuild() throws {
-        let configured = try XCTUnwrap(Env.environment["ZODL_OHTTP_GATEWAY_HOST_TESTNET"])
-        let expected = Env.environment["OHTTP_E2E_GATEWAY_HOST"] ?? configured
-        XCTAssertEqual(Env.gatewayHost, expected)
-        XCTAssertTrue(OHTTPEndpoints.isGateway(Env.gatewayHost))
-        XCTAssertEqual(OHTTPEndpoints.network(for: Env.gatewayHost), "testnet")
+    /// The gateway the tests use is the one installed from the environment. Assertions compare with
+    /// `XCTAssertTrue` so that a failure never prints a configured value.
+    func testConfiguredGatewayIsTheOneUsed() throws {
+        let mainnet = try XCTUnwrap(OHTTPE2EConfiguration.networkConfiguration("MAINNET"))
+        let testnet = try XCTUnwrap(OHTTPE2EConfiguration.networkConfiguration("TESTNET"))
+
+        let gatewayHost = try Env.gatewayHost
+        XCTAssertTrue(gatewayHost == testnet.gatewayHost, "the testnet gateway is the configured one")
+        XCTAssertTrue(OHTTPEndpoints.gatewayHost(for: .mainnet) == mainnet.gatewayHost, "the mainnet gateway is the configured one")
+        XCTAssertTrue(OHTTPEndpoints.isGateway(gatewayHost))
+        XCTAssertEqual(OHTTPEndpoints.network(for: gatewayHost), "testnet")
+        XCTAssertEqual(OHTTPEndpoints.network(for: mainnet.gatewayHost), "mainnet")
+        XCTAssertTrue(try OHTTPEndpoints.relayURL(for: gatewayHost) == testnet.relayURL, "the testnet relay is the configured one")
+        XCTAssertTrue(try OHTTPEndpoints.relayURL(for: mainnet.gatewayHost) == mainnet.relayURL, "the mainnet relay is the configured one")
     }
 
     // MARK: - Setup
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try OHTTPE2EConfiguration.install()
+    }
 
     override func setUp() {
         super.setUp()
@@ -52,6 +119,7 @@ final class OHTTPE2ETests: ZcashTestCase {
 
     override func tearDown() {
         OHTTPEndpoints.clientTraceIdPrefix = nil
+        try? OHTTPEndpoints.configure(nil)
         super.tearDown()
     }
 
@@ -89,7 +157,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         let networkString = Env.environment["OHTTP_E2E_NETWORK"] ?? "testnet"
         let isMainnet = networkString.lowercased() == "mainnet"
         let network: NetworkType = isMainnet ? .mainnet : .testnet
-        let gatewayHost = isMainnet ? OHTTPEndpoints.gatewayHost(for: .mainnet) : Env.gatewayHost
+        let gatewayHost = try isMainnet ? XCTUnwrap(OHTTPEndpoints.gatewayHost(for: .mainnet)) : Env.gatewayHost
         let birthday: BlockHeight = Env.environment["OHTTP_E2E_SEND_BIRTHDAY"].flatMap { Int($0) } ?? 4_123_865
         let sendAmount = Zatoshi(Env.environment["OHTTP_E2E_SEND_ZATOSHI"].flatMap { Int64($0) } ?? 1_000_000)
 
@@ -299,7 +367,7 @@ final class OHTTPE2ETests: ZcashTestCase {
         }
 
         let mode = tor ? "tor+ohttp" : "ohttp"
-        let host = Env.gatewayHost
+        let host = try Env.gatewayHost
         XCTAssertTrue(OHTTPEndpoints.isGateway(host), "the testnet gateway host must be a configured OHTTP gateway")
         _ = try OHTTPEndpoints.relayURL(for: host)
         log("mode=\(mode) birthday=\(Env.birthday)")
@@ -446,7 +514,7 @@ final class OHTTPE2ETests: ZcashTestCase {
                 dataDbURL: databases.dataDB,
                 torDirURL: databases.torDir,
                 endpoint: LightWalletEndpoint(
-                    address: Env.gatewayHost,
+                    address: try Env.gatewayHost,
                     port: 443,
                     secure: true,
                     singleCallTimeoutInMillis: 30_000,
@@ -720,7 +788,7 @@ extension OHTTPE2ETests {
         log("mode=\(mode) network=mainnet")
 
         let gateway = LightWalletEndpoint(
-            address: OHTTPEndpoints.gatewayHost(for: .mainnet),
+            address: try XCTUnwrap(OHTTPEndpoints.gatewayHost(for: .mainnet)),
             port: 443,
             secure: true,
             singleCallTimeoutInMillis: 30_000,
@@ -846,7 +914,7 @@ extension OHTTPE2ETests {
         let mode = "fallback-\(expectGatewayDown ? "down" : "up")\(tor ? "+tor" : "")"
 
         let gateway = LightWalletEndpoint(
-            address: Env.gatewayHost,
+            address: try Env.gatewayHost,
             port: 443,
             secure: true,
             singleCallTimeoutInMillis: 30_000,

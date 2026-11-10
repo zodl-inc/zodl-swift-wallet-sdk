@@ -12,26 +12,44 @@ build and archive commands. An Apple Silicon host alone may still request x86_64
 generic destination. Keep `-skipMacroValidation` and an explicit `-derivedDataPath`
 outside the Xcode app's DerivedData directory on these commands.
 
-## Native OHTTP source-build configuration
+## OHTTP configuration at runtime
 
-Previously, mainnet and testnet could share relay URLs, signing keys and key DNS names.
-Native SDK source builds now require all eight exported `ZODL_OHTTP_*` inputs and reject
-sharing in any corresponding gateway host, relay URL, signing key or key DNS name pair,
-including differences consisting only of ASCII letter case. Replace each shared pair with
-separate mainnet/testnet configuration before rebuilding. Each signing public key must be
-exactly 64 ASCII hex digits. Missing, empty or malformed inputs fail before native compilation
-or configured cache reuse, with variable names rather than values in the error.
+The OHTTP gateway hosts, relay URLs, key DNS names and signing keys are no longer source-build
+inputs, and the binaries carry no configuration. A build, a precompiled SDK and
+`init-local-ffi.sh --cached` need no `ZODL_OHTTP_*` variables. Stop exporting them for SDK builds.
 
-The build child sets `ZODL_OHTTP_REQUIRE=1`, even when the inherited value is `0`.
-This is build policy, not a ninth secret or a configuration-digest input. Keep exporting the
-same eight names listed in `docs/LOCAL_DEVELOPMENT.md`; their spelling and exact bytes are
-preserved in the compiled configuration and versioned digest. Rebuild native source after
-changing configuration. Consuming a precompiled SDK or running `init-local-ffi.sh --cached`
-requires no new environment variables or Swift call-site edits.
+Install the configuration once at launch, before any other SDK use:
 
-Compiled OHTTP gateway/relay hosts, DNS names and signing public keys are observable in binaries.
-Keeping literals out of source does not make the compiled configuration confidential;
-CI secret storage does not change this property of the distributed binary.
+```swift
+try OHTTPEndpoints.configure(OHTTPConfiguration(mainnet: mainnetNetwork, testnet: testnetNetwork))
+```
+
+`mainnetNetwork` and `testnetNetwork` are `OHTTPNetworkConfiguration` values with a gateway host, a
+relay URL, a key DNS name and an Ed25519 signing public key (64 hex digits). A network has all four
+values or none, and the two networks share no value (ASCII letter case is ignored). An invalid
+configuration throws `ZcashError.ohttpConfigurationInvalid`, whose message names the field and the
+rule, never the value. A `switch` over `ZcashError` that is exhaustive must handle the new case.
+
+Passing `nil`, or never calling `configure`, leaves OHTTP off:
+
+- While OHTTP is off for a network, that network's gateway host is treated as a plain lightwalletd
+  server.
+- Requests to the proxied third-party hosts (the CoinMarketCap, NEAR and Flexa aliases) fail.
+- Predefined-server voting is reached directly when the wallet's network has no configuration
+  (Tor still applies). With a configuration for that network it rides OHTTP and fails closed.
+
+Other API changes:
+
+- `OHTTPEndpoints.gatewayHost(for:)` returns `String?`, `nil` when no gateway is configured for the
+  network. Unwrap it or treat `nil` as "OHTTP off".
+- `OHTTPEndpoints.usesOperatorRelay` is removed without replacement: the app chooses its relay, so the
+  SDK no longer answers whether the relay is independent of the gateway operator. `gatewayHost(for:) != nil`
+  only tells whether OHTTP is on for a network.
+- Calling `configure` again replaces the previous configuration completely. Keys verified under one
+  configuration are never reused under another.
+
+Compiled OHTTP values used to be observable in the binaries; they no longer are, but the values the
+app passes to `configure` are in the app and subject to its own protection.
 
 ## OHTTP HTTP requirements
 

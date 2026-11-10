@@ -9,6 +9,10 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
 
     // MARK: - OHTTP Endpoints Tests
 
@@ -33,7 +37,7 @@ final class OHTTPTests: XCTestCase {
     }
 
     func testOHTTPEndpointsRelayMapping() throws {
-        // Relay routing must use the native build configuration for the selected network.
+        // Relay routing must use the runtime configuration for the selected network.
         let relay1 = try OHTTPEndpoints.relayURL(for: OHTTPTestSupport.testnetHost)
         XCTAssertEqual(relay1, try XCTUnwrap(OHTTPNative.relayURL(for: OHTTPTestSupport.testnetHost)))
 

@@ -189,6 +189,11 @@ final class TorHTTPStreamReaderTests: XCTestCase {
 final class TorCappedErrorBodyClassificationTests: XCTestCase {
     private static let cappedBody = String(repeating: "e", count: 65_536)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     /// An outer answer read through a ``TorHTTPStreamReader`` whose native stream gives the capped body
     /// with END and fails the test on any further read. The idle timeout is one second of the fake's clock,
     /// so a reader that waited past the cap would end in `URLError.timedOut`, not in the classifier.

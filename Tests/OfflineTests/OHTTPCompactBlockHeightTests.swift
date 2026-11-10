@@ -3,6 +3,11 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPCompactBlockHeightTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private func makeService() -> LightWalletOHTTPService {
         let service = LightWalletOHTTPService(
             endpoint: LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true),

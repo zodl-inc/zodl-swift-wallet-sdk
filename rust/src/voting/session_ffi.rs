@@ -195,10 +195,15 @@ struct ProofStatusResponse {
 /// - `tor` non-null: Tor, to the vote and PIR servers directly.
 /// - `tor` null and `is_custom_server`: the direct HTTP route (the voter chose
 ///   their own server).
-/// - `tor` null and not `is_custom_server`: OHTTP through the relay and
-///   gateway, failing closed. Every chain and PIR endpoint of the session must
-///   be one the gateway carries, or the open fails with `invalid_input`;
-///   nothing falls back to a direct connection.
+/// - `tor` null, not `is_custom_server`, and OHTTP configured for the wallet's
+///   network ([`zcashlc_ohttp_configure`](crate::ohttp_config::zcashlc_ohttp_configure)):
+///   OHTTP through the relay and gateway, failing closed. Every chain and PIR
+///   endpoint of the session must be one the gateway carries, or the open
+///   fails with `invalid_input`; nothing falls back to a direct connection.
+///   The session keeps the configuration installed when it opened.
+/// - `tor` null, not `is_custom_server`, and OHTTP off for the wallet's
+///   network: the direct HTTP route, as the rest of the wallet's traffic on
+///   that network.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_session_open(
     db: *mut VotingDatabaseHandle,
@@ -229,6 +234,7 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
             .map(String::as_str)
             .collect();
         let route = resolve_session_route(
+            crate::ohttp_config::installed_networks(),
             unsafe { (*tor).as_ref() },
             is_custom_server,
             handle.network,
@@ -1009,12 +1015,14 @@ mod tests {
         unsafe { zcashlc_voting_db_free(db) };
     }
 
-    /// A predefined server with Tor off goes through the OHTTP gateway, which
-    /// carries only its own exact host list: the fixture's endpoints are not on
-    /// it, so the open is refused up front, typed, rather than falling back to a
-    /// direct connection.
+    /// A predefined server with Tor off goes through the OHTTP gateway the app
+    /// configured, which carries only its own exact host list: the fixture's
+    /// endpoints are not on it, so the open is refused up front, typed, rather
+    /// than falling back to a direct connection.
     #[test]
     fn session_open_tor_off_predefined_server_outside_the_gateway_fails_closed() {
+        let _guard = crate::ohttp_config::lock_installed_networks();
+        crate::ohttp_config::install_for_test(crate::ohttp_config::example::networks());
         let db = open_memory_store_ptr(crate::NETWORK_ID_TESTNET, "w");
         let (_dir, wallet_path, account_uuid) =
             temp_wallet_db_with_account(crate::NETWORK_ID_TESTNET);
