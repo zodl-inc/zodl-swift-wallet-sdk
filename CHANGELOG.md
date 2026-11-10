@@ -94,6 +94,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- OHTTP requests are padded to fixed size buckets (`zodl-ohttp-client` 1.0). A lightwalletd
+  `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of 32 KiB when larger.
+  Every other request is padded to the next multiple of 4 KiB. The relay and the network see a few
+  request sizes only.
 - The FFI XCFramework now supports ARM64 only on iOS devices, iOS simulators, and macOS.
   Intel Macs and x86_64 simulators are no longer supported. Use an Apple Silicon Mac and an
   ARM64 simulator; macOS 14 and iOS 16 remain the minimum versions.

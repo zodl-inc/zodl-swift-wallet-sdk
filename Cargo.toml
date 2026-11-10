@@ -159,12 +159,11 @@ hex = "0.4"
 # Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
 # key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
-# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
-# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. The SDK and Slipstream pin the same source and
-# commit: the engine takes the OHTTP configuration as this crate's `OhttpNetworks`, which another
-# commit would make a different type.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0f3eeb54e7d0aa22557ed5404a14e952d2ad3172", default-features = false }
+# `zcashlc_ohttp_*` C functions. From crates.io, pinned to the exact version; 1.0.1 is the v1.0.0
+# release with crates.io metadata. The SDK and Slipstream must take it from the same source: the
+# engine takes the OHTTP configuration as this crate's `OhttpNetworks`, which a second source would
+# make a different type.
+zodl-ohttp-client = { version = "=1.0.1", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -228,7 +227,7 @@ strip = false
 [patch.crates-io]
 # OHTTP transport, with its configuration passed in at runtime, on the released NU7 dependency
 # family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "0114e104ff7b90711e97e608e157e4b9e909b7bc" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "9c8f573b01a37f6df3b9f907098b398284ffd66d" }
 
 # DO NOT ALTER THIS COMMENT
 #

@@ -614,6 +614,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `zcashlc_ohttp_encapsulate` pads each request to a fixed size bucket (`zodl-ohttp-client` 1.0,
+  from crates.io). A `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of
+  32 KiB when larger. Every other request is padded to the next multiple of 4 KiB.
 - **Breaking:** the OHTTP configuration comes from `zcashlc_ohttp_configure` at runtime instead of the
   eight OHTTP build variables (each network's gateway host, relay URL, keys DNS name and signing key),
   which the build no longer reads or requires; `libzcashlc` carries no OHTTP endpoint or key. Call

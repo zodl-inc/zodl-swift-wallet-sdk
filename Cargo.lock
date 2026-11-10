@@ -8842,8 +8842,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "1.0.0"
-source = "git+https://github.com/zodl-inc/zodl-ohttp.git?rev=0f3eeb54e7d0aa22557ed5404a14e952d2ad3172#0f3eeb54e7d0aa22557ed5404a14e952d2ad3172"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "012209d071157159ec851ffd98f1a1494459090359edf7c325e63b509abfe522"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -8862,7 +8863,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream"
 version = "0.4.1"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=0114e104ff7b90711e97e608e157e4b9e909b7bc#0114e104ff7b90711e97e608e157e4b9e909b7bc"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=9c8f573b01a37f6df3b9f907098b398284ffd66d#9c8f573b01a37f6df3b9f907098b398284ffd66d"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8918,7 +8919,7 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=0114e104ff7b90711e97e608e157e4b9e909b7bc#0114e104ff7b90711e97e608e157e4b9e909b7bc"
+source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=9c8f573b01a37f6df3b9f907098b398284ffd66d#9c8f573b01a37f6df3b9f907098b398284ffd66d"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",
