@@ -8862,8 +8862,9 @@ dependencies = [
 
 [[package]]
 name = "zodl-slipstream"
-version = "0.4.1"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=9c8f573b01a37f6df3b9f907098b398284ffd66d#9c8f573b01a37f6df3b9f907098b398284ffd66d"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7700a83ee573810520765c99294bba6203eeeccf0f6bad57ff30d51f6e0cbad"
 dependencies = [
  "arti-client",
  "bytes",
@@ -8919,7 +8920,8 @@ dependencies = [
 [[package]]
 name = "zodl-slipstream-gpuhash"
 version = "0.1.2"
-source = "git+https://github.com/zodl-inc/slipstream-internal.git?rev=9c8f573b01a37f6df3b9f907098b398284ffd66d#9c8f573b01a37f6df3b9f907098b398284ffd66d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63bcac7954dcad1500be8464182edc6ed1b4a64a1b6dd630bb34bd32e0bdd18e"
 dependencies = [
  "bytemuck",
  "ff 0.14.0",

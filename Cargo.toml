@@ -150,8 +150,8 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The OHTTP engine patch below identifies itself as 0.4.1.
-slipstream-core = { version = "=0.4.1", package = "zodl-slipstream" }
+# 0.5.0 takes the OHTTP configuration at runtime.
+slipstream-core = { version = "=0.5.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -225,10 +225,6 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# OHTTP transport, with its configuration passed in at runtime, on the released NU7 dependency
-# family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "9c8f573b01a37f6df3b9f907098b398284ffd66d" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress
