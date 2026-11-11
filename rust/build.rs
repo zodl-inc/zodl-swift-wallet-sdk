@@ -62,6 +62,7 @@ fn main() {
         .rename_item("HttpResponseHeader", "FfiHttpResponseHeader")
         .rename_item("SingleUseTaddr", "FfiSingleUseTaddr")
         .rename_item("AddressCheckResult", "FfiAddressCheckResult")
+        .rename_item("TransparentAddressCheck", "FfiTransparentAddressCheck")
         .rename_item("ZecUsdExchange", "FfiZecUsdExchange")
         .rename_item("ErrorReport", "FfiErrorReport")
         .rename_item("GiftCardLink", "FfiGiftCardLink")
@@ -89,6 +90,39 @@ fn main() {
             "zcashlc_proving_interactive_begin",
             "zcashlc_proving_interactive_end",
             "zcashlc_proving_interactive_active",
+            // Every OHTTP symbol the Swift transport is built on (`rust/src/ohttp.rs`), and the
+            // installation of its configuration (`rust/src/ohttp_config.rs`).
+            "zcashlc_ohttp_configure",
+            "zcashlc_ohttp_verify_key_config",
+            "zcashlc_free_ohttp_key",
+            "zcashlc_ohttp_encapsulate",
+            "zcashlc_free_ohttp_sealed",
+            "zcashlc_ohttp_complete",
+            "zcashlc_ohttp_last_decode_outcome",
+            "zcashlc_ohttp_last_failure_kind",
+            "zcashlc_ohttp_last_grpc_status",
+            "zcashlc_free_ohttp_outcome",
+            "zcashlc_ohttp_opener_free",
+            "zcashlc_ohttp_answer_is_sealed",
+            "zcashlc_ohttp_stream_decoder",
+            "zcashlc_ohttp_stream_push",
+            "zcashlc_ohttp_stream_finish",
+            "zcashlc_free_ohttp_stream_events",
+            "zcashlc_ohttp_stream_decoder_free",
+            "zcashlc_ohttp_signed_config_url",
+            "zcashlc_ohttp_relay_url_for",
+            "zcashlc_ohttp_gateway_host",
+            "zcashlc_ohttp_profile_info",
+            "zcashlc_free_ohttp_profile_info",
+            "zcashlc_ohttp_doh_resolver_count",
+            "zcashlc_ohttp_doh_query_url",
+            "zcashlc_ohttp_envelope_from_doh_json",
+            "zcashlc_ohttp_free_bytes",
+            // The wallet half of the transparent-address checks `LightWalletOHTTPService` runs.
+            "zcashlc_single_use_taddr_to_check",
+            "zcashlc_free_transparent_address_check",
+            "zcashlc_schedule_single_use_taddr_check",
+            "zcashlc_transparent_address_utxo_start_height",
         ] {
             assert!(
                 header.contains(symbol),

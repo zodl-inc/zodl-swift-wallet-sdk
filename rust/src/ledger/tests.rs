@@ -14,7 +14,7 @@ use transparent::{
     bundle::{OutPoint, TxOut},
     keys::IncomingViewingKey as _,
 };
-use zcash_address::unified::{Encoding as _, Fvk, Revision, Ufvk, Uitem};
+use zcash_address::unified::{Fvk, Revision, Ufvk, Uitem};
 use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding, PcztResult},

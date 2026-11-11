@@ -46,7 +46,7 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 /// Two halves. The store half is this type: an opaque `VotingDatabaseHandle`
 /// over the sidecar database, the reads a host renders a round list from, and
 /// the maintenance calls it makes outside a round. The round half is
-/// ``VotingRoundSession``, opened through ``makeSession(inputs:binding:torRuntime:epoch:)``,
+/// ``VotingRoundSession``, opened through ``makeSession(inputs:binding:torRuntime:isCustomServer:epoch:)``,
 /// which owns everything that reads the wallet, proves, or reaches the network.
 ///
 /// Stateless FFI — hotkeys, key extraction, the proving policy — is exposed as
@@ -329,12 +329,34 @@ public final class VotingRustBackend: @unchecked Sendable {
 
     /// Open a session for one round over this backend's sidecar.
     ///
-    /// `torRuntime` selects the route every service the session touches takes
-    /// for its whole life — chain and helper traffic, PIR queries and vote-tree
-    /// sync alike: `nil` is the direct HTTP route, and a runtime is used
-    /// through an isolated client taken during this call, so the round's
-    /// circuits are not linkable to the rest of the wallet's Tor use. A session
-    /// opened on Tor never falls back to a direct connection.
+    /// `torRuntime` and `isCustomServer` select the route every service the
+    /// session touches takes for its whole life — chain and helper traffic, PIR
+    /// queries and vote-tree sync alike. PIR takes the same route as the rest
+    /// of the session; it is never decided separately:
+    ///
+    /// - A runtime: Tor, to the vote and PIR servers directly, through an
+    ///   isolated client taken during this call, so the round's circuits are not
+    ///   linkable to the rest of the wallet's Tor use. A session opened on Tor
+    ///   never falls back to a direct connection.
+    /// - `nil`, `isCustomServer == false` (predefined servers) and an OHTTP
+    ///   configuration for the wallet's network (`OHTTPEndpoints.configure(_:)`):
+    ///   OHTTP through the relay and gateway, so no vote or PIR server sees the
+    ///   voter's address. Fails closed: when any chain or PIR endpoint is not one
+    ///   the gateway carries, opening throws ``VotingError`` with
+    ///   ``VotingErrorKind/invalidInput``, and nothing falls back to a direct
+    ///   connection when the gateway is unavailable. The session keeps the
+    ///   configuration installed when it opened.
+    /// - `nil`, `isCustomServer == false` and no OHTTP configuration for the
+    ///   wallet's network: the direct HTTP route, like the rest of the wallet's
+    ///   traffic on that network, so the servers see the voter's address.
+    /// - `nil` and `isCustomServer == true` (a server the voter added): the
+    ///   direct HTTP route. Choosing one's own server is the voter's decision
+    ///   to be reached directly.
+    ///
+    /// `isCustomServer` is required and has no default: with OHTTP configured, a
+    /// caller that passed `false` by accident would fail closed on a custom
+    /// server, and one that passed `true` by accident would leave the OHTTP route
+    /// for a predefined one.
     ///
     /// The runtime is borrowed for this call only; the caller keeps ownership
     /// of it. Nothing here reaches the network: every failure is a decision
@@ -343,6 +365,7 @@ public final class VotingRustBackend: @unchecked Sendable {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         torRuntime: OpaquePointer?,
+        isCustomServer: Bool,
         epoch: UInt64
     ) throws -> VotingRoundSession {
         let inputsJSON = try Self.encodeJSON(inputs, describing: "session inputs")
@@ -358,6 +381,7 @@ public final class VotingRustBackend: @unchecked Sendable {
                         bindingBuffer.baseAddress,
                         UInt(bindingBuffer.count),
                         torRuntime,
+                        isCustomServer,
                         epoch
                     )
                 }

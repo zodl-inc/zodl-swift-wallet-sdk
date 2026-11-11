@@ -42,9 +42,9 @@ test_ffi_ci_clears_the_macos_products_before_building() {
     assert_succeeds "the removal comes before the build" test "${rm_line:-0}" -lt "${make_line:-0}"
 }
 
-test_ffi_macos_still_builds_both_macos_architectures_with_lto() {
+test_ffi_macos_builds_only_arm64_with_lto() {
     local f; f="$(_dry_run ffi-macos)"
-    assert_file_contains "$f" "target x86_64-apple-darwin" "make ffi-macos still builds x86_64"
+    assert_file_lacks "$f" "target x86_64-apple-darwin" "make ffi-macos excludes x86_64"
     assert_file_contains "$f" "target aarch64-apple-darwin" "make ffi-macos still builds arm64"
     assert_file_lacks "$f" "CARGO_PROFILE_RELEASE_LTO" "make ffi-macos keeps the release profile's lto"
 }
@@ -167,7 +167,7 @@ test_swift_workflow_installs_only_the_arm64_macos_rust_target() {
 
 test_swift_workflow_cache_keys_name_the_ci_build() {
     assert_file_contains "$(_swift_workflow)" "key: ffi-xcframework-macos-arm64-nolto-" "the XCFramework key names the ffi-ci build"
-    assert_file_contains "$(_swift_workflow)" "cargo-ci-macos-arm64-nolto-v3-" "the cargo key isolates the CI build variant"
+    assert_file_contains "$(_swift_workflow)" "cargo-ci-macos-arm64-nolto-v4-" "the cargo key isolates the CI build variant"
     assert_file_lacks "$(_swift_workflow)" "cargo-v1-" "no v1 cargo key remains"
 }
 
@@ -241,12 +241,12 @@ test_codeql_swift_job_builds_with_ffi_ci() {
     assert_file_lacks "$(_codeql_workflow)" "run: make ffi-macos" "CodeQL no longer builds the universal slice"
     assert_file_contains "$(_codeql_workflow)" "key: codeql-ffi-xcframework-macos-arm64-nolto-" \
         "CodeQL's XCFramework key names the ffi-ci build"
-    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v2-${{ steps.toolchain.outputs.cachekey }}-' \
+    assert_file_contains "$(_codeql_workflow)" 'codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-' \
         "CodeQL's cargo key carries the rustc version"
-    assert_file_contains "$(_codeql_workflow)" "find rust Cargo.toml Cargo.lock BuildSupport Makefile -type f" \
-        "CodeQL's FFI hash covers the root Makefile"
+    assert_file_contains "$(_codeql_workflow)" "Scripts/ci/ffi-input-hash.sh" \
+        "CodeQL's FFI hash covers committed native build inputs including the runner"
     assert_file_contains "$(_codeql_workflow)" "id: toolchain" "CodeQL's Setup Rust step has an id"
-    assert_file_contains "$(_codeql_workflow)" 'echo "cachekey=' "CodeQL's Setup Rust step sets the cachekey output"
+    assert_file_contains "$(_codeql_workflow)" 'Scripts/ci/rust_toolchain.py' "CodeQL validates the compiler and exports its identity"
     assert_file_lacks "$(_codeql_workflow)" "x86_64-apple-darwin" "CodeQL installs no x86_64 target"
 }
 
@@ -295,8 +295,8 @@ test_every_local_action_a_workflow_uses_exists() {
 # would ever save the rebuilt ones, so the key has to name the rustc version.
 test_swift_workflow_cargo_key_includes_the_toolchain() {
     assert_file_contains "$(_swift_workflow)" "id: toolchain" "the build job's Rust setup step has an id"
-    assert_file_contains "$(_swift_workflow)" 'echo "cachekey=' "the Rust setup step sets the cachekey output"
-    assert_file_contains "$(_swift_workflow)" 'cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-' \
+    assert_file_contains "$(_swift_workflow)" 'Scripts/ci/rust_toolchain.py' "the validator exports the cachekey output"
+    assert_file_contains "$(_swift_workflow)" 'cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-' \
         "the cargo cache key carries the rustc identity and build variant"
 }
 
@@ -310,46 +310,92 @@ test_ci_cache_rust_setup_precedes_product_restore() {
 
 test_ci_cache_keys_include_complete_rust_identity() {
     local workflow key lines
-    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)"; do
-        assert_file_contains "$workflow" 'id: toolchain' 'Rust setup exports its identity'
-        assert_file_contains "$workflow" 'rustc +stable --version --verbose > "$rustc_version_file"' 'capture complete compiler identity'
-        assert_file_contains "$workflow" 'shasum -a 256 "$rustc_version_file"' 'hash every verbose identity field'
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        assert_file_contains "$workflow" 'id: toolchain' 'Rust validation exports its identity'
+        assert_file_contains "$workflow" 'Scripts/ci/rust_toolchain.py' 'validate complete compiler identity'
         lines="$(awk '/^[[:space:]]*key:/ { print } /^[[:space:]]*restore-keys:/ { fallback=1; next } fallback && /[^[:space:]]/ { if ($0 ~ /^[[:space:]]+\$\{\{/) print; else fallback=0 }' "$workflow" | grep -E 'cargo-|ffi-xcframework-')"
         while IFS= read -r key; do
             printf '%s\n' "$key" > "$SCRATCH/rust-key.txt"
             assert_file_contains "$SCRATCH/rust-key.txt" '${{ steps.toolchain.outputs.cachekey }}' 'all compiled keys and fallbacks constrain Rust'
         done <<< "$lines"
     done
-    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
+    assert_file_contains "$(_build_ffi_workflow)" 'cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-' 'release Cargo namespace isolates all slices and LTO'
 }
 
 test_ci_cache_rust_identity_changes_for_verbose_fields() {
     local workflow script dir first second expected
     dir="$(mktemp -d "$SCRATCH/rust-identity.XXXXXX")"
-    printf '#!/bin/sh\nexit 0\n' > "$dir/rustup"
+    cat > "$dir/rustup" <<'SH'
+#!/bin/sh
+case "$1" in
+    show) printf 'stable-aarch64-apple-darwin (environment override)\n' ;;
+    which) printf '%s/%s\n' "$RUST_FIXTURE_BIN" "$4" ;;
+    *) exit 9 ;;
+esac
+SH
     printf '#!/bin/sh\ncat "$RUST_IDENTITY_FILE"\n' > "$dir/rustc"
-    chmod +x "$dir/rustup" "$dir/rustc"
-    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)"; do
-        script="$dir/setup.sh"
+    printf '#!/bin/sh\nprintf "cargo 1.100.0 (bbbbbbbbb 2026-10-28)\\n"\n' > "$dir/cargo"
+    chmod +x "$dir/rustup" "$dir/rustc" "$dir/cargo"
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        script="$dir/validate.sh"
         awk '/id: toolchain/ { active=1; next } active && /run: \|/ { body=1; next } active && body { if ($0 ~ /^[[:space:]]*(- name:|#|$)/) exit; print }' "$workflow" > "$script"
-        printf 'rustc fixture\ncommit-hash: abcdef012345\ncommit-date: 2026-10-24\nhost: aarch64-apple-darwin\nLLVM version: 22\n' > "$dir/identity"
+        printf 'rustc 1.100.0 (aaaaaaaaa 2026-10-28)\nbinary: rustc\ncommit-hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ncommit-date: 2026-10-28\nhost: aarch64-apple-darwin\nrelease: 1.100.0\nLLVM version: 22\n' > "$dir/identity"
         : > "$dir/output"
-        PATH="$dir:$PATH" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" bash "$script" > /dev/null
+        (unset RUSTC RUSTUP_TOOLCHAIN; PATH="$dir:$PATH" RUST_FIXTURE_BIN="$dir" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" GITHUB_PATH="$dir/path" bash -e "$script") > /dev/null
         first="$(sed -n 's/^cachekey=//p' "$dir/output")"
         expected="$(shasum -a 256 "$dir/identity" | cut -d' ' -f1)"
-        assert_eq "$expected" "$first" 'cache identity hashes the full rustc output'
-        printf 'LLVM version: 23\n' >> "$dir/identity"
+        assert_eq "$expected" "$first" 'workflow validation hashes the full rustc output'
+        sed 's/LLVM version: 22/LLVM version: 23/' "$dir/identity" > "$dir/changed"
+        mv "$dir/changed" "$dir/identity"
         : > "$dir/output"
-        PATH="$dir:$PATH" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" bash "$script" > /dev/null
+        (unset RUSTC RUSTUP_TOOLCHAIN; PATH="$dir:$PATH" RUST_FIXTURE_BIN="$dir" RUST_IDENTITY_FILE="$dir/identity" GITHUB_ENV="$dir/env" GITHUB_OUTPUT="$dir/output" GITHUB_PATH="$dir/path" bash -e "$script") > /dev/null
         second="$(sed -n 's/^cachekey=//p' "$dir/output")"
-        assert_succeeds 'a verbose identity field changes the cache key' test "$first" != "$second"
+        assert_succeeds 'a verbose identity field changes the workflow cache key' test "$first" != "$second"
     done
+}
+
+# Restrict swift.yml to its native build job so rustfmt's independent setup
+# cannot accidentally satisfy the build-job ordering contract.
+_rust_build_job() {
+    if [ "$1" = "$(_swift_workflow)" ]; then
+        awk '/^  build:/ { active=1 } active' "$1"
+    else
+        cat "$1"
+    fi
+}
+
+test_ci_validates_installed_stable_before_tests_and_cache_restore() {
+    local workflow job python install validate consumer
+    for workflow in "$(_swift_workflow)" "$(_build_ffi_workflow)" "$(_codeql_workflow)"; do
+        job="$SCRATCH/rust-build-job.yml"
+        _rust_build_job "$workflow" > "$job"
+        python="$(grep -n 'uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1' "$job" | cut -d: -f1)"
+        install="$(grep -n 'rustup toolchain install stable --profile minimal --no-self-update' "$job" | cut -d: -f1)"
+        validate="$(grep -n 'Scripts/ci/rust_toolchain.py' "$job" | cut -d: -f1)"
+        consumer="$(grep -nE 'uses: actions/cache@|run: make test-scripts|run: make ffi-ci' "$job" | head -1 | cut -d: -f1)"
+        assert_file_contains "$job" "python-version: '3.12'" 'validator and its tests use a TOML-capable Python'
+        assert_succeeds 'Python setup precedes validation' test "${python:-0}" -gt 0
+        assert_succeeds 'explicit stable install precedes validation' test "${install:-0}" -gt 0
+        assert_succeeds 'validator is configured' test "${validate:-0}" -gt 0
+        assert_succeeds 'known Python precedes validation' test "${python:-0}" -lt "${validate:-0}"
+        assert_succeeds 'stable install precedes validation' test "${install:-0}" -lt "${validate:-0}"
+        assert_succeeds 'validation precedes Cargo fixture tests and product restores' test "${validate:-0}" -lt "${consumer:-0}"
+        assert_file_contains "$job" 'python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"' 'validated selection survives into later CI steps'
+        assert_file_lacks "$job" 'rustup default stable' 'CI keeps the runner global default intact'
+    done
+}
+
+test_codeql_validation_is_required_on_ffi_cache_hits() {
+    local block="$SCRATCH/codeql-validator.yml"
+    awk '/- name: Validate Rust/ { active=1 } active && /- name:/ && !/Validate Rust/ { exit } active { print }' "$(_codeql_workflow)" > "$block"
+    assert_file_contains "$block" "if: matrix.language == 'swift'" 'validation covers every Swift matrix run'
+    assert_file_lacks "$block" 'cache-hit' 'CodeQL cache hits cannot bypass validation'
 }
 
 test_ci_cache_release_keeps_publication_and_targets() {
     local workflow
     workflow="$(_build_ffi_workflow)"
-    assert_file_contains "$workflow" 'target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin' 'release retains all five architecture targets'
+    assert_file_contains "$workflow" 'target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin' 'release installs all three ARM targets'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"' 'release force publication command is preserved'
     assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts "$VERSION"' 'release publication command is preserved'
 }
@@ -464,4 +510,158 @@ test_swift_cache_identity_uses_actual_compiler_output() {
     PATH="$dir:$PATH" SWIFT_IDENTITY_FILE="$dir/identity" GITHUB_OUTPUT="$dir/output" bash -e -o pipefail "$script" > /dev/null
     second="$(sed -n 's/^hash=//p' "$dir/output")"
     assert_succeeds 'a compiler build change invalidates the Swift cache' test "$first" != "$second"
+}
+
+# The ohttp-trace feature turns OHTTP client trace ids on: QA/E2E builds only.
+test_ohttp_e2e_builds_the_ffi_with_ohttp_trace() {
+    assert_file_contains "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" \
+        "make ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace" \
+        "ohttp-e2e.yml passes FFI_CARGO_FEATURES=ohttp-trace to make"
+    local out; out="$SCRATCH/dry-run-ffi-macos-trace.txt"
+    make -C "$REPO_ROOT" -n ffi-macos MACOS_ARCHS=aarch64-apple-darwin FFI_CARGO_FEATURES=ohttp-trace > "$out" 2>/dev/null
+    assert_file_contains "$out" "cargo build --locked --manifest-path ../Cargo.toml --release --features ohttp-trace" \
+        "FFI_CARGO_FEATURES turns into --features flag"
+}
+
+test_release_ffi_builds_never_enable_ohttp_trace() {
+    local f
+    for f in .github/workflows/build-ffi.yml Scripts/prepare-release.sh Scripts/release.sh; do
+        assert_file_lacks "$REPO_ROOT/$f" "ohttp-trace" "$f does not enable ohttp-trace"
+        assert_file_lacks "$REPO_ROOT/$f" "FFI_CARGO_FEATURES" "$f passes no extra Cargo features"
+    done
+    for f in ffi-all ffi-ci ffi-macos; do
+        assert_file_lacks "$(_dry_run "$f")" " --features" "make $f enables no Cargo feature"
+    done
+    local out; out="$SCRATCH/dry-run-ffi-all-env-trace.txt"
+    FFI_CARGO_FEATURES=ohttp-trace make -C "$REPO_ROOT" -n ffi-all > "$out" 2>/dev/null
+    assert_file_lacks "$out" " --features" "make ffi-all ignores FFI_CARGO_FEATURES from the environment"
+    assert_file_contains "$REPO_ROOT/Cargo.toml" "default = []" "ohttp-trace is not a default feature"
+}
+
+# The OHTTP configuration is installed by the app at runtime, so no build,
+# cache or hash step in any workflow takes it. The only mention of the
+# repository secrets is the eight OHTTP_E2E_* mappings on the steps that run the
+# live E2E tests.
+test_workflows_carry_no_ohttp_build_inputs() {
+    local workflow
+    for workflow in swift codeql build-ffi ohttp-e2e; do
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'ZODL_OHTTP_''REQUIRE' "$workflow sets no OHTTP build policy"
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'ohttp-config' "$workflow has no OHTTP configuration step"
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'ohttp_''env' "$workflow runs no OHTTP configuration helper"
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'configuration-hash' "$workflow passes no configuration digest"
+    done
+    for workflow in swift codeql build-ffi; do
+        assert_file_lacks "$REPO_ROOT/.github/workflows/$workflow.yml" 'ZODL_OHTTP' "$workflow references no OHTTP secret"
+    done
+    assert_succeeds 'only the E2E test steps map the eight secrets, under OHTTP_E2E_* names' \
+        ruby -ryaml -e '
+          nets = %w[MAINNET TESTNET]
+          fields = %w[GATEWAY_HOST RELAY_URL KEYS_DNS_NAME SIGNING_PUBKEY]
+          want = fields.flat_map { |f| nets.map { |n| ["OHTTP_E2E_#{f}_#{n}", "${{ secrets.ZODL_OHTTP_#{f}_#{n} }}"] } }.to_h
+          jobs = YAML.load_file(ARGV[0]).fetch("jobs")
+          jobs.each do |name, job|
+            abort "job #{name} env carries OHTTP values" if job.fetch("env", {}).keys.any? { |k| k.start_with?("ZODL_OHTTP", "OHTTP_E2E_GATEWAY", "OHTTP_E2E_RELAY", "OHTTP_E2E_KEYS", "OHTTP_E2E_SIGNING") }
+            job.fetch("steps").each do |step|
+              env = step.fetch("env", {})
+              abort "ZODL_OHTTP env entry in #{name}" if env.keys.any? { |k| k.start_with?("ZODL_OHTTP") }
+              mapped = env.select { |k, _| want.key?(k) }
+              if name == "e2e" && step.fetch("run", "").include?("OHTTPE2ETests")
+                abort "E2E step #{step["name"]} lacks the eight mappings" unless mapped == want
+              else
+                abort "mapping outside the E2E test steps (#{name}: #{step["name"]})" unless mapped.empty?
+              end
+            end
+          end
+          abort "no E2E test step maps the secrets" unless jobs.fetch("e2e").fetch("steps").any? { |s| s.fetch("env", {}).key?("OHTTP_E2E_GATEWAY_HOST_MAINNET") }
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+    assert_eq "8" "$(grep -o 'secrets\.ZODL_OHTTP_[A-Z_]*' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" | sort -u | wc -l | tr -d ' ')" 'the E2E workflow references exactly the eight secrets'
+    assert_eq "0" "$(grep 'ZODL_OHTTP' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml" | grep -vc 'secrets\.ZODL_OHTTP_')" 'no other ZODL_OHTTP reference in the E2E workflow'
+}
+
+test_ohttp_build_inputs_are_gone_from_the_build() {
+    assert_succeeds 'the configuration marker is removed' test ! -e "$REPO_ROOT/BuildSupport/ohttp-config-"version
+    assert_succeeds 'the build-time configuration helper is removed' test ! -e "$REPO_ROOT/Scripts/lib/ohttp_"env.py
+    local f
+    for f in Makefile BuildSupport/Makefile Scripts/init-local-ffi.sh Scripts/rebuild-local-ffi.sh Scripts/prepare-release.sh Scripts/ci/ffi-input-hash.sh; do
+        assert_file_lacks "$REPO_ROOT/$f" 'ohttp_''env' "$f runs no configuration helper"
+        assert_file_lacks "$REPO_ROOT/$f" 'OHTTP_ENV_RESOLVED' "$f has no configuration resolution marker"
+        assert_file_lacks "$REPO_ROOT/$f" 'ZODL_OHTTP' "$f names no OHTTP build input"
+    done
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'ZODL_OHTTP' 'local docs list no OHTTP build input'
+    assert_file_lacks "$REPO_ROOT/docs/LOCAL_DEVELOPMENT.md" 'ohttp_''env' 'local docs mention no configuration helper'
+}
+
+test_e2e_cache_identities_keep_toolchain_and_compiler_boundaries() {
+    assert_succeeds 'E2E build and test caches retain toolchain and compiler identities, with no configuration' \
+        ruby -ryaml -e '
+          jobs = YAML.load_file(ARGV[0]).fetch("jobs")
+          ffi = jobs.fetch("ffi")
+          steps = ffi.fetch("steps")
+          cache = steps.index { |s| s.fetch("uses", "").include?("actions/cache") }
+          rust = steps.index { |s| s["id"] == "toolchain" }
+          abort "no toolchain validation before restore" unless rust && rust < cache
+          steps.select { |s| s.fetch("uses", "").include?("actions/cache") }.each do |s|
+            key = s.fetch("with").fetch("key")
+            %w[steps.toolchain.outputs.cachekey steps.xcode-cache-key.outputs.hash runner.arch].each { |field| abort "missing cache identity" unless key.include?(field) }
+            abort "private source cache" if s.fetch("with").fetch("path").include?("~/.cargo/git")
+          end
+          abort "FFI job carries env" unless ffi.fetch("env", {}).empty?
+          e2e = jobs.fetch("e2e")
+          swift = e2e.fetch("steps").find { |s| s["name"] == "Cache SwiftPM" }.fetch("with")
+          %w[needs.ffi.outputs.xcode-hash needs.ffi.outputs.source-hash].each { |field| abort "Swift product cache omits source/compiler identity" unless swift.fetch("key").include?(field) }
+          abort "broad Swift cache fallback" unless swift.fetch("restore-keys", "").empty?
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+# Secret configuration must not be exposed by network-test diagnostics.
+test_ohttp_e2e_diagnostics_do_not_print_configured_endpoints() {
+    assert_succeeds 'E2E output keeps configured endpoint values private' python3 - "$REPO_ROOT/Tests/NetworkTests/OHTTPE2ETests.swift" <<'PYTHON'
+import pathlib, re, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+for line in source.splitlines():
+    if re.search(r'\b(log|XCTAssertTrue)\(', line):
+        assert not re.search(r'gateway=|relay=|tier0_ranked=\\\(tier0Hosts|\\\(host\\?\)', line), line
+PYTHON
+}
+
+# Validate the parsed trigger, not a matching branch name elsewhere in the file.
+test_ohttp_e2e_push_trigger_tracks_integration_branch() {
+    assert_succeeds 'OHTTP E2E push trigger follows feature/ohttp' \
+        ruby -ryaml -e '
+          workflow = YAML.load_file(ARGV[0])
+          trigger = workflow.fetch("on") { workflow.fetch(true) }
+          abort "wrong integration branch" unless trigger.fetch("push").fetch("branches") == ["feature/ohttp"]
+          abort "manual dispatch removed" unless trigger.key?("workflow_dispatch")
+        ' "$REPO_ROOT/.github/workflows/ohttp-e2e.yml"
+}
+
+test_ci_full_build_excludes_intel_targets() {
+    assert_file_lacks "$(_dry_run ffi-all)" 'target x86_64-' 'full builds compile no Intel target'
+    assert_file_lacks "$(_build_ffi_workflow)" 'x86_64-apple-' 'release setup installs no Intel target'
+}
+
+# A newly added Python suite must be discovered by the same entrypoint CI runs.
+test_ci_make_test_scripts_discovers_python_regressions() {
+    local repo output
+    repo="$(mktemp -d "$SCRATCH/python-entrypoint.XXXXXX")"
+    mkdir -p "$repo/Scripts/tests"
+    cp "$REPO_ROOT/Makefile" "$repo/Makefile"
+    printf '#!/bin/sh\nexit 0\n' > "$repo/Scripts/tests/run-tests.sh"
+    chmod +x "$repo/Scripts/tests/run-tests.sh"
+    printf 'import unittest\nclass Regression(unittest.TestCase):\n    def test_future_regression(self):\n        self.fail("python discovery sentinel")\n' > "$repo/Scripts/tests/test_future.py"
+    output="$repo/output"
+    if make -C "$repo" test-scripts "PYTHON=${PYTHON:-python3}" > "$output" 2>&1; then
+        _fail 'make test-scripts must fail when a discovered Python regression fails'
+    fi
+    assert_file_contains "$output" 'python discovery sentinel' 'ordinary script test entrypoint reaches new Python suites'
+}
+
+test_ci_install_excludes_intel_rust_targets() {
+    local output
+    output="$SCRATCH/install-targets.txt"
+    make -C "$REPO_ROOT/BuildSupport" -n install > "$output" 2>/dev/null
+    assert_file_lacks "$output" 'x86_64-apple-' 'BuildSupport install sets up only ARM targets'
+    assert_file_contains "$output" 'aarch64-apple-ios' 'device target remains available'
+    assert_file_contains "$output" 'aarch64-apple-ios-sim' 'simulator target remains available'
+    assert_file_contains "$output" 'aarch64-apple-darwin' 'macOS target remains available'
 }

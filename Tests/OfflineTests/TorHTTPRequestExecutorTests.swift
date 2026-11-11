@@ -38,6 +38,7 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
         let second = TorWorkerGate()
         let queued = TorWorkerGate()
         let disposed = expectation(description: "queued lease disposed")
+        let queuedDisposals = TorTestCounter()
         let firstReturned = TorTestCounter()
         let firstTask = Task {
             defer { firstReturned.increment() }
@@ -46,7 +47,15 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
         let secondTask = Task { try await executor.execute(deadlineUptime: 10_000_000, operation: { try second.run($0) }) }
         await fulfillment(of: [first.entered, second.entered], timeout: 3)
         let queuedTask = Task {
-            try await executor.execute(deadlineUptime: 10_000_000, operation: { try queued.run($0) }, dispose: { disposed.fulfill() })
+            try await executor.execute(
+                deadlineUptime: 10_000_000,
+                operation: { try queued.run($0) },
+                dispose: {
+                    queuedDisposals.increment()
+                    disposed.fulfill()
+                },
+                onStart: { XCTFail("Cancelled queued work must not start") }
+            )
         }
         await clock.waitForSleepers(1)
         queuedTask.cancel()
@@ -67,6 +76,7 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
         next.release()
         _ = try await secondTask.value
         _ = try await nextTask.value
+        XCTAssertEqual(queuedDisposals.value, 1)
     }
 
     func testQueuedExpiryAndAdmissionUseRemainingWholeMilliseconds() async throws {
@@ -130,13 +140,41 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
         queue.setSpecific(key: key, value: "worker")
         let executor = TorHTTPRequestExecutor(workerQueue: queue)
         let disposals = TorTestCounter()
+        let starts = TorTestCounter()
         _ = try await executor.execute(deadlineUptime: UInt64.max, operation: { _ in
             XCTAssertEqual(DispatchQueue.getSpecific(key: key), "worker")
             return TorWorkerGate.response
         }, dispose: {
             XCTAssertEqual(DispatchQueue.getSpecific(key: key), "worker")
             disposals.increment()
+        }, onStart: {
+            XCTAssertEqual(DispatchQueue.getSpecific(key: key), "worker")
+            starts.increment()
         })
+        XCTAssertEqual(disposals.value, 1)
+        XCTAssertEqual(starts.value, 1)
+    }
+
+    func testThrowingStartDisposesWithoutNativeEntry() async {
+        let executor = TorHTTPRequestExecutor(now: { 0 })
+        let budget = OHTTPHealthProbeBudget(milliseconds: 0, now: { 0 })
+        let nativeCalls = TorTestCounter()
+        let disposals = TorTestCounter()
+        do {
+            _ = try await executor.execute(
+                deadlineUptime: UInt64.max,
+                operation: { _ in
+                    nativeCalls.increment()
+                    return TorWorkerGate.response
+                },
+                dispose: { disposals.increment() },
+                onStart: { try budget.beginNetworkAttempt() }
+            )
+            XCTFail("An expired probe must reject dispatch even when its executor deadline remains valid")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertEqual(nativeCalls.value, 0)
         XCTAssertEqual(disposals.value, 1)
     }
 
@@ -216,7 +254,10 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
             return clock.now
         })
         let work = TorWorkerGate()
-        let task = Task { try await executor.execute(deadlineUptime: 2_000_000, operation: { try work.run($0) }) }
+        let starts = TorTestCounter()
+        let task = Task {
+            try await executor.execute(deadlineUptime: 2_000_000, operation: { try work.run($0) }, onStart: { starts.increment() })
+        }
         await fulfillment(of: [read], timeout: 3)
         clock.advance(to: 1_000_001)
         release.signal()
@@ -225,6 +266,7 @@ final class TorHTTPRequestExecutorTests: XCTestCase {
             XCTFail("Expired native entry succeeded")
         } catch { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
         XCTAssertEqual(work.entries, 0)
+        XCTAssertEqual(starts.value, 0)
     }
 
     private func assertCancelled(_ task: Task<(data: Data, response: HTTPURLResponse), Error>) async {

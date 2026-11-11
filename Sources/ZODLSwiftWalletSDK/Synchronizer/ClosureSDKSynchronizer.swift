@@ -313,6 +313,7 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64,
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     ) {
@@ -322,6 +323,7 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
                 inputs: inputs,
                 binding: binding,
                 route: route,
+                isCustomServer: isCustomServer,
                 epoch: epoch
             )
         }
@@ -341,6 +343,12 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
     ) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
             try await self.synchronizer.httpGetOverTor(for: request, retryLimit: retryLimit, timeoutMilliseconds: timeoutMilliseconds)
+        }
+    }
+
+    public func httpRequestOverOHTTP(for request: URLRequest, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.httpRequestOverOHTTP(for: request, viaTor: false)
         }
     }
 

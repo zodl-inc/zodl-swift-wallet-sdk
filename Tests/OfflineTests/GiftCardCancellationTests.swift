@@ -359,7 +359,14 @@ struct GiftCardCancellationFixture {
         container.mock(type: LightWalletService.self, isSingleton: true) { _ in service }
         container.mock(type: TransactionRepository.self, isSingleton: true) { _ in repository }
         container.mock(type: CompactBlockRepository.self, isSingleton: true) { _ in storage }
-        if let torClient { container.mock(type: TorClient.self, isSingleton: true) { _ in torClient } }
+        let torClient = torClient ?? TorClient(
+            torDir: storageDirectory.appendingPathComponent("fixture-tor"),
+            httpGetNative: TorHTTPGetNative(
+                freeRuntime: { _ in },
+                startup: TorRuntimeStartupNative.fixture { _, _ in OpaquePointer(bitPattern: 1) }
+            )
+        )
+        container.mock(type: TorClient.self, isSingleton: true) { _ in torClient }
         let engine = GatedFakeSlipstreamEngine()
         await engine.setNextSnapshot(
             SlipstreamSnapshot(
@@ -402,6 +409,7 @@ struct GiftCardCancellationFixture {
                     initializer: initializer,
                     alternateEndpoints: [],
                     engine: engine,
+                    makeEndpointService: { _, _, _, _ in service },
                     restoreAnchor: { isRestore, birthday, fallback, endpoint, network, torDirPath in
                         await anchor.resolve(
                             isRestore: isRestore,

@@ -24,6 +24,53 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
         try await assertSlipstreamDisableOrder(first: .exchangeRate)
     }
 
+    /// A binding must preserve the legacy service-aware Tor gate. PUT reaches TorClient's
+    /// method validation without native networking, proving the service's root was found.
+    func testLegacyTorHTTPFindsWrappedTorServiceButRejectsWrappedDirectService() async throws {
+        let runtimes = TorTestRuntimes()
+        let native = TorHTTPGetNative(
+            get: { _, _, _, _, _, _ in
+                XCTFail("unexpected native GET")
+                return nil
+            },
+            freeResponse: { _ in },
+            isolateRuntime: { pointer in
+                XCTAssertTrue(runtimes.isAlive(pointer))
+                return runtimes.clone(runtimes.parent)
+            },
+            freeRuntime: { runtimes.free($0) }
+        )
+        let client = TorClient(runtimePtr: runtimes.parent, torDir: testTempDirectory, httpGetNative: native)
+        let direct = LightWalletServiceMock()
+        direct.closeConnectionsClosure = {}
+        let binding = RebindingLightWalletService(service: direct)
+        let initializer = try makeInitializer(client: client, service: binding)
+        let synchronizer = SDKSynchronizer(initializer: initializer)
+        var request = URLRequest(url: URL(string: "https://example.com")!)
+        request.httpMethod = "PUT"
+        do {
+            _ = try await synchronizer.httpRequestOverTor(for: request)
+            XCTFail("a non-Tor service must not expose the container's Tor client")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code, .torClientUnavailable)
+        }
+        binding.replace(with: LightWalletGRPCServiceOverTor(endpoint: LightWalletEndpointBuilder.default, tor: client))
+        do {
+            _ = try await synchronizer.httpRequestOverTor(for: request)
+            XCTFail("PUT is deliberately unsupported")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code, .rustTorHttpRequest, "the wrapped service must expose its own Tor client")
+        }
+        try await synchronizer.tor(enabled: false)
+        do {
+            _ = try await synchronizer.httpRequestOverTor(for: request)
+            XCTFail("disabled Tor must reject the request")
+        } catch let error as ZcashError {
+            XCTAssertEqual(error.code, .torNotEnabled)
+        }
+        try await client.close()
+    }
+
     private func assertSlipstreamDisableOrder(first: SlipstreamTorConsumer, enableFirstConsumer: Bool = true) async throws {
         let fixture = SlipstreamTorLifecycleFixture()
         let client = TorClient(torDir: testTempDirectory.appendingPathComponent("tor-lifecycle"), httpGetNative: fixture.native)
@@ -170,10 +217,17 @@ final class TorSynchronizerRoutingTests: ZcashTestCase {
         try await client.close()
     }
 
-    private func makeInitializer(client: TorClient, torEnabled: Bool = true, exchangeRateEnabled: Bool = false) throws -> Initializer {
+    private func makeInitializer(
+        client: TorClient,
+        torEnabled: Bool = true,
+        exchangeRateEnabled: Bool = false,
+        service: LightWalletService? = nil
+    ) throws -> Initializer {
         mockContainer.mock(type: TorClient.self, isSingleton: true) { _ in client }
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in ZcashRustBackendWeldingMock() }
-        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
+        let defaultService = LightWalletServiceMock()
+        defaultService.closeConnectionsClosure = {}
+        mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in service ?? defaultService }
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in TransactionRepositoryMock() }
         return Initializer(
             container: mockContainer,
@@ -234,7 +288,7 @@ private final class SlipstreamTorLifecycleFixture: @unchecked Sendable {
                 }
                 runtimes.free(pointer)
             },
-            createRuntime: { [self] _, _ in
+            startup: TorRuntimeStartupNative.fixture { [self] _, _ in
                 lock.withLock { creations += 1 }
                 return runtimes.parent
             }

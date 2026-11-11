@@ -9,6 +9,8 @@
 //! requests keep the transport open without headers for at least 10 seconds. State
 //! should be unique to this test run (for example a fresh URL token). HTTP 500 does
 //! not meet this contract because the production retry filter retries errors only.
+//! TOR_HTTP_TEST_ERROR_PAGE_URL defaults to /drip?numbytes=1000000&code=429&duration=20&delay=0.
+//! It must answer a non-2xx status with a body well past 64 KiB, spread over the duration.
 //!
 //! The Rust test harness has no dynamic skip result. A TOR STAGE-SKIP diagnostic
 //! means prerequisite unavailable, not passed live coverage, even if harness says ok.
@@ -30,6 +32,9 @@ struct Stages {
     body_entries: usize,
     status: Option<u16>,
     first_retry_at: Option<Instant>,
+    /// The bound the production collector chose when it entered, i.e. with the status the retry
+    /// filter had recorded by then (`SeenStatus`).
+    body_limit: Option<usize>,
 }
 
 // block_on polls this pipeline on the FFI caller thread. Per-thread counters avoid
@@ -50,10 +55,11 @@ pub(crate) fn observe_retry(result: Result<u16, ()>) {
     });
 }
 
-pub(crate) fn observe_body() {
+pub(crate) fn observe_body(max_bytes: usize) {
     STAGES.with_borrow_mut(|stages| {
         if let Some(stages) = stages {
             stages.body_entries += 1;
+            stages.body_limit = Some(max_bytes);
         }
     });
 }
@@ -81,6 +87,16 @@ impl NativeFixture {
     }
 
     fn get(&mut self, url: &str, retries: u8, timeout_ms: u64) -> Result<(), String> {
+        self.get_response(url, retries, timeout_ms).map(|_| ())
+    }
+
+    /// The real FFI GET; returns the response's status and body length.
+    fn get_response(
+        &mut self,
+        url: &str,
+        retries: u8,
+        timeout_ms: u64,
+    ) -> Result<(u16, usize), String> {
         let url = CString::new(url).expect("fixture URL contains no NUL");
         let headers = ptr::NonNull::<ffi::HttpRequestHeader>::dangling().as_ptr();
         let response = unsafe {
@@ -97,8 +113,9 @@ impl NativeFixture {
             // Must remain on the native call's thread, before any other FFI call.
             Err(last_error())
         } else {
+            let status_and_body_len = unsafe { &*response }.status_and_body_len();
             unsafe { ffi::zcashlc_free_http_response_bytes(response) };
-            Ok(())
+            Ok(status_and_body_len)
         }
     }
 }
@@ -260,5 +277,73 @@ fn real_ffi_retry_uses_original_deadline() {
             "TOR EVIDENCE: retry errors={}, timeout after {elapsed:?}",
             stages.retry_errors
         );
+    });
+}
+
+// Break caught: zcash_client_backend no longer calls the retry filter with the final response's
+// status before it hands the body to the collector (the collector would then read an error page
+// up to the caller's ceiling). The local transport tests exercise the same guard with the
+// crate's call order replayed by hand; this one runs the crate's own `http_request`.
+#[test]
+#[ignore = "requires a live Tor bootstrap and a large, slow error-page fixture"]
+fn real_ffi_error_page_is_cut_at_the_fixed_guard() {
+    guarded_live_test(|fixture| {
+        let url = std::env::var("TOR_HTTP_TEST_ERROR_PAGE_URL").unwrap_or_else(|_| {
+            format!(
+                "{}/drip?numbytes=1000000&code=429&duration=20&delay=0",
+                fixture_base()
+            )
+        });
+        STAGES.with_borrow_mut(|stages| *stages = Some(Stages::default()));
+        let start = Instant::now();
+        let result = fixture.get_response(&url, 0, 30_000);
+        let elapsed = start.elapsed();
+        let stages = STAGES.with_borrow_mut(|stages| stages.take().unwrap());
+        // Whatever the fixture answered (a timeout included), a collector that entered did so
+        // with the status the retry filter had recorded for that response, and with the bound
+        // that status selects. Checked before any skip: this is the regression this test is for.
+        if stages.body_entries > 0 {
+            assert!(
+                stages.status.is_some(),
+                "the collector entered before the retry filter saw the final response: {result:?}"
+            );
+            let expected_bound = match stages.status {
+                Some(200..=299) => crate::TOR_HTTP_MAX_RESPONSE_BYTES,
+                _ => crate::TOR_HTTP_MAX_ERROR_BODY_BYTES,
+            };
+            assert_eq!(
+                stages.body_limit,
+                Some(expected_bound),
+                "the collector's bound does not follow the status the filter recorded ({:?})",
+                stages.status
+            );
+        }
+        // Fixture availability is read off the FFI result (the response's own status), never
+        // off the retry filter: a crate that stopped calling the filter must fail above or below,
+        // not skip.
+        let (status, body_len) = match result {
+            Ok((status, body_len)) if status == 429 => (status, body_len),
+            result => {
+                eprintln!("TOR STAGE-SKIP: fixture did not answer 429; result={result:?}");
+                return;
+            }
+        };
+        assert_eq!(
+            stages.status,
+            Some(status),
+            "the retry filter must have seen the final response's status"
+        );
+        assert_eq!(stages.body_entries, 1);
+        assert_eq!(
+            stages.body_limit,
+            Some(crate::TOR_HTTP_MAX_ERROR_BODY_BYTES),
+            "the collector must enter after the filter recorded the final 429"
+        );
+        assert_eq!(body_len, 0, "the cut error page comes back empty");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the 20 s drip was read to its end instead of stopping at 64 KiB: {elapsed:?}"
+        );
+        eprintln!("TOR EVIDENCE: real FFI 429 page cut at the guard after {elapsed:?}");
     });
 }

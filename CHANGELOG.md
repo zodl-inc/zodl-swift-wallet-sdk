@@ -6,6 +6,435 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
+  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
+- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
+  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
+  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
+- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
+  stops compiling until they are handled.
+- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
+  more notes than one transaction can spend within the block size limit is now refused when the
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
+  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
+  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
+  None of the new cases carries the recipient, the memo or an amount.
+- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
+  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
+  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
+  `rustProposeTransfer` or `rustProposeTransferFromURI`.
+
+# 8.0.0 - 2026-11-06
+
+## Added
+
+- `OHTTPNetworkConfiguration` (gateway host, relay URL, key DNS name and signing public key of one network),
+  `OHTTPConfiguration` (mainnet and testnet) and `OHTTPEndpoints.configure(_:)` install the OHTTP configuration
+  at runtime. Call it once at launch, before any other SDK use. `OHTTPEndpoints.configuration` returns the
+  installed one. Passing `nil`, or never calling it, leaves OHTTP off. An invalid configuration throws the new
+  `ZcashError.ohttpConfigurationInvalid` (`ZTSRV0009`), whose message names the field and the rule but never
+  the value; descriptions and `dump` of the configuration types never show the values either. An exhaustive
+  `switch` over `ZcashError` must handle the new case.
+
+- `OHTTPEndpoints.gatewayHost(for:)` returns `String?`: the gateway host `configure` installed for the
+  network, or `nil` until it does. Use it when constructing gateway endpoints instead of a fixed hostname.
+
+- The binaries carry no OHTTP configuration, and a source build needs no OHTTP inputs. Whatever the app
+  passes to `configure` is in the app and subject to its own protection.
+
+- While OHTTP is off for a network, that network's gateway host is treated as a plain lightwalletd server,
+  requests to the proxied third-party hosts (the CoinMarketCap, NEAR and Flexa aliases) fail, and the
+  predefined voting servers are reached directly (Tor still applies). With a configuration for the
+  wallet's network they ride OHTTP and fail closed.
+
+- Public keys verified under one configuration are never reused under another; `configure` replaces the
+  previous configuration completely.
+
+- `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
+  with the default timing, send every transaction that was submitted but that no server has accepted yet
+  through the given server, once and right away, and add that server at the end of each transaction's retry
+  plan; Public and Manual background resubmission keeps trying the recorded servers first. Meant for a wallet
+  whose user moved to another server while sends were stuck, such as during a private relay outage. Each report says whether
+  the server took the transaction. The server receives these transactions with the device's network address
+  unless the route hides it (Tor). Custom `Broadcaster` conformers inherit a no-op and need no changes.
+- `TorTransitionProviding` exposes retained `TorTransitionState` and updates on `SlipstreamSynchronizer`.
+  `requestTorTransition(enabled:)` immediately fences new requests and cancels an opposite startup.
+  Its `TorTransitionRequest.apply()` activates once after the host acquires its transaction guard;
+  `wait()` only observes, and `cancelBeforeApplying()` cancels a dormant ticket.
+  This Tor transition API adds no requirements to `Synchronizer`.
+
+- `OHTTPHealthContext.complete(_:failed:allFailedAttempts:)` accepts the complete finite set of
+  attempts whose failures determine an all-failed business result. Use distinct, finished attempts
+  for every failed branch; mixed or unknown results, missing or invalid children, and groups beyond
+  64 terminal request identities supply no qualifying evidence. Every child must have terminal
+  transport failures for the same route and generation. Original request identities and global
+  health observations are preserved; `failed: false` supplies no evidence and does not consume
+  children. Publish the original business result and release transaction/wallet guards before awaiting
+  completion, which retains existing backpressure and cancellation behavior. Existing call sites
+  using `failedAttempt` need no changes.
+
+- `OHTTPHealthContext.withBackground(operation:)` clears inherited user-operation attribution for
+  automatic refreshes, retries and other background work. Wrap those awaits in this scope; real
+  requests still update global connection health.
+
+- Concrete synchronizers implement `OHTTPHealthProviding` to create a health session and run a
+  fresh read-only diagnostic using their selected OHTTP endpoint and Tor runtime. Diagnostics use
+  one 5-second direct or 20-second Tor budget across admission, keys, retries, and response collection;
+  native resource cleanup can extend completion. Explicit relay pauses prevent dispatch.
+- Real Swift OHTTP requests now contribute typed route and backend evidence without changing RPC
+  results or retry behavior. Use `OHTTPHealthContext.withAttempt` with a distinct `OHTTPHealthAttempt`
+  for each network alternative. Pass the explicitly failed token as `failedAttempt` to `complete`;
+  omitting it reports business failure with no attributed final network evidence. Earlier optional
+  failures must not be attributed to an unrelated local failure. Publish the business result before
+  awaiting completion delivery. Attempt identities remain local and are never sent on the wire.
+
+- `OHTTPHealthSession(route:generation:)` adds retained OHTTP health snapshots and operation completion
+  updates without changing `Synchronizer`. Initialization throws when the native capability is unsupported.
+  Use `OHTTPHealthContext.withOperation` to correlate child work locally, then publish the business result
+  before awaiting `OHTTPHealthContext.complete(_:failed:)`. Completion includes its own bounded evidence;
+  a stalled update consumer applies backpressure after 64 completions. Drain updates without waiting for
+  UI interaction, and cancel the consumer or call `close()` when retiring the route. Compare evidence
+  using `OHTTPHealthClock` and reject historical or older-generation observations as fresh traffic.
+
+- `Synchronizer.httpStreamOverOHTTP(for:viaTor:)` sends an HTTP request through the OHTTP relay and
+  gateway like `httpRequestOverOHTTP` and returns once the response head is in, with the body read
+  as the gateway sends it (`OHTTPStreamedResponse`): a server-sent event stream arrives event by
+  event, and a body that breaks off before the gateway's final chunk throws. In Tor mode the relay
+  leg, read as it arrives too, rides Tor.
+
+- `OHTTPURLProtocol` sends every request of the sessions it is registered in through
+  `httpStreamOverOHTTP`, mapped to the host's gateway alias; a host with no alias fails and never
+  goes out directly. `OHTTPURLProtocol.session(configuration:headers:delegate:delegateQueue:)` also
+  passes header fields the session would set (`Last-Event-ID`), which a `URLProtocol` is not given.
+
+- `api.flexa.co` maps to the mainnet gateway alias `flexa.zodl.com`, whose `Authorization` is the
+  client's own and goes through (the gateway replaces only the placeholder publishable key).
+
+## Changed
+
+- OHTTP requests are padded to fixed size buckets (`zodl-ohttp-client` 1.0). A lightwalletd
+  `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of 32 KiB when larger.
+  Every other request is padded to the next multiple of 4 KiB. The relay and the network see a few
+  request sizes only.
+- The FFI XCFramework now supports ARM64 only on iOS devices, iOS simulators, and macOS.
+  Intel Macs and x86_64 simulators are no longer supported. Use an Apple Silicon Mac and an
+  ARM64 simulator; macOS 14 and iOS 16 remain the minimum versions.
+
+- Custom `Synchronizer` conformers and test doubles must implement
+  `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)`;
+  existing conformances without these
+  members no longer compile. The SDK's concrete synchronizers already supply them.
+  OHTTP HTTP calls require a supported gateway destination and fail without a direct fallback.
+  The legacy `httpRequestOverTor(for:retryLimit:)` remains Tor-only, including for supported
+  external services; it does not select OHTTP. See `MIGRATING.md` for exact signatures.
+
+- `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)`
+  requires `isCustomServer` before `epoch`; existing call sites must pass it explicitly.
+  With `.direct`, pass `false` for predefined servers to use OHTTP (unsupported chain/PIR
+  destinations fail closed), or `true` for voter-supplied servers to use direct HTTP(S) according to
+  the endpoint URL, subject to existing network and endpoint validation.
+  With `.tor`, both choices use Tor to reach the servers directly. PIR shares the session route.
+
+- The default Sapling parameter mirror is
+  `https://raw.githubusercontent.com/zodl-inc/zcash-sapling-params/main/`.
+  In Private, Public and Manual modes, downloads use direct HTTPS with Tor off and Tor with
+  Tor on. They do not use OHTTP. Existing parameter caching and SHA-256 verification remain;
+  applications using `SaplingParamsSourceURL.default` need no call-site edits.
+
+- OHTTP relay connections detect silent calls from received traffic and per-call stall limits
+  without HTTP/2 keep-alive PINGs, so slow or Tor connections are not retired for a late PING
+  response. A connection whose response body stays silent past its timeout is no longer reused.
+
+- `SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
+  `drainEvents` now have explicit `async` signatures. External actor calls already using `await`
+  are unchanged; actor-isolated callers must add `await`.
+
+- `TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,
+  `sleep` and `wake` are explicitly asynchronous so a cold client can await bounded Tor startup.
+  Existing external actor calls using `await` need no edits; synchronous actor-isolated callers
+  must now await them.
+
+- Sapling parameter files are now verified with SHA-256 instead of SHA-1.
+
+- OHTTP key-configuration response size limit (64 KiB) is now enforced incrementally while reading
+  the body, not post-read. The per-request limit is carried through every HTTPSender implementation
+  (clearnet URLSession and Tor) so that key-config GETs use the 64 KiB limit and relay POSTs use
+  the 257 MiB limit. Addresses ZIP MUST requirement.
+
+- OHTTP voting route now tracks whether the `on_dispatch` callback fired. Failures before dispatch
+  (e.g., key-config fetch, relay connect) are classified as Transport (safely retriable); failures
+  after dispatch are Ambiguous (no retry). Previously all failures were marked after-dispatch.
+
+- An OHTTP relay's 429 is back-off, not a failure of the relay as a key source: a key-configuration
+  fetch the relay answers 429, or one made while the relay's pause runs, fails with that 429 and never
+  falls back to the DNS-over-HTTPS resolvers. A 429 that carries no usable `Retry-After` now starts a
+  30 s pause (`OHTTPTransport.defaultRateLimitPause`, the ZIP's reference default); it started none.
+
+- An OHTTP caller that is cancelled while the shared key-configuration fetch of its relay runs now
+  stops waiting at once (`CancellationError`); the fetch runs on for the other callers and its key is
+  still stored.
+
+- A non-2xx answer of the OHTTP relay (an error page) is read up to 64 KiB
+  (`OHTTPTransport.maxErrorBodyBytes`), a fixed guard whatever the call's own ceiling; the read stops
+  there and the answer is reported by its HTTP status (`OHTTPError.httpStatusError`, a 429 with its
+  `Retry-After` honoured) rather than as `responseTooLarge`. Over Tor the Rust connector applies the
+  same fixed 64 KiB guard while reading (it takes the status from the retry filter, which
+  `zcash_client_backend` calls before the body collector); an error page past it is reported by its
+  status, with an empty body, instead of failing as too large.
+
+- The transparent-address RPCs of an OHTTP gateway endpoint (`checkSingleUseTransparentAddresses`,
+  `updateTransparentAddressTransactions`, `fetchUTXOsByAddress`) ride the OHTTP transport like every
+  other call of that endpoint, on an isolated Tor circuit per call in Tor mode; the wallet half runs
+  through the new `zcashlc_single_use_taddr_to_check`, `zcashlc_schedule_single_use_taddr_check` and
+  `zcashlc_transparent_address_utxo_start_height` FFI. A gateway host is no longer dialled over Tor
+  by the Rust connector at all: `zcashlc_tor_connect_to_lightwalletd` refuses it (see
+  `rust/CHANGELOG.md`). A transaction height a block height cannot hold, other than lightwalletd's
+  `u64::MAX` for an unmined transaction, is now an error on this path as on the Tor gRPC one.
+
+- Sapling parameter Tor downloader now creates the destination directory before writing its temporary
+  file, fixing ENOENT when the SDK caller supplies a new parameters directory.
+
+- OHTTP relay posts over Tor (`httpRequestOverOHTTP`, the lightwalletd and migration OHTTP clients)
+  are tried again on a new isolated circuit, twice at most, when they fail to reach the relay
+  before any of the sealed request was sent (Tor stream or TLS); a sealed request is still never
+  resent. They were not retried at all.
+
+- OHTTP now routes `GET https://raw.githubusercontent.com/valargroup/token-holder-voting-config/*`
+  through the mainnet gateway. The host is returned unchanged (passthrough by :authority header),
+  so the inner request authority is `raw.githubusercontent.com` itself. Other paths on
+  raw.githubusercontent.com remain rejected as unsupportedPrivateDestination.
+
+- `TorClient.httpRequest(for:maxBytes:retryLimit:)` now has a default value for `maxBytes`
+  (257 MiB), preserving compatibility with existing callers that do not specify it.
+
+- A streamed answer read over Tor (`httpStreamOverOHTTP` in Tor mode, and `OHTTPURLProtocol`
+  sessions in Tor mode) now fails with `URLError.timedOut` when no body bytes arrive for the
+  request's `timeoutInterval`, instead of waiting forever.
+
+- `SlipstreamSynchronizer.switchTo(endpoint:)` made after `wipe()` completes and before the next
+  `prepare(with:walletBirthday:name:keySource:)` now only records the endpoint: that `prepare`
+  fetches the new wallet's provisioning anchor (a restore's chain tip, a new wallet's tree state)
+  from it and opens the engine there. The switch used to reopen the engine at once, recreating the
+  wallet database the wipe had just deleted, so a host could move a reset wallet only after
+  `prepare`, by which time its anchor had been fetched from the server in use before the wipe. A
+  host that resets a wallet to leave a server should now switch after the wipe and before
+  preparing; without that switch the next wallet stays on the server in use before the wipe, as
+  before. A switch made while that `prepare` is opening the engine is applied once the engine is
+  open, so the engine ends on the server of the last switch. `SDKSynchronizer` is unaffected.
+
+- OHTTP transport upgraded to Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08). The Swift SDK now
+  uses `encapsulate_chunked_request` and `ChunkedResponseDecoder` from `zodl-ohttp-client` to seal
+  requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
+  responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
+  no longer used. See PR #4 in zodl-inc/ohttp.
+
+## Fixed
+
+- `make configure-local-ffi` gives the local FFI's macOS framework the versioned bundle layout
+  required when embedding in macOS apps, as `Scripts/init-local-ffi.sh` already did. The release
+  XCFramework keeps its existing layout. No caller changes are required.
+
+- `SDKSynchronizer` background transaction retries use only the selected Private gateway,
+  retaining recorded retry plans for later Public or Manual use. Awaiting transactions and
+  unavailable consent records remain unsent. Legacy retries honor the selected endpoint's
+  custom single-call timeout, including after server switches; failed validation retains the
+  previous route and timeout. No caller changes are required.
+
+- `SlipstreamSynchronizer.start`, `stop`, `stopAndWait`, `switchTo`, `restartSync`, `prepare`,
+  `importAccount`, `deleteAccount`, `rewind`, stall recovery, Tor transitions and `wipe` now cancel
+  pending background transaction retries before waiting for lifecycle work.
+  Retries registering while a lifecycle request is still joining the queue remain cancelled.
+  A route switch or completed stop still waits for an active sender to finish. Cancellation retains
+  already-known acceptance and submission consent, stops later transactions/endpoints and does not
+  advance the completed retry cadence. No call-site changes are needed.
+- `SlipstreamSynchronizer` retries and per-endpoint submissions share one `LightWalletEndpoint.singleCallTimeoutInMillis`
+  budget (30 seconds by default) across route admission, OHTTP key fetch, height check, send and
+  known-transaction lookup, including native Tor requests. Expiry fails closed; resource cleanup
+  finishes before lifecycle work proceeds and can extend completion beyond the network budget.
+
+- Pending transaction retries use only the selected Private gateway after an endpoint switch,
+  including transactions whose saved retry plans contain public servers. Switches wait for earlier
+  retries to finish, and stopped or wiped wallets discard stale queued retries. Stopping or changing servers
+  can wait for an already-running retry before the native engine is interrupted at its next block boundary. Submission consent,
+  accepted history, the five-minute retry policy and Public/Manual retry behavior are preserved.
+
+- `SlipstreamSynchronizer.restartSync(at:)` rejects gateways from the other wallet network before
+  cancelling Tor transitions or stopping or reopening the engine. `TorClient.httpRequest` throws an
+  ordinary error for negative response size limits before preparing Tor; zero and positive limits
+  keep their existing behavior.
+
+- OHTTP health reports preserve relay failures when DNS key fallback fails. Third-party backend
+  rate limits no longer pause lightwalletd health probes; relay rate limits still do.
+
+- OHTTP health probes that expire while waiting to dispatch or preparing a request report an inconclusive
+  result instead of a network outage, including after a successful key fetch. No call-site changes are needed.
+
+- `SlipstreamSynchronizer.wipe()` cancels an active background transaction retry before waiting for it
+  to finish, so a retry awaiting cancellation cannot block cleanup. Wallet files remain protected until
+  that retry finishes. No call-site changes are needed.
+
+- OHTTP requests remain reliable when relay connections rotate during request setup; no call-site changes are needed.
+
+- OHTTP DNS fallback honors each resolver’s rate-limit deadline independently, so one
+  throttled resolver does not prevent another resolver from restoring connectivity.
+
+- OHTTP requests lowercase ASCII letters in the wire authority while preserving its port and
+  the method, path, query and body. Mixed-case gateway hosts now reach the configured backend.
+  No call-site changes are required.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+
+- Native source-build wrappers reject malformed OHTTP gateway/DNS names and relay URL schemes
+  before starting Cargo, without including configured values in validation errors. No call-site changes are required.
+
+- `SlipstreamSynchronizer.prepare` throws the `Initializer`'s URL parsing error (`urlsParsingError`)
+  before preparing, as `SDKSynchronizer.prepare` does.
+
+- Gateway detection, relay selection, signed-key verification, DNS fallback and voting routes use
+  the configured network hosts, including ASCII case-insensitive caller hosts. Unknown hosts and
+  gateways from the other wallet network remain rejected. No call-site changes are required.
+
+- `SlipstreamSynchronizer.start(retry:)` revalidates retained Tor intent after a stopped or failed startup.
+  Failed required restarts after `switchTo(endpoint:)` or `restartSync(at:)` retain the prior endpoint
+  and block new networking until restoration, including when Tor is turned off during the switch.
+  A newer explicit server choice or wallet wipe retires that restoration target. No call-site changes are required.
+- Cancelling a queued Tor preparation no longer waits for an unrelated wallet's native bootstrap.
+
+- Expired or cancelled Tor acquisition now owns safe retirement of the old native sync loop,
+  while admitted broadcasts retain their resources, route and result. Retirement cannot apply an
+  expired replacement or stop a newer installed route, and observer failure stays immediate.
+- Tor startup APIs now return the same typed failure shown by their state stream, including HTTP
+  and native timeouts and later ordinary sync starts; cancellation remains `CancellationError`.
+
+- `SlipstreamSynchronizer.tor(enabled:)` now stops the old pass and waits for both required Tor
+  owners before resuming an intended-running wallet. Idle wallets remain idle. Failed enablement
+  keeps Tor required, and new network work fails with `TorTransitionState.Failure.routeUnavailable`
+  until a successful route choice. Already-admitted broadcasts retain their route and original
+  result, including outcome recovery and multi-endpoint propagation after acceptance. The existing
+  nonthrowing `Broadcaster.submit` reports a refused admission as `.unreachable` and retains the
+  created transaction's intended retry endpoints without recreating plans after a wipe.
+- An idle Tor enable keeps its completed ticket result while a later normal sync start publishes
+  fresh pending, ready or failed state for the native owner it now requires.
+- Wallet and account provisioning now retain their admitted route through native restore-anchor
+  work, and new provisioning and server-selection probes cannot bypass a pending route fence.
+- Explicit Tor choices have a 30-second acquisition budget, including host guard waiting, followed
+  by a shared 60-second startup budget after safe stop. Stop, wipe, prepare and endpoint replacement
+  invalidate pending choices. Superseded diagnostic sessions are cancelled; create a new health
+  session after the replacement binding becomes ready.
+
+
+- Cold `TorClient` startup now leaves the actor responsive and cancels native bootstrap when
+  its final waiting caller cancels or the client closes. Standalone cold startup uses a 60-second
+  deadline including worker waiting, and late results cannot restore a closed client. Prepared isolated clients
+  remain usable after the base client closes.
+
+- Migration OHTTP key preparation failures are included in `OHTTPHealthContext.complete`
+  evidence for the selected failed attempt, for direct and Tor routes. Transaction results,
+  key fallback and successful key preparation behavior are unchanged. No caller changes are needed.
+
+- Buffered OHTTP health retains authenticated gRPC rejection status when later decoding fails.
+  Policy rejections (7 and 16) and backend unavailability (14) keep their health classification
+  through a missing final chunk. A zero status alone never establishes complete-body success,
+  and original RPC errors and HTTP rejection precedence are unchanged.
+
+- `OHTTPHealthSnapshot` preserves ordinary recovery evidence beside diagnostic observations
+  and later completions from older requests. Ordinary route success keeps its greatest request
+  start and original metadata; failure ordering is unchanged. No caller changes are needed.
+
+- The source-built native dependency includes the rejected-response body-failure classification
+  correction. All five configured architectures use the same pinned native revision.
+
+- `probeOHTTPHealth(session:)` preserves authenticated inner HTTP and gRPC rejection outcomes,
+  including the original Retry-After deadline. RPC errors and caller code are unchanged.
+
+- Both synchronizers retire OHTTP health sessions before committed engine or service replacement
+  and wallet wipes, including failed replacements. A retained binding reports when the selected
+  route settles. Retired diagnostic probes cancel, drain admitted work, and cannot deliver evidence
+  or late rate-limit replay to replacement sessions.
+  An unexpired server pause accepted before retirement still prevents diagnostics on the same route after replacement.
+  Consumers should retain `OHTTPHealthProviding.ohttpHealthBinding`, wait for its ready publication,
+  and create a new session through that provider after resource replacement. Recheck
+  `OHTTPHealthSession.bindingID` against the ready binding and `OHTTPHealthSession.isValid` before
+  consuming evidence or probing. `OHTTPHealthError.bindingUnavailable` defers setup until the binding
+  is ready. Provider probes cancel foreign, retired and directly constructed unbound sessions before
+  dispatch; direct session construction does not establish provider ownership.
+
+- `OHTTPHealthContext.complete` now attributes submission failures to the terminal failed request,
+  including preflight, multi-endpoint submission, migration and gift-card redemption. Accepted
+  fallback, known-on-server recovery, local creation failures and unresolved timeouts do not reuse
+  earlier network failures. Transaction results and retries are unchanged. Keep `withAttempt` active
+  while consuming a submission stream, then publish the business result and release transaction
+  guards before calling `complete`. Attempts retain at most 64 terminal request identities; exceeding
+  that limit leaves the completion without attributed evidence.
+
+- OHTTP health preserves an authenticated rejection when response decoding or body collection fails.
+  Diagnostic key fallback stops on a known rate limit, and Retry-After keeps its original head-time
+  deadline through delayed bodies and cleanup. Public RPC errors and submission behavior are unchanged.
+
+- `SlipstreamSynchronizer` preserves restore progress across retries and stop/start on the same
+  engine instance, and limits rewind-related drops to reopened work. No caller changes are required.
+
+- `SlipstreamSynchronizer` keeps work-based sync progress through a temporary fallback to block-based
+  progress, so the reported progress no longer drops when the work estimate returns. No caller changes
+  are required.
+
+- `SlipstreamEngine.stop()` and `stopForWalletChange()` both request scan interruption between
+  blocks; the interrupted scan batch is scanned again by the next session while earlier committed
+  progress remains. Stopping can still wait for current work, queued computation and writes.
+  Wallet-changing operations still use `stopForWalletChange()` to identify host intent and require a quiescent stop report before
+  mutation. No caller changes are needed.
+
+- Sapling parameter downloads over Tor preserve on-demand runtime preparation and use one
+  30-minute total GET budget across preparation, admission, retries, and body collection. A slow
+  valid body can complete after the backend's default 60-second body timeout. Downloads still
+  validate before atomic installation, retain their response-size limits, and discard temporary
+  files on failure or cancellation.
+
+- `SlipstreamSynchronizer.switchTo(endpoint:)` and `restartSync(at:)` now move retained Swift
+  RPC consumers to the selected endpoint along with the sync engine, including public server ↔ OHTTP
+  gateway transitions. Selecting a server after a wipe also updates RPC routing while leaving the
+  wallet database closed until `prepare`. Broadcasters keep their existing identity and no caller
+  API changes are required.
+
+- OHTTP gateway connections keep checking single-use transparent addresses exposed within the previous
+  24 hours of target time across NU7, and recheck unfunded addresses using the next block's target
+  spacing. After activation they previously checked only eight hours of exposure and delayed rechecks
+  three times as long. Custom networks follow their registered activation heights. No caller changes
+  are required.
+
+- Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
+  For custom regtest snapshots at height 11 or later, the registered activation schedule must
+  select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3540000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3545000.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4580000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4590000.json
+````
+
+# 7.0.1 - 2026-11-02
+
 ## Fixed
 
 - The Rust core's HTTP/2 connections now run on `h2` 0.4.20: the gRPC connections to lightwalletd,
@@ -14,6 +443,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection whose server floods it with small HTTP/2 DATA frames, failing the calls on it, where
   the flood was previously processed without limit. lightwalletd's block streams, which send one
   small frame per compact block, stay within the limit. No caller changes are required.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3532500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3537500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4550000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4570000.json
+````
 
 # 7.0.0 - 2026-10-27
 

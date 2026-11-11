@@ -21,15 +21,36 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
     private let sdkFlags: SDKFlags
     private let rustBackend: ZcashRustBackendWelding
     private let logger: Logger
+    private let networkType: NetworkType
+    private let serviceFactory: ((LightWalletEndpoint, TorClient) -> any LightWalletService)?
 
-    init(torClient: TorClient, sdkFlags: SDKFlags, rustBackend: ZcashRustBackendWelding, logger: Logger) {
+    init(
+        torClient: TorClient,
+        sdkFlags: SDKFlags,
+        rustBackend: ZcashRustBackendWelding,
+        logger: Logger,
+        networkType: NetworkType,
+        serviceFactory: ((LightWalletEndpoint, TorClient) -> any LightWalletService)? = nil
+    ) {
         self.torClient = torClient
         self.sdkFlags = sdkFlags
         self.rustBackend = rustBackend
         self.logger = logger
+        self.networkType = networkType
+        self.serviceFactory = serviceFactory
     }
 
     func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+        try await SubmissionBudget.withBudget(milliseconds: endpoint.singleCallTimeoutInMillis) {
+            try await self.sdkFlags.routeAdmission.withLease {
+                try await self.submitAdmitted(transaction: transaction, to: endpoint)
+            }
+        }
+    }
+
+    private func submitAdmitted(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+        _ = try SubmissionBudget.current?.remainingMilliseconds()
+        let health = OHTTPHealthFailureOwner()
         let mode: ServiceMode
         let serviceTorClient: TorClient
         let transport: String
@@ -51,7 +72,22 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
             "Transaction \(transaction.txId.toHexStringTxId()) submitting to \(endpoint.host):\(endpoint.port) over \(transport)."
         )
 
-        let service = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: serviceTorClient)
+        let service: any LightWalletService
+        if let serviceFactory {
+            service = serviceFactory(endpoint, serviceTorClient)
+        } else {
+            let configuredService: LightWalletGRPCServiceOverTor
+            if OHTTPEndpoints.isGateway(endpoint.host) {
+                // S7: pass wallet network on every production path
+                let ohttpService = LightWalletOHTTPService(endpoint: endpoint, tor: serviceTorClient)
+                ohttpService.walletNetwork = networkType
+                configuredService = ohttpService
+            } else {
+                configuredService = LightWalletGRPCServiceOverTor(endpoint: endpoint, tor: serviceTorClient)
+            }
+            configuredService.sdkFlags = sdkFlags
+            service = configuredService
+        }
 
         let response: LightWalletServiceResponse
         do {
@@ -59,7 +95,9 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
             // tip and the height of this endpoint. Each endpoint is judged at its own height, which is read from the service, and in
             // the mode, that is about to submit to it. A height that cannot be read fails the attempt at this endpoint, like a
             // connection that cannot be made, and so does a transaction that cannot be judged.
-            if let refusal = try await service.submissionRefusal(for: transaction.raw, mode: mode, using: rustBackend) {
+            if let refusal = try await health.request(operation: {
+                try await service.submissionRefusal(for: transaction.raw, mode: mode, using: rustBackend)
+            }) {
                 logger.warn(
                     """
                     Transaction \(transaction.txId.toHexStringTxId()) is not submitted to \(endpoint.host):\(endpoint.port): \
@@ -69,14 +107,25 @@ final class GRPCEndpointSubmitter: EndpointSubmitter {
                 throw TransactionEncoderError.notSubmittable(refusal)
             }
 
-            response = try await service.submit(spendTransaction: transaction.raw, mode: mode)
+            _ = try SubmissionBudget.current?.remainingMilliseconds()
+            response = try await health.request {
+                try await service.submit(spendTransaction: transaction.raw, mode: mode)
+            }
         } catch {
             await service.closeConnections()
             throw error
         }
 
         guard response.errorCode >= 0 else {
-            let isKnown = await service.isTransactionKnownToServer(txId: transaction.txId, mode: mode)
+            do {
+                _ = try SubmissionBudget.current?.remainingMilliseconds()
+            } catch {
+                await service.closeConnections()
+                throw error
+            }
+            let isKnown = await health.withAttempt(health.makeAttempt()) {
+                await service.isTransactionKnownToServer(txId: transaction.txId, mode: mode)
+            }
             await service.closeConnections()
 
             if isKnown {

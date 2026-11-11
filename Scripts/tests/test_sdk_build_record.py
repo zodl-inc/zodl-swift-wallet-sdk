@@ -35,9 +35,11 @@ if name == "make":
     if target == "ffi-all":
         slices = {
             "ios-arm64": ("ios", None, ["arm64"]),
-            "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]),
-            "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"]),
+            "ios-arm64-simulator": ("ios", "simulator", ["arm64"]),
+            "macos-arm64": ("macos", None, ["arm64"]),
         }
+        if os.environ.get("OLD_UNIVERSAL"):
+            slices = {"ios-arm64": ("ios", None, ["arm64"]), "ios-arm64_x86_64-simulator": ("ios", "simulator", ["arm64", "x86_64"]), "macos-arm64_x86_64": ("macos", None, ["arm64", "x86_64"])}
         libraries = []
         for identifier, (platform, variant, arches) in slices.items():
             if os.environ.get("MISSING_SLICE") == identifier:
@@ -65,6 +67,10 @@ if name == "make":
             (framework / "Modules/module.modulemap").write_text("module wrong {}")
         if broken == "plist":
             (framework / "Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "999"}))
+        if os.environ.get("FAT_ARCH"):
+            (product / "macos-arm64/libzcashlc.framework/libzcashlc").write_text("arm64 x86_64")
+        if os.environ.get("STALE_EXTRA"):
+            (product / "macos-arm64_x86_64").mkdir()
         if os.environ.get("WRONG_ARCH"):
             (product / "ios-arm64/libzcashlc.framework/libzcashlc").write_text("x86_64")
         if os.environ.get("MUTATE_SOURCE") == target:
@@ -150,7 +156,7 @@ class NativeRecordTests(unittest.TestCase):
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
 
     def artifacts(self, *flags, record=True, expected_source=None, **env):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k not in ("GH_REPO", "SWIFT", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_", "ZODL_OHTTP_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog))
         if record:
             environment["ZODL_SDK_BUILD_RECORD"] = "1"
@@ -199,7 +205,7 @@ if sys.argv[1:] == ["--version"]:
         self.assertFalse(any(c[:2] in (["release", "create"], ["release", "upload"], ["release", "edit"]) for c in self.gh_calls()))
 
     def policy_environment(self):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k != "GH_REPO"}
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_", "ZODL_OHTTP_")) and k != "GH_REPO"}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog), GH_REPO="owner/sdk")
         real_git = shutil.which("git")
         sentinel = self.tools / "git"
@@ -289,12 +295,44 @@ if sys.argv[1:] == ["--version"]:
         self.assertEqual(self.make_calls(), [[target] for target in TARGETS])
         self.assertEqual(proof["commands"], [["make", target] for target in TARGETS])
         self.assertEqual(proof["component_versions"], dict(cargo="5.0.0", lock="5.0.0", plist_short="5.0.0", plist_build="42"))
-        self.assertEqual(len(proof["slices"]), 3)
+        self.assertEqual({s["identifier"] for s in proof["slices"]}, {"ios-arm64", "ios-arm64-simulator", "macos-arm64"})
+        self.assertTrue(all(s["architectures"] == ["arm64"] for s in proof["slices"]))
         self.assertEqual(proof["execution"], dict(backend="local", request_id="c"*32, workflow=None))
         self.assertTrue(all(proof["toolchains"].values()))
         self.assertFalse((self.source / "LocalPackages").exists())
         self.assertTrue(any(c[:2] == ["release", "upload"] and any("sdk-build-record.json" in a for a in c) for c in self.gh_calls()))
         self.assertTrue((self.products / "release.env").is_file())
+
+    def rust_identity_fixtures(self, *, bound):
+        directory = self.root / "selected-rust" if bound else self.tools
+        directory.mkdir(exist_ok=True)
+        for name in ("cargo", "rustc"):
+            executable = directory / name
+            expected = ["--version", "--verbose"] if bound else ["+stable", "--version", "--verbose"]
+            executable.write_text("#!/usr/bin/env python3\nimport sys\n"
+                                  + "if sys.argv[1:] != " + repr(expected) + ": sys.exit(9)\n"
+                                  + "print(" + repr(("selected" if bound else "fallback") + " " + name + " identity") + ")\n")
+            executable.chmod(0o755)
+        return {name.upper(): str(directory / name) for name in ("cargo", "rustc")} if bound else {}
+
+    def test_record_uses_selected_real_rust_binaries_without_proxy_arguments(self):
+        result = self.artifacts(**self.rust_identity_fixtures(bound=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["toolchains"]["cargo"], "selected cargo identity")
+        self.assertEqual(self.record()["toolchains"]["rustc"], "selected rustc identity")
+
+    def test_record_keeps_stable_proxy_fallback_without_selected_rust_binaries(self):
+        result = self.artifacts(**self.rust_identity_fixtures(bound=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record()["toolchains"]["cargo"], "fallback cargo identity")
+        self.assertEqual(self.record()["toolchains"]["rustc"], "fallback rustc identity")
+
+    def test_record_rejects_invalid_selected_rust_without_echoing_raw_override(self):
+        raw = "/invalid/private-secret\nVALUE=1"
+        result = self.artifacts(CARGO=raw)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("private-secret", result.stdout + result.stderr)
+        self.assert_no_release_write()
 
     def test_make_swift_identity_target_is_quiet_and_read_only(self):
         environment = {key: value for key, value in os.environ.items() if key not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
@@ -379,6 +417,14 @@ if sys.argv[1:] == ["--version"]:
         result = self.artifacts(WRONG_ARCH="1")
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_release_write()
+
+    def test_universal_fat_and_stale_extra_products_are_rejected(self):
+        for variable in ("OLD_UNIVERSAL", "FAT_ARCH", "STALE_EXTRA"):
+            with self.subTest(variable=variable):
+                self.ghlog.unlink(missing_ok=True)
+                result = self.artifacts(**{variable: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assert_no_release_write()
 
     def test_symlink_product_is_rejected(self):
         result = self.artifacts(SYMLINK_PRODUCT="1")
