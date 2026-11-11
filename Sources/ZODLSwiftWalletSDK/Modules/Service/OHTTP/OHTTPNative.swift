@@ -62,17 +62,68 @@ enum OHTTPNative {
     /// `ClientProfile::IOS` of the shared core.
     static let profile: UInt32 = 2
 
-    /// Every valid native SDK build supplies both networks. A missing host is an SDK invariant failure.
-    static func gatewayHost(for network: NetworkType) -> String {
+    /// Installs `mainnet` and `testnet` in the shared core, which checks every value and keeps a copy; nil turns
+    /// OHTTP off for that network.
+    ///
+    /// - Throws: ``ZcashError/ohttpConfigurationInvalid(_:)`` with the core's message, which names the network, the
+    ///   field and the rule, never the value. The configuration installed before stays.
+    static func configure(mainnet: OHTTPNetworkConfiguration?, testnet: OHTTPNetworkConfiguration?) throws {
+        let installed = withNativeConfiguration(of: mainnet) { mainnetConfiguration in
+            withNativeConfiguration(of: testnet) { testnetConfiguration in
+                zcashlc_ohttp_configure(mainnetConfiguration, testnetConfiguration)
+            }
+        }
+        guard installed else {
+            throw ZcashError.ohttpConfigurationInvalid(lastErrorMessage(fallback: "The OHTTP configuration was refused"))
+        }
+    }
+
+    /// Calls `body` with `network` laid out as `zcashlc_ohttp_configure` takes it, or with null for nil. The
+    /// pointers are valid only during the call.
+    private static func withNativeConfiguration<R>(
+        of network: OHTTPNetworkConfiguration?,
+        _ body: (UnsafePointer<FfiOhttpNetworkConfigV1>?) -> R
+    ) -> R {
+        guard let network else {
+            return body(nil)
+        }
+        let gatewayHost = Array(network.gatewayHost.utf8)
+        let relayURL = Array(network.relayURL.utf8)
+        let keysDNSName = Array(network.keysDNSName.utf8)
+        let signingPublicKey = Array(network.signingPublicKey.utf8)
+        return gatewayHost.withUnsafeBufferPointer { gatewayHostBytes in
+            relayURL.withUnsafeBufferPointer { relayURLBytes in
+                keysDNSName.withUnsafeBufferPointer { keysDNSNameBytes in
+                    signingPublicKey.withUnsafeBufferPointer { signingPublicKeyBytes in
+                        let configuration = FfiOhttpNetworkConfigV1(
+                            gateway_host: gatewayHostBytes.baseAddress,
+                            gateway_host_len: UInt(gatewayHostBytes.count),
+                            relay_url: relayURLBytes.baseAddress,
+                            relay_url_len: UInt(relayURLBytes.count),
+                            keys_dns_name: keysDNSNameBytes.baseAddress,
+                            keys_dns_name_len: UInt(keysDNSNameBytes.count),
+                            signing_pubkey: signingPublicKeyBytes.baseAddress,
+                            signing_pubkey_len: UInt(signingPublicKeyBytes.count)
+                        )
+                        return withUnsafePointer(to: configuration) { body($0) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gateway host the installed configuration has for `network`, or nil when OHTTP is off for it.
+    static func gatewayHost(for network: NetworkType) -> String? {
         guard let result = zcashlc_ohttp_gateway_host(network == .testnet) else {
-            preconditionFailure("SDK invariant: native OHTTP gateway configuration is unavailable")
+            return nil
         }
         defer { zcashlc_string_free(result) }
         return String(cString: result)
     }
 
     /// Verifies the signed key-configuration `envelope` fetched for `gatewayHost` and selects the gateway's
-    /// key out of it. The network, and so the pinned signing key, follows from the host.
+    /// key out of it. The network, and so the installed signing key the envelope is checked against, follows
+    /// from the host.
     static func verifyKeyConfig(gatewayHost: String, envelope: Data, now: Date) throws -> OHTTPVerifiedKey {
         let seconds = UInt64(max(0, now.timeIntervalSince1970))
         let host = Array(gatewayHost.utf8)
@@ -227,9 +278,8 @@ enum OHTTPNative {
         )
     }
 
-    /// Returns the relay URL for a given gateway host, or nil if the host is not a known gateway.
-    /// The built-in mapping can be overridden at build time via environment variables
-    /// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET`.
+    /// Returns the relay URL the installed configuration has for a gateway host, or nil if the host is not the
+    /// gateway of a configured network. Host matching ignores ASCII case.
     static func relayURL(for gatewayHost: String) -> String? {
         let host = Array(gatewayHost.utf8)
         let result: UnsafeMutablePointer<CChar>? = host.withUnsafeBufferPointer { hostBuffer in

@@ -123,6 +123,7 @@ mod migration_keystone;
 mod migration_plan_cache;
 mod migration_turnstile;
 mod ohttp;
+mod ohttp_config;
 mod ohttp_health;
 mod payment_uri;
 mod retained_marks;
@@ -8898,6 +8899,8 @@ pub unsafe extern "C" fn zcashlc_slipstream_tor_startup_free_v1(
 }
 
 /// Opt-in bounded Tor start. The capability supplies generation and deadline; each is one-shot.
+/// Like [`zcashlc_slipstream_start`], it reads the installed OHTTP configuration: a gateway endpoint rides
+/// OHTTP only when one is installed for the wallet's network, otherwise it is a plain server.
 /// Returns false for reused/stale/cancelled/expired capabilities without disturbing the active pass.
 /// Retained capability status reports startup, independently of legacy progress/error snapshots.
 /// # Safety
@@ -9179,7 +9182,9 @@ fn install_slipstream_panic_hook() {
 /// Opens a Slipstream engine handle.
 ///
 /// - `db_data`/`db_data_len`: path to the wallet data.db (UTF-8 bytes, no NUL terminator).
-/// - `server_host`/`server_host_len`: lightwalletd hostname (UTF-8 bytes).
+/// - `server_host`/`server_host_len`: lightwalletd hostname (UTF-8 bytes). When it is the
+///   gateway of a network in the installed OHTTP configuration (`zcashlc_ohttp_configure`),
+///   each [`zcashlc_slipstream_start`] reaches it through OHTTP.
 /// - `server_port`: lightwalletd port.
 /// - `use_tls`: `true` for TLS (mainnet), `false` for plaintext.
 /// - `network_id`: `1` for mainnet, `0` for testnet.
@@ -9440,6 +9445,8 @@ pub(crate) fn anchor_retention_policy(network: NetworkParams) -> Option<AnchorRe
 ///
 /// Can be called after [`zcashlc_slipstream_stop`] to restart. Cancels any in-flight
 /// sync before spawning the new one.
+/// Each start reads the OHTTP configuration installed at that moment (`zcashlc_ohttp_configure`)
+/// and the pass keeps it; a configuration installed later applies from the next start.
 /// Returns `true` on success, `false` on error
 /// (check [`zcashlc_get_last_error_message`] for the error text).
 ///
@@ -9573,11 +9580,14 @@ unsafe fn start_slipstream(
             )
         };
 
+        // The OHTTP configuration the app installed, as it stands at this start: the pass keeps
+        // it, and the next start reads the installed one again.
         #[allow(unused_mut)] // `mut` is only used under the `gpu` feature below.
         let mut cfg = slipstream_core::config::EngineConfig::new(
             h.network,
             h.wallet_db_path.clone(),
             h.endpoint.clone(),
+            (*ohttp_config::installed_networks()).clone(),
         )
         // T8.4: derate fetch/split budgets on <3 GiB devices from the open-time
         // physical-memory hint (0 = unknown → defaults). Explicit field overrides win.
@@ -9972,7 +9982,9 @@ pub unsafe extern "C" fn zcashlc_slipstream_notify_tx_change(
 /// a short-lived runtime and blocks until resolved (typically one round-trip; the direct
 /// path is a SINGLE attempt — the offline fallback IS the retry policy). When `tor_dir` is
 /// non-empty the identifying fetches ride an isolated Tor circuit; a requested-but-failed
-/// Tor bootstrap resolves OFFLINE — never a de-anonymising direct retry.
+/// Tor bootstrap resolves OFFLINE — never a de-anonymising direct retry. A `server_host` that
+/// is the gateway of a network in the installed OHTTP configuration (`zcashlc_ohttp_configure`)
+/// is reached through OHTTP.
 ///
 /// Returns null only on invalid arguments or an internal panic. Free with
 /// [`zcashlc_slipstream_free_restore_anchor`].
@@ -10029,6 +10041,8 @@ pub unsafe extern "C" fn zcashlc_slipstream_restore_anchor(
             slipstream_core::anchor::AnchorIntent::New
         };
 
+        // A server that is the gateway of a network the app configured is reached through OHTTP.
+        let ohttp = ohttp_config::installed_networks();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -10050,8 +10064,14 @@ pub unsafe extern "C" fn zcashlc_slipstream_restore_anchor(
                 }
                 None => None,
             };
-            slipstream_core::anchor::restore_anchor(&endpoint, network.into(), intent, tor_conn.as_ref())
-                .await
+            slipstream_core::anchor::restore_anchor(
+                &ohttp,
+                &endpoint,
+                network.into(),
+                intent,
+                tor_conn.as_ref(),
+            )
+            .await
         });
 
         let (ts_ptr, ts_len) = match anchor.treestate {

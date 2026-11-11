@@ -12,7 +12,7 @@ _ffi_fixture() {
     for input in Cargo.toml Cargo.lock Makefile rust/lib.rs BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py BuildSupport/ohttp-config-version; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ffi_layout.py; do
         printf 'fixture\n' > "$repo/$input"
     done
     printf 'BuildSupport/products/\n' > "$repo/.gitignore"
@@ -26,11 +26,7 @@ _ffi_commit() {
 }
 
 _ffi_hash() {
-    CI=1 ZODL_OHTTP_GATEWAY_HOST_MAINNET=main.example.invalid ZODL_OHTTP_GATEWAY_HOST_TESTNET=test.example.invalid \
-    ZODL_OHTTP_RELAY_URL_MAINNET="${HASH_RELAY_MAINNET:-https://main.example.invalid/relay}" ZODL_OHTTP_RELAY_URL_TESTNET=https://test.example.invalid/relay \
-    ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-    ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=main.example.invalid ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=test.example.invalid \
-        "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$1"
+    CI=1 "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$1"
 }
 
 _assert_hash_changed() {
@@ -108,7 +104,7 @@ test_ffi_hash_rejects_invalid_inputs() {
     for input in Cargo.toml Cargo.lock Makefile rust BuildSupport/Makefile \
         BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap \
         BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh \
-        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ohttp_env.py Scripts/lib/ffi_layout.py BuildSupport/ohttp-config-version; do
+        Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ffi_layout.py; do
         copy="$(mktemp -d "$SCRATCH/ffi-missing.XXXXXX")"
         git clone -q "$repo" "$copy"
         git -C "$copy" rm -qr "$input"
@@ -192,12 +188,22 @@ test_swift_dependency_archive_excludes_products_and_credentials() {
 }
 
 # A changed runner changes native build semantics even when Rust is unchanged.
-test_ffi_hash_covers_relay_runner_source() {
+test_ffi_hash_covers_layout_runner_source() {
     local repo before
     repo="$(_ffi_fixture)"
     before="$(_ffi_hash "$repo")"
-    printf 'changed\n' >> "$repo/Scripts/lib/ohttp_env.py"
+    printf 'changed\n' >> "$repo/Scripts/lib/ffi_layout.py"
     _assert_hash_changed "$before" "$repo" 'runner source invalidates committed native input hash'
-    before="$(_ffi_hash "$repo")"
-    assert_succeeds 'relay values fingerprint cache identity' test "$before" != "$(HASH_RELAY_MAINNET=https://synthetic.example.invalid _ffi_hash "$repo")"
+}
+
+# The OHTTP configuration is installed at runtime, so no build input carries it:
+# the hash needs no configuration helper (the fixture has none) and does not
+# depend on whatever the environment holds.
+test_ffi_hash_has_no_ohttp_configuration_component() {
+    local repo plain configured
+    repo="$(_ffi_fixture)"
+    plain="$(env -u ZODL_OHTTP_GATEWAY_HOST_MAINNET -u ZODL_OHTTP_RELAY_URL_MAINNET "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$repo")"
+    configured="$(ZODL_OHTTP_GATEWAY_HOST_MAINNET=ohttp-gateway.example ZODL_OHTTP_RELAY_URL_MAINNET=https://relay-mainnet.example/relay "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" "$repo")"
+    assert_eq "$plain" "$configured" 'OHTTP environment does not change the FFI input hash'
+    assert_file_lacks "$REPO_ROOT/Scripts/ci/ffi-input-hash.sh" 'ohttp' 'the hash script names no OHTTP input'
 }

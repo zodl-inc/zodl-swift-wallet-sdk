@@ -1,11 +1,11 @@
 name: "Authorize cargo against the private slipstream repository"
 description: >-
-  Mints a short-lived read token for the private zodl-inc repositories cargo fetches (slipstream,
-  slipstream-internal and zodl-ohttp) and points cargo's git fetches at it. `slipstream-core` and
-  `zodl-ohttp-client` are git dependencies on those private repos, and cargo fetches the source while
-  resolving the dependency graph — before feature selection — so every job that runs cargo needs
-  read access with the SDK's default features. Without it cargo reports
-  "revision ... not found / failed to authenticate".
+  Mints a short-lived read token for the private zodl-inc repositories cargo fetches (slipstream
+  and slipstream-internal) and points cargo's git fetches at it. `slipstream-core` is a git
+  dependency on those private repos, and cargo fetches the source while resolving the dependency
+  graph — before feature selection — so every job that runs cargo needs read access with the SDK's
+  default features. Without it cargo reports "revision ... not found / failed to authenticate".
+  `zodl-ohttp-client` comes from crates.io and needs no token.
 
   A no-op when the inputs are empty, which is what happens on pull requests from forks: secrets
   are unavailable there by design, so those runs still cannot build the Rust library. Fixing that
@@ -14,7 +14,7 @@ description: >-
 inputs:
   app-id:
     description: >-
-      App ID of the GitHub App holding Contents:Read on zodl-inc/slipstream, slipstream-internal and zodl-ohttp. Leave empty to skip
+      App ID of the GitHub App holding Contents:Read on zodl-inc/slipstream and slipstream-internal. Leave empty to skip
       the credential setup entirely.
     required: false
     default: ""
@@ -26,7 +26,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Mint a read token for the private slipstream and zodl-ohttp repositories
+    - name: Mint a read token for the private slipstream repositories
       id: token
       if: inputs.app-id != '' && inputs.app-private-key != ''
       uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
@@ -36,7 +36,7 @@ runs:
         # The App is installed on zodl-inc, not on this repository's owner, so the installation
         # to mint against has to be named explicitly.
         owner: zodl-inc
-        repositories: slipstream,slipstream-internal,zodl-ohttp
+        repositories: slipstream,slipstream-internal
         # Narrow the minted token to exactly what cargo needs, rather than inheriting whatever
         # the App's installation happens to hold. Fetching a git dependency is a read of repository
         # contents and nothing more.

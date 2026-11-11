@@ -56,12 +56,6 @@ if ! command -v cargo >/dev/null 2>&1; then
     export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-# Resolve before any architecture loop or product replacement. Inner Cargo
-# invocations validate the inherited complete environment without loading it again.
-if [[ "$MODE" != cached && "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
-    exec python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 /bin/bash Scripts/init-local-ffi.sh "$@"
-fi
-
 XCFRAMEWORK_DIR=LocalPackages/libzcashlc.xcframework
 mkdir -p LocalPackages
 STAGE=$(mktemp -d LocalPackages/.ffi-stage.XXXXXX)
@@ -131,7 +125,7 @@ else
             macos) triple=aarch64-apple-darwin; slice=macos-arm64 ;;
         esac
         rustup target add "$triple"
-        python3 Scripts/lib/ohttp_env.py --required -- cargo build --locked --target "$triple" --release "${CARGO_FEATURES[@]}"
+        cargo build --locked --target "$triple" --release "${CARGO_FEATURES[@]}"
         framework="$STAGED_XCFW/$slice/libzcashlc.framework"
         mkdir -p "$framework/Headers" "$framework/Modules"
         cp "target/$triple/release/libzcashlc.a" "$framework/libzcashlc"

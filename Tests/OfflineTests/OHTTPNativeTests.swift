@@ -13,7 +13,12 @@ import CryptoKit
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPNativeTests: XCTestCase {
-    func testGatewayHostsExposeTheNativeBuildConfiguration() {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
+    func testGatewayHostsAreThoseOfTheInstalledConfiguration() {
         XCTAssertEqual(OHTTPNative.gatewayHost(for: .mainnet), OHTTPTestSupport.mainnetHost)
         XCTAssertEqual(OHTTPNative.gatewayHost(for: .testnet), OHTTPTestSupport.testnetHost)
         XCTAssertEqual(OHTTPEndpoints.gatewayHost(for: .mainnet), OHTTPTestSupport.mainnetHost)
@@ -21,12 +26,12 @@ final class OHTTPNativeTests: XCTestCase {
     }
 
     func testConfiguredGatewayRoutingNormalizesCaseAndRejectsTheOtherNetwork() throws {
-        for (network, host, otherNetwork) in [
-            (NetworkType.mainnet, OHTTPTestSupport.mainnetHost, NetworkType.testnet),
-            (NetworkType.testnet, OHTTPTestSupport.testnetHost, NetworkType.mainnet)
+        for (network, configuration, otherNetwork) in [
+            (NetworkType.mainnet, OHTTPTestSupport.exampleMainnet, NetworkType.testnet),
+            (NetworkType.testnet, OHTTPTestSupport.exampleTestnet, NetworkType.mainnet)
         ] {
-            let suffix = network == .mainnet ? "MAINNET" : "TESTNET"
-            let expectedRelay = OHTTPTestSupport.configuredValue("ZODL_OHTTP_RELAY_URL_\(suffix)")
+            let host = configuration.gatewayHost
+            let expectedRelay = configuration.relayURL
             for caller in [host, host.uppercased(), host.lowercased()] {
                 XCTAssertTrue(OHTTPEndpoints.isGateway(caller))
                 XCTAssertEqual(try OHTTPEndpoints.relayURL(for: caller), expectedRelay)

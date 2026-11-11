@@ -6,10 +6,56 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Changed
+
+- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
+  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
+- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
+  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
+  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
+- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
+  stops compiling until they are handled.
+- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
+  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
+  more notes than one transaction can spend within the block size limit is now refused when the
+  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
+  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
+  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
+  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
+  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
+  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
+  None of the new cases carries the recipient, the memo or an amount.
+- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
+  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
+  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
+  `rustProposeTransfer` or `rustProposeTransferFromURI`.
+
+# 8.0.0 - 2026-11-06
+
 ## Added
 
-- `OHTTPEndpoints.gatewayHost(for:)` returns the gateway configured into the native SDK for the
-  selected network. Use it when constructing gateway endpoints instead of a fixed hostname.
+- `OHTTPNetworkConfiguration` (gateway host, relay URL, key DNS name and signing public key of one network),
+  `OHTTPConfiguration` (mainnet and testnet) and `OHTTPEndpoints.configure(_:)` install the OHTTP configuration
+  at runtime. Call it once at launch, before any other SDK use. `OHTTPEndpoints.configuration` returns the
+  installed one. Passing `nil`, or never calling it, leaves OHTTP off. An invalid configuration throws the new
+  `ZcashError.ohttpConfigurationInvalid` (`ZTSRV0009`), whose message names the field and the rule but never
+  the value; descriptions and `dump` of the configuration types never show the values either. An exhaustive
+  `switch` over `ZcashError` must handle the new case.
+
+- `OHTTPEndpoints.gatewayHost(for:)` returns `String?`: the gateway host `configure` installed for the
+  network, or `nil` until it does. Use it when constructing gateway endpoints instead of a fixed hostname.
+
+- The binaries carry no OHTTP configuration, and a source build needs no OHTTP inputs. Whatever the app
+  passes to `configure` is in the app and subject to its own protection.
+
+- While OHTTP is off for a network, that network's gateway host is treated as a plain lightwalletd server,
+  requests to the proxied third-party hosts (the CoinMarketCap, NEAR and Flexa aliases) fail, and the
+  predefined voting servers are reached directly (Tor still applies). With a configuration for the
+  wallet's network they ride OHTTP and fail closed.
+
+- Public keys verified under one configuration are never reused under another; `configure` replaces the
+  previous configuration completely.
 
 - `Broadcaster.resubmitUnacceptedTransactions(through:timing:)`, and `resubmitUnacceptedTransactions(through:)`
   with the default timing, send every transaction that was submitted but that no server has accepted yet
@@ -73,6 +119,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- OHTTP requests are padded to fixed size buckets (`zodl-ohttp-client` 1.0). A lightwalletd
+  `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of 32 KiB when larger.
+  Every other request is padded to the next multiple of 4 KiB. The relay and the network see a few
+  request sizes only.
 - The FFI XCFramework now supports ARM64 only on iOS devices, iOS simulators, and macOS.
   Intel Macs and x86_64 simulators are no longer supported. Use an Apple Silicon Mac and an
   ARM64 simulator; macOS 14 and iOS 16 remain the minimum versions.
@@ -97,16 +147,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In Private, Public and Manual modes, downloads use direct HTTPS with Tor off and Tor with
   Tor on. They do not use OHTTP. Existing parameter caching and SHA-256 verification remain;
   applications using `SaplingParamsSourceURL.default` need no call-site edits.
-
-- Compiled OHTTP gateway/relay hosts, DNS names and signing public keys are observable in binaries.
-  Keeping these configuration literals out of source does not make the compiled configuration
-  confidential. Treat them as observable public configuration, even when supplied through CI secrets.
-
-- Native SDK source builds reject shared mainnet/testnet gateway hosts, relay URLs, signing
-  keys or key DNS names, including case-only differences. Export all eight inputs with distinct
-  values for each corresponding network pair and 64 ASCII hex digits per signing key. Build
-  wrappers force `ZODL_OHTTP_REQUIRE=1`; it is build policy, not an additional secret.
-  Precompiled SDK consumers and Swift call sites need no changes. See `MIGRATING.md`.
 
 - OHTTP relay connections detect silent calls from received traffic and per-call stall limits
   without HTTP/2 keep-alive PINGs, so slow or Tor connections are not retired for a late PING
@@ -194,29 +234,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests as `message/ohttp-chunked-req` and incrementally decode `message/ohttp-chunked-res`
   responses. Relay and gateway endpoints must support chunked OHTTP; single-shot RFC 9458 OHTTP is
   no longer used. See PR #4 in zodl-inc/ohttp.
-
-- `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
-  `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
-  An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
-- A shortfall found while selecting change now throws `rustProposalInsufficientFunds` with both
-  amounts from `proposeTransfer`, `proposefulfillingPaymentURI` and `proposeSendMax`, where it
-  previously surfaced as the call site's own case with `RustErrorKind.changeSelectionFailed`.
-- `RustErrorKind` gains `transactionTooLarge` and `transparentMemo`. An exhaustive `switch` over it
-  stops compiling until they are handled.
-- `proposeSendMax(accountUUID:recipient:memo:mode:)` (on `Synchronizer`, `ClosureSynchronizer` and
-  `CombineSynchronizer`) types every failure a wallet is expected to explain. A balance spread over
-  more notes than one transaction can spend within the block size limit is now refused when the
-  proposal is made, throwing the new `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`);
-  before, the proposal succeeded and only creating its transaction failed. A memo for a transparent
-  or TEX recipient throws the new `rustProposalTransparentMemo` (`ZRUST0175`), and a recipient with
-  no receiver the wallet can pay throws the new `rustProposalUnsupportedAddress` (`ZRUST0176`).
-  Each of these previously surfaced as `rustProposeSendMaxTransfer` (`ZRUST0129`), which now
-  carries only the remaining, unclassified failures: a `catch` keyed on it no longer sees them.
-  None of the new cases carries the recipient, the memo or an amount.
-- `proposeTransfer(accountUUID:recipient:amount:memo:)` and
-  `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
-  (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
-  `rustProposeTransfer` or `rustProposeTransferFromURI`.
 
 ## Fixed
 
@@ -397,6 +414,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Voting rounds with NU7 snapshots are now supported. Public API signatures are unchanged.
   For custom regtest snapshots at height 11 or later, the registered activation schedule must
   select NU7; otherwise opening the voting session rejects the consensus-branch mismatch.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3540000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3545000.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4580000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4590000.json
+````
 
 # 7.0.1 - 2026-11-02
 

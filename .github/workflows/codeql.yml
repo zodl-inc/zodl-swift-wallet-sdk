@@ -39,16 +39,6 @@ permissions:
 
 jobs:
   analyze:
-    env:
-      ZODL_OHTTP_REQUIRE: '1'
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -136,13 +126,6 @@ jobs:
       run: |
         python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
 
-    - name: Validate OHTTP configuration
-      id: ohttp-config
-      if: matrix.language == 'swift'
-      run: |
-        OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
-        echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
-
     - name: Generate FFI source hash
       if: matrix.language == 'swift'
       id: ffi-hash
@@ -190,9 +173,9 @@ jobs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
+          codeql-${{ runner.os }}-cargo-v4-${{ steps.toolchain.outputs.cachekey }}-
 
     # The arm64 macOS slice without fat LTO is all the Swift build needs for
     # analysis; the universal LTO build used to run into the 30-minute limit.

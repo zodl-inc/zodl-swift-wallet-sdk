@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "7.0.1"
+version = "8.0.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -150,8 +150,8 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# The OHTTP engine patch below still identifies itself as 0.4.0.
-slipstream-core = { version = "=0.4.0", package = "zodl-slipstream" }
+# 0.5.0 takes the OHTTP configuration at runtime.
+slipstream-core = { version = "=0.5.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
@@ -159,10 +159,11 @@ hex = "0.4"
 # Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
 # key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
-# `zcashlc_ohttp_*` C functions. It is a private repository, so cargo needs the same read token as
-# `slipstream-core` (see `.github/actions/authorize-slipstream`). Pinned by commit: a stale hash
-# fails loudly, a branch would follow a force-push. Both SDK and Slipstream share this source.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0324db3240adf00ea847aa0a93e8d765e32b61da", default-features = false }
+# `zcashlc_ohttp_*` C functions. From crates.io, pinned to the exact version; 1.0.1 is the v1.0.0
+# release with crates.io metadata. The SDK and Slipstream must take it from the same source: the
+# engine takes the OHTTP configuration as this crate's `OhttpNetworks`, which a second source would
+# make a different type.
+zodl-ohttp-client = { version = "=1.0.1", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -229,9 +230,6 @@ lto = true
 strip = false
 
 [patch.crates-io]
-# OHTTP transport on the released NU7 dependency family, pinned to its reviewed commit.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "44d821779e96fb9f8ee9e2147cb1b1536a662941" }
-
 # DO NOT ALTER THIS COMMENT
 #
 # This section is left in place to ensure that development against in-progress

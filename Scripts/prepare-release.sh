@@ -452,21 +452,6 @@ produce_artifacts() {
     : "${GH_REPO:=${GITHUB_REPOSITORY:-$DEFAULT_REPO}}"
     export GH_REPO
 
-    # Keep compilation and native-sensitive verification in the same resolved
-    # child. Re-enter only artifact production, so caller-side version/PR work
-    # is not repeated and validation precedes destructive product cleanup.
-    if [ "$DRY_RUN" != "true" ] && [ "${OHTTP_ENV_RESOLVED:-}" != "1" ]; then
-        local -a config_args=(artifacts "$version")
-        [ "$force" != "true" ] || config_args+=(--force-overwrite-existing-release)
-        [ "$verify" != "false" ] || config_args+=(--skip-verify)
-        python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 \
-            /bin/bash Scripts/prepare-release.sh "${config_args[@]}"
-        return
-    fi
-    if [ "$DRY_RUN" != "true" ]; then
-        python3 Scripts/lib/ohttp_env.py --required
-    fi
-
     if [ "${ZODL_SDK_BUILD_RECORD:-}" = "1" ]; then
         [ "$verify" = "true" ] && [ "$DRY_RUN" = "false" ] || \
             die "native build evidence requires verification and a real build."

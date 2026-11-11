@@ -765,6 +765,8 @@ public protocol Synchronizer: AnyObject {
 
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
     /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`).
+    /// While OHTTP is off for the wallet's network (see `OHTTPEndpoints.configure(_:)`) the request
+    /// fails; it never goes out directly.
     ///
     /// - Parameters:
     ///    - for: URLRequest with the OHTTP proxy hostname (use `OHTTPEndpoints.proxyURL(for:)` to convert)
@@ -810,13 +812,17 @@ public protocol Synchronizer: AnyObject {
     ///    - route: Which route every service the session touches takes.
     ///    - isCustomServer: Whether the voter chose the round's vote and PIR servers
     ///      themselves rather than taking the predefined ones. Required. Read only on
-    ///      `.direct`, where it decides between the two clearnet-side routes: `false`
-    ///      (predefined servers) opens the session over OHTTP through the relay and
-    ///      gateway and fails closed with ``VotingErrorKind/invalidInput`` when a chain
-    ///      or PIR endpoint is not one the gateway carries; `true` (custom servers)
-    ///      opens it on a plain direct connection. On `.tor` it has no effect: Tor
-    ///      reaches the servers directly either way. PIR queries always share the
-    ///      session's route.
+    ///      `.direct`, where it decides between the clearnet-side routes. `false`
+    ///      (predefined servers) depends on the OHTTP configuration
+    ///      (`OHTTPEndpoints.configure(_:)`): with one for the wallet's network, the
+    ///      session rides OHTTP through the relay and gateway and fails closed,
+    ///      throwing ``VotingErrorKind/invalidInput`` when a chain or PIR endpoint is
+    ///      not one the gateway carries and never falling back to a direct connection
+    ///      when the gateway is unavailable; with no configuration for that network,
+    ///      the servers are reached on a plain direct connection. `true` (custom
+    ///      servers) always opens it on a plain direct connection. On `.tor` it has
+    ///      no effect: Tor reaches the servers directly either way, configured or not.
+    ///      PIR queries always share the session's route.
     ///    - epoch: The submission epoch the session starts at.
     func makeVotingRoundSession(
         backend: VotingRustBackend,
