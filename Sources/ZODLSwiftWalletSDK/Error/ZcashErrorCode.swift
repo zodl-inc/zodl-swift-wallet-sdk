@@ -221,6 +221,12 @@ public enum ZcashErrorCode: String {
     case rustProposalScanRequired = "ZRUST0153"
     /// The spendable balance does not cover this payment and its fee.
     case rustProposalInsufficientFunds = "ZRUST0154"
+    /// The transaction would spend too many notes to fit in a block.
+    case rustProposalTransactionTooLarge = "ZRUST0174"
+    /// The recipient cannot receive a memo.
+    case rustProposalTransparentMemo = "ZRUST0175"
+    /// The recipient address has no receiver this wallet can pay.
+    case rustProposalUnsupportedAddress = "ZRUST0176"
     /// Error from rust layer when calling TorClient.init
     case rustTorClientInit = "ZRUST0062"
     /// Error from rust layer when calling TorClient.get

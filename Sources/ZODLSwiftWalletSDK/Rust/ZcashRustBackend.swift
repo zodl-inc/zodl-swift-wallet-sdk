@@ -442,10 +442,15 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         )
 
         guard let proposal else {
-            throw proposalError(
-                fallback: "`proposeSendMaxTransfer` failed with unknown error",
-                wrap: ZcashError.rustProposeSendMaxTransfer
-            )
+            let fallback = "`proposeSendMaxTransfer` failed with unknown error"
+
+            // The immediate migration lane (`orchardOnly`) keeps the mapping it has always had;
+            // only the user's send-max reports the send-max cases.
+            if orchardOnly {
+                throw proposalError(fallback: fallback, wrap: ZcashError.rustProposeSendMaxTransfer)
+            }
+
+            throw sendMaxProposalError(fallback: fallback)
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -3099,8 +3104,8 @@ nonisolated func lastErrorReport(fallback: String) -> RedactedRustError {
 }
 
 /// Maps a failed proposal or transaction-creation call to the `ZcashError` the wallet should act
-/// on: a dedicated case for the two conditions a wallet is expected to render itself, and
-/// otherwise the per-call-site case supplied by `wrap`.
+/// on: a dedicated case for the conditions a wallet is expected to render itself, and otherwise
+/// the per-call-site case supplied by `wrap`.
 ///
 /// `wrap` is what keeps the call sites distinguishable. Before this existed all four of them
 /// threw `rustCreateToAddress`, so a user's error report could not say whether the failure
@@ -3109,8 +3114,15 @@ nonisolated func proposalError(
     fallback: String,
     wrap: (RedactedRustError) -> ZcashError
 ) -> ZcashError {
-    let report = lastErrorReport(fallback: fallback)
+    proposalError(for: lastErrorReport(fallback: fallback), wrap: wrap)
+}
 
+/// The mapping `proposalError(fallback:wrap:)` applies, separated from the read of the last
+/// rust error so it can be exercised with any report.
+nonisolated func proposalError(
+    for report: RedactedRustError,
+    wrap: (RedactedRustError) -> ZcashError
+) -> ZcashError {
     switch report.kind {
     case .scanRequired:
         return .rustProposalScanRequired
@@ -3121,8 +3133,37 @@ nonisolated func proposalError(
         }
         return .rustProposalInsufficientFunds(available, required)
 
+    case .transactionTooLarge:
+        return .rustProposalTransactionTooLarge
+
     default:
         return wrap(report)
+    }
+}
+
+/// Maps a failed send-max proposal to the `ZcashError` the wallet should act on.
+///
+/// On top of `proposalError(for:wrap:)`, a send-max reports a memo its recipient cannot receive
+/// and a recipient with no payable receiver as their own cases; anything else is
+/// `rustProposeSendMaxTransfer`.
+nonisolated func sendMaxProposalError(fallback: String) -> ZcashError {
+    sendMaxProposalError(for: lastErrorReport(fallback: fallback))
+}
+
+/// The mapping `sendMaxProposalError(fallback:)` applies, separated from the read of the last
+/// rust error so it can be exercised with any report.
+nonisolated func sendMaxProposalError(for report: RedactedRustError) -> ZcashError {
+    proposalError(for: report) { report in
+        switch report.kind {
+        case .transparentMemo:
+            return .rustProposalTransparentMemo
+
+        case .noSupportedReceivers:
+            return .rustProposalUnsupportedAddress
+
+        default:
+            return .rustProposeSendMaxTransfer(report)
+        }
     }
 }
 
