@@ -6,6 +6,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `Zip317.marginalFee` is the ZIP 317 marginal fee (5,000 zatoshis), the fee per logical action
+  and the value at or below which a note costs more to spend than it carries. It is read from the
+  Rust core, so a wallet need not hardcode it, and needs no `Synchronizer`.
+
 ## Changed
 
 - `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
@@ -116,10 +122,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `api.flexa.co` maps to the mainnet gateway alias `flexa.zodl.com`, whose `Authorization` is the
   client's own and goes through (the gateway replaces only the placeholder publishable key).
-
-- `Zip317.marginalFee` is the ZIP 317 marginal fee (5,000 zatoshis), the fee per logical action
-  and the value at or below which a note costs more to spend than it carries. It is read from the
-  Rust core, so a wallet need not hardcode it, and needs no `Synchronizer`.
 
 ## Changed
 
