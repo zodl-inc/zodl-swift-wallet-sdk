@@ -860,7 +860,7 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(rejected.last, [transaction.txId])
     }
 
-    func testOneExplicitRejectionBesideATransientRefusalIsRecordedAsRejected() async throws {
+    func testOneExplicitRejectionBesideATransientRefusalStaysPending() async throws {
         let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
         defer { try? terminal.stop() }
         let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
@@ -868,10 +868,11 @@ final class BroadcasterTests: ZcashTestCase {
         let synchronizer = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
-        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
 
+        XCTAssertNil(outcome.rejection)
         let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
-        XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.invalid))
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "the transient refusal may clear on a later attempt")
     }
 
     /// A transport failure may hide an acceptance whose reply was lost: beside a terminal refusal it
@@ -1044,14 +1045,14 @@ final class BroadcasterTests: ZcashTestCase {
     }
 
     /// Answers that arrive after the deadline complete the verdict: once every endpoint has answered,
-    /// none accepted and one refused for good, the transaction is rejected.
+    /// none accepted and every refusal was for good, the transaction is rejected.
     func testLateAnswersAfterTheDeadlineCompleteARejection() async throws {
         let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
         let late = LightWalletEndpoint(address: "late.example.com", port: 443, secure: true)
         let endpointSubmitter = EndpointSubmitterMock()
         let gate = Gate()
         endpointSubmitter.set(behavior: .reject(code: -25, message: tooLargeMessage), for: rejecting)
-        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -25, message: "Missing inputs")), for: late)
+        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -26, message: "bad-txns-vout-negative")), for: late)
         let synchronizer = try makeSynchronizer(
             transactionEncoder: StubTransactionEncoder(createdTransactions: []),
             endpointSubmitter: endpointSubmitter
@@ -1070,9 +1071,10 @@ final class BroadcasterTests: ZcashTestCase {
 
     // MARK: - The outcome carries the recorded terminal refusal
 
-    /// One endpoint refuses transiently, another terminally, in either order: the transaction is
-    /// rejected, and the outcome carries the terminal refusal the SDK recorded, not the first one.
-    func testMixedTransientAndTerminalRefusalsInEitherOrderReportTheTerminalOne() async throws {
+    /// One endpoint refuses for good (the size limit), another in a way that may be transient (a
+    /// mempool chain limit), in either order: the transaction is not rejected, the outcome carries
+    /// no terminal refusal, and background resubmission keeps it.
+    func testATerminalRefusalBesideATransientOneInEitherOrderStaysPending() async throws {
         for terminalFirst in [true, false] {
             let terminal = LightWalletEndpoint(address: "terminal.example.com", port: 443, secure: true)
             let transient = LightWalletEndpoint(address: "transient.example.com", port: 443, secure: true)
@@ -1082,7 +1084,7 @@ final class BroadcasterTests: ZcashTestCase {
                 for: terminal
             )
             endpointSubmitter.set(
-                behavior: .rejectAfter(terminalFirst ? 0.2 : 0, code: -25, message: "Missing inputs"),
+                behavior: .rejectAfter(terminalFirst ? 0.2 : 0, code: -26, message: "too-long-mempool-chain"),
                 for: transient
             )
             let synchronizer = try makeSynchronizer(
@@ -1096,11 +1098,45 @@ final class BroadcasterTests: ZcashTestCase {
                 to: [transient, terminal],
                 timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.1)
             )
+            await settledSubmissions(of: synchronizer)
 
-            XCTAssertEqual(outcome, .rejected(code: -25, message: tooLargeMessage), "terminal first: \(terminalFirst)")
-            XCTAssertEqual(outcome.rejection, .tooLarge, "terminal first: \(terminalFirst)")
+            XCTAssertNil(outcome.rejection, "terminal first: \(terminalFirst)")
             let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
-            XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.tooLarge), "terminal first: \(terminalFirst)")
+            XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "terminal first: \(terminalFirst)")
+        }
+    }
+
+    /// Both endpoints refuse for good, in either order: the transaction is rejected, and the outcome
+    /// carries the terminal refusal the SDK recorded.
+    func testTerminalRefusalsFromEveryEndpointInEitherOrderAreRejected() async throws {
+        for tooLargeFirst in [true, false] {
+            let tooLarge = LightWalletEndpoint(address: "toolarge.example.com", port: 443, secure: true)
+            let invalid = LightWalletEndpoint(address: "invalid.example.com", port: 443, secure: true)
+            let endpointSubmitter = EndpointSubmitterMock()
+            endpointSubmitter.set(
+                behavior: .rejectAfter(tooLargeFirst ? 0 : 0.2, code: -25, message: tooLargeMessage),
+                for: tooLarge
+            )
+            endpointSubmitter.set(
+                behavior: .rejectAfter(tooLargeFirst ? 0.2 : 0, code: -26, message: "bad-txns-vout-negative"),
+                for: invalid
+            )
+            let synchronizer = try makeSynchronizer(
+                transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+                endpointSubmitter: endpointSubmitter
+            )
+            let transaction = makeCreatedTransaction(seed: tooLargeFirst ? 0x53 : 0x54)
+
+            let outcome = await synchronizer.broadcaster.submit(
+                transaction: transaction,
+                to: [tooLarge, invalid],
+                timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.1)
+            )
+
+            XCTAssertEqual(outcome, .rejected(code: -25, message: tooLargeMessage), "too large first: \(tooLargeFirst)")
+            XCTAssertEqual(outcome.rejection, .tooLarge, "too large first: \(tooLargeFirst)")
+            let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+            XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.tooLarge), "too large first: \(tooLargeFirst)")
         }
     }
 

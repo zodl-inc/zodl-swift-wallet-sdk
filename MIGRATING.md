@@ -349,7 +349,7 @@ rather than on either string.
 ## `TransactionSubmissionStatus` gained a case — `rejected`
 
 `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`, for a transaction a
-server explicitly refused for good while none accepted it. The SDK no longer resubmits such a transaction, and its inputs stay
+the servers explicitly refused, every refusal for good, while none accepted it. The SDK no longer resubmits such a transaction, and its inputs stay
 reserved until it expires, so show it as rejected (until its state becomes expired) rather than as
 still sending. `Synchronizer.rejectedTransactionIdsStream` reports the same transactions as a set.
 

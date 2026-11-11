@@ -60,10 +60,13 @@ func endpointKey(_ endpoint: LightWalletEndpoint) -> String {
 ///
 /// A node that explicitly refuses a transaction for good (a ``SubmitRejection``) has rejected it,
 /// and that is reported as an error rather than left pending, but only once nothing else can still
-/// take it. So it is rejected only when every endpoint in `planEndpoints` gave an explicit server
-/// answer (accepted or refused), none of `outcomes` accepted it (an endpoint that already holds
-/// it counts as accepting it), and at least one is a terminal refusal; an inconclusive refusal
-/// beside it does not prevent the verdict.
+/// take it and nothing suggests a later attempt could succeed. So it is rejected only when every
+/// endpoint in `planEndpoints` gave an explicit server answer (accepted or refused), none of
+/// `outcomes` accepted it (an endpoint that already holds it counts as accepting it), and every
+/// refusal in `outcomes` is a terminal one. A refusal that is not terminal (one that depends on
+/// the server's view of the chain or its mempool, a local refusal, or any unrecognized refusal)
+/// keeps the verdict pending even beside a terminal refusal from another endpoint, since that
+/// endpoint may take the transaction on a later attempt.
 ///
 /// A transport failure (`.failed`: a connection lost, a timeout, any thrown error) is not an
 /// answer: the request may have reached the server and been accepted, with only the reply lost.
@@ -71,8 +74,9 @@ func endpointKey(_ endpoint: LightWalletEndpoint) -> String {
 /// cancellation, and keeps the verdict pending: no new rejection is drawn and an earlier one
 /// (`previous`) merely stands, as it does without a terminal refusal in `outcomes`, until an
 /// acceptance clears it. Background resubmission keeps retrying it, and the verdict is drawn again
-/// from the next complete set of explicit answers. The recorded rejection is the first terminal
-/// refusal in `planEndpoints` order, then any other.
+/// from the next complete set of explicit answers. A complete set holding a refusal that is not
+/// terminal is pending in the same way. The recorded rejection is the first terminal refusal in
+/// `planEndpoints` order, then any other.
 func submitRejectionVerdict(
     planEndpoints: [LightWalletEndpoint],
     outcomes: [String: EndpointSubmission],
@@ -80,6 +84,8 @@ func submitRejectionVerdict(
 ) -> StoredRejection? {
     guard !outcomes.values.contains(where: \.isAcceptance) else { return nil }
     guard planEndpoints.allSatisfy({ outcomes[endpointKey($0)]?.isServerAnswer == true }) else { return previous }
+    let refusals = outcomes.values.filter { if case .refused = $0 { return true } else { return false } }
+    guard !refusals.isEmpty, refusals.allSatisfy({ $0.rejection != nil }) else { return previous }
     let ordered = planEndpoints.compactMap { outcomes[endpointKey($0)] }
         + outcomes.keys.sorted().filter { key in !planEndpoints.contains { endpointKey($0) == key } }.compactMap { outcomes[$0] }
     if case let .refused(code, message) = ordered.first(where: { $0.rejection != nil }) {

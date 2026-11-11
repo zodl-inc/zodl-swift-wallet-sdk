@@ -304,10 +304,10 @@ public enum TransactionSubmissionOutcome: Equatable {
     case accepted(by: LightWalletEndpoint)
     /// Every endpoint responded and none accepted. Carries the terminal refusal
     /// (``SubmitRejection``) the SDK recorded when it marked the transaction rejected,
-    /// whichever endpoint gave it; otherwise the first lightwalletd rejection (error
-    /// code + message) that was observed, which is then never a terminal refusal
-    /// (except for an Orchard migration preparation, which is never recorded as
-    /// rejected). ``rejection`` tells the two apart.
+    /// which it does only when every refusal was terminal; otherwise the first
+    /// lightwalletd rejection (error code + message) that was observed, which is
+    /// then never a terminal refusal (except for an Orchard migration preparation,
+    /// which is never recorded as rejected). ``rejection`` tells the two apart.
     ///
     /// Before it submits the transaction to an endpoint, the SDK reads that
     /// endpoint's latest block height and refuses to submit a transaction that
@@ -324,7 +324,8 @@ public enum TransactionSubmissionOutcome: Equatable {
     /// `responseTimeout` timer fired (others may have rejected or failed in the
     /// meantime — details are logged), or an endpoint refused the transaction
     /// for good while another's submission failed at the transport level, so
-    /// whether that one took it is unknown. The transaction may still have
+    /// whether that one took it is unknown, or while another refused it in a
+    /// way that may be transient. The transaction may still have
     /// been broadcast — treat as pending, not failed. Once every endpoint's
     /// submission has ended, a late acceptance is recorded, or the rejection
     /// their complete answers make; background resubmission reconciles an

@@ -389,7 +389,8 @@ extension SDKBroadcaster {
     /// - Accepted, in this submission's race or earlier (by an earlier submission or background
     ///   resubmission): `.accepted(by:)` with the accepting endpoint, when it is one this
     ///   submission or the stored plan names.
-    /// - Otherwise (an endpoint's transport failure left the verdict inconclusive, an acceptance by
+    /// - Otherwise (an endpoint's transport failure or a refusal that is not terminal left the
+    ///   verdict pending, an acceptance by
     ///   an endpoint neither names, or a store that cannot be read): `.timedOut` when the race
     ///   carries a terminal refusal, since the transaction is pending and may still be mined, or the
     ///   race's own outcome when its refusal is not terminal.

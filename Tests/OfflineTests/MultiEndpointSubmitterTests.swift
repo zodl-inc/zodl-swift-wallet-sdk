@@ -82,7 +82,7 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
     }
 
-    func testATransientRefusalBesideAnExplicitOneIsStillRejected() async {
+    func testATransientRefusalBesideAnExplicitOneKeepsItPending() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpoint(2))
@@ -92,7 +92,10 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         guard case .rejected = result.outcome else {
             return XCTFail("Expected rejected, got \(result.outcome)")
         }
-        XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+        XCTAssertNil(
+            submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil),
+            "the transient refusal may clear on a later attempt"
+        )
     }
 
     func testATransportFailureBesideAnExplicitRejectionIsInconclusive() async {

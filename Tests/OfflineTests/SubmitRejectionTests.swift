@@ -194,15 +194,60 @@ final class SubmitRejectionTests: XCTestCase {
         )
     }
 
-    func testOneExplicitRejectionWithATransientRefusalIsRejected() {
-        XCTAssertEqual(
+    func testOneExplicitRejectionWithATransientRefusalStaysPending() {
+        XCTAssertNil(
             submitRejectionVerdict(
                 planEndpoints: [endpointA, endpointB],
                 outcomes: [endpointKey(endpointA): transient, endpointKey(endpointB): terminal],
                 previous: nil
             ),
-            StoredRejection(code: -26, reason: "bad-txns-vout-negative")
+            "a refusal that may be transient keeps it pending beside a terminal one"
         )
+        let previous = StoredRejection(code: -25, reason: zakuraTooLarge)
+        XCTAssertEqual(
+            submitRejectionVerdict(
+                planEndpoints: [endpointA, endpointB],
+                outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): transient],
+                previous: previous
+            ),
+            previous,
+            "no new rejection is drawn; an earlier one merely stands"
+        )
+    }
+
+    /// A size refusal from one endpoint and a mempool-chain refusal from the other, in either plan
+    /// order: the second may clear on a later attempt, so the transaction stays pending.
+    func testATooLargeRefusalBesideAMempoolChainRefusalStaysPendingInEitherOrder() {
+        let tooLarge = EndpointSubmission.refused(code: -25, message: "tx size exceeding the configured mempool maximum")
+        let chain = EndpointSubmission.refused(code: -26, message: "too-long-mempool-chain")
+        for plan in [[endpointA, endpointB], [endpointB, endpointA]] {
+            XCTAssertNil(submitRejectionVerdict(
+                planEndpoints: plan,
+                outcomes: [endpointKey(endpointA): tooLarge, endpointKey(endpointB): chain],
+                previous: nil
+            ))
+            XCTAssertNil(submitRejectionVerdict(
+                planEndpoints: plan,
+                outcomes: [endpointKey(endpointA): chain, endpointKey(endpointB): tooLarge],
+                previous: nil
+            ))
+        }
+    }
+
+    func testALocalRefusalBesideATerminalOneStaysPending() {
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA, endpointB],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): .refused(code: -9101, message: "not submittable")],
+            previous: nil
+        ))
+    }
+
+    func testARefusalOutsideThePlanThatMayBeTransientKeepsItPending() {
+        XCTAssertNil(submitRejectionVerdict(
+            planEndpoints: [endpointA],
+            outcomes: [endpointKey(endpointA): terminal, endpointKey(endpointB): transient],
+            previous: nil
+        ))
     }
 
     func testAnExplicitRejectionBesideATransportFailureStaysPending() {

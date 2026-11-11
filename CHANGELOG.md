@@ -45,8 +45,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Broadcaster.submit(transaction:to:timing:)` is the SDK's verdict: its `rejection` is non-`nil`
   exactly when the SDK recorded the transaction as rejected
   (`TransactionSubmissionStatus.rejected`) and stopped resubmitting it, and `.rejected(code:message:)`
-  then carries that terminal refusal rather than the first refusal to arrive, so a transient
-  refusal from one endpoint no longer hides a terminal one from another. A transaction a server
+  then carries a terminal refusal, whichever endpoint gave it. A terminal refusal from one endpoint
+  beside a refusal from another that may be transient is not a rejection: the transaction stays
+  pending, its outcome's `rejection` is `nil`, and it keeps being resubmitted. A transaction a server
   has accepted, in this submission or earlier (including by background resubmission), is
   `.accepted(by:)` whatever another refusal says, and a terminal refusal the SDK did not record,
   because another endpoint's submission failed at the transport level, is `.timedOut` (pending). Migration preparations
@@ -114,14 +115,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
   (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
   `rustProposeTransfer` or `rustProposeTransferFromURI`.
-- `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`: a node the
-  transaction was submitted to explicitly refused it terminally and none accepted it. The SDK then stops
+- `TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`: the nodes the
+  transaction was submitted to explicitly refused it, every refusal terminal, and none accepted it. The SDK then stops
   resubmitting it in the background, where it previously retried until expiry; its inputs stay
   reserved until it expires. A transaction with a retry plan (the endpoints given to
   `Broadcaster.submit` or `releaseForResubmission`) is recorded as rejected once every endpoint
-  gave an explicit server answer, none accepted it and at least one explicitly refused it
-  terminally, whether on submission or on a background retry; a transient refusal beside it
-  neither prevents nor counts towards it. A transport failure (a lost connection, a timeout, any
+  gave an explicit server answer, none accepted it and every refusal was terminal, whether on
+  submission or on a background retry; a refusal that may be transient (`min relay fee`,
+  `too-long-mempool-chain`, `unknown-anchor`, `txn-mempool-conflict`, a local refusal, any
+  unrecognized message) from any endpoint keeps it pending and resubmitted, even beside a terminal
+  refusal from another endpoint. A transport failure (a lost connection, a timeout, any
   thrown error) is not an answer, because the server may have accepted the transaction and only
   its reply was lost: beside it the transaction stays pending, background resubmission keeps
   retrying, and a later acceptance clears it while a later explicit refusal completes the verdict.
