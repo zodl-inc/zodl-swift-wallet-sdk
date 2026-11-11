@@ -278,6 +278,44 @@ class LayoutTests(unittest.TestCase):
         self.assertIn('ffi-layout:', result.stderr)
         self.assertEqual(list(destination.iterdir()), [])
 
+    def compressed_archive(self, members):
+        archive = self.base / 'compressed.zip'
+        with zipfile.ZipFile(archive, 'w') as output:
+            for name, content, is_link, compression in members:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = ((stat.S_IFLNK if is_link else stat.S_IFREG) | 0o755) << 16
+                info.compress_type = compression
+                output.writestr(info, content)
+        return archive
+
+    def test_extract_rejects_unsupported_compression_before_opening_any_member(self):
+        macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
+        plain = ('libzcashlc.xcframework/Info.plist', 'plist', False, zipfile.ZIP_STORED)
+        cases = {
+            'bzip2 link': [plain, (macos + 'Headers', MACOS_LINKS['Headers'], True, zipfile.ZIP_BZIP2)],
+            'lzma regular member': [plain, ('libzcashlc.xcframework/lzma', 'data', False, zipfile.ZIP_LZMA)],
+            'bzip2 regular member': [('libzcashlc.xcframework/bzip2', 'data', False, zipfile.ZIP_BZIP2)],
+        }
+        sys.path.insert(0, str(ROOT / 'Scripts/lib'))
+        import ffi_layout
+        for label, members in cases.items():
+            with self.subTest(label):
+                archive = self.compressed_archive(members)
+                destination = self.base / 'out'
+                shutil.rmtree(destination, ignore_errors=True)
+                destination.mkdir()
+                opened = []
+                real = zipfile.ZipFile.open
+                def recording(zipped, *args, **kwargs):
+                    opened.append(args)
+                    return real(zipped, *args, **kwargs)
+                with mock.patch.object(zipfile.ZipFile, 'open', recording), \
+                        self.assertRaisesRegex(ffi_layout.LayoutError, 'unsupported archive compression'):
+                    ffi_layout.extract(archive, destination)
+                self.assertEqual(opened, [])
+                self.assertEqual(list(destination.iterdir()), [])
+
     def test_extract_rejects_members_nested_under_a_link_before_writing_anything(self):
         macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
         links = [(macos + name, target, True) for name, target in MACOS_LINKS.items()]

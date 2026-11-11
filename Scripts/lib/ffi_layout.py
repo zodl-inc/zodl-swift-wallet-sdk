@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import lzma
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
@@ -213,6 +212,10 @@ def extract(archive, destination):
         # Check every member before writing anything, so a rejected archive
         # leaves no partial extraction behind.
         for item in source.infolist():
+            # Release archives hold only stored or deflated data. The bzip2 and lzma decompressors
+            # cannot be output-limited, so refuse every other method before any member is opened.
+            if item.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise LayoutError("unsupported archive compression: " + item.filename)
             path = PurePosixPath(item.filename)
             kind = stat.S_IFMT(item.external_attr >> 16)
             if (path.is_absolute() or "\\" in item.filename or ".." in path.parts
@@ -227,11 +230,13 @@ def extract(archive, destination):
                 if expected is None or item.file_size != len(expected.encode("utf-8")):
                     raise LayoutError("unexpected link member: " + item.filename)
                 try:
-                    # The declared size is only a header claim, so read at most one byte beyond the
-                    # expected target: a stream that inflates further is never decompressed.
+                    # The declared size is only a header claim, so the read is bounded to the expected
+                    # target plus one byte. Only stored or deflated data is allowed, so decompression
+                    # stops near that bound, and a stream that inflates further fails the CRC or length
+                    # check. The link created is always the expected constant target.
                     with source.open(item) as incoming:
                         target = incoming.read(len(expected.encode("utf-8")) + 1).decode("utf-8")
-                except (UnicodeDecodeError, zipfile.BadZipFile, OSError, zlib.error, lzma.LZMAError, EOFError) as error:
+                except (UnicodeDecodeError, zipfile.BadZipFile, OSError, zlib.error, EOFError) as error:
                     raise LayoutError("unreadable link member: " + item.filename) from error
                 if target != expected:
                     raise LayoutError("unexpected link member: " + item.filename)
@@ -253,7 +258,7 @@ def extract(archive, destination):
                 source.extract(item, destination)
             for path, target in links:
                 os.symlink(target, Path(destination, *path.parts))
-        except (zipfile.BadZipFile, zlib.error, lzma.LZMAError, EOFError) as error:
+        except (zipfile.BadZipFile, zlib.error, EOFError) as error:
             raise LayoutError("corrupt archive member") from error
 
 
