@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ["clean-ffi", "ffi-all", "configure-local-ffi", "build", "test-offline"]
@@ -45,12 +47,25 @@ if name == "make":
             if os.environ.get("MISSING_SLICE") == identifier:
                 continue
             framework = product / identifier / "libzcashlc.framework"
-            (framework / "Headers").mkdir(parents=True)
-            (framework / "Modules").mkdir()
-            (framework / "libzcashlc").write_text(" ".join(arches))
-            (framework / "Headers/zcashlc.h").write_text("void fixture(void);\\n")
-            (framework / "Modules/module.modulemap").write_text('module libzcashlc { header "zcashlc.h" }\\n')
-            shutil.copyfile(root / "BuildSupport/platform-Info.plist", framework / "Info.plist")
+            # The macOS slice mirrors the real build's versioned layout unless a test asks for the old flat one.
+            versioned = platform == "macos" and not os.environ.get("SHALLOW_MACOS")
+            content = framework / "Versions/A" if versioned else framework
+            (content / "Headers").mkdir(parents=True)
+            (content / "Modules").mkdir()
+            (content / "libzcashlc").write_text(" ".join(arches))
+            (content / "Headers/zcashlc.h").write_text("void fixture(void);\\n")
+            (content / "Modules/module.modulemap").write_text('module libzcashlc { header "zcashlc.h" }\\n')
+            if versioned:
+                (content / "Resources").mkdir()
+                shutil.copyfile(root / "BuildSupport/platform-Info.plist", content / "Resources/Info.plist")
+                (framework / "Versions/Current").symlink_to("A")
+                for link in ("libzcashlc", "Headers", "Modules", "Resources"):
+                    target = "Versions/A/" + link if link == "Headers" and os.environ.get("BAD_MACOS_LINK") else "Versions/Current/" + link
+                    (framework / link).symlink_to(target)
+                if os.environ.get("ROOT_PLIST_MACOS"):
+                    shutil.copyfile(root / "BuildSupport/platform-Info.plist", framework / "Info.plist")
+            else:
+                shutil.copyfile(root / "BuildSupport/platform-Info.plist", framework / "Info.plist")
             libraries.append(dict(LibraryIdentifier=identifier, LibraryPath="libzcashlc.framework",
                                   SupportedPlatform=platform, SupportedArchitectures=arches))
             if variant:
@@ -68,7 +83,8 @@ if name == "make":
         if broken == "plist":
             (framework / "Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "999"}))
         if os.environ.get("FAT_ARCH"):
-            (product / "macos-arm64/libzcashlc.framework/libzcashlc").write_text("arm64 x86_64")
+            macos = product / "macos-arm64/libzcashlc.framework"
+            (macos / "Versions/A/libzcashlc" if (macos / "Versions").is_dir() else macos / "libzcashlc").write_text("arm64 x86_64")
         if os.environ.get("STALE_EXTRA"):
             (product / "macos-arm64_x86_64").mkdir()
         if os.environ.get("WRONG_ARCH"):
@@ -302,6 +318,18 @@ if sys.argv[1:] == ["--version"]:
         self.assertFalse((self.source / "LocalPackages").exists())
         self.assertTrue(any(c[:2] == ["release", "upload"] and any("sdk-build-record.json" in a for a in c) for c in self.gh_calls()))
         self.assertTrue((self.products / "release.env").is_file())
+        macos = "libzcashlc.xcframework/macos-arm64/libzcashlc.framework/"
+        links = {"Versions/Current": "A", "libzcashlc": "Versions/Current/libzcashlc", "Headers": "Versions/Current/Headers",
+                 "Modules": "Versions/Current/Modules", "Resources": "Versions/Current/Resources"}
+        with zipfile.ZipFile(archive) as bundle:
+            members = {item.filename: item for item in bundle.infolist()}
+            for name, target in links.items():
+                item = members[macos + name]
+                self.assertEqual(stat.S_IFMT(item.external_attr >> 16), stat.S_IFLNK, name)
+                self.assertEqual(bundle.read(item).decode(), target, name)
+        self.assertFalse([name for name in members if name.startswith(macos + "Versions/Current/")])
+        macos_slice = next(s for s in proof["slices"] if s["identifier"] == "macos-arm64")
+        self.assertEqual(macos_slice["binary_sha256"], hashlib.sha256((self.products / macos / "Versions/A/libzcashlc").read_bytes()).hexdigest())
 
     def rust_identity_fixtures(self, *, bound):
         directory = self.root / "selected-rust" if bound else self.tools
@@ -428,6 +456,27 @@ if sys.argv[1:] == ["--version"]:
 
     def test_symlink_product_is_rejected(self):
         result = self.artifacts(SYMLINK_PRODUCT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_no_release_write()
+
+    def test_shallow_macos_release_product_is_rejected(self):
+        self.assert_rejected(SHALLOW_MACOS="1")
+
+    def test_wrong_macos_link_target_is_rejected(self):
+        self.assert_rejected(BAD_MACOS_LINK="1")
+
+    def test_versioned_macos_with_root_plist_is_rejected(self):
+        self.assert_rejected(ROOT_PLIST_MACOS="1")
+
+    def test_archive_with_copied_links_is_rejected(self):
+        # Without -y, zip follows the links and stores three copies of the library.
+        zip_tool = self.tools / "zip"
+        zip_tool.write_text("#!/usr/bin/env python3\nimport subprocess, sys\nargs = sys.argv[1:]\nargs[0] = args[0].replace('y', '')\nsubprocess.run(['/usr/bin/zip', *args], check=True)\n")
+        zip_tool.chmod(0o755)
+        self.assert_rejected()
+
+    def assert_rejected(self, **env):
+        result = self.artifacts(**env)
         self.assertNotEqual(result.returncode, 0)
         self.assert_no_release_write()
 

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 import zipfile
@@ -20,6 +21,17 @@ SLICES = {
     "ios-arm64": ("ios", None, {"arm64"}),
     "ios-arm64-simulator": ("ios", "simulator", {"arm64"}),
     "macos-arm64": ("macos", None, {"arm64"}),
+}
+# The macOS slice is a versioned framework, so these links are the only symlinks a product may hold.
+# They are kept in step with the Makefile's assembly by hand, because the hosted-build contract test
+# copies this file without the shared layout module.
+MACOS_FRAMEWORK = "macos-arm64/libzcashlc.framework"
+MACOS_LINKS = {
+    "Versions/Current": "A",
+    "libzcashlc": "Versions/Current/libzcashlc",
+    "Headers": "Versions/Current/Headers",
+    "Modules": "Versions/Current/Modules",
+    "Resources": "Versions/Current/Resources",
 }
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
 
@@ -114,9 +126,19 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def walk_entries(product: Path):
+    """Yield every entry under the product without following links (identical on every Python version)."""
+    for directory, directories, files in os.walk(product, followlinks=False):
+        for name in directories + files:
+            yield Path(directory) / name
+
+
 def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
-    if product.is_symlink() or not product.is_dir() or any(path.is_symlink() for path in product.rglob("*")):
-        raise BuildError("native product must be a real tree without symlinks")
+    if product.is_symlink() or not product.is_dir():
+        raise BuildError("native product must be a real tree")
+    allowed = {product / MACOS_FRAMEWORK / name for name in MACOS_LINKS}
+    if any(path.is_symlink() and path not in allowed for path in walk_entries(product)):
+        raise BuildError("native product may only contain the macOS framework links")
     info = read_plist(product / "Info.plist")
     libraries = info.get("AvailableLibraries")
     if info.get("XCFrameworkFormatVersion") != "1.0" or info.get("CFBundlePackageType") != "XFWK" or not isinstance(libraries, list) or len(libraries) != 3:
@@ -137,22 +159,63 @@ def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
         if item.get("SupportedPlatform") != platform or item.get("SupportedPlatformVariant") != variant or item.get("LibraryPath") != "libzcashlc.framework" or not isinstance(actual_arches, list) or not all(isinstance(arch, str) for arch in actual_arches) or set(actual_arches) != architectures or len(actual_arches) != len(architectures):
             raise BuildError("invalid XCFramework slice metadata")
         framework = product / identifier / "libzcashlc.framework"
-        for name in ("libzcashlc", "Headers/zcashlc.h", "Modules/module.modulemap", "Info.plist"):
-            path = framework / name
+        content = framework
+        plist_path = framework / "Info.plist"
+        if platform == "macos":
+            # A versioned framework has no root Info.plist, so tools that read the shallow layout fail loudly instead of silently.
+            for name, target in MACOS_LINKS.items():
+                link = framework / name
+                if not link.is_symlink() or os.readlink(link) != target:
+                    raise BuildError("macOS framework link missing or wrong")
+            if {path.name for path in framework.iterdir()} != {"Versions", "libzcashlc", "Headers", "Modules", "Resources"}:
+                raise BuildError("macOS framework is not exactly the versioned layout")
+            if {path.name for path in (framework / "Versions").iterdir()} != {"A", "Current"} or (framework / "Versions/A").is_symlink():
+                raise BuildError("macOS framework has unexpected versions")
+            content = framework / "Versions/A"
+            plist_path = content / "Resources/Info.plist"
+        names = ("libzcashlc", "Headers/zcashlc.h", "Modules/module.modulemap")
+        for path in [content / name for name in names] + [plist_path]:
             if not path.is_file() or path.stat().st_size == 0:
                 raise BuildError("missing/nonempty framework binary, headers or modules")
-        actual = run(["lipo", "-archs", str(framework / "libzcashlc")], source).split()
+        actual = run(["lipo", "-archs", str(content / "libzcashlc")], source).split()
         if set(actual) != architectures or len(actual) != len(architectures):
             raise BuildError("actual binary architectures do not match full slice")
-        module = (framework / "Modules/module.modulemap").read_text()
+        module = (content / "Modules/module.modulemap").read_text()
         if not re.search(r"\bmodule\s+libzcashlc\b", module) or "zcashlc.h" not in module:
             raise BuildError("invalid libzcashlc module map")
-        plist = read_plist(framework / "Info.plist")
+        plist = read_plist(plist_path)
         if plist.get("CFBundleIdentifier") != "libzcashlc" or plist.get("CFBundleExecutable") != "libzcashlc" or plist.get("CFBundleShortVersionString") != versions["plist_short"] or plist.get("CFBundleVersion") != versions["plist_build"]:
             raise BuildError("framework plist differs from immutable source metadata")
         verified.append({"identifier": identifier, "platform": platform, "variant": variant,
-                         "architectures": sorted(actual), "binary_sha256": sha256(framework / "libzcashlc")})
+                         "architectures": sorted(actual), "binary_sha256": sha256(content / "libzcashlc")})
     return verified
+
+
+def product_inventory(product: Path) -> dict:
+    """Map each non-directory entry to its bytes or link target, without following links."""
+    inventory = {}
+    for path in walk_entries(product):
+        key = path.relative_to(product.parent).as_posix()
+        if path.is_symlink():
+            inventory[key] = ("link", os.readlink(path))
+        elif path.is_file():
+            inventory[key] = ("file", sha256(path))
+    return inventory
+
+
+def archive_inventory(archive: Path) -> dict:
+    inventory = {}
+    with zipfile.ZipFile(archive) as bundle:
+        for item in bundle.infolist():
+            if item.is_dir():
+                continue
+            if item.filename in inventory:
+                raise BuildError("archive contents differ from verified native product")
+            if stat.S_IFMT(item.external_attr >> 16) == stat.S_IFLNK:
+                inventory[item.filename] = ("link", bundle.read(item).decode())
+            else:
+                inventory[item.filename] = ("file", hashlib.sha256(bundle.read(item)).hexdigest())
+    return inventory
 
 
 def capture_source(root: Path, expected: str | None) -> dict:
@@ -231,14 +294,9 @@ def finish_record(root: Path, archive: Path, context: dict, destination: Path) -
     slices = verify_slices(product, versions, root)
     if archive.name != "libzcashlc.xcframework.zip" or archive.is_symlink() or not archive.is_file():
         raise BuildError("missing native release archive")
-    expected = {str(path.relative_to(product.parent)): path for path in product.rglob("*") if path.is_file()}
-    with zipfile.ZipFile(archive) as bundle:
-        files = [item for item in bundle.infolist() if not item.is_dir()]
-        if len(files) != len(expected) or {item.filename for item in files} != set(expected):
-            raise BuildError("archive contents differ from verified native product")
-        for item in files:
-            if hashlib.sha256(bundle.read(item)).hexdigest() != sha256(expected[item.filename]):
-                raise BuildError("archive bytes differ from verified native product")
+    # Links count as members: an archive that stored the targets' bytes instead would not unpack as a framework.
+    if archive_inventory(archive) != product_inventory(product):
+        raise BuildError("archive contents differ from verified native product")
     toolchains = {
         "swift": run(["make", "--no-print-directory", "print-swift-version"], root),
         "cargo": rust_identity("cargo", root),
