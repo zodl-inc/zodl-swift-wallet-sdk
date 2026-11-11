@@ -6,6 +6,11 @@ import os
 final class OHTTPHealthLifecycleTests: ZcashTestCase {
     private let endpoint = LightWalletEndpoint(address: OHTTPTestSupport.testnetHost, port: 443, secure: true)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private func session(_ sync: SlipstreamSynchronizer) async throws -> OHTTPHealthSession {
         try await sync.makeOHTTPHealthSession(
             route: OHTTPHealthRoute(

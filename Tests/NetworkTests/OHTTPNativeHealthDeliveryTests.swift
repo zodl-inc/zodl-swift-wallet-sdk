@@ -5,8 +5,18 @@ import libzcashlc
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPNativeHealthDeliveryTests: ZcashTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try OHTTPE2EConfiguration.install()
+    }
+
+    override func tearDown() {
+        try? OHTTPEndpoints.configure(nil)
+        super.tearDown()
+    }
+
     func testNativeDeliveryWhileProductionWalletSummaryIsBlocked() async throws {
-        let endpoint = LightWalletEndpoint(address: OHTTPEndpoints.gatewayHost(for: .testnet), port: 443, secure: true)
+        let endpoint = LightWalletEndpoint(address: try XCTUnwrap(OHTTPEndpoints.gatewayHost(for: .testnet)), port: 443, secure: true)
         let engine = GatedFakeSlipstreamEngine()
         let synchronizer = try makeSlipstreamSynchronizer(engine: engine, endpoint: endpoint)
         let route = OHTTPHealthRoute(

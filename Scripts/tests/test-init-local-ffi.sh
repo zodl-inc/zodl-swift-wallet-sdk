@@ -42,9 +42,3 @@ test_init_local_ffi_rejects_trace_with_cached() {
 test_init_local_ffi_rejects_too_many_arguments_with_trace() {
     assert_fails "too many arguments besides --trace" _init_local_ffi --trace foo bar
 }
-
-# Fake only the toolchain boundary; execute the real packaging scripts.
-test_native_relay_environment() {
-    assert_succeeds 'native entrypoints resolve required configuration once' \
-        python3 -B -m unittest discover -s "$REPO_ROOT/Scripts/tests" -p test_native_relay_env.py
-}

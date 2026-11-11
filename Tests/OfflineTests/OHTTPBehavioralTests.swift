@@ -17,6 +17,10 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPBehavioralTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
 
     /// Counts the key fetches and the relay posts a transport makes, answering each post from `answer`.
     private final class Counters: @unchecked Sendable {

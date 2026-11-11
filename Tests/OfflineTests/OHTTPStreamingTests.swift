@@ -47,6 +47,11 @@ final class PassThroughStreamDecoder: OHTTPStreamDecoding {
 }
 
 final class OHTTPStreamingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private func keyResponse(_ request: URLRequest) -> (Data, HTTPURLResponse) {
         (
             OHTTPTestSupport.stubEnvelope,
@@ -354,6 +359,11 @@ final class OHTTPStreamingTests: XCTestCase {
 }
 
 final class OHTTPExternalHTTPTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testFlexaMapsToItsGatewayAliasAndKeepsItsAuthorization() throws {
         let url = try XCTUnwrap(URL(string: "https://api.flexa.co/commerce_sessions/cs_1/approve"))
         XCTAssertEqual(OHTTPEndpoints.proxyURL(for: url)?.absoluteString, "https://flexa.zodl.com/commerce_sessions/cs_1/approve")

@@ -52,18 +52,7 @@ concurrency:
 
 jobs:
   ffi:
-    env:
-      ZODL_OHTTP_REQUIRE: '1'
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     outputs:
-      configuration-hash: ${{ steps.ohttp-config.outputs.hash }}
       source-hash: ${{ steps.ffi-hash.outputs.hash }}
       xcode-hash: ${{ steps.xcode-cache-key.outputs.hash }}
     name: Build FFI (macOS arm64)
@@ -102,12 +91,6 @@ jobs:
         run: |
           python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
 
-      - name: Validate OHTTP configuration
-        id: ohttp-config
-        run: |
-          OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
-          echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
-
       - name: FFI source hash
         id: ffi-hash
         run: |
@@ -130,9 +113,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
+            ohttp-e2e-cargo-macos-arm64-ohttp-trace-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-
 
       # arm64 only: the runner is arm64 and nothing here links an x86_64 slice.
       # ohttp-trace: client trace ids (client_trace_prefix input) work only in such a build.
@@ -153,16 +136,6 @@ jobs:
           if-no-files-found: error
 
   e2e:
-    env:
-      ZODL_OHTTP_REQUIRE: '1'
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     name: E2E (${{ matrix.mode }})
     needs: ffi
     runs-on: xcode-27
@@ -189,7 +162,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
-          key: ohttp-e2e-swiftpm-v2-${{ runner.os }}-${{ runner.arch }}-${{ needs.ffi.outputs.xcode-hash }}-${{ needs.ffi.outputs.source-hash }}-${{ needs.ffi.outputs.configuration-hash }}-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
+          key: ohttp-e2e-swiftpm-v2-${{ runner.os }}-${{ runner.arch }}-${{ needs.ffi.outputs.xcode-hash }}-${{ needs.ffi.outputs.source-hash }}-${{ hashFiles('Package.resolved') }}-${{ matrix.mode }}
 
       - name: Build Swift package
         timeout-minutes: 30
@@ -213,6 +186,14 @@ jobs:
         if: ${{ !cancelled() && (inputs.scenario == '' || inputs.scenario == 'e2e') }}
         timeout-minutes: 75
         env:
+          OHTTP_E2E_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+          OHTTP_E2E_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+          OHTTP_E2E_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+          OHTTP_E2E_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
           OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
           OHTTP_E2E_MIN_BALANCE_ZAT: ${{ vars.OHTTP_E2E_MIN_BALANCE_ZAT || '9000000000' }}
@@ -232,6 +213,14 @@ jobs:
         if: ${{ !cancelled() && startsWith(inputs.scenario, 'fallback-') }}
         timeout-minutes: 30
         env:
+          OHTTP_E2E_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+          OHTTP_E2E_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+          OHTTP_E2E_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+          OHTTP_E2E_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
           OHTTP_E2E_BIRTHDAY: ${{ vars.OHTTP_E2E_BIRTHDAY || '4123503' }}
           OHTTP_E2E_GATEWAY_STATE: ${{ inputs.scenario == 'fallback-down' && 'down' || 'up' }}
@@ -245,6 +234,14 @@ jobs:
         if: ${{ !cancelled() && inputs.scenario == 'bench-mainnet' }}
         timeout-minutes: 30
         env:
+          OHTTP_E2E_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+          OHTTP_E2E_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+          OHTTP_E2E_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+          OHTTP_E2E_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
           OHTTP_E2E_SEED_HEX: ${{ secrets.OHTTP_E2E_SEED_HEX }}
           OHTTP_E2E_TOR: ${{ matrix.mode == 'tor' && '1' || '0' }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
@@ -256,6 +253,14 @@ jobs:
         if: ${{ !cancelled() && inputs.scenario == 'send' && matrix.mode == 'tor' }}
         timeout-minutes: 45
         env:
+          OHTTP_E2E_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+          OHTTP_E2E_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+          OHTTP_E2E_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+          OHTTP_E2E_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_SEED2_HEX }}
           OHTTP_E2E_RECIPIENT_UA: ${{ inputs.recipient }}
           OHTTP_E2E_CLIENT_TRACE_PREFIX: ${{ inputs.client_trace_prefix }}
@@ -267,6 +272,14 @@ jobs:
         if: ${{ !cancelled() && inputs.scenario == 'send-mainnet' && matrix.mode == 'tor' }}
         timeout-minutes: 90
         env:
+          OHTTP_E2E_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+          OHTTP_E2E_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+          OHTTP_E2E_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+          OHTTP_E2E_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+          OHTTP_E2E_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+          OHTTP_E2E_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
           OHTTP_E2E_NETWORK: mainnet
           OHTTP_E2E_SEED2_HEX: ${{ secrets.OHTTP_E2E_MAINNET_SEED2_HEX }}
           OHTTP_E2E_SEND_BIRTHDAY: 3427084

@@ -20,10 +20,6 @@ done
 FEATURE_ARGS=()
 [[ -z "$CARGO_FEATURES" ]] || FEATURE_ARGS=(--features "$CARGO_FEATURES")
 
-# Resolve before any architecture loop or product replacement.
-if [[ "${OHTTP_ENV_RESOLVED:-}" != "1" ]]; then
-    exec python3 Scripts/lib/ohttp_env.py --required -- env OHTTP_ENV_RESOLVED=1 /bin/bash Scripts/rebuild-local-ffi.sh "$@"
-fi
 XCFRAMEWORK_DIR=LocalPackages/libzcashlc.xcframework
 if ! python3 Scripts/lib/ffi_layout.py validate "$XCFRAMEWORK_DIR" --allow-versioned-macos; then
     echo 'Error: Local FFI is missing or incompatible. Reinitialize with ./Scripts/init-local-ffi.sh (or an --arm-* subset).' >&2
@@ -39,7 +35,7 @@ case "$TARGET" in
     macos) RUST_TARGET=aarch64-apple-darwin; SLICE=macos-arm64 ;;
 esac
 rustup target add "$RUST_TARGET"
-python3 Scripts/lib/ohttp_env.py --required -- cargo build --locked --target "$RUST_TARGET" --release "${FEATURE_ARGS[@]}"
+cargo build --locked --target "$RUST_TARGET" --release "${FEATURE_ARGS[@]}"
 
 STAGE=$(mktemp -d LocalPackages/.ffi-stage.XXXXXX)
 STAGED_XCFW="$STAGE/libzcashlc.xcframework"

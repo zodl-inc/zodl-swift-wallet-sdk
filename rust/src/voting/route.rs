@@ -2,9 +2,10 @@
 //!
 //! `zcash_voting` keeps PIR, tree-sync, helper and vote-chain traffic behind one
 //! host-supplied request executor, [`zcash_voting::RouteHttp`]. [`SdkRoute`] is
-//! this SDK's executor: the wallet's Tor runtime, the OHTTP relay and gateway,
-//! or the crate's own direct HTTP client ([`resolve_session_route`] decides).
-//! A session picks one when it opens and keeps it, so a
+//! this SDK's executor: the wallet's Tor runtime, the OHTTP relay and gateway
+//! the app configured, or the crate's own direct HTTP client
+//! ([`resolve_session_route`] decides). A session picks one when it opens and
+//! keeps it, together with the OHTTP configuration it was picked under, so a
 //! round that chose Tor can never reach the network any other way — a Tor route
 //! that cannot connect fails the request rather than falling back, because a
 //! silent fall-back would put the voter's traffic on the clear network after
@@ -30,6 +31,7 @@ use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
     RouteResponse,
 };
+use zodl_ohttp_client::OhttpNetworks;
 
 use super::errors::invalid_input;
 
@@ -74,8 +76,9 @@ pub(super) enum SdkRoute {
     /// order of magnitude larger than a `DirectRoute`, and every session pays
     /// for the larger arm otherwise.
     Tor(Box<TorRoute>),
-    /// The OHTTP relay and gateway, for predefined servers with Tor off.
-    /// Fails closed: there is no path from here to a direct connection.
+    /// The OHTTP relay and gateway, for predefined servers with Tor off and
+    /// OHTTP configured for the wallet's network. Fails closed: there is no
+    /// path from here to a direct connection.
     Ohttp(OhttpRoute),
     /// Refuses every request before dispatch and counts the attempts, so a
     /// test can prove which traffic reached the session's route.
@@ -404,64 +407,64 @@ fn url_host(url: &str) -> Result<String, RouteError> {
 /// forwards it to the vote or PIR server. The relay sees the device address but
 /// only ciphertext; the gateway sees the request but only the relay's address.
 ///
-/// Used when Tor is off and the server is a predefined one. Fails closed: a
-/// request the gateway cannot carry fails rather than going out directly, which
-/// would show the voter's address to the vote server.
+/// Used when Tor is off, the server is a predefined one and OHTTP is configured
+/// for the wallet's network. Fails closed: a request the gateway cannot carry
+/// fails rather than going out directly, which would show the voter's address
+/// to the vote server.
 ///
 /// Rides the same OHTTP stack as the lightwalletd path (signed HPKE key
 /// configs fetched through the relay, 64 MiB response cap).
 pub(super) struct OhttpRoute {
+    /// The OHTTP configuration the session opened under, which every request of
+    /// the session uses.
+    networks: Arc<OhttpNetworks>,
     gateway_host: String,
     network: NetworkType,
 }
 
 impl OhttpRoute {
-    /// The OHTTP route for the server at `url` through the gateway of the
-    /// wallet's `network`, or a pre-dispatch failure when the gateway does not
-    /// carry that host or there is no gateway for the network (regtest).
-    pub(super) fn new(url: &str, network: zcash_voting::Network) -> Result<Self, RouteError> {
+    /// The OHTTP route for the server at `url` through the gateway `networks`
+    /// configures for the wallet's `network`, or a pre-dispatch failure when the
+    /// gateway does not carry that host or there is no gateway for the network
+    /// (OHTTP off for it, or regtest).
+    pub(super) fn new(
+        networks: &Arc<OhttpNetworks>,
+        url: &str,
+        network: zcash_voting::Network,
+    ) -> Result<Self, RouteError> {
         let host = url_host(url)?;
         if !can_handle_ohttp(&host) {
             return Err(RouteError::before_dispatch(format!(
                 "host {host} not supported by the OHTTP gateway"
             )));
         }
-        let (gateway_host, network) = gateway_for(network)?;
+        let (gateway_host, network) = gateway_for(networks, network).ok_or_else(|| {
+            RouteError::before_dispatch("no OHTTP gateway for this network".to_string())
+        })?;
         Ok(Self {
+            networks: Arc::clone(networks),
             gateway_host: gateway_host.to_string(),
             network,
         })
     }
 }
 
-/// The OHTTP gateway of `network`, and the network the engine checks it
-/// against. A testnet session never rides the mainnet gateway, nor the other
-/// way round.
-fn gateway_for(network: zcash_voting::Network) -> Result<(&'static str, NetworkType), RouteError> {
-    match network {
-        zcash_voting::Network::Mainnet => {
-            configured_gateway(zodl_ohttp_client::Network::Mainnet, NetworkType::Main)
-        }
-        zcash_voting::Network::Testnet => {
-            configured_gateway(zodl_ohttp_client::Network::Testnet, NetworkType::Test)
-        }
-        _ => Err(RouteError::before_dispatch(
-            "no OHTTP gateway for this network".to_string(),
-        )),
-    }
-}
-
-fn configured_gateway(
-    network: zodl_ohttp_client::Network,
-    engine_network: NetworkType,
-) -> Result<(&'static str, NetworkType), RouteError> {
-    crate::ohttp::gateway_host(network)
-        .map(|host| (host, engine_network))
-        .map_err(|_| {
-            RouteError::before_dispatch(
-                "SDK invariant: missing OHTTP gateway configuration".to_string(),
-            )
-        })
+/// The OHTTP gateway `networks` configures for `network`, and the network the
+/// engine checks it against; `None` when OHTTP is off for the network, which it
+/// always is for regtest. A testnet session never rides the mainnet gateway,
+/// nor the other way round.
+fn gateway_for(
+    networks: &OhttpNetworks,
+    network: zcash_voting::Network,
+) -> Option<(&str, NetworkType)> {
+    let (ohttp_network, engine_network) = match network {
+        zcash_voting::Network::Mainnet => (zodl_ohttp_client::Network::Mainnet, NetworkType::Main),
+        zcash_voting::Network::Testnet => (zodl_ohttp_client::Network::Testnet, NetworkType::Test),
+        zcash_voting::Network::Regtest => return None,
+    };
+    networks
+        .get(ohttp_network)
+        .map(|config| (config.gateway_host(), engine_network))
 }
 
 /// Wraps `on_dispatch` so that `dispatched` records whether it fired.
@@ -535,6 +538,7 @@ impl RouteHttp for OhttpRoute {
             // reached stays before dispatch. The engine also stops reading an answer once it
             // is past `max_response_bytes`, instead of buffering it in full.
             let call = http_round_trip_with_dispatch(
+                &self.networks,
                 &self.gateway_host,
                 self.network,
                 Dialer::Direct,
@@ -569,23 +573,28 @@ impl RouteHttp for OhttpRoute {
     }
 }
 
-/// Chooses the route a voting session rides, from Tor availability and whether
-/// the servers are the user's own.
+/// Chooses the route a voting session rides, from Tor availability, whether
+/// the servers are the user's own and the OHTTP configuration `networks`.
 ///
 /// - Tor on (`tor` is `Some`): [`SdkRoute::Tor`], over an isolated client, to
 ///   the vote and PIR servers directly.
 /// - Tor off and a custom server: [`SdkRoute::Direct`]. Choosing one's own
 ///   server is the user's decision to be reached directly.
-/// - Tor off and a predefined server: [`SdkRoute::Ohttp`] through the relay and
-///   gateway, and an error when the gateway does not carry every one of
-///   `endpoint_urls`. No fallback to a direct connection.
+/// - Tor off, a predefined server and OHTTP configured for the wallet's
+///   network: [`SdkRoute::Ohttp`] through the relay and gateway, and an error
+///   when the gateway does not carry every one of `endpoint_urls`. No fallback
+///   to a direct connection.
+/// - Tor off, a predefined server and OHTTP off for the wallet's network:
+///   [`SdkRoute::Direct`]. There is no gateway to carry the request, and the
+///   rest of the wallet's traffic on that network goes direct too.
 ///
 /// `endpoint_urls` is every chain and PIR endpoint the session will use: they
 /// share one route (a PIR query hides which rows are fetched, not who fetches
 /// them), so one that the gateway cannot carry refuses the session rather than
 /// failing partway through a round. It is read only in the Tor-off, predefined
-/// case.
+/// case with OHTTP on.
 pub(super) fn resolve_session_route(
+    networks: Arc<OhttpNetworks>,
     tor: Option<&crate::tor::TorRuntime>,
     is_custom_server: bool,
     network: zcash_voting::Network,
@@ -594,12 +603,12 @@ pub(super) fn resolve_session_route(
     if let Some(tor) = tor {
         return Ok(SdkRoute::tor(tor.isolated_client()));
     }
-    if is_custom_server {
+    if is_custom_server || gateway_for(&networks, network).is_none() {
         return Ok(SdkRoute::direct());
     }
     // Every endpoint must pass; the route itself carries no per-endpoint state.
     let mut routes = endpoint_urls.iter().map(|url| {
-        OhttpRoute::new(url, network).map_err(|error| {
+        OhttpRoute::new(&networks, url, network).map_err(|error| {
             invalid_input(format!(
                 "cannot reach predefined vote server at {url} with Tor disabled: {error}"
             ))
@@ -631,6 +640,14 @@ mod tests {
         http::{HttpError, TimeoutPhase},
     };
     use zcash_voting::{RouteHttp, RoutePhase, RouteRequest};
+    use zodl_ohttp_client::OhttpNetworks;
+
+    use crate::ohttp_config::example;
+
+    /// Both networks configured, with the example values.
+    fn configured() -> Arc<OhttpNetworks> {
+        Arc::new(example::networks())
+    }
 
     fn http_build_error() -> http::Error {
         http::Request::builder()
@@ -803,9 +820,13 @@ mod tests {
     #[test]
     fn ohttp_route_host_validation_is_before_dispatch() {
         // Host validation happens before any network call, so it's always before-dispatch.
-        let error = OhttpRoute::new("https://unknown.example", zcash_voting::Network::Mainnet)
-            .err()
-            .expect("host not in OHTTP_VOTE_HOSTS");
+        let error = OhttpRoute::new(
+            &configured(),
+            "https://unknown.example",
+            zcash_voting::Network::Mainnet,
+        )
+        .err()
+        .expect("host not in OHTTP_VOTE_HOSTS");
         assert_eq!(
             error.phase,
             RoutePhase::BeforeDispatch,
@@ -816,19 +837,27 @@ mod tests {
     #[test]
     fn ohttp_route_uses_the_gateway_of_the_wallet_network() {
         let url = "https://vote.zodl.com";
-        let mainnet = OhttpRoute::new(url, zcash_voting::Network::Mainnet).expect("mainnet");
-        assert_eq!(
-            mainnet.gateway_host,
-            env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
-        );
-        let testnet = OhttpRoute::new(url, zcash_voting::Network::Testnet).expect("testnet");
-        assert_eq!(
-            testnet.gateway_host,
-            env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
-        );
-        let error = OhttpRoute::new(url, zcash_voting::Network::Regtest)
+        let networks = configured();
+        let mainnet =
+            OhttpRoute::new(&networks, url, zcash_voting::Network::Mainnet).expect("mainnet");
+        assert_eq!(mainnet.gateway_host, example::MAINNET.gateway_host);
+        assert_eq!(mainnet.network, NetworkType::Main);
+        let testnet =
+            OhttpRoute::new(&networks, url, zcash_voting::Network::Testnet).expect("testnet");
+        assert_eq!(testnet.gateway_host, example::TESTNET.gateway_host);
+        assert_eq!(testnet.network, NetworkType::Test);
+        let error = OhttpRoute::new(&networks, url, zcash_voting::Network::Regtest)
             .err()
             .expect("no regtest gateway");
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+        // A network without a configuration has no gateway either.
+        let error = OhttpRoute::new(
+            &Arc::new(OhttpNetworks::default()),
+            url,
+            zcash_voting::Network::Mainnet,
+        )
+        .err()
+        .expect("no gateway with OHTTP off");
         assert_eq!(error.phase, RoutePhase::BeforeDispatch);
     }
 
@@ -954,7 +983,7 @@ mod tests {
             "not a url",
             "vote.zodl.com",
         ] {
-            let error = OhttpRoute::new(url, zcash_voting::Network::Mainnet)
+            let error = OhttpRoute::new(&configured(), url, zcash_voting::Network::Mainnet)
                 .err()
                 .expect(url);
             assert_eq!(error.phase, RoutePhase::BeforeDispatch, "{url}");
@@ -963,6 +992,7 @@ mod tests {
 
     #[test]
     fn ohttp_route_accepts_every_gateway_host_with_or_without_slash_and_port() {
+        let networks = configured();
         for host in EXPECTED_VOTE_HOSTS.iter().chain(EXPECTED_PIR_HOSTS.iter()) {
             for url in [
                 format!("https://{host}"),
@@ -970,7 +1000,7 @@ mod tests {
                 format!("https://{host}:443/api/v1/round"),
             ] {
                 assert!(
-                    OhttpRoute::new(&url, zcash_voting::Network::Mainnet).is_ok(),
+                    OhttpRoute::new(&networks, &url, zcash_voting::Network::Mainnet).is_ok(),
                     "{url}"
                 );
             }
@@ -985,8 +1015,14 @@ mod tests {
             &["https://vote.zodl.com"][..],
             &[][..],
         ] {
-            let route = resolve_session_route(None, true, zcash_voting::Network::Mainnet, urls)
-                .expect("custom server");
+            let route = resolve_session_route(
+                configured(),
+                None,
+                true,
+                zcash_voting::Network::Mainnet,
+                urls,
+            )
+            .expect("custom server");
             assert_eq!(variant(&route), "Direct");
         }
     }
@@ -995,19 +1031,32 @@ mod tests {
     fn tor_off_predefined_servers_route_through_ohttp() {
         for host in EXPECTED_VOTE_HOSTS {
             let url = format!("https://{host}");
-            let route = resolve_session_route(None, false, zcash_voting::Network::Mainnet, &[&url])
-                .expect(host);
+            let route = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                &[&url],
+            )
+            .expect(host);
             assert_eq!(variant(&route), "Ohttp", "{host}");
         }
         // The three PIR hosts take the same route as the vote servers.
         for host in EXPECTED_PIR_HOSTS {
             let url = format!("https://{host}/");
-            let route = resolve_session_route(None, false, zcash_voting::Network::Mainnet, &[&url])
-                .expect(host);
+            let route = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                &[&url],
+            )
+            .expect(host);
             assert_eq!(variant(&route), "Ohttp", "{host}");
         }
         // A session's chain and PIR endpoints together.
         let route = resolve_session_route(
+            configured(),
             None,
             false,
             zcash_voting::Network::Mainnet,
@@ -1029,9 +1078,15 @@ mod tests {
             &["https://vote.zodl.com", "https://pir.example.com/"][..],
             &[][..],
         ] {
-            let error = resolve_session_route(None, false, zcash_voting::Network::Mainnet, urls)
-                .err()
-                .unwrap_or_else(|| panic!("{urls:?} must not resolve a route"));
+            let error = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                urls,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{urls:?} must not resolve a route"));
             // Crosses the FFI as the typed `invalid_input` envelope.
             let view: serde_json::Value =
                 serde_json::from_str(&error.to_string()).expect("typed VotingErrorView JSON");
@@ -1039,10 +1094,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn voting_route_goes_direct_without_configuration() {
+        let mainnet_only = Arc::new(
+            OhttpNetworks::new(Some(example::config(example::MAINNET)), None).expect("mainnet"),
+        );
+        for (networks, network) in [
+            (
+                Arc::new(OhttpNetworks::default()),
+                zcash_voting::Network::Mainnet,
+            ),
+            (
+                Arc::new(OhttpNetworks::default()),
+                zcash_voting::Network::Testnet,
+            ),
+            // Configuring the other network does not configure the wallet's.
+            (mainnet_only, zcash_voting::Network::Testnet),
+            // OHTTP never serves regtest.
+            (configured(), zcash_voting::Network::Regtest),
+        ] {
+            // Predefined servers, the gateway's hosts and others alike: with OHTTP off for the
+            // wallet's network there is no gateway to carry them, so they are reached directly.
+            for urls in [
+                &[
+                    "https://vote.zodl.com",
+                    "https://lb-pir-primary.valargroup.org/",
+                ][..],
+                &["https://unknown.example.com/"][..],
+            ] {
+                let route =
+                    resolve_session_route(Arc::clone(&networks), None, false, network, urls)
+                        .unwrap_or_else(|error| panic!("{network:?} {urls:?}: {error}"));
+                assert_eq!(variant(&route), "Direct", "{network:?} {urls:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn voting_route_uses_ohttp_with_configuration() {
+        let urls = &["https://vote.zodl.com", "https://zpir-1.stardust.rest/"][..];
+        for (network, gateway_host, engine_network) in [
+            (
+                zcash_voting::Network::Mainnet,
+                example::MAINNET.gateway_host,
+                NetworkType::Main,
+            ),
+            (
+                zcash_voting::Network::Testnet,
+                example::TESTNET.gateway_host,
+                NetworkType::Test,
+            ),
+        ] {
+            let networks = configured();
+            let route = resolve_session_route(Arc::clone(&networks), None, false, network, urls)
+                .unwrap_or_else(|error| panic!("{network:?}: {error}"));
+            let route = match route {
+                SdkRoute::Ohttp(route) => route,
+                other => panic!("{network:?} took the {} route", variant(&other)),
+            };
+            // The session rides the gateway of its network, under the configuration it opened
+            // with.
+            assert_eq!(route.gateway_host, gateway_host);
+            assert_eq!(route.network, engine_network);
+            assert!(Arc::ptr_eq(&route.networks, &networks));
+
+            // Unchanged with a configuration: a server the gateway does not carry still refuses
+            // the session rather than going direct.
+            assert!(
+                resolve_session_route(
+                    configured(),
+                    None,
+                    false,
+                    network,
+                    &["https://vote.zodl.com", "https://unknown.example.com/"],
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ohttp_route_refuses_an_unlisted_host_before_dispatch() {
-        let route = OhttpRoute::new("https://vote.zodl.com", zcash_voting::Network::Mainnet)
-            .expect("listed host");
+        let route = OhttpRoute::new(
+            &configured(),
+            "https://vote.zodl.com",
+            zcash_voting::Network::Mainnet,
+        )
+        .expect("listed host");
         let dispatched = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&dispatched);
         let on_dispatch = move || flag.store(true, Ordering::SeqCst);

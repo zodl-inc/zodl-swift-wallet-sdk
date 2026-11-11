@@ -9,6 +9,10 @@ import XCTest
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPAuditFixTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
 
     // MARK: - C-07: 400-retry substring match vulnerability
 

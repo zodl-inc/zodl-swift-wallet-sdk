@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'Scripts/lib/ffi_layout.py'
@@ -27,7 +26,8 @@ class LayoutTests(unittest.TestCase):
         lipo = self.tools / 'lipo'
         lipo.write_text('#!/bin/sh\n[ "$1" = -archs ] || exit 7\ncat "$2"\n')
         lipo.chmod(0o755)
-        self.env = dict(os.environ, **VALUES, PATH=str(self.tools) + os.pathsep + os.environ['PATH'])
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('ZODL_OHTTP_')}
+        self.env.update(PATH=str(self.tools) + os.pathsep + os.environ['PATH'])
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(HELPER), *map(str, args)], env=self.env, text=True, capture_output=True)
@@ -166,7 +166,6 @@ class MakePackagingTests(unittest.TestCase):
         (source / 'Scripts/lib').mkdir(parents=True)
         if HELPER.exists():
             shutil.copy(HELPER, source / 'Scripts/lib/ffi_layout.py')
-        shutil.copy(ROOT / 'Scripts/lib/ohttp_env.py', source / 'Scripts/lib/ohttp_env.py')
         (source / 'Cargo.toml').write_text('fixture')
         (source / 'rust').mkdir()
         (source / 'target/Headers').mkdir(parents=True)

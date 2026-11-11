@@ -15,6 +15,11 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
     private let latestBlockHeight = BlockHeight(2_000_000)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private var endpointA: LightWalletEndpoint {
         LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
     }

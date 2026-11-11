@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ["clean-ffi", "ffi-all", "configure-local-ffi", "build", "test-offline"]
@@ -128,7 +127,7 @@ class NativeRecordTests(unittest.TestCase):
             path = self.tools / tool
             path.write_text(GH_DOUBLE if tool == "gh" else NATIVE_DOUBLE)
             path.chmod(0o755)
-        for relative in ("Makefile", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/lib/ohttp_env.py", "Scripts/ci/sdk_build_record.py"):
+        for relative in ("Makefile", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/ci/sdk_build_record.py"):
             source = ROOT / relative
             if source.exists():
                 target = self.source / relative
@@ -157,8 +156,7 @@ class NativeRecordTests(unittest.TestCase):
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
 
     def artifacts(self, *flags, record=True, expected_source=None, **env):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
-        environment.update(VALUES)
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_", "ZODL_OHTTP_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog))
         if record:
             environment["ZODL_SDK_BUILD_RECORD"] = "1"
@@ -207,8 +205,7 @@ if sys.argv[1:] == ["--version"]:
         self.assertFalse(any(c[:2] in (["release", "create"], ["release", "upload"], ["release", "edit"]) for c in self.gh_calls()))
 
     def policy_environment(self):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_")) and k != "GH_REPO"}
-        environment.update(VALUES)
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_", "ZODL_OHTTP_")) and k != "GH_REPO"}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog), GH_REPO="owner/sdk")
         real_git = shutil.which("git")
         sentinel = self.tools / "git"

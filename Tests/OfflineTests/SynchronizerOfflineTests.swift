@@ -19,6 +19,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
         network = ZcashNetworkBuilder.network(for: .testnet)
         cancellables = []
     }

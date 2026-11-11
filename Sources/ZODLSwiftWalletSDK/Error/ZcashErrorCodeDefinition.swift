@@ -117,6 +117,10 @@ enum ZcashErrorDefinition {
     /// TorClient is called but SDKFlags are set as Tor disabled
     // sourcery: code="ZTSRV0005"
     case torNotEnabled
+    /// The OHTTP configuration passed to `OHTTPEndpoints.configure` was refused; the one installed before stays.
+    /// - `rustError` names the network, the field and the rule the value breaks, never the value.
+    // sourcery: code="ZTSRV0009"
+    case ohttpConfigurationInvalid(_ rustError: String)
 
     // MARK: SQLite connection
 

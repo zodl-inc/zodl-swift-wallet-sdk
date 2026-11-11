@@ -12,6 +12,11 @@ import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPZipConformanceTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private final class Recorder: @unchecked Sendable {
         var keyFetches = 0
         var posts: [URLRequest] = []
@@ -550,23 +555,6 @@ final class OHTTPZipConformanceTests: XCTestCase {
         func withLock<T: Sendable>(_ body: @Sendable (inout Counts) -> T) -> T {
             counts.withLock(body)
         }
-    }
-
-    func testConfiguredRelaysReportTheirOperatorIndependence() throws {
-        let independentFingerprints: Set<String> = [
-            "f3aec311b948b8d86d88a0ffdfaf23c6a35ddc2c26beb410fe919dfc2eb69c87",
-            "54d9951ab67cea3f069555738dfce2722218bdd5501e4b6c1f4ad9ad3ff732c7"
-        ]
-        for (gateway, name) in [
-            (OHTTPTestSupport.mainnetHost, "ZODL_OHTTP_RELAY_URL_MAINNET"),
-            (OHTTPTestSupport.testnetHost, "ZODL_OHTTP_RELAY_URL_TESTNET")
-        ] {
-            let url = try XCTUnwrap(URL(string: OHTTPTestSupport.configuredValue(name)))
-            let host = try XCTUnwrap(url.host).lowercased()
-            let fingerprint = SHA256.hash(data: Data(host.utf8)).map { String(format: "%02x", $0) }.joined()
-            XCTAssertEqual(OHTTPEndpoints.usesOperatorRelay(gatewayHost: gateway), !independentFingerprints.contains(fingerprint))
-        }
-        XCTAssertTrue(OHTTPEndpoints.usesOperatorRelay(gatewayHost: "lwd.example.com"))
     }
 
     // MARK: - One client per circuit
