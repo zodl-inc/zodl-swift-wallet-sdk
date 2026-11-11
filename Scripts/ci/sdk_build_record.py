@@ -192,29 +192,45 @@ def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
 
 
 def product_inventory(product: Path) -> dict:
-    """Map each non-directory entry to its bytes or link target, without following links."""
-    inventory = {}
+    """Map each entry to its bytes, link target or directory marker, without following links."""
+    inventory = {product.name: ("dir",)}
     for path in walk_entries(product):
         key = path.relative_to(product.parent).as_posix()
         if path.is_symlink():
             inventory[key] = ("link", os.readlink(path))
+        elif path.is_dir():
+            inventory[key] = ("dir",)
         elif path.is_file():
             inventory[key] = ("file", sha256(path))
     return inventory
 
 
 def archive_inventory(archive: Path) -> dict:
+    """Describe what unzip would create, so the gate guarantees the archive unpacks to exactly the product."""
     inventory = {}
+    folded = set()
     with zipfile.ZipFile(archive) as bundle:
         for item in bundle.infolist():
-            if item.is_dir():
-                continue
-            if item.filename in inventory:
+            name = item.filename.rstrip("/")
+            mode = stat.S_IFMT(item.external_attr >> 16)
+            # Unix mode bits only count when the member says it was written on Unix. Otherwise unzip
+            # ignores them and would extract a link as a regular file holding its target text.
+            if item.create_system != 3:
+                raise BuildError("archive member lacks Unix attributes")
+            if name in inventory or name.casefold() in folded:
+                # APFS is case-insensitive, so a case variant would merge into the same path.
                 raise BuildError("archive contents differ from verified native product")
-            if stat.S_IFMT(item.external_attr >> 16) == stat.S_IFLNK:
-                inventory[item.filename] = ("link", bundle.read(item).decode())
+            folded.add(name.casefold())
+            if item.is_dir():
+                if mode != stat.S_IFDIR:
+                    raise BuildError("archive directory member has an unexpected type")
+                inventory[name] = ("dir",)
+            elif mode == stat.S_IFLNK:
+                inventory[name] = ("link", bundle.read(item).decode())
+            elif mode == stat.S_IFREG:
+                inventory[name] = ("file", hashlib.sha256(bundle.read(item)).hexdigest())
             else:
-                inventory[item.filename] = ("file", hashlib.sha256(bundle.read(item)).hexdigest())
+                raise BuildError("archive member has an unexpected type")
     return inventory
 
 

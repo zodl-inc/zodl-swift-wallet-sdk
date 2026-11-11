@@ -473,11 +473,45 @@ if sys.argv[1:] == ["--version"]:
         zip_tool = self.tools / "zip"
         zip_tool.write_text("#!/usr/bin/env python3\nimport subprocess, sys\nargs = sys.argv[1:]\nargs[0] = args[0].replace('y', '')\nsubprocess.run(['/usr/bin/zip', *args], check=True)\n")
         zip_tool.chmod(0o755)
-        self.assert_rejected()
+        self.assert_rejected(message="archive contents differ from verified native product")
 
-    def assert_rejected(self, **env):
+    def rewriting_zip(self, body):
+        # Runs the real zip, then rewrites the archive with every member's ZipInfo intact except what body changes.
+        zip_tool = self.tools / "zip"
+        zip_tool.write_text("#!/usr/bin/env python3\nimport subprocess, sys, zipfile\nsubprocess.run(['/usr/bin/zip', *sys.argv[1:]], check=True)\n"
+                            "archive = sys.argv[2]\nwith zipfile.ZipFile(archive) as source:\n    members = [(i, source.read(i)) for i in source.infolist()]\n"
+                            + body + "with zipfile.ZipFile(archive, 'w') as out:\n    for info, data in members:\n        out.writestr(info, data)\n")
+        zip_tool.chmod(0o755)
+
+    FRAMEWORK = "libzcashlc.xcframework/macos-arm64/libzcashlc.framework/"
+
+    def test_archive_with_links_not_marked_unix_is_rejected(self):
+        self.rewriting_zip("for info, _ in members:\n    if info.filename.endswith('/Headers') and not info.is_dir():\n        info.create_system = 0\n")
+        self.assert_rejected(message="archive member lacks Unix attributes")
+
+    def test_archive_with_directory_shadowing_a_link_is_rejected(self):
+        self.rewriting_zip("import copy\nlink = next(m for m in members if m[0].filename == " + repr(self.FRAMEWORK + "Headers") + ")\n"
+                           "directory = copy.copy(link[0])\ndirectory.filename = link[0].filename + '/'\ndirectory.external_attr = (0o40755 << 16) | 0x10\ndirectory.file_size = 0\n"
+                           "members.insert(members.index(link), (directory, b''))\n")
+        self.assert_rejected(message="archive contents differ from verified native product")
+
+    def test_archive_with_case_variant_directory_is_rejected(self):
+        self.rewriting_zip(self.extra_directory(self.FRAMEWORK + "versions/"))
+        self.assert_rejected(message="archive contents differ from verified native product")
+
+    def test_archive_with_extra_slice_directory_is_rejected(self):
+        self.rewriting_zip(self.extra_directory("libzcashlc.xcframework/macos-arm64_x86_64/"))
+        self.assert_rejected(message="archive contents differ from verified native product")
+
+    def extra_directory(self, name):
+        return ("import copy\ndirectory = copy.copy(members[0][0])\ndirectory.filename = " + repr(name) + "\n"
+                "directory.external_attr = (0o40755 << 16) | 0x10\ndirectory.file_size = 0\nmembers.append((directory, b''))\n")
+
+    def assert_rejected(self, message=None, **env):
         result = self.artifacts(**env)
         self.assertNotEqual(result.returncode, 0)
+        if message:
+            self.assertIn(message, result.stderr)
         self.assert_no_release_write()
 
     def test_component_version_mismatch_stops_before_make(self):
