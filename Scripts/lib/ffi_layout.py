@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
+import zlib
 from xml.parsers.expat import ExpatError
 
 SLICES = {
@@ -192,6 +195,50 @@ def install(root, wrapper, destination):
             shutil.rmtree(stage)
 
 
+def extract(archive, destination):
+    """Unpack a release zip, admitting only the known macOS framework links."""
+    root = "libzcashlc.xcframework"
+    macos = PurePosixPath(root, "macos-arm64", "libzcashlc.framework")
+    allowed_links = {macos / name: target for name, target in MACOS_LINKS.items()}
+    try:
+        source = zipfile.ZipFile(archive)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise LayoutError("cannot read archive: " + str(archive)) from error
+    with source:
+        seen = set()
+        regular = []
+        links = []
+        # Check every member before writing anything, so a rejected archive
+        # leaves no partial extraction behind.
+        for item in source.infolist():
+            path = PurePosixPath(item.filename)
+            kind = stat.S_IFMT(item.external_attr >> 16)
+            if (path.is_absolute() or "\\" in item.filename or ".." in path.parts
+                    or not path.parts or path.parts[0] != root or path in seen
+                    or kind not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK)):
+                raise LayoutError("unsafe or duplicate archive member: " + item.filename)
+            seen.add(path)
+            if kind == stat.S_IFLNK:
+                try:
+                    target = source.read(item).decode("utf-8")
+                except (UnicodeDecodeError, zipfile.BadZipFile, OSError) as error:
+                    raise LayoutError("unreadable link member: " + item.filename) from error
+                if allowed_links.get(path) != target:
+                    raise LayoutError("unexpected link member: " + item.filename)
+                links.append((path, target))
+            else:
+                regular.append(item)
+        # Links are created only after every regular member is written, so a
+        # link can never redirect a later write out of the destination.
+        try:
+            for item in regular:
+                source.extract(item, destination)
+            for path, target in links:
+                os.symlink(target, Path(destination, *path.parts))
+        except (zipfile.BadZipFile, zlib.error) as error:
+            raise LayoutError("corrupt archive member") from error
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -206,10 +253,15 @@ def main(argv=None):
     local.add_argument("root", type=Path)
     local.add_argument("wrapper", type=Path)
     local.add_argument("destination", type=Path)
+    unpack = operations.add_parser("extract")
+    unpack.add_argument("archive", type=Path)
+    unpack.add_argument("destination", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.operation == "manifest":
             args.output.write_bytes(plistlib.dumps(manifest(args.identifiers)))
+        elif args.operation == "extract":
+            extract(args.archive, args.destination)
         elif args.operation == "install":
             install(args.root, args.wrapper, args.destination)
         else:
