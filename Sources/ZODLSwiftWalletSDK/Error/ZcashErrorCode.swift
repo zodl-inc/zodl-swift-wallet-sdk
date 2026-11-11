@@ -55,8 +55,16 @@ public enum ZcashErrorCode: String {
     case grpcServiceCalledWithTorMode = "ZTSRV0003"
     /// TorClient is nil
     case torClientUnavailable = "ZTSRV0004"
+    /// Request URL host is not registered in OHTTPEndpoints — cannot route over OHTTP.
+    case ohttpUnsupportedHost = "ZTSRV0006"
+    /// OHTTP transport returned a response that could not be converted to HTTPURLResponse.
+    case ohttpResponseError = "ZTSRV0007"
+    /// OHTTP transport error (e.g., self reference lost in httpSender closure).
+    case ohttpTransportError = "ZTSRV0008"
     /// TorClient is called but SDKFlags are set as Tor disabled
     case torNotEnabled = "ZTSRV0005"
+    /// The OHTTP configuration passed to `OHTTPEndpoints.configure` was refused; the one installed before stays.
+    case ohttpConfigurationInvalid = "ZTSRV0009"
     /// SimpleConnectionProvider init of Connection failed.
     case simpleConnectionProvider = "ZSCPC0001"
     /// Downloaded file with sapling spending parameters isn't valid.

@@ -689,7 +689,8 @@ final class MigrationLogicTests: ZcashTestCase {
         let broadcaster = MigrationBroadcaster(
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
-            torClientFactory: factory.make
+            torClientFactory: factory.make,
+            networkType: .testnet
         )
 
         let first = Task { try await broadcaster.dedicatedTorClient() }
@@ -719,7 +720,8 @@ final class MigrationLogicTests: ZcashTestCase {
         let broadcaster = MigrationBroadcaster(
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
-            torClientFactory: factory.make
+            torClientFactory: factory.make,
+            networkType: .testnet
         )
         let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
 
@@ -754,6 +756,42 @@ final class MigrationLogicTests: ZcashTestCase {
         XCTAssertEqual(callCountAfterRetry, 2, "a later broadcast must retry with a fresh bootstrap, not replay the cached failure")
     }
 
+    /// With the SDK's Tor mode on, a broadcast asked for without Tor still takes the fail-closed Tor
+    /// path: a Tor runtime that cannot start fails the broadcast instead of a direct submit going out.
+    func testTorModeForcesTheTorPathWhateverTheCallerAsked() async throws {
+        let events = BroadcastEventLog()
+        let service = LightWalletServiceMock()
+        service.latestBlockHeightModeReturnValue = 4_465_026
+        service.submitSpendTransactionModeReturnValue = LightWalletServiceMockResponse.submitAnswer(errorCode: 0, errorMessage: "")
+        service.closeConnectionsClosure = { }
+        let broadcaster = MigrationBroadcaster(
+            torDirURL: testGeneralStorageDirectory,
+            logger: logger,
+            torClientFactory: { _ in throw StubTorBootstrapError() },
+            torMode: { true },
+            networkType: .testnet,
+            directServiceFactory: { _ in
+                events.record("direct")
+                return service
+            }
+        )
+        let endpoint = LightWalletEndpoint(address: "default.example", port: 9067)
+        let attempt = Task {
+            try await broadcaster.broadcast(
+                to: endpoint, useTor: false,
+                onWillSubmit: { events.record("willSubmit") },
+                prepareTransaction: { _ in
+                    events.record("prepare")
+                    return Data([0x01])
+                }
+            )
+        }
+        await assertThrowsMigrationTorUnavailable(attempt)
+        XCTAssertEqual(events.events, [])
+        XCTAssertFalse(service.latestBlockHeightModeCalled)
+        XCTAssertFalse(service.submitSpendTransactionModeCalled)
+    }
+
     // MARK: - Broadcaster order (direct transport)
     //
     // The broadcaster reads the server's height on the connection it submits over BEFORE it asks
@@ -767,6 +805,7 @@ final class MigrationLogicTests: ZcashTestCase {
             torDirURL: testGeneralStorageDirectory,
             logger: logger,
             torClientFactory: { _ in throw StubTorBootstrapError() },
+            networkType: .testnet,
             directServiceFactory: { _ in service }
         )
     }

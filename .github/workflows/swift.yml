@@ -85,31 +85,25 @@ jobs:
         cat "$xcode_version_file"
         echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+    # Validate before tests (whose fixtures execute Cargo) and cache lookup.
+    # The compiler identity includes its host, commit and LLVM version.
+    - name: Setup Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      with:
+        python-version: '3.12'
+
+    - name: Install stable Rust
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
+
+    - name: Validate Rust
+      id: toolchain
+      run: |
+        python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
+
     - name: Run release-script tests
       run: make test-scripts
 
-    # Needed unconditionally: even on an FFI cache hit, the Rust test step below
-    # compiles the crate's test profile and so needs the toolchain. Only the
-    # arm64 macOS target: `make ffi-ci` builds nothing else.
-    #
-    # The runner image already ships rustup, so no toolchain action is needed.
-    # Incremental compilation stays off, because its files would only swell the
-    # cached target directory. Hash the complete compiler identity so every
-    # compiler, host and LLVM change starts a compatible cache namespace.
-    - name: Setup Rust
-      id: toolchain
-      run: |
-        rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin
-        rustup default stable
-        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
-        rustc_version_file=$(mktemp)
-        trap 'rm -f "$rustc_version_file"' EXIT
-        rustc +stable --version --verbose > "$rustc_version_file"
-        cat "$rustc_version_file"
-        echo "cachekey=$(shasum -a 256 "$rustc_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
-    # Hash every input of the FFI build for the XCFramework cache key.
     - name: Generate FFI source hash
       id: ffi-hash
       run: |
@@ -125,7 +119,19 @@ jobs:
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         path: BuildSupport/products/libzcashlc.xcframework
-        key: ffi-xcframework-macos-arm64-nolto-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+        key: ffi-xcframework-macos-arm64-nolto-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ffi-hash.outputs.hash }}
+
+    # This branch fetches private git dependencies (see Cargo.lock), so every
+    # cargo invocation needs this token: an FFI cache miss (the FFI build below)
+    # and the Rust test step, which runs on every event. `~/.cargo/git` is
+    # deliberately left out of the cache, see `Cache Cargo`. Fork PRs get no
+    # secrets; the action then does nothing and their fetches of the private
+    # repositories fail.
+    - name: Authorize cargo against the private slipstream repository
+      uses: ./.github/actions/authorize-slipstream
+      with:
+        app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+        app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
 
     # Used by both the FFI build and the Rust tests, so it is not conditional on
     # the FFI cache.
@@ -152,10 +158,9 @@ jobs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v3-${{ steps.toolchain.outputs.cachekey }}-
-
+          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-
     # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
     # the Swift build and the offline tests need. Releases still build every
     # slice with LTO.

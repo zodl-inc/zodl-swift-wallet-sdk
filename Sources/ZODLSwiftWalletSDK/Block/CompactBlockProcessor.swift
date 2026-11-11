@@ -49,6 +49,7 @@ actor CompactBlockProcessor {
     let storage: CompactBlockRepository
     private let transactionRepository: TransactionRepository
     private let fileManager: ZcashFileManager
+    private let sdkFlags: SDKFlags
 
     private var retryAttempts: Int = 0
     private var serviceFailureRetryAttempts: Int = 0
@@ -207,6 +208,7 @@ actor CompactBlockProcessor {
         self.config = config
         self.transactionRepository = container.resolve(TransactionRepository.self)
         self.fileManager = container.resolve(ZcashFileManager.self)
+        self.sdkFlags = container.resolve(SDKFlags.self)
         self.configProvider = configProvider
     }
 
@@ -526,17 +528,16 @@ extension CompactBlockProcessor {
     func consumeMempoolStream() async throws {
         let stream = try service.getMempoolStream()
 
-        do {
-            for try await rawTransaction in stream {
-                let mempoolTransactions = try await resolveMempools(rawTransaction: rawTransaction)
+        // S3: let errors propagate to watchMempool's 30s back-off; a clean end is a normal return
+        for try await rawTransaction in stream {
+            let mempoolTransactions = try await resolveMempools(rawTransaction: rawTransaction)
 
-                // The transactions are stored whatever the height is. The event carries it as a `BlockHeight`, so it is only
-                // sent for a height the SDK can use.
-                if !mempoolTransactions.isEmpty, let height = BlockHeight(serverHeight: rawTransaction.height) {
-                    await send(event: .foundTransactions(mempoolTransactions, .init(uncheckedBounds: (lower: height, upper: height))))
-                }
+            // The transactions are stored whatever the height is. The event carries it as a `BlockHeight`, so it is only
+            // sent for a height the SDK can use.
+            if !mempoolTransactions.isEmpty, let height = BlockHeight(serverHeight: rawTransaction.height) {
+                await send(event: .foundTransactions(mempoolTransactions, .init(uncheckedBounds: (lower: height, upper: height))))
             }
-        } catch { }
+        }
     }
 
     // DB-AUDIT (2026-08-03): WRITE — decryptAndStoreTransaction persists the decrypted tx;
@@ -661,9 +662,7 @@ extension CompactBlockProcessor {
         (actions[.fetchUTXO] as? FetchUTXOsAction)?.utxoFetcher = updatedUTXOFetcher
 
         // TransactionEncoder
-        let transactionEncoder = container.resolve(TransactionEncoder.self)
-
-        (actions[.txResubmission] as? TxResubmissionAction)?.transactionEncoder = transactionEncoder
+        (actions[.txResubmission] as? TxResubmissionAction)?.updateService(container)
     }
 }
 
@@ -1125,11 +1124,11 @@ extension CompactBlockProcessor {
     func refreshUTXOs(tAddress: TransparentAddress, startHeight: BlockHeight) async throws -> RefreshedUTXOs {
         let dataDb = self.config.dataDb
 
-        // ServiceMode to resolve
+        // Wallet-identifying: its own Tor circuit when Tor is on.
         let stream: AsyncThrowingStream<UnspentTransactionOutputEntity, Error> = try blockDownloaderService.fetchUnspentTransactionOutputs(
             tAddress: tAddress.stringEncoded,
             startHeight: startHeight,
-            mode: .direct
+            mode: await sdkFlags.ifTor(.uniqueTor)
         )
         var utxos: [UnspentTransactionOutputEntity] = []
 

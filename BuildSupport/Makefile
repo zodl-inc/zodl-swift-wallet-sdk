@@ -7,8 +7,8 @@ MAKEFLAGS += --no-builtin-rules
 
 PLATFORMS = ios-device macos ios-simulator
 IOS_DEVICE_ARCHS = aarch64-apple-ios
-IOS_SIM_ARCHS_STABLE = x86_64-apple-ios  aarch64-apple-ios-sim
-MACOS_ARCHS = x86_64-apple-darwin aarch64-apple-darwin
+IOS_SIM_ARCHS_STABLE = aarch64-apple-ios-sim
+MACOS_ARCHS = aarch64-apple-darwin
 IOS_SIM_ARCHS = $(IOS_SIM_ARCHS_STABLE)
 ALL_ARCHS = $(IOS_DEVICE_ARCHS) $(IOS_SIM_ARCHS) $(MACOS_ARCHS)
 
@@ -27,23 +27,27 @@ IPHONEOS_DEPLOYMENT_TARGET = 16.0
 # artifact directory (../target/release), so running one `cargo build --target X`
 # per architecture cannot overlap them — `make -j` does not help. That matters
 # most for the link step: `lto = true` is a single-threaded whole-program pass
-# costing roughly two minutes per architecture, so five of them run back to back.
+# costing roughly two minutes per architecture, so three of them run back to back.
 #
 # Passing several `--target` flags to one invocation puts every architecture in a
 # single job graph, letting those passes run concurrently.
-CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --locked --manifest-path ../Cargo.toml --release
+# Extra Cargo features, for QA builds only (ohttp-e2e.yml passes ohttp-trace);
+# release builds leave it empty.
+FFI_CARGO_FEATURES ?=
+CARGO_BUILD = RUSTUP_TOOLCHAIN=stable MACOSX_DEPLOYMENT_TARGET=$(MACOSX_DEPLOYMENT_TARGET) IPHONEOS_DEPLOYMENT_TARGET=$(IPHONEOS_DEPLOYMENT_TARGET) cargo build --locked --manifest-path ../Cargo.toml --release $(if $(FFI_CARGO_FEATURES),--features $(FFI_CARGO_FEATURES))
 cargo_targets = $(addprefix --target ,$(1))
 
 RUST_SRCS = $(shell find ../rust -name "*.rs") ../Cargo.toml
-STATIC_LIBS = $(shell find ../target -name "libzcashlc.a")
 
 install:
 	rustup toolchain add stable
-	rustup +stable target add aarch64-apple-ios x86_64-apple-ios x86_64-apple-darwin aarch64-apple-darwin aarch64-apple-ios-sim
+	rustup +stable target add aarch64-apple-ios aarch64-apple-darwin aarch64-apple-ios-sim
 	
 .PHONY: install
 
-release: clean xcframework
+release:
+	$(MAKE) clean
+	$(MAKE) xcframework
 .PHONY: release
 
 # Discard assembled build products. ../target is deliberately preserved so that
@@ -69,9 +73,10 @@ products/libzcashlc.xcframework: cargo-all $(PLATFORMS)
 	rm -rf $@
 	mkdir -p $@
 	cp -R products/ios-device/frameworks $@/ios-arm64
-	cp -R products/ios-simulator/frameworks $@/ios-arm64_x86_64-simulator
-	cp -R products/macos/frameworks $@/macos-arm64_x86_64
+	cp -R products/ios-simulator/frameworks $@/ios-arm64-simulator
+	cp -R products/macos/frameworks $@/macos-arm64
 	cp Info.plist $@
+	python3 ../Scripts/lib/ffi_layout.py validate $@ --require-full
 
 frameworks: $(PLATFORMS)
 .PHONY: frameworks
@@ -92,15 +97,15 @@ products/%/frameworks/libzcashlc.framework: products/%/universal/libzcashlc.a
 
 products/macos/universal/libzcashlc.a: $(MACOS_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/macos/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create products/macos/static-libraries/aarch64-apple-darwin/libzcashlc.a -output $@
 
 products/ios-simulator/universal/libzcashlc.a: $(IOS_SIM_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/ios-simulator/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create products/ios-simulator/static-libraries/aarch64-apple-ios-sim/libzcashlc.a -output $@
 
 products/ios-device/universal/libzcashlc.a: $(IOS_DEVICE_ARCHS)
 	mkdir -p $(@D)
-	lipo -create $(shell find products/ios-device/static-libraries -name "libzcashlc.a") -output $@
+	lipo -create products/ios-device/static-libraries/aarch64-apple-ios/libzcashlc.a -output $@
 
 $(MACOS_ARCHS): %: cargo-macos
 	mkdir -p products/macos/static-libraries/$*

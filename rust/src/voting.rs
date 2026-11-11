@@ -13,6 +13,8 @@ pub mod ffi_types;
 pub mod helpers;
 pub mod hotkey;
 pub mod keys;
+#[cfg(test)]
+mod nu7_compatibility;
 pub mod route;
 pub mod runtime;
 pub mod session;

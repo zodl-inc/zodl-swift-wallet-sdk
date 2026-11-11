@@ -58,7 +58,7 @@ use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::errors::invalid_input;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
-use super::route::SdkRoute;
+use super::route::resolve_session_route;
 use super::session::{EventCallback, EventSink, VotingSession};
 use super::store::VotingDatabaseHandle;
 use super::store_ffi::handle_from_ptr;
@@ -186,6 +186,24 @@ struct ProofStatusResponse {
 ///   the caller keeps ownership and still frees it with
 ///   [`zcashlc_free_tor_runtime`](crate::zcashlc_free_tor_runtime).
 /// - Call [`zcashlc_voting_session_free`] to free the returned handle.
+///
+/// # Route
+///
+/// One route serves every service of the session (chain, helper, PIR and
+/// vote-tree traffic), chosen here and kept for its life:
+///
+/// - `tor` non-null: Tor, to the vote and PIR servers directly.
+/// - `tor` null and `is_custom_server`: the direct HTTP route (the voter chose
+///   their own server).
+/// - `tor` null, not `is_custom_server`, and OHTTP configured for the wallet's
+///   network ([`zcashlc_ohttp_configure`](crate::ohttp_config::zcashlc_ohttp_configure)):
+///   OHTTP through the relay and gateway, failing closed. Every chain and PIR
+///   endpoint of the session must be one the gateway carries, or the open
+///   fails with `invalid_input`; nothing falls back to a direct connection.
+///   The session keeps the configuration installed when it opened.
+/// - `tor` null, not `is_custom_server`, and OHTTP off for the wallet's
+///   network: the direct HTTP route, as the rest of the wallet's traffic on
+///   that network.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zcashlc_voting_session_open(
     db: *mut VotingDatabaseHandle,
@@ -194,6 +212,7 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
     binding_json: *const u8,
     binding_json_len: usize,
     tor: *const crate::tor::TorRuntime,
+    is_custom_server: bool,
     epoch: u64,
 ) -> *mut VotingSessionHandle {
     let db = AssertUnwindSafe(db);
@@ -208,10 +227,19 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
         // isolated client is taken here rather than by the host, so a session
         // cannot be handed a runtime whose circuits another part of the wallet
         // is already using.
-        let route = match unsafe { (*tor).as_ref() } {
-            Some(tor) => SdkRoute::tor(tor.isolated_client()),
-            None => SdkRoute::direct(),
-        };
+        let endpoints: Vec<&str> = inputs
+            .chain_endpoints
+            .iter()
+            .chain(inputs.pir_endpoints.iter())
+            .map(String::as_str)
+            .collect();
+        let route = resolve_session_route(
+            crate::ohttp_config::installed_networks(),
+            unsafe { (*tor).as_ref() },
+            is_custom_server,
+            handle.network,
+            &endpoints,
+        )?;
         let session = VotingSession::open(handle, inputs, binding, route, epoch)?;
         Ok(Box::into_raw(Box::new(VotingSessionHandle {
             session: Arc::new(session),
@@ -811,6 +839,7 @@ mod tests {
                 binding.as_ptr(),
                 binding.len(),
                 std::ptr::null(),
+                true,
                 3,
             )
         };
@@ -923,6 +952,7 @@ mod tests {
                     inputs.as_ptr(),
                     inputs.len(),
                     std::ptr::null(),
+                    true,
                     1,
                 )
             }
@@ -940,6 +970,7 @@ mod tests {
                     inputs.as_ptr(),
                     inputs.len(),
                     std::ptr::null(),
+                    true,
                     1,
                 )
             }
@@ -974,6 +1005,41 @@ mod tests {
                     binding.as_ptr(),
                     binding.len(),
                     std::ptr::null(),
+                    true,
+                    1,
+                )
+            }
+            .is_null()
+        );
+        assert_eq!(last_error_kind(), "invalid_input");
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    /// A predefined server with Tor off goes through the OHTTP gateway the app
+    /// configured, which carries only its own exact host list: the fixture's
+    /// endpoints are not on it, so the open is refused up front, typed, rather
+    /// than falling back to a direct connection.
+    #[test]
+    fn session_open_tor_off_predefined_server_outside_the_gateway_fails_closed() {
+        let _guard = crate::ohttp_config::lock_installed_networks();
+        crate::ohttp_config::install_for_test(crate::ohttp_config::example::networks());
+        let db = open_memory_store_ptr(crate::NETWORK_ID_TESTNET, "w");
+        let (_dir, wallet_path, account_uuid) =
+            temp_wallet_db_with_account(crate::NETWORK_ID_TESTNET);
+        let inputs =
+            serde_json::to_vec(&synthetic_session_inputs(0x53, &wallet_path, &account_uuid))
+                .expect("inputs JSON");
+        let binding = serde_json::to_vec(&synthetic_binding(1, None)).expect("binding JSON");
+        assert!(
+            unsafe {
+                zcashlc_voting_session_open(
+                    db,
+                    inputs.as_ptr(),
+                    inputs.len(),
+                    binding.as_ptr(),
+                    binding.len(),
+                    std::ptr::null(),
+                    false,
                     1,
                 )
             }

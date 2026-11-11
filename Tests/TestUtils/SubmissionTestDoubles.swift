@@ -451,6 +451,19 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         return await recordPlan(txId: txId, endpoints: endpoints)
     }
 
+    /// Mirrors the real store: only a submitted plan no server has accepted gains the endpoint, at
+    /// its end and once per host and port; nothing else changes and nothing is created.
+    @discardableResult
+    func addEndpointToUnacceptedPlan(txId: Data, endpoint: LightWalletEndpoint) async -> SubmitPlanLifecycle? {
+        guard !storeUnavailable, storeFileExists, case .ready(let endpoints, nil) = plans[txId], !endpoints.isEmpty else {
+            return nil
+        }
+        if !endpoints.contains(where: { $0.host == endpoint.host && $0.port == endpoint.port }) {
+            plans[txId] = StoredSubmitPlan.ready(endpoints + [endpoint], acceptedBy: nil)
+        }
+        return await currentLifecycle()
+    }
+
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async {
         // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
         // is dropped instead of resurrecting a plan the caller already asked to clear.

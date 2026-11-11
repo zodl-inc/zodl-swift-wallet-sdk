@@ -32,10 +32,9 @@ cd "$(git rev-parse --show-toplevel)"
 # shellcheck source=lib/release-lib.sh
 . "Scripts/lib/release-lib.sh"
 
-# Ensure cargo/rustup are on PATH (needed when invoked from CI or Xcode).
-if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck source=/dev/null
-    . "$HOME/.cargo/env"
+# Find the normal toolchain without sourcing interactive or personal startup.
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 usage() {

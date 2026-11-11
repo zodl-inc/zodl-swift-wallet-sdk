@@ -9,6 +9,7 @@ import Foundation
 
 final class TxResubmissionAction {
     let resubmitter: TxResubmitter
+    private var endpoint: LightWalletEndpoint
 
     var latestResolvedTime: TimeInterval {
         get { resubmitter.latestResolvedTime }
@@ -25,6 +26,12 @@ final class TxResubmissionAction {
 
     init(container: DIContainer) {
         resubmitter = TxResubmitter(container: container)
+        endpoint = container.resolve(LightWalletEndpoint.self)
+    }
+
+    func updateService(_ container: DIContainer) {
+        transactionEncoder = container.resolve(TransactionEncoder.self)
+        endpoint = container.resolve(LightWalletEndpoint.self)
     }
 }
 
@@ -34,7 +41,12 @@ extension TxResubmissionAction: Action {
     func run(with context: ActionContext, didUpdate: @escaping (CompactBlockProcessor.Event) async -> Void) async throws -> ActionContext {
         let latestBlockHeight = await context.syncControlData.latestBlockHeight
 
-        await resubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight)
+        // The endpoint is bound with the encoder only after successful service publication.
+        let endpoint = self.endpoint
+        let privateEndpoint = OHTTPEndpoints.isGateway(endpoint.host) ? endpoint : nil
+        await SubmissionBudget.$legacyTimeoutMilliseconds.withValue(endpoint.singleCallTimeoutInMillis) {
+            await resubmitter.checkAndResubmit(latestBlockHeight: latestBlockHeight, privateEndpoint: privateEndpoint)
+        }
 
         if await context.prevState == .enhance {
             await context.update(state: .updateChainTip)

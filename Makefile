@@ -24,6 +24,7 @@
 
 SWIFT ?= swift
 CARGO ?= cargo
+PYTHON ?= python3
 BUILD_SUPPORT := BuildSupport
 SCRIPTS := Scripts
 
@@ -139,8 +140,9 @@ test-offline: ## Run the offline tests (no network, no lightwalletd)
 	$(SWIFT) test --filter $(OFFLINE_TEST_FILTER)
 
 .PHONY: test-scripts
-test-scripts: ## Run the release-script unit tests
+test-scripts: ## Run the shell and Python script unit tests
 	./$(SCRIPTS)/tests/run-tests.sh
+	$(PYTHON) -m unittest discover -s $(SCRIPTS)/tests -p 'test_*.py' -v
 
 .PHONY: test-all
 test-all: ## Run the whole test suite, including networked tests
@@ -150,7 +152,7 @@ test-all: ## Run the whole test suite, including networked tests
 # they are not reached by any `swift test` filter and need their own target.
 .PHONY: test-rust
 test-rust: ## Run the Rust unit tests
-	cargo test --locked
+	$(CARGO) test --locked
 
 .PHONY: format-rust
 format-rust: ## Format the Rust sources with rustfmt
@@ -203,40 +205,29 @@ clean-rust: ## Clean the Cargo build artifacts (target/)
 # Rust FFI (BuildSupport/)
 # ---------------------------------------------------------------------------
 #
-# ffi-macos builds the universal macOS slice (arm64 and x86_64) with the
-# release profile, then assembles the XCFramework around it. macOS alone is
-# enough to build and test the Swift package.
+# ffi-macos builds the ARM64 macOS slice with the release profile. It owns
+# the assembled product, so stale slices cannot survive a platform-only build.
 
 .PHONY: ffi-macos
 ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
 	$(MAKE) -C $(BUILD_SUPPORT) macos
-	cd $(BUILD_SUPPORT) && mkdir -p products/libzcashlc.xcframework
-	# Clear the slice first: `cp -R src dst` copies *into* dst when it already
-	# exists, which would nest the framework a level down and leave the previous
-	# build's framework — the one Info.plist names — in place, so the Swift build
-	# would compile against a stale zcashlc.h.
-	cd $(BUILD_SUPPORT) && rm -rf products/libzcashlc.xcframework/macos-arm64_x86_64
-	cd $(BUILD_SUPPORT) && cp -R products/macos/frameworks \
-		products/libzcashlc.xcframework/macos-arm64_x86_64
-	cd $(BUILD_SUPPORT) && cp Info.plist products/libzcashlc.xcframework
+	rm -rf $(XCFRAMEWORK)
+	mkdir -p $(XCFRAMEWORK)
+	cp -R $(BUILD_SUPPORT)/products/macos/frameworks $(XCFRAMEWORK)/macos-arm64
+	python3 $(SCRIPTS)/lib/ffi_layout.py manifest $(XCFRAMEWORK)/Info.plist macos-arm64
+	python3 $(SCRIPTS)/lib/ffi_layout.py validate $(XCFRAMEWORK)
 
-# ffi-ci reproduces the CI "Build FFI for macOS" step exactly: the arm64 macOS
-# slice alone, built without the release profile's whole-program LTO, a
-# single-threaded pass per architecture. That is all the Swift build and the
-# offline tests need on an Apple Silicon runner; releases (ffi-all) still build
-# every slice with LTO. The previous macOS products go first, because the lipo
-# step bundles every static library it finds there, a stale x86_64 one
-# included.
-# Keep the rm on a line of its own: make -n still executes any line that runs
-# $(MAKE), and the script tests dry-run this target.
+# CI uses the same ARM64 slice without release whole-program LTO. Keep rm
+# separate from recursive make so dry runs cannot delete build products.
 .PHONY: ffi-ci
 ffi-ci: require-macos ## Build the FFI the way CI does: arm64 macOS only, without fat LTO
 	rm -rf $(BUILD_SUPPORT)/products/macos
 	CARGO_PROFILE_RELEASE_LTO=false $(MAKE) ffi-macos MACOS_ARCHS=aarch64-apple-darwin
 
+# Releases never get extra Cargo features (ohttp-trace), whatever the environment holds.
 .PHONY: ffi-all
 ffi-all: require-macos ## Build the full XCFramework for every platform
-	$(MAKE) -C $(BUILD_SUPPORT) xcframework
+	$(MAKE) -C $(BUILD_SUPPORT) xcframework FFI_CARGO_FEATURES=
 
 .PHONY: verify-ffi
 verify-ffi: ## Check the XCFramework exists and show its contents
@@ -250,13 +241,7 @@ verify-ffi: ## Check the XCFramework exists and show its contents
 # the released binary target.
 .PHONY: configure-local-ffi
 configure-local-ffi: verify-ffi ## Point Package.swift at the locally built FFI
-	mkdir -p LocalPackages
-	# Replace rather than merge: `cp -R` into an existing xcframework leaves the
-	# previous build's slices behind, so a slice that is no longer produced keeps
-	# shadowing the current one.
-	rm -rf LocalPackages/$(notdir $(XCFRAMEWORK))
-	cp -R $(XCFRAMEWORK) LocalPackages/
-	cp $(BUILD_SUPPORT)/LocalPackages-Package.swift LocalPackages/Package.swift
+	$(PYTHON) $(SCRIPTS)/lib/ffi_layout.py install "$(XCFRAMEWORK)" "$(BUILD_SUPPORT)/LocalPackages-Package.swift" LocalPackages
 	@echo "LocalPackages created; Package.swift will use the local FFI"
 
 .PHONY: clean-ffi

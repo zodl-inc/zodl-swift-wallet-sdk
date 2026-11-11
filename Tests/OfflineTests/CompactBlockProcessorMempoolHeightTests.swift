@@ -141,6 +141,40 @@ final class CompactBlockProcessorMempoolHeightTests: ZcashTestCase {
         )
     }
 
+    // ZIP #10 conformance: a clean end of the mempool long poll (grpc-status: 0 after no messages)
+    // is treated as "poll again later", not an error (ZIP lines 1294-1295). The gateway ends it
+    // after ~25s without messages. `consumeMempoolStream` completes normally, and the caller
+    // (`watchMempool`) waits and polls again.
+    func testCleanEndOfMempoolStreamCompletesNormallyAndCallerPollsAgain() async throws {
+        let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory)
+        let processor = fixture.synchronizer.blockProcessor
+        addTeardownBlock {
+            await processor.stopAndWait()
+            try await fixture.cleanup()
+        }
+
+        var callCount = 0
+        // Return an empty stream (clean end: no items, completes without error)
+        fixture.service.getMempoolStreamClosure = {
+            callCount += 1
+            return AsyncThrowingStream { continuation in
+                continuation.finish()  // Clean end, no items
+            }
+        }
+
+        // First poll: completes without error
+        try await processor.consumeMempoolStream()
+        XCTAssertEqual(callCount, 1, "consumeMempoolStream should call getMempoolStream once")
+
+        // Caller (watchMempool) would wait then poll again
+        try await processor.consumeMempoolStream()
+        XCTAssertEqual(callCount, 2, "caller polls again after clean end")
+
+        // Both polls completed without error
+        XCTAssertEqual(fixture.backend.decryptAndStoreTransactionTxBytesMinedHeightCallsCount, 0,
+                      "no transactions should be stored when stream is empty")
+    }
+
     private func overview(rawID: Data) -> ZcashTransaction.Overview {
         ZcashTransaction.Overview(
             accountUUID: TestsData.mockedAccountUUID,

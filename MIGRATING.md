@@ -1,5 +1,166 @@
 # Migrating from previous versions to _Unreleased_
 
+## ARM64-only platform support
+
+The FFI XCFramework previously included x86_64 macOS and iOS simulator binaries. It now
+contains only `ios-arm64`, `ios-arm64-simulator`, and `macos-arm64`. Intel Macs and x86_64
+simulator destinations cannot build or run the SDK. Move development and CI to Apple Silicon
+and select an ARM64 simulator destination. The minimum OS versions remain macOS 14 and iOS 16.
+Reinitialize existing local FFI installations to remove the old universal slices.
+For generic macOS or iOS Simulator destinations, add `ARCHS=arm64` to `xcodebuild`
+build and archive commands. An Apple Silicon host alone may still request x86_64 for a
+generic destination. Keep `-skipMacroValidation` and an explicit `-derivedDataPath`
+outside the Xcode app's DerivedData directory on these commands.
+
+## OHTTP configuration at runtime
+
+The OHTTP gateway hosts, relay URLs, key DNS names and signing keys are no longer source-build
+inputs, and the binaries carry no configuration. A build, a precompiled SDK and
+`init-local-ffi.sh --cached` need no `ZODL_OHTTP_*` variables. Stop exporting them for SDK builds.
+
+Install the configuration once at launch, before any other SDK use:
+
+```swift
+try OHTTPEndpoints.configure(OHTTPConfiguration(mainnet: mainnetNetwork, testnet: testnetNetwork))
+```
+
+`mainnetNetwork` and `testnetNetwork` are `OHTTPNetworkConfiguration` values with a gateway host, a
+relay URL, a key DNS name and an Ed25519 signing public key (64 hex digits). A network has all four
+values or none, and the two networks share no value (ASCII letter case is ignored). An invalid
+configuration throws `ZcashError.ohttpConfigurationInvalid`, whose message names the field and the
+rule, never the value. A `switch` over `ZcashError` that is exhaustive must handle the new case.
+
+Passing `nil`, or never calling `configure`, leaves OHTTP off:
+
+- While OHTTP is off for a network, that network's gateway host is treated as a plain lightwalletd
+  server.
+- Requests to the proxied third-party hosts (the CoinMarketCap, NEAR and Flexa aliases) fail.
+- Predefined-server voting is reached directly when the wallet's network has no configuration
+  (Tor still applies). With a configuration for that network it rides OHTTP and fails closed.
+
+Other API changes:
+
+- `OHTTPEndpoints.gatewayHost(for:)` returns `String?`, `nil` when no gateway is configured for the
+  network. Unwrap it or treat `nil` as "OHTTP off".
+- `OHTTPEndpoints.usesOperatorRelay` is removed without replacement: the app chooses its relay, so the
+  SDK no longer answers whether the relay is independent of the gateway operator. `gatewayHost(for:) != nil`
+  only tells whether OHTTP is on for a network.
+- Calling `configure` again replaces the previous configuration completely. Keys verified under one
+  configuration are never reused under another.
+
+Compiled OHTTP values used to be observable in the binaries; they no longer are, but the values the
+app passes to `configure` are in the app and subject to its own protection.
+
+## OHTTP HTTP requirements
+
+Before, custom `Synchronizer` implementations could omit these members. After upgrading,
+conformers and test doubles must supply these two requirements; there is no default
+implementation. The SDK's concrete synchronizers already implement them:
+
+```swift
+func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
+func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
+```
+
+For OHTTP calls, map external URLs with `OHTTPEndpoints.proxyURL(for:)` and pass a supported
+alias or allowlisted destination. Unknown destinations fail instead of falling back to direct
+HTTP. Both OHTTP methods put the relay leg on Tor whenever Tor is enabled, even if `viaTor`
+is false. The streaming method returns the response head before the body finishes; consume
+its throwing body to detect an incomplete answer.
+
+`httpGetOverTor(for:retryLimit:timeoutMilliseconds:)` was already required before this change;
+its bounded GET contract is detailed below.
+
+The legacy `httpRequestOverTor(for:retryLimit:)` remains Tor-only and does not select OHTTP
+for external services. Call the appropriate OHTTP member when that service requires gateway
+routing, independently of the wallet's lightwalletd server mode.
+
+## Voting custom-server selection
+
+`makeVotingRoundSession` now requires `isCustomServer: Bool` between `route` and `epoch`.
+Calls that omit it no longer compile. Carry the user's actual server selection into the call:
+
+```swift
+// Before: no custom-server selection.
+let session = try await synchronizer.makeVotingRoundSession(
+    backend: backend,
+    inputs: inputs,
+    binding: binding,
+    route: route,
+    epoch: epoch
+)
+
+// After: choose explicitly from the user's server selection.
+let session = try await synchronizer.makeVotingRoundSession(
+    backend: backend,
+    inputs: inputs,
+    binding: binding,
+    route: route,
+    isCustomServer: userSelectedCustomServers,
+    epoch: epoch
+)
+```
+
+With `.direct`, predefined servers (`false`) use OHTTP and unsupported chain/PIR endpoints
+fail with `VotingErrorKind.invalidInput`, without a direct fallback. Custom servers (`true`)
+use direct HTTP(S) according to the endpoint URL, subject to existing network and endpoint
+validation. With `.tor`, either selection reaches servers directly through Tor and
+never falls back to a direct connection. Every service, including PIR, shares the session's
+route. Custom conformers overriding this method must add the same `isCustomServer: Bool`
+parameter; the protocol's default implementation already forwards it.
+
+## Sapling parameter mirror and routing
+
+`SaplingParamsSourceURL.default` downloads from
+`https://raw.githubusercontent.com/zodl-inc/zcash-sapling-params/main/`.
+Existing callers using the default need no edits. Private, Public and Manual wallet modes
+all use direct HTTPS with Tor off and Tor with Tor on. Sapling parameter downloads do not
+use OHTTP or require a gateway alias. Parameter caching and SHA-256 verification are retained.
+
+## Slipstream Tor choices and engine calls
+
+`tor(enabled:)` remains the standalone async convenience. Hosts with a transaction guard may
+cast to `TorTransitionProviding`, create the ticket before waiting for that guard, then call
+`apply()` while holding it. If guard acquisition fails, call `cancelBeforeApplying()`. Creating
+a ticket immediately fences new network work and cancels opposite startup; it does not apply
+the replacement route. Expiry or cancellation may retire the old native sync pass independently
+of replacement activation, while leaving admitted broadcasts and their HTTP resources intact.
+The failed observer does not wait for retirement and its result never changes. `wait()` observes
+without activation, and cancelling an observer does not cancel the shared owner. Use the request identity to avoid acquiring the host guard twice
+for joined UI choices. A completed ticket keeps its result. When an idle Tor-enabled wallet later
+starts syncing, the current state stream reports a fresh run identity and requires native readiness
+as well as HTTP readiness. Observe that current state for startup failure and retry UI.
+
+`SlipstreamEngine.open`, `setAlternates`, `notifyTxChange`, `close`, `reopen`, `snapshot` and
+`drainEvents` now explicitly suspend until exclusive handle access is available. External actor
+calls keep their syntax. Inside code isolated to the actor, add `await`:
+
+```swift
+// Before, inside actor-isolated code:
+let progress = snapshot()
+
+// After:
+let progress = await snapshot()
+```
+
+## `TorClient` methods await cold startup
+
+`TorClient.isolatedClient`, `httpRequest`, `getExchangeRateUSD`, `connectToLightwalletd`,
+`sleep` and `wake` now have explicit `async` signatures. External actor calls already using
+`await` keep their existing syntax. Code isolated to the actor must add `await`, for example:
+
+```swift
+// Before, in actor-isolated code:
+let isolated = try isolatedClient()
+
+// After:
+let isolated = try await isolatedClient()
+```
+
+Throwing methods can now report `CancellationError` when their preparation is cancelled and
+`URLError(.timedOut)` when its startup deadline expires. `sleep` and `wake` continue ignoring
+preparation errors.
+
 ## `ZcashError.slipstreamEngineNotQuiescent` carries the refused stop's report
 
 `ZRUST0155` now carries the `SlipstreamStopReport` of the stop that refused the operation, so its
@@ -584,6 +745,7 @@ let session = try await synchronizer.makeVotingRoundSession(
     inputs: inputs,                                        // VotingSessionInputs
     binding: VotingSessionBinding(roster: roster, hotkeySecret: Data(hotkey.storedSecret)),
     route: .tor,
+    isCustomServer: false,                                 // true only for a server the voter added
     epoch: operationEpoch
 )
 
@@ -811,7 +973,7 @@ switches wallets or leaves the flow, and every bounded pass started under the ol
 its next boundary.
 
 **A route change means a new session.** The route is chosen once, at
-`makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, and is fixed for the session's whole
+`makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)`, and is fixed for the session's whole
 life: there is no setter, and `.tor` never falls back to `.direct`. It governs every service the
 session touches, not only chain traffic — helper delivery, PIR queries and vote-tree sync all ride
 the same route, because a PIR query hides which rows are fetched, not who fetches them. So a Tor
@@ -986,9 +1148,11 @@ three separate validators, and refuses a branch id supplied from outside. Note s
 honour the registered heights, so the two halves of a round can resolve different branches at the
 same height.
 
-Voting runs on NU6.3 on both sides, so where the two differ at least one of them has not reached
-NU6.3 at that height, and at least one half refuses the round on its own.
-`makeVotingRoundSession(backend:inputs:binding:route:epoch:)` compares them and refuses, naming both
+Voting accepts Ironwood notes at both NU6.3 and NU7 snapshots. The TX1 PCZT signing profile remains
+V6/NU6.3. The supplied snapshot branch is checked against the voting base identity's schedule, so a
+custom registered schedule must select the same branch as that identity at the round's snapshot.
+Standard mainnet and testnet schedules align with their own voting identities.
+`makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` compares them and refuses, naming both
 branches and the snapshot height, as the first thing it does once its inputs decode — so a host
 reads one clear reason rather than an unsupported note version from note selection or an unsupported
 branch id from a delegation step:
@@ -996,32 +1160,33 @@ branch id from a delegation step:
 ```swift
 do {
     let session = try await synchronizer.makeVotingRoundSession(
-        backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch
+        backend: backend, inputs: inputs, binding: binding, route: route,
+        isCustomServer: isCustomServer, epoch: epoch
     )
     drive(session)
 } catch let error as VotingError where error.kind == .invalidInput {
     // Opening refuses several things as `.invalidInput` — a malformed round id and an anchor that
     // is not a `TreeState` among them — so show the message rather than labelling every one of them
     // a chain mismatch. This one names both branches and the height:
-    // "…select consensus branch Nu6_2 at the round's snapshot height 4200000, but voting
-    //  delegation follows the Mainnet schedule, which selects Nu6_3…"
+    // "…select consensus branch Nu6_2 at the round's snapshot height 4_200_000, but voting
+    //  delegation follows the Mainnet schedule, which selects Nu7…"
     showRoundUnavailable(error.message)
 }
 ```
 
 The rule is per round, not per chain: the comparison is made at that round's snapshot height, so a
 custom chain whose schedule differs elsewhere but selects the same branch there opens and votes as
-the base network does — provided that branch is NU6.3, the only one voting runs on. A host on a
-custom chain drives the rounds whose snapshot falls where the two schedules agree. Keep the
-registered heights mirroring the `nuparams` of the node you connect to whatever a round asks for:
-they are what sync and spending resolve against, and moving them to suit a round breaks both.
+the base network does. Keep registered heights mirroring the actual node or lightwalletd `nuparams`:
+sync and spending use those heights, so they cannot be changed to make a voting round agree. For a
+later custom regtest snapshot, configure both the registered heights and actual node to select NU7
+at that snapshot.
 
 Mainnet and testnet are unaffected — a standard network is compared against itself and agrees at
-every height. A regtest base is the one stock configuration the comparison turns away:
-`ZcashNetworkBuilder.network(for: .regtest)` registers `NetworkActivationHeights.allActiveFromGenesis`,
-which activates NU6.3 at height 1, while the voting crate's own regtest schedule activates it at
-height 10. A round whose snapshot height falls below 10 is refused there; from height 10 on, the two
-agree.
+every height. `ZcashNetworkBuilder.network(for: .regtest)` registers
+`NetworkActivationHeights.allActiveFromGenesis` by default, which activates NU6.3 at height 1 and
+leaves NU7 disabled. The voting crate's built-in regtest schedule activates NU6.3 at height 10 and
+NU7 at height 11, so the default schedule agrees only at snapshot 10; snapshots 1–9 and 11+ are
+rejected.
 
 ### Validate every stage before shipping
 
@@ -1963,11 +2128,14 @@ Ironwood testing backend) whose network upgrades activate at arbitrary heights:
   modified chain may identify with its base chain's name and a nonstandard branch id). The
   Sapling-activation-height check still applies.
 - Coinholder voting reads these heights for note selection but not for its delegation branch, which
-  the voting crate derives from the base network alone. A round session opens only where the custom
-  network's consensus branch at the round's snapshot height equals the base network's, and throws
-  `VotingError` with `kind == .invalidInput` otherwise — which for the stock heights of `network(for: .regtest)` means
-  every round whose snapshot height is from 1 to 9. See "Voting on a custom network: only where the consensus
-  branch agrees" above.
+  the voting crate derives from the base network alone. Voting accepts NU6.3 and NU7 snapshots, but
+  a round session opens only where the custom network's consensus branch at the round's snapshot
+  height equals the base network's, and throws `VotingError` with `kind == .invalidInput` otherwise.
+  The default regtest heights agree with voting only at snapshot 10: snapshots 1–9 and 11+ are
+  rejected. For later regtest snapshots, explicitly configure the registered heights and actual node
+  to select NU7 at the snapshot. Keep registered heights aligned with the actual node/lightwalletd
+  `nuparams` because sync and spending use them. See "Voting on a custom network: only where the
+  consensus branch agrees" above.
 
 **Process-global registration and ordering.** The custom network's parameters are registered with
 the Rust core **once per process** (the first `Initializer` created with a custom network does this).

@@ -12,7 +12,7 @@ required=(
     Cargo.toml Cargo.lock Makefile rust BuildSupport/Makefile
     BuildSupport/LocalPackages-Package.swift BuildSupport/module.modulemap
     BuildSupport/platform-Info.plist Scripts/init-local-ffi.sh
-    Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh
+    Scripts/rebuild-local-ffi.sh Scripts/version-macos-framework.sh Scripts/lib/ffi_layout.py
 )
 for input in "${required[@]}"; do
     if ! git -C "$repo" cat-file -e "HEAD:$input"; then
@@ -24,10 +24,12 @@ done
 # ls-tree emits the mode, object identity and full path with NUL delimiters.
 # Hash that stream directly so spaces/newlines and additions/deletions are safe.
 # Generated products never enter the committed tree.
+{
+printf 'ZODL-FFI-INPUTS-v3\0'
 git -C "$repo" ls-tree -r -z HEAD -- \
     rust Cargo.toml Cargo.lock BuildSupport Makefile .cargo \
     rust-toolchain rust-toolchain.toml \
     Scripts/init-local-ffi.sh Scripts/rebuild-local-ffi.sh \
     Scripts/version-macos-framework.sh Scripts/prepare-release.sh \
-    Scripts/release.sh Scripts/lib/release-lib.sh Scripts/ci/ffi-input-hash.sh \
-    | shasum -a 256 | cut -d' ' -f1
+    Scripts/release.sh Scripts/lib/release-lib.sh Scripts/lib/ffi_layout.py Scripts/ci/ffi-input-hash.sh
+} | shasum -a 256 | cut -d' ' -f1

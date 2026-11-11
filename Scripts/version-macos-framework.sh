@@ -20,7 +20,7 @@
 set -euo pipefail
 
 NAME="libzcashlc"
-DEFAULT_FW="LocalPackages/libzcashlc.xcframework/macos-arm64_x86_64/${NAME}.framework"
+DEFAULT_FW="LocalPackages/libzcashlc.xcframework/macos-arm64/${NAME}.framework"
 FW="${1:-$DEFAULT_FW}"
 
 if [[ ! -d "$FW" ]]; then

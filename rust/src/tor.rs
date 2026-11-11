@@ -1,8 +1,20 @@
 //! Tor support
+//!
+//! Lightwalletd endpoints whose host is the OHTTP gateway of a network the app configured
+//! (`crate::ohttp_config`, matched by `slipstream_core::ohttp::relay_for`) are never dialled here:
+//! the gateway refuses plain gRPC, and the Swift `LightWalletOHTTPService` reaches it through its
+//! relay (over Tor when Tor is on). A gateway endpoint is refused. With OHTTP off for its network,
+//! the same host is a plain server.
 
 pub(crate) mod http;
+pub(crate) mod startup;
 
+use std::convert::TryInto;
 use std::path::Path;
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use tonic::transport::{Channel, Uri};
@@ -25,8 +37,10 @@ use zcash_protocol::{
     value::Zatoshis,
 };
 use zcash_script::script;
+use zodl_ohttp_client::OhttpNetworks;
 
 use crate::ffi;
+use crate::ohttp_config::installed_networks;
 
 pub struct TorRuntime {
     runtime: PreferredRuntime,
@@ -46,6 +60,26 @@ impl TorRuntime {
             .await
         })?;
         Ok(Self { runtime, client })
+    }
+
+    /// True when `endpoint` is the gateway of a network `networks` configures, which is never
+    /// dialled directly.
+    fn is_ohttp_gateway(networks: &OhttpNetworks, endpoint: &Uri) -> bool {
+        endpoint
+            .host()
+            .is_some_and(|h| slipstream_core::ohttp::relay_for(networks, h).is_some())
+    }
+
+    /// Refuses `endpoint` when it is the gateway of a network `networks` configures: a gateway
+    /// refuses plain gRPC and is reached only through its relay, by the Swift OHTTP transport.
+    /// The error names the condition, not the endpoint, whose host is a configured value.
+    fn refuse_ohttp_gateway(networks: &OhttpNetworks, endpoint: &Uri) -> anyhow::Result<()> {
+        if Self::is_ohttp_gateway(networks, endpoint) {
+            return Err(anyhow!(
+                "the endpoint is an OHTTP gateway: reached through the OHTTP transport, not dialled over Tor"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn runtime(&self) -> &PreferredRuntime {
@@ -93,20 +127,86 @@ impl TorRuntime {
     ///
     /// Each connection returned by this method is isolated from any other Tor usage.
     pub(crate) fn connect_to_lightwalletd(&self, endpoint: Uri) -> anyhow::Result<LwdConn> {
+        self.connect_lightwalletd(endpoint, None)
+    }
+
+    pub(crate) fn connect_to_lightwalletd_with_timeout(
+        &self,
+        endpoint: Uri,
+        timeout_ms: u64,
+    ) -> anyhow::Result<LwdConn> {
+        let submission = SubmissionRuntime::new(timeout_ms)?;
+        self.connect_lightwalletd(endpoint, Some(submission))
+    }
+
+    fn connect_lightwalletd(
+        &self,
+        endpoint: Uri,
+        submission: Option<SubmissionRuntime>,
+    ) -> anyhow::Result<LwdConn> {
+        Self::refuse_ohttp_gateway(&installed_networks(), &endpoint)?;
+
         let Self { runtime, client } = self.isolated_client();
 
         let allow_onion_services = false;
-        let conn = runtime.block_on(async {
-            client
+        let conn = run_lwd(&runtime, submission.as_ref(), async {
+            Ok(client
                 .connect_to_lightwalletd(endpoint, allow_onion_services)
-                .await
+                .await?)
         })?;
 
         Ok(LwdConn {
             runtime,
             _client: client,
             conn,
+            submission,
         })
+    }
+}
+
+/// A submission owns the executor polling tonic's connection tasks. Its current-thread
+/// executor cannot continue sending between calls, and closing it aborts every connection
+/// task before returning. Arti's isolated circuit continues to use its existing runtime.
+struct SubmissionRuntime {
+    executor: tokio::runtime::Runtime,
+    deadline: Instant,
+}
+
+impl SubmissionRuntime {
+    fn new(timeout_ms: u64) -> anyhow::Result<Self> {
+        if timeout_ms == 0 {
+            anyhow::bail!("Tor submission timeout must be positive");
+        }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or_else(|| anyhow!("Tor submission timeout is too large"))?;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self { executor, deadline })
+    }
+
+    fn run<T>(&self, operation: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        if Instant::now() >= self.deadline {
+            anyhow::bail!("Tor submission deadline expired");
+        }
+        self.executor.block_on(async {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), operation)
+                .await
+                .map_err(|_| anyhow!("Tor submission deadline expired"))?
+        })
+    }
+}
+
+fn run_lwd<T>(
+    runtime: &PreferredRuntime,
+    submission: Option<&SubmissionRuntime>,
+    operation: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if let Some(submission) = submission {
+        submission.run(operation)
+    } else {
+        runtime.clone().block_on(operation)
     }
 }
 
@@ -114,6 +214,7 @@ pub struct LwdConn {
     conn: CompactTxStreamerClient<Channel>,
     _client: Client,
     runtime: PreferredRuntime,
+    submission: Option<SubmissionRuntime>,
 }
 
 impl LwdConn {
@@ -128,11 +229,10 @@ impl LwdConn {
 
     /// Fetches the height and hash of the block at the tip of the best chain.
     pub(crate) fn get_latest_block(&mut self) -> anyhow::Result<(BlockHeight, BlockHash)> {
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.conn.get_latest_block(service::ChainSpec {}))?
-            .into_inner();
+        let response = run_lwd(&self.runtime, self.submission.as_ref(), async {
+            Ok(self.conn.get_latest_block(service::ChainSpec {}).await?)
+        })?
+        .into_inner();
 
         Ok((
             BlockHeight::from_u32(response.height.try_into()?),
@@ -152,11 +252,10 @@ impl LwdConn {
             ..Default::default()
         };
 
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.conn.get_transaction(request))?
-            .into_inner();
+        let response = run_lwd(&self.runtime, self.submission.as_ref(), async {
+            Ok(self.conn.get_transaction(request).await?)
+        })?
+        .into_inner();
 
         Ok((response.data, response.height))
     }
@@ -168,11 +267,10 @@ impl LwdConn {
             ..Default::default()
         };
 
-        let response = self
-            .runtime
-            .clone()
-            .block_on(self.conn.send_transaction(request))?
-            .into_inner();
+        let response = run_lwd(&self.runtime, self.submission.as_ref(), async {
+            Ok(self.conn.send_transaction(request).await?)
+        })?
+        .into_inner();
 
         if response.error_code == 0 {
             Ok(())
@@ -297,5 +395,68 @@ impl LwdConn {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+#[path = "tor/submission_tests.rs"]
+mod submission_tests;
+
+#[cfg(test)]
+mod gateway_tests {
+    use tonic::transport::Uri;
+    use zodl_ohttp_client::OhttpNetworks;
+
+    use super::TorRuntime;
+    use crate::ohttp_config::example;
+
+    /// Only the gateway of a network OHTTP is configured for is kept from a plain gRPC dial, in
+    /// any letter case; with OHTTP off for its network the same host is a plain server.
+    #[test]
+    fn only_a_configured_gateway_is_refused() {
+        let uri = |host: &str| format!("https://{host}:443").parse::<Uri>().expect("a URI");
+        let configured = example::networks();
+        for host in [
+            example::MAINNET.gateway_host.to_owned(),
+            example::TESTNET.gateway_host.to_ascii_uppercase(),
+        ] {
+            assert!(
+                TorRuntime::is_ohttp_gateway(&configured, &uri(&host)),
+                "{host}"
+            );
+            assert!(
+                !TorRuntime::is_ohttp_gateway(&OhttpNetworks::default(), &uri(&host)),
+                "{host}"
+            );
+        }
+        assert!(!TorRuntime::is_ohttp_gateway(
+            &configured,
+            &uri("zec.rocks")
+        ));
+    }
+
+    /// The refusal of a configured gateway names the condition, never the endpoint: its host is
+    /// a configured value, kept out of every error text whatever its letter case.
+    #[test]
+    fn gateway_refusal_names_no_host() {
+        let uri = |host: &str| format!("https://{host}:443").parse::<Uri>().expect("a URI");
+        let configured = example::networks();
+        for host in [
+            example::MAINNET.gateway_host.to_owned(),
+            example::TESTNET.gateway_host.to_ascii_uppercase(),
+        ] {
+            let message = TorRuntime::refuse_ohttp_gateway(&configured, &uri(&host))
+                .expect_err("a configured gateway is refused")
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(message.contains("ohttp gateway"), "{message}");
+            for gateway in [example::MAINNET.gateway_host, example::TESTNET.gateway_host] {
+                assert!(
+                    !message.contains(gateway),
+                    "the refusal names a configured gateway host"
+                );
+            }
+        }
+        assert!(TorRuntime::refuse_ohttp_gateway(&configured, &uri("zec.rocks")).is_ok());
     }
 }

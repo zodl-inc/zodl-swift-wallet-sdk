@@ -14,7 +14,11 @@ struct ClassicProcessorCleanupFixture {
     let container: DIContainer
     let latest: LatestBlocksDataProviderMock
 
-    static func make(storageDirectory: URL) async throws -> ClassicProcessorCleanupFixture {
+    static func make(
+        storageDirectory: URL,
+        endpoint: LightWalletEndpoint = LightWalletEndpointBuilder.default,
+        endpointSubmitter: EndpointSubmitter? = nil
+    ) async throws -> ClassicProcessorCleanupFixture {
         let container = DIContainer()
         container.isTestEnvironment = true
         let backend = ZcashRustBackendWeldingMock()
@@ -79,7 +83,7 @@ struct ClassicProcessorCleanupFixture {
             generalStorageURL: rootDirectory.appendingPathComponent("general_storage", isDirectory: true),
             dataDbURL: rootDirectory.appendingPathComponent("data.db"),
             torDirURL: rootDirectory.appendingPathComponent("tor", isDirectory: true),
-            endpoint: LightWalletEndpointBuilder.default,
+            endpoint: endpoint,
             network: ZcashNetworkBuilder.network(for: .testnet),
             spendParamsURL: rootDirectory.appendingPathComponent("sapling-spend.params"),
             outputParamsURL: rootDirectory.appendingPathComponent("sapling-output.params"),
@@ -89,6 +93,11 @@ struct ClassicProcessorCleanupFixture {
             isTorEnabled: false,
             isExchangeRateEnabled: false
         )
+        if let endpointSubmitter {
+            container.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
+                SubmitPlanExecutor(endpointSubmitter: endpointSubmitter, logger: NullLogger())
+            }
+        }
         let processor = CompactBlockProcessor(initializer: initializer, walletBirthdayProvider: { initializer.walletBirthday })
         let synchronizer = SDKSynchronizer(
             status: .stopped,

@@ -63,6 +63,15 @@ protocol SubmitPlanStoring {
     /// release that landed after a wipe.
     @discardableResult
     func recordPlanForAwaitingTransaction(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle?
+    /// Adds `endpoint` at the end of the plan of a transaction that was submitted but that no
+    /// server has accepted yet, unless the plan lists a server at the same host and port already.
+    /// Touches no other plan and never creates a row or the database file.
+    ///
+    /// - Returns: The lifecycle token for a later `markAccepted(txId:host:lifecycle:)` when the
+    ///   transaction has such a plan; `nil` when it is awaiting submission, accepted, unknown, or
+    ///   the store cannot be read.
+    @discardableResult
+    func addEndpointToUnacceptedPlan(txId: Data, endpoint: LightWalletEndpoint) async -> SubmitPlanLifecycle?
     /// Records that `host` (`host:port`) took the transaction into its mempool.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
@@ -187,6 +196,33 @@ actor SubmitPlanStore: SubmitPlanStoring {
             cachedConnection = nil
             connectionFailed = true
             logger.warn("SubmitPlanStore failed to release a transaction for resubmission; disabling the store: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    @discardableResult
+    func addEndpointToUnacceptedPlan(txId: Data, endpoint: LightWalletEndpoint) -> SubmitPlanLifecycle? {
+        // `existingConnection()`: a transaction without a row has no plan to extend, so a call that lands after
+        // `wipe()` never recreates the store's file.
+        guard !connectionFailed, let connection = existingConnection() else { return nil }
+        do {
+            let row = table.filter(txIdColumn == Blob(bytes: txId.bytes))
+            // An accepted transaction is in a mempool already, and one with no servers is still awaiting the
+            // host's submission: neither is stuck, so neither changes.
+            guard
+                let stored = try connection.pluck(row),
+                stored[acceptedHostColumn] == nil,
+                let data = stored[endpointsColumn].data(using: .utf8),
+                let storedEndpoints = try? JSONDecoder().decode([StoredEndpoint].self, from: data),
+                !storedEndpoints.isEmpty
+            else { return nil }
+            let endpoints = storedEndpoints.map(\.endpoint)
+            if !endpoints.contains(where: { $0.host == endpoint.host && $0.port == endpoint.port }) {
+                try connection.run(row.update(endpointsColumn <- SubmitPlanStore.encodeEndpoints(endpoints + [endpoint])))
+            }
+            return currentLifecycle()
+        } catch {
+            logger.warn("SubmitPlanStore failed to add a server to a submit plan: \(error.localizedDescription)")
             return nil
         }
     }

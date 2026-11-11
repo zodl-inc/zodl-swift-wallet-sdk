@@ -18,8 +18,8 @@ WORKFLOW_PATH = ".github/workflows/build-ffi.yml"
 TARGETS = ("clean-ffi", "ffi-all", "configure-local-ffi", "build", "test-offline")
 SLICES = {
     "ios-arm64": ("ios", None, {"arm64"}),
-    "ios-arm64_x86_64-simulator": ("ios", "simulator", {"arm64", "x86_64"}),
-    "macos-arm64_x86_64": ("macos", None, {"arm64", "x86_64"}),
+    "ios-arm64-simulator": ("ios", "simulator", {"arm64"}),
+    "macos-arm64": ("macos", None, {"arm64"}),
 }
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
 
@@ -121,6 +121,8 @@ def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
     libraries = info.get("AvailableLibraries")
     if info.get("XCFrameworkFormatVersion") != "1.0" or info.get("CFBundlePackageType") != "XFWK" or not isinstance(libraries, list) or len(libraries) != 3:
         raise BuildError("invalid full XCFramework manifest")
+    if {path.name for path in product.iterdir() if path.is_dir()} != set(SLICES):
+        raise BuildError("undeclared or missing native slice directories")
     verified = []
     seen = set()
     for item in libraries:
@@ -203,6 +205,20 @@ def execution_identity(repository: str, source_commit: str) -> dict:
     return {"backend": "github-actions", "request_id": request, "workflow": workflow}
 
 
+def rust_identity(tool: str, source: Path) -> str:
+    """Real bound binaries need no rustup proxy's +stable selector."""
+    selected = os.environ.get(tool.upper())
+    if selected is None:
+        return run([tool, "+stable", "--version", "--verbose"], source)
+    if not selected or not Path(selected).is_absolute() or any(not char.isprintable() for char in selected):
+        raise BuildError("invalid selected Rust executable")
+    try:
+        return run([selected, "--version", "--verbose"], source)
+    except BuildError:
+        # Environment-supplied executable paths can carry secrets.
+        raise BuildError("could not record selected Rust compiler identity") from None
+
+
 def finish_record(root: Path, archive: Path, context: dict, destination: Path) -> dict:
     """Bind the existing ZIP bytes to verified slices and successful native stages."""
     check_source(root, context)
@@ -225,8 +241,8 @@ def finish_record(root: Path, archive: Path, context: dict, destination: Path) -
                 raise BuildError("archive bytes differ from verified native product")
     toolchains = {
         "swift": run(["make", "--no-print-directory", "print-swift-version"], root),
-        "cargo": run(["cargo", "+stable", "--version", "--verbose"], root),
-        "rustc": run(["rustc", "+stable", "--version", "--verbose"], root),
+        "cargo": rust_identity("cargo", root),
+        "rustc": rust_identity("rustc", root),
         "xcode": run(["xcodebuild", "-version", "-skipMacroValidation", "-derivedDataPath", str(root / "DerivedData")], root),
     }
     if not all(toolchains.values()):

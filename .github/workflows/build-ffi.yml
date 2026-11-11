@@ -47,22 +47,27 @@ jobs:
           cat "$xcode_version_file"
           echo "hash=$(shasum -a 256 "$xcode_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      # The runner image already ships rustup, so no toolchain action is needed.
-      # The settings are those of swift.yml's build job, with every target a
-      # release builds.
-      - name: Setup Rust
-        id: toolchain
+      - name: Authorize cargo against the private slipstream repository
+        uses: ./.github/actions/authorize-slipstream
+        with:
+          app-id: ${{ secrets.SLIPSTREAM_APP_ID || secrets.CARGO_PRIVATE_APP_ID }}
+          app-private-key: ${{ secrets.SLIPSTREAM_APP_PRIVATE_KEY || secrets.CARGO_PRIVATE_APP_KEY }}
+
+      # Release builds support all three ARM64 Apple platforms.
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update \
-            --target aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,aarch64-apple-darwin
-          rustup default stable
-          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-          echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
-          rustc_version_file=$(mktemp)
-          trap 'rm -f "$rustc_version_file"' EXIT
-          rustc +stable --version --verbose > "$rustc_version_file"
-          cat "$rustc_version_file"
-          echo "cachekey=$(shasum -a 256 "$rustc_version_file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            --target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+
+      - name: Validate Rust
+        id: toolchain
+        run: |
+          python3 Scripts/ci/rust_toolchain.py --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT" --github-path "$GITHUB_PATH"
 
       - name: Cache Cargo
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -85,9 +90,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-all-slices-lto-v2-${{ steps.toolchain.outputs.cachekey }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-release-arm64-slices-lto-v3-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Build and upload draft release
         env:
