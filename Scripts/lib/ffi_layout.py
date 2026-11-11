@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import lzma
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
@@ -226,8 +227,11 @@ def extract(archive, destination):
                 if expected is None or item.file_size != len(expected.encode("utf-8")):
                     raise LayoutError("unexpected link member: " + item.filename)
                 try:
-                    target = source.read(item).decode("utf-8")
-                except (UnicodeDecodeError, zipfile.BadZipFile, OSError) as error:
+                    # The declared size is only a header claim, so read at most one byte beyond the
+                    # expected target: a stream that inflates further is never decompressed.
+                    with source.open(item) as incoming:
+                        target = incoming.read(len(expected.encode("utf-8")) + 1).decode("utf-8")
+                except (UnicodeDecodeError, zipfile.BadZipFile, OSError, zlib.error, lzma.LZMAError, EOFError) as error:
                     raise LayoutError("unreadable link member: " + item.filename) from error
                 if target != expected:
                     raise LayoutError("unexpected link member: " + item.filename)
@@ -249,7 +253,7 @@ def extract(archive, destination):
                 source.extract(item, destination)
             for path, target in links:
                 os.symlink(target, Path(destination, *path.parts))
-        except (zipfile.BadZipFile, zlib.error) as error:
+        except (zipfile.BadZipFile, zlib.error, lzma.LZMAError, EOFError) as error:
             raise LayoutError("corrupt archive member") from error
 
 

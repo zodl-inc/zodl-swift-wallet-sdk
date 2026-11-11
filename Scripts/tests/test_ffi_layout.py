@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -231,6 +232,51 @@ class LayoutTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn('unexpected link member', result.stderr)
                 self.assertEqual(list(destination.iterdir()), [])
+
+    def test_extract_reads_a_link_target_with_a_bound_close_to_its_expected_length(self):
+        name = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/Headers'
+        expected = MACOS_LINKS['Headers']
+        archive = self.base / 'bomb.zip'
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as output:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o755) << 16
+            # A few MB of deflated zeros behind a header that declares the real target length.
+            output.writestr(info, b'\0' * (4 * 1024 ** 2))
+            output.getinfo(name).file_size = len(expected)
+        reads = []
+        real = zipfile.ZipExtFile.read
+        def recording(extfile, size=-1):
+            reads.append(size)
+            return real(extfile, size)
+        destination = self.base / 'out'
+        destination.mkdir()
+        sys.path.insert(0, str(ROOT / 'Scripts/lib'))
+        import ffi_layout
+        with mock.patch.object(zipfile.ZipExtFile, 'read', recording), self.assertRaises(ffi_layout.LayoutError):
+            ffi_layout.extract(archive, destination)
+        self.assertTrue(reads)
+        self.assertTrue(all(0 <= size <= len(expected) + 1 for size in reads), reads)
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_extract_reports_a_corrupt_compressed_link_as_a_layout_error(self):
+        name = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/Headers'
+        archive = self.base / 'corrupt.zip'
+        with zipfile.ZipFile(archive, 'w') as output:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o755) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            output.writestr(info, MACOS_LINKS['Headers'])
+        data = bytearray(archive.read_bytes())
+        start = data.index(name.encode()) + len(name)
+        data[start:start + 6] = b'\xff' * 6
+        archive.write_bytes(data)
+        result, destination = self.extract_cli(archive)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertIn('ffi-layout:', result.stderr)
+        self.assertEqual(list(destination.iterdir()), [])
 
     def test_extract_rejects_members_nested_under_a_link_before_writing_anything(self):
         macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
