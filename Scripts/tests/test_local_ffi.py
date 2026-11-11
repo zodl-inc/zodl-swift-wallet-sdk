@@ -335,7 +335,9 @@ exec /bin/mv "$@"
             with self.subTest(case=sorted(case)):
                 shutil.rmtree(self.base / 'archive-source', ignore_errors=True)
                 self.archive(versioned=True, **case)
-                self.assert_preserved_failure(self.run_script('init-local-ffi.sh', '--cached'), self.snapshot())
+                result = self.run_script('init-local-ffi.sh', '--cached')
+                self.assert_preserved_failure(result, self.snapshot())
+                self.assertIn('unexpected link member', result.stderr)
                 self.assertFalse(outside.exists())
 
 

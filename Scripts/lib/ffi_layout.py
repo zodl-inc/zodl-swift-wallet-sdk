@@ -219,11 +219,16 @@ def extract(archive, destination):
                 raise LayoutError("unsafe or duplicate archive member: " + item.filename)
             seen.add(path)
             if kind == stat.S_IFLNK:
+                # Check the name and declared size before decompressing, so a
+                # hostile link member cannot make us inflate arbitrary data.
+                expected = allowed_links.get(path)
+                if expected is None or item.file_size != len(expected.encode("utf-8")):
+                    raise LayoutError("unexpected link member: " + item.filename)
                 try:
                     target = source.read(item).decode("utf-8")
                 except (UnicodeDecodeError, zipfile.BadZipFile, OSError) as error:
                     raise LayoutError("unreadable link member: " + item.filename) from error
-                if allowed_links.get(path) != target:
+                if target != expected:
                     raise LayoutError("unexpected link member: " + item.filename)
                 links.append((path, target))
             else:

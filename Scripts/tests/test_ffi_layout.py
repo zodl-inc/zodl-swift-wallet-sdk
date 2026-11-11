@@ -4,13 +4,18 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'Scripts/lib/ffi_layout.py'
+sys.path.insert(0, str(ROOT / 'Scripts/lib'))
+from ffi_layout import MACOS_LINKS  # noqa: E402
+
 SLICES = {'ios-arm64': ('ios', None), 'ios-arm64-simulator': ('ios', 'simulator'), 'macos-arm64': ('macos', None)}
 
 
@@ -193,6 +198,50 @@ class LayoutTests(unittest.TestCase):
         path.rename(outside)
         path.symlink_to(outside)
         self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
+
+    def zip_with(self, members):
+        archive = self.base / 'hostile.zip'
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as output:
+            for name, content, is_link in members:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = ((stat.S_IFLNK if is_link else stat.S_IFREG) | 0o755) << 16
+                output.writestr(info, content)
+        return archive
+
+    def extract_cli(self, archive):
+        destination = self.base / 'out'
+        shutil.rmtree(destination, ignore_errors=True)
+        destination.mkdir()
+        return self.cli('extract', archive, destination), destination
+
+    def test_extract_rejects_disallowed_links_before_writing_anything(self):
+        macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
+        regular = ('libzcashlc.xcframework/Info.plist', 'plist', False)
+        cases = {
+            'wrong target': (macos + 'Headers', 'Versions/A/Headers'),
+            'escaping target': (macos + 'Headers', '../../../../escaped'),
+            'link in ios slice': ('libzcashlc.xcframework/ios-arm64/libzcashlc.framework/Headers', 'Versions/Current/Headers'),
+            'extra link name': (macos + 'Versions/A/evil', 'A'),
+            'oversized link under a disallowed name': ('libzcashlc.xcframework/ios-arm64/x', '\0' * 400_000),
+        }
+        for label, (name, target) in cases.items():
+            with self.subTest(label):
+                result, destination = self.extract_cli(self.zip_with([regular, (name, target, True)]))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('unexpected link member', result.stderr)
+                self.assertEqual(list(destination.iterdir()), [])
+
+    def test_extract_creates_exactly_the_five_macos_links(self):
+        macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
+        members = [(macos + 'Versions/A/libzcashlc', 'binary', False)]
+        members += [(macos + name, target, True) for name, target in MACOS_LINKS.items()]
+        result, destination = self.extract_cli(self.zip_with(members))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        framework = destination / 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework'
+        for name, target in MACOS_LINKS.items():
+            self.assertTrue((framework / name).is_symlink(), name)
+            self.assertEqual(os.readlink(framework / name), target)
 
 
 class MakePackagingTests(unittest.TestCase):
