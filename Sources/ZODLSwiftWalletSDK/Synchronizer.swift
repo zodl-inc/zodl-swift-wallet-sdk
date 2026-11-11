@@ -269,11 +269,15 @@ public protocol Synchronizer: AnyObject {
     /// selected and must be shielded first — see `proposeShielding`.
     ///
     /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
-    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`) where the rust layer
-    /// reports that condition, carrying both amounts; a wallet still catching up throws
-    /// `ZcashError.rustProposalScanRequired` (`ZRUST0153`). Anything else the rust layer returns surfaces as
-    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload names the
-    /// condition without carrying an amount or an address.
+    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), carrying both amounts;
+    /// a wallet still catching up throws `ZcashError.rustProposalScanRequired` (`ZRUST0153`). A balance spread
+    /// over more notes than one transaction can spend within the block size limit throws
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`) here rather than when the transaction is
+    /// created; a memo for a transparent or TEX recipient throws `ZcashError.rustProposalTransparentMemo`
+    /// (`ZRUST0175`); and a recipient with no receiver this wallet can pay throws
+    /// `ZcashError.rustProposalUnsupportedAddress` (`ZRUST0176`). Anything else the rust layer returns
+    /// surfaces as `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload
+    /// names the condition without carrying an amount or an address.
     ///
     /// - Parameter accountUUID: the account from which to spend funds.
     /// - Parameter recipient: the recipient's address.
@@ -631,6 +635,13 @@ public protocol Synchronizer: AnyObject {
 
     /// This API stops the synchronization and re-initalizes everything according to the new endpoint provided.
     /// It can be called anytime.
+    ///
+    /// Between a completed `wipe()` and the next `prepare(...)`, the Slipstream implementation only records the endpoint and
+    /// leaves its engine closed, because opening it would recreate the wallet database the wipe deleted. That `prepare` fetches
+    /// the new wallet's provisioning anchor (a restore's chain tip, a new wallet's tree state) from the recorded endpoint and
+    /// opens the engine there. This is how a host names the server a reset wallet talks to; without such a switch the next
+    /// wallet stays on the server in use before the wipe. A switch made while that `prepare` is opening the engine is applied
+    /// once the engine is open, so the engine ends on the server of the last switch.
     /// - Throws: ZcashError when failures occur and related to `synchronizer.start(retry: Bool)`, it's the only throwing operation
     /// during the whole endpoint change.
     func switchTo(endpoint: LightWalletEndpoint) async throws
@@ -752,6 +763,26 @@ public protocol Synchronizer: AnyObject {
         timeoutMilliseconds: UInt64
     ) async throws -> (data: Data, response: HTTPURLResponse)
 
+    /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
+    /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`).
+    /// While OHTTP is off for the wallet's network (see `OHTTPEndpoints.configure(_:)`) the request
+    /// fails; it never goes out directly.
+    ///
+    /// - Parameters:
+    ///    - for: URLRequest with the OHTTP proxy hostname (use `OHTTPEndpoints.proxyURL(for:)` to convert)
+    ///    - viaTor: When true, the relay POST rides a Tor circuit (Tor → relay → gateway). The gateway
+    ///              injects secrets for external APIs (CMC, NEAR) on behalf of the client. When false,
+    ///              uses clearnet to reach the relay (device → relay → gateway). Default false.
+    func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse)
+
+    /// Makes an HTTP request through the OHTTP relay→gateway as ``httpRequestOverOHTTP(for:viaTor:)`` does,
+    /// returning as soon as the response head is in, with the body read as the gateway sends it (a
+    /// server-sent event stream comes out event by event). The body throws if the gateway's answer breaks
+    /// off before its end. In Tor mode the relay leg rides Tor whatever `viaTor` says.
+    /// `request.timeoutInterval` bounds each wait for the relay, not the whole answer.
+    func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
+
+    // swiftlint:disable function_parameter_count
     /// Open a voting round session on the explicitly selected route.
     ///
     /// The route is fixed for the session's whole life. `.tor` requires an
@@ -779,14 +810,29 @@ public protocol Synchronizer: AnyObject {
     ///    - inputs: The round's parameters and endpoints.
     ///    - binding: The proposal roster the session is bound to.
     ///    - route: Which route every service the session touches takes.
+    ///    - isCustomServer: Whether the voter chose the round's vote and PIR servers
+    ///      themselves rather than taking the predefined ones. Required. Read only on
+    ///      `.direct`, where it decides between the clearnet-side routes. `false`
+    ///      (predefined servers) depends on the OHTTP configuration
+    ///      (`OHTTPEndpoints.configure(_:)`): with one for the wallet's network, the
+    ///      session rides OHTTP through the relay and gateway and fails closed,
+    ///      throwing ``VotingErrorKind/invalidInput`` when a chain or PIR endpoint is
+    ///      not one the gateway carries and never falling back to a direct connection
+    ///      when the gateway is unavailable; with no configuration for that network,
+    ///      the servers are reached on a plain direct connection. `true` (custom
+    ///      servers) always opens it on a plain direct connection. On `.tor` it has
+    ///      no effect: Tor reaches the servers directly either way, configured or not.
+    ///      PIR queries always share the session's route.
     ///    - epoch: The submission epoch the session starts at.
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession
+    // swiftlint:enable function_parameter_count
 
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!
@@ -1961,6 +2007,8 @@ public extension Synchronizer {
         }
     }
 
+    // swiftlint:disable function_parameter_count
+
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route.
     ///
     /// Only a conformer that owns a Tor client can open a round on Tor, and the refusal is the
@@ -1971,15 +2019,23 @@ public extension Synchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
-            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            return try backend.makeSession(
+                inputs: inputs,
+                binding: binding,
+                torRuntime: nil,
+                isCustomServer: isCustomServer,
+                epoch: epoch
+            )
         case .tor:
             throw ZcashError.torClientUnavailable
         }
     }
+    // swiftlint:enable function_parameter_count
 
     /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
     /// source-compatible and report that the capability is unavailable.
@@ -2279,13 +2335,20 @@ public extension ClosureSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64,
         completion: @escaping (Result<VotingRoundSession, Error>) -> Void
     ) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
             switch route {
             case .direct:
-                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+                return try backend.makeSession(
+                    inputs: inputs,
+                    binding: binding,
+                    torRuntime: nil,
+                    isCustomServer: isCustomServer,
+                    epoch: epoch
+                )
             case .tor:
                 throw ZcashError.torClientUnavailable
             }
@@ -2314,6 +2377,7 @@ public extension ClosureSynchronizer {
 }
 
 public extension CombineSynchronizer {
+    // swiftlint:disable function_parameter_count
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route,
     /// matching `Synchronizer`'s own default.
     func makeVotingRoundSession(
@@ -2321,17 +2385,25 @@ public extension CombineSynchronizer {
         inputs: VotingSessionInputs,
         binding: VotingSessionBinding,
         route: VotingTransportRoute,
+        isCustomServer: Bool,
         epoch: UInt64
     ) -> SinglePublisher<VotingRoundSession, Error> {
         AsyncToCombineGateway.executeThrowingAction {
             switch route {
             case .direct:
-                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+                return try backend.makeSession(
+                    inputs: inputs,
+                    binding: binding,
+                    torRuntime: nil,
+                    isCustomServer: isCustomServer,
+                    epoch: epoch
+                )
             case .tor:
                 throw ZcashError.torClientUnavailable
             }
         }
     }
+    // swiftlint:enable function_parameter_count
 
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast

@@ -1,9 +1,11 @@
-//! Transport route — Tor or direct — selected when a voting session is opened.
+//! Transport route — Tor, OHTTP or direct — selected when a voting session is opened.
 //!
 //! `zcash_voting` keeps PIR, tree-sync, helper and vote-chain traffic behind one
 //! host-supplied request executor, [`zcash_voting::RouteHttp`]. [`SdkRoute`] is
-//! this SDK's executor: either the crate's own direct HTTP client, or the
-//! wallet's Tor runtime. A session picks one when it opens and keeps it, so a
+//! this SDK's executor: the wallet's Tor runtime, the OHTTP relay and gateway
+//! the app configured, or the crate's own direct HTTP client
+//! ([`resolve_session_route`] decides). A session picks one when it opens and
+//! keeps it, together with the OHTTP configuration it was picked under, so a
 //! round that chose Tor can never reach the network any other way — a Tor route
 //! that cannot connect fails the request rather than falling back, because a
 //! silent fall-back would put the voter's traffic on the clear network after
@@ -21,11 +23,46 @@ use std::sync::{
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
+use slipstream_core::ohttp::{
+    Dialer, HttpRoundTripError, NetworkType, http_round_trip_with_dispatch,
+};
 use zcash_client_backend::tor::{Error as TorError, http::HttpError};
 use zcash_voting::{
     DirectRoute, HyperTransport, RouteError, RouteFuture, RouteHttp, RoutePhase, RouteRequest,
     RouteResponse,
 };
+use zodl_ohttp_client::OhttpNetworks;
+
+use super::errors::invalid_input;
+
+/// Exact vote and PIR hosts in the gateway's BACKENDS (mainnet).
+///
+/// The gateway removed suffix routing and matches exact hosts only. MUST match
+/// `kubernetes/apps/ohttp-gateway/deployment.yaml` BACKENDS in zodl-inc/infra,
+/// and the Android SDK's `OHTTP_VOTE_HOSTS`.
+const OHTTP_VOTE_HOSTS: &[&str] = &[
+    // Vote servers
+    "vote.zodl.com",
+    "prod.vote-chain-primary.valargroup.org",
+    "voting.valargroup.dev",
+    "ru.zcash.space",
+    "147-182-192-212.sslip.io",
+    "134-209-215-69.sslip.io",
+    "mnval01.zcash.legends.sh",
+    "zvote-1.stardust.rest",
+    "zvote.zodl.com",
+    "zvote.keplr.app",
+    "zvote.zfnd.org",
+    "v.ombie.cash",
+    // PIR endpoints (delegation): fail closed through OHTTP when Tor is OFF and
+    // the servers are predefined.
+    "lb-pir-primary.valargroup.org",
+    "lb-pir-backup.valargroup.org",
+    "zpir-1.stardust.rest",
+];
+
+/// 64 MiB response cap for one voting call (the client's own bound; the gateway allows up to 256 MiB).
+const MAX_OHTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The request executor a voting session routes its traffic through.
 ///
@@ -39,6 +76,10 @@ pub(super) enum SdkRoute {
     /// order of magnitude larger than a `DirectRoute`, and every session pays
     /// for the larger arm otherwise.
     Tor(Box<TorRoute>),
+    /// The OHTTP relay and gateway, for predefined servers with Tor off and
+    /// OHTTP configured for the wallet's network. Fails closed: there is no
+    /// path from here to a direct connection.
+    Ohttp(OhttpRoute),
     /// Refuses every request before dispatch and counts the attempts, so a
     /// test can prove which traffic reached the session's route.
     #[cfg(test)]
@@ -70,6 +111,7 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.execute(request, on_dispatch),
             Self::Tor(tor) => tor.execute(request, on_dispatch),
+            Self::Ohttp(ohttp) => ohttp.execute(request, on_dispatch),
             #[cfg(test)]
             Self::Refusing(attempts) => {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -86,6 +128,7 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.hook_precedes_connection_setup(),
             Self::Tor(tor) => tor.hook_precedes_connection_setup(),
+            Self::Ohttp(ohttp) => ohttp.hook_precedes_connection_setup(),
             #[cfg(test)]
             Self::Refusing(_) => false,
         }
@@ -95,6 +138,7 @@ impl RouteHttp for SdkRoute {
         match self {
             Self::Direct(direct) => direct.enforces_connect_timeout(),
             Self::Tor(tor) => tor.enforces_connect_timeout(),
+            Self::Ohttp(ohttp) => ohttp.enforces_connect_timeout(),
             #[cfg(test)]
             Self::Refusing(_) => false,
         }
@@ -342,6 +386,243 @@ impl RouteHttp for TorRoute {
     // connect budget either.
 }
 
+/// Whether `host` is one the OHTTP gateway will forward to: an exact match in
+/// [`OHTTP_VOTE_HOSTS`], never a suffix.
+fn can_handle_ohttp(host: &str) -> bool {
+    OHTTP_VOTE_HOSTS.contains(&host)
+}
+
+/// The host of an `http(s)` `url`, or the pre-dispatch failure for a URL
+/// without one. A URL with no scheme is refused rather than guessed at.
+fn url_host(url: &str) -> Result<String, RouteError> {
+    url.parse::<http::Uri>()
+        .ok()
+        .filter(|uri| matches!(uri.scheme_str(), Some("http" | "https")))
+        .and_then(|uri| uri.host().map(str::to_owned))
+        .ok_or_else(|| RouteError::before_dispatch(format!("invalid URL: {url}")))
+}
+
+/// Routes voting requests through the OHTTP gateway: the request is
+/// BHTTP-encoded and HPKE-encrypted, sent via the relay, and the gateway
+/// forwards it to the vote or PIR server. The relay sees the device address but
+/// only ciphertext; the gateway sees the request but only the relay's address.
+///
+/// Used when Tor is off, the server is a predefined one and OHTTP is configured
+/// for the wallet's network. Fails closed: a request the gateway cannot carry
+/// fails rather than going out directly, which would show the voter's address
+/// to the vote server.
+///
+/// Rides the same OHTTP stack as the lightwalletd path (signed HPKE key
+/// configs fetched through the relay, 64 MiB response cap).
+pub(super) struct OhttpRoute {
+    /// The OHTTP configuration the session opened under, which every request of
+    /// the session uses.
+    networks: Arc<OhttpNetworks>,
+    gateway_host: String,
+    network: NetworkType,
+}
+
+impl OhttpRoute {
+    /// The OHTTP route for the server at `url` through the gateway `networks`
+    /// configures for the wallet's `network`, or a pre-dispatch failure when the
+    /// gateway does not carry that host or there is no gateway for the network
+    /// (OHTTP off for it, or regtest).
+    pub(super) fn new(
+        networks: &Arc<OhttpNetworks>,
+        url: &str,
+        network: zcash_voting::Network,
+    ) -> Result<Self, RouteError> {
+        let host = url_host(url)?;
+        if !can_handle_ohttp(&host) {
+            return Err(RouteError::before_dispatch(format!(
+                "host {host} not supported by the OHTTP gateway"
+            )));
+        }
+        let (gateway_host, network) = gateway_for(networks, network).ok_or_else(|| {
+            RouteError::before_dispatch("no OHTTP gateway for this network".to_string())
+        })?;
+        Ok(Self {
+            networks: Arc::clone(networks),
+            gateway_host: gateway_host.to_string(),
+            network,
+        })
+    }
+}
+
+/// The OHTTP gateway `networks` configures for `network`, and the network the
+/// engine checks it against; `None` when OHTTP is off for the network, which it
+/// always is for regtest. A testnet session never rides the mainnet gateway,
+/// nor the other way round.
+fn gateway_for(
+    networks: &OhttpNetworks,
+    network: zcash_voting::Network,
+) -> Option<(&str, NetworkType)> {
+    let (ohttp_network, engine_network) = match network {
+        zcash_voting::Network::Mainnet => (zodl_ohttp_client::Network::Mainnet, NetworkType::Main),
+        zcash_voting::Network::Testnet => (zodl_ohttp_client::Network::Testnet, NetworkType::Test),
+        zcash_voting::Network::Regtest => return None,
+    };
+    networks
+        .get(ohttp_network)
+        .map(|config| (config.gateway_host(), engine_network))
+}
+
+/// Wraps `on_dispatch` so that `dispatched` records whether it fired.
+fn dispatch_tracking<'a>(
+    dispatched: &'a AtomicBool,
+    on_dispatch: &'a (dyn Fn() + Send + Sync),
+) -> impl Fn() + Send + Sync + 'a {
+    move || {
+        dispatched.store(true, Ordering::SeqCst);
+        on_dispatch();
+    }
+}
+
+/// A transport failure or timeout is ambiguous only once the sealed request may have left the
+/// device. `on_dispatch` runs right before the sealed request is written to the relay
+/// connection, so a key-config failure, a relay pause or a relay that cannot be reached stays
+/// before dispatch: the request is provably unsent, and it keeps the before-dispatch phase and
+/// its safe retry.
+fn dispatch_phase_error(dispatched: &AtomicBool, message: String) -> RouteError {
+    if dispatched.load(Ordering::SeqCst) {
+        RouteError::after_dispatch(message)
+    } else {
+        RouteError::before_dispatch(format!("{message} (before dispatch)"))
+    }
+}
+
+/// The route failure for an OHTTP round trip that ended in `error`.
+///
+/// An answer past the ceiling is a response-read failure whether or not the hook fired, because
+/// the engine reads an answer only after it has sent the request. Any other failure follows the
+/// hook, as [`dispatch_phase_error`] describes.
+fn ohttp_route_error(dispatched: &AtomicBool, error: HttpRoundTripError) -> RouteError {
+    match error {
+        HttpRoundTripError::ResponseTooLarge(message) => {
+            RouteError::response_read(format!("OHTTP response too large: {message}"))
+        }
+        HttpRoundTripError::Failed(message) => {
+            dispatch_phase_error(dispatched, format!("OHTTP transport: {message}"))
+        }
+    }
+}
+
+impl RouteHttp for OhttpRoute {
+    fn execute<'a>(
+        &'a self,
+        request: RouteRequest<'a>,
+        on_dispatch: &'a (dyn Fn() + Send + Sync),
+    ) -> RouteFuture<'a> {
+        Box::pin(async move {
+            // The session's endpoints were checked when it opened, but helper
+            // and tree-node URLs arrive later from the host: refuse one the
+            // gateway would reject anyway, before anything leaves the device.
+            let host = url_host(request.url)?;
+            if !can_handle_ohttp(&host) {
+                return Err(RouteError::before_dispatch(format!(
+                    "host {host} not supported by the OHTTP gateway"
+                )));
+            }
+
+            let method = request.method.as_str().to_string();
+            let max_response_bytes = request.max_response_bytes.min(MAX_OHTTP_RESPONSE_BYTES);
+
+            // Track whether on_dispatch fired. Failures before the callback are definitely unsent
+            // (before-dispatch phase, safe to retry); failures after it are ambiguous.
+            let dispatched = AtomicBool::new(false);
+            let wrapped_on_dispatch = dispatch_tracking(&dispatched, on_dispatch);
+
+            // The relay leg uses the device's own connection (`Dialer::Direct`).
+            // The callback fires right before the sealed request is written to the relay
+            // connection, so a key-config failure, a relay pause or a relay that cannot be
+            // reached stays before dispatch. The engine also stops reading an answer once it
+            // is past `max_response_bytes`, instead of buffering it in full.
+            let call = http_round_trip_with_dispatch(
+                &self.networks,
+                &self.gateway_host,
+                self.network,
+                Dialer::Direct,
+                &method,
+                request.url,
+                request.headers,
+                &request.body,
+                max_response_bytes,
+                &wrapped_on_dispatch,
+            );
+            let (status, headers, body) = tokio::time::timeout(request.timeout, call)
+                .await
+                .map_err(|_| {
+                    dispatch_phase_error(&dispatched, "OHTTP request timed out".to_string())
+                })?
+                .map_err(|error| ohttp_route_error(&dispatched, error))?;
+
+            // The engine refuses a longer body itself; this check only keeps the ceiling true
+            // should that ever change.
+            if body.len() > max_response_bytes {
+                return Err(RouteError::response_read(format!(
+                    "response body too large: {} > {max_response_bytes} bytes",
+                    body.len()
+                )));
+            }
+            Ok(RouteResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
+}
+
+/// Chooses the route a voting session rides, from Tor availability, whether
+/// the servers are the user's own and the OHTTP configuration `networks`.
+///
+/// - Tor on (`tor` is `Some`): [`SdkRoute::Tor`], over an isolated client, to
+///   the vote and PIR servers directly.
+/// - Tor off and a custom server: [`SdkRoute::Direct`]. Choosing one's own
+///   server is the user's decision to be reached directly.
+/// - Tor off, a predefined server and OHTTP configured for the wallet's
+///   network: [`SdkRoute::Ohttp`] through the relay and gateway, and an error
+///   when the gateway does not carry every one of `endpoint_urls`. No fallback
+///   to a direct connection.
+/// - Tor off, a predefined server and OHTTP off for the wallet's network:
+///   [`SdkRoute::Direct`]. There is no gateway to carry the request, and the
+///   rest of the wallet's traffic on that network goes direct too.
+///
+/// `endpoint_urls` is every chain and PIR endpoint the session will use: they
+/// share one route (a PIR query hides which rows are fetched, not who fetches
+/// them), so one that the gateway cannot carry refuses the session rather than
+/// failing partway through a round. It is read only in the Tor-off, predefined
+/// case with OHTTP on.
+pub(super) fn resolve_session_route(
+    networks: Arc<OhttpNetworks>,
+    tor: Option<&crate::tor::TorRuntime>,
+    is_custom_server: bool,
+    network: zcash_voting::Network,
+    endpoint_urls: &[&str],
+) -> anyhow::Result<SdkRoute> {
+    if let Some(tor) = tor {
+        return Ok(SdkRoute::tor(tor.isolated_client()));
+    }
+    if is_custom_server || gateway_for(&networks, network).is_none() {
+        return Ok(SdkRoute::direct());
+    }
+    // Every endpoint must pass; the route itself carries no per-endpoint state.
+    let mut routes = endpoint_urls.iter().map(|url| {
+        OhttpRoute::new(&networks, url, network).map_err(|error| {
+            invalid_input(format!(
+                "cannot reach predefined vote server at {url} with Tor disabled: {error}"
+            ))
+        })
+    });
+    let route = routes
+        .next()
+        .ok_or_else(|| invalid_input("at least one endpoint is required to choose a route"))??;
+    for other in routes {
+        other?;
+    }
+    Ok(SdkRoute::Ohttp(route))
+}
+
 /// The crate transport for every service of one session: chain, helper, PIR
 /// and vote-tree traffic.
 pub(super) fn routed_transport(route: SdkRoute) -> Arc<HyperTransport<SdkRoute>> {
@@ -359,6 +640,14 @@ mod tests {
         http::{HttpError, TimeoutPhase},
     };
     use zcash_voting::{RouteHttp, RoutePhase, RouteRequest};
+    use zodl_ohttp_client::OhttpNetworks;
+
+    use crate::ohttp_config::example;
+
+    /// Both networks configured, with the example values.
+    fn configured() -> Arc<OhttpNetworks> {
+        Arc::new(example::networks())
+    }
 
     fn http_build_error() -> http::Error {
         http::Request::builder()
@@ -462,6 +751,117 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_phase_follows_the_callback() {
+        let dispatched = AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let on_dispatch = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        };
+        let wrapped = dispatch_tracking(&dispatched, &on_dispatch);
+
+        // Key-config fetch failed: the callback never ran.
+        let error = dispatch_phase_error(&dispatched, "config HTTP 503".to_string());
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+
+        wrapped();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the caller's callback still runs"
+        );
+        let error = dispatch_phase_error(&dispatched, "relay reset".to_string());
+        assert_eq!(error.phase, RoutePhase::AfterDispatch);
+    }
+
+    #[test]
+    fn ohttp_response_too_large_is_a_response_read_failure() {
+        // An answer is only read once the request has been sent, so whether the hook fired
+        // does not decide this failure.
+        for dispatched in [false, true] {
+            let error = ohttp_route_error(
+                &AtomicBool::new(dispatched),
+                HttpRoundTripError::ResponseTooLarge(
+                    "response body too large: 300 > 200 bytes".into(),
+                ),
+            );
+            assert_eq!(
+                error.phase,
+                RoutePhase::ResponseRead,
+                "an answer past the ceiling is a response-read failure (dispatched: {dispatched})"
+            );
+            assert!(
+                error.message.contains("300 > 200"),
+                "the sizes reach the caller: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn ohttp_failures_follow_the_dispatch_hook() {
+        let error = ohttp_route_error(
+            &AtomicBool::new(false),
+            HttpRoundTripError::Failed("relay down".into()),
+        );
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+        assert!(
+            error.message.ends_with("(before dispatch)"),
+            "{}",
+            error.message
+        );
+
+        let error = ohttp_route_error(
+            &AtomicBool::new(true),
+            HttpRoundTripError::Failed("relay down".into()),
+        );
+        assert_eq!(error.phase, RoutePhase::AfterDispatch);
+    }
+
+    #[test]
+    fn ohttp_route_host_validation_is_before_dispatch() {
+        // Host validation happens before any network call, so it's always before-dispatch.
+        let error = OhttpRoute::new(
+            &configured(),
+            "https://unknown.example",
+            zcash_voting::Network::Mainnet,
+        )
+        .err()
+        .expect("host not in OHTTP_VOTE_HOSTS");
+        assert_eq!(
+            error.phase,
+            RoutePhase::BeforeDispatch,
+            "Host validation failure should be before-dispatch"
+        );
+    }
+
+    #[test]
+    fn ohttp_route_uses_the_gateway_of_the_wallet_network() {
+        let url = "https://vote.zodl.com";
+        let networks = configured();
+        let mainnet =
+            OhttpRoute::new(&networks, url, zcash_voting::Network::Mainnet).expect("mainnet");
+        assert_eq!(mainnet.gateway_host, example::MAINNET.gateway_host);
+        assert_eq!(mainnet.network, NetworkType::Main);
+        let testnet =
+            OhttpRoute::new(&networks, url, zcash_voting::Network::Testnet).expect("testnet");
+        assert_eq!(testnet.gateway_host, example::TESTNET.gateway_host);
+        assert_eq!(testnet.network, NetworkType::Test);
+        let error = OhttpRoute::new(&networks, url, zcash_voting::Network::Regtest)
+            .err()
+            .expect("no regtest gateway");
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+        // A network without a configuration has no gateway either.
+        let error = OhttpRoute::new(
+            &Arc::new(OhttpNetworks::default()),
+            url,
+            zcash_voting::Network::Mainnet,
+        )
+        .err()
+        .expect("no gateway with OHTTP off");
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+    }
+
+    #[test]
     fn direct_route_executes_against_loopback_server() {
         // Minimal HTTP/1.1 server on 127.0.0.1 answering 200 with body "ok". Bound
         // before the thread is spawned so the address is live when the client dials,
@@ -519,5 +919,288 @@ mod tests {
     fn routed_transport_carries_the_selected_route() {
         let transport = routed_transport(SdkRoute::direct());
         assert!(matches!(**transport.route(), SdkRoute::Direct(_)));
+    }
+
+    const EXPECTED_VOTE_HOSTS: [&str; 12] = [
+        "vote.zodl.com",
+        "prod.vote-chain-primary.valargroup.org",
+        "voting.valargroup.dev",
+        "ru.zcash.space",
+        "147-182-192-212.sslip.io",
+        "134-209-215-69.sslip.io",
+        "mnval01.zcash.legends.sh",
+        "zvote-1.stardust.rest",
+        "zvote.zodl.com",
+        "zvote.keplr.app",
+        "zvote.zfnd.org",
+        "v.ombie.cash",
+    ];
+
+    const EXPECTED_PIR_HOSTS: [&str; 3] = [
+        "lb-pir-primary.valargroup.org",
+        "lb-pir-backup.valargroup.org",
+        "zpir-1.stardust.rest",
+    ];
+
+    fn variant(route: &SdkRoute) -> &'static str {
+        match route {
+            SdkRoute::Direct(_) => "Direct",
+            SdkRoute::Tor(_) => "Tor",
+            SdkRoute::Ohttp(_) => "Ohttp",
+            SdkRoute::Refusing(_) => "Refusing",
+        }
+    }
+
+    #[test]
+    fn ohttp_vote_hosts_match_the_gateway_backends() {
+        assert_eq!(OHTTP_VOTE_HOSTS.len(), 15);
+        for host in EXPECTED_VOTE_HOSTS.iter().chain(EXPECTED_PIR_HOSTS.iter()) {
+            assert!(
+                OHTTP_VOTE_HOSTS.contains(host),
+                "{host} missing from OHTTP_VOTE_HOSTS"
+            );
+        }
+    }
+
+    #[test]
+    fn ohttp_host_matching_is_exact() {
+        assert!(can_handle_ohttp("vote.zodl.com"));
+        assert!(can_handle_ohttp("zpir-1.stardust.rest"));
+        // A suffix or a lookalike of a listed host is not a listed host.
+        assert!(!can_handle_ohttp("unknown.valargroup.org"));
+        assert!(!can_handle_ohttp("pir.valargroup.org"));
+        assert!(!can_handle_ohttp("evil.vote.zodl.com"));
+        assert!(!can_handle_ohttp("custom.example.com"));
+    }
+
+    #[test]
+    fn ohttp_route_rejects_unsupported_and_malformed_urls() {
+        for url in [
+            "https://custom.example.com/api/vote",
+            "https://pir.valargroup.org/api",
+            // Userinfo must not smuggle a listed host in front of the real one.
+            "https://vote.zodl.com@evil.example/api",
+            "not a url",
+            "vote.zodl.com",
+        ] {
+            let error = OhttpRoute::new(&configured(), url, zcash_voting::Network::Mainnet)
+                .err()
+                .expect(url);
+            assert_eq!(error.phase, RoutePhase::BeforeDispatch, "{url}");
+        }
+    }
+
+    #[test]
+    fn ohttp_route_accepts_every_gateway_host_with_or_without_slash_and_port() {
+        let networks = configured();
+        for host in EXPECTED_VOTE_HOSTS.iter().chain(EXPECTED_PIR_HOSTS.iter()) {
+            for url in [
+                format!("https://{host}"),
+                format!("https://{host}/"),
+                format!("https://{host}:443/api/v1/round"),
+            ] {
+                assert!(
+                    OhttpRoute::new(&networks, &url, zcash_voting::Network::Mainnet).is_ok(),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tor_off_custom_server_routes_direct() {
+        for urls in [
+            &["https://custom.example.com"][..],
+            // Custom servers ride direct even at a host the gateway lists.
+            &["https://vote.zodl.com"][..],
+            &[][..],
+        ] {
+            let route = resolve_session_route(
+                configured(),
+                None,
+                true,
+                zcash_voting::Network::Mainnet,
+                urls,
+            )
+            .expect("custom server");
+            assert_eq!(variant(&route), "Direct");
+        }
+    }
+
+    #[test]
+    fn tor_off_predefined_servers_route_through_ohttp() {
+        for host in EXPECTED_VOTE_HOSTS {
+            let url = format!("https://{host}");
+            let route = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                &[&url],
+            )
+            .expect(host);
+            assert_eq!(variant(&route), "Ohttp", "{host}");
+        }
+        // The three PIR hosts take the same route as the vote servers.
+        for host in EXPECTED_PIR_HOSTS {
+            let url = format!("https://{host}/");
+            let route = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                &[&url],
+            )
+            .expect(host);
+            assert_eq!(variant(&route), "Ohttp", "{host}");
+        }
+        // A session's chain and PIR endpoints together.
+        let route = resolve_session_route(
+            configured(),
+            None,
+            false,
+            zcash_voting::Network::Mainnet,
+            &[
+                "https://vote.zodl.com",
+                "https://zvote.zodl.com/",
+                "https://lb-pir-primary.valargroup.org/",
+            ],
+        )
+        .expect("mixed vote and PIR endpoints");
+        assert_eq!(variant(&route), "Ohttp");
+    }
+
+    #[test]
+    fn tor_off_unknown_predefined_server_fails_closed() {
+        for urls in [
+            &["https://unknown.example.com/"][..],
+            // One unsupported endpoint refuses the whole session.
+            &["https://vote.zodl.com", "https://pir.example.com/"][..],
+            &[][..],
+        ] {
+            let error = resolve_session_route(
+                configured(),
+                None,
+                false,
+                zcash_voting::Network::Mainnet,
+                urls,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{urls:?} must not resolve a route"));
+            // Crosses the FFI as the typed `invalid_input` envelope.
+            let view: serde_json::Value =
+                serde_json::from_str(&error.to_string()).expect("typed VotingErrorView JSON");
+            assert_eq!(view["kind"], "invalid_input", "{urls:?}");
+        }
+    }
+
+    #[test]
+    fn voting_route_goes_direct_without_configuration() {
+        let mainnet_only = Arc::new(
+            OhttpNetworks::new(Some(example::config(example::MAINNET)), None).expect("mainnet"),
+        );
+        for (networks, network) in [
+            (
+                Arc::new(OhttpNetworks::default()),
+                zcash_voting::Network::Mainnet,
+            ),
+            (
+                Arc::new(OhttpNetworks::default()),
+                zcash_voting::Network::Testnet,
+            ),
+            // Configuring the other network does not configure the wallet's.
+            (mainnet_only, zcash_voting::Network::Testnet),
+            // OHTTP never serves regtest.
+            (configured(), zcash_voting::Network::Regtest),
+        ] {
+            // Predefined servers, the gateway's hosts and others alike: with OHTTP off for the
+            // wallet's network there is no gateway to carry them, so they are reached directly.
+            for urls in [
+                &[
+                    "https://vote.zodl.com",
+                    "https://lb-pir-primary.valargroup.org/",
+                ][..],
+                &["https://unknown.example.com/"][..],
+            ] {
+                let route =
+                    resolve_session_route(Arc::clone(&networks), None, false, network, urls)
+                        .unwrap_or_else(|error| panic!("{network:?} {urls:?}: {error}"));
+                assert_eq!(variant(&route), "Direct", "{network:?} {urls:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn voting_route_uses_ohttp_with_configuration() {
+        let urls = &["https://vote.zodl.com", "https://zpir-1.stardust.rest/"][..];
+        for (network, gateway_host, engine_network) in [
+            (
+                zcash_voting::Network::Mainnet,
+                example::MAINNET.gateway_host,
+                NetworkType::Main,
+            ),
+            (
+                zcash_voting::Network::Testnet,
+                example::TESTNET.gateway_host,
+                NetworkType::Test,
+            ),
+        ] {
+            let networks = configured();
+            let route = resolve_session_route(Arc::clone(&networks), None, false, network, urls)
+                .unwrap_or_else(|error| panic!("{network:?}: {error}"));
+            let route = match route {
+                SdkRoute::Ohttp(route) => route,
+                other => panic!("{network:?} took the {} route", variant(&other)),
+            };
+            // The session rides the gateway of its network, under the configuration it opened
+            // with.
+            assert_eq!(route.gateway_host, gateway_host);
+            assert_eq!(route.network, engine_network);
+            assert!(Arc::ptr_eq(&route.networks, &networks));
+
+            // Unchanged with a configuration: a server the gateway does not carry still refuses
+            // the session rather than going direct.
+            assert!(
+                resolve_session_route(
+                    configured(),
+                    None,
+                    false,
+                    network,
+                    &["https://vote.zodl.com", "https://unknown.example.com/"],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ohttp_route_refuses_an_unlisted_host_before_dispatch() {
+        let route = OhttpRoute::new(
+            &configured(),
+            "https://vote.zodl.com",
+            zcash_voting::Network::Mainnet,
+        )
+        .expect("listed host");
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dispatched);
+        let on_dispatch = move || flag.store(true, Ordering::SeqCst);
+        let headers = Vec::new();
+        let error = route
+            .execute(
+                RouteRequest {
+                    method: http::Method::GET,
+                    url: "https://helper.example.com/status",
+                    headers: &headers,
+                    body: Vec::new(),
+                    timeout: std::time::Duration::from_secs(5),
+                    connect_timeout: None,
+                    max_response_bytes: 1024,
+                },
+                &on_dispatch,
+            )
+            .await
+            .expect_err("an unlisted host never reaches the gateway");
+        assert_eq!(error.phase, RoutePhase::BeforeDispatch);
+        assert!(!dispatched.load(Ordering::SeqCst));
     }
 }

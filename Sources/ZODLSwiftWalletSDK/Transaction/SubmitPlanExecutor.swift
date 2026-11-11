@@ -22,6 +22,12 @@ final class SubmitPlanExecutor {
     ///   retry threw may ignore it.
     @discardableResult
     func submit(transaction: CreatedTransaction, endpoints: [LightWalletEndpoint]) async throws -> LightWalletEndpoint? {
+        try await OHTTPHealthContext.withBackground {
+            try await self.submitInBackground(transaction: transaction, endpoints: endpoints)
+        }
+    }
+
+    private func submitInBackground(transaction: CreatedTransaction, endpoints: [LightWalletEndpoint]) async throws -> LightWalletEndpoint? {
         let txId = transaction.txId.toHexStringTxId()
         logger.debug("Transaction \(txId) background retry across \(endpoints.count) recorded endpoint(s).")
         var lastError: Error?

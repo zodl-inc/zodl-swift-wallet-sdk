@@ -219,6 +219,21 @@ extension SlipstreamSynchronizer {
 final class LifecycleQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var tail: Task<Void, Never>?
+    private var pending = 0
+
+    /// How many operations are on the queue: running or waiting for their turn. A test seam, so a test
+    /// can wait until an operation it started has joined the queue rather than sleep and hope.
+    var depth: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending
+    }
+
+    private func finished() {
+        lock.lock()
+        pending -= 1
+        lock.unlock()
+    }
 
     /// Appends a non-throwing operation. The returned task completes with the operation's value,
     /// once every operation enqueued before it has finished.
@@ -226,8 +241,10 @@ final class LifecycleQueue: @unchecked Sendable {
     func enqueue<T: Sendable>(_ operation: @escaping @Sendable () async -> T) -> Task<T, Never> {
         lock.lock()
         defer { lock.unlock() }
+        pending += 1
         let previous = tail
         let task = Task<T, Never> {
+            defer { self.finished() }
             await previous?.value
             return await operation()
         }
@@ -241,8 +258,10 @@ final class LifecycleQueue: @unchecked Sendable {
     func enqueueThrowing<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) -> Task<T, Error> {
         lock.lock()
         defer { lock.unlock() }
+        pending += 1
         let previous = tail
         let task = Task<T, Error> {
+            defer { self.finished() }
             await previous?.value
             return try await operation()
         }

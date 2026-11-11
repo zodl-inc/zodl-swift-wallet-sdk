@@ -1,6 +1,7 @@
 import Foundation
 import libzcashlc
 import XCTest
+import os
 @testable import ZODLSwiftWalletSDK
 
 final class TorHTTPGetTests: XCTestCase {
@@ -29,6 +30,61 @@ final class TorHTTPGetTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 
+    func testNegativeMaxBytesThrowsWithoutNativeCall() async throws {
+        for method in ["GET", "POST"] {
+            for maxBytes in [-1, Int.min] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let nativeCallCount = OSAllocatedUnfairLock(initialState: 0)
+                let native = TorHTTPGetNative(startup: TorRuntimeStartupNative.fixture { _, _ in
+                    nativeCallCount.withLock { $0 += 1 }
+                    return nil
+                })
+                let client = TorClient(torDir: directory, httpGetNative: native)
+                var request = URLRequest(url: URL(string: "https://example.com")!)
+                request.httpMethod = method
+                do {
+                    _ = try await client.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                    XCTFail("Negative response limit accepted for \(method)")
+                } catch {
+                    guard case ZcashError.rustTorHttpRequest = error else {
+                        XCTFail("Expected ordinary HTTP argument error for \(method), got \(type(of: error))")
+                        XCTAssertEqual(nativeCallCount.withLock { $0 }, 0)
+                        continue
+                    }
+                }
+                XCTAssertEqual(nativeCallCount.withLock { $0 }, 0)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+            }
+        }
+    }
+
+    func testZeroAndPositiveMaxBytesRetainNativeStartupForGETAndPOST() async throws {
+        for method in ["GET", "POST"] {
+            for maxBytes in [0, 1, Int.max] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let nativeCallCount = OSAllocatedUnfairLock(initialState: 0)
+                let native = TorHTTPGetNative(startup: TorRuntimeStartupNative.fixture { _, _ in
+                    nativeCallCount.withLock { $0 += 1 }
+                    return nil
+                })
+                let client = TorClient(torDir: directory, httpGetNative: native)
+                var request = URLRequest(url: URL(string: "https://example.com")!)
+                request.httpMethod = method
+                do {
+                    _ = try await client.httpRequest(for: request, maxBytes: maxBytes, retryLimit: 0)
+                    XCTFail("Expected fixture startup failure")
+                } catch {
+                    guard case ZcashError.rustTorClientInit = error else {
+                        return XCTFail("Nonnegative response limit rejected before native startup")
+                    }
+                }
+                XCTAssertEqual(nativeCallCount.withLock { $0 }, 1)
+            }
+        }
+    }
+
     func testUnpreparedRuntimeFailsWithoutBootstrapping() async throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data([1]).write(to: file)
@@ -42,6 +98,54 @@ final class TorHTTPGetTests: XCTestCase {
             guard case ZcashError.torClientUnavailable = error else { return XCTFail("Expected unavailable runtime") }
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testPreparingGETExpiryIncludesBlockedBootstrapAndCleansLateRuntime() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entered = expectation(description: "native preparation entered")
+        let expired = expectation(description: "shared deadline expires during preparation")
+        let freed = expectation(description: "late runtime closed")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let runtimes = TorTestRuntimes()
+        defer { if runtimes.isAlive(runtimes.parent) { runtimes.free(runtimes.parent) } }
+        let native = TorHTTPGetNative(
+            get: { _, _, _, _, _, _ in
+                XCTFail("Expired preparation must not GET")
+                return nil
+            },
+            isolateRuntime: { _ in
+                XCTFail("Expired preparation must not isolate")
+                return nil
+            },
+            freeRuntime: { runtime in
+                runtimes.free(runtime)
+                freed.fulfill()
+            },
+            startup: TorRuntimeStartupNative.fixture { _, _ in
+                entered.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                return runtimes.parent
+            }
+        )
+        let client = TorClient(torDir: directory, httpGetNative: native)
+        let task = Task {
+            do {
+                _ = try await client.httpGetPreparingRuntime(
+                    for: URLRequest(url: URL(string: "https://example.com/test")!), retryLimit: 2, timeoutMilliseconds: 100
+                )
+                XCTFail("Preparation must use the request's original deadline")
+            } catch {
+                XCTAssertEqual((error as? URLError)?.code, .timedOut)
+                expired.fulfill()
+            }
+        }
+        await fulfillment(of: [entered, expired], timeout: 1)
+        release.signal()
+        await task.value
+        try await client.close()
+        await fulfillment(of: [freed], timeout: 1)
     }
 
     func testCopiesResponseBeforeFreeingAndForwardsNativeArgumentsOnWorker() async throws {
@@ -252,7 +356,7 @@ final class TorTestRuntimes: @unchecked Sendable {
 
     func clone(_ pointer: OpaquePointer?) -> OpaquePointer? {
         lock.withLock {
-            guard pointer == parent && parentAlive else {
+            guard let pointer, (pointer == parent && parentAlive) || children.contains(pointer) else {
                 XCTFail("Cloning a freed or unexpected runtime")
                 return nil
             }

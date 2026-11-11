@@ -25,11 +25,13 @@ Standard handling:
 
 ## Build and test
 
-Open the package or workspace in Xcode and build against an iOS or macOS target:
+Compile and test the package on the CLI against an ARM64 iOS or macOS target:
 
 - `swift build` — build the package (macOS target).
 - `swift test --filter OfflineTests` — run the offline unit tests. This is what CI runs (see `.github/workflows/swift.yml`).
-- `xcodebuild ... -testPlan ZODLSwiftWalletSDK.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
+- `xcodebuild ... -skipMacroValidation -derivedDataPath DerivedData -testPlan ZODLSwiftWalletSDK.xctestplan` — the shared test plan enables only `OfflineTests`; other test targets are disabled by default and must be enabled manually when needed.
+
+Run Apple builds and tests on the CLI. Every `xcodebuild` build/test invocation must pass `-skipMacroValidation` and an explicit `-derivedDataPath` outside the Xcode app cache (default: repo-local `DerivedData/`). Ask which scheme to test if it is unclear. Use ARM64 simulator or Mac destinations; Intel destinations are unsupported.
 
 Test targets are grouped by external dependencies:
 
@@ -49,7 +51,7 @@ The Rust code in `rust/` is compiled into the `libzcashlc` XCFramework. Two mode
 
 Scripts:
 
-- `./Scripts/init-local-ffi.sh` — one-time setup; default builds all 5 architectures and creates `LocalPackages/`. The **`--arm-*`** flags build an arm64-only subset instead, skipping the x86_64 slices and so finishing faster on Apple Silicon: **`--arm-macos`** for the macOS slice (good for `swift build` / `swift test` on the Mac), **`--arm-ios`** for the iOS simulator and device slices, **`--arm-simulator`** for the iOS simulator slice alone, **`--arm-all`** for all three. Building for a slice you did not include then fails until you build it. Use `--cached` only when your branch has no FFI changes relative to the release.
+- `./Scripts/init-local-ffi.sh` — one-time setup; default builds all three ARM64 platform slices and creates `LocalPackages/`. **`--arm-macos`** selects macOS, **`--arm-ios`** selects iOS simulator and device, **`--arm-simulator`** selects only iOS simulator, and **`--arm-all`** selects all three. Missing platforms can be added with `rebuild-local-ffi.sh`. Use ARM64 Xcode destinations. `--cached` requires the pinned release to use the canonical ARM64 layout and your branch to have no FFI changes relative to that release. Older cached products must be replaced by a source initialization. Incompatible local layouts fail before incremental builds; reinitialize them explicitly.
 - `./Scripts/rebuild-local-ffi.sh [ios-sim|ios-device|macos]` — fast single-arch incremental rebuild after Rust edits. `ios-sim` is default.
 - `./Scripts/reset-local-ffi.sh` — remove `LocalPackages/` and switch back to the release binary.
 
@@ -235,7 +237,7 @@ that binary is stale the moment your branch changes anything under `rust/`.
 `make ffi-ci` reproduces the CI "Build FFI for macOS" step exactly: the arm64
 macOS slice alone, built without the release profile's whole-program LTO. That
 is enough to build and test the Swift package on Apple Silicon; `make ffi-macos`
-builds the universal macOS slice with release settings instead.
+builds the ARM64 macOS slice with release settings instead.
 
 ```bash
 make ffi-ci              # once per branch, and after each Rust edit
@@ -256,7 +258,7 @@ says nothing about them; `swift.yml` runs both.
 | Swift style or rename | `make lint` |
 | Swift logic or refactor | `make check`, then `make lint` |
 | Rust internals | `make ffi-ci`, then `make check` (which runs `make test-rust`) |
-| Any change to an FFI signature or a new FFI function | `make ffi-all` (all five architectures) before PRing |
+| Any change to an FFI signature or a new FFI function | `make ffi-all` (all three ARM64 platform slices) before PRing |
 | Bumping the pinned `zcash_client_backend` | `./Scripts/update-proposal-proto.sh --check` |
 
 `make ffi-ci`, `make ffi-macos` and `make rebuild-ffi` cover a single platform.

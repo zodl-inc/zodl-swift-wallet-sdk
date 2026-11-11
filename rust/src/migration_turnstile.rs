@@ -11,11 +11,13 @@
 //! 2.8.0-rc.1 calls it. It is the same primitive [`crate::zcashlc_propose_send_max_transfer`]
 //! exposes generally, with the pool set, recipient and spend mode fixed.
 
+use std::fmt;
+
 use anyhow::anyhow;
 use zcash_address::{ToAddress, ZcashAddress, unified, unified::Encoding as _};
 use zcash_client_backend::{
     data_api::{
-        Account as _, InputSource, MaxSpendMode, WalletRead,
+        Account as _, InputSource, MaxSpendMode, WalletRead, WalletWrite,
         wallet::{
             ConfirmationsPolicy, input_selection::LockedInputPolicy, propose_send_max_transfer,
         },
@@ -23,20 +25,13 @@ use zcash_client_backend::{
     fees::StandardFeeRule,
     proposal::Proposal,
 };
-use zcash_client_sqlite::{AccountUuid, WalletDb, util::SystemClock};
 use zcash_protocol::{
     ShieldedPool,
     consensus::{NetworkUpgrade, Parameters},
     memo::MemoBytes,
 };
 
-use crate::NetworkParams;
-
-// This line carries custom (regtest-style) networks, so the wallet handle is parameterized by
-// `NetworkParams` rather than `zcash_protocol`'s fixed `Network`.
-type Db = WalletDb<rusqlite::Connection, NetworkParams, SystemClock, crate::SystemRng>;
-
-type MigrationProposal = Proposal<StandardFeeRule, <Db as InputSource>::NoteRef>;
+type MigrationProposal<NoteRef> = Proposal<StandardFeeRule, NoteRef>;
 
 /// Proposes migrating the account's entire Orchard balance into the Ironwood
 /// pool, sending the maximum from Orchard to the account's own internal Orchard
@@ -47,11 +42,22 @@ type MigrationProposal = Proposal<StandardFeeRule, <Db as InputSource>::NoteRef>
 /// call builds an Orchard-pool output (a fee-costing self-send that migrates
 /// nothing). Uses `MaxSpendMode::Everything` so it fails rather than silently
 /// migrating only the spendable subset.
-pub(crate) fn propose_orchard_to_ironwood(
-    db_data: &mut Db,
-    network: &NetworkParams,
-    account: AccountUuid,
-) -> anyhow::Result<MigrationProposal> {
+///
+/// Generic over the wallet and the network only so the synthetic test wallet can drive it; the
+/// FFI calls it with the SDK's `WalletDb` and `NetworkParams`, which carry custom (regtest-style)
+/// networks.
+pub(crate) fn propose_orchard_to_ironwood<DbT, P>(
+    db_data: &mut DbT,
+    network: &P,
+    account: <DbT as WalletRead>::AccountId,
+) -> anyhow::Result<MigrationProposal<<DbT as InputSource>::NoteRef>>
+where
+    DbT: WalletWrite
+        + InputSource<Error = <DbT as WalletRead>::Error, AccountId = <DbT as WalletRead>::AccountId>,
+    <DbT as InputSource>::NoteRef: Copy + Eq + Ord + fmt::Display,
+    <DbT as WalletRead>::Error: fmt::Display,
+    P: Parameters + Clone,
+{
     let chain_tip = db_data
         .chain_height()
         .map_err(|e| anyhow!("Error reading the chain tip: {}", e))?
