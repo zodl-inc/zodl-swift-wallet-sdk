@@ -21,6 +21,9 @@ SLICES = {
     "macos-arm64": ("macos", None),
 }
 
+# Release archives hold only these compression methods.
+ALLOWED_COMPRESSION = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+
 # The only links a versioned macOS framework may contain, relative to the
 # framework root. Everything else must be a real file or directory.
 MACOS_LINKS = {
@@ -211,11 +214,13 @@ def extract(archive, destination):
         links = []
         # Check every member before writing anything, so a rejected archive
         # leaves no partial extraction behind.
+        # Release archives hold only stored or deflated data. The zipfile module does not limit
+        # the output of its bzip2 and lzma decompressors on the Python versions we support, so
+        # refuse every other method in a pass of its own, before any member is opened.
         for item in source.infolist():
-            # Release archives hold only stored or deflated data. The bzip2 and lzma decompressors
-            # cannot be output-limited, so refuse every other method before any member is opened.
-            if item.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            if item.compress_type not in ALLOWED_COMPRESSION:
                 raise LayoutError("unsupported archive compression: " + item.filename)
+        for item in source.infolist():
             path = PurePosixPath(item.filename)
             kind = stat.S_IFMT(item.external_attr >> 16)
             if (path.is_absolute() or "\\" in item.filename or ".." in path.parts
@@ -230,10 +235,10 @@ def extract(archive, destination):
                 if expected is None or item.file_size != len(expected.encode("utf-8")):
                     raise LayoutError("unexpected link member: " + item.filename)
                 try:
-                    # The declared size is only a header claim, so the read is bounded to the expected
-                    # target plus one byte. Only stored or deflated data is allowed, so decompression
-                    # stops near that bound, and a stream that inflates further fails the CRC or length
-                    # check. The link created is always the expected constant target.
+                    # The declared size already equals the expected length, and zipfile stops at the
+                    # declared size, so any further output is discarded. With only stored or deflated
+                    # data a read decompresses at most about 4 KiB. What it returns must match the
+                    # expected target (and its CRC), and the link created is always that constant target.
                     with source.open(item) as incoming:
                         target = incoming.read(len(expected.encode("utf-8")) + 1).decode("utf-8")
                 except (UnicodeDecodeError, zipfile.BadZipFile, OSError, zlib.error, EOFError) as error:

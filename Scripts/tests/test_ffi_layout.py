@@ -15,6 +15,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'Scripts/lib/ffi_layout.py'
 sys.path.insert(0, str(ROOT / 'Scripts/lib'))
+import ffi_layout  # noqa: E402
 from ffi_layout import MACOS_LINKS  # noqa: E402
 
 SLICES = {'ios-arm64': ('ios', None), 'ios-arm64-simulator': ('ios', 'simulator'), 'macos-arm64': ('macos', None)}
@@ -285,8 +286,12 @@ class LayoutTests(unittest.TestCase):
                 info = zipfile.ZipInfo(name)
                 info.create_system = 3
                 info.external_attr = ((stat.S_IFLNK if is_link else stat.S_IFREG) | 0o755) << 16
-                info.compress_type = compression
+                # Only the central directory label matters to the compression check, so other methods are
+                # written stored and relabeled, which keeps these fixtures independent of bzip2 and lzma.
+                relabel = compression not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                info.compress_type = zipfile.ZIP_STORED if relabel else compression
                 output.writestr(info, content)
+                info.compress_type = compression
         return archive
 
     def test_extract_rejects_unsupported_compression_before_opening_any_member(self):
@@ -296,9 +301,13 @@ class LayoutTests(unittest.TestCase):
             'bzip2 link': [plain, (macos + 'Headers', MACOS_LINKS['Headers'], True, zipfile.ZIP_BZIP2)],
             'lzma regular member': [plain, ('libzcashlc.xcframework/lzma', 'data', False, zipfile.ZIP_LZMA)],
             'bzip2 regular member': [('libzcashlc.xcframework/bzip2', 'data', False, zipfile.ZIP_BZIP2)],
+            'bzip2 directory': [('libzcashlc.xcframework/dir/', '', False, zipfile.ZIP_BZIP2)],
+            # The deflated link is valid on its own, so only an archive-wide pass can refuse it unopened.
+            'deflated link before a bzip2 member': [
+                (macos + 'Headers', MACOS_LINKS['Headers'], True, zipfile.ZIP_DEFLATED),
+                ('libzcashlc.xcframework/bzip2', 'data', False, zipfile.ZIP_BZIP2),
+            ],
         }
-        sys.path.insert(0, str(ROOT / 'Scripts/lib'))
-        import ffi_layout
         for label, members in cases.items():
             with self.subTest(label):
                 archive = self.compressed_archive(members)
