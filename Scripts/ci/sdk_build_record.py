@@ -162,7 +162,7 @@ def verify_slices(product: Path, versions: dict, source: Path) -> list[dict]:
         content = framework
         plist_path = framework / "Info.plist"
         if platform == "macos":
-            # A versioned framework has no root Info.plist, so tools that read the shallow layout fail loudly instead of silently.
+            # macOS embeds only versioned frameworks, and the archive must unpack to exactly this layout, so require the exact links, the exact top-level set and a real Versions/A.
             for name, target in MACOS_LINKS.items():
                 link = framework / name
                 if not link.is_symlink() or os.readlink(link) != target:

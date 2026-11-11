@@ -156,10 +156,11 @@ def install(root, wrapper, destination):
         shutil.copytree(root, staged_framework, symlinks=True)
         shutil.copy2(wrapper, staged_wrapper)
         validate(staged_framework)
-        # Release products now arrive with a versioned macOS framework. The
-        # versioner is idempotent and still converts shallow input such as an
-        # old cached release. Convert only the staged local copy, so a failed
-        # conversion leaves the installed framework untouched.
+        # Release products arrive with a versioned macOS framework, while a
+        # product built before the Makefile versioned it is still shallow. The
+        # versioner is idempotent and converts only the shallow case. Convert
+        # only the staged local copy, so a failed conversion leaves the
+        # installed framework untouched.
         macos = staged_framework / "macos-arm64/libzcashlc.framework"
         if macos.is_dir():
             versioner = Path(__file__).resolve().parents[1] / "version-macos-framework.sh"
@@ -233,6 +234,14 @@ def extract(archive, destination):
                 links.append((path, target))
             else:
                 regular.append(item)
+        # A shallow archive has plain directories where a versioned one has
+        # links, so only the links this archive really contains claim a path.
+        # Compare without case, because APFS ignores it.
+        claimed = [tuple(part.lower() for part in path.parts) for path, _ in links]
+        for path in seen:
+            lowered = tuple(part.lower() for part in path.parts)
+            if any(lowered[:len(parent)] == parent and len(lowered) > len(parent) for parent in claimed):
+                raise LayoutError("unexpected member nested under a link: " + path.as_posix())
         # Links are created only after every regular member is written, so a
         # link can never redirect a later write out of the destination.
         try:

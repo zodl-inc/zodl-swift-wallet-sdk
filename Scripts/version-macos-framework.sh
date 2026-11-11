@@ -14,7 +14,7 @@
 # correct macOS Info.plist (FMWK / MacOSX / LSMinimumSystemVersion). Idempotent.
 # BuildSupport/Makefile runs it on every macOS framework it assembles, so release
 # products (`ffi-all`, `ffi-macos`, `ffi-ci`) carry the versioned layout too, and
-# `make configure-local-ffi` runs it only on products built before that change.
+# `make configure-local-ffi` runs it on every product too and converts only shallow ones.
 #
 # Usage:
 #   ./Scripts/version-macos-framework.sh <path/to/libzcashlc.framework>

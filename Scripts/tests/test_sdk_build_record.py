@@ -460,13 +460,13 @@ if sys.argv[1:] == ["--version"]:
         self.assert_no_release_write()
 
     def test_shallow_macos_release_product_is_rejected(self):
-        self.assert_rejected(SHALLOW_MACOS="1")
+        self.assert_rejected("macOS framework link missing or wrong", SHALLOW_MACOS="1")
 
     def test_wrong_macos_link_target_is_rejected(self):
-        self.assert_rejected(BAD_MACOS_LINK="1")
+        self.assert_rejected("macOS framework link missing or wrong", BAD_MACOS_LINK="1")
 
     def test_versioned_macos_with_root_plist_is_rejected(self):
-        self.assert_rejected(ROOT_PLIST_MACOS="1")
+        self.assert_rejected("not exactly the versioned layout", ROOT_PLIST_MACOS="1")
 
     def test_archive_with_copied_links_is_rejected(self):
         # Without -y, zip follows the links and stores three copies of the library.

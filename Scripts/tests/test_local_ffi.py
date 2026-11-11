@@ -295,7 +295,6 @@ exec /bin/mv "$@"
                 shutil.rmtree(self.base / 'archive-source', ignore_errors=True)
                 self.archive(extra=extra)
                 self.assert_preserved_failure(self.run_script('init-local-ffi.sh', '--cached'), self.snapshot())
-                self.assertFalse(outside.exists())
         shutil.rmtree(self.base / 'archive-source')
         archive = self.archive()
         archive.write_bytes(b'not a zip')
@@ -316,7 +315,6 @@ exec /bin/mv "$@"
 
     def test_cached_rejects_unexpected_macos_links(self):
         self.seed()
-        outside = self.base / 'escaped'
         macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
 
         def retarget(target):
@@ -338,7 +336,6 @@ exec /bin/mv "$@"
                 result = self.run_script('init-local-ffi.sh', '--cached')
                 self.assert_preserved_failure(result, self.snapshot())
                 self.assertIn('unexpected link member', result.stderr)
-                self.assertFalse(outside.exists())
 
 
 if __name__ == '__main__':

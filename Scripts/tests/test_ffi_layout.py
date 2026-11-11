@@ -232,6 +232,18 @@ class LayoutTests(unittest.TestCase):
                 self.assertIn('unexpected link member', result.stderr)
                 self.assertEqual(list(destination.iterdir()), [])
 
+    def test_extract_rejects_members_nested_under_a_link_before_writing_anything(self):
+        macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
+        links = [(macos + name, target, True) for name, target in MACOS_LINKS.items()]
+        # APFS is case-insensitive, so a case variant of a link path is just as much a parent.
+        for nested in (macos + 'Headers/x.h', macos + 'headers/x.h', macos + 'Versions/Current/x'):
+            with self.subTest(nested):
+                regular = ('libzcashlc.xcframework/Info.plist', 'plist', False)
+                result, destination = self.extract_cli(self.zip_with([regular, (nested, 'data', False)] + links))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('member nested under a link', result.stderr)
+                self.assertEqual(list(destination.iterdir()), [])
+
     def test_extract_creates_exactly_the_five_macos_links(self):
         macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
         members = [(macos + 'Versions/A/libzcashlc', 'binary', False)]
@@ -351,6 +363,7 @@ else:
 ''')
         result = subprocess.run(['make', '-C', str(support), 'xcframework'], env=self.env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('macOS framework must be versioned', result.stderr)
 
 
 class VersionerTests(unittest.TestCase):
