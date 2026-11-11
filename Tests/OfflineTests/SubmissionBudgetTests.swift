@@ -11,6 +11,7 @@ import XCTest
 final class SubmissionBudgetTests: ZcashTestCase {
     override func setUp() async throws {
         try await super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
         await clearGatewayKey()
     }
 
@@ -22,7 +23,7 @@ final class SubmissionBudgetTests: ZcashTestCase {
     private func clearGatewayKey() async {
         let host = OHTTPTestSupport.testnetHost
         let relay = try! OHTTPEndpoints.relayURL(for: host)
-        await OHTTPKeyCache.shared.store(nil, for: "\(relay)|\(host)|tor")
+        await OHTTPKeyCache.shared.store(nil, for: OHTTPTransport.keyCacheKey(relayURL: relay, gatewayHost: host, viaTor: true))
     }
 
     func testHeightReadConsumesSendBudget() async throws {

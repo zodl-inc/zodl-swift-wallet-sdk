@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from test_ohttp_env import VALUES
 
 ROOT = Path(__file__).resolve().parents[2]
 SLICES = {'ios-arm64': ('ios', None), 'ios-arm64-simulator': ('ios', 'simulator'), 'macos-arm64': ('macos', None)}
@@ -48,7 +47,9 @@ class LocalFFITests(unittest.TestCase):
         self.home = self.base / 'home'
         self.home.mkdir()
         self.log = self.base / 'calls'
-        self.env = dict(os.environ, **VALUES, HOME=str(self.home), PATH=str(self.tools) + os.pathsep + os.environ['PATH'], CALLS=str(self.log))
+        # The native entry points take no OHTTP inputs: run them without any.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('ZODL_OHTTP_')}
+        self.env.update(HOME=str(self.home), PATH=str(self.tools) + os.pathsep + os.environ['PATH'], CALLS=str(self.log))
         self.env.pop('CARGO_TARGET_DIR', None)
         self.tool('python3', '#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         self.tool('uname', '#!/bin/sh\necho x86_64\n')

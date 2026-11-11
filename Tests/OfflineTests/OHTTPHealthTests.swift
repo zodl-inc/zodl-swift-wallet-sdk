@@ -4,6 +4,11 @@ import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     private func route() -> OHTTPHealthRoute {
         OHTTPHealthRoute(network: .testnet, gatewayHost: "\(UUID().uuidString.lowercased()).test", relayURL: "https://relay.test/", viaTor: false)
     }

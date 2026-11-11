@@ -10,22 +10,46 @@ import CryptoKit
 @testable import ZODLSwiftWalletSDK
 
 enum OHTTPTestSupport {
-    /// Expectations come from the same public build environment as the compiled native fixture.
-    static func configuredValue(_ name: String) -> String {
-        guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
-            preconditionFailure("Tests require the native build configuration: \(name)")
+    /// The mainnet half of ``exampleConfiguration``.
+    static let exampleMainnet = OHTTPNetworkConfiguration(
+        gatewayHost: "ohttp-gateway.example",
+        relayURL: "https://relay-mainnet.example/relay",
+        keysDNSName: "mainnet.ohttp-keys.example",
+        signingPublicKey: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    )
+
+    /// The testnet half of ``exampleConfiguration``.
+    static let exampleTestnet = OHTTPNetworkConfiguration(
+        gatewayHost: "ohttp-gateway-testnet.example",
+        relayURL: "https://relay-testnet.example/relay",
+        keysDNSName: "testnet.ohttp-keys.example",
+        signingPublicKey: "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    )
+
+    /// The OHTTP configuration the tests run under: RFC 2606 example hosts, and as signing keys the public keys
+    /// of RFC 8032 section 7.1 TEST 1 (mainnet) and TEST 2 (testnet), which are valid Ed25519 points.
+    static let exampleConfiguration = OHTTPConfiguration(mainnet: exampleMainnet, testnet: exampleTestnet)
+
+    /// Installs ``exampleConfiguration``. A test that needs OHTTP calls it in `setUp`, since OHTTP is off until a
+    /// configuration is installed; a test that installs another one calls it again in `tearDown`, so that the
+    /// tests run after it find the example.
+    static func installExampleConfiguration() {
+        do {
+            try OHTTPEndpoints.configure(exampleConfiguration)
+        } catch {
+            preconditionFailure("The example OHTTP configuration was refused: \(error)")
         }
-        return value
     }
 
-    static let mainnetHost = configuredValue("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
-    static let testnetHost = configuredValue("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
-    static let mainnetDNSName = configuredValue("ZODL_OHTTP_KEYS_DNS_NAME_MAINNET")
-    static let testnetDNSName = configuredValue("ZODL_OHTTP_KEYS_DNS_NAME_TESTNET")
+    static let mainnetHost = exampleMainnet.gatewayHost
+    static let testnetHost = exampleTestnet.gatewayHost
+    static let mainnetDNSName = exampleMainnet.keysDNSName
+    static let testnetDNSName = exampleTestnet.keysDNSName
 
+    /// The id the signed key configuration of `network` names its example signing key by: the first four bytes
+    /// of the key's SHA-256, in hex.
     static func signingKeyId(for network: NetworkType) -> String {
-        let suffix = network == .mainnet ? "MAINNET" : "TESTNET"
-        let hex = Array(configuredValue("ZODL_OHTTP_SIGNING_PUBKEY_\(suffix)"))
+        let hex = Array(network == .mainnet ? exampleMainnet.signingPublicKey : exampleTestnet.signingPublicKey)
         precondition(hex.count == 64, "Tests require a 32-byte signing public key")
         let bytes = stride(from: 0, to: hex.count, by: 2).map { index -> UInt8 in
             guard let byte = UInt8(String(hex[index...index + 1]), radix: 16) else {

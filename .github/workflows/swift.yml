@@ -62,16 +62,6 @@ jobs:
       run: make check-format-rust
 
   build:
-    env:
-      ZODL_OHTTP_REQUIRE: '1'
-      ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-      ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-      ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
-      ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-      ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-      ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
     permissions:
       contents: read
 
@@ -113,13 +103,6 @@ jobs:
 
     - name: Run release-script tests
       run: make test-scripts
-
-    # Hash every input of the FFI build for the XCFramework cache key.
-    - name: Validate OHTTP configuration
-      id: ohttp-config
-      run: |
-        OHTTP_HASH=$(python3 Scripts/lib/ohttp_env.py --hash)
-        echo "hash=$OHTTP_HASH" >> "$GITHUB_OUTPUT"
 
     - name: Generate FFI source hash
       id: ffi-hash
@@ -175,9 +158,9 @@ jobs:
           ~/.cargo/registry/index
           ~/.cargo/registry/cache
           ~/.cargo/registry/src
-        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-${{ steps.ohttp-config.outputs.hash }}-
+          ${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-cache-key.outputs.hash }}-cargo-ci-macos-arm64-nolto-v4-${{ steps.toolchain.outputs.cachekey }}-
     # Build the arm64 macOS slice without fat LTO (`make ffi-ci`), which is all
     # the Swift build and the offline tests need. Releases still build every
     # slice with LTO.

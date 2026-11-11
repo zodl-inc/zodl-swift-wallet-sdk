@@ -7,6 +7,11 @@ import XCTest
 @testable import TestUtils
 
 final class TorRouteTransitionTests: ZcashTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testRunningEnableStopsDirectBeforeTorStart() async throws {
         let engine = GatedFakeSlipstreamEngine()
         let entered = expectation(description: "HTTP bootstrap entered")

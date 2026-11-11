@@ -5,6 +5,11 @@ import os
 @testable import ZODLSwiftWalletSDK
 
 final class OHTTPHealthTorTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testSuccessfulKeyFetchDoesNotAuthorizeQueuedPostExpiry() async throws {
         try await assertPostTimeoutAfterSuccessfulKeys(queued: true)
     }

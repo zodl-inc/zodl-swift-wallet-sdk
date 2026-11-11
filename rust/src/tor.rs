@@ -1,8 +1,10 @@
 //! Tor support
 //!
-//! Lightwalletd endpoints whose host is an OHTTP gateway (`slipstream_core::ohttp::relay_for`)
-//! are never dialled here: the gateway refuses plain gRPC, and the Swift `LightWalletOHTTPService`
-//! reaches it through its relay (over Tor when Tor is on). A gateway endpoint is refused.
+//! Lightwalletd endpoints whose host is the OHTTP gateway of a network the app configured
+//! (`crate::ohttp_config`, matched by `slipstream_core::ohttp::relay_for`) are never dialled here:
+//! the gateway refuses plain gRPC, and the Swift `LightWalletOHTTPService` reaches it through its
+//! relay (over Tor when Tor is on). A gateway endpoint is refused. With OHTTP off for its network,
+//! the same host is a plain server.
 
 pub(crate) mod http;
 pub(crate) mod startup;
@@ -35,8 +37,10 @@ use zcash_protocol::{
     value::Zatoshis,
 };
 use zcash_script::script;
+use zodl_ohttp_client::OhttpNetworks;
 
 use crate::ffi;
+use crate::ohttp_config::installed_networks;
 
 pub struct TorRuntime {
     runtime: PreferredRuntime,
@@ -58,11 +62,24 @@ impl TorRuntime {
         Ok(Self { runtime, client })
     }
 
-    /// True when `endpoint` is an OHTTP gateway, which is never dialled directly.
-    fn is_ohttp_gateway(endpoint: &Uri) -> bool {
+    /// True when `endpoint` is the gateway of a network `networks` configures, which is never
+    /// dialled directly.
+    fn is_ohttp_gateway(networks: &OhttpNetworks, endpoint: &Uri) -> bool {
         endpoint
             .host()
-            .is_some_and(|h| slipstream_core::ohttp::relay_for(h).is_some())
+            .is_some_and(|h| slipstream_core::ohttp::relay_for(networks, h).is_some())
+    }
+
+    /// Refuses `endpoint` when it is the gateway of a network `networks` configures: a gateway
+    /// refuses plain gRPC and is reached only through its relay, by the Swift OHTTP transport.
+    /// The error names the condition, not the endpoint, whose host is a configured value.
+    fn refuse_ohttp_gateway(networks: &OhttpNetworks, endpoint: &Uri) -> anyhow::Result<()> {
+        if Self::is_ohttp_gateway(networks, endpoint) {
+            return Err(anyhow!(
+                "the endpoint is an OHTTP gateway: reached through the OHTTP transport, not dialled over Tor"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn runtime(&self) -> &PreferredRuntime {
@@ -127,14 +144,7 @@ impl TorRuntime {
         endpoint: Uri,
         submission: Option<SubmissionRuntime>,
     ) -> anyhow::Result<LwdConn> {
-        // An OHTTP gateway refuses plain gRPC and is only reached through its relay, by the Swift
-        // OHTTP transport; it is never dialled from here.
-        if Self::is_ohttp_gateway(&endpoint) {
-            return Err(anyhow!(
-                "{} is an OHTTP gateway: reached through the OHTTP transport, not dialled over Tor",
-                endpoint
-            ));
-        }
+        Self::refuse_ohttp_gateway(&installed_networks(), &endpoint)?;
 
         let Self { runtime, client } = self.isolated_client();
 
@@ -391,3 +401,62 @@ impl LwdConn {
 #[cfg(test)]
 #[path = "tor/submission_tests.rs"]
 mod submission_tests;
+
+#[cfg(test)]
+mod gateway_tests {
+    use tonic::transport::Uri;
+    use zodl_ohttp_client::OhttpNetworks;
+
+    use super::TorRuntime;
+    use crate::ohttp_config::example;
+
+    /// Only the gateway of a network OHTTP is configured for is kept from a plain gRPC dial, in
+    /// any letter case; with OHTTP off for its network the same host is a plain server.
+    #[test]
+    fn only_a_configured_gateway_is_refused() {
+        let uri = |host: &str| format!("https://{host}:443").parse::<Uri>().expect("a URI");
+        let configured = example::networks();
+        for host in [
+            example::MAINNET.gateway_host.to_owned(),
+            example::TESTNET.gateway_host.to_ascii_uppercase(),
+        ] {
+            assert!(
+                TorRuntime::is_ohttp_gateway(&configured, &uri(&host)),
+                "{host}"
+            );
+            assert!(
+                !TorRuntime::is_ohttp_gateway(&OhttpNetworks::default(), &uri(&host)),
+                "{host}"
+            );
+        }
+        assert!(!TorRuntime::is_ohttp_gateway(
+            &configured,
+            &uri("zec.rocks")
+        ));
+    }
+
+    /// The refusal of a configured gateway names the condition, never the endpoint: its host is
+    /// a configured value, kept out of every error text whatever its letter case.
+    #[test]
+    fn gateway_refusal_names_no_host() {
+        let uri = |host: &str| format!("https://{host}:443").parse::<Uri>().expect("a URI");
+        let configured = example::networks();
+        for host in [
+            example::MAINNET.gateway_host.to_owned(),
+            example::TESTNET.gateway_host.to_ascii_uppercase(),
+        ] {
+            let message = TorRuntime::refuse_ohttp_gateway(&configured, &uri(&host))
+                .expect_err("a configured gateway is refused")
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(message.contains("ohttp gateway"), "{message}");
+            for gateway in [example::MAINNET.gateway_host, example::TESTNET.gateway_host] {
+                assert!(
+                    !message.contains(gateway),
+                    "the refusal names a configured gateway host"
+                );
+            }
+        }
+        assert!(TorRuntime::refuse_ohttp_gateway(&configured, &uri("zec.rocks")).is_ok());
+    }
+}

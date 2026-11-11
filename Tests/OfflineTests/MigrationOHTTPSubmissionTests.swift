@@ -5,6 +5,11 @@ import XCTest
 @_spi(Testing) @testable import ZODLSwiftWalletSDK
 
 final class MigrationOHTTPSubmissionTests: ZcashTestCase {
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testMigrationRejectsBeforePreparationWhenRouteIsRetired() async throws {
         let admission = TorNetworkAdmission(enabled: false)
         let state = State()
@@ -173,7 +178,7 @@ final class MigrationOHTTPSubmissionTests: ZcashTestCase {
                 if expired {
                     await cache.store(
                         OHTTPVerifiedKey(bytes: Data(repeating: 1, count: 33), notAfter: 1, isTestnet: true),
-                        for: "\(route.relayURL)|\(route.gatewayHost)|\(viaTor ? "tor" : "direct")"
+                        for: OHTTPTransport.keyCacheKey(relayURL: route.relayURL, gatewayHost: route.gatewayHost, viaTor: viaTor)
                     )
                 }
                 let operation = OHTTPHealthOperation()

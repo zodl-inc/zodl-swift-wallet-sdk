@@ -6,6 +6,11 @@ import XCTest
 final class LegacyPrivateRetryRoutingTests: ZcashTestCase {
     private let txId = Data(repeating: 0x51, count: 32)
 
+    override func setUp() {
+        super.setUp()
+        OHTTPTestSupport.installExampleConfiguration()
+    }
+
     func testInitialCustomBudgetReachesLegacyHeightAndSend() async throws {
         let endpoint = LightWalletEndpoint(address: "public.example.com", port: 443, singleCallTimeoutInMillis: 750)
         let fixture = try await ClassicProcessorCleanupFixture.make(storageDirectory: testTempDirectory, endpoint: endpoint)
