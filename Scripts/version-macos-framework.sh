@@ -12,6 +12,9 @@
 #    since the platform does not use shallow bundles".
 # This rewrites the macOS slice into Versions/A/... with the proper symlinks and a
 # correct macOS Info.plist (FMWK / MacOSX / LSMinimumSystemVersion). Idempotent.
+# BuildSupport/Makefile runs it on every macOS framework it assembles, so release
+# products (`ffi-all`, `ffi-macos`, `ffi-ci`) carry the versioned layout too, and
+# `make configure-local-ffi` runs it only on products built before that change.
 #
 # Usage:
 #   ./Scripts/version-macos-framework.sh <path/to/libzcashlc.framework>
@@ -20,6 +23,9 @@
 set -euo pipefail
 
 NAME="libzcashlc"
+# The version source is located relative to this script, not the working directory:
+# the Makefile runs it from BuildSupport/ while other callers run it from the root.
+PLATFORM_PLIST="$(dirname "${BASH_SOURCE[0]}")/../BuildSupport/platform-Info.plist"
 DEFAULT_FW="LocalPackages/libzcashlc.xcframework/macos-arm64/${NAME}.framework"
 FW="${1:-$DEFAULT_FW}"
 
@@ -34,6 +40,22 @@ if [[ -d "$FW/Versions/A" ]]; then
     exit 0
 fi
 
+# Read both versions before changing anything, so a missing or incomplete plist
+# fails with the framework untouched. There is deliberately no fallback value: a
+# made-up version in a shipped bundle is worse than a failed build.
+if [[ ! -f "$PLATFORM_PLIST" ]]; then
+    echo "error: version source not found: $PLATFORM_PLIST" >&2
+    exit 1
+fi
+SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLATFORM_PLIST") || {
+    echo "error: CFBundleShortVersionString missing from $PLATFORM_PLIST" >&2
+    exit 1
+}
+BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLATFORM_PLIST") || {
+    echo "error: CFBundleVersion missing from $PLATFORM_PLIST" >&2
+    exit 1
+}
+
 echo "version-macos-framework: converting $FW to versioned layout"
 
 mkdir -p "$FW/Versions/A/Resources"
@@ -44,10 +66,8 @@ mkdir -p "$FW/Versions/A/Resources"
 [[ -d "$FW/Modules" ]] && mv "$FW/Modules" "$FW/Versions/A/Modules"
 
 # Drop the shallow (iOS) Info.plist and write the correct macOS one into Resources.
-# The bundle version comes from BuildSupport/platform-Info.plist (the single source
-# the Makefile stamps into every slice) so a future bump cannot drift; the fallback
-# only covers running against a framework outside a repo checkout.
-BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "BuildSupport/platform-Info.plist" 2>/dev/null || echo "0.8.1")
+# The versions were read from BuildSupport/platform-Info.plist above (the single
+# source the Makefile stamps into every slice) so a future bump cannot drift.
 rm -f "$FW/Info.plist"
 cat > "$FW/Versions/A/Resources/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,7 +87,7 @@ cat > "$FW/Versions/A/Resources/Info.plist" <<PLIST
 	<key>CFBundleVersion</key>
 	<string>${BUNDLE_VERSION}</string>
 	<key>CFBundleShortVersionString</key>
-	<string>${BUNDLE_VERSION}</string>
+	<string>${SHORT_VERSION}</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>

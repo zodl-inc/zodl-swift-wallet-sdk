@@ -244,8 +244,28 @@ class LayoutTests(unittest.TestCase):
             self.assertEqual(os.readlink(framework / name), target)
 
 
+def walk_without_following_links(root):
+    for directory, names, files in os.walk(root, followlinks=False):
+        for name in names + files:
+            yield Path(directory) / name
+
+
 class MakePackagingTests(unittest.TestCase):
     setUp = LayoutTests.setUp
+    walk = staticmethod(walk_without_following_links)
+
+    def assert_versioned_macos(self, product, version):
+        framework = product / 'macos-arm64/libzcashlc.framework'
+        self.assertEqual({p.name for p in framework.iterdir()},
+                         {'Versions', 'libzcashlc', 'Headers', 'Modules', 'Resources'})
+        for link, target in MACOS_LINKS.items():
+            self.assertTrue((framework / link).is_symlink(), link)
+            self.assertEqual(os.readlink(framework / link), target)
+        self.assertEqual((framework / 'Versions/A/libzcashlc').read_text(), 'arm64')
+        self.assertFalse((framework / 'Info.plist').exists())
+        info = plistlib.loads((framework / 'Versions/A/Resources/Info.plist').read_bytes())
+        self.assertEqual(info['CFBundleShortVersionString'], version)
+
     def test_real_packaging_excludes_stale_intel_inputs_and_replaces_old_product(self):
         source = self.base / 'source'
         support = source / 'BuildSupport'
@@ -253,6 +273,8 @@ class MakePackagingTests(unittest.TestCase):
         (source / 'Scripts/lib').mkdir(parents=True)
         if HELPER.exists():
             shutil.copy(HELPER, source / 'Scripts/lib/ffi_layout.py')
+        versioner = source / 'Scripts/version-macos-framework.sh'
+        shutil.copy(ROOT / 'Scripts/version-macos-framework.sh', versioner)
         (source / 'Cargo.toml').write_text('fixture')
         (source / 'rust').mkdir()
         (source / 'target/Headers').mkdir(parents=True)
@@ -284,12 +306,107 @@ else:
         self.assertEqual(set(p.name for p in product.iterdir()), set(SLICES) | {'Info.plist'})
         for identifier in SLICES:
             self.assertEqual((product / identifier / 'libzcashlc.framework/libzcashlc').read_text(), 'arm64')
+        platform = plistlib.loads((support / 'platform-Info.plist').read_bytes())
+        self.assert_versioned_macos(product, platform['CFBundleShortVersionString'])
+        for identifier in ('ios-arm64', 'ios-arm64-simulator'):
+            framework = product / identifier / 'libzcashlc.framework'
+            self.assertTrue((framework / 'Info.plist').is_file())
+            self.assertEqual([p for p in self.walk(framework) if p.is_symlink()], [])
         shutil.copy(ROOT / 'Makefile', source / 'Makefile')
         result = subprocess.run(['make', '-C', str(source), 'ffi-macos'], env=self.env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(set(p.name for p in product.iterdir()), {'macos-arm64', 'Info.plist'})
         info = plistlib.loads((product / 'Info.plist').read_bytes())
         self.assertEqual([i['LibraryIdentifier'] for i in info['AvailableLibraries']], ['macos-arm64'])
+        self.assert_versioned_macos(product, platform['CFBundleShortVersionString'])
+
+    def test_release_packaging_refuses_a_shallow_macos_slice(self):
+        source = self.base / 'source'
+        support = source / 'BuildSupport'
+        shutil.copytree(ROOT / 'BuildSupport', support, ignore=shutil.ignore_patterns('products'))
+        (source / 'Scripts/lib').mkdir(parents=True)
+        shutil.copy(HELPER, source / 'Scripts/lib/ffi_layout.py')
+        # A versioner that succeeds without converting anything must not yield a release.
+        versioner = source / 'Scripts/version-macos-framework.sh'
+        versioner.write_text('#!/bin/sh\nexit 0\n')
+        versioner.chmod(0o755)
+        (source / 'Cargo.toml').write_text('fixture')
+        (source / 'rust').mkdir()
+        (source / 'target/Headers').mkdir(parents=True)
+        (source / 'target/Headers/zcashlc.h').write_text('void fixture(void);')
+        for arch in ('aarch64-apple-darwin', 'aarch64-apple-ios', 'aarch64-apple-ios-sim'):
+            archive = source / 'target' / arch / 'release/libzcashlc.a'
+            archive.parent.mkdir(parents=True)
+            archive.write_text('arm64')
+        (self.tools / 'cargo').write_text('#!/bin/sh\nexit 0\n')
+        (self.tools / 'cargo').chmod(0o755)
+        (self.tools / 'lipo').write_text('''#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+if args[0] == '-archs':
+    print(pathlib.Path(args[1]).read_text())
+else:
+    output = args.index('-output')
+    pathlib.Path(args[output + 1]).write_text(pathlib.Path(args[1]).read_text())
+''')
+        result = subprocess.run(['make', '-C', str(support), 'xcframework'], env=self.env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class VersionerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name) / 'repo'
+        (self.repo / 'Scripts').mkdir(parents=True)
+        (self.repo / 'BuildSupport').mkdir()
+        shutil.copy(ROOT / 'Scripts/version-macos-framework.sh', self.repo / 'Scripts')
+        self.platform = self.repo / 'BuildSupport/platform-Info.plist'
+        self.platform.write_bytes(plistlib.dumps({
+            'CFBundleIdentifier': 'libzcashlc', 'CFBundleExecutable': 'libzcashlc',
+            'CFBundleShortVersionString': '9.8.7', 'CFBundleVersion': '42'}))
+        self.framework = self.base_framework()
+
+    def base_framework(self):
+        framework = Path(self.temp.name) / 'libzcashlc.framework'
+        (framework / 'Headers').mkdir(parents=True)
+        (framework / 'Modules').mkdir()
+        (framework / 'libzcashlc').write_text('arm64')
+        (framework / 'Headers/zcashlc.h').write_text('void fixture(void);')
+        (framework / 'Modules/module.modulemap').write_text('module libzcashlc {}')
+        (framework / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'libzcashlc'}))
+        return framework
+
+    def run_versioner(self):
+        return subprocess.run(['../Scripts/version-macos-framework.sh', str(self.framework)],
+                              cwd=self.repo / 'BuildSupport', text=True, capture_output=True)
+
+    def test_versions_come_from_the_plist_beside_the_script_from_any_directory(self):
+        result = self.run_versioner()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        info = plistlib.loads((self.framework / 'Versions/A/Resources/Info.plist').read_bytes())
+        self.assertEqual(info['CFBundleShortVersionString'], '9.8.7')
+        self.assertEqual(info['CFBundleVersion'], '42')
+        self.assertFalse((self.framework / 'Info.plist').exists())
+
+    def test_missing_platform_plist_fails_before_touching_the_framework(self):
+        self.platform.unlink()
+        before = self.snapshot()
+        result = self.run_versioner()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_platform_plist_without_a_version_key_fails_before_touching_the_framework(self):
+        self.platform.write_bytes(plistlib.dumps({'CFBundleVersion': '42'}))
+        before = self.snapshot()
+        result = self.run_versioner()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.framework)): (os.readlink(p) if p.is_symlink() else
+                                                    None if p.is_dir() else p.read_bytes())
+                for p in walk_without_following_links(self.framework)}
 
 
 class ConfigureLocalFFITests(unittest.TestCase):
@@ -367,6 +484,17 @@ class ConfigureLocalFFITests(unittest.TestCase):
                 self.assertEqual({p.name for p in self.install.iterdir()}, set(identifiers) | {'Info.plist'})
                 self.assertEqual((self.local / 'Package.swift').read_text(), 'new wrapper')
                 self.assertEqual((self.install / 'macos-arm64/libzcashlc.framework/libzcashlc').read_text(), 'arm64')
+
+    def test_versioned_product_installs_with_identical_payload(self):
+        self.fixture()
+        framework = LayoutTests.version_macos(self)
+        result = self.configure()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installed = self.install / 'macos-arm64/libzcashlc.framework'
+        for link, target in MACOS_LINKS.items():
+            self.assertEqual(os.readlink(installed / link), target)
+        self.assertEqual((installed / 'Versions/A/libzcashlc').read_bytes(),
+                         (framework / 'Versions/A/libzcashlc').read_bytes())
 
     def test_versioning_failure_preserves_both_installed_paths(self):
         self.fixture()

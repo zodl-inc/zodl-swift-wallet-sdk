@@ -31,6 +31,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
   `rustProposeTransfer` or `rustProposeTransferFromURI`.
 
+## Fixed
+
+- The macOS slice of the released `libzcashlc.xcframework` is now a versioned framework bundle
+  (`Versions/A` with `Versions/Current` and top-level symlinks). The release archive keeps those
+  links. macOS apps that embed the binary SDK no longer fail Xcode's Validate step with "contains
+  Info.plist, expected Versions/Current/Resources/Info.plist". The iOS slices are unchanged.
+
 # 8.0.0 - 2026-11-06
 
 ## Added
