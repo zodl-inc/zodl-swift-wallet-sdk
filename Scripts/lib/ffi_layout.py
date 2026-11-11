@@ -18,6 +18,16 @@ SLICES = {
     "macos-arm64": ("macos", None),
 }
 
+# The only links a versioned macOS framework may contain, relative to the
+# framework root. Everything else must be a real file or directory.
+MACOS_LINKS = {
+    "Versions/Current": "A",
+    "libzcashlc": "Versions/Current/libzcashlc",
+    "Headers": "Versions/Current/Headers",
+    "Modules": "Versions/Current/Modules",
+    "Resources": "Versions/Current/Resources",
+}
+
 
 class LayoutError(ValueError):
     """The bundle cannot be used as an ARM64 local or release product."""
@@ -48,21 +58,28 @@ def read_plist(path):
         raise LayoutError("missing or malformed plist: " + str(path)) from error
 
 
-def validate_framework(framework, allow_versioned):
-    """Allow only the local macOS links emitted by version-macos-framework.sh."""
+def validate_framework(framework, allow_versioned, require_versioned=False):
+    """Allow only the macOS links emitted by version-macos-framework.sh."""
     if framework.is_symlink() or not framework.is_dir():
         raise LayoutError("framework must be a real directory")
     versioned = (framework / "Versions").exists()
     links = {}
     if versioned:
         if not allow_versioned:
-            raise LayoutError("versioned macOS framework requires explicit opt-in")
-        links = {"Versions/Current": "A"}
-        links.update({name: "Versions/Current/" + name for name in ("libzcashlc", "Headers", "Modules", "Resources")})
+            raise LayoutError("only the macOS slice may be a versioned framework")
+        links = MACOS_LINKS
+        # A stray root plist or extra entry would make the bundle ambiguous to
+        # codesign and to Xcode's validation, so the top level is exact.
+        if {p.name for p in framework.iterdir()} != {"Versions", "libzcashlc", "Headers", "Modules", "Resources"}:
+            raise LayoutError("unexpected top-level entries in versioned macOS framework")
+        if (framework / "Versions/A").is_symlink() or not (framework / "Versions/A").is_dir():
+            raise LayoutError("Versions/A must be a real directory")
         for name, target in links.items():
             path = framework / name
             if not path.is_symlink() or os.readlink(path) != target:
                 raise LayoutError("unexpected versioned macOS link: " + name)
+    elif require_versioned:
+        raise LayoutError("macOS framework must be versioned")
     for path in framework.rglob("*"):
         if path.is_symlink():
             relative = str(path.relative_to(framework))
@@ -87,7 +104,7 @@ def validate_framework(framework, allow_versioned):
         raise LayoutError("actual binary architectures must be exactly arm64")
 
 
-def validate(root, require_full=False, allow_versioned_macos=False):
+def validate(root, require_full=False, require_versioned_macos=False):
     """Verify metadata, physical slice inventory, required files and binary archs."""
     if root.is_symlink() or not root.is_dir():
         raise LayoutError("XCFramework must be a real directory")
@@ -117,7 +134,8 @@ def validate(root, require_full=False, allow_versioned_macos=False):
         directory = root / identifier
         if directory.is_symlink() or {p.name for p in directory.iterdir()} != {"libzcashlc.framework"}:
             raise LayoutError("unexpected slice contents")
-        validate_framework(directory / "libzcashlc.framework", allow_versioned_macos and identifier == "macos-arm64")
+        is_macos = identifier == "macos-arm64"
+        validate_framework(directory / "libzcashlc.framework", is_macos, require_versioned_macos and is_macos)
     return identifiers
 
 
@@ -135,15 +153,17 @@ def install(root, wrapper, destination):
         shutil.copytree(root, staged_framework, symlinks=True)
         shutil.copy2(wrapper, staged_wrapper)
         validate(staged_framework)
-        # Release products stay shallow. Convert only the staged local copy,
-        # so a failed conversion leaves the installed framework untouched.
+        # Release products now arrive with a versioned macOS framework. The
+        # versioner is idempotent and still converts shallow input such as an
+        # old cached release. Convert only the staged local copy, so a failed
+        # conversion leaves the installed framework untouched.
         macos = staged_framework / "macos-arm64/libzcashlc.framework"
         if macos.is_dir():
             versioner = Path(__file__).resolve().parents[1] / "version-macos-framework.sh"
             result = subprocess.run(["bash", str(versioner), str(macos)], check=False)
             if result.returncode:
                 raise LayoutError("could not version the staged macOS framework")
-        validate(staged_framework, allow_versioned_macos=True)
+        validate(staged_framework)
         replacements = [(staged_framework, destination / root.name),
                         (staged_wrapper, destination / "Package.swift")]
         try:
@@ -181,7 +201,7 @@ def main(argv=None):
     check = operations.add_parser("validate")
     check.add_argument("root", type=Path)
     check.add_argument("--require-full", action="store_true")
-    check.add_argument("--allow-versioned-macos", action="store_true")
+    check.add_argument("--require-versioned-macos", action="store_true")
     local = operations.add_parser("install")
     local.add_argument("root", type=Path)
     local.add_argument("wrapper", type=Path)
@@ -193,7 +213,7 @@ def main(argv=None):
         elif args.operation == "install":
             install(args.root, args.wrapper, args.destination)
         else:
-            validate(args.root, args.require_full, args.allow_versioned_macos)
+            validate(args.root, args.require_full, args.require_versioned_macos)
     except (LayoutError, OSError, RuntimeError) as error:
         print("ffi-layout: " + str(error), file=sys.stderr)
         return 1

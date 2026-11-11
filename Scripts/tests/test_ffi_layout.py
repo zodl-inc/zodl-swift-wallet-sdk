@@ -136,25 +136,63 @@ class LayoutTests(unittest.TestCase):
         (framework / 'Versions/Current').symlink_to('A')
         return framework
 
-    def test_versioned_macos_requires_opt_in_and_stays_local(self):
+    def test_versioned_macos_is_accepted_without_opt_in(self):
+        self.fixture(('macos-arm64',))
+        self.version_macos()
+        result = self.cli('validate', self.product)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_require_versioned_macos_rejects_shallow_macos_only(self):
+        self.fixture()
+        flags = ('--require-full', '--require-versioned-macos')
+        self.assertNotEqual(self.cli('validate', self.product, *flags).returncode, 0)
+        self.version_macos()
+        result = self.cli('validate', self.product, *flags)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_require_versioned_macos_does_not_require_a_macos_slice(self):
+        self.fixture(('ios-arm64',))
+        result = self.cli('validate', self.product, '--require-versioned-macos')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_versioned_macos_with_root_plist_or_extra_entries_is_rejected(self):
         self.fixture(('macos-arm64',))
         framework = self.version_macos()
+        plist = framework / 'Info.plist'
+        plist.write_bytes(plistlib.dumps({'CFBundleExecutable': 'libzcashlc'}))
         self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
-        result = self.cli('validate', self.product, '--allow-versioned-macos')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        plist.unlink()
+        extra = framework / 'extra'
+        extra.write_text('x')
+        self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
+        extra.unlink()
+        evil = framework / 'Versions/A/evil'
+        evil.symlink_to('A')
+        self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
+        evil.unlink()
+        resource_plist = framework / 'Versions/A/Resources/Info.plist'
+        content = resource_plist.read_bytes()
+        resource_plist.unlink()
+        self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
+        resource_plist.write_bytes(content)
+        self.assertEqual(self.cli('validate', self.product).returncode, 0)
+
+    def test_versioned_macos_with_bad_link_targets_is_rejected(self):
+        self.fixture(('macos-arm64',))
+        framework = self.version_macos()
         for target in ('../../../../outside', str(framework / 'Versions/A/Headers'), 'Versions/Current/libzcashlc'):
             path = framework / 'Headers'
             path.unlink()
             path.symlink_to(target)
-            self.assertNotEqual(self.cli('validate', self.product, '--allow-versioned-macos').returncode, 0)
+            self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
 
-    def test_ios_links_and_symlinked_slice_are_rejected_with_opt_in(self):
+    def test_ios_links_and_symlinked_slice_are_rejected(self):
         self.fixture()
         path = self.product / 'ios-arm64/libzcashlc.framework/Headers/zcashlc.h'
         outside = self.base / 'header'
         path.rename(outside)
         path.symlink_to(outside)
-        self.assertNotEqual(self.cli('validate', self.product, '--allow-versioned-macos').returncode, 0)
+        self.assertNotEqual(self.cli('validate', self.product).returncode, 0)
 
 
 class MakePackagingTests(unittest.TestCase):

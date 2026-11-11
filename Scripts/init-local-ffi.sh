@@ -143,7 +143,7 @@ python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" "${VALIDATION[@]}"
 if [[ -d "$STAGED_XCFW/macos-arm64" ]]; then
     ./Scripts/version-macos-framework.sh "$STAGED_XCFW/macos-arm64/libzcashlc.framework"
 fi
-python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" --allow-versioned-macos "${VALIDATION[@]}"
+python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" "${VALIDATION[@]}"
 cp BuildSupport/LocalPackages-Package.swift "$STAGE/Package.swift"
 
 # Same-filesystem renames with rollback keep the installed bundle and wrapper

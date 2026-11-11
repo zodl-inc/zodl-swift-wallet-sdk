@@ -142,7 +142,7 @@ shutil.copyfile(os.environ['ARCHIVE'], dest / 'libzcashlc.xcframework.zip')
                 if args:
                     cargo_calls = {line for line in self.log.read_text().splitlines() if line.startswith('cargo ')}
                     self.assertEqual(cargo_calls, {'cargo build --locked --target ' + expected_triples[identifier] + ' --release' for identifier in expected})
-                self.require_ok(subprocess.run([sys.executable, str(self.repo / 'Scripts/lib/ffi_layout.py'), 'validate', str(self.install), '--allow-versioned-macos'], env=self.env, text=True, capture_output=True))
+                self.require_ok(subprocess.run([sys.executable, str(self.repo / 'Scripts/lib/ffi_layout.py'), 'validate', str(self.install)], env=self.env, text=True, capture_output=True))
                 if 'macos-arm64' in expected:
                     self.assertTrue((self.install / 'macos-arm64/libzcashlc.framework/Versions/Current').is_symlink())
 
