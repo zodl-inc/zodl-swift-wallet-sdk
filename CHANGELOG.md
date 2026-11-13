@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 8.1.0 - 2026-11-13
+
 ## Changed
 
 - Every outer OHTTP request (the sealed POST and the key configuration fetch) now carries the fixed
