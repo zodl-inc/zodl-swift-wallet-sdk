@@ -8,6 +8,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- Every outer OHTTP request (the sealed POST and the key configuration fetch) now carries the fixed
+  `User-Agent: zodl-ohttp/1`, set on each request after the profile headers, so the OHTTP relays
+  cannot tell clients apart by app version or OS. It was `zodl-ohttp/1.0`. The `user-agent` of the
+  inner, encrypted gRPC request is now the same `zodl-ohttp/1` (was `zodl-ohttp-swift/1.0`), so it
+  no longer differs per platform either. Other inner request headers are unchanged.
 - `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
   `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
   An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.

@@ -118,7 +118,7 @@ final class OHTTPStreamingTests: XCTestCase {
         XCTAssertEqual(posts.count, 1)
         XCTAssertEqual(posts.first?.httpMethod, "POST")
         XCTAssertEqual(posts.first?.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-chunked-req")
-        XCTAssertEqual(posts.first?.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1.0")
+        XCTAssertEqual(posts.first?.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1")
     }
 
     func testABodyThatBreaksOffFails() async throws {

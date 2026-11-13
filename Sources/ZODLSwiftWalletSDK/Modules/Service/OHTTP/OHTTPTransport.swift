@@ -286,6 +286,13 @@ final class RotatingSession: Sendable {
     }
 }
 
+/// The headers every outer request to a relay carries.
+enum OHTTPRelayHeaders {
+    /// Identical on every platform and build, so that a relay cannot tell clients apart by app version or OS.
+    /// Set on each request: a session-level header would not replace URLSession's own.
+    static let userAgent = "zodl-ohttp/1"
+}
+
 actor OHTTPTransport {
     /// Pluggable HTTP sender for the relay POST (and the key-config GET).
     /// Device → Tor → relay when Tor is enabled; device → relay otherwise.
@@ -336,7 +343,7 @@ actor OHTTPTransport {
     /// Fixed relay-facing `User-Agent` and `Accept-Language`, so URLSession does not add the app's name
     /// and build, the CFNetwork and Darwin versions, or the device locale.
     internal static let fixedRelayHeaders: [(name: String, value: String)] = [
-        ("User-Agent", "zodl-ohttp/1.0"),
+        ("User-Agent", OHTTPRelayHeaders.userAgent),
         ("Accept-Language", "en")
     ]
 
@@ -706,10 +713,10 @@ actor OHTTPTransport {
 
         var request = URLRequest(url: urlObj, timeoutInterval: TimeInterval(timeoutMS) / 1000.0)
         request.httpMethod = "GET"
-        for (name, value) in Self.fixedRelayHeaders {
+        for (name, value) in profile.keyFetchHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
-        for (name, value) in profile.keyFetchHeaders {
+        for (name, value) in Self.fixedRelayHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
 
@@ -757,11 +764,11 @@ actor OHTTPTransport {
         request.httpMethod = "POST"
         request.httpBody = body
 
-        for (name, value) in Self.fixedRelayHeaders {
+        for (name, value) in profile.postHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
 
-        for (name, value) in profile.postHeaders {
+        for (name, value) in Self.fixedRelayHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
 
