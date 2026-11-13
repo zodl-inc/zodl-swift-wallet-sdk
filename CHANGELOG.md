@@ -150,6 +150,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the round and the ids of every claim transaction sent so far. This version redeems in one
   transaction and does not throw them yet. An exhaustive `switch` over either type stops compiling
   until the new cases are handled.
+- The documentation of the rejection verdict (`Broadcaster.resubmitUnacceptedTransactions`,
+  `TransactionSubmissionStatus.rejected`, the submit-plan store) states the rule as implemented: a
+  transaction is rejected only when every endpoint of its plan answered explicitly, none accepted
+  it and every refusal was for good. The tests derive the ZIP 317 minimum fee from librustzcash
+  instead of restating a literal, and pin that a transaction of up to two logical actions costs two
+  marginal fees. No behavior changes.
 
 # 8.0.0 - 2026-11-06
 

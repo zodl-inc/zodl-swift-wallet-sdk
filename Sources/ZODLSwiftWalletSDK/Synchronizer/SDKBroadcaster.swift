@@ -132,7 +132,7 @@ final class SDKBroadcaster: Broadcaster {
 
         case .rejected, .unreachable:
             // Every endpoint's submission ended and none took it. When every endpoint answered
-            // explicitly, a node that refused it for good makes it rejected, and background
+            // explicitly, none accepted it and every refusal was for good, it is rejected, and background
             // resubmission stops: it could only repeat the refusal until the transaction expires.
             // A transport failure is not an answer (the reply may be all that was lost), so beside
             // one the transaction stays pending and resubmission reconciles it.

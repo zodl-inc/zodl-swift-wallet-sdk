@@ -18,8 +18,8 @@ enum StoredSubmitPlan: Equatable {
     /// does not end retrying: an accepted transaction is still resubmitted
     /// until it is mined, because a mempool is not a commitment.
     case ready([LightWalletEndpoint], acceptedBy: String?)
-    /// A node the transaction was submitted to refused it for good (see `SubmitRejection`) and
-    /// none accepted it. Resubmission must skip it: the same transaction
+    /// Every endpoint of the plan answered explicitly, none accepted the transaction and every
+    /// refusal was for good (see `SubmitRejection`). Resubmission must skip it: the same transaction
     /// cannot succeed, and retrying would only repeat the refusal until it expires. `code` and
     /// `reason` are the recorded terminal refusal's (see `submitRejectionVerdict`).
     case rejected(code: Int, reason: String)
@@ -89,7 +89,7 @@ protocol SubmitPlanStoring {
     /// Dropped — logged, not thrown — when `lifecycle` belongs to an epoch the store has since
     /// wiped: see `currentLifecycle()`.
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async
-    /// Records that a node refused the transaction for good and none accepted it (see
+    /// Records that every endpoint answered explicitly, none accepted the transaction and every refusal was for good (see
     /// `submitRejectionVerdict`), with the recorded refusal's `code` and `reason`. Creates the row when the transaction has no plan yet, as
     /// `markAccepted` does. Ignored for a transaction a server has accepted, and dropped — logged,
     /// not thrown — when `lifecycle` belongs to an epoch the store has since wiped.
@@ -258,7 +258,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
             let row = table.filter(txIdColumn == Blob(bytes: txId.bytes))
             // An accepted transaction is in a mempool already, and one with no servers is still awaiting the
             // host's submission: neither is stuck, so neither changes. Nor does one recorded as rejected (as
-            // `plan(for:)` reads it: never a migration transaction): a node refused it for good, and sending it
+            // `plan(for:)` reads it: never a migration transaction): it was refused by every endpoint for good, and sending it
             // again could only repeat that refusal.
             guard
                 let stored = try connection.pluck(row),

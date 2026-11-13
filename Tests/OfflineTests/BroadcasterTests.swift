@@ -1364,6 +1364,30 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
     }
 
+    /// The recorded rejection is persisted: a store reopened over the same file reads it back, and a
+    /// later transient answer (which draws no verdict) leaves it standing.
+    func testARecordedRejectionSurvivesARestartAndALaterTransientAnswerKeepsIt() async throws {
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? rejecting.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
+        let databaseURL = submitPlanDatabaseURL(for: synchronizer)
+
+        let reopened = SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        let plan = await reopened.plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+
+        let stored = StoredRejection(code: -26, reason: "bad-txns-vout-negative")
+        let transient = submitRejectionVerdict(
+            planEndpoints: [rejecting.endpoint],
+            outcomes: [endpointKey(rejecting.endpoint): .failed],
+            previous: stored
+        )
+        XCTAssertEqual(transient, stored)
+    }
+
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {
         let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }
