@@ -150,8 +150,10 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
-# 0.5.0 takes the OHTTP configuration at runtime.
-slipstream-core = { version = "=0.5.0", package = "zodl-slipstream" }
+# 0.6.0 sends the fixed OHTTP User-Agent that every Zodl client sends. It is taken
+# from the public repository's release tag until it is published to crates.io;
+# `version` makes cargo confirm that the tag still holds 0.6.0.
+slipstream-core = { git = "https://github.com/zodl-inc/slipstream", tag = "zodl_slipstream-0.6.0", version = "=0.6.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
 hex = "0.4"
