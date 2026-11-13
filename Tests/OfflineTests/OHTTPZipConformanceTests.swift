@@ -117,9 +117,35 @@ final class OHTTPZipConformanceTests: XCTestCase {
         let requests = recorder.gets + recorder.posts
         XCTAssertFalse(recorder.posts.isEmpty)
         for sent in requests {
-            XCTAssertEqual(sent.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1.0")
+            XCTAssertEqual(sent.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1")
             XCTAssertEqual(sent.value(forHTTPHeaderField: "Accept-Language"), "en")
             XCTAssertNil(sent.value(forHTTPHeaderField: "Cookie"))
+        }
+    }
+
+    func testRelayUserAgentIsOneFixedValueAndInnerHeadersStayInside() async throws {
+        let recorder = Recorder()
+        let transport = makeTransport(recorder: recorder, cache: OHTTPKeyCache())
+        let inner = OHTTPRequest(
+            method: "POST",
+            scheme: "https",
+            authority: OHTTPTestSupport.testnetHost,
+            path: "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            headers: [("user-agent", "inner-agent/9")],
+            body: Data([0x00])
+        )
+
+        _ = try? await transport.roundTrip(request: inner, timeoutMS: 5000)
+
+        XCTAssertEqual(OHTTPRelayHeaders.userAgent, "zodl-ohttp/1")
+        XCTAssertEqual(OHTTPGRPCClient.userAgent, "zodl-ohttp/1", "the inner gRPC user-agent is the same on every platform")
+        XCTAssertFalse(recorder.gets.isEmpty)
+        XCTAssertFalse(recorder.posts.isEmpty)
+        for sent in recorder.gets + recorder.posts {
+            XCTAssertEqual(sent.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1")
+            let userAgents = (sent.allHTTPHeaderFields ?? [:]).filter { $0.key.lowercased() == "user-agent" }
+            XCTAssertEqual(userAgents.count, 1)
+            XCTAssertFalse(String(data: sent.httpBody ?? Data(), encoding: .utf8)?.contains("inner-agent") ?? false)
         }
     }
 
