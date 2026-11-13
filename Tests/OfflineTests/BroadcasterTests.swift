@@ -1364,28 +1364,38 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
     }
 
-    /// The recorded rejection is persisted: a store reopened over the same file reads it back, and a
-    /// later transient answer (which draws no verdict) leaves it standing.
-    func testARecordedRejectionSurvivesARestartAndALaterTransientAnswerKeepsIt() async throws {
-        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
-        defer { try? rejecting.stop() }
-        let synchronizer = try makeSubmittingSynchronizer()
+    /// A rejection is persisted, and after a restart a submission to a new endpoint that refuses in a
+    /// way that may be transient draws no new verdict and does not clear the stored one.
+    func testARejectionSurvivesARestartAndANewEndpointsTransientRefusalKeepsIt() async throws {
+        let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? terminal.stop() }
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let first = try makeSubmittingSynchronizer()
         let transaction = makeCreatedTransaction()
 
-        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
-        let databaseURL = submitPlanDatabaseURL(for: synchronizer)
+        _ = await first.broadcaster.submit(transaction: transaction, to: [terminal.endpoint])
+        let rejected = await first.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(rejected, TransactionSubmissionStatus.rejected(.invalid))
+        let databaseURL = submitPlanDatabaseURL(for: first)
 
-        let reopened = SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
-        let plan = await reopened.plan(for: transaction.txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+        // A restart: a fresh store over the same file.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in
+            SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        }
+        let second = try makeSubmittingSynchronizer()
+        let afterRestart = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(afterRestart, TransactionSubmissionStatus.rejected(.invalid))
 
-        let stored = StoredRejection(code: -26, reason: "bad-txns-vout-negative")
-        let transient = submitRejectionVerdict(
-            planEndpoints: [rejecting.endpoint],
-            outcomes: [endpointKey(rejecting.endpoint): .failed],
-            previous: stored
+        _ = await second.broadcaster.submit(transaction: transaction, to: [transient.endpoint])
+        let kept = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(kept, TransactionSubmissionStatus.rejected(.invalid), "a transient answer keeps the stored rejection")
+        let plan = await SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger()).plan(for: transaction.txId)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"),
+            "the stored refusal is neither replaced by the transient one nor cleared"
         )
-        XCTAssertEqual(transient, stored)
     }
 
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {

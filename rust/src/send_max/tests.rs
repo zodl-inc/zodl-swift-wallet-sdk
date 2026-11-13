@@ -261,7 +261,7 @@ fn a_balance_that_does_not_exceed_the_fee_is_insufficient_funds() {
             required: Zatoshis::const_from_u64(minimum_fee() + 1),
         })
     );
-    assert_redacted(&e, &["9000", "10001"]);
+    assert_redacted(&e, &["9000", &(minimum_fee() + 1).to_string()]);
 }
 
 #[test]

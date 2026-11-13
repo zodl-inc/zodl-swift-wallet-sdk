@@ -144,8 +144,9 @@ public protocol Broadcaster: AnyObject {
     /// (every endpoint of the plan answered explicitly, none accepted and every refusal was for
     /// good). What `endpoint` answers is recorded as a submission's answers
     /// are: an acceptance (including "already in its mempool") marks the transaction accepted, and
-    /// a refusal counts toward the rejection verdict, which needs an explicit answer from
-    /// every endpoint in the transaction's plan. A transaction `endpoint` does not accept, and
+    /// a refusal for good counts toward the rejection verdict, which needs an explicit answer from
+    /// every endpoint in the transaction's plan and no refusal that may be transient (one that
+    /// is keeps the transaction pending). A transaction `endpoint` does not accept, and
     /// that is not thereby rejected, stays with background resubmission like any other.
     ///
     /// Privacy: `endpoint` receives each of these transactions together with the network address

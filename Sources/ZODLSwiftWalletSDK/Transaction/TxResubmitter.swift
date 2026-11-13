@@ -152,7 +152,7 @@ private extension TxResubmitter {
             // Every endpoint answered, none accepted it and every refusal was for good. Retrying cannot succeed; the plan is pruned
             // once the transaction expires, like any other.
             logger.info(
-                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): a node rejected it."
+                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): it is recorded as rejected (every endpoint answered, none accepted it, every refusal was for good)."
             )
 
         case .storeUnavailable:
