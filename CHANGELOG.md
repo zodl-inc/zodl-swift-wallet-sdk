@@ -45,6 +45,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   links. macOS apps that embed the binary SDK no longer fail Xcode's Validate step with "contains
   Info.plist, expected Versions/Current/Resources/Info.plist". The iOS slices are unchanged.
 
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3547500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3567500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4600000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4610000.json
+````
+
 # 8.0.0 - 2026-11-06
 
 ## Added
