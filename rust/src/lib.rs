@@ -9067,6 +9067,17 @@ fn tip_fresh_stop_window<P: Parameters>(network: &P, known_tip: u64) -> std::tim
 /// commit (a few seconds, A10).
 const SLIPSTREAM_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The stack each thread of a handle's runtime gets in an unoptimized build.
+///
+/// A session's first poll runs on one of those threads, from the task down to its first network
+/// dial, without yielding. Unoptimized, the session's async frames give every nested future a
+/// stack slot of its own, and that one poll needs about 2.1 MiB: past the 2 MiB a thread gets by
+/// default, on which a debug build aborts with a stack overflow whenever a session gets as far as
+/// dialling its server. An optimized build needs a few hundred KiB on the same path and keeps the
+/// default, because every thread of the runtime, the blocking pool's included, reserves this much.
+#[cfg(debug_assertions)]
+const UNOPTIMIZED_SLIPSTREAM_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// C-compatible snapshot of Slipstream engine progress. Returned by
 /// [`zcashlc_slipstream_snapshot`] (by value — no heap allocation).
 ///
@@ -9295,11 +9306,11 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             }
         }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow!("tokio runtime: {e}"))?;
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(4).enable_all();
+        #[cfg(debug_assertions)]
+        runtime.thread_stack_size(UNOPTIMIZED_SLIPSTREAM_THREAD_STACK_SIZE);
+        let runtime = runtime.build().map_err(|e| anyhow!("tokio runtime: {e}"))?;
 
         let inner = slipstream_core::ffi_handle::SlipstreamHandle {
             runtime,
@@ -12903,6 +12914,66 @@ mod tor_startup_ffi_tests {
             zcashlc_slipstream_stop(handle);
             zcashlc_slipstream_tor_startup_free_v1(startup);
             zcashlc_slipstream_free(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod slipstream_runtime_stack_tests {
+    use super::*;
+    use std::{
+        net::TcpListener,
+        ptr,
+        time::{Duration, Instant},
+    };
+
+    /// A session started without Tor dials its server in its first poll, which runs on one of the
+    /// handle runtime's threads and reaches the deepest stack the session uses before its first
+    /// await. A connection arriving at the listener proves that thread's stack held it.
+    #[test]
+    fn a_direct_session_dials_its_server_within_the_runtime_thread_stack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (_dir, db) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        let host = b"127.0.0.1";
+        unsafe {
+            let handle = zcashlc_slipstream_open(
+                db.as_ptr(),
+                db.len(),
+                host.as_ptr(),
+                host.len(),
+                port,
+                false,
+                NETWORK_ID_TESTNET,
+                0,
+            );
+            assert!(!handle.is_null());
+            assert!(zcashlc_slipstream_start(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                ptr::null(),
+                0
+            ));
+            // Generous, because a loaded machine may run the session's first poll late.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let dialled = loop {
+                match listener.accept() {
+                    Ok(_) => break true,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break false,
+                }
+            };
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_free(handle);
+            assert!(dialled, "the session never dialled its server");
         }
     }
 }

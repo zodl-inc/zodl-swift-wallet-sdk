@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "8.0.0"
+version = "8.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9066,9 +9066,9 @@ dependencies = [
 
 [[package]]
 name = "zodl-slipstream"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7700a83ee573810520765c99294bba6203eeeccf0f6bad57ff30d51f6e0cbad"
+checksum = "19f31767340f365f2ce32e09607b2eedad5d25738b73ab1d3f220f767b9928cf"
 dependencies = [
  "arti-client",
  "bytes",

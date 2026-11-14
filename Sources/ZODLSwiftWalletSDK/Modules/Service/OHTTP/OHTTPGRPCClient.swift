@@ -18,7 +18,8 @@ actor OHTTPGRPCClient {
     private let logger = os.Logger(subsystem: "ZODLSwiftWalletSDK", category: "OHTTPGRPCClient")
 
     private static let grpcContentType = "application/grpc"
-    private static let userAgent = "zodl-ohttp-swift/1.0"
+    /// Same fixed value as the outer relay header, so the request inside the encryption does not differ per platform.
+    static let userAgent = OHTTPRelayHeaders.userAgent
     private static let frameHeaderSize = 5
     private static let httpOK = 200
     private static let timeoutSlackMS = 5000
