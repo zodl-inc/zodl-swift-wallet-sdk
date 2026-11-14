@@ -3,6 +3,7 @@
 //  ZODLSwiftWalletSDK
 //
 
+import Combine
 import Foundation
 import SQLite
 
@@ -17,6 +18,11 @@ enum StoredSubmitPlan: Equatable {
     /// does not end retrying: an accepted transaction is still resubmitted
     /// until it is mined, because a mempool is not a commitment.
     case ready([LightWalletEndpoint], acceptedBy: String?)
+    /// A node the transaction was submitted to refused it for good (see `SubmitRejection`) and
+    /// none accepted it. Resubmission must skip it: the same transaction
+    /// cannot succeed, and retrying would only repeat the refusal until it expires. `code` and
+    /// `reason` are the recorded terminal refusal's (see `submitRejectionVerdict`).
+    case rejected(code: Int, reason: String)
     /// The store cannot be read, so whether a plan exists is unknown.
     /// Resubmission must skip the transaction: auto-submitting something the
     /// app may never have released is worse than delaying a retry.
@@ -34,6 +40,10 @@ extension StoredSubmitPlan {
         case .ready(_, let acceptedBy):
             guard let acceptedBy else { return .submitted }
             return .accepted(host: acceptedBy)
+        case let .rejected(code, reason):
+            // Only a classified refusal is ever recorded, so the fallback is unreachable in
+            // practice; `invalid` is the conservative reading of an unknown terminal refusal.
+            return .rejected(SubmitRejection(code: code, message: reason) ?? .invalid)
         case .storeUnavailable:
             return nil
         }
@@ -68,16 +78,37 @@ protocol SubmitPlanStoring {
     /// Touches no other plan and never creates a row or the database file.
     ///
     /// - Returns: The lifecycle token for a later `markAccepted(txId:host:lifecycle:)` when the
-    ///   transaction has such a plan; `nil` when it is awaiting submission, accepted, unknown, or
-    ///   the store cannot be read.
+    ///   transaction has such a plan; `nil` when it is awaiting submission, accepted, recorded as
+    ///   rejected, unknown, or the store cannot be read.
     @discardableResult
     func addEndpointToUnacceptedPlan(txId: Data, endpoint: LightWalletEndpoint) async -> SubmitPlanLifecycle?
-    /// Records that `host` (`host:port`) took the transaction into its mempool.
+    /// Records that `host` (`host:port`) took the transaction into its mempool, clearing any
+    /// rejection recorded for it.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
     /// Dropped — logged, not thrown — when `lifecycle` belongs to an epoch the store has since
     /// wiped: see `currentLifecycle()`.
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async
+    /// Records that a node refused the transaction for good and none accepted it (see
+    /// `submitRejectionVerdict`), with the recorded refusal's `code` and `reason`. Creates the row when the transaction has no plan yet, as
+    /// `markAccepted` does. Ignored for a transaction a server has accepted, and dropped — logged,
+    /// not thrown — when `lifecycle` belongs to an epoch the store has since wiped.
+    func markRejected(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) async
+    /// The transactions currently recorded as rejected: emits the current set on subscription and
+    /// again whenever it changes.
+    var rejectedTransactionIds: AnyPublisher<Set<Data>, Never> { get }
+    /// Marks `txId` as an Orchard migration transaction (a preparation, or a sweep a migration
+    /// proposal creates), whose submission keeps main's behaviour: it is never recorded as
+    /// rejected, so background resubmission retries it until it expires. The mark is keyed by the
+    /// transaction id and persisted at once, before the transaction has a plan or even exists (a
+    /// PCZT's id is known from its creation), so it survives a restart and the PCZT's
+    /// serialization; it is also set on the plan's row once the plan is recorded. Pruning a plan
+    /// removes its mark, and so does `clear()` or `wipe()`. Dropped, like `markAwaitingSubmission`,
+    /// when `lifecycle` belongs to an epoch the store has since wiped, so work begun for a deleted
+    /// wallet never recreates its store.
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) async
+    /// Whether `txId` was marked by `markMigrationPreparation(txId:)`.
+    func isMigrationPreparation(txId: Data) async -> Bool
     /// `nil` means the store was read successfully and has no row — a legacy
     /// transaction unknown to this store. Read failures return
     /// `.storeUnavailable`, never `nil`.
@@ -112,11 +143,28 @@ actor SubmitPlanStore: SubmitPlanStoring {
 
     private static let tableName = "tx_submit_plans"
     private static let acceptedHostColumnName = "accepted_host"
+    private static let rejectedCodeColumnName = "rejected_code"
+    private static let rejectedReasonColumnName = "rejected_reason"
+    private static let migrationPreparationColumnName = "migration_preparation"
+    private static let migrationMarksTableName = "tx_migration_marks"
 
     private let table = Table(SubmitPlanStore.tableName)
     private let txIdColumn = SQLite.Expression<Blob>("tx_id")
     private let endpointsColumn = SQLite.Expression<String>("endpoints")
     private let acceptedHostColumn = SQLite.Expression<String?>(SubmitPlanStore.acceptedHostColumnName)
+    private let rejectedCodeColumn = SQLite.Expression<Int64?>(SubmitPlanStore.rejectedCodeColumnName)
+    private let rejectedReasonColumn = SQLite.Expression<String?>(SubmitPlanStore.rejectedReasonColumnName)
+    private let migrationPreparationColumn = SQLite.Expression<Bool?>(SubmitPlanStore.migrationPreparationColumnName)
+    /// The migration marks, keyed by transaction id, independent of any plan row: a row in the
+    /// plans table would change what `plan(for:)` reports for a transaction that has no plan yet.
+    private let migrationMarksTable = Table(SubmitPlanStore.migrationMarksTableName)
+    /// Migration transactions marked in this lifecycle, so the mark holds even when the store
+    /// cannot write it.
+    private var migrationPreparations: Set<Data> = []
+
+    /// The rejected transaction ids, as `rejectedTransactionIds` publishes them. Seeded from the
+    /// database on first subscription, then kept current by every write that can change it.
+    private nonisolated let rejectedSubject = CurrentValueSubject<Set<Data>, Never>([])
 
     init(databaseURL: URL, logger: Logger) {
         self.databaseURL = databaseURL
@@ -171,6 +219,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
             )
             try connection.run(insert)
             try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(endpointsColumn <- json))
+            if isMigrationPreparation(txId: txId) { try flagMigrationPreparation(txId: txId, in: connection) }
         } catch {
             logger.warn("SubmitPlanStore failed to record submit plan: \(error.localizedDescription)")
         }
@@ -208,10 +257,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
         do {
             let row = table.filter(txIdColumn == Blob(bytes: txId.bytes))
             // An accepted transaction is in a mempool already, and one with no servers is still awaiting the
-            // host's submission: neither is stuck, so neither changes.
+            // host's submission: neither is stuck, so neither changes. Nor does one recorded as rejected (as
+            // `plan(for:)` reads it: never a migration transaction): a node refused it for good, and sending it
+            // again could only repeat that refusal.
             guard
                 let stored = try connection.pluck(row),
                 stored[acceptedHostColumn] == nil,
+                stored[rejectedCodeColumn] == nil || stored[migrationPreparationColumn] == true,
                 let data = stored[endpointsColumn].data(using: .utf8),
                 let storedEndpoints = try? JSONDecoder().decode([StoredEndpoint].self, from: data),
                 !storedEndpoints.isEmpty
@@ -248,10 +300,18 @@ actor SubmitPlanStore: SubmitPlanStoring {
                 endpointsColumn <- "[]"
             )
             try connection.run(insert)
-            try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(acceptedHostColumn <- host))
+            // An acceptance clears any earlier rejection: a server holds the transaction now.
+            try connection.run(
+                table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(
+                    acceptedHostColumn <- host,
+                    rejectedCodeColumn <- nil,
+                    rejectedReasonColumn <- nil
+                )
+            )
         } catch {
             logger.warn("SubmitPlanStore failed to record the accepting server for a submit plan: \(error.localizedDescription)")
         }
+        publishRejectedTransactionIds()
     }
 
     func plan(for txId: Data) -> StoredSubmitPlan? {
@@ -274,6 +334,10 @@ actor SubmitPlanStore: SubmitPlanStoring {
             // by a path that only marked the transaction awaiting, has none and
             // keeps the endpoint-driven mapping.
             let acceptedHost = row[acceptedHostColumn]
+
+            if acceptedHost == nil, row[migrationPreparationColumn] != true, let rejectedCode = row[rejectedCodeColumn] {
+                return .rejected(code: Int(rejectedCode), reason: row[rejectedReasonColumn] ?? "")
+            }
 
             let json = row[endpointsColumn]
             guard
@@ -318,19 +382,25 @@ actor SubmitPlanStore: SubmitPlanStoring {
         do {
             for txId in txIds {
                 try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).delete())
+                try connection.run(migrationMarksTable.filter(txIdColumn == Blob(bytes: txId.bytes)).delete())
+                migrationPreparations.remove(txId)
             }
         } catch {
             logger.warn("SubmitPlanStore failed to delete submit plans: \(error)")
         }
+        publishRejectedTransactionIds()
     }
 
     func clear() {
         guard let connection = existingConnection() else { return }
         do {
             try connection.run(table.delete())
+            try connection.run(migrationMarksTable.delete())
+            migrationPreparations = []
         } catch {
             logger.warn("SubmitPlanStore failed to clear submit plans: \(error)")
         }
+        publishRejectedTransactionIds()
     }
 
     func wipe() {
@@ -338,11 +408,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
         // already holding a token from this epoch — a foreground submission whose network race is
         // still in flight — must see the mismatch, however soon after this line it arrives.
         lifecycleGeneration += 1
+        migrationPreparations = []
         // Drop the connection first so the file handle is closed, then remove
         // the file itself: row deletion alone would leave transaction ids and
         // endpoints recoverable from SQLite free pages after a wallet wipe.
         cachedConnection = nil
         connectionFailed = false
+        rejectedSubject.send([])
         guard FileManager.default.fileExists(atPath: databaseURL.path) else { return }
         do {
             try FileManager.default.removeItem(at: databaseURL)
@@ -404,6 +476,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
                 builder.column(txIdColumn, primaryKey: true)
                 builder.column(endpointsColumn, defaultValue: "[]")
                 builder.column(acceptedHostColumn)
+                builder.column(rejectedCodeColumn)
+                builder.column(rejectedReasonColumn)
+                builder.column(migrationPreparationColumn)
+            })
+            // Additive like the columns below: an older SDK build never reads it.
+            try connection.run(migrationMarksTable.create(ifNotExists: true) { builder in
+                builder.column(txIdColumn, primaryKey: true)
             })
             // `accepted_host` is added by presence check instead of by a schema
             // version bump on purpose. A nullable added column is backward
@@ -412,8 +491,19 @@ actor SubmitPlanStore: SubmitPlanStoring {
             // instead trip the newer-schema guard above in every older build on
             // the same device — a TestFlight downgrade or a QA device that
             // alternates builds would lose submit plans entirely.
-            if try !columnNames(of: connection).contains(Self.acceptedHostColumnName) {
+            // The rejection columns are additive in the same way, for the same reason.
+            let columns = try columnNames(of: connection)
+            if !columns.contains(Self.acceptedHostColumnName) {
                 try connection.run(table.addColumn(acceptedHostColumn))
+            }
+            if !columns.contains(Self.rejectedCodeColumnName) {
+                try connection.run(table.addColumn(rejectedCodeColumn))
+            }
+            if !columns.contains(Self.rejectedReasonColumnName) {
+                try connection.run(table.addColumn(rejectedReasonColumn))
+            }
+            if !columns.contains(Self.migrationPreparationColumnName) {
+                try connection.run(table.addColumn(migrationPreparationColumn))
             }
             if schemaVersion < Self.schemaVersion {
                 try connection.run("PRAGMA user_version = \(Self.schemaVersion)")
@@ -434,6 +524,104 @@ actor SubmitPlanStore: SubmitPlanStoring {
     private func columnNames(of connection: Connection) throws -> [String] {
         try connection.prepare("PRAGMA table_info(\(Self.tableName))").compactMap { row in
             row[1] as? String
+        }
+    }
+}
+
+// MARK: - Terminal rejections
+
+extension SubmitPlanStore {
+    nonisolated var rejectedTransactionIds: AnyPublisher<Set<Data>, Never> {
+        rejectedSubject
+            .handleEvents(receiveSubscription: { [weak self] _ in
+                Task { await self?.publishRejectedTransactionIds() }
+            })
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
+
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) {
+        // The same stale-epoch guard as `markAwaitingSubmission`: a mark for a transaction whose
+        // creation began before a wipe must not recreate the store the wipe deleted.
+        guard lifecycle.generation == lifecycleGeneration else {
+            logger.info("SubmitPlanStore ignored a migration mark from a previous wallet lifecycle.")
+            return
+        }
+        migrationPreparations.insert(txId)
+        guard let connection = connection() else { return }
+        do {
+            try connection.run(migrationMarksTable.insert(or: .ignore, txIdColumn <- Blob(bytes: txId.bytes)))
+            try flagMigrationPreparation(txId: txId, in: connection)
+        } catch {
+            logger.warn("SubmitPlanStore failed to mark a migration preparation: \(error.localizedDescription)")
+        }
+    }
+
+    /// Flags the plan row of `txId`, if it has one, as a migration preparation.
+    private func flagMigrationPreparation(txId: Data, in connection: Connection) throws {
+        try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).update(migrationPreparationColumn <- true))
+    }
+
+    func isMigrationPreparation(txId: Data) -> Bool {
+        if migrationPreparations.contains(txId) { return true }
+        guard let connection = existingConnection() else { return false }
+        do {
+            let row = try connection.pluck(table.select(migrationPreparationColumn).filter(txIdColumn == Blob(bytes: txId.bytes)))
+            if row?[migrationPreparationColumn] == true { return true }
+            return try connection.pluck(migrationMarksTable.filter(txIdColumn == Blob(bytes: txId.bytes))) != nil
+        } catch {
+            logger.warn("SubmitPlanStore failed to read a migration preparation mark: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    func markRejected(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) {
+        // The same stale-epoch guard as `markAccepted`: a refusal for a submission that began
+        // before a wipe must not recreate the store the wipe deleted.
+        guard lifecycle.generation == lifecycleGeneration else {
+            logger.info("SubmitPlanStore ignored a rejection from a previous wallet lifecycle.")
+            return
+        }
+        // A migration preparation keeps main's resubmission until expiry, whatever its servers say.
+        guard !isMigrationPreparation(txId: txId) else {
+            logger.info("SubmitPlanStore keeps a migration preparation pending despite its rejection.")
+            return
+        }
+        guard let connection = connection() else { return }
+        do {
+            let insert = table.insert(
+                or: .ignore,
+                txIdColumn <- Blob(bytes: txId.bytes),
+                endpointsColumn <- "[]"
+            )
+            try connection.run(insert)
+            // A server that ever accepted the transaction may still mine it, so an acceptance is
+            // never overridden by a later refusal elsewhere.
+            try connection.run(
+                table
+                    .filter(txIdColumn == Blob(bytes: txId.bytes) && acceptedHostColumn == nil)
+                    .update(rejectedCodeColumn <- Int64(code), rejectedReasonColumn <- reason)
+            )
+        } catch {
+            logger.warn("SubmitPlanStore failed to record a rejected transaction: \(error.localizedDescription)")
+        }
+        publishRejectedTransactionIds()
+    }
+
+    /// Reads the rejected transaction ids and publishes them. A store that does not exist or cannot
+    /// be read has none to report.
+    private func publishRejectedTransactionIds() {
+        guard let connection = existingConnection() else {
+            rejectedSubject.send([])
+            return
+        }
+        do {
+            let query = table.select(txIdColumn)
+                .filter(rejectedCodeColumn != nil && acceptedHostColumn == nil && migrationPreparationColumn == nil)
+            let ids = try connection.prepare(query).map { Data($0[txIdColumn].bytes) }
+            rejectedSubject.send(Set(ids))
+        } catch {
+            logger.warn("SubmitPlanStore failed to list rejected transactions: \(error.localizedDescription)")
         }
     }
 }
@@ -462,5 +650,29 @@ private struct StoredEndpoint: Codable, Equatable {
             singleCallTimeoutInMillis: singleCallTimeoutInMillis,
             streamingCallTimeoutInMillis: streamingCallTimeoutInMillis
         )
+    }
+}
+
+extension SubmitPlanStoring {
+    /// Marks the transaction `pczt` commits to as an Orchard migration when `proposal` is a
+    /// migration proposal, so its submission keeps main's resubmission until expiry whichever path
+    /// later builds and submits it. The mark is keyed by the transaction id the PCZT commits to,
+    /// which is known at creation and survives the PCZT's serialization, proving and signing, and
+    /// is persisted at once, so it also survives a restart before the transaction is built.
+    /// `lifecycle` is the store's token captured before the PCZT was created: a wipe since then
+    /// drops the mark.
+    func markMigrationPCZT(
+        _ pczt: Pczt,
+        of proposal: Proposal,
+        rustBackend: ZcashRustBackendWelding,
+        lifecycle: SubmitPlanLifecycle,
+        logger: Logger
+    ) async {
+        guard proposal.isMigration else { return }
+        guard let txId = await rustBackend.pcztTxid(pczt: pczt) else {
+            logger.error("Could not read the transaction id of a migration PCZT; it is not marked as a migration.")
+            return
+        }
+        await markMigrationPreparation(txId: txId, lifecycle: lifecycle)
     }
 }

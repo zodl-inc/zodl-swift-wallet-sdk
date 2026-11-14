@@ -51,7 +51,7 @@ class ZcashRustBackendTests: XCTestCase {
 
         // Control: this semantic fixture reaches native creation and is rejected there.
         do {
-            _ = try await rustBackend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard)
+            _ = try await rustBackend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard, sizeBound: .consensus)
             XCTFail("The unfunded wallet cannot create this fixture proposal")
         } catch is CancellationError {
             XCTFail("The uncancelled control must reach the native boundary")
@@ -75,7 +75,7 @@ class ZcashRustBackendTests: XCTestCase {
         let creation = Task {
             defer { creationFinished.fulfill() }
             creationStarted.fulfill()
-            return try await backend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard)
+            return try await backend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard, sizeBound: .consensus)
         }
         await fulfillment(of: [creationStarted], timeout: 5)
         creation.cancel()
@@ -114,7 +114,7 @@ class ZcashRustBackendTests: XCTestCase {
         let creation = GiftCardTransactionCreationContext.$admission.withValue(admission) {
             Task { @DBActor in
                 XCTAssertFalse(Task.isCancelled, "gift cancellation closes admission without cancelling owned completion")
-                return try await backend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard)
+                return try await backend.createProposedTransactions(proposal: proposal, usk: key, ovkPolicy: .discard, sizeBound: .consensus)
             }
         }
         admission.cancelBeforeCreation()

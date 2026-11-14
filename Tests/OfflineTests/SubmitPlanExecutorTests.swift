@@ -55,6 +55,19 @@ final class SubmitPlanExecutorTests: ZcashTestCase {
         XCTAssertTrue(mock.recordedSubmissions().isEmpty)
     }
 
+    /// A refusal saying the server already holds the transaction is that endpoint's acceptance, even
+    /// after another endpoint refused it terminally.
+    func testAnEndpointThatAlreadyHoldsTheTransactionAcceptsIt() async throws {
+        mock.set(behavior: .reject(code: -26, message: "16: bad-txns-sapling-bundle-invalid"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -26, message: "18: txn-already-in-mempool"), for: endpoint(2))
+
+        let attempt = try await executor.submitRecordingAnswers(transaction: makeTransaction(), endpoints: [endpoint(1), endpoint(2)])
+
+        XCTAssertEqual(attempt.accepted, endpoint(2))
+        XCTAssertEqual(attempt.answers[endpointKey(endpoint(2))], .accepted)
+        XCTAssertNil(attempt.lastError)
+    }
+
     func testThrowsLastErrorWhenAllEndpointsFail() async {
         mock.set(behavior: .failTransport, for: endpoint(1))
         mock.set(behavior: .reject(code: -25, message: "no"), for: endpoint(2))

@@ -44,6 +44,22 @@ final class SubmitPlanStoreWipeRaceTests: ZcashTestCase {
         XCTAssertNil(plan)
     }
 
+    func testAMigrationMarkFromBeforeAWipeDoesNotRecreateTheStore() async throws {
+        let store = makeStore()
+        let lifecycle = await store.recordPlan(txId: txId, endpoints: [endpointA])
+        await store.wipe()
+
+        await store.markMigrationPreparation(txId: txId, lifecycle: lifecycle)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path), "a pre-wipe migration mark must not recreate the deleted store")
+        let marked = await store.isMigrationPreparation(txId: txId)
+        XCTAssertFalse(marked)
+
+        await store.markMigrationPreparation(txId: otherTxId, lifecycle: await store.currentLifecycle())
+        let markedNow = await store.isMigrationPreparation(txId: otherTxId)
+        XCTAssertTrue(markedNow, "a mark from the current lifecycle is recorded")
+    }
+
     func testNewLifecycleAfterWipeRecordsAcceptanceNormally() async throws {
         let store = makeStore()
         _ = await store.recordPlan(txId: txId, endpoints: [endpointA])

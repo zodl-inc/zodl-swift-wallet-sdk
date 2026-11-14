@@ -29,6 +29,7 @@ use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork, valu
 use super::*;
 use crate::error_report::Shortfall;
 
+mod bounded;
 mod migration_lanes;
 
 /// A synthetic wallet with one account, as `zcash_client_backend`'s test harness builds it.
@@ -145,6 +146,7 @@ fn user_send_max(recipient: ZcashAddress, memo: Option<MemoBytes>) -> SendMaxReq
         recipient,
         memo,
         confirmations_policy: ConfirmationsPolicy::default(),
+        size_bound: TransactionSizeBound::CONSENSUS,
     }
 }
 
@@ -301,23 +303,40 @@ const TOO_MANY_NOTES: usize = 700;
 /// Notes per block when receiving [`TOO_MANY_NOTES`], to keep the chain short.
 const NOTES_PER_BLOCK: usize = 50;
 
-/// A wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes, each worth more than the
-/// marginal fee it costs to spend.
-fn wallet_with_too_many_notes() -> TestWallet {
-    let mut st = unscanned_wallet();
+/// Receives `count` Orchard notes, each worth more than the marginal fee it costs to spend, at
+/// most [`NOTES_PER_BLOCK`] to a block, and returns the height of the first block.
+fn receive_many_orchard_notes(st: &mut TestWallet, count: usize) -> BlockHeight {
     let output = FakeCompactOutput::new(
-        orchard_fvk(&st),
+        orchard_fvk(st),
         AddressType::DefaultExternal,
         Zatoshis::const_from_u64(MINIMUM_FEE),
     );
-    let block = vec![output; NOTES_PER_BLOCK];
-    let first = (0..TOO_MANY_NOTES / NOTES_PER_BLOCK)
-        .map(|_| st.generate_next_block_multi(&block).0)
-        .min()
-        .unwrap();
+    let mut remaining = count;
+    let mut first = None;
+    while remaining > 0 {
+        let in_block = remaining.min(NOTES_PER_BLOCK);
+        let height = st
+            .generate_next_block_multi(&vec![output.clone(); in_block])
+            .0;
+        first.get_or_insert(height);
+        remaining -= in_block;
+    }
+    first.expect("at least one note")
+}
+
+/// A wallet holding `count` spendable Orchard notes, as [`receive_many_orchard_notes`] receives
+/// them.
+fn wallet_with_note_count(count: usize) -> TestWallet {
+    let mut st = unscanned_wallet();
+    let first = receive_many_orchard_notes(&mut st, count);
     mine_empty_blocks(&mut st, CONFIRMATIONS);
     scan_from(&mut st, first);
     st
+}
+
+/// A wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes.
+fn wallet_with_too_many_notes() -> TestWallet {
+    wallet_with_note_count(TOO_MANY_NOTES)
 }
 
 /// A send-max that would spend more notes than fit in a block is refused when it is proposed,

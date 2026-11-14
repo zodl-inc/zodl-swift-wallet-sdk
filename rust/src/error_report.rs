@@ -85,8 +85,9 @@ pub enum ErrorKind {
     /// The wallet has not scanned to a height it can anchor the transaction on: scan further,
     /// then retry.
     AnchorNotFound = 21,
-    /// The transaction would exceed the maximum size of a block, because it spends too many
-    /// notes. Raised when a proposal is made and again when its transactions are built.
+    /// The transaction would exceed the maximum size of a block, or the size bound the caller
+    /// passed, because it spends too many notes. Raised when a proposal is made and again when
+    /// its transactions are built.
     TransactionTooLarge = 22,
     /// A memo was given for a recipient that cannot receive one, such as a transparent or
     /// ZIP 320 (TEX) address.

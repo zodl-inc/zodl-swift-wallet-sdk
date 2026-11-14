@@ -63,7 +63,7 @@ final class GiftCardRecipientTests: ZcashTestCase {
         let recipient = try noOrchardRecipient()
         try await withFixture { fixture in
             _ = try await fixture.redeemer.check()
-            let callsBeforeRedemption = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount
+            let callsBeforeRedemption = fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount
             let destination = SynchronizerMock()
             await assertErrorCode("ZGIFT0013") {
                 _ = try await fixture.redeemer.redeem(to: recipient, memo: nil)
@@ -71,8 +71,8 @@ final class GiftCardRecipientTests: ZcashTestCase {
             await assertErrorCode("ZGIFT0013") {
                 _ = try await fixture.redeemer.redeem(to: recipient, memo: nil, recordIn: destination)
             }
-            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, callsBeforeRedemption)
-            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount == 0)
+            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, callsBeforeRedemption)
+            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount == 0)
             XCTAssertTrue(fixture.service.submitSpendTransactionModeCallsCount == 0)
         }
     }
@@ -82,7 +82,7 @@ final class GiftCardRecipientTests: ZcashTestCase {
     func testUnsupportedRecipientCannotConsumeAnOrchardPreviewWithDifferentFee() async throws {
         let recipient = try noOrchardRecipient()
         try await withFixture(spendableValue: Zatoshi(15_000)) { fixture in
-            fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+            fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
                 FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [15_000], changeValues: [], fee: 10_000)]).inner
             }
             let status = try await fixture.redeemer.check()
@@ -91,22 +91,22 @@ final class GiftCardRecipientTests: ZcashTestCase {
             XCTAssertEqual(status.fee, Zatoshi(10_000))
             XCTAssertEqual(status.redeemable, Zatoshi(5_000))
             XCTAssertEqual(
-                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments?.address,
+                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments?.address,
                 fixture.card.fundingAddress.stringEncoded
             )
 
-            fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+            fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
                 throw ZcashError.rustProposalInsufficientFunds(Zatoshi(15_000), Zatoshi(20_000))
             }
             await assertErrorCode("ZGIFT0013") {
                 _ = try await fixture.redeemer.redeem(to: recipient, memo: nil, recordIn: nil)
             }
             XCTAssertEqual(
-                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount,
+                fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount,
                 1,
                 "the unsupported recipient must never reach its actual proposal"
             )
-            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount == 0)
+            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount == 0)
             XCTAssertTrue(fixture.service.submitSpendTransactionModeCallsCount == 0)
         }
     }
@@ -118,11 +118,11 @@ final class GiftCardRecipientTests: ZcashTestCase {
             _ = try await fixture.redeemer.check()
             let results = try await fixture.redeemer.redeem(to: fixture.card.fundingAddress, memo: Memo(string: "Gift card"))
             XCTAssertEqual(results, [.success(txId: Data(repeating: 0xA1, count: 32))])
-            let call = try XCTUnwrap(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments)
+            let call = try XCTUnwrap(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments)
             XCTAssertEqual(call.address, fixture.card.fundingAddress.stringEncoded)
             XCTAssertEqual(try call.memo?.intoMemo(), try Memo(string: "Gift card"))
-            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 2)
-            XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 2)
+            XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
             XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
         }
     }
@@ -136,10 +136,10 @@ final class GiftCardRecipientTests: ZcashTestCase {
             XCTAssertEqual(result.results, [.success(txId: Data(repeating: 0xA1, count: 32))])
             XCTAssertEqual(result.fee, Zatoshi(10_000))
             XCTAssertEqual(result.amount, Zatoshi(40_000))
-            let call = try XCTUnwrap(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments)
+            let call = try XCTUnwrap(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments)
             XCTAssertEqual(call.address, recipient.stringEncoded)
             XCTAssertEqual(try call.memo?.intoMemo(), try Memo(string: "Multiple receivers"))
-            XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+            XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
             XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
         }
     }
@@ -159,8 +159,8 @@ final class GiftCardRecipientTests: ZcashTestCase {
             await assertErrorCode("ZGIFT0005") {
                 _ = try await fixture.redeemer.redeem(to: recipient, memo: nil, recordIn: nil)
             }
-            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 1)
-            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount == 0)
+            XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 1)
+            XCTAssertTrue(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount == 0)
             XCTAssertTrue(fixture.service.submitSpendTransactionModeCallsCount == 0)
         }
     }

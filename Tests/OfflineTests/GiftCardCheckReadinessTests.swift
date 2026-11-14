@@ -37,7 +37,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
             _ = try await caller.value
             XCTFail("Unknown tip must not classify funds")
         } catch ZcashError.giftCardCheckTimedOut { }
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 0)
         try await fixture.redeemer.cleanup()
     }
 
@@ -109,7 +109,7 @@ final class GiftCardCheckReadinessTests: ZcashTestCase {
         let calls = await fixture.engine.calls
         XCTAssertFalse(calls.contains("close"))
         XCTAssertFalse(calls.contains(where: GatedFakeSlipstreamEngine.isStop))
-        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 0)
+        XCTAssertEqual(fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 0)
         fixture.engine.startGate.open()
         try await fixture.redeemer.cleanup()
     }

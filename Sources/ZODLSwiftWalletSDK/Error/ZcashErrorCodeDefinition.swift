@@ -1250,6 +1250,22 @@ enum ZcashErrorDefinition {
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     // sourcery: code="ZGIFT0016"
     case giftCardCheckSyncStalled
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    /// block). Nothing was created or broadcast, and the card's funds are untouched. Redeeming such
+    /// a card takes several transactions, which this SDK version does not yet create.
+    // sourcery: code="ZGIFT0017"
+    case giftCardTooManyNotes
+    /// A redemption round after the first was not accepted by a server, so the redemption stopped.
+    /// `round` is the failed round, from 1; `txIds` are the ids of every claim transaction sent so
+    /// far, earlier rounds' included. The failed round's inputs stay reserved until it expires;
+    /// redeeming again afterwards picks up what remains.
+    // sourcery: code="ZGIFT0018"
+    case giftCardRoundFailed(_ round: Int, _ txIds: [Data])
+    /// A redemption round was not mined before it expired or the redeemer stopped waiting for it.
+    /// `round` is that round, from 1; `txIds` are the ids of every claim transaction sent so far.
+    /// Redeeming again picks up what remains once the round's transactions expire.
+    // sourcery: code="ZGIFT0019"
+    case giftCardRoundExpired(_ round: Int, _ txIds: [Data])
 
     // MARK: - Models
 

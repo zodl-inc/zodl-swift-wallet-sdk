@@ -394,7 +394,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         accountUUID: AccountUUID,
         to address: String,
         value: Int64,
-        memo: MemoBytes?
+        memo: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal {
         let proposal = zcashlc_propose_transfer(
             dbData.0,
@@ -404,7 +405,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             value,
             memo?.bytes,
             networkType.networkId,
-            confirmationsPolicy.toBackend()
+            confirmationsPolicy.toBackend(),
+            sizeBound.ffiValue
         )
 
         guard let proposal else {
@@ -422,13 +424,31 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         ))
     }
 
+    /// Which send-max `zcashlc_propose_send_max_transfer` proposes: the user's, held to a size
+    /// bound, or the immediate migration lane's Orchard-only sweep, which is never bounded.
+    private enum SendMaxLane {
+        case user(TransactionSizeBound)
+        case orchardMigration
+
+        var orchardOnly: Bool {
+            if case .orchardMigration = self { return true }
+            return false
+        }
+
+        var sizeBound: TransactionSizeBound {
+            if case let .user(bound) = self { return bound }
+            return .consensus
+        }
+    }
+
     private func proposeSendMaxTransfer(
         accountUUID: AccountUUID,
         address: String,
         memo: MemoBytes?,
         ffiMode: FfiMaxSpendMode,
-        orchardOnly: Bool
+        lane: SendMaxLane
     ) throws -> FfiProposal {
+        let orchardOnly = lane.orchardOnly
         let proposal = zcashlc_propose_send_max_transfer(
             dbData.0,
             dbData.1,
@@ -438,7 +458,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             memo?.bytes,
             ffiMode,
             confirmationsPolicy.toBackend(),
-            orchardOnly
+            orchardOnly,
+            lane.sizeBound.ffiValue
         )
 
         guard let proposal else {
@@ -467,14 +488,16 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         accountUUID: AccountUUID,
         to address: String,
         memo: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal {
         return try proposeSendMaxTransfer(
             accountUUID: accountUUID,
             address: address,
             memo: memo,
             ffiMode: mode.ffiMode,
-            orchardOnly: false // orchard_only — the public send-max path draws on every shielded pool
+            // The public send-max path draws on every shielded pool.
+            lane: .user(sizeBound)
         )
     }
 
@@ -513,7 +536,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     // proposeTransfer; the URI is parsed in memory.
     func proposeTransferFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> FfiProposal {
         let proposal = zcashlc_propose_transfer_from_uri(
             dbData.0,
@@ -521,7 +545,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             accountUUID.id,
             [CChar](uri.utf8CString),
             networkType.networkId,
-            confirmationsPolicy.toBackend()
+            confirmationsPolicy.toBackend(),
+            sizeBound.ffiValue
         )
 
         guard let proposal else {
@@ -542,7 +567,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     @DBActor
     func createPCZTFromProposal(
         accountUUID: AccountUUID,
-        proposal: FfiProposal
+        proposal: FfiProposal,
+        sizeBound: TransactionSizeBound
     ) async throws -> Pczt {
         let proposalBytes = try proposal.serializedData(partial: false).bytes
 
@@ -553,12 +579,20 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 networkType.networkId,
                 proposalPtr.baseAddress,
                 UInt(proposalBytes.count),
-                accountUUID.id
+                accountUUID.id,
+                sizeBound.ffiValue
             )
         }
 
         guard let pcztPtr else {
-            throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: "`createPCZTFromProposal` failed with unknown error"))
+            let fallback = "`createPCZTFromProposal` failed with unknown error"
+            // Unbounded callers (the migration lanes, hardware signing) keep the error they have
+            // always seen. A bounded caller gets the typed size failure, and otherwise the redacted
+            // report.
+            guard sizeBound != .consensus else {
+                throw ZcashError.rustCreatePCZTFromProposal(lastErrorMessage(fallback: fallback))
+            }
+            throw pcztProposalError(for: lastErrorReport(fallback: fallback))
         }
 
         defer { zcashlc_free_boxed_slice(pcztPtr) }
@@ -606,6 +640,19 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                 UInt(pczt.count)
             )
         }
+    }
+
+    func pcztTxid(pczt: Pczt) async -> Data? {
+        var txid = [UInt8](repeating: 0, count: 32)
+        let succeeded = pczt.withUnsafeBytes { buffer -> Bool in
+            guard let bufferPtr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            return txid.withUnsafeMutableBufferPointer { txidPtr in
+                zcashlc_pczt_txid(bufferPtr, UInt(pczt.count), txidPtr.baseAddress)
+            }
+        }
+        return succeeded ? Data(txid) : nil
     }
 
     func addProofsToPCZT(
@@ -1466,7 +1513,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     func createProposedTransactions(
         proposal: FfiProposal,
         usk: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [Data] {
         let proposalBytes = try proposal.serializedData(partial: false).bytes
 
@@ -1488,7 +1536,8 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
                     outputParamsPath.0,
                     outputParamsPath.1,
                     networkType.networkId,
-                    ovkPolicy.ffiValue
+                    ovkPolicy.ffiValue,
+                    sizeBound.ffiValue
                 )
             }
         }
@@ -2315,7 +2364,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
             address: recipient,
             memo: memo,
             ffiMode: MaxSpendable,
-            orchardOnly: orchardOnly
+            lane: orchardOnly ? .orchardMigration : .user(.consensus)
         )
     }
 
@@ -3144,6 +3193,13 @@ nonisolated func proposalError(
     default:
         return wrap(report)
     }
+}
+
+/// Maps a failed bounded `createPCZTFromProposal` to the `ZcashError` the wallet should act on:
+/// a proposal over its size bound (or a block) is `rustProposalTransactionTooLarge`, and anything
+/// else `rustCreatePCZTFromProposal` with the redacted message.
+nonisolated func pcztProposalError(for report: RedactedRustError) -> ZcashError {
+    proposalError(for: report) { ZcashError.rustCreatePCZTFromProposal($0.message) }
 }
 
 /// Maps a failed send-max proposal to the `ZcashError` the wallet should act on.

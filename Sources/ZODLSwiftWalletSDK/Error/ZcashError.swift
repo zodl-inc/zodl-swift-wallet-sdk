@@ -1140,6 +1140,22 @@ public enum ZcashError: Equatable, Error {
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     /// ZGIFT0016
     case giftCardCheckSyncStalled
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    /// block). Nothing was created or broadcast, and the card's funds are untouched. Redeeming such
+    /// a card takes several transactions, which this SDK version does not yet create.
+    /// ZGIFT0017
+    case giftCardTooManyNotes
+    /// A redemption round after the first was not accepted by a server, so the redemption stopped.
+    /// `round` is the failed round, from 1; `txIds` are the ids of every claim transaction sent so
+    /// far, earlier rounds' included. The failed round's inputs stay reserved until it expires;
+    /// redeeming again afterwards picks up what remains.
+    /// ZGIFT0018
+    case giftCardRoundFailed(_ round: Int, _ txIds: [Data])
+    /// A redemption round was not mined before it expired or the redeemer stopped waiting for it.
+    /// `round` is that round, from 1; `txIds` are the ids of every claim transaction sent so far.
+    /// Redeeming again picks up what remains once the round's transactions expire.
+    /// ZGIFT0019
+    case giftCardRoundExpired(_ round: Int, _ txIds: [Data])
     /// Attempt to init TxId with input that is not 32 bytes.
     /// ZMODEL0001
     case txIdNot32Bytes
@@ -1553,6 +1569,9 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckTimedOut: return "The gift-card check did not finish in time. Cleanup still owns unfinished wallet work."
         case .giftCardCheckDisconnected: return "The gift-card check could not reconnect in time. The card balance is still unknown."
         case .giftCardCheckSyncStalled: return "The gift-card wallet stopped making progress. The card balance is still unknown."
+        case .giftCardTooManyNotes: return "The card holds more notes than one claim transaction may spend within its size bound (or a"
+        case .giftCardRoundFailed: return "A redemption round after the first was not accepted by a server, so the redemption stopped."
+        case .giftCardRoundExpired: return "A redemption round was not mined before it expired or the redeemer stopped waiting for it."
         case .txIdNot32Bytes: return "Attempt to init TxId with input that is not 32 bytes."
         case .txIdInvalidHexEncoding: return "Attempt to init TxId with invalid hex encoding."
         case .ledgerUserRejected: return "The user declined on the Ledger device."
@@ -1913,6 +1932,9 @@ public enum ZcashError: Equatable, Error {
         case .giftCardCheckTimedOut: return .giftCardCheckTimedOut
         case .giftCardCheckDisconnected: return .giftCardCheckDisconnected
         case .giftCardCheckSyncStalled: return .giftCardCheckSyncStalled
+        case .giftCardTooManyNotes: return .giftCardTooManyNotes
+        case .giftCardRoundFailed: return .giftCardRoundFailed
+        case .giftCardRoundExpired: return .giftCardRoundExpired
         case .txIdNot32Bytes: return .txIdNot32Bytes
         case .txIdInvalidHexEncoding: return .txIdInvalidHexEncoding
         case .ledgerUserRejected: return .ledgerUserRejected
