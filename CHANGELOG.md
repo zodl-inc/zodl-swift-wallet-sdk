@@ -42,6 +42,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Versions/A` with `Versions/Current` and top-level symlinks). The release archive keeps those
   links. macOS apps that embed the binary SDK no longer fail Xcode's Validate step with "contains
   Info.plist, expected Versions/Current/Resources/Info.plist". The iOS slices are unchanged.
+- Transaction resubmission no longer resends ZIP 318 migration transactions (preparations and
+  transfers into the wallet's own account). Only the migration broadcaster sends them, over the
+  migration's own Tor choice. Before, a migration transaction that stayed unmined could be resent
+  over the app-wide Tor setting, so with migration Tor on and app-wide Tor off it went directly to
+  the lightwalletd server, which could link the user's IP to that pool crossing. No caller changes
+  are required.
 
 # 8.0.0 - 2026-11-06
 

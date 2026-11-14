@@ -215,16 +215,65 @@ class TransactionSQLDAO: TransactionRepository {
         return try await execute(query) { try ZcashTransaction.Overview(row: $0) }
     }
 
+    /// Unmined, unexpired sends, minus every ZIP 318 migration transaction. Only the migration
+    /// broadcaster delivers those, over the migration's own Tor choice (ZIP 318: every migration
+    /// broadcast uses the selected anonymity network). The generic retry sends over the app-wide Tor
+    /// setting instead, so retrying a migration transaction could send it directly to a lightwalletd
+    /// that already saw it over Tor, linking the user's IP to the pool crossing.
+    ///
+    /// A migration transaction is recognised by its classification, a preparation (always a
+    /// self-send) or a transfer that crossed into the wallet's own account (`pool_crossing_value`
+    /// set), and by the migration engine having scheduled it. A transfer-shaped payment to someone
+    /// else keeps its ordinary retry. The classification covers a migration transaction the engine
+    /// has no row for, such as one from another device on the same seed; the engine's table covers
+    /// one that is not classified yet.
     func findForResubmission(upTo: BlockHeight) async throws -> [ZcashTransaction.Overview] {
+        let zip318Kind = ZcashTransaction.Overview.Column.zip318Kind
         let query = transactionsView
             .filter(
                 ZcashTransaction.Overview.Column.minedHeight == nil &&
                 ZcashTransaction.Overview.Column.expiryHeight > upTo
             )
             .filterQueryFor(kind: .sent)
+            .filter(
+                zip318Kind != ZIP318KindCode.preparation &&
+                !(zip318Kind == ZIP318KindCode.transfer && ZcashTransaction.Overview.Column.poolCrossingValue != nil)
+            )
             .limit(Int.max)
 
-        return try await execute(query) { try ZcashTransaction.Overview(row: $0) }
+        let candidates: [ZcashTransaction.Overview] = try await execute(query) { try ZcashTransaction.Overview(row: $0) }
+        let scheduled = try migrationScheduledTxids()
+        return candidates.filter { !scheduled.contains($0.rawID) }
+    }
+
+    /// The `zip318_kind` codes of the two migration kinds (`Zip318Classification::to_code`).
+    private enum ZIP318KindCode {
+        static let preparation = 2
+        static let transfer = 3
+    }
+
+    // DB-READ: SELECT over the migration engine's own transactions table — read-only by construction.
+    /// The txids the Orchard to Ironwood migration engine has scheduled. Defensive like
+    /// `unreconciledTxids()`: a DB without the migration table yields an empty set, and the
+    /// classification filter in `findForResubmission(upTo:)` still applies. Any other read error throws.
+    private func migrationScheduledTxids() throws -> Set<Data> {
+        do {
+            let statement = try connection().prepare(
+                "SELECT txid FROM orchard_ironwood_migration_transactions WHERE txid IS NOT NULL"
+            )
+            var result: Set<Data> = []
+            for row in statement {
+                if let blob = row[0] as? Blob {
+                    result.insert(Data(blob: blob))
+                }
+            }
+            return result
+        } catch {
+            // Only a missing table means "nothing scheduled". Any other read error fails the pass, so
+            // an unclassified migration transaction is never treated as an ordinary retry candidate.
+            if "\(error)".lowercased().contains("no such table") { return [] }
+            throw error
+        }
     }
 
     func findReceived(offset: Int, limit: Int) async throws -> [ZcashTransaction.Overview] {
