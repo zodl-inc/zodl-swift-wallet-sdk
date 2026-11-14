@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 8.1.0 - 2026-11-13
+
 ## Added
 
 - `Zip317.marginalFee` is the ZIP 317 marginal fee (5,000 zatoshis), the fee per logical action
@@ -14,6 +16,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- Every outer OHTTP request (the sealed POST and the key configuration fetch) now carries the fixed
+  `User-Agent: zodl-ohttp/1`, set on each request after the profile headers, so the OHTTP relays
+  cannot tell clients apart by app version or OS. It was `zodl-ohttp/1.0`. The `user-agent` of the
+  inner, encrypted gRPC request is now the same `zodl-ohttp/1` (was `zodl-ohttp-swift/1.0`), so it
+  no longer differs per platform either. Other inner request headers are unchanged.
+- The Slipstream engine behind `SlipstreamSynchronizer` and `SlipstreamEngine` now sends the same
+  fixed `User-Agent: zodl-ohttp/1` on every request to an OHTTP relay (the encapsulated POST and the
+  key configuration fetch, including its DNS-over-HTTPS lookups), where it sent
+  `zodl-slipstream-ohttp/0.1`. The relays see the client's address, and a Slipstream-specific
+  value let them tell its users apart from other Zodl clients. Encapsulated request headers are
+  unchanged.
 - `ZcashError` and `ZcashErrorCode` gain `rustProposalTransactionTooLarge` (`ZRUST0174`),
   `rustProposalTransparentMemo` (`ZRUST0175`) and `rustProposalUnsupportedAddress` (`ZRUST0176`).
   An exhaustive `switch` over either stops compiling until they are handled; see `MIGRATING.md`.
@@ -36,6 +49,31 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `proposefulfillingPaymentURI(_:accountUUID:)` throw `rustProposalTransactionTooLarge`
   (`ZRUST0174`) for a payment whose transaction would not fit in a block, instead of
   `rustProposeTransfer` or `rustProposeTransferFromURI`.
+
+## Fixed
+
+- The macOS slice of the released `libzcashlc.xcframework` is now a versioned framework bundle
+  (`Versions/A` with `Versions/Current` and top-level symlinks). The release archive keeps those
+  links. macOS apps that embed the binary SDK no longer fail Xcode's Validate step with "contains
+  Info.plist, expected Versions/Current/Resources/Info.plist". The iOS slices are unchanged.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3547500.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/mainnet/3567500.json
+````
+
+Testnet
+
+````
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4600000.json
+...
+Sources/ZODLSwiftWalletSDK/Resources/checkpoints/testnet/4610000.json
+````
 
 # 8.0.0 - 2026-11-06
 

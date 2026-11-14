@@ -213,9 +213,9 @@ ffi-macos: require-macos ## Build the macOS FFI and assemble the XCFramework
 	$(MAKE) -C $(BUILD_SUPPORT) macos
 	rm -rf $(XCFRAMEWORK)
 	mkdir -p $(XCFRAMEWORK)
-	cp -R $(BUILD_SUPPORT)/products/macos/frameworks $(XCFRAMEWORK)/macos-arm64
+	cp -RP $(BUILD_SUPPORT)/products/macos/frameworks $(XCFRAMEWORK)/macos-arm64
 	python3 $(SCRIPTS)/lib/ffi_layout.py manifest $(XCFRAMEWORK)/Info.plist macos-arm64
-	python3 $(SCRIPTS)/lib/ffi_layout.py validate $(XCFRAMEWORK)
+	python3 $(SCRIPTS)/lib/ffi_layout.py validate $(XCFRAMEWORK) --require-versioned-macos
 
 # CI uses the same ARM64 slice without release whole-program LTO. Keep rm
 # separate from recursive make so dry runs cannot delete build products.

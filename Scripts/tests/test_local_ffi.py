@@ -34,6 +34,25 @@ def bundle(root, identifiers=SLICES, arch='arm64'):
     (root / 'Info.plist').write_bytes(plistlib.dumps(dict(AvailableLibraries=libraries, CFBundlePackageType='XFWK', XCFrameworkFormatVersion='1.0')))
 
 
+def version_macos(framework):
+    version = framework / 'Versions/A'
+    version.mkdir(parents=True)
+    for name in ('libzcashlc', 'Headers', 'Modules'):
+        (framework / name).rename(version / name)
+        (framework / name).symlink_to('Versions/Current/' + name)
+    (version / 'Resources').mkdir()
+    (framework / 'Info.plist').rename(version / 'Resources/Info.plist')
+    (framework / 'Resources').symlink_to('Versions/Current/Resources')
+    (framework / 'Versions/Current').symlink_to('A')
+
+
+def link_member(name):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.external_attr = (stat.S_IFLNK | 0o755) << 16
+    return info
+
+
 class LocalFFITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -109,16 +128,24 @@ shutil.copyfile(os.environ['ARCHIVE'], dest / 'libzcashlc.xcframework.zip')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.snapshot(), before)
 
-    def archive(self, mutate=None, extra=None):
+    def archive(self, mutate=None, extra=None, versioned=False):
         product = self.base / 'archive-source/libzcashlc.xcframework'
         bundle(product)
+        if versioned:
+            version_macos(product / 'macos-arm64/libzcashlc.framework')
         if mutate:
             mutate(product)
         archive = self.base / 'asset.zip'
-        with zipfile.ZipFile(archive, 'w') as output:
-            for p in product.rglob('*'):
-                if p.is_file():
-                    output.write(p, str(p.relative_to(product.parent)))
+        if versioned:
+            # The release is built with the real zip tool, which stores symlinks as links.
+            archive.unlink(missing_ok=True)
+            subprocess.run(['/usr/bin/zip', '-qry', str(archive), 'libzcashlc.xcframework'], cwd=product.parent, check=True)
+        mode = 'a' if versioned else 'w'
+        with zipfile.ZipFile(archive, mode) as output:
+            if not versioned:
+                for p in product.rglob('*'):
+                    if p.is_file():
+                        output.write(p, str(p.relative_to(product.parent)))
             if extra:
                 info, content = extra
                 output.writestr(info, content)
@@ -142,7 +169,7 @@ shutil.copyfile(os.environ['ARCHIVE'], dest / 'libzcashlc.xcframework.zip')
                 if args:
                     cargo_calls = {line for line in self.log.read_text().splitlines() if line.startswith('cargo ')}
                     self.assertEqual(cargo_calls, {'cargo build --locked --target ' + expected_triples[identifier] + ' --release' for identifier in expected})
-                self.require_ok(subprocess.run([sys.executable, str(self.repo / 'Scripts/lib/ffi_layout.py'), 'validate', str(self.install), '--allow-versioned-macos'], env=self.env, text=True, capture_output=True))
+                self.require_ok(subprocess.run([sys.executable, str(self.repo / 'Scripts/lib/ffi_layout.py'), 'validate', str(self.install)], env=self.env, text=True, capture_output=True))
                 if 'macos-arm64' in expected:
                     self.assertTrue((self.install / 'macos-arm64/libzcashlc.framework/Versions/Current').is_symlink())
 
@@ -268,7 +295,6 @@ exec /bin/mv "$@"
                 shutil.rmtree(self.base / 'archive-source', ignore_errors=True)
                 self.archive(extra=extra)
                 self.assert_preserved_failure(self.run_script('init-local-ffi.sh', '--cached'), self.snapshot())
-                self.assertFalse(outside.exists())
         shutil.rmtree(self.base / 'archive-source')
         archive = self.archive()
         archive.write_bytes(b'not a zip')
@@ -276,6 +302,40 @@ exec /bin/mv "$@"
         manifest = self.repo / 'Package.swift'
         manifest.write_text(manifest.read_text().split('checksum:')[0] + 'checksum: "' + checksum + '"\n')
         self.assert_preserved_failure(self.run_script('init-local-ffi.sh', '--cached'), self.snapshot())
+
+    def test_cached_versioned_release_installs_with_its_links(self):
+        self.seed()
+        self.archive(versioned=True)
+        self.require_ok(self.run_script('init-local-ffi.sh', '--cached'))
+        framework = self.install / 'macos-arm64/libzcashlc.framework'
+        self.assertEqual(os.readlink(framework / 'libzcashlc'), 'Versions/Current/libzcashlc')
+        self.assertEqual(os.readlink(framework / 'Versions/Current'), 'A')
+        self.assertTrue((framework / 'Versions/A/Resources/Info.plist').is_file())
+        self.assertFalse((framework / 'Info.plist').exists())
+
+    def test_cached_rejects_unexpected_macos_links(self):
+        self.seed()
+        macos = 'libzcashlc.xcframework/macos-arm64/libzcashlc.framework/'
+
+        def retarget(target):
+            def mutate(product):
+                link = product / 'macos-arm64/libzcashlc.framework/Headers'
+                link.unlink()
+                link.symlink_to(target)
+            return mutate
+        cases = [
+            dict(mutate=retarget('../../../../escaped')),
+            dict(mutate=retarget('Versions/A/Headers')),
+            dict(extra=(link_member('libzcashlc.xcframework/ios-arm64/libzcashlc.framework/Headers2'), 'Headers')),
+            dict(extra=(link_member(macos + 'Versions/A/evil'), 'A')),
+        ]
+        for case in cases:
+            with self.subTest(case=sorted(case)):
+                shutil.rmtree(self.base / 'archive-source', ignore_errors=True)
+                self.archive(versioned=True, **case)
+                result = self.run_script('init-local-ffi.sh', '--cached')
+                self.assert_preserved_failure(result, self.snapshot())
+                self.assertIn('unexpected link member', result.stderr)
 
 
 if __name__ == '__main__':

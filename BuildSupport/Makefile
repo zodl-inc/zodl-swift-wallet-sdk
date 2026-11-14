@@ -72,11 +72,11 @@ xcframework: products/libzcashlc.xcframework
 products/libzcashlc.xcframework: cargo-all $(PLATFORMS)
 	rm -rf $@
 	mkdir -p $@
-	cp -R products/ios-device/frameworks $@/ios-arm64
-	cp -R products/ios-simulator/frameworks $@/ios-arm64-simulator
-	cp -R products/macos/frameworks $@/macos-arm64
+	cp -RP products/ios-device/frameworks $@/ios-arm64
+	cp -RP products/ios-simulator/frameworks $@/ios-arm64-simulator
+	cp -RP products/macos/frameworks $@/macos-arm64
 	cp Info.plist $@
-	python3 ../Scripts/lib/ffi_layout.py validate $@ --require-full
+	python3 ../Scripts/lib/ffi_layout.py validate $@ --require-full --require-versioned-macos
 
 frameworks: $(PLATFORMS)
 .PHONY: frameworks
@@ -94,6 +94,9 @@ products/%/frameworks/libzcashlc.framework: products/%/universal/libzcashlc.a
 	# Workaround for a bug in the XCode 15.3 build system.
 	# https://github.com/Electric-Coin-Company/zashi-ios/issues/1166
 	cp platform-Info.plist $@/Info.plist
+	# macOS rejects shallow bundles, so that slice is converted here, where every
+	# product (release, ffi-macos, ffi-ci) is assembled, rather than after the fact.
+	$(if $(filter macos,$*),../Scripts/version-macos-framework.sh $@)
 
 products/macos/universal/libzcashlc.a: $(MACOS_ARCHS)
 	mkdir -p $(@D)

@@ -301,3 +301,10 @@ require_gh_auth() {
 # this rather than a hardcoded slug, so a rehearsal against a fork stays inside
 # the fork instead of reaching the canonical repository.
 repo_for_remote() { repo_slug_from_url "$(git remote get-url "$1")"; }
+
+# Zip the XCFramework. -y stores symlinks as links: without it zip follows them
+# and the macOS slice's versioned-framework links become three copies of the
+# library, which no longer unpack as a framework.
+create_release_archive() {
+    ( cd "$PRODUCTS_DIR" && rm -f "$ZIP_FILE" && zip -qry "$ZIP_FILE" libzcashlc.xcframework )
+}

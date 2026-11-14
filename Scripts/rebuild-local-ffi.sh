@@ -21,7 +21,7 @@ FEATURE_ARGS=()
 [[ -z "$CARGO_FEATURES" ]] || FEATURE_ARGS=(--features "$CARGO_FEATURES")
 
 XCFRAMEWORK_DIR=LocalPackages/libzcashlc.xcframework
-if ! python3 Scripts/lib/ffi_layout.py validate "$XCFRAMEWORK_DIR" --allow-versioned-macos; then
+if ! python3 Scripts/lib/ffi_layout.py validate "$XCFRAMEWORK_DIR"; then
     echo 'Error: Local FFI is missing or incompatible. Reinitialize with ./Scripts/init-local-ffi.sh (or an --arm-* subset).' >&2
     exit 1
 fi
@@ -76,7 +76,7 @@ SLICES+=("$SLICE")
 IFS=$'\n' SLICES=($(printf '%s\n' "${SLICES[@]}" | sort))
 unset IFS
 python3 Scripts/lib/ffi_layout.py manifest "$STAGED_XCFW/Info.plist" "${SLICES[@]}"
-python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" --allow-versioned-macos
+python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW"
 mv "$XCFRAMEWORK_DIR" "$STAGE/previous.xcframework"
 OLD_FRAMEWORK=true
 mv "$STAGED_XCFW" "$XCFRAMEWORK_DIR"
