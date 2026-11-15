@@ -22,10 +22,6 @@
 //! stable `MIGRATION_PLAN_STALE` error (mapped to `ZcashError.migrationPlanStale` in Swift) so the
 //! app re-proposes, rather than silently recomputing a fresh, differently-randomized plan the user
 //! never saw or approved.
-//!
-//! Each entry also records whether the plan was previewed through the IMMEDIATE lane, so the
-//! commit path knows to rewrite the committed transfers' scheduled heights to the commit height
-//! (everything due at once) instead of keeping the drawn ZIP 318 spread.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,12 +64,10 @@ impl std::fmt::Display for PlanLookupError {
 
 impl std::error::Error for PlanLookupError {}
 
-/// A cached preview: the plan, the handle identifying it, and whether it was previewed through
-/// the immediate lane.
+/// A cached preview: the plan and the handle identifying it.
 #[derive(Clone)]
 pub(crate) struct CachedPlan {
     pub plan: MigrationPlan,
-    pub immediate: bool,
     handle: PlanHandle,
 }
 
@@ -93,7 +87,6 @@ pub(crate) fn set(
     db_path: PathBuf,
     account: [u8; 16],
     plan: MigrationPlan,
-    immediate: bool,
 ) -> PlanHandle {
     let handle = loop {
         let candidate = rng.next_u64();
@@ -101,14 +94,10 @@ pub(crate) fn set(
             break candidate;
         }
     };
-    store().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        (db_path, account),
-        CachedPlan {
-            plan,
-            immediate,
-            handle,
-        },
-    );
+    store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((db_path, account), CachedPlan { plan, handle });
     handle
 }
 
