@@ -3,13 +3,13 @@
 //! The user's send-max goes through [`propose`]: `zcashlc_propose_send_max_transfer` with
 //! `orchard_only` false (the wallet's Send Max and the gift card sweep). [`propose`] is the
 //! only place that pins the fee rule and the input locking behaviour for it, applies the
-//! transaction size limit, and sorts the failures `zcash_client_backend` reports into the
-//! [`ErrorKind`]s a wallet branches on.
+//! transaction size limit and the caller's [`TransactionSizeBound`], and sorts the failures
+//! `zcash_client_backend` reports into the [`ErrorKind`]s a wallet branches on.
 //!
 //! The migration lanes do not use it: the immediate migration lane (`orchard_only` true) and
 //! the single-shot Orchard to Ironwood turnstile in [`crate::migration_turnstile`] call
 //! upstream's `propose_send_max_transfer` directly, exactly as they always have, with neither
-//! the size limit nor this classification.
+//! the size limit, a size bound, nor this classification.
 //!
 //! The selection itself is upstream's [`propose_send_max_transfer`]: it selects every spendable
 //! note in the chosen pools and computes the ZIP 317 fee internally, so the payment is exactly
@@ -35,6 +35,7 @@ use zcash_client_backend::{
 use zcash_protocol::{ShieldedPool, consensus::Parameters, memo::MemoBytes};
 
 use crate::error_report::{ClassifiedError, ErrorKind};
+use crate::size_bound::{self, TransactionSizeBound};
 
 #[cfg(test)]
 mod tests;
@@ -65,6 +66,9 @@ pub(crate) struct SendMaxRequest {
     pub(crate) memo: Option<MemoBytes>,
     /// The confirmations a note needs before it is spendable.
     pub(crate) confirmations_policy: ConfirmationsPolicy,
+    /// The caps the proposal is held to below consensus. A send-max that exceeds them fails as
+    /// [`ErrorKind::TransactionTooLarge`]; it is not cut down to what fits.
+    pub(crate) size_bound: TransactionSizeBound,
 }
 
 /// Proposes sending the maximum `request` describes from `account`.
@@ -116,6 +120,7 @@ where
         debug!("{context} failed: {e}");
         ClassifiedError::classify_proposal(context, &e)
     })?;
+    size_bound::enforce(&proposal, params, &request.size_bound, context)?;
 
     Ok(proposal)
 }

@@ -190,6 +190,49 @@ public protocol CombineSynchronizer {
     /// Combine counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
     func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never>
 
+    /// Combine counterpart of `Synchronizer.rejectedTransactionIdsStream`.
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { get }
+
+    /// Combine counterpart of `Synchronizer.proposeTransfer(accountUUID:recipient:amount:memo:sizeBound:)`.
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:sizeBound:)`.
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.proposefulfillingPaymentURI(_:accountUUID:sizeBound:)`.
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)`,
+    /// with ``OvkPolicy/sender``.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>
+
+    /// Combine counterpart of `Synchronizer.createPCZTFromProposal(accountUUID:proposal:sizeBound:)`.
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Pczt, Error>
+
     /// Combine counterpart of `Synchronizer.restartSync(at:)`.
     func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error>
 

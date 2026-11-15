@@ -10,6 +10,11 @@ import Foundation
 /// A data structure that describes a series of transactions to be created.
 public struct Proposal: Equatable {
     let inner: FfiProposal
+    /// Whether this proposal is an Orchard to Ironwood migration sweep: set by the migration
+    /// proposers only (`proposeOrchardToIronwoodMigration`, `proposeImmediateMigration`). The SDK
+    /// resubmits the transactions such a proposal creates until they expire, as it always has,
+    /// even when every server refuses them for good, so they are never recorded as rejected.
+    var isMigration = false
 
     /// Returns the number of transactions that this proposal will create.
     ///
