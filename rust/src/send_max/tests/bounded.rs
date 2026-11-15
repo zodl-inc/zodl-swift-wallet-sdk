@@ -69,7 +69,7 @@ fn a_consensus_bound_proposes_what_an_unbounded_send_max_does() {
     assert_eq!(spent_note_count(&bounded), NOTES);
     assert_eq!(
         u64::from(payment_total(&bounded)) + u64::from(total_fee(&bounded)),
-        NOTES as u64 * MINIMUM_FEE
+        NOTES as u64 * minimum_fee()
     );
 }
 

@@ -1364,6 +1364,40 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
     }
 
+    /// A rejection is persisted, and after a restart a submission to a new endpoint that refuses in a
+    /// way that may be transient draws no new verdict and does not clear the stored one.
+    func testARejectionSurvivesARestartAndANewEndpointsTransientRefusalKeepsIt() async throws {
+        let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? terminal.stop() }
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let first = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        _ = await first.broadcaster.submit(transaction: transaction, to: [terminal.endpoint])
+        let rejected = await first.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(rejected, TransactionSubmissionStatus.rejected(.invalid))
+        let databaseURL = submitPlanDatabaseURL(for: first)
+
+        // A restart: a fresh store over the same file.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in
+            SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        }
+        let second = try makeSubmittingSynchronizer()
+        let afterRestart = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(afterRestart, TransactionSubmissionStatus.rejected(.invalid))
+
+        _ = await second.broadcaster.submit(transaction: transaction, to: [transient.endpoint])
+        let kept = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(kept, TransactionSubmissionStatus.rejected(.invalid), "a transient answer keeps the stored rejection")
+        let plan = await SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger()).plan(for: transaction.txId)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"),
+            "the stored refusal is neither replaced by the transient one nor cleared"
+        )
+    }
+
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {
         let acceptingService = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
         defer { try? acceptingService.stop() }

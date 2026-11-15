@@ -45,8 +45,11 @@ const CONTEXT: &str = "propose_send_max_transfer";
 const NOTE_VALUE: u64 = 100_000;
 
 /// The ZIP 317 fee of a single-transaction send-max whose inputs and output all fit in the
-/// two-action minimum of one Orchard bundle.
-const MINIMUM_FEE: u64 = 10_000;
+/// grace actions' minimum of one Orchard bundle: librustzcash's `MINIMUM_FEE`, the marginal fee
+/// times the grace actions, so no fee literal is restated here.
+fn minimum_fee() -> u64 {
+    zcash_primitives::transaction::fees::zip317::MINIMUM_FEE.into_u64()
+}
 
 /// Received funds need ten confirmations under the default confirmations policy.
 const CONFIRMATIONS: usize = 10;
@@ -222,8 +225,8 @@ fn send_max_pays_the_whole_balance_less_the_fee() {
 
     let max = propose_max(&mut st, user_send_max(recipient, None)).expect("proposes the send-max");
 
-    assert_eq!(u64::from(total_fee(&max)), MINIMUM_FEE);
-    assert_eq!(u64::from(payment_total(&max)), NOTE_VALUE - MINIMUM_FEE);
+    assert_eq!(u64::from(total_fee(&max)), minimum_fee());
+    assert_eq!(u64::from(payment_total(&max)), NOTE_VALUE - minimum_fee());
     assert_eq!(spent_note_count(&max), 1);
 }
 
@@ -255,10 +258,10 @@ fn a_balance_that_does_not_exceed_the_fee_is_insufficient_funds() {
         e.amounts(),
         Some(Shortfall {
             available: Zatoshis::const_from_u64(BELOW_FEE),
-            required: Zatoshis::const_from_u64(MINIMUM_FEE + 1),
+            required: Zatoshis::const_from_u64(minimum_fee() + 1),
         })
     );
-    assert_redacted(&e, &["9000", "10001"]);
+    assert_redacted(&e, &["9000", &(minimum_fee() + 1).to_string()]);
 }
 
 #[test]
@@ -309,7 +312,7 @@ fn receive_many_orchard_notes(st: &mut TestWallet, count: usize) -> BlockHeight 
     let output = FakeCompactOutput::new(
         orchard_fvk(st),
         AddressType::DefaultExternal,
-        Zatoshis::const_from_u64(MINIMUM_FEE),
+        Zatoshis::const_from_u64(minimum_fee()),
     );
     let mut remaining = count;
     let mut first = None;
