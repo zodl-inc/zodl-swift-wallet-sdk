@@ -270,7 +270,7 @@ zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a
 zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
 zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
 zip321 = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal", rev = "80f95741896543a22262182ab37a5a05d484d2e7" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream", rev = "80f95741896543a22262182ab37a5a05d484d2e7" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes
