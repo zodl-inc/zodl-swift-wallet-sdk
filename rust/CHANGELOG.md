@@ -614,9 +614,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The shared OHTTP core is `zodl-ohttp-client` 2.0.0 (was 1.0.1; see its changelog, section
-  "2.0.0"), and the Slipstream engine is built on the same version.
-  - `zcashlc_ohttp_profile_info` returns the uniform 2.0.0 header lists. Post: `Content-Type:
+- The shared OHTTP core is `zodl-ohttp-client` 2.0.2 (was 1.0.1; see its changelog, sections
+  "2.0.0" to "2.0.2"), and the Slipstream engine is built on the same version.
+  - `zcashlc_ohttp_profile_info` returns the uniform 2.0 header lists. Post: `Content-Type:
     message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`, `Accept-Encoding: identity`,
     `Accept-Language: en`, `User-Agent: zodl-ohttp/1`. Signed key-configuration fetch: `Accept:
     application/json` (was `application/ohttp-keys`, while the endpoint serves JSON),
@@ -624,7 +624,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `trace_on_key_fetch` is now `false`: the key fetch never carries a trace id.
   - `zcashlc_ohttp_configure` refuses more relay URLs (a relay on a gateway host, non-ASCII text,
     an encoded `/` or `\`, an empty path segment, a `%` not followed by two hex digits, and two
-    spellings of one relay for both networks), naming the field and the rule as before.
+    spellings of one relay for both networks), naming the field and the rule as before. A gateway
+    host written as a numeric alias of an IPv4 address, and a relay whose host is an IPv6 literal
+    embedding the gateway's IPv4 address, are refused too.
     `zcashlc_ohttp_relay_url_for` returns the relay URL in its canonical form (one trailing `/`
     removed, the host in lower case, no `:443`, dot segments resolved).
   - Error texts no longer quote what a relay or resolver sent: a signed envelope for the wrong

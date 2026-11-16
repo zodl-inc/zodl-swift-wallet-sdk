@@ -151,7 +151,7 @@ incrementalmerkletree = { version = "0.9", default-features = false }
 # Slipstream engine — the alternative sync engine the SlipstreamSynchronizer
 # drives, published to crates.io as `zodl-slipstream` from zodl-inc/slipstream.
 # 0.5.0 takes the OHTTP configuration at runtime. 0.6.0 is patched below with the engine on
-# zodl-ohttp-client 2.0.0, which its configuration types come from.
+# zodl-ohttp-client 2.0.2, which its configuration types come from.
 slipstream-core = { version = "=0.6.0", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 base64 = "0.22"
@@ -164,7 +164,7 @@ hex = "0.4"
 # Slipstream must take the same version from the same source: the engine takes the OHTTP
 # configuration as this crate's `OhttpNetworks`, which a second version or source would make a
 # different type.
-zodl-ohttp-client = { version = "=2.0.0", default-features = false }
+zodl-ohttp-client = { version = "=2.0.2", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -251,9 +251,9 @@ strip = false
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 
-# zodl-slipstream 0.6.0 with zodl-ohttp-client 2.0.0 (zodl-inc/slipstream-internal PR #90), until a
+# zodl-slipstream 0.6.0 with zodl-ohttp-client 2.0.2 (zodl-inc/slipstream-internal PR #90), until a
 # Slipstream release carries it: remove this and take that release from crates.io before merging.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "f718c59b649613e62990b1a9cf6610dd8212eb3c" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "3e8bf3ecc9fd16b4814a7af42a95560ec0da6b42" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes

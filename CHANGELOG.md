@@ -8,7 +8,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
-- The OHTTP core is `zodl-ohttp-client` 2.0.0 (see its changelog, section "2.0.0"). Every outer
+- The OHTTP core is `zodl-ohttp-client` 2.0.2 (see its changelog, sections "2.0.0" to "2.0.2"). Every outer
   OHTTP request now carries exactly the header list the core gives every client. The sealed POST:
   `Content-Type: message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`,
   `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1` (and, in a debug
@@ -21,7 +21,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OHTTPEndpoints.configure(_:)` refuses more relay URLs with `ohttpConfigurationInvalid`
   (`ZTSRV0009`): a relay on a gateway host, non-ASCII text (write a host in its `xn--` form), an
   encoded `/` or `\`, an empty path segment (`//`), a `%` not followed by two hex digits, and the
-  same relay spelled two ways for both networks. Check the shipped configuration. Sealed requests
+  same relay spelled two ways for both networks. A gateway host written as a numeric alias of an
+  IPv4 address, and a relay whose host is an IPv6 literal embedding the gateway's IPv4 address, are
+  refused too. Check the shipped configuration. Sealed requests
   go to the relay URL in its canonical form (one trailing `/` removed, the host in lower case, no
   `:443`, dot segments resolved).
 - OHTTP error messages no longer quote what a relay or resolver sent: a signed key configuration
