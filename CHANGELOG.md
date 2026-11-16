@@ -8,8 +8,29 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- The OHTTP core is `zodl-ohttp-client` 2.0.0 (see its changelog, section "2.0.0"). Every outer
+  OHTTP request now carries exactly the header list the core gives every client. The sealed POST:
+  `Content-Type: message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`,
+  `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1` (and, in a debug
+  build with a trace prefix set, `X-Client-Trace-Id`). The key configuration fetch: `Accept:
+  application/json` (was `application/ohttp-keys`), `Accept-Encoding: identity`, `Accept-Language:
+  en`, `User-Agent: zodl-ohttp/1`, and no longer a trace id. The iOS client then sends the relay
+  the same headers as the Android and Slipstream clients. The Slipstream engine moves to 0.6.0 on
+  the same core: its relay requests carry `User-Agent: zodl-ohttp/1` (was
+  `zodl-slipstream-ohttp/0.1`) and `Accept-Language: en` too.
+- `OHTTPEndpoints.configure(_:)` refuses more relay URLs with `ohttpConfigurationInvalid`
+  (`ZTSRV0009`): a relay on a gateway host, non-ASCII text (write a host in its `xn--` form), an
+  encoded `/` or `\`, an empty path segment (`//`), a `%` not followed by two hex digits, and the
+  same relay spelled two ways for both networks. Check the shipped configuration. Sealed requests
+  go to the relay URL in its canonical form (one trailing `/` removed, the host in lower case, no
+  `:443`, dot segments resolved).
+- OHTTP error messages no longer quote what a relay or resolver sent: a signed key configuration
+  for the wrong network or key is reported without its network or key id, JSON and DNS TXT parse
+  errors give only their kind and position, and the detail of a relay refusal is at most 120
+  characters of printable ASCII (it was the first 200 bytes). Code matching on those messages must
+  be updated.
 - Every outer OHTTP request (the sealed POST and the key configuration fetch) now carries the fixed
-  `User-Agent: zodl-ohttp/1`, set on each request after the profile headers, so the OHTTP relays
+  `User-Agent: zodl-ohttp/1`, from the core's header list, so the OHTTP relays
   cannot tell clients apart by app version or OS. It was `zodl-ohttp/1.0`. The `user-agent` of the
   inner, encrypted gRPC request is now the same `zodl-ohttp/1` (was `zodl-ohttp-swift/1.0`), so it
   no longer differs per platform either. Other inner request headers are unchanged.
