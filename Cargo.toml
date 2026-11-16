@@ -125,8 +125,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Tor
-fs-mistrust = "0.14"
-tor-rtcompat = "0.43"
+fs-mistrust = "0.15"
+tor-rtcompat = "0.44"
 rust_decimal = { version = "1", default-features = false, features = ["c-repr"] }
 # - The "static" feature is required for the "compression" default feature of arti-client.
 xz2 = { version = "0.1", features = ["static"] }
@@ -249,6 +249,28 @@ strip = false
 #zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
 #zip321 = { git = "https://github.com/zcash/librustzcash", rev = "13ce6c4ef57a6c7e8837d797d85112ae16ac7455" }
+
+# Tor hotfix: librustzcash 0.25.0 (branch michal/zcb-0.25.0-arti-0.44) and zodl-slipstream 0.6.0
+# (branch michal/slipstream-0.6.0-arti-0.44), each moved to Arti 0.44. Arti 0.43's guard sampler
+# returns no guards while the Tor consensus omits its bandwidth-weights line, so Tor never builds a
+# circuit. Every librustzcash crate in the graph is pinned to the same revision, because they
+# depend on each other by path. Remove these pins once releases of librustzcash and zodl-slipstream
+# ship Arti 0.44 or later.
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream", rev = "80f95741896543a22262182ab37a5a05d484d2e7" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes
