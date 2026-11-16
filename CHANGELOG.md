@@ -6,6 +6,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Fixed
+
+- Connections over Tor (`TorClient`, including `TorClient.connectToLightwalletd(endpoint:)`, and
+  `SlipstreamSynchronizer`'s sync with Tor enabled) no longer fail outright while the Tor
+  network's consensus omits its `bandwidth-weights` line, as it has intermittently since
+  2026-11-15. Every guard relay then weighed zero, so the Tor client found no usable guard, built
+  no circuit, and Tor startup timed out. The Rust core now uses Arti 0.44, which picks guards
+  uniformly at random while the weights are missing; Tor can be slower than usual then, and
+  selection returns to bandwidth weighting once the consensus carries the weights again. No
+  caller changes are required.
+
 # 8.1.0 - 2026-11-13
 
 ## Added
