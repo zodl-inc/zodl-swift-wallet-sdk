@@ -1148,6 +1148,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `zcashlc_voting_session_open` with a null `TorRuntime` and `is_custom_server` false opens an
+  OHTTP session when the round's chain or PIR endpoints include `svote.zcashlabs.com`,
+  `207-180-214-226.sslip.io`, `vote.atlasstaking.com`, `zvote.polkachu.com`,
+  `zvote.cros-nest.net` or `vote.infra.cypherpunk.com`; it refused the session before any network
+  I/O, with a last error saying the host is not supported by the OHTTP gateway. The signature is
+  unchanged; no caller changes are needed.
+
 - `zcashlc_tor_connect_to_lightwalletd` and `zcashlc_tor_connect_to_lightwalletd_with_timeout`
   refuse a configured OHTTP gateway with a last error that no longer names the endpoint, so the
   gateway host stays out of error text. The refusal itself and the signatures are unchanged.

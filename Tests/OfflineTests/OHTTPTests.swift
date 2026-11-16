@@ -155,6 +155,12 @@ final class OHTTPTests: XCTestCase {
         "zvote.keplr.app",
         "zvote.zfnd.org",
         "v.ombie.cash",
+        "svote.zcashlabs.com",
+        "207-180-214-226.sslip.io",
+        "vote.atlasstaking.com",
+        "zvote.polkachu.com",
+        "zvote.cros-nest.net",
+        "vote.infra.cypherpunk.com",
         "lb-pir-primary.valargroup.org",
         "lb-pir-backup.valargroup.org",
         "zpir-1.stardust.rest",
@@ -162,7 +168,7 @@ final class OHTTPTests: XCTestCase {
 
     func testProxyAllowlistIsExactlyTheGatewayHostList() {
         XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts, Set(Self.gatewayVoteAndPirHosts))
-        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts.count, 15)
+        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts.count, 21)
         for host in Self.gatewayVoteAndPirHosts {
             XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: host), host)
         }

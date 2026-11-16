@@ -17,6 +17,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection returns to bandwidth weighting once the consensus carries the weights again. No
   caller changes are required.
 
+- Coinholder voting on predefined servers with Tor off
+  (`Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` with
+  `.direct` and `isCustomServer: false`) no longer refuses to open a round session whose vote
+  servers include `svote.zcashlabs.com`, `207-180-214-226.sslip.io`, `vote.atlasstaking.com`,
+  `zvote.polkachu.com`, `zvote.cros-nest.net` or `vote.infra.cypherpunk.com`. Those hosts were
+  missing from the OHTTP host list, so opening the session failed before anything was sent
+  ("cannot reach predefined vote server … not supported by the OHTTP gateway") and the round
+  could not be entered. They now ride OHTTP like the other predefined servers.
+  `OHTTPEndpoints.proxyAllowedHosts` and `OHTTPEndpoints.isProxyAllowlisted(host:)` include them,
+  `OHTTPEndpoints.proxyHost(for:)` returns their host unchanged instead of `nil`, and
+  `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)` accept requests to
+  them instead of throwing `ZcashError.ohttpUnsupportedHost`. The OHTTP gateway of the
+  installed configuration must forward these hosts as well; until it does, requests to them fail
+  at the gateway. No caller changes are required.
+
 # 8.1.0 - 2026-11-13
 
 ## Added
