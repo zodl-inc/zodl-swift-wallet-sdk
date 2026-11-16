@@ -253,7 +253,7 @@ strip = false
 
 # zodl-slipstream 0.6.0 with zodl-ohttp-client 2.0.2 (zodl-inc/slipstream-internal PR #90), until a
 # Slipstream release carries it: remove this and take that release from crates.io before merging.
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "3e8bf3ecc9fd16b4814a7af42a95560ec0da6b42" }
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "93827d4b5fc7be081bf30ee8d9fac8c0b6444c5f" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes
