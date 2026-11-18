@@ -71,45 +71,22 @@ public enum OHTTPEndpoints {
     /// placeholder publishable key the app is given, and passes a user's token as it is.
     static let clientAuthorizationAliases: Set<String> = ["flexa.zodl.com"]
 
-    /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 18 vote
-    /// servers and the 3 PIR endpoints, host-bound. Exact match only: the gateway removed suffix
-    /// routing, and several of these domains also serve unrelated hosts, so a suffix rule would
-    /// let the app send a request the gateway can only reject (or, worse, trust a lookalike).
+    /// True when the gateway of `network` carries `host` as a passthrough host: an exact, case-insensitive
+    /// match against the host list that gateway published. The list the SDK compiles in is only the
+    /// starting list; the gateway's own list decides once it has been fetched. No suffix matching, and
+    /// nothing is reached directly: a host that is not carried has no route. False while OHTTP is off
+    /// for `network`.
     ///
-    /// MUST equal the predefined vote/PIR hosts of the BACKENDS list and the Rust voting route's
-    /// `OHTTP_VOTE_HOSTS` (`rust/src/voting/route.rs`); a host missing here fails closed in the app.
-    /// The `cmc.zodl.com` and `near.zodl.com` aliases are not listed: they carry gateway-injected
-    /// credentials (``isAliasHost(_:)``) and are reached through `proxyHostMapping`.
-    public static let proxyAllowedHosts: Set<String> = [
-        // Vote servers
-        "vote.zodl.com",
-        "prod.vote-chain-primary.valargroup.org",
-        "voting.valargroup.dev",
-        "ru.zcash.space",
-        "147-182-192-212.sslip.io",
-        "134-209-215-69.sslip.io",
-        "mnval01.zcash.legends.sh",
-        "zvote-1.stardust.rest",
-        "zvote.zodl.com",
-        "zvote.keplr.app",
-        "zvote.zfnd.org",
-        "v.ombie.cash",
-        "svote.zcashlabs.com",
-        "207-180-214-226.sslip.io",
-        "vote.atlasstaking.com",
-        "zvote.polkachu.com",
-        "zvote.cros-nest.net",
-        "vote.infra.cypherpunk.com",
-        // PIR endpoints (delegation)
-        "lb-pir-primary.valargroup.org",
-        "lb-pir-backup.valargroup.org",
-        "zpir-1.stardust.rest",
-    ]
+    /// The `cmc.zodl.com` and `near.zodl.com` aliases carry gateway-injected credentials
+    /// (``isAliasHost(_:)``) and are reached through `proxyHostMapping`.
+    public static func isProxyAllowlisted(host: String, network: NetworkType) -> Bool {
+        OHTTPNative.thirdPartyCarriedAuthority(host: host, network: network) != nil
+    }
 
-    /// Returns true if the host is allowlisted for passthrough OHTTP proxying: an exact,
-    /// case-insensitive match against `proxyAllowedHosts`. No suffix matching.
+    /// True when the gateway of either configured network carries `host` (see
+    /// ``isProxyAllowlisted(host:network:)``). False for every host while OHTTP is off for both networks.
     public static func isProxyAllowlisted(host: String) -> Bool {
-        proxyAllowedHosts.contains(host.lowercased())
+        isProxyAllowlisted(host: host, network: .mainnet) || isProxyAllowlisted(host: host, network: .testnet)
     }
 
     /// True only for the lightwalletd gateway hosts of the installed configuration (``configure(_:)``), those
@@ -151,8 +128,8 @@ public enum OHTTPEndpoints {
             }
             return relay
         }
-        // Allowlisted hosts use mainnet relay
-        if isProxyAllowlisted(host: gatewayHost) {
+        // Hosts the mainnet gateway's list carries use mainnet relay
+        if isProxyAllowlisted(host: gatewayHost, network: .mainnet) {
             guard let relay = mainnetRelayURL else {
                 throw OHTTPError.transportError("No OHTTP relay configured for gateway host \(gatewayHost)")
             }
@@ -162,7 +139,7 @@ public enum OHTTPEndpoints {
     }
 
     /// Maps a real external-service URL to its OHTTP proxy hostname.
-    /// For allowlisted hosts, returns the SAME host (no rewrite — gateway proxies by `:authority`).
+    /// For hosts a gateway's list carries, returns the SAME host (no rewrite — gateway proxies by `:authority`).
     /// For static mappings, returns the rewritten proxy host.
     /// Returns nil if the host has no configured proxy (caller should fall through to clearnet or Tor).
     /// Static hostname mappings — checked BEFORE the host allowlist so that hosts with a gateway
@@ -193,7 +170,7 @@ public enum OHTTPEndpoints {
             return nil
         }
 
-        // Allowlisted hosts pass through unchanged (vote servers learned at run time)
+        // Hosts a gateway's list carries pass through unchanged (vote servers learned at run time)
         if isProxyAllowlisted(host: host) {
             return host
         }

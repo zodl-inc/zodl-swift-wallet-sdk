@@ -14,6 +14,11 @@ final class OHTTPTests: XCTestCase {
         OHTTPTestSupport.installExampleConfiguration()
     }
 
+    override func tearDown() {
+        OHTTPTestSupport.installExampleConfiguration()
+        super.tearDown()
+    }
+
     // MARK: - OHTTP Endpoints Tests
 
     func testOHTTPEndpointsGatewayDetection() {
@@ -166,12 +171,36 @@ final class OHTTPTests: XCTestCase {
         "zpir-1.stardust.rest",
     ]
 
-    func testProxyAllowlistIsExactlyTheGatewayHostList() {
-        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts, Set(Self.gatewayVoteAndPirHosts))
-        XCTAssertEqual(OHTTPEndpoints.proxyAllowedHosts.count, 21)
+    func testProxyAllowlistStartsFromTheBootstrapList() {
         for host in Self.gatewayVoteAndPirHosts {
+            XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: host, network: .mainnet), host)
+            XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: host, network: .testnet), host)
             XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: host), host)
         }
+    }
+
+    func testProxyAllowlistFollowsTheFetchedList() {
+        OHTTPTestSupport.installHostList(["vote.example.org"], network: .mainnet)
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "vote.example.org", network: .mainnet))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "vote.example.org", network: .testnet))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "vote.example.org"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "vote.zodl.com", network: .mainnet))
+        XCTAssertTrue(OHTTPEndpoints.isProxyAllowlisted(host: "vote.zodl.com", network: .testnet))
+        XCTAssertEqual(OHTTPEndpoints.proxyHost(for: URL(string: "https://vote.example.org/x")!), "vote.example.org")
+    }
+
+    func testProxyAllowlistIsEmptyWhileOHTTPIsOff() throws {
+        try OHTTPEndpoints.configure(nil)
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "vote.zodl.com"))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "vote.zodl.com", network: .mainnet))
+        XCTAssertFalse(OHTTPEndpoints.isProxyAllowlisted(host: "vote.zodl.com", network: .testnet))
+    }
+
+    func testRelayURLForAPassthroughHostAsksTheMainnetList() throws {
+        OHTTPTestSupport.installHostList(["vote.example.org"], network: .testnet)
+        XCTAssertThrowsError(try OHTTPEndpoints.relayURL(for: "vote.example.org"))
+        OHTTPTestSupport.installHostList(["vote.example.org"], network: .mainnet)
+        XCTAssertEqual(try OHTTPEndpoints.relayURL(for: "vote.example.org"), OHTTPTestSupport.exampleMainnet.relayURL)
     }
 
     func testProxyAllowlistHasNoSuffixMatching() {
