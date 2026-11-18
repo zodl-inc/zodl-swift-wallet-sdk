@@ -349,9 +349,10 @@ final class OHTTPTests: XCTestCase {
         XCTAssertEqual(traceId?.count, 64, "Trace ID should be truncated to exactly 64 chars")
     }
 
-    func testTraceIdAlsoRidesTheKeyConfigurationFetch() async throws {
-        // The iOS profile sends the trace id on the key fetch as well as on the post.
+    func testTraceIdRidesThePostButNotTheKeyConfigurationFetch() async throws {
+        // Every profile keeps the trace id off the key fetch: the fetch carries the same headers on every client.
         var fetch: URLRequest?
+        var post: URLRequest?
         let transport = OHTTPTestSupport.makeTransport(clientTraceIdPrefix: "trace") { request, _ in
             if request.httpMethod == "GET" {
                 fetch = request
@@ -360,12 +361,15 @@ final class OHTTPTests: XCTestCase {
                     OHTTPTestSupport.response(for: request.url, status: 200)
                 )
             }
+            post = request
             throw OHTTPError.transportError("test abort")
         }
 
         _ = try? await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
 
-        XCTAssertNotNil(fetch?.value(forHTTPHeaderField: "X-Client-Trace-Id"))
+        XCTAssertNotNil(fetch, "the key configuration was fetched")
+        XCTAssertNil(fetch?.value(forHTTPHeaderField: "X-Client-Trace-Id"))
+        XCTAssertNotNil(post?.value(forHTTPHeaderField: "X-Client-Trace-Id"))
     }
 
     func testRequestsCarryTheProfileHeaders() async throws {
@@ -385,7 +389,10 @@ final class OHTTPTests: XCTestCase {
 
         _ = try? await transport.roundTrip(request: OHTTPTestSupport.simpleRequest, timeoutMS: 5000)
 
-        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept"), "application/ohttp-keys")
+        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept"), "application/json")
+        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
+        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "Accept-Language"), "en")
+        XCTAssertEqual(fetch?.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1")
         XCTAssertEqual(post?.value(forHTTPHeaderField: "Content-Type"), "message/ohttp-chunked-req")
         XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept"), "message/ohttp-chunked-res")
         XCTAssertEqual(post?.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
