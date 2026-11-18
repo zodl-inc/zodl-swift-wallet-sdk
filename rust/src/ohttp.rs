@@ -207,7 +207,7 @@ fn profile_from_id(id: u32) -> anyhow::Result<ClientProfile> {
 ///
 /// - When `len` is non-zero, `ptr` must be non-null and valid for reads for `len` bytes, with an
 ///   alignment of `1`, and the memory must not be mutated while the slice is in use.
-unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> anyhow::Result<&'a [u8]> {
+pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> anyhow::Result<&'a [u8]> {
     if len == 0 {
         Ok(&[])
     } else if ptr.is_null() {

@@ -24,6 +24,7 @@ use zodl_ohttp_client::{ConfigField, Network, OhttpConfig, OhttpConfigParams, Oh
 use crate::unwrap_exc_or;
 
 /// The installed configuration together with the gateway host lists that belong to it.
+#[derive(Clone)]
 struct Installed {
     networks: Arc<OhttpNetworks>,
     hosts: Arc<ThirdPartyHostLists>,
@@ -38,13 +39,6 @@ impl Installed {
             crate::ohttp_hosts::BOOTSTRAP_THIRD_PARTY_HOSTS,
         ));
         Self { networks, hosts }
-    }
-
-    fn duplicate(&self) -> Self {
-        Self {
-            networks: Arc::clone(&self.networks),
-            hosts: Arc::clone(&self.hosts),
-        }
     }
 }
 
@@ -240,7 +234,7 @@ impl Drop for InstalledNetworksGuard {
     fn drop(&mut self) {
         // Restored after a failed test too, so that the tests that run afterwards do not inherit
         // its configuration.
-        *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = self.previous.duplicate();
+        *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = self.previous.clone();
     }
 }
 
@@ -254,7 +248,7 @@ pub(crate) fn lock_installed_networks() -> InstalledNetworksGuard {
         previous: INSTALLED
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .duplicate(),
+            .clone(),
     }
 }
 
