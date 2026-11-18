@@ -1328,7 +1328,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
         summary: WalletSummary?,
         localBalances: [AccountUUID: AccountBalance]
     ) {
-        guard let localSummary = try getUnmaskedWalletSummary() else { return (nil, [:]) }
+        guard let localSummary = try await getUnmaskedWalletSummary() else { return (nil, [:]) }
 
         // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
         if await !sdkFlags.chainTipUpdated {
@@ -1341,13 +1341,47 @@ struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     // DB-READ (audited 2026-09-01): delegates to getUnmaskedWalletSummary(), whose
     // get_wallet_summary FFI read is audited below; performs no writes.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
-        try getUnmaskedWalletSummary()?.accountBalances ?? [:]
+        try await getUnmaskedWalletSummary()?.accountBalances ?? [:]
+    }
+
+    /// Reads the unmasked wallet summary on a GCD thread rather than on the caller's.
+    ///
+    /// `get_wallet_summary` walks the wallet database and does not return for seconds on a wallet
+    /// with a long history. Called directly from an `async` function, it holds a thread of the
+    /// cooperative pool for that whole time, and the pool has only as many threads as the device has
+    /// cores, so every other task in the process runs with one thread fewer, or with none when
+    /// several reads overlap. A GCD thread is outside that pool, so the caller suspends instead of
+    /// blocking. The same pattern is used for `SlipstreamEngine`'s blocking calls.
+    private func getUnmaskedWalletSummary() async throws -> WalletSummary? {
+        let dbPath = dbData.0
+        let dbPathLength = dbData.1
+        let networkID = networkType.networkId
+        let policy = confirmationsPolicy
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result {
+                    try Self.readUnmaskedWalletSummary(
+                        dbPath: dbPath,
+                        dbPathLength: dbPathLength,
+                        networkID: networkID,
+                        confirmationsPolicy: policy
+                    )
+                })
+            }
+        }
     }
 
     // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
     // across its whole body; the summary pointer is freed before this function returns.
-    private func getUnmaskedWalletSummary() throws -> WalletSummary? {
-        let summaryPtr = zcashlc_get_wallet_summary(dbData.0, dbData.1, networkType.networkId, confirmationsPolicy.toBackend())
+    /// The error message is read on the same thread as the failed call, because the Rust side keeps
+    /// the last error per thread.
+    private static func readUnmaskedWalletSummary(
+        dbPath: String,
+        dbPathLength: UInt,
+        networkID: UInt32,
+        confirmationsPolicy: ConfirmationsPolicy
+    ) throws -> WalletSummary? {
+        let summaryPtr = zcashlc_get_wallet_summary(dbPath, dbPathLength, networkID, confirmationsPolicy.toBackend())
 
         guard let summaryPtr else {
             throw ZcashError.rustGetWalletSummary(lastErrorMessage(fallback: "`getWalletSummary` failed with unknown error"))
