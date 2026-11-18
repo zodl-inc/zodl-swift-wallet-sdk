@@ -6,6 +6,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `OHTTPEndpoints.isProxyAllowlisted(host:network:)` tells whether a host is passed through OHTTP
+  on a network, according to the gateway's host list.
+
 ## Changed
 
 - The OHTTP core is `zodl-ohttp-client` 2.1.0 (see its changelog, sections "2.0.0" to
@@ -32,6 +37,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors give only their kind and position, and the detail of a relay refusal is at most 120
   characters of printable ASCII (it was the first 200 bytes). Code matching on those messages must
   be updated.
+- The passthrough hosts an OHTTP gateway carries (vote and PIR servers reached under their own
+  name) are taken from the gateway's own third-party host list (`zodl-ohttp-client` 2.1.0),
+  starting from one compiled list. The list is fetched only through OHTTP, on the route of the
+  request that needs it (over Tor in Tor mode), is kept in memory, and is forgotten when another
+  configuration is installed. A failed fetch keeps the list held. A host that is not carried is
+  refused with `ohttpUnsupportedHost`, after at most one refresh, and is never reached directly.
+  A voting session with Tor off leaves out the chain and PIR endpoints the gateway does not carry
+  and is refused only when none of a kind is left. A server on a port other than 443 and an
+  `http://` server URL are refused through OHTTP.
+
+## Removed
+
+- `OHTTPEndpoints.proxyAllowedHosts` is removed. Ask
+  `OHTTPEndpoints.isProxyAllowlisted(host:network:)` instead.
 
 ## Fixed
 

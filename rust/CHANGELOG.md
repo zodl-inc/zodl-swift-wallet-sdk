@@ -618,6 +618,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no chain tip, on a network that has an NU7 activation height and without the bypass, returns
   NULL with the last error set ("sync first"); with the bypass, or on a network with no NU7
   activation height, no tip is read.
+- `zcashlc_ohttp_third_party_carried_authority`: `:authority` of a carried host, or NULL.
+- `zcashlc_ohttp_third_party_refresh_before_refusing`: true when a refresh is worth trying first.
+- `zcashlc_ohttp_third_party_is_refreshing`: whether a refresh of the host list is running.
+- `zcashlc_ohttp_third_party_note_answer`: reports the gateway's answer to a request for a host.
+- `zcashlc_ohttp_third_party_begin_refresh`: begins a due refresh and returns its handle, or NULL.
+- `zcashlc_ohttp_third_party_refresh_authority`: the `:authority` of a refresh request.
+- `zcashlc_ohttp_third_party_refresh_path`: the path of a refresh request.
+- `zcashlc_ohttp_third_party_refresh_if_none_match`: the `if-none-match` value of a refresh request.
+- `zcashlc_ohttp_third_party_finish_refresh`: ends a refresh with the gateway's answer.
+- `zcashlc_ohttp_third_party_fail_refresh`: ends a refresh as failed and keeps the list held.
+- `zcashlc_ohttp_third_party_free_refresh`: frees a refresh handle that was not ended.
 
 ### Changed
 
@@ -1064,6 +1075,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     does not parse fails with `MIGRATION_PROVING_UNAVAILABLE`.
   - `upgrade_gate_bypass` is retained on the broadcast accessors for ABI compatibility. It never
     bypasses submission validity; branch, expiry and server-height checks apply on every network.
+- `zcashlc_voting_session_open` leaves out endpoints the gateway does not carry. The compiled
+  `OHTTP_VOTE_HOSTS` is replaced by the bootstrap list of the third-party host lists.
 
 ### Removed
 
