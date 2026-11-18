@@ -76,6 +76,199 @@ pub unsafe extern "C" fn zcashlc_voting_extract_nc_root(
     unwrap_exc_or_null(res)
 }
 
+/// Recompute a vote round id the way the vote chain derives it: Poseidon (P128Pow5T3,
+/// ConstantLength<8>) over `created_at_height`, the snapshot blockhash and the proposals hash
+/// (each split into two little-endian 128-bit limbs), `vote_end_time`, `nullifier_imt_root` and
+/// `nc_root`.
+///
+/// A wallet compares the result with the round id a vote server reported, so a server cannot
+/// show different ballot content under a signed round id.
+///
+/// Returns the 32-byte canonical field element as `*mut FfiBoxedSlice`, or null on error
+/// (a length other than 32, or a root that is not a canonical Pallas field element).
+///
+/// # Safety
+///
+/// - Each pointer must be valid for reads of its paired length in bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_derive_round_id(
+    created_at_height: u64,
+    snapshot_blockhash: *const u8,
+    snapshot_blockhash_len: usize,
+    proposals_hash: *const u8,
+    proposals_hash_len: usize,
+    vote_end_time: u64,
+    nullifier_imt_root: *const u8,
+    nullifier_imt_root_len: usize,
+    nc_root: *const u8,
+    nc_root_len: usize,
+) -> *mut crate::ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let fixed = |ptr: *const u8, len: usize, name: &str| -> anyhow::Result<[u8; 32]> {
+            let bytes = unsafe { bytes_from_ptr(ptr, len) }?;
+            <[u8; 32]>::try_from(bytes)
+                .map_err(|_| anyhow!("{name} must be exactly 32 bytes, got {}", bytes.len()))
+        };
+        let round_id = derive_round_id(
+            created_at_height,
+            fixed(
+                snapshot_blockhash,
+                snapshot_blockhash_len,
+                "snapshot_blockhash",
+            )?,
+            fixed(proposals_hash, proposals_hash_len, "proposals_hash")?,
+            vote_end_time,
+            fixed(
+                nullifier_imt_root,
+                nullifier_imt_root_len,
+                "nullifier_imt_root",
+            )?,
+            fixed(nc_root, nc_root_len, "nc_root")?,
+        )?;
+        Ok(crate::ffi::BoxedSlice::some(round_id.to_vec()))
+    });
+    unwrap_exc_or_null(res)
+}
+
+fn derive_round_id(
+    created_at_height: u64,
+    snapshot_blockhash: [u8; 32],
+    proposals_hash: [u8; 32],
+    vote_end_time: u64,
+    nullifier_imt_root: [u8; 32],
+    nc_root: [u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    use ff::PrimeField;
+    use halo2_poseidon::{ConstantLength, Hash, P128Pow5T3};
+    use pasta_curves::pallas::Base;
+
+    let limbs = |bytes: &[u8; 32]| -> (Base, Base) {
+        let lo = u128::from_le_bytes(bytes[..16].try_into().expect("16 bytes"));
+        let hi = u128::from_le_bytes(bytes[16..].try_into().expect("16 bytes"));
+        (Base::from_u128(lo), Base::from_u128(hi))
+    };
+    let field = |bytes: [u8; 32], name: &str| -> anyhow::Result<Base> {
+        Option::from(Base::from_repr(bytes))
+            .ok_or_else(|| anyhow!("{name} is not a canonical Pallas field element"))
+    };
+
+    let (bh_lo, bh_hi) = limbs(&snapshot_blockhash);
+    let (ph_lo, ph_hi) = limbs(&proposals_hash);
+    let inputs = [
+        Base::from(created_at_height),
+        bh_lo,
+        bh_hi,
+        ph_lo,
+        ph_hi,
+        Base::from(vote_end_time),
+        field(nullifier_imt_root, "nullifier_imt_root")?,
+        field(nc_root, "nc_root")?,
+    ];
+
+    let hash = Hash::<_, P128Pow5T3, ConstantLength<8>, 3, 2>::init().hash(inputs);
+    Ok(hash.to_repr())
+}
+
+#[cfg(test)]
+mod derive_round_id_tests {
+    use super::derive_round_id;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    // A real round from the prod vote chain ("NU7 Scope"); the expected id is its `vote_round_id`.
+    const BLOCKHASH: &str = "000000000079f151b017b515d0084713d19bd596a76ecfd75f82fd32bf43d968";
+    const PROPOSALS_HASH: &str = "7699c729a197ead27b327c569a5fa7a4b98132a67081b3cb6b9baea3a5ef2d02";
+    const NF_ROOT: &str = "362eaf14c595d4df74932bbcc184b5cd5d1896592668c2dba7dcd7bac685da09";
+    const NC_ROOT: &str = "060a13d76e798c460b1a51497e621f61a9e482bae1def3ca06eecb0d85a5d41d";
+    const ROUND_ID: &str = "16eef7ebc77e0e04fb1c7329abfcc390f4a0c002964671ebb360914a3e5a3f11";
+
+    fn derive(height: u64, proposals_hash: &str) -> anyhow::Result<[u8; 32]> {
+        derive_round_id(
+            height,
+            hex32(BLOCKHASH),
+            hex32(proposals_hash),
+            1_789_412_400,
+            hex32(NF_ROOT),
+            hex32(NC_ROOT),
+        )
+    }
+
+    #[test]
+    fn matches_the_on_chain_round_id() {
+        assert_eq!(derive(5_717_157, PROPOSALS_HASH).unwrap(), hex32(ROUND_ID));
+    }
+
+    #[test]
+    fn changing_any_input_changes_the_id() {
+        let other_hash = "7699c729a197ead27b327c569a5fa7a4b98132a67081b3cb6b9baea3a5ef2d03";
+        assert_ne!(derive(5_717_157, other_hash).unwrap(), hex32(ROUND_ID));
+        assert_ne!(derive(5_717_158, PROPOSALS_HASH).unwrap(), hex32(ROUND_ID));
+    }
+
+    #[test]
+    fn rejects_a_non_canonical_field_element() {
+        let result = derive_round_id(
+            5_717_157,
+            hex32(BLOCKHASH),
+            hex32(PROPOSALS_HASH),
+            1_789_412_400,
+            [0xff; 32],
+            hex32(NC_ROOT),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ffi_returns_the_round_id_and_null_on_a_wrong_length() {
+        let (bh, ph, nf, nc) = (
+            hex32(BLOCKHASH),
+            hex32(PROPOSALS_HASH),
+            hex32(NF_ROOT),
+            hex32(NC_ROOT),
+        );
+        let ok = unsafe {
+            super::zcashlc_voting_derive_round_id(
+                5_717_157,
+                bh.as_ptr(),
+                32,
+                ph.as_ptr(),
+                32,
+                1_789_412_400,
+                nf.as_ptr(),
+                32,
+                nc.as_ptr(),
+                32,
+            )
+        };
+        assert!(!ok.is_null());
+        let bytes = unsafe { (*ok).as_slice() }.to_vec();
+        unsafe { crate::ffi::zcashlc_free_boxed_slice(ok) };
+        assert_eq!(bytes, hex32(ROUND_ID).to_vec());
+
+        let short = unsafe {
+            super::zcashlc_voting_derive_round_id(
+                5_717_157,
+                bh.as_ptr(),
+                31,
+                ph.as_ptr(),
+                32,
+                1_789_412_400,
+                nf.as_ptr(),
+                32,
+                nc.as_ptr(),
+                32,
+            )
+        };
+        assert!(short.is_null());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ff::PrimeField;
