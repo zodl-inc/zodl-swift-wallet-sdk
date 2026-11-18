@@ -58,7 +58,7 @@ use crate::{unwrap_exc_or, unwrap_exc_or_null};
 
 use super::errors::invalid_input;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
-use super::route::resolve_session_route;
+use super::route::{resolve_session_route, retain_carried, rides_ohttp};
 use super::session::{EventCallback, EventSink, VotingSession};
 use super::store::VotingDatabaseHandle;
 use super::store_ffi::handle_from_ptr;
@@ -197,10 +197,14 @@ struct ProofStatusResponse {
 ///   their own server).
 /// - `tor` null, not `is_custom_server`, and OHTTP configured for the wallet's
 ///   network ([`zcashlc_ohttp_configure`](crate::ohttp_config::zcashlc_ohttp_configure)):
-///   OHTTP through the relay and gateway, failing closed. Every chain and PIR
-///   endpoint of the session must be one the gateway carries, or the open
-///   fails with `invalid_input`; nothing falls back to a direct connection.
-///   The session keeps the configuration installed when it opened.
+///   OHTTP through the relay and gateway, failing closed. The chain and PIR
+///   endpoints that the gateway's host list for the network does not carry
+///   are left out of the session; the open fails with `invalid_input` only
+///   when every chain endpoint, or every PIR endpoint, it was given is left
+///   out.
+///   Nothing falls back to a direct connection. The session keeps the
+///   configuration and the host lists installed when it opened. The open
+///   still reaches no network: it decides by the list as it is held.
 /// - `tor` null, not `is_custom_server`, and OHTTP off for the wallet's
 ///   network: the direct HTTP route, as the rest of the wallet's traffic on
 ///   that network.
@@ -219,27 +223,35 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
     let tor = AssertUnwindSafe(tor);
     let res = catch_panic(|| {
         let handle = unsafe { handle_from_ptr(*db) }?;
-        let inputs: SessionInputsDto =
+        let mut inputs: SessionInputsDto =
             unsafe { json_from_ptr(inputs_json, inputs_json_len, "session inputs") }?;
         let binding: SessionBindingDto =
             unsafe { json_from_ptr(binding_json, binding_json_len, "session binding") }?;
+        // Read once: the servers kept and the route are decided by the same
+        // configuration and host lists, whatever is installed meanwhile.
+        let lists = crate::ohttp_config::installed_third_party_hosts();
         // SAFETY: the caller's live runtime, per this function's contract. The
         // isolated client is taken here rather than by the host, so a session
         // cannot be handed a runtime whose circuits another part of the wallet
         // is already using.
+        let tor = unsafe { (*tor).as_ref() };
+        if rides_ohttp(
+            lists.networks(),
+            tor.is_some(),
+            is_custom_server,
+            handle.network,
+        ) {
+            retain_carried(&lists, handle.network, &mut inputs.chain_endpoints, "vote")?;
+            retain_carried(&lists, handle.network, &mut inputs.pir_endpoints, "PIR")?;
+        }
         let endpoints: Vec<&str> = inputs
             .chain_endpoints
             .iter()
             .chain(inputs.pir_endpoints.iter())
             .map(String::as_str)
             .collect();
-        let route = resolve_session_route(
-            crate::ohttp_config::installed_networks(),
-            unsafe { (*tor).as_ref() },
-            is_custom_server,
-            handle.network,
-            &endpoints,
-        )?;
+        let route =
+            resolve_session_route(lists, tor, is_custom_server, handle.network, &endpoints)?;
         let session = VotingSession::open(handle, inputs, binding, route, epoch)?;
         Ok(Box::into_raw(Box::new(VotingSessionHandle {
             session: Arc::new(session),
