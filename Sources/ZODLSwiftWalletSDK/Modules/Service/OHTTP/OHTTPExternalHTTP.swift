@@ -95,6 +95,11 @@ enum OHTTPExternalHTTP {
     /// Sends `request` through the relay and the gateway of the wallet's `network` and returns once the
     /// backend's head is in. With `viaTor` the relay leg, the key-configuration fetch included, rides Tor.
     /// `request.timeoutInterval` bounds each wait for the relay, not the whole answer.
+    ///
+    /// A passthrough host is admitted by the gateway's host list before anything is sent for it. That list is
+    /// fetched only through OHTTP, over this request's own transport and so on its route (Tor with `viaTor`),
+    /// and a host it does not carry is refused with `ZcashError.ohttpUnsupportedHost`: nothing is reached
+    /// directly.
     static func stream(
         _ request: URLRequest,
         network: NetworkType,
@@ -102,10 +107,11 @@ enum OHTTPExternalHTTP {
         torSender: @escaping OHTTPTransport.HTTPSender,
         torStreamSender: @escaping OHTTPTransport.StreamSender
     ) async throws -> OHTTPStreamedResponse {
-        guard let url = request.url, let host = url.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
-                || OHTTPEndpoints.isProxyAllowlisted(host: host)
-                || OHTTPEndpoints.isPathRestrictedProxyURL(url) else {
+        guard let url = request.url, let host = url.host else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        // A host that is not a fixed destination needs the list of the wallet's gateway, so OHTTP on for it.
+        guard OHTTPThirdPartyHosts.isFixedDestination(url, host: host) || OHTTPEndpoints.gatewayHost(for: network) != nil else {
             throw ZcashError.ohttpUnsupportedHost
         }
         let route = try OHTTPEndpoints.proxyRoute(for: host, network: network)
@@ -131,6 +137,15 @@ enum OHTTPExternalHTTP {
             )
         }
 
+        // The list is refreshed over this transport's round trip, which uses its own sender: in Tor mode a Tor
+        // circuit, never the device's own address.
+        try await OHTTPThirdPartyHosts.admit(
+            url: url,
+            host: host,
+            network: network,
+            exchange: OHTTPThirdPartyHosts.exchange(through: transport, timeoutMS: OHTTPThirdPartyHosts.admissionRefreshTimeoutMS)
+        )
+
         let streamed = try await transport.stream(request: inner, timeoutMS: timeoutMS(for: request.timeoutInterval))
         guard let response = HTTPURLResponse(
             url: url,
@@ -140,7 +155,12 @@ enum OHTTPExternalHTTP {
         ) else {
             throw ZcashError.ohttpResponseError
         }
-        return OHTTPStreamedResponse(response: response, body: streamed.body)
+        // A `403` for a host the list carries may be the gateway's `unknown authority`: its body is read through,
+        // as it comes, and reported to the list once it ends. A fixed destination is not on the list.
+        let body = streamed.status == 403 && !OHTTPThirdPartyHosts.isFixedDestination(url, host: host)
+            ? OHTTPThirdPartyHosts.watchingForUnknownAuthority(streamed.body, host: host, network: network)
+            : streamed.body
+        return OHTTPStreamedResponse(response: response, body: body)
     }
 
     /// The longest wait for the relay a request can ask for.
