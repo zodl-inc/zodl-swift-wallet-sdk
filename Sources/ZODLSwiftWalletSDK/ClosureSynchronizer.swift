@@ -202,6 +202,59 @@ public protocol ClosureSynchronizer {
     /// Closure counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
     func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void)
 
+    /// Counterpart of `Synchronizer.rejectedTransactionIdsStream`.
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { get }
+
+    // Disabled around the declarations rather than on the line before each: a `disable:next`
+    // between a doc comment and its symbol detaches the two.
+    // swiftlint:disable function_parameter_count
+
+    /// Closure counterpart of `Synchronizer.proposeTransfer(accountUUID:recipient:amount:memo:sizeBound:)`.
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    )
+
+    /// Closure counterpart of `Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:sizeBound:)`.
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    )
+    // swiftlint:enable function_parameter_count
+
+    /// Closure counterpart of `Synchronizer.proposefulfillingPaymentURI(_:accountUUID:sizeBound:)`.
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    )
+
+    /// Closure counterpart of `Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)`,
+    /// with ``OvkPolicy/sender``.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>) -> Void
+    )
+
+    /// Closure counterpart of `Synchronizer.createPCZTFromProposal(accountUUID:proposal:sizeBound:)`.
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Pczt, Error>) -> Void
+    )
+
     /// Closure counterpart of `Synchronizer.restartSync(at:)`.
     func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void)
 

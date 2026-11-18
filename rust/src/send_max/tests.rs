@@ -29,6 +29,7 @@ use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork, valu
 use super::*;
 use crate::error_report::Shortfall;
 
+mod bounded;
 mod migration_lanes;
 
 /// A synthetic wallet with one account, as `zcash_client_backend`'s test harness builds it.
@@ -44,8 +45,11 @@ const CONTEXT: &str = "propose_send_max_transfer";
 const NOTE_VALUE: u64 = 100_000;
 
 /// The ZIP 317 fee of a single-transaction send-max whose inputs and output all fit in the
-/// two-action minimum of one Orchard bundle.
-const MINIMUM_FEE: u64 = 10_000;
+/// grace actions' minimum of one Orchard bundle: librustzcash's `MINIMUM_FEE`, the marginal fee
+/// times the grace actions, so no fee literal is restated here.
+fn minimum_fee() -> u64 {
+    zcash_primitives::transaction::fees::zip317::MINIMUM_FEE.into_u64()
+}
 
 /// Received funds need ten confirmations under the default confirmations policy.
 const CONFIRMATIONS: usize = 10;
@@ -145,6 +149,7 @@ fn user_send_max(recipient: ZcashAddress, memo: Option<MemoBytes>) -> SendMaxReq
         recipient,
         memo,
         confirmations_policy: ConfirmationsPolicy::default(),
+        size_bound: TransactionSizeBound::CONSENSUS,
     }
 }
 
@@ -220,8 +225,8 @@ fn send_max_pays_the_whole_balance_less_the_fee() {
 
     let max = propose_max(&mut st, user_send_max(recipient, None)).expect("proposes the send-max");
 
-    assert_eq!(u64::from(total_fee(&max)), MINIMUM_FEE);
-    assert_eq!(u64::from(payment_total(&max)), NOTE_VALUE - MINIMUM_FEE);
+    assert_eq!(u64::from(total_fee(&max)), minimum_fee());
+    assert_eq!(u64::from(payment_total(&max)), NOTE_VALUE - minimum_fee());
     assert_eq!(spent_note_count(&max), 1);
 }
 
@@ -253,10 +258,10 @@ fn a_balance_that_does_not_exceed_the_fee_is_insufficient_funds() {
         e.amounts(),
         Some(Shortfall {
             available: Zatoshis::const_from_u64(BELOW_FEE),
-            required: Zatoshis::const_from_u64(MINIMUM_FEE + 1),
+            required: Zatoshis::const_from_u64(minimum_fee() + 1),
         })
     );
-    assert_redacted(&e, &["9000", "10001"]);
+    assert_redacted(&e, &["9000", &(minimum_fee() + 1).to_string()]);
 }
 
 #[test]
@@ -301,23 +306,40 @@ const TOO_MANY_NOTES: usize = 700;
 /// Notes per block when receiving [`TOO_MANY_NOTES`], to keep the chain short.
 const NOTES_PER_BLOCK: usize = 50;
 
-/// A wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes, each worth more than the
-/// marginal fee it costs to spend.
-fn wallet_with_too_many_notes() -> TestWallet {
-    let mut st = unscanned_wallet();
+/// Receives `count` Orchard notes, each worth more than the marginal fee it costs to spend, at
+/// most [`NOTES_PER_BLOCK`] to a block, and returns the height of the first block.
+fn receive_many_orchard_notes(st: &mut TestWallet, count: usize) -> BlockHeight {
     let output = FakeCompactOutput::new(
-        orchard_fvk(&st),
+        orchard_fvk(st),
         AddressType::DefaultExternal,
-        Zatoshis::const_from_u64(MINIMUM_FEE),
+        Zatoshis::const_from_u64(minimum_fee()),
     );
-    let block = vec![output; NOTES_PER_BLOCK];
-    let first = (0..TOO_MANY_NOTES / NOTES_PER_BLOCK)
-        .map(|_| st.generate_next_block_multi(&block).0)
-        .min()
-        .unwrap();
+    let mut remaining = count;
+    let mut first = None;
+    while remaining > 0 {
+        let in_block = remaining.min(NOTES_PER_BLOCK);
+        let height = st
+            .generate_next_block_multi(&vec![output.clone(); in_block])
+            .0;
+        first.get_or_insert(height);
+        remaining -= in_block;
+    }
+    first.expect("at least one note")
+}
+
+/// A wallet holding `count` spendable Orchard notes, as [`receive_many_orchard_notes`] receives
+/// them.
+fn wallet_with_note_count(count: usize) -> TestWallet {
+    let mut st = unscanned_wallet();
+    let first = receive_many_orchard_notes(&mut st, count);
     mine_empty_blocks(&mut st, CONFIRMATIONS);
     scan_from(&mut st, first);
     st
+}
+
+/// A wallet holding [`TOO_MANY_NOTES`] spendable Orchard notes.
+fn wallet_with_too_many_notes() -> TestWallet {
+    wallet_with_note_count(TOO_MANY_NOTES)
 }
 
 /// A send-max that would spend more notes than fit in a block is refused when it is proposed,

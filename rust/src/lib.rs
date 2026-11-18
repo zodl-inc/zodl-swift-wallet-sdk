@@ -126,12 +126,15 @@ mod ohttp;
 mod ohttp_config;
 mod ohttp_health;
 mod payment_uri;
+mod pczt_txid;
 mod retained_marks;
 mod sapling_prover;
 mod send_max;
+mod size_bound;
 mod tor;
 use tor::startup::*;
 mod voting;
+mod zip317;
 
 #[cfg(target_vendor = "apple")]
 mod os_log;
@@ -2777,9 +2780,13 @@ fn zip317_helper<DbT>(
 /// - `to` must be non-null and must point to a null-terminated UTF-8 string.
 /// - `memo` must either be null (indicating an empty memo or a transparent recipient) or point to a
 ///   512-byte array.
+/// - `size_bound`: the caps the proposal is held to below consensus, as
+///   [`ffi::FfiTransactionSizeBound`] describes; all `-1` for consensus only. A proposal exceeding
+///   it fails as `TransactionTooLarge`.
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_propose_transfer(
     db_data: *const u8,
     db_data_len: usize,
@@ -2789,11 +2796,13 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
     memo: *const u8,
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_transfer";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
@@ -2870,6 +2879,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
             debug!("{CONTEXT} failed: {e}");
             ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -2900,9 +2910,12 @@ pub unsafe extern "C" fn zcashlc_propose_transfer(
 /// - `orchard_only`: when `true`, restricts the spendable pools to Orchard alone (the Orchard→
 ///   Ironwood immediate migration lane's sweep, which must not draw on Sapling funds); when
 ///   `false`, spends from both Sapling and Orchard (pre-existing behavior).
+/// - `size_bound`: as for [`zcashlc_propose_transfer`], for the user's send-max only. It is
+///   ignored when `orchard_only` is `true`: the migration lane is never bounded.
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     db_data: *const u8,
     db_data_len: usize,
@@ -2913,6 +2926,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
     mode: ffi::MaxSpendMode,
     confirmations_policy: ffi::ConfirmationsPolicy,
     orchard_only: bool,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_send_max_transfer";
 
@@ -2968,6 +2982,7 @@ pub unsafe extern "C" fn zcashlc_propose_send_max_transfer(
                 recipient: to,
                 memo,
                 confirmations_policy: confirmation_policy,
+                size_bound: size_bound::TransactionSizeBound::try_from(size_bound)?,
             };
 
             send_max::propose(&mut db_data, &network, account_uuid, request, CONTEXT)?
@@ -3089,6 +3104,7 @@ pub unsafe extern "C" fn zcashlc_propose_orchard_to_ironwood_migration(
 /// - `network_id` a u32. 0 for Testnet and 1 for Mainnet
 /// - `confirmations_policy` number of trusted/untrusted confirmations of the funds to spend
 /// - `use_zip317_fees` `true` to use ZIP-317 fees.
+/// - `size_bound`: as for [`zcashlc_propose_transfer`].
 /// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned
 ///   pointer when done using it.
 #[unsafe(no_mangle)]
@@ -3099,11 +3115,13 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
     payment_uri: *const c_char,
     network_id: u32,
     confirmations_policy: ffi::ConfirmationsPolicy,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     const CONTEXT: &str = "propose_transfer_from_uri";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
@@ -3143,6 +3161,7 @@ pub unsafe extern "C" fn zcashlc_propose_transfer_from_uri(
             debug!("{CONTEXT} failed: {e}");
             ClassifiedError::classify_proposing(CONTEXT, &e)
         })?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
 
         let encoded = Proposal::from_standard_proposal(&proposal).encode_to_vec();
 
@@ -3627,7 +3646,11 @@ where
 ///   function call.
 /// - The total size `output_params_len` must be no larger than `isize::MAX`. See the safety
 ///   documentation of pointer::offset.
+///
+/// `size_bound` is checked before anything is built, as for [`zcashlc_propose_transfer`]; all
+/// `-1` checks consensus only, which the builder does regardless.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     db_data: *const u8,
     db_data_len: usize,
@@ -3641,11 +3664,13 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
     output_params_len: usize,
     network_id: u32,
     ovk_policy: u32,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::TxIds {
     const CONTEXT: &str = "create_proposed_transactions";
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let ovk_policy = parse_ovk_policy(ovk_policy)?;
@@ -3671,6 +3696,7 @@ pub unsafe extern "C" fn zcashlc_create_proposed_transactions(
             )
         }?;
         let proposal = proposal_proto.try_into_standard_proposal(&network, &db_data)?;
+        size_bound::enforce(&proposal, &network, &size_bound, CONTEXT)?;
         let usk = unsafe { decode_usk(usk_ptr, usk_len) }?;
         let expiry_height = requested_expiry_height(&network, &db_data, &proposal);
 
@@ -3765,6 +3791,8 @@ pub unsafe extern "C" fn zcashlc_get_transaction(
 /// - `proposal_ptr`: A pointer to a buffer containing an encoded `Proposal` protobuf.
 /// - `proposal_len`: The length of the `proposal_ptr` buffer.
 /// - `account_uuid_bytes`: A pointer to the 16-byte representaion of the account UUID.
+/// - `size_bound`: checked before the PCZT is created, as for [`zcashlc_propose_transfer`]; all
+///   `-1` checks consensus only. A proposal exceeding it fails as `TransactionTooLarge`.
 ///
 /// # Safety
 ///
@@ -3793,15 +3821,23 @@ pub unsafe extern "C" fn zcashlc_create_pczt_from_proposal(
     proposal_ptr: *const u8,
     proposal_len: usize,
     account_uuid_bytes: *const u8,
+    size_bound: ffi::FfiTransactionSizeBound,
 ) -> *mut ffi::BoxedSlice {
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let size_bound = size_bound::TransactionSizeBound::try_from(size_bound)?;
         let mut db_data = unsafe { wallet_db(system_rng(), db_data, db_data_len, network)? };
 
         let proposal =
             Proposal::decode(unsafe { slice::from_raw_parts(proposal_ptr, proposal_len) })
                 .map_err(|e| anyhow!("Invalid proposal: {}", e))?
                 .try_into_standard_proposal(&network, &db_data)?;
+        size_bound::enforce(
+            &proposal,
+            &network,
+            &size_bound,
+            "create_pczt_from_proposal",
+        )?;
 
         let account_uuid = account_uuid_from_bytes(account_uuid_bytes)?;
 
@@ -9031,6 +9067,17 @@ fn tip_fresh_stop_window<P: Parameters>(network: &P, known_tip: u64) -> std::tim
 /// commit (a few seconds, A10).
 const SLIPSTREAM_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The stack each thread of a handle's runtime gets in an unoptimized build.
+///
+/// A session's first poll runs on one of those threads, from the task down to its first network
+/// dial, without yielding. Unoptimized, the session's async frames give every nested future a
+/// stack slot of its own, and that one poll needs about 2.1 MiB: past the 2 MiB a thread gets by
+/// default, on which a debug build aborts with a stack overflow whenever a session gets as far as
+/// dialling its server. An optimized build needs a few hundred KiB on the same path and keeps the
+/// default, because every thread of the runtime, the blocking pool's included, reserves this much.
+#[cfg(debug_assertions)]
+const UNOPTIMIZED_SLIPSTREAM_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// C-compatible snapshot of Slipstream engine progress. Returned by
 /// [`zcashlc_slipstream_snapshot`] (by value — no heap allocation).
 ///
@@ -9259,11 +9306,11 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             }
         }
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .map_err(|e| anyhow!("tokio runtime: {e}"))?;
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(4).enable_all();
+        #[cfg(debug_assertions)]
+        runtime.thread_stack_size(UNOPTIMIZED_SLIPSTREAM_THREAD_STACK_SIZE);
+        let runtime = runtime.build().map_err(|e| anyhow!("tokio runtime: {e}"))?;
 
         let inner = slipstream_core::ffi_handle::SlipstreamHandle {
             runtime,
@@ -12867,6 +12914,66 @@ mod tor_startup_ffi_tests {
             zcashlc_slipstream_stop(handle);
             zcashlc_slipstream_tor_startup_free_v1(startup);
             zcashlc_slipstream_free(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod slipstream_runtime_stack_tests {
+    use super::*;
+    use std::{
+        net::TcpListener,
+        ptr,
+        time::{Duration, Instant},
+    };
+
+    /// A session started without Tor dials its server in its first poll, which runs on one of the
+    /// handle runtime's threads and reaches the deepest stack the session uses before its first
+    /// await. A connection arriving at the listener proves that thread's stack held it.
+    #[test]
+    fn a_direct_session_dials_its_server_within_the_runtime_thread_stack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (_dir, db) = crate::voting::test_support::temp_wallet_db(NETWORK_ID_TESTNET);
+        let host = b"127.0.0.1";
+        unsafe {
+            let handle = zcashlc_slipstream_open(
+                db.as_ptr(),
+                db.len(),
+                host.as_ptr(),
+                host.len(),
+                port,
+                false,
+                NETWORK_ID_TESTNET,
+                0,
+            );
+            assert!(!handle.is_null());
+            assert!(zcashlc_slipstream_start(
+                handle,
+                ptr::null(),
+                0,
+                0,
+                ptr::null(),
+                0
+            ));
+            // Generous, because a loaded machine may run the session's first poll late.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let dialled = loop {
+                match listener.accept() {
+                    Ok(_) => break true,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break false,
+                }
+            };
+            zcashlc_slipstream_stop(handle);
+            zcashlc_slipstream_free(handle);
+            assert!(dialled, "the session never dialled its server");
         }
     }
 }

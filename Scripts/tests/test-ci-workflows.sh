@@ -665,3 +665,17 @@ test_ci_install_excludes_intel_rust_targets() {
     assert_file_contains "$output" 'aarch64-apple-ios-sim' 'simulator target remains available'
     assert_file_contains "$output" 'aarch64-apple-darwin' 'macOS target remains available'
 }
+
+# upload-artifact follows symlinks and stores the files they point to, so a raw
+# XCFramework directory loses the macOS framework's version links in transit and
+# the layout validator then rejects it. A tar file keeps the links intact.
+test_no_workflow_uploads_the_raw_xcframework_directory() {
+    local f offenders
+    for f in "$REPO_ROOT"/.github/workflows/*.yml; do
+        offenders="$SCRATCH/artifact-paths-$(basename "$f").txt"
+        awk '/uses:[[:space:]]*actions\/(upload|download)-artifact@/ { in_step = 1; next }
+             /^[[:space:]]*-[[:space:]]/ { in_step = 0 }
+             in_step && /path:.*libzcashlc\.xcframework[[:space:]]*$/ { print }' "$f" > "$offenders"
+        assert_succeeds "$(basename "$f") moves no raw XCFramework directory as an artifact" test ! -s "$offenders"
+    done
+}

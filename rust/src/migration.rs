@@ -8340,6 +8340,7 @@ mod tests {
                     untrusted: 1,
                     allow_zero_conf_shielding: true,
                 },
+                crate::ffi::FfiTransactionSizeBound::CONSENSUS,
             )
         };
         if ptr.is_null() {

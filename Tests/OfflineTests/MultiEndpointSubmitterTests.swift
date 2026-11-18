@@ -71,6 +71,81 @@ final class MultiEndpointSubmitterTests: ZcashTestCase {
         XCTAssertTrue([-25, -26].contains(code))
     }
 
+    func testEveryEndpointRefusingTerminallyIsRejected() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertNotNil(result.outcome.rejection)
+        XCTAssertNotNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+    }
+
+    func testATransientRefusalBesideAnExplicitOneKeepsItPending() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
+        mock.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        guard case .rejected = result.outcome else {
+            return XCTFail("Expected rejected, got \(result.outcome)")
+        }
+        XCTAssertNil(
+            submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil),
+            "the transient refusal may clear on a later attempt"
+        )
+    }
+
+    func testATransportFailureBesideAnExplicitRejectionIsInconclusive() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
+        mock.set(behavior: .failTransport, for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertEqual(result.outcome, .rejected(code: -26, message: "bad-txns-vout-negative"))
+        XCTAssertEqual(result.endpointOutcomes[endpointKey(endpoint(2))], .failed)
+        XCTAssertNil(
+            submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil),
+            "a transport failure may hide an acceptance, so it holds back the rejection"
+        )
+    }
+
+    func testAnAnswerAfterTheDeadlineIsInTheSettledOutcomes() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        let gate = Gate()
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
+        mock.set(behavior: .gated(gate, then: .succeed), for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(
+            transaction: makeTransaction(),
+            to: endpoints,
+            timing: SubmissionTiming(responseTimeout: 0.2, postAcceptanceGraceDelay: 0.1)
+        )
+        XCTAssertEqual(result.outcome, .timedOut)
+        XCTAssertNil(result.endpointOutcomes[endpointKey(endpoint(2))])
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+
+        gate.open()
+        let settled = await result.settledEndpointOutcomes()
+
+        XCTAssertEqual(settled[endpointKey(endpoint(1))], .refused(code: -26, message: "bad-txns-vout-negative"))
+        XCTAssertEqual(settled[endpointKey(endpoint(2))], .accepted, "work that ignores cancellation still answers")
+    }
+
+    func testAnAcceptanceIsNeverRejectedByAll() async {
+        let endpoints = [endpoint(1), endpoint(2)]
+        mock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint(1))
+        mock.set(behavior: .succeed, for: endpoint(2))
+
+        let result = await submitter.submitClassifyingRejection(transaction: makeTransaction(), to: endpoints, timing: fastTiming)
+
+        XCTAssertEqual(result.outcome, .accepted(by: endpoint(2)))
+        XCTAssertNil(submitRejectionVerdict(planEndpoints: endpoints, outcomes: result.endpointOutcomes, previous: nil))
+    }
+
     func testAllTransportFailuresAreUnreachable() async {
         let endpoints = [endpoint(1), endpoint(2)]
         mock.set(behavior: .failTransport, for: endpoint(1))
