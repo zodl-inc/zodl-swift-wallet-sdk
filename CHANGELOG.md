@@ -10,13 +10,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `SlipstreamSynchronizer.getLocalAccountBalances()` no longer starts a new read of the wallet
   database for each caller. A call made while another call's read is still running waits for that
-  read and returns its result, or throws its error. The read blocks a Swift concurrency thread for
-  its whole duration, which is seconds on a wallet with a long history. Several reads at once, as
-  when the app returns to the foreground, could block every such thread and stall all other async
-  work in the app, including Face ID prompts, for many seconds. A call made after a read has
-  finished still starts a fresh one. No change is needed at call sites.
+  read and returns its result, or throws its error. The read takes seconds on a wallet with a long
+  history, and several reads at once, as when the app returns to the foreground, blocked every Swift
+  concurrency thread and stalled all other async work in the app, including Face ID prompts, for
+  many seconds. A call made after a read has finished still starts a fresh one. No change is needed
+  at call sites.
 - `SlipstreamSynchronizer.getAccountsBalances()` no longer reads the local balances, which it never
   returned. Its result is unchanged, and it no longer pays for that read.
+- Wallet-summary reads now run off the Swift concurrency thread pool. This covers
+  `SlipstreamSynchronizer.getLocalAccountBalances()`, the local balances in
+  `SlipstreamSynchronizer`'s state, and on `SDKSynchronizer` `getAccountsBalances()`,
+  `getLocalAccountBalances()`, the balances in its state stream and the sync progress read. The
+  caller suspends while the wallet database is read, instead of holding one of the pool's threads
+  for the whole read, so other async work in the app keeps running. `SDKSynchronizer` does not
+  share one read between concurrent callers; each call still reads the database. No change is
+  needed at call sites.
 
 # 7.0.1 - 2026-11-02
 
