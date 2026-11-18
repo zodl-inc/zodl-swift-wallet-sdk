@@ -105,6 +105,44 @@ final class OHTTPThirdPartyHostsTests: XCTestCase {
         XCTAssertEqual(calls.count, 1)
     }
 
+    func testAdmitRefusesAnHTTPURL() async throws {
+        // No list is fetched yet, so a refresh would be due: the scheme is refused before it.
+        let calls = ExchangeCalls()
+
+        await assertRefused(try url("http://zvote.zodl.com/x"), exchange: calls.exchange(answering: answer(["zvote.zodl.com"])))
+
+        XCTAssertEqual(calls.count, 0)
+    }
+
+    func testACancelledCallerIsLeftOutOfTheRefresh() async throws {
+        let calls = ExchangeCalls()
+        let exchange = calls.exchange(answering: answer(["helper.example.com"]))
+        let target = try url(unknownURL)
+
+        let task = Task {
+            // Runs the body only once the task is cancelled.
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            try await OHTTPThirdPartyHosts.admit(url: target, host: target.host ?? "", network: .mainnet, exchange: exchange)
+        }
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("a cancelled caller was admitted")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("a cancelled caller got \(error)")
+        }
+        XCTAssertEqual(calls.count, 0)
+
+        // No refresh was begun and failed, so no backoff was started.
+        let handle = OHTTPNative.thirdPartyBeginRefresh(network: .mainnet)
+        XCTAssertNotNil(handle)
+        handle?.fail()
+    }
+
     func testAdmitRunsADueRefreshFirstThenPassesACarriedHost() async throws {
         let calls = ExchangeCalls()
 

@@ -42,13 +42,14 @@ enum OHTTPThirdPartyHosts {
         }
     }
 
-    /// Runs one refresh of `network`'s list if one is due. Nil when none was due.
+    /// Runs one refresh of `network`'s list if one is due. Nil when none was due, and when the caller is already
+    /// cancelled: a refresh begun only to fail would start the list's backoff for every caller.
     ///
     /// The refresh ends in every case: with the gateway's answer, or as failed when `exchange` throws, a
     /// cancellation included, so the list held stays in use and the next refresh is not blocked.
     @discardableResult
     static func refresh(network: NetworkType, exchange: Exchange) async -> OHTTPHostListRefreshOutcome? {
-        guard let refresh = OHTTPNative.thirdPartyBeginRefresh(network: network) else {
+        guard !Task.isCancelled, let refresh = OHTTPNative.thirdPartyBeginRefresh(network: network) else {
             return nil
         }
         let request = OHTTPRequest(
@@ -75,8 +76,8 @@ enum OHTTPThirdPartyHosts {
 
     /// Passes, or throws `ZcashError.ohttpUnsupportedHost` before anything is sent to `host`.
     ///
-    /// A fixed destination passes without the list. Any other host needs OHTTP on for `network` and no port but
-    /// 443, since the request is sent under the host alone. A refresh that is due runs first, over `exchange`;
+    /// A fixed destination passes without the list. Any other host needs OHTTP on for `network`, an `https` URL
+    /// and no port but 443, since the request is sent under the host alone. A refresh that is due runs first, over `exchange`;
     /// a host the list does not carry then gets one more refresh when the list is worth asking again, and waits
     /// up to `runningRefreshWait` for a refresh another caller is running, before it is refused. Every wait
     /// happens in the caller's task, and a cancelled caller stops waiting.
@@ -90,6 +91,9 @@ enum OHTTPThirdPartyHosts {
         if isFixedDestination(url, host: host) {
             return
         }
+        guard url.scheme?.lowercased() == "https" else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
         guard OHTTPEndpoints.gatewayHost(for: network) != nil else {
             throw ZcashError.ohttpUnsupportedHost
         }
@@ -98,12 +102,14 @@ enum OHTTPThirdPartyHosts {
         }
 
         await refresh(network: network, exchange: exchange)
+        try Task.checkCancellation()
         if OHTTPEndpoints.isProxyAllowlisted(host: host, network: network) {
             return
         }
 
         if OHTTPNative.thirdPartyRefreshBeforeRefusing(network: network) {
             await refresh(network: network, exchange: exchange)
+            try Task.checkCancellation()
         }
         let waitStarted = ContinuousClock.now
         while OHTTPNative.thirdPartyIsRefreshing(network: network), seconds(since: waitStarted) < runningRefreshWait {
