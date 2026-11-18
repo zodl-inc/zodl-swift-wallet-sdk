@@ -43,6 +43,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request that needs it (over Tor in Tor mode), is kept in memory, and is forgotten when another
   configuration is installed. A failed fetch keeps the list held. A host that is not carried is
   refused with `ohttpUnsupportedHost`, after at most one refresh, and is never reached directly.
+  `makeVotingRoundSession`, `httpRequestOverOHTTP` and `httpStreamOverOHTTP` may first wait for one
+  host-list refresh.
   A voting session with Tor off leaves out the chain and PIR endpoints the gateway does not carry
   and is refused only when none of a kind is left. A voting server on a port other than 443, or
   with an `http://` URL, is refused through OHTTP. See MIGRATING.md.

@@ -696,9 +696,10 @@ impl RouteHttp for OhttpRoute {
 ///
 /// `endpoint_urls` is every chain and PIR endpoint the session will use: they
 /// share one route (a PIR query hides which rows are fetched, not who fetches
-/// them), so one that the gateway cannot carry refuses the session rather than
-/// failing partway through a round. It is read only in the Tor-off, predefined
-/// case with OHTTP on. The route keeps `lists`, so every request of the session
+/// them), so the route refuses one that the gateway cannot carry rather than
+/// failing partway through a round. The open filters the endpoints the gateway
+/// does not carry out first, so the route sees only the carried ones. It is read
+/// only in the Tor-off, predefined case with OHTTP on. The route keeps `lists`, so every request of the session
 /// is decided by the lists it opened with.
 pub(super) fn resolve_session_route(
     lists: Arc<ThirdPartyHostLists>,
@@ -1196,7 +1197,7 @@ mod tests {
     fn tor_off_unknown_predefined_server_fails_closed() {
         for urls in [
             &["https://unknown.example.com/"][..],
-            // One unsupported endpoint refuses the whole session.
+            // The route refuses one unsupported endpoint; the open filters such endpoints out first.
             &["https://vote.zodl.com", "https://pir.example.com/"][..],
             &[][..],
         ] {
@@ -1287,8 +1288,8 @@ mod tests {
             assert_eq!(route.network, engine_network);
             assert!(Arc::ptr_eq(route.lists.networks(), &networks));
 
-            // Unchanged with a configuration: a server the gateway does not carry still refuses
-            // the session rather than going direct.
+            // Unchanged with a configuration: the route still refuses a server the gateway does not
+            // carry rather than going direct. The open filters such servers out before it asks.
             assert!(
                 resolve_session_route(
                     lists(),

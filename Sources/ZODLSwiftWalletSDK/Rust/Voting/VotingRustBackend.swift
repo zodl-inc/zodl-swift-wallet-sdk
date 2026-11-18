@@ -341,9 +341,10 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// - `nil`, `isCustomServer == false` (predefined servers) and an OHTTP
     ///   configuration for the wallet's network (`OHTTPEndpoints.configure(_:)`):
     ///   OHTTP through the relay and gateway, so no vote or PIR server sees the
-    ///   voter's address. Fails closed: when any chain or PIR endpoint is not one
-    ///   the gateway carries, opening throws ``VotingError`` with
-    ///   ``VotingErrorKind/invalidInput``, and nothing falls back to a direct
+    ///   voter's address. The session leaves out the chain and PIR endpoints the
+    ///   gateway does not carry. Fails closed: opening throws ``VotingError`` with
+    ///   ``VotingErrorKind/invalidInput`` only when none of the chain endpoints or
+    ///   none of the PIR endpoints is left, and nothing falls back to a direct
     ///   connection when the gateway is unavailable. The session keeps the
     ///   configuration installed when it opened.
     /// - `nil`, `isCustomServer == false` and no OHTTP configuration for the

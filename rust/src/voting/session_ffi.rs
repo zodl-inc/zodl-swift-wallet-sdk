@@ -1029,8 +1029,9 @@ mod tests {
 
     /// A predefined server with Tor off goes through the OHTTP gateway the app
     /// configured, which carries only its own exact host list: the fixture's
-    /// endpoints are not on it, so the open is refused up front, typed, rather
-    /// than falling back to a direct connection.
+    /// endpoints are not on it, so the open filters them out, finds none left and
+    /// is refused up front, typed, rather than falling back to a direct
+    /// connection.
     #[test]
     fn session_open_tor_off_predefined_server_outside_the_gateway_fails_closed() {
         let _guard = crate::ohttp_config::lock_installed_networks();
