@@ -1428,12 +1428,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// A named result type rather than a tuple — SwiftLint's `large_tuple` caps tuples at 2
     /// members — but every call site's `.visible` / `.local` / `.isSpendableMasked` member access
     /// reads identically either way.
-    private func walletBalanceSnapshots() async -> WalletBalanceSnapshots {
+    ///
+    /// `includeLocal: false` skips the local snapshot for callers that only read `visible`. The local
+    /// read is a full, uncached `get_wallet_summary` walk of the wallet database, which takes seconds
+    /// on a wallet with a long history, so a caller that discards it must not pay for it.
+    private func walletBalanceSnapshots(includeLocal: Bool = true) async -> WalletBalanceSnapshots {
         // [MOB-1850] The policy is spelled out for the same reason the drain capacity is: it is the
         // concrete engine's own default, restated because a protocol requirement cannot carry one.
         let summary = await engine.walletSummary(confirmationsPolicy: ConfirmationsPolicy.defaultTransferPolicy())
-        let provider = initializer.rustBackend as? LocalBalanceProviding
-        let local = try? await provider?.getLocalAccountBalances()
+        let local: [AccountUUID: AccountBalance]?
+        if includeLocal, let provider = initializer.rustBackend as? LocalBalanceProviding {
+            local = try? await sharedLocalAccountBalances(provider: provider)
+        } else {
+            local = nil
+        }
         guard let summary else {
             return WalletBalanceSnapshots(visible: nil, local: local, isSpendableMasked: nil)
         }
@@ -1450,14 +1458,48 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [v2.1 Phase 2] ONE call, correct at every phase: the engine resolves recovery
         // (Σ-reconciled view values) vs normal (upstream passthrough) inside the unified
         // summary FFI and rations the expensive walk itself — no host-side branching.
-        let summaries = await walletBalanceSnapshots()
+        // Only `visible` is returned, so the local snapshot is not read at all.
+        let summaries = await walletBalanceSnapshots(includeLocal: false)
         return summaries.visible?.accountBalances ?? [:]
     }
 
     public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
         guard latestState.internalSyncStatus.isPrepared else { return nil }
         guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
-        return try await provider.getLocalAccountBalances()
+        return try await sharedLocalAccountBalances(provider: provider)
+    }
+
+    /// The local-balance read that is in flight, shared by every caller that arrives while it runs.
+    private var inFlightLocalAccountBalances: Task<Result<[AccountUUID: AccountBalance], Error>, Never>?
+
+    /// Reads the local balances once for all concurrent callers.
+    ///
+    /// The read is a blocking `get_wallet_summary` FFI call that occupies a cooperative-pool thread
+    /// for its whole duration, and on a wallet with a long history it takes seconds. When the app
+    /// returns to the foreground, the poll tick and several features ask for balances at once; each
+    /// starting its own walk filled every cooperative thread, and all other Swift work stalled until
+    /// they finished. A caller that arrives while a read is running waits for that read instead, so
+    /// at most one walk runs at a time. Every waiter receives the same result or the same error.
+    private func sharedLocalAccountBalances(
+        provider: LocalBalanceProviding
+    ) async throws -> [AccountUUID: AccountBalance] {
+        if let inFlight = inFlightLocalAccountBalances {
+            return try await inFlight.value.get()
+        }
+        let read = Task<Result<[AccountUUID: AccountBalance], Error>, Never> {
+            do {
+                return .success(try await provider.getLocalAccountBalances())
+            } catch {
+                return .failure(error)
+            }
+        }
+        inFlightLocalAccountBalances = read
+        let result = await read.value
+        // The actor may have started a newer read while this one was awaited; only clear our own.
+        if inFlightLocalAccountBalances == read {
+            inFlightLocalAccountBalances = nil
+        }
+        return try result.get()
     }
 
     public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
