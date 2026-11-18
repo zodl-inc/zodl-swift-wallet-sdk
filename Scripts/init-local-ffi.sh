@@ -95,26 +95,9 @@ PY
     gh release download "$SDK_VERSION" --repo "$REPO" --pattern libzcashlc.xcframework.zip --dir "$STAGE"
     ACTUAL_CHECKSUM=$(shasum -a 256 "$STAGE/libzcashlc.xcframework.zip" | awk '{print $1}')
     [[ "$ACTUAL_CHECKSUM" == "$EXPECTED_CHECKSUM" ]] || { echo 'Error: Checksum mismatch!' >&2; exit 1; }
-    # Check every member before extracting anything. Release products are shallow:
-    # links and special files are rejected, including entries outside the bundle.
-    python3 - "$STAGE/libzcashlc.xcframework.zip" "$STAGE" <<'PY'
-from pathlib import Path, PurePosixPath
-import stat
-import sys
-import zipfile
-archive, stage = sys.argv[1:]
-with zipfile.ZipFile(archive) as source:
-    seen = set()
-    for item in source.infolist():
-        path = PurePosixPath(item.filename)
-        kind = stat.S_IFMT(item.external_attr >> 16)
-        if (path.is_absolute() or '\\' in item.filename or '..' in path.parts
-                or not path.parts or path.parts[0] != 'libzcashlc.xcframework'
-                or kind not in (0, stat.S_IFREG, stat.S_IFDIR) or path in seen):
-            raise ValueError('unsafe or duplicate archive member: ' + item.filename)
-        seen.add(path)
-    source.extractall(Path(stage))
-PY
+    # Members are checked before anything is written. Links are refused except the
+    # five fixed ones of a versioned macOS framework, which new releases store.
+    python3 Scripts/lib/ffi_layout.py extract "$STAGE/libzcashlc.xcframework.zip" "$STAGE"
 else
     mkdir -p "$STAGED_XCFW"
     SLICES=()
@@ -143,7 +126,7 @@ python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" "${VALIDATION[@]}"
 if [[ -d "$STAGED_XCFW/macos-arm64" ]]; then
     ./Scripts/version-macos-framework.sh "$STAGED_XCFW/macos-arm64/libzcashlc.framework"
 fi
-python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" --allow-versioned-macos "${VALIDATION[@]}"
+python3 Scripts/lib/ffi_layout.py validate "$STAGED_XCFW" "${VALIDATION[@]}"
 cp BuildSupport/LocalPackages-Package.swift "$STAGE/Package.swift"
 
 # Same-filesystem renames with rollback keep the installed bundle and wrapper

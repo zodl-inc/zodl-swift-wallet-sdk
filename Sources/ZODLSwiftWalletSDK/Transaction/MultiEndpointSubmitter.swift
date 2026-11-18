@@ -19,15 +19,41 @@ final class MultiEndpointSubmitter {
         self.logger = logger
     }
 
+    /// The outcome of one submission race, with what each endpoint answered.
+    struct RaceResult {
+        let outcome: TransactionSubmissionOutcome
+        /// Each endpoint's answer, keyed by `endpointKey(_:)`, as far as the race had them when it
+        /// resolved; an endpoint still in flight then (after a timeout, say) has no entry.
+        let endpointOutcomes: [String: EndpointSubmission]
+        /// The race itself, still winding down in the background after `outcome` resolved.
+        let race: SubmissionRace?
+
+        /// Each endpoint's final answer, once every endpoint's submission has ended: an endpoint in
+        /// work that ignores cancellation (Tor) may still accept or refuse after the deadline.
+        /// An endpoint whose submission ended by cancellation without answering has no entry.
+        func settledEndpointOutcomes() async -> [String: EndpointSubmission] {
+            guard let race else { return endpointOutcomes }
+            return await race.settledAnswers()
+        }
+    }
+
     func submit(
         transaction: CreatedTransaction,
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> TransactionSubmissionOutcome {
+        await submitClassifyingRejection(transaction: transaction, to: endpoints, timing: timing).outcome
+    }
+
+    func submitClassifyingRejection(
+        transaction: CreatedTransaction,
+        to endpoints: [LightWalletEndpoint],
+        timing: SubmissionTiming
+    ) async -> RaceResult {
         let health = OHTTPHealthFailureOwner()
         guard !endpoints.isEmpty else {
             logger.warn("Multi-endpoint submission requested with an empty endpoint list.")
-            return .unreachable
+            return RaceResult(outcome: .unreachable, endpointOutcomes: [:], race: nil)
         }
 
         let race = SubmissionRace(
@@ -45,7 +71,7 @@ final class MultiEndpointSubmitter {
             await race.run()
         }
 
-        return await withTaskCancellationHandler {
+        let outcome = await withTaskCancellationHandler {
             await race.outcome()
         } onCancel: {
             worker.cancel()
@@ -58,6 +84,7 @@ final class MultiEndpointSubmitter {
                 await race.callerCancelled()
             }
         }
+        return RaceResult(outcome: outcome, endpointOutcomes: await race.endpointOutcomes(), race: race)
     }
 }
 
@@ -79,7 +106,10 @@ actor SubmissionRace {
     private let health: OHTTPHealthFailureOwner
     private var failedAttempts: [OHTTPHealthAttempt?]
     private var completedCount = 0
+    private var answers: [String: EndpointSubmission] = [:]
     private var graceTask: Task<Void, Never>?
+    private var settled = false
+    private var settledContinuations: [CheckedContinuation<[String: EndpointSubmission], Never>] = []
 
     init(
         transaction: CreatedTransaction,
@@ -125,6 +155,7 @@ actor SubmissionRace {
         // Safety net: if nothing resolved (every child ended via cancellation
         // before reporting), the caller must still be released.
         resolve(.cancelled)
+        settle()
     }
 
     /// External cancellation: resolves `.cancelled` immediately (unless an
@@ -133,6 +164,25 @@ actor SubmissionRace {
     /// failure cannot win over the cancellation.
     func callerCancelled() {
         resolve(.cancelled)
+    }
+
+    /// What each endpoint has answered so far. Complete once the race has resolved `.rejected`,
+    /// which happens only after every endpoint answered.
+    func endpointOutcomes() -> [String: EndpointSubmission] {
+        answers
+    }
+
+    /// What each endpoint answered, once every child task has ended (see `run()`); the answers can
+    /// still change after the caller-facing outcome resolved, until then.
+    func settledAnswers() async -> [String: EndpointSubmission] {
+        if settled { return answers }
+        return await withCheckedContinuation { continuation in
+            if settled {
+                continuation.resume(returning: answers)
+            } else {
+                settledContinuations.append(continuation)
+            }
+        }
     }
 
     /// The caller-facing promise. Resumes exactly once.
@@ -155,6 +205,10 @@ actor SubmissionRace {
             try await health.withAttempt(attempt) {
                 try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
             }
+            submissionSucceeded(at: endpoint)
+        } catch let TransactionEncoderError.submitError(code, message) where SubmitRefusal.meansAccepted(code: code, message: message) {
+            // The server already holds the transaction: that is its acceptance.
+            logger.debug("Transaction \(transaction.txId.toHexStringTxId()) is already held by \(endpoint.host):\(endpoint.port): \(code) \(message)")
             submissionSucceeded(at: endpoint)
         } catch let TransactionEncoderError.submitError(code, message) {
             submissionRejected(at: endpoint, code: code, message: message)
@@ -188,6 +242,7 @@ actor SubmissionRace {
 
     private func submissionSucceeded(at endpoint: LightWalletEndpoint) {
         completedCount += 1
+        answers[endpointKey(endpoint)] = .accepted
         if winner == nil {
             winner = endpoint
             logger.info("Transaction \(transaction.txId.toHexStringTxId()) accepted by \(endpoint.host):\(endpoint.port).")
@@ -204,6 +259,7 @@ actor SubmissionRace {
         if firstRejection == nil {
             firstRejection = (code: code, message: message)
         }
+        answers[endpointKey(endpoint)] = .refused(code: code, message: message)
         logger.warn("Transaction \(transaction.txId.toHexStringTxId()) rejected by \(endpoint.host):\(endpoint.port): \(code) \(message)")
         resolveIfAllFailed()
         finishRaceIfAllCompleted()
@@ -211,6 +267,7 @@ actor SubmissionRace {
 
     private func submissionFailed(at endpoint: LightWalletEndpoint, error: Error) {
         completedCount += 1
+        answers[endpointKey(endpoint)] = .failed
         logger.warn("Transaction \(transaction.txId.toHexStringTxId()) submission to \(endpoint.host):\(endpoint.port) failed: \(error)")
         resolveIfAllFailed()
         finishRaceIfAllCompleted()
@@ -270,6 +327,14 @@ actor SubmissionRace {
         resolvedOutcome = outcome
         outcomeContinuation?.resume(returning: outcome)
         outcomeContinuation = nil
+    }
+
+    private func settle() {
+        guard !settled else { return }
+        settled = true
+        let continuations = settledContinuations
+        settledContinuations = []
+        continuations.forEach { $0.resume(returning: answers) }
     }
 
     private func finishRace() {

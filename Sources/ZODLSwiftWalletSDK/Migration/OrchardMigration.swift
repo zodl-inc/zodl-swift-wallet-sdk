@@ -701,7 +701,7 @@ actor OrchardMigration {
             memo: nil,
             orchardOnly: true
         )
-        let proposal = Proposal(inner: ffiProposal)
+        let proposal = Proposal(inner: ffiProposal, isMigration: true)
         let fee = proposal.totalFeeRequired()
         let amount = proposal.totalSpendValue() - fee
         return ImmediateMigrationProposal(proposal: proposal, amount: amount, fee: fee)

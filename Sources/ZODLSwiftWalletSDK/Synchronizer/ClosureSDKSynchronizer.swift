@@ -286,6 +286,86 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { synchronizer.rejectedTransactionIdsStream }
+
+    // swiftlint:disable function_parameter_count
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.proposeTransfer(
+                accountUUID: accountUUID,
+                recipient: recipient,
+                amount: amount,
+                memo: memo,
+                sizeBound: sizeBound
+            )
+        }
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.proposeSendMax(
+                accountUUID: accountUUID,
+                recipient: recipient,
+                memo: memo,
+                mode: mode,
+                sizeBound: sizeBound
+            )
+        }
+    }
+    // swiftlint:enable function_parameter_count
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: sizeBound)
+        }
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.createProposedTransactions(
+                proposal: proposal,
+                spendingKey: spendingKey,
+                ovkPolicy: .sender,
+                sizeBound: sizeBound
+            )
+        }
+    }
+
+    public func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound,
+        completion: @escaping (Result<Pczt, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: sizeBound)
+        }
+    }
+
     public func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void) {
         AsyncToClosureGateway.executeAction(completion) {
             await self.synchronizer.transactionSubmissionStatus(for: rawID)

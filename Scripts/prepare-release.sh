@@ -521,7 +521,7 @@ produce_artifacts() {
         return 0
     fi
 
-    ( cd "$PRODUCTS_DIR" && rm -f "$ZIP_FILE" && zip -qr "$ZIP_FILE" libzcashlc.xcframework )
+    create_release_archive
     checksum="$(shasum -a 256 "${PRODUCTS_DIR}/${ZIP_FILE}" | awk '{print $1}')"
     download_url="https://github.com/${GH_REPO}/releases/download/${version}/${ZIP_FILE}"
     echo "  ${ZIP_FILE}: ${checksum}"

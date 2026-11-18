@@ -317,7 +317,7 @@ final class OHTTPBehavioralTests: XCTestCase {
                 }
                 if let host = request.url?.host, host == "cloudflare-dns.com" || host == "dns.google" {
                     fallback.resolvers.append(host)
-                    XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1.0", "the DoH query carries the fixed User-Agent")
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "zodl-ohttp/1", "the DoH query carries the fixed User-Agent")
                     XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/dns-json")
                     // Cloudflare serves a mainnet envelope under the testnet name, Google the testnet one.
                     let network = host == "cloudflare-dns.com" ? "mainnet" : "testnet"

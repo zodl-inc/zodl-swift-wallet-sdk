@@ -157,7 +157,7 @@ final class BroadcasterTests: ZcashTestCase {
             expiryHeight: 123_456
         )
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = transactionData
         let encoder = WalletTransactionEncoder(
             rustBackend: rustBackend,
@@ -185,7 +185,7 @@ final class BroadcasterTests: ZcashTestCase {
         let firstTxId = Data(repeating: 0xBC, count: 32)
         let missingTxId = Data(repeating: 0xBD, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [firstTxId, missingTxId]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [firstTxId, missingTxId]
         rustBackend.getTransactionTxIdClosure = { txId in
             guard txId == firstTxId else { return nil }
             return TransactionData(txId: firstTxId, raw: Data([0x01]), expiryHeight: 123_456)
@@ -283,7 +283,8 @@ final class BroadcasterTests: ZcashTestCase {
         let transactions = try await synchronizer.broadcaster.createProposedTransactions(
             proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
             spendingKey: TestsData(networkType: .testnet).spendingKey,
-            ovkPolicy: .discard
+            ovkPolicy: .discard,
+            sizeBound: .consensus
         )
 
         XCTAssertEqual(transactions.map(\.txId), [rawID])
@@ -313,7 +314,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testWalletTransactionEncoderPassesTheOvkPolicyToTheRustBackend() async throws {
         let rawID = Data(repeating: 0xA4, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
         let encoder = makeWalletTransactionEncoder(rustBackend: rustBackend)
 
@@ -321,9 +322,10 @@ final class BroadcasterTests: ZcashTestCase {
             _ = try await encoder.createProposedTransactions(
                 proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
                 spendingKey: TestsData(networkType: .testnet).spendingKey,
-                ovkPolicy: policy
+                ovkPolicy: policy,
+                sizeBound: .consensus
             )
-            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyReceivedArguments?.ovkPolicy, policy)
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments?.ovkPolicy, policy)
         }
     }
 
@@ -382,7 +384,7 @@ final class BroadcasterTests: ZcashTestCase {
     func testWalletTransactionEncoderCreatesNonSaplingProposalsWithoutParameters() async throws {
         let rawID = Data(repeating: 0xA5, count: 32)
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [rawID]
+        rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [rawID]
         rustBackend.getTransactionTxIdReturnValue = TransactionData(txId: rawID, raw: Data([0x01]), expiryHeight: 1)
         let missing = testTempDirectory.appendingPathComponent("missing", isDirectory: true)
         let encoder = makeWalletTransactionEncoder(
@@ -395,7 +397,8 @@ final class BroadcasterTests: ZcashTestCase {
         let transactions = try await encoder.createProposedTransactions(
             proposal: Proposal(inner: Self.proposal(inputPool: .ironwood, paymentPool: .ironwood)),
             spendingKey: spendingKey,
-            ovkPolicy: .discard
+            ovkPolicy: .discard,
+            sizeBound: .consensus
         )
         XCTAssertEqual(transactions.map(\.txId), [rawID])
 
@@ -403,11 +406,12 @@ final class BroadcasterTests: ZcashTestCase {
             _ = try await encoder.createProposedTransactions(
                 proposal: Proposal(inner: Self.proposal(inputPool: .sapling, paymentPool: .orchard)),
                 spendingKey: spendingKey,
-                ovkPolicy: .sender
+                ovkPolicy: .sender,
+                sizeBound: .consensus
             )
             XCTFail("A Sapling proposal needs the parameters")
         } catch ZcashError.walletTransEncoderCreateTransactionMissingSaplingParams {
-            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+            XCTAssertEqual(rustBackend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         }
     }
 
@@ -710,6 +714,66 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "A wipe landing during creation must not be undone by a stale awaiting-mark")
     }
 
+    /// The same race for a migration proposal: the migration mark written after creation carries
+    /// the lifecycle captured before it, so a wipe meanwhile drops it and the store stays deleted.
+    func testMigrationCreationDropsItsMarkWhenWipedDuringCreation() async throws {
+        let rawID = Data(repeating: 0xFB, count: 32)
+        let overviews = [makeTransaction(raw: Data([0x01, 0x02, 0x03]), rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plansDatabaseURL = submitPlanDatabaseURL(for: synchronizer)
+        transactionEncoder.onCreateProposedTransactions = {
+            await store.wipe()
+        }
+        var proposal = Proposal.testOnlyFakeProposal(totalFee: 10)
+        proposal.isMigration = true
+
+        let created = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: proposal,
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        XCTAssertEqual(created.map(\.txId), [rawID])
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: plansDatabaseURL.path),
+            "a migration mark for a transaction created before wipe() must not recreate the store file"
+        )
+        let plan = await store.plan(for: rawID)
+        XCTAssertNil(plan)
+        let marked = await store.isMigrationPreparation(txId: rawID)
+        XCTAssertFalse(marked, "the wiped wallet's migration mark is not recorded")
+    }
+
+    /// The same race through the PCZT path: a wipe while a migration PCZT is created drops its mark.
+    func testMigrationPCZTCreationDropsItsMarkWhenWipedDuringCreation() async throws {
+        let rawID = Data(repeating: 0xFC, count: 32)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.pcztTxidPcztReturnValue = rawID
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []), rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plansDatabaseURL = submitPlanDatabaseURL(for: synchronizer)
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundClosure = { _, _, _ in
+            await store.wipe()
+            return Pczt([0x01])
+        }
+        var proposal = Proposal.testOnlyFakeProposal(totalFee: 10)
+        proposal.isMigration = true
+
+        _ = try await synchronizer.createPCZTFromProposal(accountUUID: TestsData.mockedAccountUUID, proposal: proposal)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: plansDatabaseURL.path),
+            "a migration PCZT's mark from before wipe() must not recreate the store file"
+        )
+        let marked = await store.isMigrationPreparation(txId: rawID)
+        XCTAssertFalse(marked, "the wiped wallet's migration mark is not recorded")
+    }
+
     // MARK: - Submission status reported to the host
 
     func testSubmissionStatusIsAwaitingBeforeTheAppSubmits() async throws {
@@ -770,6 +834,568 @@ final class BroadcasterTests: ZcashTestCase {
         )
 
         XCTAssertEqual(outcome, TransactionSubmissionOutcome.rejected(code: -25, message: "rejected"))
+    }
+
+    func testSubmitRejectedTerminallyByEveryEndpointIsRecordedAsRejected() async throws {
+        let first = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? first.stop() }
+        let second = try HeightReportingLightwalletd(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "tx size exceeding the configured mempool maximum")
+        )
+        defer { try? second.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+        var rejected: [Set<Data>] = []
+        synchronizer.rejectedTransactionIdsStream
+            .sink { rejected.append($0) }
+            .store(in: &cancellables)
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [first.endpoint, second.endpoint])
+
+        XCTAssertNotNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        guard case .rejected = status else {
+            return XCTFail("Expected a rejected status, got \(String(describing: status))")
+        }
+        XCTAssertEqual(rejected.last, [transaction.txId])
+    }
+
+    func testOneExplicitRejectionBesideATransientRefusalStaysPending() async throws {
+        let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? terminal.stop() }
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [terminal.endpoint, transient.endpoint])
+
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "the transient refusal may clear on a later attempt")
+    }
+
+    /// A transport failure may hide an acceptance whose reply was lost: beside a terminal refusal it
+    /// keeps the transaction pending, and background resubmission goes on.
+    func testAnExplicitRejectionBesideATransportFailureStaysPending() async throws {
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let lost = LightWalletEndpoint(address: "lost.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "tx size exceeding the configured mempool maximum"), for: rejecting)
+        endpointSubmitter.set(behavior: .failTransport, for: lost)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+        var rejected: [Set<Data>] = []
+        synchronizer.rejectedTransactionIdsStream
+            .sink { rejected.append($0) }
+            .store(in: &cancellables)
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, lost])
+
+        XCTAssertEqual(outcome, .timedOut, "pending, not failed")
+        XCTAssertNil(outcome.rejection, "no terminal rejection the SDK did not record")
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "inconclusive: the transport failure may hide an acceptance")
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([rejecting, lost], acceptedBy: nil), "resubmission keeps retrying it")
+        XCTAssertFalse(rejected.contains { $0.contains(transaction.txId) }, "it is never reported rejected")
+    }
+
+    // MARK: - The outcome agrees with the stored plan
+
+    private let invalidMessage = "16: bad-txns-sapling-bundle-invalid"
+
+    /// A server accepted the transaction, then refuses it with `-26` on a later submission: the
+    /// plan stays accepted and resubmitted, so the outcome reports the acceptance, not a rejection.
+    func testAMinus26RefusalAfterAnAcceptanceReportsTheAcceptance() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let first = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+        XCTAssertEqual(first, .accepted(by: endpoint))
+
+        endpointSubmitter.set(behavior: .reject(code: -26, message: invalidMessage), for: endpoint)
+        let second = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+
+        XCTAssertEqual(second, .accepted(by: endpoint))
+        XCTAssertNil(second.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(endpoint)))
+    }
+
+    /// The same, when the later refusal comes from a server other than the one that accepted it:
+    /// the outcome is not a rejection.
+    func testAMinus26RefusalElsewhereAfterAnAcceptanceIsNotARejection() async throws {
+        let accepting = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let refusing = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: invalidMessage), for: refusing)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [accepting])
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [refusing])
+
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(accepting)))
+    }
+
+    /// Background resubmission records an acceptance while the foreground submission is still
+    /// waiting on a refusal: the outcome reports the acceptance the store holds.
+    func testAnAcceptanceRecordedDuringTheRaceWinsOverItsRefusal() async throws {
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -26, message: invalidMessage)), for: endpoint)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let transaction = makeCreatedTransaction()
+
+        let submission = Task {
+            await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+        }
+        await endpointSubmitter.awaitSubmissionStarted(to: endpoint)
+        await store.markAccepted(txId: transaction.txId, host: endpointKey(endpoint), lifecycle: await store.currentLifecycle())
+        gate.open()
+        let outcome = await submission.value
+
+        XCTAssertEqual(outcome, .accepted(by: endpoint))
+        let plan = await store.plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpoint], acceptedBy: endpointKey(endpoint)))
+    }
+
+    // MARK: - Deadline: an endpoint still in flight keeps the transaction pending
+
+    private let tooLargeMessage = "tx size exceeding the configured mempool maximum"
+    private let deadline = SubmissionTiming(responseTimeout: 0.3, postAcceptanceGraceDelay: 0.1)
+
+    /// A terminal refusal from one endpoint while another is still in flight at the deadline is not
+    /// a verdict: the transaction stays pending, and when the other endpoint accepts it afterwards
+    /// (work that ignores cancellation, as on Tor) the acceptance is recorded and resubmission goes on.
+    func testARejectionThenALateAcceptanceAfterTheDeadlineEndsAccepted() async throws {
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let late = LightWalletEndpoint(address: "late.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: tooLargeMessage), for: rejecting)
+        endpointSubmitter.set(behavior: .gated(gate, then: .succeed), for: late)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+        var rejected: [Set<Data>] = []
+        synchronizer.rejectedTransactionIdsStream
+            .sink { rejected.append($0) }
+            .store(in: &cancellables)
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, late], timing: deadline)
+
+        XCTAssertEqual(outcome, .timedOut)
+        XCTAssertNil(outcome.rejection)
+        let atDeadline = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(atDeadline, TransactionSubmissionStatus.submitted, "an endpoint in flight keeps it pending")
+
+        gate.open()
+        await settledSubmissions(of: synchronizer)
+
+        let settled = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(settled, TransactionSubmissionStatus.accepted(host: endpointKey(late)))
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: transaction.txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([rejecting, late], acceptedBy: endpointKey(late)), "resubmission keeps retrying it")
+        XCTAssertFalse(rejected.contains { $0.contains(transaction.txId) }, "it is never reported rejected")
+    }
+
+    /// An endpoint that never answers (its submission ends by cancellation) leaves the transaction
+    /// pending, beside a terminal refusal.
+    func testATimeoutWithAnEndpointThatNeverAnswersStaysPending() async throws {
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let silent = LightWalletEndpoint(address: "silent.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: tooLargeMessage), for: rejecting)
+        endpointSubmitter.set(behavior: .hang, for: silent)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, silent], timing: deadline)
+        await settledSubmissions(of: synchronizer)
+
+        XCTAssertEqual(outcome, .timedOut)
+        XCTAssertEqual(endpointSubmitter.recordedCancellations(), [silent])
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "an endpoint that never answered may still hold it")
+    }
+
+    /// Answers that arrive after the deadline complete the verdict: once every endpoint has answered,
+    /// none accepted and every refusal was for good, the transaction is rejected.
+    func testLateAnswersAfterTheDeadlineCompleteARejection() async throws {
+        let rejecting = LightWalletEndpoint(address: "rejecting.example.com", port: 443, secure: true)
+        let late = LightWalletEndpoint(address: "late.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: tooLargeMessage), for: rejecting)
+        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -26, message: "bad-txns-vout-negative")), for: late)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting, late], timing: deadline)
+        XCTAssertEqual(outcome, .timedOut)
+
+        gate.open()
+        await settledSubmissions(of: synchronizer)
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.tooLarge))
+    }
+
+    // MARK: - The outcome carries the recorded terminal refusal
+
+    /// One endpoint refuses for good (the size limit), another in a way that may be transient (a
+    /// mempool chain limit), in either order: the transaction is not rejected, the outcome carries
+    /// no terminal refusal, and background resubmission keeps it.
+    func testATerminalRefusalBesideATransientOneInEitherOrderStaysPending() async throws {
+        for terminalFirst in [true, false] {
+            let terminal = LightWalletEndpoint(address: "terminal.example.com", port: 443, secure: true)
+            let transient = LightWalletEndpoint(address: "transient.example.com", port: 443, secure: true)
+            let endpointSubmitter = EndpointSubmitterMock()
+            endpointSubmitter.set(
+                behavior: .rejectAfter(terminalFirst ? 0 : 0.2, code: -25, message: tooLargeMessage),
+                for: terminal
+            )
+            endpointSubmitter.set(
+                behavior: .rejectAfter(terminalFirst ? 0.2 : 0, code: -26, message: "too-long-mempool-chain"),
+                for: transient
+            )
+            let synchronizer = try makeSynchronizer(
+                transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+                endpointSubmitter: endpointSubmitter
+            )
+            let transaction = makeCreatedTransaction(seed: terminalFirst ? 0x51 : 0x52)
+
+            let outcome = await synchronizer.broadcaster.submit(
+                transaction: transaction,
+                to: [transient, terminal],
+                timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.1)
+            )
+            await settledSubmissions(of: synchronizer)
+
+            XCTAssertNil(outcome.rejection, "terminal first: \(terminalFirst)")
+            let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+            XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "terminal first: \(terminalFirst)")
+        }
+    }
+
+    /// Both endpoints refuse for good, in either order: the transaction is rejected, and the outcome
+    /// carries the terminal refusal the SDK recorded.
+    func testTerminalRefusalsFromEveryEndpointInEitherOrderAreRejected() async throws {
+        for tooLargeFirst in [true, false] {
+            let tooLarge = LightWalletEndpoint(address: "toolarge.example.com", port: 443, secure: true)
+            let invalid = LightWalletEndpoint(address: "invalid.example.com", port: 443, secure: true)
+            let endpointSubmitter = EndpointSubmitterMock()
+            endpointSubmitter.set(
+                behavior: .rejectAfter(tooLargeFirst ? 0 : 0.2, code: -25, message: tooLargeMessage),
+                for: tooLarge
+            )
+            endpointSubmitter.set(
+                behavior: .rejectAfter(tooLargeFirst ? 0.2 : 0, code: -26, message: "bad-txns-vout-negative"),
+                for: invalid
+            )
+            let synchronizer = try makeSynchronizer(
+                transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+                endpointSubmitter: endpointSubmitter
+            )
+            let transaction = makeCreatedTransaction(seed: tooLargeFirst ? 0x53 : 0x54)
+
+            let outcome = await synchronizer.broadcaster.submit(
+                transaction: transaction,
+                to: [tooLarge, invalid],
+                timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.1)
+            )
+
+            XCTAssertEqual(outcome, .rejected(code: -25, message: tooLargeMessage), "too large first: \(tooLargeFirst)")
+            XCTAssertEqual(outcome.rejection, .tooLarge, "too large first: \(tooLargeFirst)")
+            let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+            XCTAssertEqual(status, TransactionSubmissionStatus.rejected(.tooLarge), "too large first: \(tooLargeFirst)")
+        }
+    }
+
+    /// Only transient refusals: the outcome reports no terminal rejection and the transaction stays
+    /// pending, resubmitted as before.
+    func testOnlyTransientRefusalsReportNoRejectionAndStayPending() async throws {
+        let first = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let second = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "Missing inputs"), for: first)
+        endpointSubmitter.set(behavior: .rejectAfter(0.1, code: -26, message: "mempool full"), for: second)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [first, second])
+
+        guard case .rejected = outcome else {
+            return XCTFail("Expected rejected, got \(outcome)")
+        }
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted)
+    }
+
+    /// A migration preparation keeps main's behaviour whatever its endpoints answer, and whenever:
+    /// the outcome reports the first refusal, and the transaction is never recorded as rejected.
+    func testAMigrationPreparationIsUnchangedByMixedOrLateRefusals() async throws {
+        let terminal = LightWalletEndpoint(address: "terminal.example.com", port: 443, secure: true)
+        let transient = LightWalletEndpoint(address: "transient.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "Missing inputs"), for: transient)
+        endpointSubmitter.set(behavior: .gated(gate, then: .reject(code: -25, message: tooLargeMessage)), for: terminal)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+
+        let mixed = makeCreatedTransaction(seed: 0x61)
+        await store.markMigrationPreparation(txId: mixed.txId, lifecycle: await store.currentLifecycle())
+        let mixedTask = Task {
+            await synchronizer.broadcaster.submit(transaction: mixed, to: [transient, terminal])
+        }
+        await endpointSubmitter.awaitSubmissionStarted(to: terminal)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        gate.open()
+        let mixedOutcome = await mixedTask.value
+        XCTAssertEqual(mixedOutcome, .rejected(code: -25, message: "Missing inputs"), "the first refusal, as on main")
+        let mixedStatus = await synchronizer.transactionSubmissionStatus(for: mixed.txId)
+        XCTAssertEqual(mixedStatus, TransactionSubmissionStatus.submitted)
+
+        gate.close()
+        let timedOut = makeCreatedTransaction(seed: 0x62)
+        await store.markMigrationPreparation(txId: timedOut.txId, lifecycle: await store.currentLifecycle())
+        let timedOutOutcome = await synchronizer.broadcaster.submit(transaction: timedOut, to: [transient, terminal], timing: deadline)
+        XCTAssertEqual(timedOutOutcome, .timedOut)
+        gate.open()
+        await settledSubmissions(of: synchronizer)
+        let timedOutStatus = await synchronizer.transactionSubmissionStatus(for: timedOut.txId)
+        XCTAssertEqual(timedOutStatus, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it until it expires")
+    }
+
+    private func settledSubmissions(of synchronizer: SDKSynchronizer) async {
+        guard let broadcaster = synchronizer.broadcaster as? SDKBroadcaster else {
+            return XCTFail("Expected the SDK's broadcaster")
+        }
+        await broadcaster.waitForSettledSubmissions()
+    }
+
+    func testOnlyTransientRefusalsStaySubmitted() async throws {
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []))
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [transient.endpoint])
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted)
+    }
+
+    func testARejectionBesideAnAcceptanceIsNotRejected() async throws {
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? rejecting.stop() }
+        let accepting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? accepting.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(
+            transaction: transaction,
+            to: [rejecting.endpoint, accepting.endpoint],
+            timing: SubmissionTiming(responseTimeout: 5, postAcceptanceGraceDelay: 0.2)
+        )
+
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
+    }
+
+    func testLegacySubmitWithoutAPlanRecordsNoRejection() async throws {
+        let rawID = Data(repeating: 0xE1, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -26, message: "bad-txns-vout-negative")
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        var results: [TransactionSubmitResult] = []
+        for try await result in stream { results.append(result) }
+
+        XCTAssertEqual(results.map(\.rejection), [.invalid], "the refusal is still classified for the caller")
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
+        XCTAssertNil(plan, "one endpoint's refusal without a plan is not a unanimous verdict")
+    }
+
+    func testLegacySubmitRecordsNothingForATransientRefusal() async throws {
+        let rawID = Data(repeating: 0xE2, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        transactionEncoder.submitError = TransactionEncoderError.submitError(code: -25, message: "Missing inputs")
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        for try await _ in stream {}
+
+        let plan = await mockContainer.resolve(SubmitPlanStoring.self).plan(for: rawID)
+        XCTAssertNil(plan, "A refusal that may be transient leaves the transaction to resubmission")
+    }
+
+    func testCreateProposedTransactionsPassesTheSizeBoundToTheEncoder() async throws {
+        let rawID = Data(repeating: 0xE3, count: 32)
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+        let bound = TransactionSizeBound(maxShieldedActions: 75)
+
+        _ = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey,
+            ovkPolicy: .sender,
+            sizeBound: bound
+        )
+        XCTAssertEqual(transactionEncoder.receivedSizeBound, bound)
+
+        let stream = try await synchronizer.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        for try await _ in stream {}
+        XCTAssertEqual(transactionEncoder.receivedSizeBound, .consensus, "The unbounded overload stays consensus only")
+    }
+
+    /// The wallet app's send path: create through the broadcaster (an awaiting plan), then submit
+    /// each transaction to the chosen endpoints. A unanimous terminal refusal is recorded.
+    func testCreateThenSubmitThroughTheBroadcasterRecordsAUnanimousRejection() async throws {
+        let rawID = Data(repeating: 0xE4, count: 32)
+        let rawTransaction = Data([0x01, 0x02])
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: rawTransaction, rawID: rawID)]),
+            rustBackend: ZcashRustBackendWeldingMock()
+        )
+        await synchronizer.updateStatus(.stopped)
+        let first = try HeightReportingLightwalletd(
+            sendResponse: makeSendResponse(errorCode: -25, errorMessage: "exceeding the next block's ZIP 218 limit")
+        )
+        defer { try? first.stop() }
+        let second = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? second.stop() }
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        let awaiting = await synchronizer.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(awaiting, TransactionSubmissionStatus.awaiting)
+
+        let reports = await synchronizer.broadcaster.submit(transactions: transactions, to: [first.endpoint, second.endpoint])
+
+        XCTAssertNotNil(reports.first?.outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: rawID)
+        guard case .rejected = status else {
+            return XCTFail("Expected a rejected status, got \(String(describing: status))")
+        }
+    }
+
+    func testAMigrationPreparationRejectedByEveryEndpointStaysSubmitted() async throws {
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? rejecting.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.markMigrationPreparation(txId: transaction.txId, lifecycle: await store.currentLifecycle())
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
+
+        XCTAssertEqual(outcome.rejection, .invalid, "the result is still classified")
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it, as on main")
+    }
+
+    func testALaterAcceptanceClearsARejection() async throws {
+        let rejecting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? rejecting.stop() }
+        let accepting = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: 0, errorMessage: ""))
+        defer { try? accepting.stop() }
+        let synchronizer = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [rejecting.endpoint])
+        let rejected = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(rejected, TransactionSubmissionStatus.rejected(.invalid))
+
+        _ = await synchronizer.broadcaster.submit(transaction: transaction, to: [accepting.endpoint])
+        let accepted = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: endpointKey(accepting.endpoint)))
+    }
+
+    /// A rejection is persisted, and after a restart a submission to a new endpoint that refuses in a
+    /// way that may be transient draws no new verdict and does not clear the stored one.
+    func testARejectionSurvivesARestartAndANewEndpointsTransientRefusalKeepsIt() async throws {
+        let terminal = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -26, errorMessage: "bad-txns-vout-negative"))
+        defer { try? terminal.stop() }
+        let transient = try HeightReportingLightwalletd(sendResponse: makeSendResponse(errorCode: -25, errorMessage: "Missing inputs"))
+        defer { try? transient.stop() }
+        let first = try makeSubmittingSynchronizer()
+        let transaction = makeCreatedTransaction()
+
+        _ = await first.broadcaster.submit(transaction: transaction, to: [terminal.endpoint])
+        let rejected = await first.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(rejected, TransactionSubmissionStatus.rejected(.invalid))
+        let databaseURL = submitPlanDatabaseURL(for: first)
+
+        // A restart: a fresh store over the same file.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in
+            SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        }
+        let second = try makeSubmittingSynchronizer()
+        let afterRestart = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(afterRestart, TransactionSubmissionStatus.rejected(.invalid))
+
+        _ = await second.broadcaster.submit(transaction: transaction, to: [transient.endpoint])
+        let kept = await second.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(kept, TransactionSubmissionStatus.rejected(.invalid), "a transient answer keeps the stored rejection")
+        let plan = await SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger()).plan(for: transaction.txId)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"),
+            "the stored refusal is neither replaced by the transient one nor cleared"
+        )
     }
 
     func testSubmitFirstAcceptanceWinsAcrossEndpoints() async throws {
@@ -933,6 +1559,150 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertNil(plan, "Legacy path must not register submit plans")
     }
 
+    // MARK: - Refusal classes
+
+    /// An endpoint that refuses the transaction because it already holds it has accepted it: a
+    /// terminal refusal from another endpoint does not reject it, and it is recorded as accepted.
+    func testARefusalSayingTheServerHoldsTheTransactionIsItsAcceptance() async throws {
+        let holding = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let refusing = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "18: txn-already-in-mempool"), for: holding)
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "16: bad-txns-sapling-bundle-invalid"), for: refusing)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        let transaction = makeCreatedTransaction()
+
+        let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [refusing, holding])
+
+        XCTAssertEqual(outcome, .accepted(by: holding))
+        XCTAssertNil(outcome.rejection)
+        let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+        XCTAssertEqual(status, TransactionSubmissionStatus.accepted(host: endpointKey(holding)))
+    }
+
+    /// The reproduced refusal: a server that has not reached the wallet's Orchard or Sapling anchor
+    /// refuses the transaction, and may accept it once it catches up. It is never rejected, and
+    /// resubmission keeps retrying it.
+    func testAnUnknownAnchorRefusalKeepsTheTransactionPending() async throws {
+        let endpoint = LightWalletEndpoint(address: "custom.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitter
+        )
+        for (seed, message) in [(UInt8(0xA1), "16: bad-txns-orchard-unknown-anchor"), (UInt8(0xA2), "16: bad-txns-sapling-unknown-anchor")] {
+            endpointSubmitter.set(behavior: .reject(code: -26, message: message), for: endpoint)
+            let transaction = makeCreatedTransaction(seed: seed)
+
+            let outcome = await synchronizer.broadcaster.submit(transaction: transaction, to: [endpoint])
+
+            XCTAssertEqual(outcome, .rejected(code: -26, message: message), "the refusal is still reported")
+            XCTAssertNil(outcome.rejection, message)
+            let status = await synchronizer.transactionSubmissionStatus(for: transaction.txId)
+            XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it: \(message)")
+        }
+    }
+
+    // MARK: - Migration sweeps are never rejected
+
+    /// An immediate migration sweep created through the broadcaster from a migration proposal
+    /// keeps main's resubmission until expiry: a unanimous terminal refusal does not reject it.
+    func testAMigrationSweepCreatedThroughTheBroadcasterIsNeverRejected() async throws {
+        let rawID = Data(repeating: 0xE7, count: 32)
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpoint)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)]),
+            endpointSubmitter: endpointSubmitter
+        )
+        await synchronizer.updateStatus(.stopped)
+        var sweep = Proposal.testOnlyFakeProposal(totalFee: 10)
+        sweep.isMigration = true
+
+        let transactions = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: sweep,
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        let outcome = await synchronizer.broadcaster.submit(transaction: try XCTUnwrap(transactions.first), to: [endpoint])
+
+        XCTAssertEqual(outcome.rejection, .invalid, "the result is still classified, as on main")
+        let status = await synchronizer.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "resubmission keeps retrying it until it expires")
+    }
+
+    /// End to end, through a restart: a migration proposal's PCZT is created, moved to a signer and
+    /// back (serialized and parsed again), proved, and only then built and submitted, by a new
+    /// process with a new submit-plan store over the same file. Every server refuses it for good,
+    /// and it is still never recorded as rejected, before or after another restart.
+    func testAMigrationPCZTSurvivesReparseAndRestartAndIsNeverRejected() async throws {
+        let rawID = Data(repeating: 0xE8, count: 32)
+        let created = Pczt([0x50, 0x43, 0x5A, 0x54, 0x01])
+        let proved = Pczt([0x50, 0x43, 0x5A, 0x54, 0x02])
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointSubmitter = EndpointSubmitterMock()
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpoint)
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue = created
+        // The id a PCZT commits to is the same before and after proving.
+        rustBackend.pcztTxidPcztClosure = { pczt in [created, proved].contains(pczt) ? rawID : nil }
+        rustBackend.extractAndStoreTxFromPCZTPcztWithProofsPcztWithSigsReturnValue = rawID
+        let encoder = StubTransactionEncoder(createdTransactions: [makeTransaction(raw: Data([0x01]), rawID: rawID)])
+
+        // Process 1: propose and create the PCZT, then hand it off.
+        let first = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+        await first.updateStatus(.stopped)
+        var sweep = Proposal.testOnlyFakeProposal(totalFee: 10)
+        sweep.isMigration = true
+        let pczt = try await first.createPCZTFromProposal(accountUUID: TestsData.mockedAccountUUID, proposal: sweep)
+        let transported = Pczt(Array(pczt))
+        XCTAssertEqual(rustBackend.pcztTxidPcztReceivedPczt, created)
+        let databaseURL = submitPlanDatabaseURL(for: first)
+
+        // Process 2: a restart, with a fresh store over the same file. Build and submit the proved PCZT.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in
+            SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        }
+        let second = try makeSynchronizer(transactionEncoder: encoder, rustBackend: rustBackend, endpointSubmitter: endpointSubmitter)
+        await second.updateStatus(.stopped)
+        XCTAssertEqual(transported, created)
+        let transactions = try await second.broadcaster.createTransactionFromPCZT(pcztWithProofs: proved, pcztWithSigs: proved)
+        let outcome = await second.broadcaster.submit(transaction: try XCTUnwrap(transactions.first), to: [endpoint])
+
+        XCTAssertEqual(outcome.rejection, .tooLarge, "the result is still classified, as on main")
+        let status = await second.transactionSubmissionStatus(for: rawID)
+        XCTAssertEqual(status, TransactionSubmissionStatus.submitted, "never rejected: resubmitted until it expires")
+
+        // Process 3: another restart still holds the mark and the plan.
+        let reopened = SubmitPlanStore(databaseURL: databaseURL, logger: submissionLifecycleLogger())
+        let marked = await reopened.isMigrationPreparation(txId: rawID)
+        XCTAssertTrue(marked)
+        await reopened.markRejected(txId: rawID, code: -25, reason: "exceeding the configured mempool maximum", lifecycle: await reopened.currentLifecycle())
+        let plan = await reopened.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpoint], acceptedBy: nil))
+    }
+
+    /// An ordinary proposal's PCZT is not marked: its submission can be rejected.
+    func testAnOrdinaryPCZTIsNotMarkedAsAMigration() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue = Pczt([0x01])
+        rustBackend.pcztTxidPcztReturnValue = Data(repeating: 0xE9, count: 32)
+        let synchronizer = try makeSynchronizer(transactionEncoder: StubTransactionEncoder(createdTransactions: []), rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+
+        _ = try await synchronizer.createPCZTFromProposal(
+            accountUUID: TestsData.mockedAccountUUID,
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10)
+        )
+
+        XCTAssertFalse(rustBackend.pcztTxidPcztCalled)
+        let marked = await mockContainer.resolve(SubmitPlanStoring.self).isMigrationPreparation(txId: Data(repeating: 0xE9, count: 32))
+        XCTAssertFalse(marked)
+    }
+
     // MARK: - Unaccepted transactions after the user moves to another server
 
     /// A transaction stuck because its recorded server cannot be reached goes out once through the server the
@@ -1035,6 +1805,102 @@ final class BroadcasterTests: ZcashTestCase {
 
         XCTAssertEqual(reports, [])
         XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
+    }
+
+    /// A transaction recorded as rejected is never sent again, through the new server or otherwise, and its plan
+    /// does not change.
+    func testResubmitUnacceptedNeverResendsARejectedTransaction() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .succeed, for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let rejected = makeTransaction(raw: Data([0x06]), rawID: Data(repeating: 0x51, count: 32))
+        try reportPending([rejected])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let lifecycle = await store.recordPlan(txId: rejected.rawID, endpoints: [gateway])
+        await store.markRejected(txId: rejected.rawID, code: -26, reason: "bad-txns-vout-negative", lifecycle: lifecycle)
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [])
+        XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty)
+        let plan = await store.plan(for: rejected.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    /// The new server's refusal for good is recorded like a submission's: when it is the plan's only endpoint, its
+    /// answer completes the verdict and the transaction is rejected, as reported.
+    func testResubmitUnacceptedRecordsATerminalRefusalAsTheRejectionVerdict() async throws {
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x07]), rawID: Data(repeating: 0x52, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [publicServer])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(
+            reports,
+            [TransactionSubmissionReport(txId: stuck.rawID, outcome: .rejected(code: -26, message: "bad-txns-vout-negative"))]
+        )
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    /// The verdict needs every planned endpoint's answer: a refusal for good from the new server alone, while a
+    /// recorded server (such as an unreachable Private endpoint) has not answered, leaves the transaction pending.
+    func testResubmitUnacceptedTerminalRefusalWithAnUnansweredPlannedEndpointStaysPending() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x08]), rawID: Data(repeating: 0x53, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        // Pending, as a submission whose refusal for good the store did not record is reported.
+        XCTAssertEqual(reports, [TransactionSubmissionReport(txId: stuck.rawID, outcome: .timedOut)])
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: nil))
+    }
+
+    /// A new server that already holds the transaction has accepted it: recorded as an acceptance.
+    func testResubmitUnacceptedCountsAlreadyInMempoolAsAcceptance() async throws {
+        let gateway = LightWalletEndpoint(address: "gateway.example.com", port: 443, secure: true)
+        let publicServer = LightWalletEndpoint(address: "public.example.com", port: 443, secure: true)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        endpointSubmitterMock.set(behavior: .reject(code: -26, message: "18: txn-already-in-mempool"), for: publicServer)
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let stuck = makeTransaction(raw: Data([0x09]), rawID: Data(repeating: 0x54, count: 32))
+        try reportPending([stuck])
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        await store.recordPlan(txId: stuck.rawID, endpoints: [gateway])
+
+        let reports = await synchronizer.broadcaster.resubmitUnacceptedTransactions(through: publicServer)
+
+        XCTAssertEqual(reports, [TransactionSubmissionReport(txId: stuck.rawID, outcome: .accepted(by: publicServer))])
+        let plan = await store.plan(for: stuck.rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([gateway, publicServer], acceptedBy: "public.example.com:443"))
     }
 
     // MARK: - Helpers
@@ -1203,6 +2069,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
     private let missingHistoryTxIds: Set<Data>
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedOvkPolicy: OvkPolicy?
+    private(set) var receivedSizeBound: TransactionSizeBound?
+    /// When set, `submit(transaction:)` records the transaction and then throws this error.
+    var submitError: Error?
     private(set) var requiresSaplingParametersCallsCount = 0
     /// What `requiresSaplingParameters(for:)` answers; the SDK downloads the parameters only when it is true.
     var requiresSaplingParameters = true
@@ -1233,7 +2102,8 @@ private final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         amount: Zatoshi,
-        memoBytes: MemoBytes?
+        memoBytes: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -1242,7 +2112,8 @@ private final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         memoBytes: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -1263,10 +2134,12 @@ private final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         receivedOvkPolicy = ovkPolicy
+        receivedSizeBound = sizeBound
         if let onCreateProposedTransactions {
             await onCreateProposedTransactions()
         }
@@ -1286,13 +2159,17 @@ private final class StubTransactionEncoder: TransactionEncoder {
 
     func proposeFulfillingPaymentFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
 
     func submit(transaction: EncodedTransaction) async throws {
         submittedTransactions.append(transaction)
+        if let submitError {
+            throw submitError
+        }
     }
 
     func isTransactionKnownToServer(txId: Data) async -> Bool {

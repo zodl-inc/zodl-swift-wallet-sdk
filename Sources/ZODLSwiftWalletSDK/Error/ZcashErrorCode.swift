@@ -627,6 +627,12 @@ public enum ZcashErrorCode: String {
     case giftCardCheckDisconnected = "ZGIFT0015"
     /// The gift-card wallet stopped making progress. The card balance is still unknown.
     case giftCardCheckSyncStalled = "ZGIFT0016"
+    /// The card holds more notes than one claim transaction may spend within its size bound (or a
+    case giftCardTooManyNotes = "ZGIFT0017"
+    /// A redemption round after the first was not accepted by a server, so the redemption stopped.
+    case giftCardRoundFailed = "ZGIFT0018"
+    /// A redemption round was not mined before it expired or the redeemer stopped waiting for it.
+    case giftCardRoundExpired = "ZGIFT0019"
     /// Attempt to init TxId with input that is not 32 bytes.
     case txIdNot32Bytes = "ZMODEL0001"
     /// Attempt to init TxId with invalid hex encoding.

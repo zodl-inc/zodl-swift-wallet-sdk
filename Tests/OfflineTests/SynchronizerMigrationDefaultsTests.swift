@@ -32,6 +32,41 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - Size bound defaults
+
+    func testABoundedProposalFromAConformerWithoutBoundsIsRefused() async {
+        let recipient = Recipient.transparent(TransparentAddress(validatedEncoding: "t1dRJRY7GmyeykJnMH38mdQoaZtFhn1QmGz"))
+        let bound = TransactionSizeBound(maxShieldedActions: 10)
+        do {
+            _ = try await synchronizer.proposeSendMax(
+                accountUUID: accountUUID,
+                recipient: recipient,
+                memo: nil,
+                mode: .maxSpendable,
+                sizeBound: bound
+            )
+            XCTFail("A bound the conformer cannot honor must be refused, not ignored")
+        } catch {
+            XCTAssertTrue(error is SizeBoundUnsupported, "\(error)")
+        }
+        do {
+            _ = try await synchronizer.createPCZTFromProposal(
+                accountUUID: accountUUID,
+                proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+                sizeBound: bound
+            )
+            XCTFail("A bound the conformer cannot honor must be refused, not ignored")
+        } catch {
+            XCTAssertTrue(error is SizeBoundUnsupported, "\(error)")
+        }
+    }
+
+    func testRejectedTransactionIdsDefaultIsEmpty() {
+        var received: [Set<Data>] = []
+        _ = synchronizer.rejectedTransactionIdsStream.sink { received.append($0) }
+        XCTAssertEqual(received, [[]])
+    }
+
     // MARK: - Throwing defaults
 
     func testMigrationAdvanceStepDefaultThrowsUnimplemented() async {

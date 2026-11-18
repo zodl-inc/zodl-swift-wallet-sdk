@@ -24,7 +24,7 @@ final class SlipstreamSynchronizerGuardTests: ZcashTestCase {
     /// missing guard, not some unrelated backend error.
     func testProposeTransferThrowsWhenSynchronizerIsNotPrepared() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.proposeTransferAccountUUIDToValueMemoReturnValue =
+        rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundReturnValue =
             FfiProposalFixtures.makeFfiProposal(feeRequired: 5_000)
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         // Status is left at its initial `.unprepared` value -- `prepare()` is deliberately not called.
@@ -47,7 +47,7 @@ final class SlipstreamSynchronizerGuardTests: ZcashTestCase {
         }
 
         XCTAssertEqual(
-            rustBackend.proposeTransferAccountUUIDToValueMemoCallsCount,
+            rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundCallsCount,
             0,
             "The rust backend must not be reached when the synchronizer isn't prepared"
         )
@@ -115,7 +115,7 @@ final class SlipstreamSynchronizerGuardTests: ZcashTestCase {
     /// way as the transfer case above.
     func testProposefulfillingPaymentURIThrowsWhenSynchronizerIsNotPrepared() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
-        rustBackend.proposeTransferFromURIAccountUUIDReturnValue =
+        rustBackend.proposeTransferFromURIAccountUUIDSizeBoundReturnValue =
             FfiProposalFixtures.makeFfiProposal(feeRequired: 5_000)
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         // Status is left at its initial `.unprepared` value -- `prepare()` is deliberately not called.
@@ -133,7 +133,7 @@ final class SlipstreamSynchronizerGuardTests: ZcashTestCase {
         }
 
         XCTAssertEqual(
-            rustBackend.proposeTransferFromURIAccountUUIDCallsCount,
+            rustBackend.proposeTransferFromURIAccountUUIDSizeBoundCallsCount,
             0,
             "The rust backend must not be reached when the synchronizer isn't prepared"
         )

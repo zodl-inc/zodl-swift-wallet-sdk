@@ -127,11 +127,16 @@ jobs:
       - name: Verify XCFramework
         run: make verify-ffi
 
+      # A tar file keeps the macOS framework's symlinks, which upload-artifact
+      # would otherwise replace with copies of their targets.
+      - name: Pack XCFramework
+        run: tar -C BuildSupport/products -cf "$RUNNER_TEMP/libzcashlc.xcframework.tar" libzcashlc.xcframework
+
       - name: Upload XCFramework
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libzcashlc-xcframework-macos
-          path: BuildSupport/products/libzcashlc.xcframework
+          path: ${{ runner.temp }}/libzcashlc.xcframework.tar
           retention-days: 3
           if-no-files-found: error
 
@@ -153,7 +158,12 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libzcashlc-xcframework-macos
-          path: BuildSupport/products/libzcashlc.xcframework
+          path: ${{ runner.temp }}/xcframework-download
+
+      - name: Unpack XCFramework
+        run: |
+          mkdir -p BuildSupport/products
+          tar -C BuildSupport/products -xf "$RUNNER_TEMP/xcframework-download/libzcashlc.xcframework.tar"
 
       - name: Configure local FFI
         run: make configure-local-ffi

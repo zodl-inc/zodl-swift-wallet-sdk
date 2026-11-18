@@ -17,6 +17,7 @@ final class SDKBroadcaster: Broadcaster {
     /// The last chain tip the synchronizer knows; `0` before it knows one.
     private let chainTip: () -> BlockHeight
     private let statusCheck: () throws -> Void
+    private let settlements = SubmissionSettlements()
 
     init(
         transactionEncoder: TransactionEncoder,
@@ -55,6 +56,21 @@ final class SDKBroadcaster: Broadcaster {
         ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction] {
         try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, recordingPlans: true)
+    }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction] {
+        try await createProposedTransactions(
+            proposal: proposal,
+            spendingKey: spendingKey,
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound,
+            recordingPlans: true
+        )
     }
 
     func createTransactionFromPCZT(
@@ -103,14 +119,39 @@ final class SDKBroadcaster: Broadcaster {
         // is in flight leaves the eventual `markAccepted` call provably stale.
         let lifecycle = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
 
-        let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
+        let result = await multiEndpointSubmitter.submitClassifyingRejection(transaction: transaction, to: endpoints, timing: timing)
+        var outcome = result.outcome
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
 
-        // Remember which server took it, so the app can tell "handed to a
-        // server" apart from "still trying" while the transaction waits to be
-        // mined. Retrying continues either way — a mempool is not a commitment.
-        if case .accepted(by: let endpoint) = outcome {
-            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)", lifecycle: lifecycle)
+        switch outcome {
+        case .accepted(by: let endpoint):
+            // Remember which server took it, so the app can tell "handed to a
+            // server" apart from "still trying" while the transaction waits to be
+            // mined. Retrying continues either way — a mempool is not a commitment.
+            await submitPlanStore.markAccepted(txId: transaction.txId, host: endpointKey(endpoint), lifecycle: lifecycle)
+
+        case .rejected, .unreachable:
+            // Every endpoint's submission ended and none took it. When every endpoint answered
+            // explicitly, none accepted it and every refusal was for good, it is rejected, and background
+            // resubmission stops: it could only repeat the refusal until the transaction expires.
+            // A transport failure is not an answer (the reply may be all that was lost), so beside
+            // one the transaction stays pending and resubmission reconciles it.
+            await recordRejectionVerdict(txId: transaction.txId, endpoints: endpoints, outcomes: result.endpointOutcomes, lifecycle: lifecycle)
+            // Report the verdict the SDK recorded, so the caller routes on the same terminal
+            // refusal that stopped resubmission rather than on whichever refusal arrived first,
+            // and never on a terminal refusal the SDK did not record.
+            if case .rejected = outcome {
+                outcome = await outcomeMatchingStoredPlan(outcome, txId: transaction.txId, endpoints: endpoints)
+            }
+
+        case .timedOut, .cancelled:
+            // An endpoint had not answered when the caller was released, so the transaction is
+            // pending: it may still take it. Once every endpoint's submission has ended, record a
+            // late acceptance, or the rejection the complete answers make.
+            await reconcileWhenSettled(txId: transaction.txId, endpoints: endpoints, result: result, lifecycle: lifecycle)
+
+        case .notAttempted:
+            break
         }
 
         return outcome
@@ -180,6 +221,7 @@ final class SDKBroadcaster: Broadcaster {
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy = .sender,
+        sizeBound: TransactionSizeBound = .consensus,
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         OHTTPHealthContext.attempt?.beginDelegation()
@@ -199,8 +241,16 @@ final class SDKBroadcaster: Broadcaster {
         let createdTransactions = try await transactionEncoder.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
-            ovkPolicy: ovkPolicy
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound
         )
+        if recordingPlans && proposal.isMigration {
+            // A migration sweep keeps main's resubmission until expiry, even if every server
+            // rejects it. The lifecycle captured before creation drops the mark after a wipe.
+            for transaction in createdTransactions {
+                await submitPlanStore.markMigrationPreparation(txId: transaction.txId, lifecycle: lifecycle)
+            }
+        }
         let overviews = await overviewsForEvent(txIds: createdTransactions.map(\.txId))
 
         return await finishCreation(
@@ -308,6 +358,125 @@ final class SDKBroadcaster: Broadcaster {
     }
 }
 
+// MARK: - Rejection verdict and settlement
+
+extension SDKBroadcaster {
+    /// Waits, off the caller's path, for every endpoint's submission in `result` to end, then
+    /// records what the complete answers say: any acceptance marks the transaction accepted (which
+    /// clears a recorded rejection), otherwise the rejection verdict over all of them applies.
+    private func reconcileWhenSettled(
+        txId: Data,
+        endpoints: [LightWalletEndpoint],
+        result: MultiEndpointSubmitter.RaceResult,
+        lifecycle: SubmitPlanLifecycle
+    ) async {
+        await settlements.run { [self] in
+            let answers = await result.settledEndpointOutcomes()
+            if let accepting = endpoints.first(where: { answers[endpointKey($0)]?.isAcceptance == true }) {
+                logger.info("Transaction \(txId.toHexStringTxId()) accepted by \(endpointKey(accepting)) after the caller was released.")
+                await submitPlanStore.markAccepted(txId: txId, host: endpointKey(accepting), lifecycle: lifecycle)
+            } else {
+                await recordRejectionVerdict(txId: txId, endpoints: endpoints, outcomes: answers, lifecycle: lifecycle)
+            }
+        }
+    }
+
+    /// The outcome to report for a submission whose race ended `.rejected`, consistent with what
+    /// the submit-plan store recorded: ``TransactionSubmissionOutcome/rejection`` is non-`nil` only
+    /// when the store recorded the transaction as rejected.
+    ///
+    /// - Recorded rejected: `.rejected` with the recorded terminal refusal.
+    /// - Accepted, in this submission's race or earlier (by an earlier submission or background
+    ///   resubmission): `.accepted(by:)` with the accepting endpoint, when it is one this
+    ///   submission or the stored plan names.
+    /// - Otherwise (an endpoint's transport failure or a refusal that is not terminal left the
+    ///   verdict pending, an acceptance by
+    ///   an endpoint neither names, or a store that cannot be read): `.timedOut` when the race
+    ///   carries a terminal refusal, since the transaction is pending and may still be mined, or the
+    ///   race's own outcome when its refusal is not terminal.
+    ///
+    /// A migration preparation is never recorded as rejected; its outcome reports the first
+    /// refusal observed, as before.
+    private func outcomeMatchingStoredPlan(
+        _ outcome: TransactionSubmissionOutcome,
+        txId: Data,
+        endpoints: [LightWalletEndpoint]
+    ) async -> TransactionSubmissionOutcome {
+        guard !(await submitPlanStore.isMigrationPreparation(txId: txId)) else { return outcome }
+        switch await submitPlanStore.plan(for: txId) {
+        case let .rejected(code, reason):
+            return .rejected(code: code, message: reason)
+        case let .ready(planEndpoints, acceptedBy: host?):
+            if let accepting = (endpoints + planEndpoints).first(where: { endpointKey($0) == host }) {
+                return .accepted(by: accepting)
+            }
+        default:
+            break
+        }
+        return outcome.rejection == nil ? outcome : .timedOut
+    }
+
+    /// Waits for every reconciliation of a submission that outlived its caller to finish.
+    func waitForSettledSubmissions() async {
+        await settlements.waitForAll()
+    }
+
+    /// Records the transaction as rejected when the verdict over its endpoints' answers says so.
+    private func recordRejectionVerdict(
+        txId: Data,
+        endpoints: [LightWalletEndpoint],
+        outcomes: [String: EndpointSubmission],
+        lifecycle: SubmitPlanLifecycle
+    ) async {
+        let planEndpoints: [LightWalletEndpoint]
+        let previous: StoredRejection?
+        switch await submitPlanStore.plan(for: txId) {
+        case let .ready(stored, acceptedBy: nil):
+            planEndpoints = stored
+            previous = nil
+        case let .rejected(code, reason):
+            // The plan just recorded is this call's endpoints; the rejection columns survive it.
+            planEndpoints = endpoints
+            previous = StoredRejection(code: code, reason: reason)
+        default:
+            // Accepted at some point, unreadable, or gone: never rejected.
+            return
+        }
+        guard let verdict = submitRejectionVerdict(planEndpoints: planEndpoints, outcomes: outcomes, previous: previous) else {
+            return
+        }
+        await submitPlanStore.markRejected(txId: txId, code: verdict.code, reason: verdict.reason, lifecycle: lifecycle)
+    }
+}
+
+/// The reconciliations of submissions that outlived their caller (see
+/// `SDKBroadcaster.reconcileWhenSettled`), kept so tests can wait for them.
+private actor SubmissionSettlements {
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+
+    func run(_ operation: @escaping () async -> Void) {
+        let id = UUID()
+        // Inserted before the task can reach `finished(_:)`, which needs this actor.
+        tasks[id] = Task {
+            await operation()
+            await self.finished(id)
+        }
+    }
+
+    func waitForAll() async {
+        while !tasks.isEmpty {
+            for (id, task) in tasks {
+                await task.value
+                tasks[id] = nil
+            }
+        }
+    }
+
+    private func finished(_ id: UUID) {
+        tasks[id] = nil
+    }
+}
+
 // MARK: - Unaccepted transactions after a server change
 
 extension SDKBroadcaster {
@@ -342,24 +511,60 @@ extension SDKBroadcaster {
             }
             // Each transaction on its own: one that the server does not take must not keep the next one waiting,
             // unlike a batch, whose later transactions may depend on the earlier ones.
-            let outcome: TransactionSubmissionOutcome
+            let result: MultiEndpointSubmitter.RaceResult
             do {
-                outcome = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
-                    await self.multiEndpointSubmitter.submit(transaction: transaction, to: [endpoint], timing: timing)
+                result = try await initializer.container.resolve(SDKFlags.self).routeAdmission.withLease {
+                    await self.multiEndpointSubmitter.submitClassifyingRejection(transaction: transaction, to: [endpoint], timing: timing)
                 }
             } catch {
-                outcome = .unreachable
+                result = MultiEndpointSubmitter.RaceResult(outcome: .unreachable, endpointOutcomes: [:], race: nil)
             }
-            if case .accepted(by: let acceptingEndpoint) = outcome {
-                await submitPlanStore.markAccepted(
-                    txId: overview.rawID,
-                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
-                    lifecycle: lifecycle
-                )
-            }
+            let outcome = await recordResubmissionAnswer(
+                result,
+                txId: overview.rawID,
+                endpoint: endpoint,
+                lifecycle: lifecycle
+            )
             logger.debug("Transaction \(txId) resubmission through \(server) \(outcome.logDescription).")
             reports.append(TransactionSubmissionReport(txId: overview.rawID, outcome: outcome))
         }
         return reports
+    }
+
+    /// Records what `endpoint` answered to a resubmission as the foreground `submit` records its
+    /// race: an acceptance (an "already held" refusal included) marks the transaction accepted;
+    /// otherwise the rejection verdict over the plan's endpoints applies, and an endpoint still in
+    /// flight when the caller is released is reconciled once it settles.
+    ///
+    /// The verdict needs an explicit answer from every endpoint in the transaction's plan, which
+    /// now ends with `endpoint`. An answer from `endpoint` alone therefore completes a rejection
+    /// only when it is the plan's sole endpoint; otherwise the transaction stays pending. The same
+    /// holds for background resubmission through a selected Private endpoint, which contacts that
+    /// endpoint only: such a retry cannot complete a rejection on its own (a follow-up for the
+    /// OHTTP route owners).
+    ///
+    /// - Returns: The outcome to report, consistent with what the store recorded.
+    private func recordResubmissionAnswer(
+        _ result: MultiEndpointSubmitter.RaceResult,
+        txId: Data,
+        endpoint: LightWalletEndpoint,
+        lifecycle: SubmitPlanLifecycle
+    ) async -> TransactionSubmissionOutcome {
+        switch result.outcome {
+        case .accepted(by: let acceptingEndpoint):
+            await submitPlanStore.markAccepted(txId: txId, host: endpointKey(acceptingEndpoint), lifecycle: lifecycle)
+            return result.outcome
+        case .rejected, .unreachable:
+            await recordRejectionVerdict(txId: txId, endpoints: [endpoint], outcomes: result.endpointOutcomes, lifecycle: lifecycle)
+            if case .rejected = result.outcome {
+                return await outcomeMatchingStoredPlan(result.outcome, txId: txId, endpoints: [endpoint])
+            }
+            return result.outcome
+        case .timedOut, .cancelled:
+            await reconcileWhenSettled(txId: txId, endpoints: [endpoint], result: result, lifecycle: lifecycle)
+            return result.outcome
+        case .notAttempted:
+            return result.outcome
+        }
     }
 }
