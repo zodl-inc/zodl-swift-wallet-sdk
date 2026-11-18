@@ -6,32 +6,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-## Fixed
-
-- Connections over Tor (`TorClient`, including `TorClient.connectToLightwalletd(endpoint:)`, and
-  `SlipstreamSynchronizer`'s sync with Tor enabled) no longer fail outright while the Tor
-  network's consensus omits its `bandwidth-weights` line, as it has intermittently since
-  2026-11-15. Every guard relay then weighed zero, so the Tor client found no usable guard, built
-  no circuit, and Tor startup timed out. The Rust core now uses Arti 0.44, which picks guards
-  uniformly at random while the weights are missing; Tor can be slower than usual then, and
-  selection returns to bandwidth weighting once the consensus carries the weights again. No
-  caller changes are required.
-
-- Coinholder voting on predefined servers with Tor off
-  (`Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` with
-  `.direct` and `isCustomServer: false`) no longer refuses to open a round session whose vote
-  servers include `svote.zcashlabs.com`, `207-180-214-226.sslip.io`, `vote.atlasstaking.com`,
-  `zvote.polkachu.com`, `zvote.cros-nest.net` or `vote.infra.cypherpunk.com`. Those hosts were
-  missing from the OHTTP host list, so opening the session failed before anything was sent
-  ("cannot reach predefined vote server … not supported by the OHTTP gateway") and the round
-  could not be entered. They now ride OHTTP like the other predefined servers.
-  `OHTTPEndpoints.proxyAllowedHosts` and `OHTTPEndpoints.isProxyAllowlisted(host:)` include them,
-  `OHTTPEndpoints.proxyHost(for:)` returns their host unchanged instead of `nil`, and
-  `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)` accept requests to
-  them instead of throwing `ZcashError.ohttpUnsupportedHost`. The OHTTP gateway of the
-  installed configuration must forward these hosts as well; until it does, requests to them fail
-  at the gateway. No caller changes are required.
-
 # 8.1.0 - 2026-11-13
 
 ## Added
@@ -196,6 +170,30 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Versions/A` with `Versions/Current` and top-level symlinks). The release archive keeps those
   links. macOS apps that embed the binary SDK no longer fail Xcode's Validate step with "contains
   Info.plist, expected Versions/Current/Resources/Info.plist". The iOS slices are unchanged.
+
+- Connections over Tor (`TorClient`, including `TorClient.connectToLightwalletd(endpoint:)`, and
+  `SlipstreamSynchronizer`'s sync with Tor enabled) no longer fail outright while the Tor
+  network's consensus omits its `bandwidth-weights` line, as it has intermittently since
+  2026-11-15. Every guard relay then weighed zero, so the Tor client found no usable guard, built
+  no circuit, and Tor startup timed out. The Rust core now uses Arti 0.44, which picks guards
+  uniformly at random while the weights are missing; Tor can be slower than usual then, and
+  selection returns to bandwidth weighting once the consensus carries the weights again. No
+  caller changes are required.
+
+- Coinholder voting on predefined servers with Tor off
+  (`Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:isCustomServer:epoch:)` with
+  `.direct` and `isCustomServer: false`) no longer refuses to open a round session whose vote
+  servers include `svote.zcashlabs.com`, `207-180-214-226.sslip.io`, `vote.atlasstaking.com`,
+  `zvote.polkachu.com`, `zvote.cros-nest.net` or `vote.infra.cypherpunk.com`. Those hosts were
+  missing from the OHTTP host list, so opening the session failed before anything was sent
+  ("cannot reach predefined vote server … not supported by the OHTTP gateway") and the round
+  could not be entered. They now ride OHTTP like the other predefined servers.
+  `OHTTPEndpoints.proxyAllowedHosts` and `OHTTPEndpoints.isProxyAllowlisted(host:)` include them,
+  `OHTTPEndpoints.proxyHost(for:)` returns their host unchanged instead of `nil`, and
+  `httpRequestOverOHTTP(for:viaTor:)` and `httpStreamOverOHTTP(for:viaTor:)` accept requests to
+  them instead of throwing `ZcashError.ohttpUnsupportedHost`. The OHTTP gateway of the
+  installed configuration must forward these hosts as well; until it does, requests to them fail
+  at the gateway. No caller changes are required.
 
 ## Checkpoints
 
