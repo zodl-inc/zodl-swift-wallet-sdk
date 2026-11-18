@@ -17,7 +17,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
     func testProposeSendMaxPassesArgumentsThroughToTheRustBackendAndReturnsTheWrappedProposal() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
         let ffiProposal = FfiProposalFixtures.makeFfiProposal(feeRequired: 5_000)
-        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeReturnValue = ffiProposal
+        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue = ffiProposal
 
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
@@ -35,19 +35,50 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
         )
 
         XCTAssertEqual(proposal, Proposal(inner: ffiProposal))
-        XCTAssertEqual(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount, 1)
+        XCTAssertEqual(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount, 1)
 
-        let receivedArguments = try XCTUnwrap(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments)
+        let receivedArguments = try XCTUnwrap(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments)
         XCTAssertEqual(receivedArguments.accountUUID, accountUUID)
         XCTAssertEqual(receivedArguments.address, recipient.stringEncoded)
         XCTAssertEqual(receivedArguments.memo, try memo.asMemoBytes())
         XCTAssertEqual(receivedArguments.mode, mode)
     }
 
+    func testProposeSendMaxPassesItsSizeBoundThroughAndTheUnboundedOverloadConsensus() async throws {
+        let rustBackend = ZcashRustBackendWeldingMock()
+        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue = FfiProposalFixtures.makeFfiProposal(feeRequired: 5_000)
+        rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundReturnValue = FfiProposalFixtures.makeFfiProposal(feeRequired: 5_000)
+        let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
+        await synchronizer.updateStatus(.stopped)
+        let recipient = Recipient.sapling(SaplingAddress(validatedEncoding: recipientAddress))
+        let bound = TransactionSizeBound.forProvingMemory(availableBytes: 2 * 1024 * 1024 * 1024)
+
+        _ = try await synchronizer.proposeSendMax(
+            accountUUID: TestsData.mockedAccountUUID,
+            recipient: recipient,
+            memo: nil,
+            mode: .maxSpendable,
+            sizeBound: bound
+        )
+        XCTAssertEqual(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments?.sizeBound, bound)
+
+        _ = try await synchronizer.proposeSendMax(accountUUID: TestsData.mockedAccountUUID, recipient: recipient, memo: nil, mode: .maxSpendable)
+        XCTAssertEqual(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments?.sizeBound, .consensus)
+
+        _ = try await synchronizer.proposeTransfer(
+            accountUUID: TestsData.mockedAccountUUID,
+            recipient: recipient,
+            amount: Zatoshi(1_000),
+            memo: nil,
+            sizeBound: bound
+        )
+        XCTAssertEqual(rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundReceivedArguments?.sizeBound, bound)
+    }
+
     func testProposeSendMaxAllowsNilMemoForTransparentRecipientAndPassesArgumentsThrough() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
         let ffiProposal = FfiProposalFixtures.makeFfiProposal(feeRequired: 1_000)
-        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeReturnValue = ffiProposal
+        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue = ffiProposal
 
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
@@ -63,7 +94,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
 
         XCTAssertEqual(proposal, Proposal(inner: ffiProposal))
 
-        let receivedArguments = try XCTUnwrap(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments)
+        let receivedArguments = try XCTUnwrap(rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments)
         XCTAssertEqual(receivedArguments.address, recipient.stringEncoded)
         XCTAssertNil(receivedArguments.memo)
         XCTAssertEqual(receivedArguments.mode, .maxSpendable)
@@ -95,7 +126,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
         }
 
         XCTAssertEqual(
-            rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount,
+            rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount,
             0,
             "The rust backend must not be reached when the memo-to-transparent-recipient guard rejects the request"
         )
@@ -106,7 +137,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
     func testProposeSendMaxThrowsWhenMemoIsSuppliedForATexRecipient() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
         let ffiProposal = FfiProposalFixtures.makeFfiProposal(feeRequired: 1_000)
-        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeReturnValue = ffiProposal
+        rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue = ffiProposal
 
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
@@ -130,7 +161,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
         }
 
         XCTAssertEqual(
-            rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeCallsCount,
+            rustBackend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount,
             0,
             "The rust backend must not be reached when the memo-to-TEX-recipient guard rejects the request"
         )
@@ -167,7 +198,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
     func testProposeTransferThrowsWhenMemoIsSuppliedForATexRecipient() async throws {
         let rustBackend = ZcashRustBackendWeldingMock()
         let ffiProposal = FfiProposalFixtures.makeFfiProposal(feeRequired: 1_000)
-        rustBackend.proposeTransferAccountUUIDToValueMemoReturnValue = ffiProposal
+        rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundReturnValue = ffiProposal
 
         let synchronizer = try makeSynchronizer(rustBackend: rustBackend)
         await synchronizer.updateStatus(.stopped)
@@ -191,7 +222,7 @@ final class SDKSynchronizerProposeSendMaxTests: ZcashTestCase {
         }
 
         XCTAssertEqual(
-            rustBackend.proposeTransferAccountUUIDToValueMemoCallsCount,
+            rustBackend.proposeTransferAccountUUIDToValueMemoSizeBoundCallsCount,
             0,
             "The rust backend must not be reached when the memo-to-TEX-recipient guard rejects the request"
         )

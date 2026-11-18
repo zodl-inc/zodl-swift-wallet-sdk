@@ -1659,6 +1659,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         await submitPlanStore.plan(for: rawID)?.submissionStatus
     }
 
+    public nonisolated var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        submitPlanStore.rejectedTransactionIds
+    }
+
     public func listAccounts() async throws -> [Account] {
         try await initializer.rustBackend.listAccounts()
     }
@@ -1933,6 +1937,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         amount: Zatoshi,
         memo: Memo?
     ) async throws -> Proposal {
+        try await proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, sizeBound: .consensus)
+    }
+
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeTransfer`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
@@ -1945,7 +1959,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             amount: amount,
-            memoBytes: memo?.asMemoBytes()
+            memoBytes: memo?.asMemoBytes(),
+            sizeBound: sizeBound
         )
     }
 
@@ -1954,6 +1969,16 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         recipient: Recipient,
         memo: Memo?,
         mode: MaxSpendMode
+    ) async throws -> Proposal {
+        try await proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, sizeBound: .consensus)
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposeSendMax`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
@@ -1967,7 +1992,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             memoBytes: memo?.asMemoBytes(),
-            mode: mode
+            mode: mode,
+            sizeBound: sizeBound
         )
     }
 
@@ -2007,6 +2033,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
+        try await proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: .consensus)
+    }
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposefulfillingPaymentURI`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
@@ -2017,7 +2051,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         return try await transactionEncoder.proposeFulfillingPaymentFromURI(
             uri,
-            accountUUID: accountUUID
+            accountUUID: accountUUID,
+            sizeBound: sizeBound
         )
     }
 
@@ -2033,10 +2068,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: .consensus)
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
         let transactions = try await broadcaster.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
-            ovkPolicy: ovkPolicy
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound
         )
         return submitTransactions(transactions)
     }
@@ -2044,10 +2089,25 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // ── PCZT ──────────────────────────────────────────────────────────────────
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt {
-        try await initializer.rustBackend.createPCZTFromProposal(
+        try await createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: .consensus)
+    }
+
+    public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
+        // Captured before creation, so a `wipe()` meanwhile drops the migration mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+        let pczt = try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
-            proposal: proposal.inner
+            proposal: proposal.inner,
+            sizeBound: sizeBound
         )
+        await submitPlanStore.markMigrationPCZT(
+            pczt,
+            of: proposal,
+            rustBackend: initializer.rustBackend,
+            lifecycle: lifecycle,
+            logger: initializer.logger
+        )
+        return pczt
     }
 
     public func redactPCZTForSigner(pczt: Pczt) async throws -> Pczt {
@@ -2586,7 +2646,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        // Captured before the preparation is taken, so a `wipe()` meanwhile drops the mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+        let prepared = try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        // Its submission keeps main's resubmission until expiry, even if every server rejects it.
+        await submitPlanStore.markMigrationPreparation(txId: prepared.txid, lifecycle: lifecycle)
+        return prepared
     }
 
     public func recordMigrationPreparationBroadcast(

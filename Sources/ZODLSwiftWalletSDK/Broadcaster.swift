@@ -57,6 +57,20 @@ public protocol Broadcaster: AnyObject {
         ovkPolicy: OvkPolicy
     ) async throws -> [CreatedTransaction]
 
+    /// Creates the transactions in the given proposal without submitting them, as
+    /// `createProposedTransactions(proposal:spendingKey:ovkPolicy:)` does, after checking the
+    /// proposal against `sizeBound`.
+    ///
+    /// A proposal that exceeds `sizeBound` throws `ZcashError.rustProposalTransactionTooLarge`
+    /// before anything is proven or stored. A conformer that does not override this throws for any
+    /// bound other than ``TransactionSizeBound/consensus`` rather than ignore it.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction]
+
     /// Finalizes a PCZT that has been separately proven and signed, stores it
     /// in the wallet, and returns the resulting transactions without submitting.
     ///
@@ -126,8 +140,14 @@ public protocol Broadcaster: AnyObject {
     /// Only transactions that are neither mined nor expired, as of the last chain tip the SDK
     /// knows, are considered. Transactions a server has already accepted, transactions created
     /// through this broadcaster that the host has not submitted or released yet, and transactions
-    /// without a recorded plan are left alone. A transaction `endpoint` does not accept stays
-    /// with background resubmission like any other.
+    /// without a recorded plan are left alone, and so are transactions recorded as rejected
+    /// (every endpoint of the plan answered explicitly, none accepted and every refusal was for
+    /// good). What `endpoint` answers is recorded as a submission's answers
+    /// are: an acceptance (including "already in its mempool") marks the transaction accepted, and
+    /// a refusal for good counts toward the rejection verdict, which needs an explicit answer from
+    /// every endpoint in the transaction's plan and no refusal that may be transient (one that
+    /// is keeps the transaction pending). A transaction `endpoint` does not accept, and
+    /// that is not thereby rejected, stays with background resubmission like any other.
     ///
     /// Privacy: `endpoint` receives each of these transactions together with the network address
     /// they come from, unless the route hides it (Tor), as it would for any submission to it.
@@ -156,6 +176,21 @@ extension Broadcaster {
         case .discard:
             throw OvkPolicyUnsupported(member: "Broadcaster.createProposedTransactions(proposal:spendingKey:ovkPolicy:)")
         }
+    }
+
+    /// Default implementation so adding the `sizeBound:` overload to the protocol is not a
+    /// source-breaking change for downstream conformers: a consensus bound is what the unbounded
+    /// overload already does, and any other bound is refused rather than silently ignored.
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> [CreatedTransaction] {
+        guard sizeBound == .consensus else {
+            throw SizeBoundUnsupported(member: "Broadcaster.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)")
+        }
+        return try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy)
     }
 
     /// Forwards with `SubmissionTiming.default` (protocol requirements cannot
@@ -269,8 +304,12 @@ public struct SubmissionTiming: Equatable {
 public enum TransactionSubmissionOutcome: Equatable {
     /// At least one endpoint accepted the transaction.
     case accepted(by: LightWalletEndpoint)
-    /// Every endpoint responded and none accepted. Carries the first
-    /// lightwalletd rejection (error code + message) that was observed.
+    /// Every endpoint responded and none accepted. Carries the terminal refusal
+    /// (``SubmitRejection``) the SDK recorded when it marked the transaction rejected,
+    /// which it does only when every refusal was terminal; otherwise the first
+    /// lightwalletd rejection (error code + message) that was observed, which is
+    /// then never a terminal refusal (except for an Orchard migration preparation,
+    /// which is never recorded as rejected). ``rejection`` tells the two apart.
     ///
     /// Before it submits the transaction to an endpoint, the SDK reads that
     /// endpoint's latest block height and refuses to submit a transaction that
@@ -283,10 +322,18 @@ public enum TransactionSubmissionOutcome: Equatable {
     /// Every endpoint failed at the transport level (gRPC/connection error);
     /// no server-level rejection was observed.
     case unreachable
-    /// No clear decision within `responseTimeout`: at least one endpoint had
-    /// not responded when the timer fired (others may have rejected or failed
-    /// in the meantime — details are logged). The transaction may still have
-    /// been broadcast — treat as pending, not failed.
+    /// No clear decision: at least one endpoint had not responded when the
+    /// `responseTimeout` timer fired (others may have rejected or failed in the
+    /// meantime — details are logged), or an endpoint refused the transaction
+    /// for good while another's submission failed at the transport level, so
+    /// whether that one took it is unknown, or while another refused it in a
+    /// way that may be transient. The transaction may still have
+    /// been broadcast — treat as pending, not failed. Once every endpoint's
+    /// submission has ended, a late acceptance is recorded, or the rejection
+    /// their complete answers make; background resubmission reconciles an
+    /// endpoint that failed at the transport level the same way.
+    /// `Synchronizer.transactionSubmissionStatus(for:)` and
+    /// `rejectedTransactionIdsStream` report it.
     case timedOut
     /// Skipped because an earlier transaction in the batch was not accepted.
     case notAttempted

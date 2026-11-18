@@ -592,6 +592,30 @@ class BroadcasterMock: Broadcaster {
         }
     }
 
+    // MARK: - createProposedTransactions
+
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundThrowableError: Error?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount = 0
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCalled: Bool {
+        return createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount > 0
+    }
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReceivedArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound)?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReturnValue: [CreatedTransaction]!
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundClosure: ((Proposal, UnifiedSpendingKey, OvkPolicy, TransactionSizeBound) async throws -> [CreatedTransaction])?
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound) async throws -> [CreatedTransaction] {
+        if let error = createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundThrowableError {
+            throw error
+        }
+        createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount += 1
+        createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReceivedArguments = (proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: sizeBound)
+        if let closure = createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundClosure {
+            return try await closure(proposal, spendingKey, ovkPolicy, sizeBound)
+        } else {
+            return createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReturnValue
+        }
+    }
+
     // MARK: - createTransactionFromPCZT
 
     var createTransactionFromPCZTPcztWithProofsPcztWithSigsThrowableError: Error?
@@ -1620,6 +1644,10 @@ class SynchronizerMock: Synchronizer {
         get { return underlyingBroadcaster }
     }
     var underlyingBroadcaster: Broadcaster!
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        get { return underlyingRejectedTransactionIdsStream }
+    }
+    var underlyingRejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never>!
     var migrationSyncBlockedStream: AnyPublisher<Bool, Never> {
         get { return underlyingMigrationSyncBlockedStream }
     }
@@ -1801,6 +1829,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposeTransfer
+
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundThrowableError: Error?
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundCallsCount = 0
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundCalled: Bool {
+        return proposeTransferAccountUUIDRecipientAmountMemoSizeBoundCallsCount > 0
+    }
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundReceivedArguments: (accountUUID: AccountUUID, recipient: Recipient, amount: Zatoshi, memo: Memo?, sizeBound: TransactionSizeBound)?
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundReturnValue: Proposal!
+    var proposeTransferAccountUUIDRecipientAmountMemoSizeBoundClosure: ((AccountUUID, Recipient, Zatoshi, Memo?, TransactionSizeBound) async throws -> Proposal)?
+
+    func proposeTransfer(accountUUID: AccountUUID, recipient: Recipient, amount: Zatoshi, memo: Memo?, sizeBound: TransactionSizeBound) async throws -> Proposal {
+        if let error = proposeTransferAccountUUIDRecipientAmountMemoSizeBoundThrowableError {
+            throw error
+        }
+        proposeTransferAccountUUIDRecipientAmountMemoSizeBoundCallsCount += 1
+        proposeTransferAccountUUIDRecipientAmountMemoSizeBoundReceivedArguments = (accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, sizeBound: sizeBound)
+        if let closure = proposeTransferAccountUUIDRecipientAmountMemoSizeBoundClosure {
+            return try await closure(accountUUID, recipient, amount, memo, sizeBound)
+        } else {
+            return proposeTransferAccountUUIDRecipientAmountMemoSizeBoundReturnValue
+        }
+    }
+
     // MARK: - proposeSendMax
 
     var proposeSendMaxAccountUUIDRecipientMemoModeThrowableError: Error?
@@ -1822,6 +1874,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(accountUUID, recipient, memo, mode)
         } else {
             return proposeSendMaxAccountUUIDRecipientMemoModeReturnValue
+        }
+    }
+
+    // MARK: - proposeSendMax
+
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundThrowableError: Error?
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundCallsCount = 0
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundCalled: Bool {
+        return proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundCallsCount > 0
+    }
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundReceivedArguments: (accountUUID: AccountUUID, recipient: Recipient, memo: Memo?, mode: MaxSpendMode, sizeBound: TransactionSizeBound)?
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundReturnValue: Proposal!
+    var proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundClosure: ((AccountUUID, Recipient, Memo?, MaxSpendMode, TransactionSizeBound) async throws -> Proposal)?
+
+    func proposeSendMax(accountUUID: AccountUUID, recipient: Recipient, memo: Memo?, mode: MaxSpendMode, sizeBound: TransactionSizeBound) async throws -> Proposal {
+        if let error = proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundThrowableError {
+            throw error
+        }
+        proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundCallsCount += 1
+        proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundReceivedArguments = (accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, sizeBound: sizeBound)
+        if let closure = proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundClosure {
+            return try await closure(accountUUID, recipient, memo, mode, sizeBound)
+        } else {
+            return proposeSendMaxAccountUUIDRecipientMemoModeSizeBoundReturnValue
         }
     }
 
@@ -1921,6 +1997,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - createProposedTransactions
+
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundThrowableError: Error?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount = 0
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCalled: Bool {
+        return createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount > 0
+    }
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReceivedArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound)?
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReturnValue: AsyncThrowingStream<TransactionSubmitResult, Error>!
+    var createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundClosure: ((Proposal, UnifiedSpendingKey, OvkPolicy, TransactionSizeBound) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error>)?
+
+    func createProposedTransactions(proposal: Proposal, spendingKey: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        if let error = createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundThrowableError {
+            throw error
+        }
+        createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundCallsCount += 1
+        createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReceivedArguments = (proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: sizeBound)
+        if let closure = createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundClosure {
+            return try await closure(proposal, spendingKey, ovkPolicy, sizeBound)
+        } else {
+            return createProposedTransactionsProposalSpendingKeyOvkPolicySizeBoundReturnValue
+        }
+    }
+
     // MARK: - proposefulfillingPaymentURI
 
     var proposefulfillingPaymentURIAccountUUIDThrowableError: Error?
@@ -1945,6 +2045,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - proposefulfillingPaymentURI
+
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundThrowableError: Error?
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundCallsCount = 0
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundCalled: Bool {
+        return proposefulfillingPaymentURIAccountUUIDSizeBoundCallsCount > 0
+    }
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundReceivedArguments: (uri: String, accountUUID: AccountUUID, sizeBound: TransactionSizeBound)?
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundReturnValue: Proposal!
+    var proposefulfillingPaymentURIAccountUUIDSizeBoundClosure: ((String, AccountUUID, TransactionSizeBound) async throws -> Proposal)?
+
+    func proposefulfillingPaymentURI(_ uri: String, accountUUID: AccountUUID, sizeBound: TransactionSizeBound) async throws -> Proposal {
+        if let error = proposefulfillingPaymentURIAccountUUIDSizeBoundThrowableError {
+            throw error
+        }
+        proposefulfillingPaymentURIAccountUUIDSizeBoundCallsCount += 1
+        proposefulfillingPaymentURIAccountUUIDSizeBoundReceivedArguments = (uri: uri, accountUUID: accountUUID, sizeBound: sizeBound)
+        if let closure = proposefulfillingPaymentURIAccountUUIDSizeBoundClosure {
+            return try await closure(uri, accountUUID, sizeBound)
+        } else {
+            return proposefulfillingPaymentURIAccountUUIDSizeBoundReturnValue
+        }
+    }
+
     // MARK: - createPCZTFromProposal
 
     var createPCZTFromProposalAccountUUIDProposalThrowableError: Error?
@@ -1966,6 +2090,30 @@ class SynchronizerMock: Synchronizer {
             return try await closure(accountUUID, proposal)
         } else {
             return createPCZTFromProposalAccountUUIDProposalReturnValue
+        }
+    }
+
+    // MARK: - createPCZTFromProposal
+
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundThrowableError: Error?
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount = 0
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundCalled: Bool {
+        return createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount > 0
+    }
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundReceivedArguments: (accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound)?
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue: Pczt!
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundClosure: ((AccountUUID, Proposal, TransactionSizeBound) async throws -> Pczt)?
+
+    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
+        if let error = createPCZTFromProposalAccountUUIDProposalSizeBoundThrowableError {
+            throw error
+        }
+        createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount += 1
+        createPCZTFromProposalAccountUUIDProposalSizeBoundReceivedArguments = (accountUUID: accountUUID, proposal: proposal, sizeBound: sizeBound)
+        if let closure = createPCZTFromProposalAccountUUIDProposalSizeBoundClosure {
+            return try await closure(accountUUID, proposal, sizeBound)
+        } else {
+            return createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue
         }
     }
 
@@ -5127,49 +5275,49 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - proposeTransfer
 
-    var proposeTransferAccountUUIDToValueMemoThrowableError: Error?
-    var proposeTransferAccountUUIDToValueMemoCallsCount = 0
-    var proposeTransferAccountUUIDToValueMemoCalled: Bool {
-        return proposeTransferAccountUUIDToValueMemoCallsCount > 0
+    var proposeTransferAccountUUIDToValueMemoSizeBoundThrowableError: Error?
+    var proposeTransferAccountUUIDToValueMemoSizeBoundCallsCount = 0
+    var proposeTransferAccountUUIDToValueMemoSizeBoundCalled: Bool {
+        return proposeTransferAccountUUIDToValueMemoSizeBoundCallsCount > 0
     }
-    var proposeTransferAccountUUIDToValueMemoReceivedArguments: (accountUUID: AccountUUID, address: String, value: Int64, memo: MemoBytes?)?
-    var proposeTransferAccountUUIDToValueMemoReturnValue: FfiProposal!
-    var proposeTransferAccountUUIDToValueMemoClosure: ((AccountUUID, String, Int64, MemoBytes?) async throws -> FfiProposal)?
+    var proposeTransferAccountUUIDToValueMemoSizeBoundReceivedArguments: (accountUUID: AccountUUID, address: String, value: Int64, memo: MemoBytes?, sizeBound: TransactionSizeBound)?
+    var proposeTransferAccountUUIDToValueMemoSizeBoundReturnValue: FfiProposal!
+    var proposeTransferAccountUUIDToValueMemoSizeBoundClosure: ((AccountUUID, String, Int64, MemoBytes?, TransactionSizeBound) async throws -> FfiProposal)?
 
-    func proposeTransfer(accountUUID: AccountUUID, to address: String, value: Int64, memo: MemoBytes?) async throws -> FfiProposal {
-        if let error = proposeTransferAccountUUIDToValueMemoThrowableError {
+    func proposeTransfer(accountUUID: AccountUUID, to address: String, value: Int64, memo: MemoBytes?, sizeBound: TransactionSizeBound) async throws -> FfiProposal {
+        if let error = proposeTransferAccountUUIDToValueMemoSizeBoundThrowableError {
             throw error
         }
-        proposeTransferAccountUUIDToValueMemoCallsCount += 1
-        proposeTransferAccountUUIDToValueMemoReceivedArguments = (accountUUID: accountUUID, address: address, value: value, memo: memo)
-        if let closure = proposeTransferAccountUUIDToValueMemoClosure {
-            return try await closure(accountUUID, address, value, memo)
+        proposeTransferAccountUUIDToValueMemoSizeBoundCallsCount += 1
+        proposeTransferAccountUUIDToValueMemoSizeBoundReceivedArguments = (accountUUID: accountUUID, address: address, value: value, memo: memo, sizeBound: sizeBound)
+        if let closure = proposeTransferAccountUUIDToValueMemoSizeBoundClosure {
+            return try await closure(accountUUID, address, value, memo, sizeBound)
         } else {
-            return proposeTransferAccountUUIDToValueMemoReturnValue
+            return proposeTransferAccountUUIDToValueMemoSizeBoundReturnValue
         }
     }
 
     // MARK: - proposeSendMaxTransfer
 
-    var proposeSendMaxTransferAccountUUIDToMemoModeThrowableError: Error?
-    var proposeSendMaxTransferAccountUUIDToMemoModeCallsCount = 0
-    var proposeSendMaxTransferAccountUUIDToMemoModeCalled: Bool {
-        return proposeSendMaxTransferAccountUUIDToMemoModeCallsCount > 0
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundThrowableError: Error?
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount = 0
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCalled: Bool {
+        return proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount > 0
     }
-    var proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments: (accountUUID: AccountUUID, address: String, memo: MemoBytes?, mode: MaxSpendMode)?
-    var proposeSendMaxTransferAccountUUIDToMemoModeReturnValue: FfiProposal!
-    var proposeSendMaxTransferAccountUUIDToMemoModeClosure: ((AccountUUID, String, MemoBytes?, MaxSpendMode) async throws -> FfiProposal)?
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments: (accountUUID: AccountUUID, address: String, memo: MemoBytes?, mode: MaxSpendMode, sizeBound: TransactionSizeBound)?
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue: FfiProposal!
+    var proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure: ((AccountUUID, String, MemoBytes?, MaxSpendMode, TransactionSizeBound) async throws -> FfiProposal)?
 
-    func proposeSendMaxTransfer(accountUUID: AccountUUID, to address: String, memo: MemoBytes?, mode: MaxSpendMode) async throws -> FfiProposal {
-        if let error = proposeSendMaxTransferAccountUUIDToMemoModeThrowableError {
+    func proposeSendMaxTransfer(accountUUID: AccountUUID, to address: String, memo: MemoBytes?, mode: MaxSpendMode, sizeBound: TransactionSizeBound) async throws -> FfiProposal {
+        if let error = proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundThrowableError {
             throw error
         }
-        proposeSendMaxTransferAccountUUIDToMemoModeCallsCount += 1
-        proposeSendMaxTransferAccountUUIDToMemoModeReceivedArguments = (accountUUID: accountUUID, address: address, memo: memo, mode: mode)
-        if let closure = proposeSendMaxTransferAccountUUIDToMemoModeClosure {
-            return try await closure(accountUUID, address, memo, mode)
+        proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundCallsCount += 1
+        proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReceivedArguments = (accountUUID: accountUUID, address: address, memo: memo, mode: mode, sizeBound: sizeBound)
+        if let closure = proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure {
+            return try await closure(accountUUID, address, memo, mode, sizeBound)
         } else {
-            return proposeSendMaxTransferAccountUUIDToMemoModeReturnValue
+            return proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue
         }
     }
 
@@ -5199,25 +5347,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - proposeTransferFromURI
 
-    var proposeTransferFromURIAccountUUIDThrowableError: Error?
-    var proposeTransferFromURIAccountUUIDCallsCount = 0
-    var proposeTransferFromURIAccountUUIDCalled: Bool {
-        return proposeTransferFromURIAccountUUIDCallsCount > 0
+    var proposeTransferFromURIAccountUUIDSizeBoundThrowableError: Error?
+    var proposeTransferFromURIAccountUUIDSizeBoundCallsCount = 0
+    var proposeTransferFromURIAccountUUIDSizeBoundCalled: Bool {
+        return proposeTransferFromURIAccountUUIDSizeBoundCallsCount > 0
     }
-    var proposeTransferFromURIAccountUUIDReceivedArguments: (uri: String, accountUUID: AccountUUID)?
-    var proposeTransferFromURIAccountUUIDReturnValue: FfiProposal!
-    var proposeTransferFromURIAccountUUIDClosure: ((String, AccountUUID) async throws -> FfiProposal)?
+    var proposeTransferFromURIAccountUUIDSizeBoundReceivedArguments: (uri: String, accountUUID: AccountUUID, sizeBound: TransactionSizeBound)?
+    var proposeTransferFromURIAccountUUIDSizeBoundReturnValue: FfiProposal!
+    var proposeTransferFromURIAccountUUIDSizeBoundClosure: ((String, AccountUUID, TransactionSizeBound) async throws -> FfiProposal)?
 
-    func proposeTransferFromURI(_ uri: String, accountUUID: AccountUUID) async throws -> FfiProposal {
-        if let error = proposeTransferFromURIAccountUUIDThrowableError {
+    func proposeTransferFromURI(_ uri: String, accountUUID: AccountUUID, sizeBound: TransactionSizeBound) async throws -> FfiProposal {
+        if let error = proposeTransferFromURIAccountUUIDSizeBoundThrowableError {
             throw error
         }
-        proposeTransferFromURIAccountUUIDCallsCount += 1
-        proposeTransferFromURIAccountUUIDReceivedArguments = (uri: uri, accountUUID: accountUUID)
-        if let closure = proposeTransferFromURIAccountUUIDClosure {
-            return try await closure(uri, accountUUID)
+        proposeTransferFromURIAccountUUIDSizeBoundCallsCount += 1
+        proposeTransferFromURIAccountUUIDSizeBoundReceivedArguments = (uri: uri, accountUUID: accountUUID, sizeBound: sizeBound)
+        if let closure = proposeTransferFromURIAccountUUIDSizeBoundClosure {
+            return try await closure(uri, accountUUID, sizeBound)
         } else {
-            return proposeTransferFromURIAccountUUIDReturnValue
+            return proposeTransferFromURIAccountUUIDSizeBoundReturnValue
         }
     }
 
@@ -5247,25 +5395,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - createProposedTransactions
 
-    var createProposedTransactionsProposalUskOvkPolicyThrowableError: Error?
-    var createProposedTransactionsProposalUskOvkPolicyCallsCount = 0
-    var createProposedTransactionsProposalUskOvkPolicyCalled: Bool {
-        return createProposedTransactionsProposalUskOvkPolicyCallsCount > 0
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundThrowableError: Error?
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount = 0
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundCalled: Bool {
+        return createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount > 0
     }
-    var createProposedTransactionsProposalUskOvkPolicyReceivedArguments: (proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy)?
-    var createProposedTransactionsProposalUskOvkPolicyReturnValue: [Data]!
-    var createProposedTransactionsProposalUskOvkPolicyClosure: ((FfiProposal, UnifiedSpendingKey, OvkPolicy) async throws -> [Data])?
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments: (proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound)?
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue: [Data]!
+    var createProposedTransactionsProposalUskOvkPolicySizeBoundClosure: ((FfiProposal, UnifiedSpendingKey, OvkPolicy, TransactionSizeBound) async throws -> [Data])?
 
-    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy) async throws -> [Data] {
-        if let error = createProposedTransactionsProposalUskOvkPolicyThrowableError {
+    func createProposedTransactions(proposal: FfiProposal, usk: UnifiedSpendingKey, ovkPolicy: OvkPolicy, sizeBound: TransactionSizeBound) async throws -> [Data] {
+        if let error = createProposedTransactionsProposalUskOvkPolicySizeBoundThrowableError {
             throw error
         }
-        createProposedTransactionsProposalUskOvkPolicyCallsCount += 1
-        createProposedTransactionsProposalUskOvkPolicyReceivedArguments = (proposal: proposal, usk: usk, ovkPolicy: ovkPolicy)
-        if let closure = createProposedTransactionsProposalUskOvkPolicyClosure {
-            return try await closure(proposal, usk, ovkPolicy)
+        createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount += 1
+        createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments = (proposal: proposal, usk: usk, ovkPolicy: ovkPolicy, sizeBound: sizeBound)
+        if let closure = createProposedTransactionsProposalUskOvkPolicySizeBoundClosure {
+            return try await closure(proposal, usk, ovkPolicy, sizeBound)
         } else {
-            return createProposedTransactionsProposalUskOvkPolicyReturnValue
+            return createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue
         }
     }
 
@@ -5295,25 +5443,25 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
 
     // MARK: - createPCZTFromProposal
 
-    var createPCZTFromProposalAccountUUIDProposalThrowableError: Error?
-    var createPCZTFromProposalAccountUUIDProposalCallsCount = 0
-    var createPCZTFromProposalAccountUUIDProposalCalled: Bool {
-        return createPCZTFromProposalAccountUUIDProposalCallsCount > 0
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundThrowableError: Error?
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount = 0
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundCalled: Bool {
+        return createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount > 0
     }
-    var createPCZTFromProposalAccountUUIDProposalReceivedArguments: (accountUUID: AccountUUID, proposal: FfiProposal)?
-    var createPCZTFromProposalAccountUUIDProposalReturnValue: Pczt!
-    var createPCZTFromProposalAccountUUIDProposalClosure: ((AccountUUID, FfiProposal) async throws -> Pczt)?
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundReceivedArguments: (accountUUID: AccountUUID, proposal: FfiProposal, sizeBound: TransactionSizeBound)?
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue: Pczt!
+    var createPCZTFromProposalAccountUUIDProposalSizeBoundClosure: ((AccountUUID, FfiProposal, TransactionSizeBound) async throws -> Pczt)?
 
-    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: FfiProposal) async throws -> Pczt {
-        if let error = createPCZTFromProposalAccountUUIDProposalThrowableError {
+    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: FfiProposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
+        if let error = createPCZTFromProposalAccountUUIDProposalSizeBoundThrowableError {
             throw error
         }
-        createPCZTFromProposalAccountUUIDProposalCallsCount += 1
-        createPCZTFromProposalAccountUUIDProposalReceivedArguments = (accountUUID: accountUUID, proposal: proposal)
-        if let closure = createPCZTFromProposalAccountUUIDProposalClosure {
-            return try await closure(accountUUID, proposal)
+        createPCZTFromProposalAccountUUIDProposalSizeBoundCallsCount += 1
+        createPCZTFromProposalAccountUUIDProposalSizeBoundReceivedArguments = (accountUUID: accountUUID, proposal: proposal, sizeBound: sizeBound)
+        if let closure = createPCZTFromProposalAccountUUIDProposalSizeBoundClosure {
+            return try await closure(accountUUID, proposal, sizeBound)
         } else {
-            return createPCZTFromProposalAccountUUIDProposalReturnValue
+            return createPCZTFromProposalAccountUUIDProposalSizeBoundReturnValue
         }
     }
 
@@ -5358,6 +5506,26 @@ class ZcashRustBackendWeldingMock: ZcashRustBackendWelding {
             return await closure(pczt)
         } else {
             return pcztRequiresSaplingProofsPcztReturnValue
+        }
+    }
+
+    // MARK: - pcztTxid
+
+    var pcztTxidPcztCallsCount = 0
+    var pcztTxidPcztCalled: Bool {
+        return pcztTxidPcztCallsCount > 0
+    }
+    var pcztTxidPcztReceivedPczt: Pczt?
+    var pcztTxidPcztReturnValue: Data?
+    var pcztTxidPcztClosure: ((Pczt) async -> Data?)?
+
+    func pcztTxid(pczt: Pczt) async -> Data? {
+        pcztTxidPcztCallsCount += 1
+        pcztTxidPcztReceivedPczt = pczt
+        if let closure = pcztTxidPcztClosure {
+            return await closure(pczt)
+        } else {
+            return pcztTxidPcztReturnValue
         }
     }
 

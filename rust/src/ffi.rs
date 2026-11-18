@@ -1945,6 +1945,48 @@ mod recovery_hold_tests {
     }
 }
 
+/// The caps a wallet holds a proposal to, below what consensus allows: see
+/// [`crate::size_bound::TransactionSizeBound`].
+///
+/// Each field is a cap, or `-1` for none. A bound with every field `-1` is consensus only, which
+/// is what every entry point taking one did before the parameter existed. `0` is a real cap: for a
+/// pool, it forbids the pool. Any other negative value is rejected.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FfiTransactionSizeBound {
+    /// The estimated serialized size of the proposal's transactions, in bytes.
+    pub max_bytes: i64,
+    /// Sapling, Orchard and Ironwood actions together.
+    pub max_shielded_actions: i64,
+    /// Sapling spends and outputs.
+    pub max_sapling_actions: i64,
+    /// Orchard actions.
+    pub max_orchard_actions: i64,
+    /// Ironwood actions.
+    pub max_ironwood_actions: i64,
+    /// Transparent inputs.
+    pub max_transparent_inputs: i64,
+    /// Transparent outputs, change included.
+    pub max_transparent_outputs: i64,
+    /// Shielded outputs that pay a recipient rather than return change to the wallet.
+    pub max_shielded_payment_outputs: i64,
+}
+
+#[cfg(test)]
+impl FfiTransactionSizeBound {
+    /// Consensus only: no field capped.
+    pub(crate) const CONSENSUS: Self = Self {
+        max_bytes: -1,
+        max_shielded_actions: -1,
+        max_sapling_actions: -1,
+        max_orchard_actions: -1,
+        max_ironwood_actions: -1,
+        max_transparent_inputs: -1,
+        max_transparent_outputs: -1,
+        max_shielded_payment_outputs: -1,
+    };
+}
+
 /// Set the default OHTTP client trace prefix (process-wide). This should be called before any
 /// OHTTP connections are made, typically during SDK initialization. Pass NULL to disable tracing.
 ///

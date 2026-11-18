@@ -107,6 +107,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zcashlc_tor_http_post_stream`: tried again on a new isolated circuit, twice at most, only when
   opening the Tor stream or the TLS session failed, before any of the request was sent.
 
+- `zcashlc_pczt_txid(pczt_ptr, pczt_len, txid_ret)` writes the id of the transaction a PCZT
+  commits to, in the SDK's raw byte order. A v5 or later transaction id commits to the
+  transaction's effects only, so it is known when the PCZT is created and is the id of the
+  transaction finally extracted from it. Returns `false` and sets the last error for bytes that are
+  not a PCZT, or a pre-v5 transaction.
+- `zcashlc_zip317_marginal_fee()` returns the ZIP 317 marginal fee in zatoshis, as
+  `zcash_primitives` defines it. It reads no database and cannot fail.
 - `zcashlc_slipstream_stop_for_wallet_change(handle)`, the stop to call right before changing the
   wallet (adding or removing an account, a rewind, a wipe, or reopening a handle on the same
   wallet). It asks the running session to end its scan at the next block, then stops exactly as
@@ -654,6 +661,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection); with no configuration installed for that network it is reached directly. With
   `is_custom_server` true it uses the direct HTTP route. PIR queries share the session's route.
 
+- `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
+  `zcashlc_propose_send_max_transfer`, `zcashlc_create_proposed_transactions` and
+  `zcashlc_create_pczt_from_proposal` take a trailing `size_bound: FfiTransactionSizeBound`, the
+  caps the proposal is held to below consensus: `max_bytes` (the proposal's estimated serialized
+  size), `max_shielded_actions`, `max_sapling_actions`, `max_orchard_actions`,
+  `max_ironwood_actions`, `max_transparent_inputs`, `max_transparent_outputs` and
+  `max_shielded_payment_outputs`, each `-1` for no cap (`0` forbids that dimension; any other
+  negative value fails). Actions are those `zcash_client_backend`'s builder produces, padding
+  included. A proposal exceeding the bound fails with `ErrorKind::TransactionTooLarge`
+  (`22`), through `zcashlc_take_last_error_report` on every one of these entry points. A
+  `max_bytes` above `MAX_BLOCK_BYTES` counts as a block, and is held against each transaction of
+  the proposal on its own. A send-max
+  is refused, never reduced to what fits. `zcashlc_propose_send_max_transfer` ignores the bound when
+  `orchard_only` is `true`. Existing callers must pass every field `-1` to keep their behavior.
 - `libzcashlc` is built for minimum iOS 16 and macOS 14 on every slice (the iOS simulator included);
   its C objects previously claimed the building Xcode SDK's version.
 - `zcashlc_set_custom_network` takes a trailing `nu7` activation height. As for the other
@@ -689,6 +710,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unredacted upstream text is logged on the device at `debug!` only. A caller that parsed the old
   text for a cause should take `zcashlc_take_last_error_report` and switch on `kind` instead.
   `zcashlc_propose_shielding` is unchanged and still reports a plain string.
+- `ErrorKind` gains `22` (`TransactionTooLarge`: the transaction would spend too many notes to fit
+  in a block) and `23` (`TransparentMemo`: a memo for a recipient that cannot receive one).
+  `zcashlc_propose_transfer` and `zcashlc_propose_transfer_from_uri` report an oversized proposal
+  as `22` rather than `17`. `zcashlc_propose_send_max_transfer` with `orchard_only` false now
+  refuses a send-max whose transaction would not fit in a block, reporting `22`, instead of
+  returning a proposal whose transaction creation then fails; it reports a recipient with no
+  payable receiver as `10` rather than `14`. These proposal calls report a memo for a recipient
+  that cannot receive one as `23` (previously `6` or `17`), and a shortfall found during change
+  selection as `2` with both amounts (previously `15`). Transaction and PCZT creation, and
+  `zcashlc_propose_send_max_transfer` with `orchard_only` true, report as before.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and
@@ -1116,6 +1147,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `migration_finalize::extract_tx`, goes with it — the FFI entry point was its only caller.
 
 ### Fixed
+
+- `zcashlc_voting_session_open` with a null `TorRuntime` and `is_custom_server` false opens an
+  OHTTP session when the round's chain or PIR endpoints include `svote.zcashlabs.com`,
+  `207-180-214-226.sslip.io`, `vote.atlasstaking.com`, `zvote.polkachu.com`,
+  `zvote.cros-nest.net` or `vote.infra.cypherpunk.com`; it refused the session before any network
+  I/O, with a last error saying the host is not supported by the OHTTP gateway. The signature is
+  unchanged; no caller changes are needed.
 
 - `zcashlc_tor_connect_to_lightwalletd` and `zcashlc_tor_connect_to_lightwalletd_with_timeout`
   refuse a configured OHTTP gateway with a last error that no longer names the endpoint, so the

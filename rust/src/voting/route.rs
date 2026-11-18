@@ -54,6 +54,12 @@ const OHTTP_VOTE_HOSTS: &[&str] = &[
     "zvote.keplr.app",
     "zvote.zfnd.org",
     "v.ombie.cash",
+    "svote.zcashlabs.com",
+    "207-180-214-226.sslip.io",
+    "vote.atlasstaking.com",
+    "zvote.polkachu.com",
+    "zvote.cros-nest.net",
+    "vote.infra.cypherpunk.com",
     // PIR endpoints (delegation): fail closed through OHTTP when Tor is OFF and
     // the servers are predefined.
     "lb-pir-primary.valargroup.org",
@@ -921,7 +927,7 @@ mod tests {
         assert!(matches!(**transport.route(), SdkRoute::Direct(_)));
     }
 
-    const EXPECTED_VOTE_HOSTS: [&str; 12] = [
+    const EXPECTED_VOTE_HOSTS: [&str; 18] = [
         "vote.zodl.com",
         "prod.vote-chain-primary.valargroup.org",
         "voting.valargroup.dev",
@@ -934,6 +940,12 @@ mod tests {
         "zvote.keplr.app",
         "zvote.zfnd.org",
         "v.ombie.cash",
+        "svote.zcashlabs.com",
+        "207-180-214-226.sslip.io",
+        "vote.atlasstaking.com",
+        "zvote.polkachu.com",
+        "zvote.cros-nest.net",
+        "vote.infra.cypherpunk.com",
     ];
 
     const EXPECTED_PIR_HOSTS: [&str; 3] = [
@@ -953,7 +965,7 @@ mod tests {
 
     #[test]
     fn ohttp_vote_hosts_match_the_gateway_backends() {
-        assert_eq!(OHTTP_VOTE_HOSTS.len(), 15);
+        assert_eq!(OHTTP_VOTE_HOSTS.len(), 21);
         for host in EXPECTED_VOTE_HOSTS.iter().chain(EXPECTED_PIR_HOSTS.iter()) {
             assert!(
                 OHTTP_VOTE_HOSTS.contains(host),

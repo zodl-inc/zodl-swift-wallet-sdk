@@ -63,11 +63,15 @@ public protocol CombineSynchronizer {
     /// selected and must be shielded first — see `proposeShielding`.
     ///
     /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
-    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`) where the rust layer
-    /// reports that condition, carrying both amounts; a wallet still catching up throws
-    /// `ZcashError.rustProposalScanRequired` (`ZRUST0153`). Anything else the rust layer returns surfaces as
-    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload names the
-    /// condition without carrying an amount or an address.
+    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), carrying both amounts;
+    /// a wallet still catching up throws `ZcashError.rustProposalScanRequired` (`ZRUST0153`). A balance spread
+    /// over more notes than one transaction can spend within the block size limit throws
+    /// `ZcashError.rustProposalTransactionTooLarge` (`ZRUST0174`) here rather than when the transaction is
+    /// created; a memo for a transparent or TEX recipient throws `ZcashError.rustProposalTransparentMemo`
+    /// (`ZRUST0175`); and a recipient with no receiver this wallet can pay throws
+    /// `ZcashError.rustProposalUnsupportedAddress` (`ZRUST0176`). Anything else the rust layer returns
+    /// surfaces as `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload
+    /// names the condition without carrying an amount or an address.
     ///
     /// - Parameter accountUUID: the account from which to spend funds.
     /// - Parameter recipient: the recipient's address.
@@ -185,6 +189,49 @@ public protocol CombineSynchronizer {
 
     /// Combine counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
     func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never>
+
+    /// Combine counterpart of `Synchronizer.rejectedTransactionIdsStream`.
+    var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> { get }
+
+    /// Combine counterpart of `Synchronizer.proposeTransfer(accountUUID:recipient:amount:memo:sizeBound:)`.
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.proposeSendMax(accountUUID:recipient:memo:mode:sizeBound:)`.
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.proposefulfillingPaymentURI(_:accountUUID:sizeBound:)`.
+    func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Proposal, Error>
+
+    /// Combine counterpart of `Synchronizer.createProposedTransactions(proposal:spendingKey:ovkPolicy:sizeBound:)`,
+    /// with ``OvkPolicy/sender``.
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>
+
+    /// Combine counterpart of `Synchronizer.createPCZTFromProposal(accountUUID:proposal:sizeBound:)`.
+    func createPCZTFromProposal(
+        accountUUID: AccountUUID,
+        proposal: Proposal,
+        sizeBound: TransactionSizeBound
+    ) -> SinglePublisher<Pczt, Error>
 
     /// Combine counterpart of `Synchronizer.restartSync(at:)`.
     func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error>
