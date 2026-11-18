@@ -120,15 +120,40 @@ private extension TxResubmitter {
             // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
+            // In Private mode the retry goes through the private endpoint only; the verdict below
+            // still requires an explicit answer from every recorded plan endpoint, so a retry that
+            // did not reach them all leaves the transaction pending rather than rejected.
             let retryEndpoints = privateEndpoint.map { [$0] } ?? endpoints
-            let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: retryEndpoints)
-            if let acceptingEndpoint {
+            let attempt = try await submitPlanExecutor.submitRecordingAnswers(transaction: createdTransaction, endpoints: retryEndpoints)
+            if let acceptingEndpoint = attempt.accepted {
                 await submitPlanStore.markAccepted(
                     txId: transaction.rawID,
-                    host: "\(acceptingEndpoint.host):\(acceptingEndpoint.port)",
+                    host: endpointKey(acceptingEndpoint),
+                    lifecycle: lifecycle
+                )
+                return
+            }
+            // Every endpoint answered explicitly, none took it and every refusal was for good: stop
+            // retrying until it expires.
+            if case .ready(_, acceptedBy: nil) = plan,
+               let verdict = submitRejectionVerdict(planEndpoints: endpoints, outcomes: attempt.answers, previous: nil) {
+                await submitPlanStore.markRejected(
+                    txId: transaction.rawID,
+                    code: verdict.code,
+                    reason: verdict.reason,
                     lifecycle: lifecycle
                 )
             }
+            if let lastError = attempt.lastError {
+                throw lastError
+            }
+
+        case .rejected:
+            // Every endpoint answered, none accepted it and every refusal was for good. Retrying cannot succeed; the plan is pruned
+            // once the transaction expires, like any other.
+            logger.info(
+                "TxResubmissionAction skipping transaction \(transaction.rawID.toHexStringTxId()): it is recorded as rejected (every endpoint answered, none accepted it, every refusal was for good)."
+            )
 
         case .storeUnavailable:
             // Whether the app ever submitted this transaction is unknown.

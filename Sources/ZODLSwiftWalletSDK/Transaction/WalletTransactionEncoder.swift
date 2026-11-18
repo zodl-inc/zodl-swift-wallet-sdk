@@ -65,13 +65,15 @@ class WalletTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         amount: Zatoshi,
-        memoBytes: MemoBytes?
+        memoBytes: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         let proposal = try await rustBackend.proposeTransfer(
             accountUUID: accountUUID,
             to: recipient,
             value: amount.amount,
-            memo: memoBytes
+            memo: memoBytes,
+            sizeBound: sizeBound
         )
 
         return Proposal(inner: proposal)
@@ -81,13 +83,15 @@ class WalletTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         memoBytes: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         let proposal = try await rustBackend.proposeSendMaxTransfer(
             accountUUID: accountUUID,
             to: recipient,
             memo: memoBytes,
-            mode: mode
+            mode: mode,
+            sizeBound: sizeBound
         )
 
         return Proposal(inner: proposal)
@@ -96,7 +100,7 @@ class WalletTransactionEncoder: TransactionEncoder {
     func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) async throws -> Proposal {
         let proposal = try await rustBackend.proposeOrchardToIronwoodMigration(accountUUID: accountUUID)
 
-        return Proposal(inner: proposal)
+        return Proposal(inner: proposal, isMigration: true)
     }
 
     func proposeShielding(
@@ -117,11 +121,13 @@ class WalletTransactionEncoder: TransactionEncoder {
 
     func proposeFulfillingPaymentFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         let proposal = try await rustBackend.proposeTransferFromURI(
             uri,
-            accountUUID: accountUUID
+            accountUUID: accountUUID,
+            sizeBound: sizeBound
         )
         return Proposal(inner: proposal)
     }
@@ -129,7 +135,8 @@ class WalletTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [CreatedTransaction] {
         // The rust layer only reads the parameter files for a proposal with a Sapling bundle, so
         // their absence is only an error for such a proposal.
@@ -142,7 +149,8 @@ class WalletTransactionEncoder: TransactionEncoder {
         let txIds = try await rustBackend.createProposedTransactions(
             proposal: proposal.inner,
             usk: spendingKey,
-            ovkPolicy: ovkPolicy
+            ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound
         )
 
         return try await createdTransactions(forTxIds: txIds)

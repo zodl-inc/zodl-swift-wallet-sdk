@@ -71,7 +71,7 @@ public enum OHTTPEndpoints {
     /// placeholder publishable key the app is given, and passes a user's token as it is.
     static let clientAuthorizationAliases: Set<String> = ["flexa.zodl.com"]
 
-    /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 12 vote
+    /// Exact hosts the gateway forwards to (infra `ohttp-gateway` BACKENDS, mainnet): the 18 vote
     /// servers and the 3 PIR endpoints, host-bound. Exact match only: the gateway removed suffix
     /// routing, and several of these domains also serve unrelated hosts, so a suffix rule would
     /// let the app send a request the gateway can only reject (or, worse, trust a lookalike).
@@ -94,6 +94,12 @@ public enum OHTTPEndpoints {
         "zvote.keplr.app",
         "zvote.zfnd.org",
         "v.ombie.cash",
+        "svote.zcashlabs.com",
+        "207-180-214-226.sslip.io",
+        "vote.atlasstaking.com",
+        "zvote.polkachu.com",
+        "zvote.cros-nest.net",
+        "vote.infra.cypherpunk.com",
         // PIR endpoints (delegation)
         "lb-pir-primary.valargroup.org",
         "lb-pir-backup.valargroup.org",

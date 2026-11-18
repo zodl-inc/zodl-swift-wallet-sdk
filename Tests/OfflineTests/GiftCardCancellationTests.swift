@@ -21,8 +21,8 @@ final class GiftCardCancellationTests: ZcashTestCase {
         XCTAssertEqual(result.results, [.success(txId: Data(repeating: 0xA1, count: 32))])
         XCTAssertEqual(result.fee, Zatoshi(10_000))
         XCTAssertEqual(result.amount, Zatoshi(40_000))
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyReceivedArguments?.ovkPolicy, .discard)
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReceivedArguments?.ovkPolicy, .discard)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
         try await fixture.redeemer.cleanup()
     }
@@ -33,7 +33,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let entered = XCTestExpectation(description: "host reached backend before native admission")
         let gate = GiftCardOperationGate()
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyClosure = { _, _, _ in
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundClosure = { _, _, _, _ in
             entered.fulfill()
             await gate.wait()
             try GiftCardTransactionCreationContext.admission?.beginNativeCreation()
@@ -55,10 +55,10 @@ final class GiftCardCancellationTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let predecessorEntered = XCTestExpectation(description: "preceding check proposes fee")
         let gate = GiftCardOperationGate()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             predecessorEntered.fulfill()
             await gate.wait()
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         let predecessor = Task { try await fixture.redeemer.check() }
         await fulfillment(of: [predecessorEntered], timeout: 5)
@@ -74,17 +74,17 @@ final class GiftCardCancellationTests: ZcashTestCase {
         // cannot execute before the redemption has joined the queue behind the held check.
         _ = await fixture.redeemer.cardWalletConfirmationsPolicy()
         redemption.cancel()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             XCTFail("Cancelled queued redemption must not prepare a proposal")
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         await gate.open()
         _ = try await predecessor.value
         await fulfillment(of: [redemptionFinished], timeout: 5)
         await assertCancellation(redemption)
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = nil
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = nil
 
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 0)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 0)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 0)
         let following = try await fixture.redeemer.check()
         XCTAssertEqual(following.state, .ready, "a cancelled operation must not poison the queue")
@@ -96,10 +96,10 @@ final class GiftCardCancellationTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let proposalEntered = XCTestExpectation(description: "redemption preparing proposal")
         let gate = GiftCardOperationGate()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = { _, _, _, _ in
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = { _, _, _, _, _ in
             proposalEntered.fulfill()
             await gate.wait()
-            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]).inner
+            return FfiProposalFixtures.makeProposal(steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]).inner
         }
         let finished = XCTestExpectation(description: "cancelled preparation finished")
         let redemption = Task {
@@ -108,12 +108,12 @@ final class GiftCardCancellationTests: ZcashTestCase {
         }
         await fulfillment(of: [proposalEntered], timeout: 5)
         redemption.cancel()
-        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeClosure = nil
+        fixture.backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundClosure = nil
         await gate.open()
         await fulfillment(of: [finished], timeout: 5)
         await assertCancellation(redemption)
 
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 0)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 0)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 0)
         let following = try await fixture.redeemer.check()
         XCTAssertEqual(following.state, .ready)
@@ -149,7 +149,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let entered = XCTestExpectation(description: "owned completion reached cancellation gate")
         let gate = GiftCardOperationGate()
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyClosure = { _, _, _ in
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundClosure = { _, _, _, _ in
             try GiftCardTransactionCreationContext.admission?.beginNativeCreation()
             if stage == .nativeCreation {
                 entered.fulfill()
@@ -199,12 +199,12 @@ final class GiftCardCancellationTests: ZcashTestCase {
         XCTAssertTrue(result.recordedInDestination)
         XCTAssertEqual(result.fee, Zatoshi(10_000))
         XCTAssertEqual(result.amount, Zatoshi(40_000))
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
         XCTAssertEqual(destination.backend.setTransactionTrustTxIdTrustedCallsCount, 1)
         try await fixture.redeemer.cleanup()
         try await fixture.redeemer.cleanup()
-        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicyCallsCount, 1)
+        XCTAssertEqual(fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundCallsCount, 1)
         XCTAssertEqual(fixture.service.submitSpendTransactionModeCallsCount, 1)
     }
 
@@ -215,7 +215,7 @@ final class GiftCardCancellationTests: ZcashTestCase {
         _ = try await fixture.redeemer.check()
         let entered = XCTestExpectation(description: "native creation admitted")
         let gate = GiftCardOperationGate()
-        fixture.backend.createProposedTransactionsProposalUskOvkPolicyClosure = { _, _, _ in
+        fixture.backend.createProposedTransactionsProposalUskOvkPolicySizeBoundClosure = { _, _, _, _ in
             try GiftCardTransactionCreationContext.admission?.beginNativeCreation()
             entered.fulfill()
             await gate.wait()
@@ -336,11 +336,14 @@ struct GiftCardCancellationFixture {
             nextIronwoodSubtreeIndex: 0
         )
         backend.getWalletSummaryReturnValue = summary
-        backend.proposeSendMaxTransferAccountUUIDToMemoModeReturnValue =
+        // A card is swept from Orchard. An unspecified pool would count as Sapling and make each
+        // redemption download the Sapling parameters from the network before native creation,
+        // which can outlast the tests' waits.
+        backend.proposeSendMaxTransferAccountUUIDToMemoModeSizeBoundReturnValue =
             FfiProposalFixtures.makeProposal(
-                steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000)]
+                steps: [FfiProposalFixtures.Step(inputValues: [50_000], changeValues: [], fee: 10_000, pool: .orchard)]
             ).inner
-        backend.createProposedTransactionsProposalUskOvkPolicyReturnValue = [Data(repeating: 0xA1, count: 32)]
+        backend.createProposedTransactionsProposalUskOvkPolicySizeBoundReturnValue = [Data(repeating: 0xA1, count: 32)]
         backend.getTransactionTxIdReturnValue = TransactionData(txId: Data(repeating: 0xA1, count: 32), raw: Data([1]), expiryHeight: 3_000_100)
         let service = LightWalletServiceMock()
         service.closeConnectionsClosure = {}

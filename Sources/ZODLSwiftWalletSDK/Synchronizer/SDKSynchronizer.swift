@@ -479,6 +479,16 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func proposeTransfer(accountUUID: AccountUUID, recipient: Recipient, amount: Zatoshi, memo: Memo?) async throws -> Proposal {
+        try await proposeTransfer(accountUUID: accountUUID, recipient: recipient, amount: amount, memo: memo, sizeBound: .consensus)
+    }
+
+    public func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
 
         try recipient.ensureMemoIsAllowed(memo)
@@ -487,13 +497,24 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             amount: amount,
-            memoBytes: memo?.asMemoBytes()
+            memoBytes: memo?.asMemoBytes(),
+            sizeBound: sizeBound
         )
 
         return proposal
     }
 
     public func proposeSendMax(accountUUID: AccountUUID, recipient: Recipient, memo: Memo?, mode: MaxSpendMode) async throws -> Proposal {
+        try await proposeSendMax(accountUUID: accountUUID, recipient: recipient, memo: memo, mode: mode, sizeBound: .consensus)
+    }
+
+    public func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
 
         try recipient.ensureMemoIsAllowed(memo)
@@ -502,7 +523,8 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             accountUUID: accountUUID,
             recipient: recipient.stringEncoded,
             memoBytes: memo?.asMemoBytes(),
-            mode: mode
+            mode: mode,
+            sizeBound: sizeBound
         )
 
         return proposal
@@ -534,10 +556,19 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
+        try await proposefulfillingPaymentURI(uri, accountUUID: accountUUID, sizeBound: .consensus)
+    }
+
+    public func proposefulfillingPaymentURI(
+        _ uri: String,
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
+    ) async throws -> Proposal {
         try throwIfUnprepared()
         return try await transactionEncoder.proposeFulfillingPaymentFromURI(
             uri,
-            accountUUID: accountUUID
+            accountUUID: accountUUID,
+            sizeBound: sizeBound
         )
     }
 
@@ -553,10 +584,20 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
         spendingKey: UnifiedSpendingKey,
         ovkPolicy: OvkPolicy
     ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
+        try await createProposedTransactions(proposal: proposal, spendingKey: spendingKey, ovkPolicy: ovkPolicy, sizeBound: .consensus)
+    }
+
+    public func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
+    ) async throws -> AsyncThrowingStream<TransactionSubmitResult, Error> {
         let transactions = try await sdkBroadcaster.createProposedTransactions(
             proposal: proposal,
             spendingKey: spendingKey,
             ovkPolicy: ovkPolicy,
+            sizeBound: sizeBound,
             recordingPlans: false
         )
 
@@ -613,10 +654,19 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
 
     public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) async throws -> Pczt {
-        try await initializer.rustBackend.createPCZTFromProposal(
+        try await createPCZTFromProposal(accountUUID: accountUUID, proposal: proposal, sizeBound: .consensus)
+    }
+
+    public func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, sizeBound: TransactionSizeBound) async throws -> Pczt {
+        // Captured before creation, so a `wipe()` meanwhile drops the migration mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+        let pczt = try await initializer.rustBackend.createPCZTFromProposal(
             accountUUID: accountUUID,
-            proposal: proposal.inner
+            proposal: proposal.inner,
+            sizeBound: sizeBound
         )
+        await submitPlanStore.markMigrationPCZT(pczt, of: proposal, rustBackend: initializer.rustBackend, lifecycle: lifecycle, logger: logger)
+        return pczt
     }
 
     public func redactPCZTForSigner(pczt: Pczt) async throws -> Pczt {
@@ -768,6 +818,10 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
 
     public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
         await submitPlanStore.plan(for: rawID)?.submissionStatus
+    }
+
+    public var rejectedTransactionIdsStream: AnyPublisher<Set<Data>, Never> {
+        submitPlanStore.rejectedTransactionIds
     }
 
     /// Fetches the latest ZEC-USD exchange rate.
@@ -1694,7 +1748,12 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     public func takeMigrationPreparation(accountUUID: AccountUUID, byTxid txid: Data) async throws -> PreparedMigrationTransfer {
-        try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        // Captured before the preparation is taken, so a `wipe()` meanwhile drops the mark below.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+        let prepared = try await migrationHost.migration(for: accountUUID).takePreparation(byTxid: txid)
+        // Its submission keeps main's resubmission until expiry, even if every server rejects it.
+        await submitPlanStore.markMigrationPreparation(txId: prepared.txid, lifecycle: lifecycle)
+        return prepared
     }
 
     public func recordMigrationPreparationBroadcast(

@@ -346,6 +346,54 @@ bridged to `NSError` has the domain `ZODLSwiftWalletSDK.ZcashError`, and the SPM
 is `zodl-swift-wallet-sdk_ZODLSwiftWalletSDK.bundle`. Match on `ZcashError`'s code or cases
 rather than on either string.
 
+## `TransactionSubmissionStatus` gained a case — `rejected`
+
+`TransactionSubmissionStatus` has a new case, `rejected(SubmitRejection)`, for a transaction a
+the servers explicitly refused, every refusal for good, while none accepted it. The SDK no longer resubmits such a transaction, and its inputs stay
+reserved until it expires, so show it as rejected (until its state becomes expired) rather than as
+still sending. `Synchronizer.rejectedTransactionIdsStream` reports the same transactions as a set.
+
+```swift
+// Before: exhaustive over the three cases.
+switch await synchronizer.transactionSubmissionStatus(for: transaction.rawID) {
+case .awaiting, .submitted: showSending()
+case .accepted: showSent()
+case nil: break
+}
+
+// After
+switch await synchronizer.transactionSubmissionStatus(for: transaction.rawID) {
+case .awaiting, .submitted: showSending()
+case .accepted: showSent()
+case .rejected(.tooLarge): showTooManyNotesUntilExpiry()
+case .rejected: showRejectedUntilExpiry()
+case nil: break
+}
+```
+
+## `ZcashError` gained cases — gift card rounds
+
+`ZcashError` and `ZcashErrorCode` have three new cases. `giftCardTooManyNotes` (`ZGIFT0017`) is
+thrown by `GiftCardRedeemer.redeem`, before creating or broadcasting anything, for a card with more
+notes than one claim may spend; it replaces `rustProposalTransactionTooLarge` from that call.
+`giftCardRoundFailed(_:_:)` (`ZGIFT0018`) and `giftCardRoundExpired(_:_:)` (`ZGIFT0019`) carry a
+round number and the ids of every claim transaction sent so far, for redemptions of several rounds.
+An exhaustive `switch` over either type stops compiling until they are handled.
+
+```swift
+// Before
+} catch ZcashError.rustProposalTransactionTooLarge {
+    showCardTooFragmented()
+}
+
+// After
+} catch ZcashError.giftCardTooManyNotes {
+    showCardTooFragmented()
+} catch let ZcashError.giftCardRoundFailed(round, txIds), let ZcashError.giftCardRoundExpired(round, txIds) {
+    showRoundStopped(round: round, sent: txIds)
+}
+```
+
 ## Minimum platforms raised — iOS 16 and macOS 14
 
 `Package.swift` now declares `.iOS(.v16)` and `.macOS(.v14)`, and the `libzcashlc` XCFramework is built

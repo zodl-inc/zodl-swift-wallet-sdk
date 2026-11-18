@@ -61,6 +61,38 @@ The `Makefile` wraps these (`make ffi-ci`, `make ffi-macos`, `make ffi-all`, `ma
 
 See `docs/LOCAL_DEVELOPMENT.md` for the full reference.
 
+## Rust dependency version requirements
+
+Write a crates.io dependency in `Cargo.toml` as a plain caret requirement:
+`zcash_client_backend = "0.25"`, never `"=0.25.0"`. The manifest states which
+versions are compatible; `Cargo.lock` already fixes the exact version every
+build uses, and `--locked` keeps CI on it. An `=` requirement says that only
+one version is compatible, which is almost never true.
+
+- **`=` is for pre-releases only**, such as `pczt_ledger = "=0.1.0-pre.0"`. A
+  caret requirement on a pre-release also accepts every later pre-release of
+  the same version, and pre-releases make no compatibility promise to each
+  other, so `=` is the only way to stay on the one that was tested.
+- **A stable version gets `=` only with a documented reason** in a comment
+  beside it, saying what breaks without it. "Pinned to the exact version" is
+  not a reason.
+- **Drop the trailing `.0`.** Write `"0.6"`, not `"0.6.0"`; they mean the same.
+  Keep a non-zero patch version when it is the real minimum, as with
+  `zodl-ohttp-client = "1.0.1"`, the first release with crates.io metadata.
+- **Remove the `=` when a pre-release becomes stable.** Moving a dependency
+  from `=0.25.0-rc.1` to its release means writing `"0.25"`, not `"=0.25.0"`.
+  This is how stray exact pins usually appear.
+- **Take a newer compatible version with `cargo update -p <crate>`**, which
+  changes only `Cargo.lock`. Edit the requirement in `Cargo.toml` only when the
+  minimum has to rise.
+
+Exact requirements matter most in a published crate: everything that depends
+on it is forced onto those exact versions, so it cannot be combined with
+anything that needs a later compatible release. This SDK is not published to
+crates.io, but it builds with Slipstream and other Zodl crates that are, and
+holding every manifest to the same rule keeps `cargo update` usable here and
+keeps exact pins from being copied into those crates.
+
 ## Release
 
 A release runs in two phases, with a human reading a pull request in between.

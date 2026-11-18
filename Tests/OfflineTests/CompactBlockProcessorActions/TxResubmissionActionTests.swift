@@ -168,6 +168,120 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting, "Awaiting plan must survive")
     }
 
+    func testRejectedTransactionIsNotResubmitted() async throws {
+        let rawID = Data(repeating: 0x0E, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        await submitPlanStore.markRejected(
+            txId: rawID,
+            code: -25,
+            reason: "transaction size exceeding the configured mempool maximum",
+            lifecycle: await submitPlanStore.currentLifecycle()
+        )
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty, "A rejected transaction must not be retried")
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "nor sent to the default endpoint")
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(
+            plan,
+            StoredSubmitPlan.rejected(code: -25, reason: "transaction size exceeding the configured mempool maximum"),
+            "The rejection stays recorded until the transaction expires"
+        )
+    }
+
+    func testBackgroundRetryRefusedTerminallyByEveryPlanEndpointIsRejected() async throws {
+        let rawID = Data(repeating: 0x0F, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        let endpointB = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpointB)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    /// Characterization: as on main, a migration preparation is resubmitted on every pass until it
+    /// expires, even when every endpoint of its plan rejects it terminally.
+    func testAUnanimouslyRejectedMigrationPreparationIsStillResubmitted() async throws {
+        let rawID = Data(repeating: 0x11, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.markMigrationPreparation(txId: rawID, lifecycle: await submitPlanStore.currentLifecycle())
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+        let afterFirst = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(afterFirst, StoredSubmitPlan.ready([endpointA], acceptedBy: nil), "never recorded as rejected")
+
+        action.latestResolvedTime = 0
+        _ = try await action.run(with: makeContext()) { _ in }
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().count, 2, "resubmitted again on the next pass")
+    }
+
+    /// A transport failure may hide an acceptance whose reply was lost, so it is inconclusive: the
+    /// transaction stays pending and is resubmitted, and the next explicit answers reconcile it.
+    func testBackgroundRetryWithAnExplicitRejectionBesideATransportFailureStaysPendingUntilReconciled() async throws {
+        let endpointB = LightWalletEndpoint(address: "b.example.com", port: 443, secure: true)
+
+        func firstPass(rawID: Data) async throws -> TxResubmissionAction {
+            let candidate = makeOverview(rawID: rawID)
+            let action = setupAction(candidates: [candidate])
+            await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA, endpointB])
+            endpointSubmitter.set(behavior: .reject(code: -26, message: "bad-txns-vout-negative"), for: endpointA)
+            endpointSubmitter.set(behavior: .failTransport, for: endpointB)
+            transactionRepository.findRawIDClosure = { _ in candidate }
+
+            _ = try await action.run(with: makeContext()) { _ in }
+
+            let plan = await submitPlanStore.plan(for: rawID)
+            XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil), "inconclusive: still pending")
+            action.latestResolvedTime = 0
+            return action
+        }
+
+        // B later accepts: accepted.
+        let acceptedID = Data(repeating: 0x10, count: 32)
+        var action = try await firstPass(rawID: acceptedID)
+        endpointSubmitter.set(behavior: .succeed, for: endpointB)
+        _ = try await action.run(with: makeContext()) { _ in }
+        var plan = await submitPlanStore.plan(for: acceptedID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: endpointKey(endpointB)))
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host).filter { $0 == "b.example.com" }.count, 2, "resubmission continued")
+
+        // B later refuses explicitly: rejected.
+        let refusedID = Data(repeating: 0x16, count: 32)
+        action = try await firstPass(rawID: refusedID)
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "exceeding the configured mempool maximum"), for: endpointB)
+        _ = try await action.run(with: makeContext()) { _ in }
+        plan = await submitPlanStore.plan(for: refusedID)
+        XCTAssertEqual(plan, StoredSubmitPlan.rejected(code: -26, reason: "bad-txns-vout-negative"))
+    }
+
+    func testBackgroundRetryWithOnlyTransientFailuresStaysReady() async throws {
+        let rawID = Data(repeating: 0x12, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        endpointSubmitter.set(behavior: .reject(code: -25, message: "Missing inputs"), for: endpointA)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
+    }
+
     func testReadyTransactionIsResubmittedThroughPlanEndpoints() async throws {
         let rawID = Data(repeating: 0x02, count: 32)
         let candidate = makeOverview(rawID: rawID)

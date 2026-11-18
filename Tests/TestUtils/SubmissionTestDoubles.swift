@@ -3,6 +3,7 @@
 //  TestUtils
 //
 
+import Combine
 import Foundation
 import GRPC
 import NIO
@@ -301,7 +302,8 @@ final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         amount: Zatoshi,
-        memoBytes: MemoBytes?
+        memoBytes: MemoBytes?,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -310,7 +312,8 @@ final class StubTransactionEncoder: TransactionEncoder {
         accountUUID: AccountUUID,
         recipient: String,
         memoBytes: MemoBytes?,
-        mode: MaxSpendMode
+        mode: MaxSpendMode,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -331,7 +334,8 @@ final class StubTransactionEncoder: TransactionEncoder {
     func createProposedTransactions(
         proposal: Proposal,
         spendingKey: UnifiedSpendingKey,
-        ovkPolicy: OvkPolicy
+        ovkPolicy: OvkPolicy,
+        sizeBound: TransactionSizeBound
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
         receivedOvkPolicy = ovkPolicy
@@ -346,7 +350,8 @@ final class StubTransactionEncoder: TransactionEncoder {
 
     func proposeFulfillingPaymentFromURI(
         _ uri: String,
-        accountUUID: AccountUUID
+        accountUUID: AccountUUID,
+        sizeBound: TransactionSizeBound
     ) async throws -> Proposal {
         fatalError("Unused in test")
     }
@@ -475,6 +480,41 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         default:
             plans[txId] = StoredSubmitPlan.ready([], acceptedBy: host)
         }
+    }
+
+    private(set) var migrationPreparations: Set<Data> = []
+
+    func markMigrationPreparation(txId: Data, lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: a mark carrying a token from before the most recent `wipe()` is dropped.
+        guard lifecycle.generation == lifecycleGeneration else { return }
+        migrationPreparations.insert(txId)
+    }
+
+    func isMigrationPreparation(txId: Data) async -> Bool {
+        migrationPreparations.contains(txId)
+    }
+
+    func markRejected(txId: Data, code: Int, reason: String, lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: stale epochs are dropped, an accepted plan stays accepted, and a
+        // migration preparation is never rejected.
+        guard lifecycle.generation == lifecycleGeneration, !migrationPreparations.contains(txId) else { return }
+        storeFileExists = true
+        if case .ready(_, .some) = plans[txId] { return }
+        plans[txId] = StoredSubmitPlan.rejected(code: code, reason: reason)
+        rejectedSubject.send(rejectedIds)
+    }
+
+    private let rejectedSubject = CurrentValueSubject<Set<Data>, Never>([])
+
+    private var rejectedIds: Set<Data> {
+        Set(plans.compactMap { txId, plan in
+            if case .rejected = plan { return txId }
+            return nil
+        })
+    }
+
+    var rejectedTransactionIds: AnyPublisher<Set<Data>, Never> {
+        rejectedSubject.eraseToAnyPublisher()
     }
 
     func currentLifecycle() async -> SubmitPlanLifecycle {
