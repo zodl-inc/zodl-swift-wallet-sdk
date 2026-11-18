@@ -44,8 +44,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration is installed. A failed fetch keeps the list held. A host that is not carried is
   refused with `ohttpUnsupportedHost`, after at most one refresh, and is never reached directly.
   A voting session with Tor off leaves out the chain and PIR endpoints the gateway does not carry
-  and is refused only when none of a kind is left. A server on a port other than 443 and an
-  `http://` server URL are refused through OHTTP.
+  and is refused only when none of a kind is left. A voting server on a port other than 443, or
+  with an `http://` URL, is refused through OHTTP. See MIGRATING.md.
 
 ## Removed
 

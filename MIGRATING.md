@@ -58,8 +58,9 @@ from a list compiled into the SDK. Three points change how an app uses them:
 
 - `OHTTPEndpoints.proxyAllowedHosts` is gone. Ask `OHTTPEndpoints.isProxyAllowlisted(host:network:)`
   instead, which says whether a host is passed through OHTTP on a network.
-- `isProxyAllowlisted(host:network:)` returns false while OHTTP is off for both networks. Otherwise
-  it follows the gateways' lists.
+- `isProxyAllowlisted(host:)` is false while OHTTP is off for both networks. Otherwise it is true
+  when the gateway of either configured network carries the host. `isProxyAllowlisted(host:network:)`
+  answers for that network's gateway only, and is false while OHTTP is off for it.
 - Pass a predefined server's request to `httpRequestOverOHTTP` even when `proxyURL(for:)` returns
   nil for it. Treat `ZcashError.ohttpUnsupportedHost` as "this server is not available through
   OHTTP, try another", never as a reason to connect directly.
