@@ -22,9 +22,8 @@ orchard = { version = "0.16" }
 pasta_curves = { version = "0.6.1", features = ["asm"] }
 ff = "0.14"
 # `zcashlc_voting_derive_round_id` recomputes a vote round id with the same Poseidon (P128Pow5T3,
-# ConstantLength<8>) the vote chain uses. Already in the graph via zcash_voting; pinned to the
-# resolved version so it stays the same crate instance.
-halo2_poseidon = "=0.2.0"
+# ConstantLength<8>) the vote chain uses. Already in the graph via orchard and zcash_voting.
+halo2_poseidon = "0.2"
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 # The scalar types in the Sapling prover traits, named by `rust/src/sapling_prover.rs`.
 bls12_381 = "0.9"
