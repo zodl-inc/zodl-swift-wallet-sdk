@@ -1474,12 +1474,15 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
     /// Reads the local balances once for all concurrent callers.
     ///
-    /// The read is a blocking `get_wallet_summary` FFI call that occupies a cooperative-pool thread
-    /// for its whole duration, and on a wallet with a long history it takes seconds. When the app
-    /// returns to the foreground, the poll tick and several features ask for balances at once; each
-    /// starting its own walk filled every cooperative thread, and all other Swift work stalled until
-    /// they finished. A caller that arrives while a read is running waits for that read instead, so
-    /// at most one walk runs at a time. Every waiter receives the same result or the same error.
+    /// The read is a blocking `get_wallet_summary` FFI call that takes seconds on a wallet with a
+    /// long history. When the app returns to the foreground, the poll tick and several features ask
+    /// for balances at once. Each used to start its own walk, and while the walks ran on the
+    /// cooperative pool they filled it and stalled all other Swift work until they finished. The
+    /// backend now runs the walk on a GCD thread, but concurrent walks still contend for the same
+    /// database, so a caller that arrives while a read is running waits for that read instead and at
+    /// most one walk runs at a time. Every waiter receives the same result or the same error.
+    /// Cancelling a caller does not cancel the read or affect the other waiters, because the read
+    /// is an unstructured task that the FFI call cannot interrupt anyway.
     private func sharedLocalAccountBalances(
         provider: LocalBalanceProviding
     ) async throws -> [AccountUUID: AccountBalance] {
