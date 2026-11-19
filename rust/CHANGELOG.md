@@ -618,9 +618,40 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no chain tip, on a network that has an NU7 activation height and without the bypass, returns
   NULL with the last error set ("sync first"); with the bypass, or on a network with no NU7
   activation height, no tip is read.
+- `zcashlc_ohttp_third_party_carried_authority`: `:authority` of a carried host, or NULL.
+- `zcashlc_ohttp_third_party_refresh_before_refusing`: true when a refresh is worth trying first.
+- `zcashlc_ohttp_third_party_is_refreshing`: whether a refresh of the host list is running.
+- `zcashlc_ohttp_third_party_note_answer`: reports the gateway's answer to a request for a host.
+- `zcashlc_ohttp_third_party_begin_refresh`: begins a due refresh and returns its handle, or NULL.
+- `zcashlc_ohttp_third_party_refresh_authority`: the `:authority` of a refresh request.
+- `zcashlc_ohttp_third_party_refresh_path`: the path of a refresh request.
+- `zcashlc_ohttp_third_party_refresh_if_none_match`: the `if-none-match` value of a refresh request.
+- `zcashlc_ohttp_third_party_finish_refresh`: ends a refresh with the gateway's answer.
+- `zcashlc_ohttp_third_party_fail_refresh`: ends a refresh as failed and keeps the list held.
+- `zcashlc_ohttp_third_party_free_refresh`: frees a refresh handle that was not ended.
 
 ### Changed
 
+- The shared OHTTP core is `zodl-ohttp-client` 2.1.0 (was 1.0.1; see its changelog, sections
+  "2.0.0" to "2.1.0"), and the Slipstream engine comes from a revision on `zodl-ohttp-client` 2.1.0.
+  - `zcashlc_ohttp_profile_info` returns the uniform 2.0 header lists. Post: `Content-Type:
+    message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`, `Accept-Encoding: identity`,
+    `Accept-Language: en`, `User-Agent: zodl-ohttp/1`. Signed key-configuration fetch: `Accept:
+    application/json` (was `application/ohttp-keys`, while the endpoint serves JSON),
+    `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1`.
+    `trace_on_key_fetch` is now `false`: the key fetch never carries a trace id.
+  - `zcashlc_ohttp_configure` refuses more relay URLs (a relay on a gateway host, non-ASCII text,
+    an encoded `/` or `\`, an empty path segment, a `%` not followed by two hex digits, and two
+    spellings of one relay for both networks), naming the field and the rule as before. A gateway
+    host written as a numeric alias of an IPv4 address, and a relay whose host is an IPv6 literal
+    embedding the gateway's IPv4 address, are refused too.
+    `zcashlc_ohttp_relay_url_for` returns the relay URL in its canonical form (one trailing `/`
+    removed, the host in lower case, no `:443`, dot segments resolved).
+  - Error texts no longer quote what a relay or resolver sent: a signed envelope for the wrong
+    network is "signed for another network, not <network>", one with the wrong key id "signed by
+    another key" (no key id is named), and JSON and DNS TXT parse errors give only their kind and
+    position. The `detail` of a refused `OhttpOutcome` is at most 120 characters of printable ASCII
+    (it was the first 200 bytes of the body).
 - `zcashlc_ohttp_encapsulate` pads each request to a fixed size bucket (`zodl-ohttp-client` 1.0,
   from crates.io). A `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of
   32 KiB when larger. Every other request is padded to the next multiple of 4 KiB.
@@ -1044,6 +1075,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     does not parse fails with `MIGRATION_PROVING_UNAVAILABLE`.
   - `upgrade_gate_bypass` is retained on the broadcast accessors for ABI compatibility. It never
     bypasses submission validity; branch, expiry and server-height checks apply on every network.
+- `zcashlc_voting_session_open` leaves out endpoints the gateway does not carry. The compiled
+  `OHTTP_VOTE_HOSTS` is replaced by the bootstrap list of the third-party host lists.
 
 ### Removed
 

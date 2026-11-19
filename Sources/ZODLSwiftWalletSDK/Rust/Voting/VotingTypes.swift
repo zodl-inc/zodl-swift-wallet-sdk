@@ -136,8 +136,9 @@ public enum VotingTransportRoute: Sendable, Equatable {
 
 /// Everything needed to open a round session.
 ///
-/// The endpoints are the ones the session uses for its whole life, and every
-/// one of them is reached over the route chosen when the session is opened.
+/// The session uses these endpoints for its whole life, and every one of them
+/// is reached over the route chosen when the session is opened. When it rides
+/// OHTTP, it uses the subset of them that the gateway carries.
 public struct VotingSessionInputs: Equatable, Sendable, Encodable {
     public let accountUUID: String
     public let walletDbPath: String

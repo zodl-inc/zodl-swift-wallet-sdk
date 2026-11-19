@@ -125,6 +125,7 @@ mod migration_turnstile;
 mod ohttp;
 mod ohttp_config;
 mod ohttp_health;
+mod ohttp_hosts;
 mod payment_uri;
 mod pczt_txid;
 mod retained_marks;

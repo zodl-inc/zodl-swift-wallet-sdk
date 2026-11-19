@@ -207,7 +207,7 @@ fn profile_from_id(id: u32) -> anyhow::Result<ClientProfile> {
 ///
 /// - When `len` is non-zero, `ptr` must be non-null and valid for reads for `len` bytes, with an
 ///   alignment of `1`, and the memory must not be mutated while the slice is in use.
-unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> anyhow::Result<&'a [u8]> {
+pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> anyhow::Result<&'a [u8]> {
     if len == 0 {
         Ok(&[])
     } else if ptr.is_null() {
@@ -1057,8 +1057,9 @@ pub extern "C" fn zcashlc_ohttp_profile_info(profile: u32) -> *mut OhttpProfileI
         let profile = profile_from_id(profile)?;
         let (post_headers, post_headers_len) =
             ptr_from_vec(pack_fields(&as_fields(profile.headers.relay_post(None)))?);
-        let (key_fetch_headers, key_fetch_headers_len) =
-            ptr_from_vec(pack_fields(&as_fields(profile.headers.key_fetch(None)))?);
+        let (key_fetch_headers, key_fetch_headers_len) = ptr_from_vec(pack_fields(&as_fields(
+            profile.headers.key_fetch_signed(None),
+        ))?);
 
         Ok(Box::into_raw(Box::new(OhttpProfileInfo {
             post_headers,
@@ -1190,7 +1191,8 @@ mod tests {
     use crate::ohttp_config::{example, install_for_test, lock_installed_networks};
     use crate::{zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length};
     use zodl_ohttp_client::{
-        CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, OhttpConfigParams, OhttpNetworks,
+        CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, MAX_REFUSED_DETAIL_CHARS,
+        OhttpConfigParams, OhttpNetworks,
     };
 
     #[test]
@@ -1342,14 +1344,14 @@ mod tests {
         // Signed for testnet, so not for the mainnet gateway.
         zcashlc_clear_last_error();
         assert!(verify(example::MAINNET.gateway_host).is_null());
-        assert!(last_error_message().contains("signed for testnet"));
+        assert!(last_error_message().contains("signed for another network, not mainnet"));
 
         // Another testnet signing key installed: the same envelope is refused by its signer.
         install_for_test(example::networks());
         zcashlc_clear_last_error();
         assert!(verify(example::TESTNET.gateway_host).is_null());
         assert!(
-            last_error_message().contains("signed by key 1325b850"),
+            last_error_message().contains("signed by another key"),
             "{}",
             last_error_message()
         );
@@ -1584,6 +1586,8 @@ mod tests {
                     ),
                     ("Accept".to_string(), CONTENT_TYPE_CHUNKED_RES.to_string()),
                     ("Accept-Encoding".to_string(), "identity".to_string()),
+                    ("Accept-Language".to_string(), "en".to_string()),
+                    ("User-Agent".to_string(), "zodl-ohttp/1".to_string()),
                 ]
             );
             let fetch =
@@ -1591,11 +1595,16 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 fetch,
-                vec![(b"Accept".to_vec(), b"application/ohttp-keys".to_vec())]
+                vec![
+                    (b"Accept".to_vec(), b"application/json".to_vec()),
+                    (b"Accept-Encoding".to_vec(), b"identity".to_vec()),
+                    (b"Accept-Language".to_vec(), b"en".to_vec()),
+                    (b"User-Agent".to_vec(), b"zodl-ohttp/1".to_vec()),
+                ]
             );
             assert_eq!(info.cache_refresh_margin_secs, 0);
             assert!(info.drop_before_refetch);
-            assert!(info.trace_on_key_fetch);
+            assert!(!info.trace_on_key_fetch);
         }
         unsafe { zcashlc_free_ohttp_profile_info(info) };
     }
@@ -1746,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn a_409_is_never_retried_and_the_detail_is_cut_at_the_window() {
+    fn a_409_is_never_retried_and_the_detail_is_cut_to_the_quote_cap() {
         let key = gateway_key();
         let (opener, _) = take_opener(seal(b"/x", &key));
         let body = vec![b'a'; 300];
@@ -1755,7 +1764,7 @@ mod tests {
         let outcome_ref = unsafe { &*outcome };
         assert_eq!(outcome_ref.kind, OUTCOME_REFUSED);
         assert_eq!(outcome_ref.status, 409);
-        assert_eq!(detail(outcome_ref).len(), 200);
+        assert_eq!(detail(outcome_ref).len(), MAX_REFUSED_DETAIL_CHARS);
         unsafe { zcashlc_free_ohttp_outcome(outcome) };
     }
 

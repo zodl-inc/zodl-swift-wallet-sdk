@@ -6,6 +6,54 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `OHTTPEndpoints.isProxyAllowlisted(host:network:)` tells whether a host is passed through OHTTP
+  on a network, according to the gateway's host list.
+
+## Changed
+
+- The OHTTP core is `zodl-ohttp-client` 2.1.0 (see its changelog, sections "2.0.0" to
+  "2.1.0"). Every outer OHTTP request now carries exactly the header list the core gives every
+  client. The sealed POST:
+  `Content-Type: message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`,
+  `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1` (and, in a debug
+  build with a trace prefix set, `X-Client-Trace-Id`). The key configuration fetch: `Accept:
+  application/json` (was `application/ohttp-keys`), `Accept-Encoding: identity`, `Accept-Language:
+  en`, `User-Agent: zodl-ohttp/1`, and no longer a trace id. The iOS client then sends the relay
+  the same headers as the Android and Slipstream clients. The Slipstream engine comes from a revision
+  on `zodl-ohttp-client` 2.1.0. Its relay requests carry `User-Agent: zodl-ohttp/1` (was
+  `zodl-slipstream-ohttp/0.1`) and `Accept-Language: en` too.
+- `OHTTPEndpoints.configure(_:)` refuses more relay URLs with `ohttpConfigurationInvalid`
+  (`ZTSRV0009`): a relay on a gateway host, non-ASCII text (write a host in its `xn--` form), an
+  encoded `/` or `\`, an empty path segment (`//`), a `%` not followed by two hex digits, and the
+  same relay spelled two ways for both networks. A gateway host written as a numeric alias of an
+  IPv4 address, and a relay whose host is an IPv6 literal embedding the gateway's IPv4 address, are
+  refused too. Check the shipped configuration. Sealed requests
+  go to the relay URL in its canonical form (one trailing `/` removed, the host in lower case, no
+  `:443`, dot segments resolved).
+- OHTTP error messages no longer quote what a relay or resolver sent: a signed key configuration
+  for the wrong network or key is reported without its network or key id, JSON and DNS TXT parse
+  errors give only their kind and position, and the detail of a relay refusal is at most 120
+  characters of printable ASCII (it was the first 200 bytes). Code matching on those messages must
+  be updated.
+- The passthrough hosts an OHTTP gateway carries (vote and PIR servers reached under their own
+  name) are taken from the gateway's own third-party host list (`zodl-ohttp-client` 2.1.0),
+  starting from one compiled list. The list is fetched only through OHTTP, on the route of the
+  request that needs it (over Tor in Tor mode), is kept in memory, and is forgotten when another
+  configuration is installed. A failed fetch keeps the list held. A host that is not carried is
+  refused with `ohttpUnsupportedHost`, after at most one refresh, and is never reached directly.
+  `makeVotingRoundSession`, `httpRequestOverOHTTP` and `httpStreamOverOHTTP` may first wait for one
+  host-list refresh.
+  A voting session with Tor off leaves out the chain and PIR endpoints the gateway does not carry
+  and is refused only when none of a kind is left. A voting server on a port other than 443, or
+  with an `http://` URL, is refused through OHTTP. See MIGRATING.md.
+
+## Removed
+
+- `OHTTPEndpoints.proxyAllowedHosts` is removed. Ask
+  `OHTTPEndpoints.isProxyAllowlisted(host:network:)` instead.
+
 ## Fixed
 
 - Transaction resubmission no longer resends ZIP 318 migration transactions (preparations and

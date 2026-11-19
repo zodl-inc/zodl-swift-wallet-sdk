@@ -51,6 +51,20 @@ Other API changes:
 Compiled OHTTP values used to be observable in the binaries; they no longer are, but the values the
 app passes to `configure` are in the app and subject to its own protection.
 
+## OHTTP passthrough hosts come from the gateway's third-party host list
+
+The hosts an OHTTP gateway carries for passthrough are now read from the gateway's own list, not
+from a list compiled into the SDK. Three points change how an app uses them:
+
+- `OHTTPEndpoints.proxyAllowedHosts` is gone. Ask `OHTTPEndpoints.isProxyAllowlisted(host:network:)`
+  instead, which says whether a host is passed through OHTTP on a network.
+- `isProxyAllowlisted(host:)` is false while OHTTP is off for both networks. Otherwise it is true
+  when the gateway of either configured network carries the host. `isProxyAllowlisted(host:network:)`
+  answers for that network's gateway only, and is false while OHTTP is off for it.
+- Pass a predefined server's request to `httpRequestOverOHTTP` even when `proxyURL(for:)` returns
+  nil for it. Treat `ZcashError.ohttpUnsupportedHost` as "this server is not available through
+  OHTTP, try another", never as a reason to connect directly.
+
 ## OHTTP HTTP requirements
 
 Before, custom `Synchronizer` implementations could omit these members. After upgrading,
