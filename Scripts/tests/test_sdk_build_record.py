@@ -171,7 +171,7 @@ class NativeRecordTests(unittest.TestCase):
         self.git("add", ".")
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
 
-    def artifacts(self, *flags, record=True, expected_source=None, **env):
+    def artifacts(self, *flags, record=True, expected_source=None, cwd=None, script="Scripts/ci/build-release-artifacts.sh", **env):
         environment = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "ZODL_SDK_", "ZODL_OHTTP_")) and k not in ("GH_REPO", "SWIFT", "CARGO", "RUSTC", "MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
         environment.update(PATH=str(self.tools) + os.pathsep + environment["PATH"], NATIVE_LOG=str(self.log), GH_LOG=str(self.ghlog))
         if record:
@@ -179,7 +179,7 @@ class NativeRecordTests(unittest.TestCase):
         if expected_source:
             environment["ZODL_SDK_EXPECTED_SOURCE"] = expected_source
         environment.update(env)
-        return subprocess.run(["bash", "Scripts/ci/build-release-artifacts.sh", *flags, "5.0.0"], cwd=self.source, env=environment, text=True, capture_output=True)
+        return subprocess.run(["bash", script, *flags, "5.0.0"], cwd=cwd or self.source, env=environment, text=True, capture_output=True)
 
     def make_calls(self):
         return [args for args in self.all_make_calls() if args != ["--no-print-directory", "print-swift-version"]]
@@ -571,6 +571,13 @@ if sys.argv[1:] == ["--version"]:
         self.assertEqual(self.make_calls(), [["clean-ffi"], ["ffi-all"]])
         self.assertFalse((self.products / "sdk-build-record.json").exists())
         self.assertTrue(any("zodl-inc/zodl-swift-wallet-sdk" in c for c in self.gh_calls()))
+
+    def test_producer_runs_from_the_repository_root_when_started_in_a_subdirectory(self):
+        result = self.artifacts("--skip-verify", record=False, cwd=self.source / "Scripts",
+                                script="ci/build-release-artifacts.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.make_calls(), [["clean-ffi"], ["ffi-all"]])
+        self.assertTrue((self.products / "release.env").is_file())
 
     def test_fork_storage_remains_supported(self):
         result = self.artifacts(GH_REPO="developer/sdk")

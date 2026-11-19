@@ -33,15 +33,27 @@ test_build_release_artifacts_without_version_fails() {
 }
 
 test_build_release_artifacts_unknown_option_fails() {
-    assert_fails "unknown option" _producer --frobnicate 2.7.1
+    local err rc=0
+    err="$(_producer --frobnicate 2.7.1 2>&1 >/dev/null)" || rc=$?
+    assert_eq "1" "$rc" "unknown option exits 1"
+    case "$err" in
+        *"unknown option '--frobnicate'"*) assert_eq "x" "x" "unknown option is named" ;;
+        *) assert_eq "unknown option '--frobnicate'" "$err" "unknown option is named" ;;
+    esac
 }
 
 test_build_release_artifacts_unknown_option_after_version_fails() {
-    assert_fails "unknown option after the version" _producer 2.7.1 --frobnicate
+    local err rc=0
+    err="$(_producer 2.7.1 --frobnicate 2>&1 >/dev/null)" || rc=$?
+    assert_eq "1" "$rc" "unknown option after the version exits 1"
+    case "$err" in
+        *"unknown option '--frobnicate'"*) assert_eq "x" "x" "unknown option after the version is named" ;;
+        *) assert_eq "unknown option '--frobnicate'" "$err" "unknown option after the version is named" ;;
+    esac
 }
 
 test_build_release_artifacts_runs_from_a_subdirectory() {
-    assert_succeeds "--help from Scripts/" \
+    assert_succeeds "invocable by relative path from Scripts/ (--help)" \
         bash -c 'cd "$1/Scripts" && ./ci/build-release-artifacts.sh --help' _ "$REPO_ROOT"
 }
 

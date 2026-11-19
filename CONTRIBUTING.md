@@ -128,7 +128,7 @@ strip metadata from an existing release name.
 
 Releases are prepared with the SDK release skill from the shared ZODL skills
 library. It cuts `release/X.Y.Z` from the previous release tag and
-`candidate/X.Y.Z` from the maintenance branch, builds and uploads the
+`candidate/X.Y.Z` from the revision being released, builds and uploads the
 XCFramework as a draft release, and tags and publishes once the pull request
 from `candidate/X.Y.Z` into `release/X.Y.Z` has merged.
 Review that pull request: its diff is exactly what users receive relative to

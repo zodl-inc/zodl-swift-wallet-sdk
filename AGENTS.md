@@ -100,7 +100,7 @@ skills library. The release XCFramework is built, verified and uploaded as a
 draft release by `Scripts/ci/build-release-artifacts.sh`, which that skill runs
 locally or through the `Build FFI XCFramework` GitHub Action
 (`workflow_dispatch`).
-`Scripts/prepare-release.sh` is a deprecated stub that only points here.
+`Scripts/prepare-release.sh` is a deprecated stub that prints where releases are now prepared.
 
 A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
 pre-release on GitHub. `make test-scripts`, which `make check` includes, covers
