@@ -15,7 +15,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read and returns its result, or throws its error. The read takes seconds on a wallet with a long
   history, and several reads at once, as when the app returns to the foreground, blocked every Swift
   concurrency thread and stalled all other async work in the app, including Face ID prompts, for
-  many seconds. A call made after a read has finished still starts a fresh one. No change is needed
+  many seconds. A call made after a read has finished still starts a fresh one, and so does a call
+  made after `wipe()`, `rewind(_:)`, `importAccount` or `deleteAccount(_:)` completes, even while a
+  read that began before it is still running. No change is needed
   at call sites.
 - `SlipstreamSynchronizer.getAccountsBalances()` no longer reads the local balances, which it never
   returned. Its result is unchanged, and it no longer pays for that read.
