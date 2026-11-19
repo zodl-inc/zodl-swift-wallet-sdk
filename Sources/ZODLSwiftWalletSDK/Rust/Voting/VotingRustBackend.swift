@@ -536,6 +536,10 @@ extension VotingRustBackend {
     /// Stateless. The three hashes and both roots are 32 bytes; the roots must
     /// be canonical Pallas field elements.
     ///
+    /// Pass `snapshotBlockhash` as the vote chain reports it (display order), not
+    /// in the internal byte order of a lightwalletd `BlockID`; the other byte
+    /// order derives a different id and every round would be rejected.
+    ///
     /// - Returns: The 32-byte round id.
     /// - Throws: When an argument has the wrong length or a root is not a
     ///   canonical field element.

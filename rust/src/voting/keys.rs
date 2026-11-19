@@ -84,6 +84,9 @@ pub unsafe extern "C" fn zcashlc_voting_extract_nc_root(
 /// A wallet compares the result with the round id a vote server reported, so a server cannot
 /// show different ballot content under a signed round id.
 ///
+/// `snapshot_blockhash` is the hash as the vote chain reports it (display order), not the internal
+/// byte order of a lightwalletd `BlockID`; the other order derives a different id.
+///
 /// Returns the 32-byte canonical field element as `*mut FfiBoxedSlice`, or null on error
 /// (a length other than 32, or a root that is not a canonical Pallas field element).
 ///
