@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 8.1.1 - 2026-11-19
+
 ## Fixed
 
 - `SlipstreamSynchronizer.getLocalAccountBalances()` no longer starts a new read of the wallet
