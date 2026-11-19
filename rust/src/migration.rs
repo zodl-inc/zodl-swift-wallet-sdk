@@ -727,8 +727,7 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
 
 /// Computes a fresh preview plan against the account's live balance and caches it under a fresh
 /// [`migration_plan_cache::PlanHandle`] (a later commit echoes the handle back and signs exactly
-/// this plan, not an independently re-randomized one). `immediate` records that the preview came
-/// through the immediate lane, so the commit rewrites the transfer schedule to "all due at once".
+/// this plan, not an independently re-randomized one).
 ///
 /// Returns the plan alongside the tip at plan time (the "now" reference the schedule encoders
 /// stamp into `FfiTransferProposal::anchor_height` and measure durations from) and the handle
@@ -739,7 +738,6 @@ fn reconcile_mined(ctx: &mut CallCtx) -> anyhow::Result<Option<MigrationState>> 
 fn plan_and_cache(
     rng: &mut impl CryptoRng,
     ctx: &mut CallCtx,
-    immediate: bool,
 ) -> anyhow::Result<Option<(MigrationPlan, BlockHeight, migration_plan_cache::PlanHandle)>> {
     match compute_plan(rng, ctx)? {
         Some((plan, reference_height)) => {
@@ -748,7 +746,6 @@ fn plan_and_cache(
                 ctx.db_path.clone(),
                 ctx.account_bytes,
                 plan.clone(),
-                immediate,
             );
             Ok(Some((plan, reference_height, handle)))
         }
@@ -1168,9 +1165,7 @@ fn encode_schedule_from_state<P: Parameters>(
 /// key and checks it against the account's before building anything, so a foreign key is refused
 /// as [`engine::CommitError::WrongSpendAuthority`] rather than silently signing nothing. A
 /// terminal stored run (a completed or cancelled previous migration) is REPLACED — that is the
-/// sequential-runs path. When the cached preview came through the immediate lane, the committed
-/// transfers' scheduled heights are rewritten to the commit tip (everything due at once;
-/// preparation mining order still gates transfers via their dependencies).
+/// sequential-runs path.
 fn commit_or_resume(
     rng: &mut impl CryptoRng,
     ctx: &mut CallCtx,
@@ -3728,19 +3723,18 @@ pub unsafe extern "C" fn zcashlc_migration_prepare_note_split(
             )?
         };
         refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
-        let (values, fee, proposal_handle) =
-            match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
-                Some((plan, _, handle)) => {
-                    let split = plan.denominations();
-                    let values: Vec<i64> = split
-                        .migration_outputs()
-                        .iter()
-                        .map(|v| zat_to_i64(*v))
-                        .collect();
-                    (values, zat_to_i64(split.prep_fees()), handle)
-                }
-                None => (Vec::new(), 0, 0),
-            };
+        let (values, fee, proposal_handle) = match plan_and_cache(&mut system_rng(), &mut ctx)? {
+            Some((plan, _, handle)) => {
+                let split = plan.denominations();
+                let values: Vec<i64> = split
+                    .migration_outputs()
+                    .iter()
+                    .map(|v| zat_to_i64(*v))
+                    .collect();
+                (values, zat_to_i64(split.prep_fees()), handle)
+            }
+            None => (Vec::new(), 0, 0),
+        };
         let (output_values, output_values_len) = ptr_from_vec(values);
         Ok(Box::into_raw(Box::new(FfiNoteSplitProposal {
             output_values,
@@ -4136,7 +4130,7 @@ pub unsafe extern "C" fn zcashlc_migration_propose_transfers(
             )?
         };
         refuse_while_upgrade_gate_closed(&ctx, upgrade_gate_bypass)?;
-        match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
+        match plan_and_cache(&mut system_rng(), &mut ctx)? {
             Some((plan, reference_height, handle)) => {
                 encode_schedule_from_plan(&ctx.network, &plan, reference_height, handle)
             }
@@ -4734,7 +4728,7 @@ pub unsafe extern "C" fn zcashlc_migration_restart_step(
                 replan_after_height: height_opt_to_i64(Some(activation)),
             })));
         }
-        let schedule = match plan_and_cache(&mut system_rng(), &mut ctx, false)? {
+        let schedule = match plan_and_cache(&mut system_rng(), &mut ctx)? {
             Some((plan, reference_height, handle)) => {
                 encode_schedule_from_plan(&ctx.network, &plan, reference_height, handle)?
             }
@@ -6690,7 +6684,7 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let (plan, _reference_height, _handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (plan, _reference_height, _handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
 
@@ -7176,7 +7170,7 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
         assert_ne!(handle, 0, "a real cached plan must mint a non-zero handle");
@@ -7256,10 +7250,10 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let (_plan1, _ref1, handle1) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (_plan1, _ref1, handle1) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("the first planning call must succeed")
             .expect("the funded account has a real migration plan");
-        let (_plan2, _ref2, handle2) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (_plan2, _ref2, handle2) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("the second planning call must succeed")
             .expect("the funded account still has a real migration plan (nothing was spent)");
         assert_ne!(
@@ -7325,7 +7319,7 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
         assert_ne!(handle, 0, "a real cached plan must mint a non-zero handle");
@@ -7463,7 +7457,7 @@ mod tests {
         }
         .expect("the fixture context opens");
 
-        let (_plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (_plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
 
@@ -7696,7 +7690,7 @@ mod tests {
             )
         }
         .expect("the fixture context opens");
-        let (_plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (_plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
 
@@ -12881,7 +12875,7 @@ mod tests {
             )
         }
         .expect("the fixture context opens");
-        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx, false)
+        let (plan, _reference_height, handle) = plan_and_cache(&mut system_rng(), &mut ctx)
             .expect("planning must succeed")
             .expect("the funded account has a real migration plan");
         let usk = unsafe { crate::decode_usk(usk_bytes.as_ptr(), usk_bytes.len()) }
@@ -13973,8 +13967,7 @@ mod tests {
             "the run holds the funded note"
         );
         // A proposal under review beside the run: the commit emptied the cache, so put it back.
-        let handle =
-            migration_plan_cache::set(&mut system_rng(), path.clone(), account, plan, false);
+        let handle = migration_plan_cache::set(&mut system_rng(), path.clone(), account, plan);
         assert!(
             migration_plan_cache::get(&path, account, handle).is_ok(),
             "the proposal is cached"
