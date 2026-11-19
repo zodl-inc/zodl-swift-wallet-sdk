@@ -12,7 +12,8 @@ import XCTest
 /// returns to the foreground, several callers ask for balances at once; if each starts its own walk,
 /// every cooperative thread ends up blocked and all other Swift work in the process stalls. These
 /// tests pin the two properties that prevent that: concurrent callers share one read, and a caller
-/// that only wants the visible balances does not read the local ones at all.
+/// that only wants the visible balances does not read the local ones at all. They also pin the limit
+/// on sharing: a read that began before a wallet change is not handed to callers that arrive after it.
 final class SlipstreamLocalBalanceReadTests: ZcashTestCase {
     // MARK: - Fixture
 
@@ -121,6 +122,37 @@ final class SlipstreamLocalBalanceReadTests: ZcashTestCase {
         XCTAssertEqual(second?[account]?.saplingBalance.spendableValue, Zatoshi(2_000))
     }
 
+    // MARK: - A wallet change ends the sharing
+
+    /// A read that began before a wallet change reports the wallet as it was. A caller that arrives
+    /// after the change must start its own read rather than join that one, while the caller already
+    /// waiting on the old read still gets its result. `deleteAccount` stands in for the other wallet
+    /// changes — `importAccount`, `rewind` and `wipe` — which drop the shared read the same way.
+    func testReadStartedBeforeAWalletChangeIsNotSharedAfterIt() async throws {
+        let backend = GatedLocalBalanceBackend()
+        backend.deleteAccountClosure = { _ in }
+        backend.result = .success([account: balance(1_000)])
+        let sync = try await makeSynchronizer(backend: backend)
+
+        let before = Task { try await sync.getLocalAccountBalances() }
+        let firstStarted = await waitUntil { backend.readCount == 1 }
+        XCTAssertTrue(firstStarted, "the first caller should start a read")
+
+        try await sync.deleteAccount(account)
+        backend.result = .success([:])
+
+        let after = Task { try await sync.getLocalAccountBalances() }
+        let secondStarted = await waitUntil { backend.readCount == 2 }
+        XCTAssertTrue(secondStarted, "a caller arriving after the change must start its own read, not join the old one")
+
+        backend.release()
+        let beforeValue = try await before.value
+        let afterValue = try await after.value
+        XCTAssertEqual(beforeValue?[account]?.saplingBalance.spendableValue, Zatoshi(1_000))
+        XCTAssertNil(afterValue?[account], "the deleted account must not appear in a read that began after the delete")
+        XCTAssertEqual(backend.readCount, 2)
+    }
+
     // MARK: - Visible balances do not pay for the local read
 
     func testAccountsBalancesDoesNotReadLocalBalances() async throws {
@@ -168,8 +200,13 @@ private final class GatedLocalBalanceBackend: ZcashRustBackendWeldingMock, Local
         released.forEach { $0.resume() }
     }
 
+    /// Each read returns the `result` set when it started, as a SQLite read sees the database as of
+    /// its own start, so a test can tell a read that began before a change from one that began after.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
-        lock.withLock { reads += 1 }
+        let snapshot = lock.withLock {
+            reads += 1
+            return storedResult
+        }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let resumeNow = lock.withLock {
                 if isOpen {
@@ -182,7 +219,7 @@ private final class GatedLocalBalanceBackend: ZcashRustBackendWeldingMock, Local
                 continuation.resume()
             }
         }
-        return try result.get()
+        return try snapshot.get()
     }
 
     func getWalletSummaryWithLocalBalances() async throws -> (
