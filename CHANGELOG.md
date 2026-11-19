@@ -80,6 +80,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share one read between concurrent callers; each call still reads the database. No change is
   needed at call sites.
 
+## Added
+
+- `VotingRustBackend.deriveRoundId(createdAtHeight:snapshotBlockhash:proposalsHash:voteEndTime:nullifierImtRoot:ncRoot:)`
+  recomputes a vote round id the way the vote chain derives it (Poseidon over the round's creation height,
+  snapshot blockhash, proposals hash, vote end time and the two tree roots) and returns the 32-byte id. A wallet
+  compares it with the round id a vote server reported, so a server cannot show different ballot content under a
+  signed round id. Throws when an argument is not 32 bytes or a root is not a canonical Pallas field element.
+
 # 8.1.0 - 2026-11-13
 
 ## Added

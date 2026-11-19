@@ -3232,6 +3232,7 @@ dependencies = [
  "ffi_helpers",
  "fs-mistrust",
  "futures",
+ "halo2_poseidon",
  "hex",
  "hkdf",
  "hpke",

@@ -8,6 +8,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_voting_derive_round_id(created_at_height, snapshot_blockhash, snapshot_blockhash_len, proposals_hash,
+  proposals_hash_len, vote_end_time, nullifier_imt_root, nullifier_imt_root_len, nc_root, nc_root_len)`
+  recomputes a vote round id the way the vote chain derives it (Poseidon P128Pow5T3, ConstantLength<8>) and
+  returns the 32-byte id as a boxed slice, to free with `zcashlc_free_boxed_slice`. It returns null, with a
+  last error, when an argument is not exactly 32 bytes or a root is not a canonical Pallas field element.
+
 - `zcashlc_ohttp_configure(const FfiOhttpNetworkConfigV1 *mainnet, const FfiOhttpNetworkConfigV1 *testnet)`
   installs the OHTTP configuration of both networks, replacing the one installed before.
   `FfiOhttpNetworkConfigV1` holds a network's gateway host, relay URL, keys DNS name and signing key
