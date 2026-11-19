@@ -1677,7 +1677,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// database, so a caller that arrives while a read is running waits for that read instead and at
     /// most one walk runs at a time. Every waiter receives the same result or the same error.
     /// Cancelling a caller does not cancel the read or affect the other waiters, because the read
-    /// is an unstructured task that the FFI call cannot interrupt anyway.
+    /// is an unstructured task that the FFI call cannot interrupt anyway. A read is shared only with
+    /// callers that arrive before the wallet next changes: see `forgetSharedLocalBalanceRead()`.
     private func sharedLocalAccountBalances(
         provider: LocalBalanceProviding
     ) async throws -> [AccountUUID: AccountBalance] {
@@ -1698,6 +1699,18 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             inFlightLocalAccountBalances = nil
         }
         return try result.get()
+    }
+
+    /// Stops sharing the local-balance read that is running, once a wallet change has landed.
+    ///
+    /// A read that began before a wipe, rewind, account import or account deletion reports the
+    /// wallet as it was, so a caller that arrives after the change must start a read of its own
+    /// instead of joining that one. The restarted pass and `prepare()` are such callers. Call this
+    /// after the change and before the pass restarts, on the failure path too, since a failed
+    /// change may have written part of it. Callers already waiting on the old read still receive its
+    /// result, and the read's creator only clears the slot if it still holds its own read.
+    private func forgetSharedLocalBalanceRead() {
+        inFlightLocalAccountBalances = nil
     }
 
     public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
@@ -1836,7 +1849,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 name: request.name,
                 keySource: request.keySource
             )
+            forgetSharedLocalBalanceRead()
         } catch {
+            forgetSharedLocalBalanceRead()
             // A failed import must not leave the engine dead. The import's own error is what the
             // caller gets; a restart that fails on top of it is reported on the state stream, the
             // same way the success path below reports it, so the host never keeps seeing
@@ -1918,6 +1933,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         do {
             try await initializer.rustBackend.deleteAccount(accountUUID)
+            forgetSharedLocalBalanceRead()
             // `delete_account` removes the account's transactions — bump `tx_set_version`
             // (tag-5 poke) so hosts re-fetch and Activity drops the dead rows on the next tick.
             await engine.notifyTxChange()
@@ -1929,6 +1945,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 }
             }
         } catch {
+            forgetSharedLocalBalanceRead()
             // A failed delete must not leave the engine dead either — mirrors importAccount's
             // catch-restart and rewind's restart-on-both-outcomes, which this path lacked.
             if wasRunning {
@@ -2439,6 +2456,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 let checkpoint = checkpointSource.birthday(for: currentHeight)
                 try await initializer.rustBackend.truncateToChainState(chainState: checkpoint.treeState())
             }
+            forgetSharedLocalBalanceRead()
             // [audit SDK-5 → E-3] No host cache to reset after a truncate: the summary is
             // engine-served per call (E-1). Engine COUNTERS are NOT reset here on purpose:
             // the handle survives a rewind, so `enhancedTxs`/`rangesCompleted` stay monotonic
@@ -2453,6 +2471,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             subject.send(completion: .finished)
         } catch {
+            forgetSharedLocalBalanceRead()
             if wasRunning {
                 do {
                     try await startImpl(retry: false, resetRecoveryBudget: true)
@@ -2574,8 +2593,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             //    wallet wipe succeeded (this `do` block only reaches here on success).
             await submitPlanStore.wipe()
 
-            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`
-            //    opens it: a switch before that only records its server (`engineClosedByWipe`).
+            // 7. Reset state to unprepared/zero, stop sharing any read of the deleted files, and keep
+            //    the engine closed until the next `prepare` opens it: a switch before that only
+            //    records its server (`engineClosedByWipe`).
+            forgetSharedLocalBalanceRead()
             engineClosedByWipe = true
             stateSubject.send(.zero)
 
@@ -2583,6 +2604,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .finished)
         } catch {
+            forgetSharedLocalBalanceRead()
             healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .failure(error))
         }
