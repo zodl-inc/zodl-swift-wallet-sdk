@@ -95,19 +95,16 @@ keeps exact pins from being copied into those crates.
 
 ## Release
 
-A release runs in two phases, with a human reading a pull request in between.
-`CONTRIBUTING.md` carries the full procedure; every command below accepts
-`--dry-run`.
-
-- `./Scripts/prepare-release.sh start --issue <N> <remote> <version>` — cut `release/X.Y.Z` from the previous release tag and `candidate/X.Y.Z` from the revision being released, promote the CHANGELOG, and open a draft pull request between them. Its diff is what users receive relative to the last release.
-- `./Scripts/prepare-release.sh build <remote> <version>` — bump the recorded version, build the XCFramework and verify the SDK against it, upload it as a draft release, point `Package.swift` at it, and mark the pull request ready. Each step derives whether it has already run, so a failure resumes rather than restarting.
-- `./Scripts/prepare-release.sh artifacts <version>` — the build and upload alone, touching no git or pull-request state. This is what the `Build FFI XCFramework` GitHub Action (`workflow_dispatch`) runs; it never builds a PR.
-- `./Scripts/release.sh <remote> <version>` — after the pull request merges, run from `release/X.Y.Z`. Verifies the checksum against the uploaded asset, signs and pushes the tag, and publishes the release.
+SDK releases are prepared with the SDK release skill from the shared ZODL
+skills library. The release XCFramework is built, verified and uploaded as a
+draft release by `Scripts/ci/build-release-artifacts.sh`, which that skill runs
+locally or through the `Build FFI XCFramework` GitHub Action
+(`workflow_dispatch`).
+`Scripts/prepare-release.sh` is a deprecated stub that only points here.
 
 A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
-pre-release on GitHub. The text transforms and predicates these scripts are
-built from live in `Scripts/lib/release-lib.sh` and are covered by
-`make test-scripts`, which `make check` includes.
+pre-release on GitHub. `make test-scripts`, which `make check` includes, covers
+the producer's helpers and CLI.
 
 ## Architecture
 

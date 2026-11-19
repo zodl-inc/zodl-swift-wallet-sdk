@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Test runner for the release-support shell library.
+# Test runner for the SDK's script helpers.
 #
-# Sources Scripts/lib/release-lib.sh, then every Scripts/tests/test-*.sh, and
+# Sources Scripts/ci/build-release-artifacts.sh, then every Scripts/tests/test-*.sh, and
 # runs each function whose name begins with `test_`. There is no external
 # dependency: adding bats to this repository is not worth it for a handful of
 # text transforms.
@@ -15,8 +15,8 @@ TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$TESTS_DIR/../.." && pwd)"
 FILTER="${1:-}"
 
-# shellcheck source=../lib/release-lib.sh
-. "$REPO_ROOT/Scripts/lib/release-lib.sh"
+# shellcheck source=../ci/build-release-artifacts.sh
+. "$REPO_ROOT/Scripts/ci/build-release-artifacts.sh"
 
 _assertions=0
 _failures=0

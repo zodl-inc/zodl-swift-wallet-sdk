@@ -143,7 +143,7 @@ class NativeRecordTests(unittest.TestCase):
             path = self.tools / tool
             path.write_text(GH_DOUBLE if tool == "gh" else NATIVE_DOUBLE)
             path.chmod(0o755)
-        for relative in ("Makefile", "Scripts/ci/build-release-artifacts.sh", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/ci/sdk_build_record.py"):
+        for relative in ("Makefile", "Scripts/ci/build-release-artifacts.sh", "Scripts/ci/sdk_build_record.py"):
             source = ROOT / relative
             if source.exists():
                 target = self.source / relative
@@ -239,20 +239,14 @@ if sys.argv[1:] == ["--version"]:
         (self.products / "release.env").write_bytes(b"existing completion\n")
         before = self.source_snapshot()
         commands = [
-            ["Scripts/prepare-release.sh", "start", "--issue", "1", "upstream"],
-            ["Scripts/prepare-release.sh", "build", "--artifacts", "local", "upstream"],
-            ["Scripts/prepare-release.sh", "build", "--artifacts", "ci", "upstream"],
-            ["Scripts/prepare-release.sh", "artifacts"],
             ["Scripts/ci/build-release-artifacts.sh"],
-            ["Scripts/release.sh", "upstream"],
         ]
         for version in ("5.0.0+build.1", "5.0.0-rc.1+build.1"):
             for command in commands:
                 for dry in ([], ["--dry-run"]):
                     for evidence in ("0", "1"):
                         with self.subTest(version=version, command=command, dry=dry, evidence=evidence):
-                            # release.sh requires options before the positionals.
-                            argv = ["bash", command[0], *dry, *command[1:], version] if command[0].endswith("/release.sh") else ["bash", *command, *dry, version]
+                            argv = ["bash", *command, *dry, version]
                             result = subprocess.run(argv, cwd=self.source, env=dict(environment, ZODL_SDK_BUILD_RECORD=evidence), text=True, capture_output=True)
                             self.assertNotEqual(result.returncode, 0)
                             self.assertIn("unsupported build metadata", result.stderr.lower())

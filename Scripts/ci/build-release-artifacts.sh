@@ -86,11 +86,12 @@ cargo_package_version() {
     ' "$1"
 }
 
-# $1 names how to report a failure, defaulting to `die`. Callers whose
-# --dry-run path makes no authenticated call pass `die_unless_dry_run`, so a
-# rehearsal reports the problem instead of refusing to run. Callers whose dry
-# run does reach GitHub keep the default: without a token those reads fail
-# anyway, and further along, with a message that misdiagnoses the cause.
+# $1 optionally names a function that reports a failure, defaulting to `die`.
+# A caller whose --dry-run path makes no authenticated call can pass a
+# reporting function that only warns in a dry run, so a rehearsal reports the
+# problem instead of refusing to run. Callers whose dry run does reach GitHub
+# keep the default: without a token those reads fail anyway, and further along,
+# with a message that misdiagnoses the cause.
 require_gh_auth() {
     local report="${1:-die}"
     if ! command -v gh >/dev/null 2>&1; then
