@@ -267,4 +267,4 @@ reset-ffi: ## Reset the local FFI development environment
 .PHONY: ffi-artifacts
 ffi-artifacts: require-macos ## Build and upload the release XCFramework (VERSION=X.Y.Z)
 	@[ -n "$(VERSION)" ] || { echo "Set VERSION, e.g. make ffi-artifacts VERSION=2.7.1"; exit 1; }
-	./$(SCRIPTS)/prepare-release.sh artifacts $(VERSION)
+	./$(SCRIPTS)/ci/build-release-artifacts.sh $(VERSION)

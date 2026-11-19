@@ -143,7 +143,7 @@ class NativeRecordTests(unittest.TestCase):
             path = self.tools / tool
             path.write_text(GH_DOUBLE if tool == "gh" else NATIVE_DOUBLE)
             path.chmod(0o755)
-        for relative in ("Makefile", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/ci/sdk_build_record.py"):
+        for relative in ("Makefile", "Scripts/ci/build-release-artifacts.sh", "Scripts/prepare-release.sh", "Scripts/release.sh", "Scripts/lib/release-lib.sh", "Scripts/ci/sdk_build_record.py"):
             source = ROOT / relative
             if source.exists():
                 target = self.source / relative
@@ -179,7 +179,7 @@ class NativeRecordTests(unittest.TestCase):
         if expected_source:
             environment["ZODL_SDK_EXPECTED_SOURCE"] = expected_source
         environment.update(env)
-        return subprocess.run(["bash", "Scripts/prepare-release.sh", "artifacts", *flags, "5.0.0"], cwd=self.source, env=environment, text=True, capture_output=True)
+        return subprocess.run(["bash", "Scripts/ci/build-release-artifacts.sh", *flags, "5.0.0"], cwd=self.source, env=environment, text=True, capture_output=True)
 
     def make_calls(self):
         return [args for args in self.all_make_calls() if args != ["--no-print-directory", "print-swift-version"]]
@@ -243,6 +243,7 @@ if sys.argv[1:] == ["--version"]:
             ["Scripts/prepare-release.sh", "build", "--artifacts", "local", "upstream"],
             ["Scripts/prepare-release.sh", "build", "--artifacts", "ci", "upstream"],
             ["Scripts/prepare-release.sh", "artifacts"],
+            ["Scripts/ci/build-release-artifacts.sh"],
             ["Scripts/release.sh", "upstream"],
         ]
         for version in ("5.0.0+build.1", "5.0.0-rc.1+build.1"):

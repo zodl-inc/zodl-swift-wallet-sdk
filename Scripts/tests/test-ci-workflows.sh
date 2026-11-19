@@ -396,8 +396,8 @@ test_ci_cache_release_keeps_publication_and_targets() {
     local workflow
     workflow="$(_build_ffi_workflow)"
     assert_file_contains "$workflow" 'target aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin' 'release installs all three ARM targets'
-    assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts --force-overwrite-existing-release "$VERSION"' 'release force publication command is preserved'
-    assert_file_contains "$workflow" './Scripts/prepare-release.sh artifacts "$VERSION"' 'release publication command is preserved'
+    assert_file_contains "$workflow" './Scripts/ci/build-release-artifacts.sh --force-overwrite-existing-release "$VERSION"' 'release force publication command is preserved'
+    assert_file_contains "$workflow" './Scripts/ci/build-release-artifacts.sh "$VERSION"' 'release publication command is preserved'
 }
 
 # Evaluate only the explicitly supported workflow contract; an unknown
@@ -525,7 +525,8 @@ test_ohttp_e2e_builds_the_ffi_with_ohttp_trace() {
 
 test_release_ffi_builds_never_enable_ohttp_trace() {
     local f
-    for f in .github/workflows/build-ffi.yml Scripts/prepare-release.sh Scripts/release.sh; do
+    for f in .github/workflows/build-ffi.yml Scripts/ci/build-release-artifacts.sh; do
+        assert_succeeds "$f exists" test -f "$REPO_ROOT/$f"
         assert_file_lacks "$REPO_ROOT/$f" "ohttp-trace" "$f does not enable ohttp-trace"
         assert_file_lacks "$REPO_ROOT/$f" "FFI_CARGO_FEATURES" "$f passes no extra Cargo features"
     done
@@ -582,7 +583,8 @@ test_ohttp_build_inputs_are_gone_from_the_build() {
     assert_succeeds 'the configuration marker is removed' test ! -e "$REPO_ROOT/BuildSupport/ohttp-config-"version
     assert_succeeds 'the build-time configuration helper is removed' test ! -e "$REPO_ROOT/Scripts/lib/ohttp_"env.py
     local f
-    for f in Makefile BuildSupport/Makefile Scripts/init-local-ffi.sh Scripts/rebuild-local-ffi.sh Scripts/prepare-release.sh Scripts/ci/ffi-input-hash.sh; do
+    for f in Makefile BuildSupport/Makefile Scripts/init-local-ffi.sh Scripts/rebuild-local-ffi.sh Scripts/ci/build-release-artifacts.sh Scripts/ci/ffi-input-hash.sh; do
+        assert_succeeds "$f exists" test -f "$REPO_ROOT/$f"
         assert_file_lacks "$REPO_ROOT/$f" 'ohttp_''env' "$f runs no configuration helper"
         assert_file_lacks "$REPO_ROOT/$f" 'OHTTP_ENV_RESOLVED' "$f has no configuration resolution marker"
         assert_file_lacks "$REPO_ROOT/$f" 'ZODL_OHTTP' "$f names no OHTTP build input"
