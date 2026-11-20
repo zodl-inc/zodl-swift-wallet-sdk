@@ -206,7 +206,7 @@ gpu = ["slipstream-core/gpu"]
 # without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
 # init-local-ffi.sh / rebuild-local-ffi.sh --trace,
 # make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
-# release builds (build-ffi.yml, prepare-release.sh) never enable it. It turns on
+# release builds (build-ffi.yml, Scripts/ci/build-release-artifacts.sh) never enable it. It turns on
 # the engine's own `client-trace` feature, so Slipstream OHTTP requests carry the
 # prefix too.
 ohttp-trace = ["slipstream-core/client-trace"]
