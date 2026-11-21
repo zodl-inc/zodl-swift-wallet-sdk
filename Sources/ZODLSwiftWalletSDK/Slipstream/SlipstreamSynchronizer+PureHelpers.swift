@@ -67,15 +67,41 @@ extension SlipstreamSynchronizer {
     /// synchronizer (it needs `latestState`/the backend). Without populating `state`, Zashi
     /// maps an INCOMING tx via `transaction.state == .pending` → `nil == .pending` → false →
     /// ".received", so a 0-conf mempool tx wrongly shows "received" instead of "receiving".
+    ///
+    /// `scannedHeight` is the engine's fully scanned height, which alone decides whether an unmined
+    /// transaction has expired; `currentHeight` only counts confirmations. Judging expiry against the
+    /// tip turned a send mined in a block not scanned yet into `.expired` after every resume.
     static func transactionsWithState(
         _ raw: [ZcashTransaction.Overview],
-        currentHeight: BlockHeight
+        currentHeight: BlockHeight,
+        scannedHeight: BlockHeight
     ) -> [ZcashTransaction.Overview] {
         raw.map { tx in
             var copy = tx
-            copy.state = tx.getState(for: currentHeight)
+            copy.state = tx.getState(for: currentHeight, scannedHeight: scannedHeight)
             return copy
         }
+    }
+
+    /// Whether the poll tick must read the transactions again because the fully scanned height
+    /// moved to `fullyScannedHeight`, with no change to `txSetVersion`: a scan that records the
+    /// mined height of a send the wallet already stores bumps no version, and an unmined send that
+    /// is never mined expires only as the scan passes its expiry height. True only when the last
+    /// read held a transaction that was unmined and not yet expired at the height it was read at
+    /// (`lastReadHadUnexpiredUnmined`), and the scan has advanced past that height since.
+    static func needsTransactionReadOnScanAdvance(
+        lastReadHadUnexpiredUnmined: Bool,
+        lastReadScannedHeight: BlockHeight,
+        fullyScannedHeight: BlockHeight
+    ) -> Bool {
+        lastReadHadUnexpiredUnmined && fullyScannedHeight > lastReadScannedHeight
+    }
+
+    /// Whether `transactions`, already carrying their `state`, hold one that a later scan can still
+    /// change: unmined and not yet expired. An expired row never changes again, so a wallet keeping
+    /// an old expired send does not re-read its transactions on every block.
+    static func hasUnexpiredUnmined(_ transactions: [ZcashTransaction.Overview]) -> Bool {
+        transactions.contains { $0.minedHeight == nil && $0.state != .expired }
     }
 
     // [v2.1 Phase 2] `shouldMarkChainTipUpdated` is GONE: tip freshness is the engine-owned

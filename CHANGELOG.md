@@ -10,6 +10,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- A send mined while the Slipstream engine was stopped no longer reads as `ZcashTransaction.Overview.State.expired`
+  after the engine resumes. An unmined transaction is now `.expired` only once the wallet's fully
+  scanned height has reached its expiry height; the chain tip alone never decides, and neither does
+  the `expired_unmined` column (`isExpiredUmined`), which can be true while the block that mined the
+  transaction is still unscanned. `getState(for:scannedHeight:)` takes the scanned height; the
+  existing `getState(for:)` keeps judging against the height it is given. `SlipstreamSynchronizer`
+  also publishes `foundTransactions` again when the fully scanned height advances while an unmined,
+  unexpired transaction is stored, so a send whose mined height a scan just recorded, or one that
+  just expired, is re-read without waiting for a transaction-set change. Call sites need no change.
 - `SlipstreamSynchronizer.getLocalAccountBalances()` no longer starts a new read of the wallet
   database for each caller. A call made while another call's read is still running waits for that
   read and returns its result, or throws its error. The read takes seconds on a wallet with a long
