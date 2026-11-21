@@ -1334,7 +1334,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         lastTxSetVersion = 0
         lastRevealRecovering = false
         lastReadScannedHeight = 0
-        lastReadHadUnexpiredUnmined = false
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // Re-arm the log and the handle-lifetime clamp for the new pass, but KEEP the recovery
         // budget: it is what bounds this very restart, and a full re-arm would clear it.
         resetStallWatchdog(resetRecoveryBudget: false)
@@ -3065,7 +3066,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         lastTxSetVersion = 0
         lastRevealRecovering = false
         lastReadScannedHeight = 0
-        lastReadHadUnexpiredUnmined = false
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // B4: re-arm the stall watchdog for the new handle.
         resetStallWatchdog()
 
@@ -3102,7 +3104,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         lastTxSetVersion = 0
         lastRevealRecovering = false
         lastReadScannedHeight = 0
-        lastReadHadUnexpiredUnmined = false
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog()
         pendingEndpointReconciliation = nil
     }
@@ -3191,7 +3194,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         lastTxSetVersion = 0
         lastRevealRecovering = false
         lastReadScannedHeight = 0
-        lastReadHadUnexpiredUnmined = false
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog(resetRecoveryBudget: true)
 
         // `startImpl`, not the public `start()`: this operation is holding the queue, and a queued
