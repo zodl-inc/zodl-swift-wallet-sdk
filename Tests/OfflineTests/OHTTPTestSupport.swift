@@ -182,4 +182,18 @@ enum OHTTPTestSupport {
         if corrupt { wire[wire.count - 1] ^= 1 }
         return (sealed.pending, wire)
     }
+
+    /// The body of a gateway host list that names `hosts` (scope `all`).
+    static func hostListBody(_ hosts: [String]) -> Data {
+        let entries = hosts.map { "{\"host\":\"\($0)\",\"routes\":[\"* /*\"]}" }.joined(separator: ",")
+        return Data("{\"version\":1,\"revision\":\"r1\",\"scope\":\"all\",\"max_age_secs\":300,\"hosts\":[\(entries)]}".utf8)
+    }
+
+    /// Makes the SDK hold `hosts` as the list just fetched from the gateway of `network`.
+    static func installHostList(_ hosts: [String], network: NetworkType = .mainnet) {
+        guard let refresh = OHTTPNative.thirdPartyBeginRefresh(network: network) else {
+            preconditionFailure("No host list refresh was due")
+        }
+        precondition(refresh.finish(status: 200, body: hostListBody(hosts)) == .updated)
+    }
 }

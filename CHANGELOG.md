@@ -6,6 +6,54 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `OHTTPEndpoints.isProxyAllowlisted(host:network:)` tells whether a host is passed through OHTTP
+  on a network, according to the gateway's host list.
+
+## Changed
+
+- The OHTTP core is `zodl-ohttp-client` 2.1.0 (see its changelog, sections "2.0.0" to
+  "2.1.0"). Every outer OHTTP request now carries exactly the header list the core gives every
+  client. The sealed POST:
+  `Content-Type: message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`,
+  `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1` (and, in a debug
+  build with a trace prefix set, `X-Client-Trace-Id`). The key configuration fetch: `Accept:
+  application/json` (was `application/ohttp-keys`), `Accept-Encoding: identity`, `Accept-Language:
+  en`, `User-Agent: zodl-ohttp/1`, and no longer a trace id. The iOS client then sends the relay
+  the same headers as the Android and Slipstream clients. The Slipstream engine comes from a revision
+  on `zodl-ohttp-client` 2.1.0. Its relay requests carry `User-Agent: zodl-ohttp/1` (was
+  `zodl-slipstream-ohttp/0.1`) and `Accept-Language: en` too.
+- `OHTTPEndpoints.configure(_:)` refuses more relay URLs with `ohttpConfigurationInvalid`
+  (`ZTSRV0009`): a relay on a gateway host, non-ASCII text (write a host in its `xn--` form), an
+  encoded `/` or `\`, an empty path segment (`//`), a `%` not followed by two hex digits, and the
+  same relay spelled two ways for both networks. A gateway host written as a numeric alias of an
+  IPv4 address, and a relay whose host is an IPv6 literal embedding the gateway's IPv4 address, are
+  refused too. Check the shipped configuration. Sealed requests
+  go to the relay URL in its canonical form (one trailing `/` removed, the host in lower case, no
+  `:443`, dot segments resolved).
+- OHTTP error messages no longer quote what a relay or resolver sent: a signed key configuration
+  for the wrong network or key is reported without its network or key id, JSON and DNS TXT parse
+  errors give only their kind and position, and the detail of a relay refusal is at most 120
+  characters of printable ASCII (it was the first 200 bytes). Code matching on those messages must
+  be updated.
+- The passthrough hosts an OHTTP gateway carries (vote and PIR servers reached under their own
+  name) are taken from the gateway's own third-party host list (`zodl-ohttp-client` 2.1.0),
+  starting from one compiled list. The list is fetched only through OHTTP, on the route of the
+  request that needs it (over Tor in Tor mode), is kept in memory, and is forgotten when another
+  configuration is installed. A failed fetch keeps the list held. A host that is not carried is
+  refused with `ohttpUnsupportedHost`, after at most one refresh, and is never reached directly.
+  `makeVotingRoundSession`, `httpRequestOverOHTTP` and `httpStreamOverOHTTP` may first wait for one
+  host-list refresh.
+  A voting session with Tor off leaves out the chain and PIR endpoints the gateway does not carry
+  and is refused only when none of a kind is left. A voting server on a port other than 443, or
+  with an `http://` URL, is refused through OHTTP. See MIGRATING.md.
+
+## Removed
+
+- `OHTTPEndpoints.proxyAllowedHosts` is removed. Ask
+  `OHTTPEndpoints.isProxyAllowlisted(host:network:)` instead.
+
 ## Fixed
 
 - Transaction resubmission no longer resends ZIP 318 migration transactions (preparations and
@@ -14,6 +62,47 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the app-wide Tor setting, so with migration Tor on and app-wide Tor off it went directly to
   the lightwalletd server, which could link the user's IP to that pool crossing. No caller changes
   are required.
+
+## Added
+
+- `VotingRustBackend.deriveRoundId(createdAtHeight:snapshotBlockhash:proposalsHash:voteEndTime:nullifierImtRoot:ncRoot:)`
+  recomputes a vote round id the way the vote chain derives it (Poseidon over the round's creation height,
+  snapshot blockhash, proposals hash, vote end time and the two tree roots) and returns the 32-byte id. A wallet
+  compares it with the round id a vote server reported, so a server cannot show different ballot content under a
+  signed round id. Throws when an argument is not 32 bytes or a root is not a canonical Pallas field element.
+
+# 8.1.1 - 2026-11-19
+
+## Fixed
+
+- A send mined while the Slipstream engine was stopped no longer reads as `ZcashTransaction.Overview.State.expired`
+  after the engine resumes. An unmined transaction is now `.expired` only once the wallet's fully
+  scanned height has reached its expiry height; the chain tip alone never decides, and neither does
+  the `expired_unmined` column (`isExpiredUmined`), which can be true while the block that mined the
+  transaction is still unscanned. `getState(for:scannedHeight:)` takes the scanned height; the
+  existing `getState(for:)` keeps judging against the height it is given. `SlipstreamSynchronizer`
+  also publishes `foundTransactions` again when the fully scanned height advances while an unmined,
+  unexpired transaction is stored, so a send whose mined height a scan just recorded, or one that
+  just expired, is re-read without waiting for a transaction-set change. Call sites need no change.
+- `SlipstreamSynchronizer.getLocalAccountBalances()` no longer starts a new read of the wallet
+  database for each caller. A call made while another call's read is still running waits for that
+  read and returns its result, or throws its error. The read takes seconds on a wallet with a long
+  history, and several reads at once, as when the app returns to the foreground, blocked every Swift
+  concurrency thread and stalled all other async work in the app, including Face ID prompts, for
+  many seconds. A call made after a read has finished still starts a fresh one, and so does a call
+  made after `wipe()`, `rewind(_:)`, `importAccount` or `deleteAccount(_:)` completes, even while a
+  read that began before it is still running. No change is needed
+  at call sites.
+- `SlipstreamSynchronizer.getAccountsBalances()` no longer reads the local balances, which it never
+  returned. Its result is unchanged, and it no longer pays for that read.
+- Wallet-summary reads now run off the Swift concurrency thread pool. This covers
+  `SlipstreamSynchronizer.getLocalAccountBalances()`, the local balances in
+  `SlipstreamSynchronizer`'s state, and on `SDKSynchronizer` `getAccountsBalances()`,
+  `getLocalAccountBalances()`, the balances in its state stream and the sync progress read. The
+  caller suspends while the wallet database is read, instead of holding one of the pool's threads
+  for the whole read, so other async work in the app keeps running. `SDKSynchronizer` does not
+  share one read between concurrent callers; each call still reads the database. No change is
+  needed at call sites.
 
 # 8.1.0 - 2026-11-13
 

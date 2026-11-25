@@ -122,63 +122,30 @@ main          ───●───────────────●──
 
 ### Cutting a release
 
-Build metadata (+suffix) is unsupported in requested release versions, including
-dry runs and resumed builds. Use a stable version such as `5.0.0` or a prerelease
-such as `5.0.0-rc.1`; do not strip metadata from an existing release name.
+Build metadata (+suffix) is unsupported in requested release versions. Use a
+stable version such as `5.0.0` or a prerelease such as `5.0.0-rc.1`; do not
+strip metadata from an existing release name.
 
-A release happens in two phases, with a human reading the pull request in
-between. Both are driven by `./Scripts/prepare-release.sh`; pass `--dry-run` to
-either to see what it will do without changing anything.
+Releases are prepared with the SDK release skill from the shared ZODL skills
+library. It cuts `release/X.Y.Z` from the previous release tag and
+`candidate/X.Y.Z` from the revision being released, builds and uploads the
+XCFramework as a draft release, and tags and publishes once the pull request
+from `candidate/X.Y.Z` into `release/X.Y.Z` has merged.
+Review that pull request: its diff is exactly what users receive relative to
+the last release, which is why the release branch is based on the previous
+release tag.
 
-**Phase one** — `./Scripts/prepare-release.sh start --issue <N> <remote> <version>`:
-
-1. Create `release/X.Y.Z` **from the previous release tag** and push it to
-   upstream. It starts out identical to the last release.
-2. Create `candidate/X.Y.Z` from the maintenance branch that contains all of
-   the changes to be released.
-3. Promote the CHANGELOG's `Unreleased` section to `X.Y.Z`.
-4. Open a **draft** pull request **on the public repository** from
-   `candidate/X.Y.Z` into `release/X.Y.Z`.
-
-Review that pull request. Its diff is exactly what users receive relative to
-the last release, rather than the intervening development history — which is
-the whole reason the release branch is based on the previous release tag.
-
-**Phase two** — `./Scripts/prepare-release.sh build <remote> <version>`:
-
-5. Bump the recorded version in `Cargo.toml`, `Cargo.lock` and
-   `BuildSupport/platform-Info.plist`.
-6. Build the XCFramework; verify the SDK builds and passes `OfflineTests`
-   against it; then upload it as a draft GitHub release. `--artifacts ci` does
-   all of that on a runner instead of locally; `--skip-verify` skips the
-   build-and-test check.
-7. Rewrite `Package.swift`'s binary target to point at that release.
-8. Extend `candidate/X.Y.Z` with both commits, comment on the pull request, and
-   mark it ready for review.
-
-Each step of phase two checks whether it has already run, so re-running it
-after a failure resumes rather than starting over.
-
-9. Merge the pull request, then run `./Scripts/release.sh <remote> X.Y.Z` from
-   `release/X.Y.Z`. It requires that branch to be identical to its counterpart
-   on `<remote>` — only what merged there may be tagged, and a pushed tag
-   cannot be recalled — then verifies the checksum in `Package.swift` against
-   the uploaded asset, signs the tag `X.Y.Z`, pushes it, and publishes the
-   release. The tag is the only thing pushed.
-
-A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
-pre-release on GitHub, both on the draft created in step 6 and on the published
-release in step 9. That bit is what keeps a release candidate from being served
-as `latest` to everyone who asks the API for the newest release.
-
-The artifact build alone is available as
-`./Scripts/prepare-release.sh artifacts <version>`. It touches no git or
-pull-request state, which is what lets `.github/workflows/build-ffi.yml` run it
-with only `contents: write`. Its
+The XCFramework is built by `Scripts/ci/build-release-artifacts.sh`, run by that
+skill locally or through `.github/workflows/build-ffi.yml`. Its
 `--force-overwrite-existing-release` replaces the assets of a *draft* release
 only: `Package.swift` pins the checksum of whatever a published release
 carries, and SwiftPM checks it on every fetch, so replacing that asset breaks
 the build of every consumer that has already resolved the version.
+`Scripts/prepare-release.sh` is a deprecated stub.
+
+A version carrying a pre-release suffix, such as `2.8.0-rc.1`, is marked as a
+pre-release on GitHub. That bit is what keeps a release candidate from being
+served as `latest` to everyone who asks the API for the newest release.
 
 ```
 tag X.Y.W  (previous release)
@@ -197,7 +164,8 @@ maint/vX.Y.x ──●────●──┴───────────�
 
 ### After the release
 
-Three merges, in order:
+Three merges, in order. The shared ZODL skills library performs them and can
+audit that a release reached them:
 
 1. Merge `release/X.Y.Z` back into `maint/vX.Y.x`, so the maintenance branch
    carries the tagged release and its preparation commits.

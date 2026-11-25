@@ -1407,6 +1407,12 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     // swiftlint:disable function_parameter_count
+    /// Opens a voting round session on `route`.
+    ///
+    /// A direct session to the predefined servers with OHTTP on for the wallet's network keeps only the servers
+    /// the gateway carries: a passthrough host is admitted by the gateway's host list. That list is refreshed
+    /// first, fetched only through OHTTP on the route the wallet's HTTP requests take (over Tor in Tor mode);
+    /// when the refresh fails, the list held is used. Nothing is reached directly for it.
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
@@ -1417,6 +1423,18 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
+            let network = initializer.network.networkType
+            if OHTTPThirdPartyHosts.refreshesBeforeSessionOpen(route: route, isCustomServer: isCustomServer, network: network),
+               let gateway = OHTTPEndpoints.gatewayHost(for: network),
+               let proxy = try? OHTTPEndpoints.proxyRoute(for: gateway, network: network) {
+                // Tor mode puts the refresh on Tor, as it does every relay leg of the HTTP requests.
+                let torMode = await sdkFlags.torEnabled
+                let transport = externalOHTTPTransport(route: proxy, viaTor: torMode)
+                await OHTTPThirdPartyHosts.refresh(
+                    network: network,
+                    exchange: OHTTPThirdPartyHosts.exchange(through: transport, timeoutMS: OHTTPThirdPartyHosts.sessionRefreshTimeoutMS)
+                )
+            }
             return try backend.makeSession(
                 inputs: inputs,
                 binding: binding,
@@ -1512,9 +1530,14 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     }
 
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
-    /// destination service. The request URL must use a hostname registered in `OHTTPEndpoints`
-    /// (e.g. `cmc.zodl.com`, `near.zodl.com`). Use `OHTTPEndpoints.proxyURL(for:)` to convert a
-    /// real API URL to its OHTTP proxy counterpart before calling this method.
+    /// destination service. The request URL must use a hostname the gateway serves: a host registered in
+    /// `OHTTPEndpoints` (e.g. `cmc.zodl.com`, `near.zodl.com`), or a passthrough host. Use
+    /// `OHTTPEndpoints.proxyURL(for:)` to convert a real API URL to its OHTTP proxy counterpart before
+    /// calling this method.
+    ///
+    /// A passthrough host is admitted by the gateway's host list before anything is sent for it. The list is
+    /// fetched only through OHTTP, on this request's own route (over Tor when the request rides Tor), and a
+    /// host it does not carry is refused with `ZcashError.ohttpUnsupportedHost`: nothing is reached directly.
     ///
     /// Tor/OHTTP matrix:
     ///   - Tor OFF: call this method → OHTTP → gateway → destination (IP hidden from destination)
@@ -1525,20 +1548,46 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
     /// app's secret when Tor is ON. With `viaTor: true`, the gateway injects the secret on behalf
     /// of the client after decrypting the OHTTP-encapsulated request.
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
-        // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
-        // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
-        // and the path-restricted voting-config mirror.
-        guard let host = request.url?.host,
-              OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
-                || OHTTPEndpoints.isProxyAllowlisted(host: host)
-                || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+        let network = initializer.network.networkType
+        guard let url = request.url, let host = url.host else {
             throw ZcashError.ohttpUnsupportedHost
         }
-        let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+        // A host that is not a fixed destination needs the list of the wallet's gateway, so OHTTP on for it.
+        guard OHTTPThirdPartyHosts.isFixedDestination(url, host: host) || OHTTPEndpoints.gatewayHost(for: network) != nil else {
+            throw ZcashError.ohttpUnsupportedHost
+        }
+        let route = try OHTTPEndpoints.proxyRoute(for: host, network: network)
         // Tor mode puts every relay leg on Tor, whatever the caller asked for.
         let torMode = await sdkFlags.torEnabled
-        let viaTor = viaTor || torMode
+        let transport = externalOHTTPTransport(route: route, viaTor: viaTor || torMode)
 
+        // The inner request: the caller's fields without the connection's own, the alias credentials the
+        // gateway injects stripped, the body read out of its stream when it has one.
+        let bhttpRequest = try OHTTPExternalHTTP.innerRequest(for: request)
+        // The list is refreshed over this transport, so on the request's own route.
+        try await OHTTPThirdPartyHosts.admit(
+            url: url,
+            host: host,
+            network: network,
+            exchange: OHTTPThirdPartyHosts.exchange(through: transport, timeoutMS: OHTTPThirdPartyHosts.admissionRefreshTimeoutMS)
+        )
+        let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
+        OHTTPThirdPartyHosts.noteAnswer(status: bhttpResponse.status, body: bhttpResponse.body, host: host, network: network)
+
+        guard let httpResponse = HTTPURLResponse(
+            url: url,
+            statusCode: bhttpResponse.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: Dictionary(bhttpResponse.headers.map { $0 }, uniquingKeysWith: { _, last in last })
+        ) else {
+            throw ZcashError.ohttpResponseError
+        }
+        return (bhttpResponse.body, httpResponse)
+    }
+
+    /// The transport of an HTTP request to a host the gateway serves, on `route`. With `viaTor` the relay POST
+    /// and the key-configuration GET ride Tor circuits; otherwise they go to the relay on clearnet.
+    private func externalOHTTPTransport(route: (gatewayHost: String, relayURL: String), viaTor: Bool) -> OHTTPTransport {
         // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
         let httpSender: OHTTPTransport.HTTPSender
         if viaTor {
@@ -1562,7 +1611,7 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             }
         }
 
-        let transport = OHTTPTransport(
+        return OHTTPTransport(
             gatewayHost: route.gatewayHost,
             relayURL: route.relayURL,
             clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
@@ -1570,21 +1619,6 @@ public class SDKSynchronizer: AwaitableStopSynchronizer {
             viaTor: viaTor,
             httpSender: httpSender
         )
-
-        // The inner request: the caller's fields without the connection's own, the alias credentials the
-        // gateway injects stripped, the body read out of its stream when it has one.
-        let bhttpRequest = try OHTTPExternalHTTP.innerRequest(for: request)
-        let bhttpResponse = try await transport.roundTrip(request: bhttpRequest, timeoutMS: 30_000)
-
-        guard let httpResponse = HTTPURLResponse(
-            url: request.url!,
-            statusCode: bhttpResponse.status,
-            httpVersion: "HTTP/1.1",
-            headerFields: Dictionary(bhttpResponse.headers.map { $0 }, uniquingKeysWith: { _, last in last })
-        ) else {
-            throw ZcashError.ohttpResponseError
-        }
-        return (bhttpResponse.body, httpResponse)
     }
 
     public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
