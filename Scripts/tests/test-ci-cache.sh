@@ -196,6 +196,18 @@ test_ffi_hash_covers_layout_runner_source() {
     _assert_hash_changed "$before" "$repo" 'runner source invalidates committed native input hash'
 }
 
+# The release producer decides how the published XCFramework is built.
+test_ffi_hash_covers_the_release_producer() {
+    local repo before
+    repo="$(_ffi_fixture)"
+    mkdir -p "$repo/Scripts/ci"
+    printf 'fixture\n' > "$repo/Scripts/ci/build-release-artifacts.sh"
+    _ffi_commit "$repo"
+    before="$(_ffi_hash "$repo")"
+    printf 'changed\n' >> "$repo/Scripts/ci/build-release-artifacts.sh"
+    _assert_hash_changed "$before" "$repo" 'release producer source invalidates committed native input hash'
+}
+
 # The OHTTP configuration is installed at runtime, so no build input carries it:
 # the hash needs no configuration helper (the fixture has none) and does not
 # depend on whatever the environment holds.

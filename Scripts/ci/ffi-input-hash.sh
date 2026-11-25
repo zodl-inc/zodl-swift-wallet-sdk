@@ -30,6 +30,6 @@ git -C "$repo" ls-tree -r -z HEAD -- \
     rust Cargo.toml Cargo.lock BuildSupport Makefile .cargo \
     rust-toolchain rust-toolchain.toml \
     Scripts/init-local-ffi.sh Scripts/rebuild-local-ffi.sh \
-    Scripts/version-macos-framework.sh Scripts/prepare-release.sh \
-    Scripts/release.sh Scripts/lib/release-lib.sh Scripts/lib/ffi_layout.py Scripts/ci/ffi-input-hash.sh
+    Scripts/version-macos-framework.sh Scripts/ci/build-release-artifacts.sh \
+    Scripts/lib/ffi_layout.py Scripts/ci/ffi-input-hash.sh
 } | shasum -a 256 | cut -d' ' -f1

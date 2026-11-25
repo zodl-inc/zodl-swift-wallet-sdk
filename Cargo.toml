@@ -21,6 +21,9 @@ orchard = { version = "0.16" }
 # none for Apple's x86-64 targets, so the x86_64 slices stay portable. 0.6.0 has no such feature.
 pasta_curves = { version = "0.6.1", features = ["asm"] }
 ff = "0.14"
+# `zcashlc_voting_derive_round_id` recomputes a vote round id with the same Poseidon (P128Pow5T3,
+# ConstantLength<8>) the vote chain uses. Already in the graph via orchard and zcash_voting.
+halo2_poseidon = "0.2"
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 # The scalar types in the Sapling prover traits, named by `rust/src/sapling_prover.rs`.
 bls12_381 = "0.9"
@@ -159,11 +162,10 @@ hex = "0.4"
 # Shared OHTTP (RFC 9458) client core, sans-IO: the Android, iOS and Slipstream clients run the same
 # key-configuration selection, signed-envelope check, Binary HTTP codec, HPKE sealing and outer
 # status rules. The Swift SDK keeps the I/O (URLSession, Tor) and calls this through the
-# `zcashlc_ohttp_*` C functions. From crates.io, at least 1.0.1, the v1.0.0 release with
-# crates.io metadata. The SDK and Slipstream must take it from the same source: the
-# engine takes the OHTTP configuration as this crate's `OhttpNetworks`, which a second source would
-# make a different type.
-zodl-ohttp-client = { version = "1.0.1", default-features = false }
+# `zcashlc_ohttp_*` C functions. From crates.io, at least 2.1.0. The SDK and Slipstream must take it
+# from the same source: the engine takes the OHTTP configuration as this crate's `OhttpNetworks`,
+# which a second source would make a different type.
+zodl-ohttp-client = { version = "2.1.0", default-features = false }
 
 [dev-dependencies]
 # Authenticated response fixtures exercise the real OHTTP decoder.
@@ -204,7 +206,7 @@ gpu = ["slipstream-core/gpu"]
 # without it the call is ignored. QA/E2E builds only (ohttp-e2e.yml,
 # init-local-ffi.sh / rebuild-local-ffi.sh --trace,
 # make ffi-macos FFI_CARGO_FEATURES=ohttp-trace);
-# release builds (build-ffi.yml, prepare-release.sh) never enable it. It turns on
+# release builds (build-ffi.yml, Scripts/ci/build-release-artifacts.sh) never enable it. It turns on
 # the engine's own `client-trace` feature, so Slipstream OHTTP requests carry the
 # prefix too.
 ohttp-trace = ["slipstream-core/client-trace"]
@@ -270,7 +272,9 @@ zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a
 zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
 zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
 zip321 = { git = "https://github.com/zcash/librustzcash", rev = "9a3ffd33a8cd05be03d3fddceeeb571cb3208b61" }
-zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream", rev = "80f95741896543a22262182ab37a5a05d484d2e7" }
+# zodl-slipstream 0.6.0 with zodl-ohttp-client 2.1.0 and the gateway's third-party host lists, from the
+# private repository until those commits are on the public one. It stays on the librustzcash and Arti of the pins above.
+zodl-slipstream = { git = "https://github.com/zodl-inc/slipstream-internal.git", rev = "2d23dd1fabcd4a0183fad171a46813934968df09" }
 
 # The Ledger tests build the Orchard proving key once, to extract and verify a proof-bearing
 # transaction a device signed. Key generation synthesizes the Orchard circuit, which takes minutes

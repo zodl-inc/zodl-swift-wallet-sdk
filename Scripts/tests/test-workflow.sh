@@ -4,8 +4,9 @@
 # YAML. They exist to pin two properties from Finding 1's fix:
 #
 #   - the workflow accepts a `force` input and reads it into the build step
-#     via `env:`, so `prepare-release.sh build --artifacts ci --rebuild` has
-#     something to forward to;
+#     via `env:`, so a release that reuses an existing draft (the SDK
+#     release skill with the GitHub Actions backend) has something to
+#     forward to;
 #   - no `${{ }}` expression is interpolated directly into a `run:` script.
 #     Template injection into `run:` is exactly what this repository's
 #     zizmor lint flags; every workflow input must instead flow in through

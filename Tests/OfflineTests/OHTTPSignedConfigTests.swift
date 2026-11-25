@@ -86,10 +86,10 @@ final class OHTTPSignedConfigTests: XCTestCase {
     func testWrongNetworkFails() throws {
         let mainnetEnvelope = envelope(network: "mainnet", keyId: Self.mainnetKeyId)
         let forTestnet = try XCTUnwrap(failure(of: mainnetEnvelope))
-        XCTAssertTrue(forTestnet.contains("signed for mainnet, not testnet"), forTestnet)
+        XCTAssertTrue(forTestnet.contains("signed for another network, not testnet"), forTestnet)
 
         let forMainnet = try XCTUnwrap(failure(of: envelope(), host: Self.mainnetHost))
-        XCTAssertTrue(forMainnet.contains("signed for testnet, not mainnet"), forMainnet)
+        XCTAssertTrue(forMainnet.contains("signed for another network, not mainnet"), forMainnet)
     }
 
     func testExpiredConfigFails() throws {
@@ -130,7 +130,10 @@ final class OHTTPSignedConfigTests: XCTestCase {
             let firstDigit = try XCTUnwrap(expectedId.first)
             let mismatchedId = "\(firstDigit == "0" ? "1" : "0")\(expectedId.dropFirst())"
             let message = try XCTUnwrap(failure(of: envelope(network: network, keyId: mismatchedId), host: host))
-            XCTAssertTrue(message.contains("signed by key \(mismatchedId), not \(expectedId)"), message)
+            XCTAssertTrue(message.contains("signed by another key"), message)
+            // Neither key id is quoted: the envelope's is the relay's text, the pinned one names the deployment.
+            XCTAssertFalse(message.contains(mismatchedId), message)
+            XCTAssertFalse(message.contains(expectedId), message)
         }
     }
 
@@ -163,9 +166,9 @@ final class OHTTPSignedConfigTests: XCTestCase {
     func testSignedConfigRejectsWrongNetwork() throws {
         // A testnet envelope is refused for the mainnet gateway and the other way round, whatever its key id.
         let testnetForMainnet = try XCTUnwrap(failure(of: envelope(), host: Self.mainnetHost))
-        XCTAssertTrue(testnetForMainnet.contains("signed for testnet, not mainnet"), testnetForMainnet)
+        XCTAssertTrue(testnetForMainnet.contains("signed for another network, not mainnet"), testnetForMainnet)
         let mainnetForTestnet = try XCTUnwrap(failure(of: envelope(network: "mainnet", keyId: Self.mainnetKeyId)))
-        XCTAssertTrue(mainnetForTestnet.contains("signed for mainnet, not testnet"), mainnetForTestnet)
+        XCTAssertTrue(mainnetForTestnet.contains("signed for another network, not testnet"), mainnetForTestnet)
     }
 
     // MARK: - Envelope fields
@@ -273,7 +276,7 @@ final class OHTTPSignedConfigTests: XCTestCase {
             XCTAssertFalse(own.contains("signed for"), "\(host): \(own)")
             // ... and one for the other network does not.
             let other = try XCTUnwrap(failure(of: envelope(network: otherNetwork), host: host), host)
-            XCTAssertTrue(other.contains("signed for \(otherNetwork), not \(network)"), "\(host): \(other)")
+            XCTAssertTrue(other.contains("signed for another network, not \(network)"), "\(host): \(other)")
         }
 
         // Unknown hosts have no configured network and would be rejected by the native layer

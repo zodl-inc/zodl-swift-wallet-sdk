@@ -3595,65 +3595,82 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    /// Makes an HTTP request through the OHTTP relay and gateway, inside the route admission: a Tor switch
+    /// waits for it to end, and a switch in progress refuses it.
+    ///
+    /// A passthrough host is admitted by the gateway's host list before anything is sent for it. The list is
+    /// fetched only through OHTTP, on this request's own route (over Tor when the request rides Tor), and a
+    /// host it does not carry is refused with `ZcashError.ohttpUnsupportedHost`: nothing is reached directly.
     public func httpRequestOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> (data: Data, response: HTTPURLResponse) {
         return try await routeAdmission.withLease {
-            // The hosts the gateway serves over HTTP: its aliases (gateway-injected credentials), the
-            // allowlisted passthrough hosts (vote servers learned at run time, kept under their own name)
-            // and the path-restricted voting-config mirror.
-            guard let host = request.url?.host,
-                  OHTTPEndpoints.isGateway(host) || OHTTPEndpoints.isAliasHost(host)
-                    || OHTTPEndpoints.isProxyAllowlisted(host: host)
-                    || OHTTPEndpoints.isPathRestrictedProxyURL(request.url!) else {
+            let network = initializer.network.networkType
+            guard let url = request.url, let host = url.host else {
                 throw ZcashError.ohttpUnsupportedHost
             }
-            let route = try OHTTPEndpoints.proxyRoute(for: host, network: initializer.network.networkType)
+            // A host that is not a fixed destination needs the list of the wallet's gateway, so OHTTP on for it.
+            guard OHTTPThirdPartyHosts.isFixedDestination(url, host: host) || OHTTPEndpoints.gatewayHost(for: network) != nil else {
+                throw ZcashError.ohttpUnsupportedHost
+            }
+            let route = try OHTTPEndpoints.proxyRoute(for: host, network: network)
             // Tor mode puts every relay leg on Tor, whatever the caller asked for.
             let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
-            let viaTor = viaTor || torMode
-
-            // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
-            let httpSender: OHTTPTransport.HTTPSender
-            if viaTor {
-                // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
-                // tried again, on a new circuit, only when it failed before any of it was sent.
-                httpSender = { [weak self] request, maxBytes in
-                    guard let self else { throw ZcashError.ohttpTransportError }
-                    return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
-                }
-            } else {
-                httpSender = { request, maxBytes in
-                    // S4: use boundedDataWithDeadline for 100s timeout
-                    let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
-                        for: request,
-                        maxBytes: maxBytes
-                    )
-                    guard let httpResponse = response as? HTTPURLResponse else {
-                        throw OHTTPError.transportError("Invalid response type")
-                    }
-                    return (data, httpResponse)
-                }
-            }
-
-            let transport = OHTTPTransport(
-                gatewayHost: route.gatewayHost,
-                relayURL: route.relayURL,
-                clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
-                walletNetwork: initializer.network.networkType,
-                viaTor: viaTor,
-                httpSender: httpSender
-            )
+            let transport = externalOHTTPTransport(route: route, viaTor: viaTor || torMode)
             // The inner request: the caller's fields without the connection's own, the alias credentials the
             // gateway injects stripped, the body read out of its stream when it has one.
             let bhttp = try OHTTPExternalHTTP.innerRequest(for: request)
+            // The list is refreshed over this transport, so on the request's own route and inside this lease.
+            try await OHTTPThirdPartyHosts.admit(
+                url: url,
+                host: host,
+                network: network,
+                exchange: OHTTPThirdPartyHosts.exchange(through: transport, timeoutMS: OHTTPThirdPartyHosts.admissionRefreshTimeoutMS)
+            )
             let response = try await transport.roundTrip(request: bhttp, timeoutMS: 30_000)
+            OHTTPThirdPartyHosts.noteAnswer(status: response.status, body: response.body, host: host, network: network)
             guard let httpResp = HTTPURLResponse(
-                url: request.url!,
+                url: url,
                 statusCode: response.status,
                 httpVersion: "HTTP/1.1",
                 headerFields: Dictionary(response.headers, uniquingKeysWith: { $1 })
             ) else { throw ZcashError.ohttpResponseError }
             return (response.body, httpResp)
         }
+    }
+
+    /// The transport of an HTTP request to a host the gateway serves, on `route`. With `viaTor` the relay POST
+    /// and the key-configuration GET ride Tor circuits; otherwise they go to the relay on clearnet.
+    private func externalOHTTPTransport(route: (gatewayHost: String, relayURL: String), viaTor: Bool) -> OHTTPTransport {
+        // Pluggable sender: when viaTor is true, the relay POST (and key-config GET) ride Tor circuits.
+        let httpSender: OHTTPTransport.HTTPSender
+        if viaTor {
+            // C-08: a sealed request is never resent (the gateway answers a repeated nonce with 409); it is
+            // tried again, on a new circuit, only when it failed before any of it was sent.
+            httpSender = { [weak self] request, maxBytes in
+                guard let self else { throw ZcashError.ohttpTransportError }
+                return try await self.httpTorClient().isolatedClient().httpRequestSentOnce(for: request, maxBytes: maxBytes)
+            }
+        } else {
+            httpSender = { request, maxBytes in
+                // S4: use boundedDataWithDeadline for 100s timeout
+                let (data, response) = try await OHTTPTransport.boundedDataWithDeadline(
+                    for: request,
+                    maxBytes: maxBytes
+                )
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OHTTPError.transportError("Invalid response type")
+                }
+                return (data, httpResponse)
+            }
+        }
+
+        return OHTTPTransport(
+            gatewayHost: route.gatewayHost,
+            relayURL: route.relayURL,
+            clientTraceIdPrefix: OHTTPEndpoints.effectiveClientTraceIdPrefix,
+            walletNetwork: initializer.network.networkType,
+            viaTor: viaTor,
+            httpSender: httpSender
+        )
     }
 
     public func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse {
@@ -3685,6 +3702,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// rather than taking the protocol default's blanket refusal — the same gate and the same
     /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
     /// the session, and the crate takes an isolated client of its own while doing so.
+    ///
+    /// A direct session to the predefined servers with OHTTP on for the wallet's network keeps only the servers
+    /// the gateway carries: a passthrough host is admitted by the gateway's host list. That list is refreshed
+    /// first, fetched only through OHTTP on the route the wallet's HTTP requests take (over Tor in Tor mode),
+    /// inside the route admission; when the refresh fails, or a Tor switch is in progress, the list held is
+    /// used. Nothing is reached directly for it.
     public func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
@@ -3695,6 +3718,22 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     ) async throws -> VotingRoundSession {
         switch route {
         case .direct:
+            // A Tor switch in progress refuses the lease: the refresh is skipped and the session opens on the
+            // list held.
+            try? await routeAdmission.withLease {
+                let network = initializer.network.networkType
+                if OHTTPThirdPartyHosts.refreshesBeforeSessionOpen(route: route, isCustomServer: isCustomServer, network: network),
+                   let gateway = OHTTPEndpoints.gatewayHost(for: network),
+                   let proxy = try? OHTTPEndpoints.proxyRoute(for: gateway, network: network) {
+                    // Tor mode puts the refresh on Tor, as it does every relay leg of the HTTP requests.
+                    let torMode = await initializer.container.resolve(SDKFlags.self).torEnabled
+                    let transport = externalOHTTPTransport(route: proxy, viaTor: torMode)
+                    await OHTTPThirdPartyHosts.refresh(
+                        network: network,
+                        exchange: OHTTPThirdPartyHosts.exchange(through: transport, timeoutMS: OHTTPThirdPartyHosts.sessionRefreshTimeoutMS)
+                    )
+                }
+            }
             return try backend.makeSession(
                 inputs: inputs,
                 binding: binding,

@@ -189,12 +189,19 @@ final class OHTTPNativeTests: XCTestCase {
         XCTAssertEqual(info.postHeaders.map { "\($0.name): \($0.value)" }, [
             "Content-Type: message/ohttp-chunked-req",
             "Accept: message/ohttp-chunked-res",
-            "Accept-Encoding: identity"
+            "Accept-Encoding: identity",
+            "Accept-Language: en",
+            "User-Agent: zodl-ohttp/1"
         ])
-        XCTAssertEqual(info.keyFetchHeaders.map { "\($0.name): \($0.value)" }, ["Accept: application/ohttp-keys"])
+        XCTAssertEqual(info.keyFetchHeaders.map { "\($0.name): \($0.value)" }, [
+            "Accept: application/json",
+            "Accept-Encoding: identity",
+            "Accept-Language: en",
+            "User-Agent: zodl-ohttp/1"
+        ])
         XCTAssertEqual(info.cacheRefreshMarginSecs, 0)
         XCTAssertTrue(info.dropBeforeRefetch)
-        XCTAssertTrue(info.traceOnKeyFetch)
+        XCTAssertFalse(info.traceOnKeyFetch)
     }
 
     func testAKeyIsFreshUntilItsNotAfter() throws {
@@ -309,7 +316,7 @@ final class OHTTPNativeTests: XCTestCase {
         }
     }
 
-    func testTheRefusalDetailIsCutAtTwoHundredBytes() throws {
+    func testTheRefusalDetailIsCutAtOneHundredTwentyCharacters() throws {
         let sealed = try OHTTPNative.encapsulate(key: makeKey(), request: makeRequest())
 
         let completed = try sealed.pending.complete(status: 500, contentType: nil, body: Data(repeating: 0x61, count: 500), attempt: 0)
@@ -317,7 +324,7 @@ final class OHTTPNativeTests: XCTestCase {
         guard case .refused(_, let detail) = completed else {
             return XCTFail("Expected refused, got \(completed)")
         }
-        XCTAssertEqual(detail.utf8.count, 200)
+        XCTAssertEqual(detail.utf8.count, 120)
     }
 
     func testAnUnusedHandleIsReleasedWithoutCompleting() throws {

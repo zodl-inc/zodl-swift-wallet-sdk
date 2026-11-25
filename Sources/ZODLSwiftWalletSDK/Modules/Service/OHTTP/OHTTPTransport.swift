@@ -340,8 +340,9 @@ actor OHTTPTransport {
         return lease.session.configuration
     }
 
-    /// Fixed relay-facing `User-Agent` and `Accept-Language`, so URLSession does not add the app's name
-    /// and build, the CFNetwork and Darwin versions, or the device locale.
+    /// Fixed `User-Agent` and `Accept-Language` of a DoH query, so URLSession does not add the app's name
+    /// and build, the CFNetwork and Darwin versions, or the device locale. The relay requests take theirs
+    /// from the core's profile lists, which carry the same two values.
     internal static let fixedRelayHeaders: [(name: String, value: String)] = [
         ("User-Agent", OHTTPRelayHeaders.userAgent),
         ("Accept-Language", "en")
@@ -716,9 +717,6 @@ actor OHTTPTransport {
         for (name, value) in profile.keyFetchHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
-        for (name, value) in Self.fixedRelayHeaders {
-            request.setValue(value, forHTTPHeaderField: name)
-        }
 
         if profile.traceOnKeyFetch, let prefix = clientTraceIdPrefix {
             let traceId = generateClientTraceId(prefix: prefix)
@@ -747,8 +745,8 @@ actor OHTTPTransport {
         return (data, response)
     }
 
-    /// The relay POST of a sealed request: the profile's headers, the fixed relay-facing ones and, in a
-    /// debug build with a prefix set, a trace id.
+    /// The relay POST of a sealed request: the profile's headers (the fixed `User-Agent` and
+    /// `Accept-Language` among them) and, in a debug build with a prefix set, a trace id.
     func relayPost(url: String, body: Data, timeoutMS: Int) throws -> URLRequest {
         // Validate https at request time to prevent downgrade attacks without crashing the app
         guard url.lowercased().hasPrefix("https://") else {
@@ -765,10 +763,6 @@ actor OHTTPTransport {
         request.httpBody = body
 
         for (name, value) in profile.postHeaders {
-            request.setValue(value, forHTTPHeaderField: name)
-        }
-
-        for (name, value) in Self.fixedRelayHeaders {
             request.setValue(value, forHTTPHeaderField: name)
         }
 

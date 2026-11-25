@@ -341,9 +341,10 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// - `nil`, `isCustomServer == false` (predefined servers) and an OHTTP
     ///   configuration for the wallet's network (`OHTTPEndpoints.configure(_:)`):
     ///   OHTTP through the relay and gateway, so no vote or PIR server sees the
-    ///   voter's address. Fails closed: when any chain or PIR endpoint is not one
-    ///   the gateway carries, opening throws ``VotingError`` with
-    ///   ``VotingErrorKind/invalidInput``, and nothing falls back to a direct
+    ///   voter's address. The session leaves out the chain and PIR endpoints the
+    ///   gateway does not carry. Fails closed: opening throws ``VotingError`` with
+    ///   ``VotingErrorKind/invalidInput`` only when none of the chain endpoints or
+    ///   none of the PIR endpoints is left, and nothing falls back to a direct
     ///   connection when the gateway is unavailable. The session keeps the
     ///   configuration installed when it opened.
     /// - `nil`, `isCustomServer == false` and no OHTTP configuration for the
@@ -521,6 +522,56 @@ extension VotingRustBackend {
         try readingBytes(fallback: "`extract_nc_root` failed") {
             treeState.withUnsafeBufferPointer { buf in
                 zcashlc_voting_extract_nc_root(buf.baseAddress, UInt(buf.count))
+            }
+        }
+    }
+
+    /// Recompute a vote round id the way the vote chain derives it.
+    ///
+    /// The id is a Poseidon hash over the round's creation height, snapshot
+    /// blockhash, proposals hash, vote end time, nullifier IMT root and note
+    /// commitment root. A wallet compares the result with the round id a vote
+    /// server reported, so a server cannot show different ballot content under
+    /// a signed round id.
+    ///
+    /// Stateless. The three hashes and both roots are 32 bytes; the roots must
+    /// be canonical Pallas field elements.
+    ///
+    /// Pass `snapshotBlockhash` as the vote chain reports it (display order), not
+    /// in the internal byte order of a lightwalletd `BlockID`; the other byte
+    /// order derives a different id and every round would be rejected.
+    ///
+    /// - Returns: The 32-byte round id.
+    /// - Throws: When an argument has the wrong length or a root is not a
+    ///   canonical field element.
+    public static func deriveRoundId(
+        createdAtHeight: UInt64,
+        snapshotBlockhash: [UInt8],
+        proposalsHash: [UInt8],
+        voteEndTime: UInt64,
+        nullifierImtRoot: [UInt8],
+        ncRoot: [UInt8]
+    ) throws -> [UInt8] {
+        try readingBytes(fallback: "`derive_round_id` failed") {
+            snapshotBlockhash.withUnsafeBufferPointer { blockhash in
+                proposalsHash.withUnsafeBufferPointer { proposals in
+                    nullifierImtRoot.withUnsafeBufferPointer { nullifierRoot in
+                        ncRoot.withUnsafeBufferPointer { commitmentRoot in
+                            zcashlc_voting_derive_round_id(
+                                createdAtHeight,
+                                blockhash.baseAddress,
+                                UInt(blockhash.count),
+                                proposals.baseAddress,
+                                UInt(proposals.count),
+                                voteEndTime,
+                                nullifierRoot.baseAddress,
+                                UInt(nullifierRoot.count),
+                                commitmentRoot.baseAddress,
+                                UInt(commitmentRoot.count)
+                            )
+                        }
+                    }
+                }
             }
         }
     }

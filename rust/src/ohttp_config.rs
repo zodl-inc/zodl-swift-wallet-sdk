@@ -7,6 +7,9 @@
 //! Tor (`tor.rs`), each start of the Slipstream engine and the provisioning anchor (`lib.rs`), and
 //! each voting session as it opens (`voting/route.rs`).
 //!
+//! The gateway host lists ([`installed_third_party_hosts`]) are kept with the configuration: a
+//! new configuration forgets them, and its lists start from the compiled bootstrap list.
+//!
 //! Until a configuration is installed, and for a network passed as null, OHTTP is off: no host is
 //! that network's gateway, so its servers are plain servers.
 
@@ -15,26 +18,63 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use anyhow::anyhow;
 use ffi_helpers::panic::catch_panic;
+use slipstream_core::ohttp::ThirdPartyHostLists;
 use zodl_ohttp_client::{ConfigField, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks};
 
 use crate::unwrap_exc_or;
 
-/// The installed configuration. A new one replaces it whole and none is edited in place, so a
-/// reader that keeps the `Arc` keeps one complete configuration.
-static INSTALLED: LazyLock<RwLock<Arc<OhttpNetworks>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(OhttpNetworks::default())));
+/// The installed configuration together with the gateway host lists that belong to it.
+#[derive(Clone)]
+struct Installed {
+    networks: Arc<OhttpNetworks>,
+    hosts: Arc<ThirdPartyHostLists>,
+}
+
+impl Installed {
+    /// The pair for `networks`, whose host lists start from the compiled bootstrap list.
+    fn new(networks: OhttpNetworks) -> Self {
+        let networks = Arc::new(networks);
+        let hosts = Arc::new(ThirdPartyHostLists::new(
+            Arc::clone(&networks),
+            crate::ohttp_hosts::BOOTSTRAP_THIRD_PARTY_HOSTS,
+        ));
+        Self { networks, hosts }
+    }
+}
+
+/// The installed configuration and its host lists. A new pair replaces it whole and none is
+/// edited in place, so a reader that keeps an `Arc` keeps one complete configuration.
+static INSTALLED: LazyLock<RwLock<Installed>> =
+    LazyLock::new(|| RwLock::new(Installed::new(OhttpNetworks::default())));
 
 /// The configuration installed now; both networks are off until [`zcashlc_ohttp_configure`]
 /// succeeds. A caller that looks up more than one thing reads it once and keeps the `Arc`, so
 /// that its lookups agree with each other even if the app installs another configuration
 /// meanwhile.
 pub(crate) fn installed_networks() -> Arc<OhttpNetworks> {
-    Arc::clone(&INSTALLED.read().unwrap_or_else(PoisonError::into_inner))
+    Arc::clone(
+        &INSTALLED
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .networks,
+    )
 }
 
-/// Replaces the installed configuration with `networks`.
+/// The gateway host lists installed now, which belong to the configuration of
+/// [`installed_networks`] (`networks()` of the lists is that very `Arc`). Installing another
+/// configuration forgets the lists: the new ones start from the bootstrap list again.
+pub(crate) fn installed_third_party_hosts() -> Arc<ThirdPartyHostLists> {
+    Arc::clone(
+        &INSTALLED
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .hosts,
+    )
+}
+
+/// Replaces the installed configuration with `networks`, and the host lists with new ones.
 fn install(networks: OhttpNetworks) {
-    *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(networks);
+    *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = Installed::new(networks);
 }
 
 /// The OHTTP configuration of one network, as [`zcashlc_ohttp_configure`] takes it: four UTF-8
@@ -181,12 +221,12 @@ unsafe fn value<'a>(
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Exclusive use of the installed configuration for one test, with the configuration installed
-/// before put back when the test ends.
+/// before (and its host lists) put back when the test ends.
 #[cfg(test)]
 pub(crate) struct InstalledNetworksGuard {
     /// Held for the guard's lifetime; dropped after [`Drop::drop`] restores.
     _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Arc<OhttpNetworks>,
+    previous: Installed,
 }
 
 #[cfg(test)]
@@ -194,7 +234,7 @@ impl Drop for InstalledNetworksGuard {
     fn drop(&mut self) {
         // Restored after a failed test too, so that the tests that run afterwards do not inherit
         // its configuration.
-        *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&self.previous);
+        *INSTALLED.write().unwrap_or_else(PoisonError::into_inner) = self.previous.clone();
     }
 }
 
@@ -205,7 +245,10 @@ pub(crate) fn lock_installed_networks() -> InstalledNetworksGuard {
     let lock = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     InstalledNetworksGuard {
         _lock: lock,
-        previous: installed_networks(),
+        previous: INSTALLED
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
     }
 }
 
@@ -257,6 +300,31 @@ mod tests {
 
     use super::*;
     use crate::{zcashlc_clear_last_error, zcashlc_error_message_utf8, zcashlc_last_error_length};
+
+    #[test]
+    fn the_installed_lists_follow_the_installed_configuration() {
+        use slipstream_core::ohttp::NetworkType;
+        let _guard = lock_installed_networks();
+        install_for_test(OhttpNetworks::default());
+        let off = installed_third_party_hosts();
+        assert!(off.hosts(NetworkType::Main).is_none());
+        assert!(off.hosts(NetworkType::Test).is_none());
+
+        install_for_test(example::networks());
+        let lists = installed_third_party_hosts();
+        assert!(Arc::ptr_eq(lists.networks(), &installed_networks()));
+        for network in [NetworkType::Main, NetworkType::Test] {
+            let hosts = lists.hosts(network).expect("configured");
+            assert_eq!(
+                hosts.bootstrap_len(),
+                crate::ohttp_hosts::BOOTSTRAP_THIRD_PARTY_HOSTS.len()
+            );
+        }
+
+        // Another configuration starts from the bootstrap list again, in new lists.
+        install_for_test(example::networks());
+        assert!(!Arc::ptr_eq(&lists, &installed_third_party_hosts()));
+    }
 
     /// `params` as the C caller passes them: each value a pointer to its bytes and their length.
     fn ffi(params: &OhttpConfigParams<'_>) -> FfiOhttpNetworkConfigV1 {

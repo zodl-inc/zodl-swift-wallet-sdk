@@ -844,8 +844,11 @@ public protocol Synchronizer: AnyObject {
     ) async throws -> (data: Data, response: HTTPURLResponse)
 
     /// Makes an HTTP request through the OHTTP relay→gateway, hiding the client IP from the
-    /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`).
-    /// While OHTTP is off for the wallet's network (see `OHTTPEndpoints.configure(_:)`) the request
+    /// destination. The request URL must use a hostname in OHTTPEndpoints (e.g. `cmc.zodl.com`),
+    /// or a passthrough host the gateway's list carries. That list is refreshed first when it is due,
+    /// through OHTTP on this request's own route (Tor in Tor mode), so the call may wait for one
+    /// refresh. A host the list does not carry is refused with `ohttpUnsupportedHost` and never
+    /// reached directly. While OHTTP is off for the wallet's network (see `OHTTPEndpoints.configure(_:)`) the request
     /// fails; it never goes out directly.
     ///
     /// - Parameters:
@@ -860,6 +863,9 @@ public protocol Synchronizer: AnyObject {
     /// server-sent event stream comes out event by event). The body throws if the gateway's answer breaks
     /// off before its end. In Tor mode the relay leg rides Tor whatever `viaTor` says.
     /// `request.timeoutInterval` bounds each wait for the relay, not the whole answer.
+    /// A passthrough host is admitted by the gateway's list as for ``httpRequestOverOHTTP(for:viaTor:)``:
+    /// refreshed on this request's own route, and a host it does not carry is refused with
+    /// `ohttpUnsupportedHost`.
     func httpStreamOverOHTTP(for request: URLRequest, viaTor: Bool) async throws -> OHTTPStreamedResponse
 
     // swiftlint:disable function_parameter_count
@@ -871,7 +877,10 @@ public protocol Synchronizer: AnyObject {
     /// round over plain HTTP. The Tor runtime stays owned by the synchronizer,
     /// and is lent to the crate for the duration of this call.
     ///
-    /// Opening the session reaches no network. Both shipped synchronizers
+    /// Opening the session reaches no network, with one exception: a `.direct`
+    /// open of the predefined servers with OHTTP on may first refresh the
+    /// gateway's host list through OHTTP on the same route (Tor in Tor mode),
+    /// and a failed refresh does not fail the open. Both shipped synchronizers
     /// bootstrap their Tor client while `tor(enabled:)` runs, so by the time a
     /// round session is opened that client is already up. A conformer that
     /// instead defers the bootstrap until the runtime is first needed pays for
@@ -895,10 +904,11 @@ public protocol Synchronizer: AnyObject {
     ///      `.direct`, where it decides between the clearnet-side routes. `false`
     ///      (predefined servers) depends on the OHTTP configuration
     ///      (`OHTTPEndpoints.configure(_:)`): with one for the wallet's network, the
-    ///      session rides OHTTP through the relay and gateway and fails closed,
-    ///      throwing ``VotingErrorKind/invalidInput`` when a chain or PIR endpoint is
-    ///      not one the gateway carries and never falling back to a direct connection
-    ///      when the gateway is unavailable; with no configuration for that network,
+    ///      session rides OHTTP through the relay and gateway, leaves out the chain and
+    ///      PIR endpoints the gateway does not carry, and fails closed, throwing
+    ///      ``VotingErrorKind/invalidInput`` only when none of the chain endpoints or
+    ///      none of the PIR endpoints is left, and never falling back to a direct
+    ///      connection when the gateway is unavailable; with no configuration for that network,
     ///      the servers are reached on a plain direct connection. `true` (custom
     ///      servers) always opens it on a plain direct connection. On `.tor` it has
     ///      no effect: Tor reaches the servers directly either way, configured or not.
