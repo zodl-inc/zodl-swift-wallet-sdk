@@ -137,6 +137,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // changes the VISIBLE list with no engine write — is host-observed. Together with the
     // version compare this is the WHOLE emission rule.
     private var lastRevealRecovering = false
+    // The fully scanned height the last read was taken at, and whether that read held a
+    // transaction a later scan can still change (unmined, not yet expired). A scan that records
+    // the mined height of a stored send bumps no `txSetVersion`, so the tick also re-reads when the
+    // scan advances past the last read while such a row exists (`needsTransactionReadOnScanAdvance`).
+    private var lastReadScannedHeight: BlockHeight = 0
+    private var lastReadHadUnexpiredUnmined = false
 
     // [v2.1 Phase 2] The F2 boundary-refresh mirror and the [#1591] chain-tip-flag parity
     // machinery are GONE: the engine refreshes the unified summary at its own boundaries
@@ -1141,11 +1147,24 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // Reading first and re-validating with `isCurrent()` after means a wipe in that window is
         // caught before either the mirrors move or anything is emitted; the version comparison
         // below still alone decides whether this tick has anything to report.
-        if snap.txSetVersion != lastTxSetVersion || recovering != lastRevealRecovering {
+        // The third edge is the scan itself: the block that mines a send the wallet already stores
+        // only sets its mined height, which bumps no version, and a send that is never mined expires
+        // only as the scan passes its expiry height. Both change the published states, so the rows
+        // are read again when the fully scanned height has moved past the last read while that read
+        // still held an unmined, unexpired transaction.
+        let fullyScannedHeight = latestState.fullyScannedHeight
+        let scanAdvanced = Self.needsTransactionReadOnScanAdvance(
+            lastReadHadUnexpiredUnmined: lastReadHadUnexpiredUnmined,
+            lastReadScannedHeight: lastReadScannedHeight,
+            fullyScannedHeight: fullyScannedHeight
+        )
+        if snap.txSetVersion != lastTxSetVersion || recovering != lastRevealRecovering || scanAdvanced {
             let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
             guard isCurrent() else { return }
             lastTxSetVersion = snap.txSetVersion
             lastRevealRecovering = recovering
+            lastReadScannedHeight = fullyScannedHeight
+            lastReadHadUnexpiredUnmined = Self.hasUnexpiredUnmined(txs)
             eventSubject.send(.foundTransactions(txs, nil))
         }
     }
@@ -1314,6 +1333,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // otherwise the first tick of the new pass reads the reset `txSetVersion` as "unchanged".
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // Re-arm the log and the handle-lifetime clamp for the new pass, but KEEP the recovery
         // budget: it is what bounds this very restart, and a full re-arm would clear it.
         resetStallWatchdog(resetRecoveryBudget: false)
@@ -1623,12 +1645,20 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// A named result type rather than a tuple — SwiftLint's `large_tuple` caps tuples at 2
     /// members — but every call site's `.visible` / `.local` / `.isSpendableMasked` member access
     /// reads identically either way.
-    private func walletBalanceSnapshots() async -> WalletBalanceSnapshots {
+    ///
+    /// `includeLocal: false` skips the local snapshot for callers that only read `visible`. The local
+    /// read is a full, uncached `get_wallet_summary` walk of the wallet database, which takes seconds
+    /// on a wallet with a long history, so a caller that discards it must not pay for it.
+    private func walletBalanceSnapshots(includeLocal: Bool = true) async -> WalletBalanceSnapshots {
         // [MOB-1850] The policy is spelled out for the same reason the drain capacity is: it is the
         // concrete engine's own default, restated because a protocol requirement cannot carry one.
         let summary = await engine.walletSummary(confirmationsPolicy: ConfirmationsPolicy.defaultTransferPolicy())
-        let provider = initializer.rustBackend as? LocalBalanceProviding
-        let local = try? await provider?.getLocalAccountBalances()
+        let local: [AccountUUID: AccountBalance]?
+        if includeLocal, let provider = initializer.rustBackend as? LocalBalanceProviding {
+            local = try? await sharedLocalAccountBalances(provider: provider)
+        } else {
+            local = nil
+        }
         guard let summary else {
             return WalletBalanceSnapshots(visible: nil, local: local, isSpendableMasked: nil)
         }
@@ -1645,14 +1675,64 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // [v2.1 Phase 2] ONE call, correct at every phase: the engine resolves recovery
         // (Σ-reconciled view values) vs normal (upstream passthrough) inside the unified
         // summary FFI and rations the expensive walk itself — no host-side branching.
-        let summaries = await walletBalanceSnapshots()
+        // Only `visible` is returned, so the local snapshot is not read at all.
+        let summaries = await walletBalanceSnapshots(includeLocal: false)
         return summaries.visible?.accountBalances ?? [:]
     }
 
     public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
         guard latestState.internalSyncStatus.isPrepared else { return nil }
         guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
-        return try await provider.getLocalAccountBalances()
+        return try await sharedLocalAccountBalances(provider: provider)
+    }
+
+    /// The local-balance read that is in flight, shared by every caller that arrives while it runs.
+    private var inFlightLocalAccountBalances: Task<Result<[AccountUUID: AccountBalance], Error>, Never>?
+
+    /// Reads the local balances once for all concurrent callers.
+    ///
+    /// The read is a blocking `get_wallet_summary` FFI call that takes seconds on a wallet with a
+    /// long history. When the app returns to the foreground, the poll tick and several features ask
+    /// for balances at once. Each used to start its own walk, and while the walks ran on the
+    /// cooperative pool they filled it and stalled all other Swift work until they finished. The
+    /// backend now runs the walk on a GCD thread, but concurrent walks still contend for the same
+    /// database, so a caller that arrives while a read is running waits for that read instead and at
+    /// most one walk runs at a time. Every waiter receives the same result or the same error.
+    /// Cancelling a caller does not cancel the read or affect the other waiters, because the read
+    /// is an unstructured task that the FFI call cannot interrupt anyway. A read is shared only with
+    /// callers that arrive before the wallet next changes: see `forgetSharedLocalBalanceRead()`.
+    private func sharedLocalAccountBalances(
+        provider: LocalBalanceProviding
+    ) async throws -> [AccountUUID: AccountBalance] {
+        if let inFlight = inFlightLocalAccountBalances {
+            return try await inFlight.value.get()
+        }
+        let read = Task<Result<[AccountUUID: AccountBalance], Error>, Never> {
+            do {
+                return .success(try await provider.getLocalAccountBalances())
+            } catch {
+                return .failure(error)
+            }
+        }
+        inFlightLocalAccountBalances = read
+        let result = await read.value
+        // The actor may have started a newer read while this one was awaited; only clear our own.
+        if inFlightLocalAccountBalances == read {
+            inFlightLocalAccountBalances = nil
+        }
+        return try result.get()
+    }
+
+    /// Stops sharing the local-balance read that is running, once a wallet change has landed.
+    ///
+    /// A read that began before a wipe, rewind, account import or account deletion reports the
+    /// wallet as it was, so a caller that arrives after the change must start a read of its own
+    /// instead of joining that one. The restarted pass and `prepare()` are such callers. Call this
+    /// after the change and before the pass restarts, on the failure path too, since a failed
+    /// change may have written part of it. Callers already waiting on the old read still receive its
+    /// result, and the read's creator only clears the slot if it still holds its own read.
+    private func forgetSharedLocalBalanceRead() {
+        inFlightLocalAccountBalances = nil
     }
 
     public func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
@@ -1795,7 +1875,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 name: request.name,
                 keySource: request.keySource
             )
+            forgetSharedLocalBalanceRead()
         } catch {
+            forgetSharedLocalBalanceRead()
             // A failed import must not leave the engine dead. The import's own error is what the
             // caller gets; a restart that fails on top of it is reported on the state stream, the
             // same way the success path below reports it, so the host never keeps seeing
@@ -1877,6 +1959,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
 
         do {
             try await initializer.rustBackend.deleteAccount(accountUUID)
+            forgetSharedLocalBalanceRead()
             // `delete_account` removes the account's transactions — bump `tx_set_version`
             // (tag-5 poke) so hosts re-fetch and Activity drops the dead rows on the next tick.
             await engine.notifyTxChange()
@@ -1888,6 +1971,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 }
             }
         } catch {
+            forgetSharedLocalBalanceRead()
             // A failed delete must not leave the engine dead either — mirrors importAccount's
             // catch-restart and rewind's restart-on-both-outcomes, which this path lacked.
             if wasRunning {
@@ -2235,10 +2319,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// leaves `state == nil`, so without this Zashi maps an INCOMING tx via
     /// `transaction.state == .pending` → `nil == .pending` → false → ".received" — a 0-conf
     /// mempool tx then wrongly shows "received" instead of "receiving". Pure mapping lives in
-    /// `transactionsWithState`; here we just resolve the current chain height it needs.
+    /// `transactionsWithState`; here we just resolve the heights it needs: the chain tip for
+    /// confirmations, and the fully scanned height for expiry. The engine reports that height
+    /// through the wallet summary, so before the first summary it is 0 and no unmined transaction
+    /// is expired, which is the right answer for a wallet that has not told us what it scanned.
     private func enhanceWithState(_ raw: [ZcashTransaction.Overview]) async -> [ZcashTransaction.Overview] {
         let tip = latestState.latestBlockHeight
-        return Self.transactionsWithState(raw, currentHeight: tip != 0 ? tip : ((try? await initializer.rustBackend.maxScannedHeight()) ?? .zero))
+        let currentHeight = tip != 0 ? tip : ((try? await initializer.rustBackend.maxScannedHeight()) ?? .zero)
+        return Self.transactionsWithState(raw, currentHeight: currentHeight, scannedHeight: latestState.fullyScannedHeight)
     }
 
     public func getMemos(for rawID: Data) async throws -> [Memo] {
@@ -2454,6 +2542,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
                 let checkpoint = checkpointSource.birthday(for: currentHeight)
                 try await initializer.rustBackend.truncateToChainState(chainState: checkpoint.treeState())
             }
+            forgetSharedLocalBalanceRead()
             // [audit SDK-5 → E-3] No host cache to reset after a truncate: the summary is
             // engine-served per call (E-1). Engine COUNTERS are NOT reset here on purpose:
             // the handle survives a rewind, so `enhancedTxs`/`rangesCompleted` stay monotonic
@@ -2468,6 +2557,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             }
             subject.send(completion: .finished)
         } catch {
+            forgetSharedLocalBalanceRead()
             if wasRunning {
                 do {
                     try await startImpl(retry: false, resetRecoveryBudget: true)
@@ -2554,6 +2644,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         //     destroyed, so the Rust-side monotonic counter restarts at 0 on next open().
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        lastReadHadUnexpiredUnmined = false
 
         // 3a-B4. Re-arm the stall watchdog: the handle is destroyed.
         resetStallWatchdog()
@@ -2589,8 +2681,10 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             //    wallet wipe succeeded (this `do` block only reaches here on success).
             await submitPlanStore.wipe()
 
-            // 7. Reset state to unprepared/zero, and keep the engine closed until the next `prepare`
-            //    opens it: a switch before that only records its server (`engineClosedByWipe`).
+            // 7. Reset state to unprepared/zero, stop sharing any read of the deleted files, and keep
+            //    the engine closed until the next `prepare` opens it: a switch before that only
+            //    records its server (`engineClosedByWipe`).
+            forgetSharedLocalBalanceRead()
             engineClosedByWipe = true
             stateSubject.send(.zero)
 
@@ -2598,6 +2692,7 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
             healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .finished)
         } catch {
+            forgetSharedLocalBalanceRead()
             healthOwner.settle(transition: healthTransition, endpoint: currentEndpoint)
             subject.send(completion: .failure(error))
         }
@@ -2970,6 +3065,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // Also reset the tx-set-version mirror: the new handle's counter starts from zero.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // B4: re-arm the stall watchdog for the new handle.
         resetStallWatchdog()
 
@@ -3005,6 +3103,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         rebindEndpointServices(to: endpoint)
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog()
         pendingEndpointReconciliation = nil
     }
@@ -3092,6 +3193,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog(resetRecoveryBudget: true)
 
         // `startImpl`, not the public `start()`: this operation is holding the queue, and a queued

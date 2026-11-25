@@ -17,37 +17,40 @@ public enum ZcashTransaction {
             /// its required confirmations: the trusted count of ``ConfirmationsPolicy`` (ZIP 315)
             /// for a trusted receive, `ZcashSDK.defaultStaleTolerance` for anything else.
             case confirmed
-            /// transaction has no `minedHeight` but current known height is less than `expiryHeight`.
+            /// transaction has no `minedHeight` and the scanned height has not reached its `expiryHeight`,
+            /// or has a `minedHeight` with fewer confirmations than it needs.
             case pending
-            /// transaction has no `minedHeight` and current known height is greater or equal than `expiryHeight`.
+            /// transaction has no `minedHeight` and the scanned height has reached its `expiryHeight`.
             case expired
 
+            /// - Parameters:
+            ///   - currentHeight: the chain tip, which counts the confirmations of a mined transaction.
+            ///   - expiredUnmined: ignored. The `expired_unmined` column compares the expiry height with
+            ///     the highest scanned block, which can sit above an unscanned gap that still holds the
+            ///     block that mined the transaction, so it is no proof of expiry.
+            ///   - scannedHeight: the height below which every block has been scanned. An unmined
+            ///     transaction is expired only once this height has reached its expiry height; the chain
+            ///     tip alone cannot tell, because after a resume it runs far ahead of the scan while the
+            ///     block that mined the transaction is still unscanned. `nil` falls back to
+            ///     `currentHeight`, for callers whose height already reflects what the wallet has scanned.
             init(
                 currentHeight: BlockHeight,
                 minedHeight: BlockHeight?,
                 expiredUnmined: Bool?,
                 expiryHeight: BlockHeight? = nil,
-                requiredConfirmations: Int = ZcashSDK.defaultStaleTolerance
+                requiredConfirmations: Int = ZcashSDK.defaultStaleTolerance,
+                scannedHeight: BlockHeight? = nil
             ) {
-                guard let expiredUnmined, !expiredUnmined else {
-                    self = .expired
+                if let minedHeight {
+                    self = (currentHeight - minedHeight) >= requiredConfirmations ? .confirmed : .pending
                     return
                 }
 
-                if let minedHeight, (currentHeight - minedHeight) >= requiredConfirmations {
-                    self = .confirmed
-                } else if let minedHeight, (currentHeight - minedHeight) < requiredConfirmations {
-                    self = .pending
-                } else if minedHeight == nil {
-                    // Fallback for when `expired_unmined` lags: a tx whose expiry has passed
-                    // is physically unminable regardless of column state.
-                    if let expiryHeight, expiryHeight > 0, currentHeight >= expiryHeight {
-                        self = .expired
-                    } else {
-                        self = .pending
-                    }
-                } else {
+                // An expiry height of 0 disables expiry.
+                if let expiryHeight, expiryHeight > 0, (scannedHeight ?? currentHeight) >= expiryHeight {
                     self = .expired
+                } else {
+                    self = .pending
                 }
             }
         }
@@ -358,13 +361,18 @@ public extension ZcashTransaction.Overview {
     /// a trusted receive (``isTrusted``, ZIP 315) uses the trusted count of the transfer
     /// ``ConfirmationsPolicy``, the one at which its funds become spendable; every other
     /// transaction, sent and shielding ones included, uses `ZcashSDK.defaultStaleTolerance`.
-    func getState(for currentHeight: BlockHeight) -> State {
+    ///
+    /// An unmined transaction is ``State/expired`` only once `scannedHeight`, the height below which
+    /// every block has been scanned, has reached its expiry height. `nil` judges it against
+    /// `currentHeight` instead, which is only right when that height is itself a scanned height.
+    func getState(for currentHeight: BlockHeight, scannedHeight: BlockHeight? = nil) -> State {
         State(
             currentHeight: currentHeight,
             minedHeight: minedHeight,
             expiredUnmined: self.isExpiredUmined,
             expiryHeight: self.expiryHeight,
-            requiredConfirmations: requiredConfirmations
+            requiredConfirmations: requiredConfirmations,
+            scannedHeight: scannedHeight
         )
     }
 
