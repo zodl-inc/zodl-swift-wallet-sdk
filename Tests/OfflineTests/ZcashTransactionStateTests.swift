@@ -10,7 +10,9 @@ import TestUtils
 @testable import ZODLSwiftWalletSDK
 
 final class ZcashTransactionStateTests: XCTestCase {
-    func testExpiredUnminedState() throws {
+    /// The `expired_unmined` column is no proof of expiry: it is computed against the highest
+    /// scanned block, which can sit above an unscanned gap. Only the scanned height decides.
+    func testExpiredUnminedFlagAloneDoesNotExpire() throws {
         let currentHeight = 1010
 
         XCTAssertEqual(
@@ -19,7 +21,103 @@ final class ZcashTransactionStateTests: XCTestCase {
                 minedHeight: nil,
                 expiredUnmined: true
             ),
+            .pending
+        )
+
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: currentHeight,
+                minedHeight: nil,
+                expiredUnmined: true,
+                expiryHeight: 1000,
+                scannedHeight: 999
+            ),
+            .pending
+        )
+
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: currentHeight,
+                minedHeight: nil,
+                expiredUnmined: true,
+                expiryHeight: 1000,
+                scannedHeight: 1000
+            ),
             .expired
+        )
+
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: currentHeight,
+                minedHeight: currentHeight - ZcashSDK.defaultStaleTolerance,
+                expiredUnmined: true
+            ),
+            .confirmed
+        )
+    }
+
+    /// After a resume the chain tip runs far ahead of the scan. An unmined send is expired only
+    /// once the scanned height has reached its expiry height, whatever the tip says.
+    func testUnminedExpiryIsJudgedAgainstTheScannedHeightNotTheTip() {
+        let expiryHeight = 1_000_040
+        let tip = expiryHeight + 500
+
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: tip,
+                minedHeight: nil,
+                expiredUnmined: false,
+                expiryHeight: expiryHeight,
+                scannedHeight: expiryHeight - 1
+            ),
+            .pending
+        )
+
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: tip,
+                minedHeight: nil,
+                expiredUnmined: false,
+                expiryHeight: expiryHeight,
+                scannedHeight: expiryHeight
+            ),
+            .expired
+        )
+
+        // 0 is what the Slipstream host passes before the engine reported a scanned height.
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: tip,
+                minedHeight: nil,
+                expiredUnmined: false,
+                expiryHeight: expiryHeight,
+                scannedHeight: 0
+            ),
+            .pending
+        )
+
+        // An expiry height of 0 disables expiry.
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: tip,
+                minedHeight: nil,
+                expiredUnmined: false,
+                expiryHeight: 0,
+                scannedHeight: tip
+            ),
+            .pending
+        )
+
+        // A mined transaction counts its confirmations from the tip, not the scanned height.
+        XCTAssertEqual(
+            ZcashTransaction.Overview.State(
+                currentHeight: tip,
+                minedHeight: tip - ZcashSDK.defaultStaleTolerance,
+                expiredUnmined: false,
+                expiryHeight: expiryHeight,
+                scannedHeight: 0
+            ),
+            .confirmed
         )
     }
 
@@ -54,7 +152,9 @@ final class ZcashTransactionStateTests: XCTestCase {
         )
     }
 
-    func testUnminedPastExpiryIsExpiredWhenColumnNotYetUpdated() {
+    /// Without a scanned height the current height stands in for it, for callers whose height is
+    /// itself a scanned height.
+    func testUnminedPastExpiryIsExpiredAgainstTheCurrentHeightWithoutAScannedHeight() {
         let currentHeight = 1_500_000
 
         XCTAssertEqual(

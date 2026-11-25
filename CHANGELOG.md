@@ -62,6 +62,28 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the app-wide Tor setting, so with migration Tor on and app-wide Tor off it went directly to
   the lightwalletd server, which could link the user's IP to that pool crossing. No caller changes
   are required.
+
+## Added
+
+- `VotingRustBackend.deriveRoundId(createdAtHeight:snapshotBlockhash:proposalsHash:voteEndTime:nullifierImtRoot:ncRoot:)`
+  recomputes a vote round id the way the vote chain derives it (Poseidon over the round's creation height,
+  snapshot blockhash, proposals hash, vote end time and the two tree roots) and returns the 32-byte id. A wallet
+  compares it with the round id a vote server reported, so a server cannot show different ballot content under a
+  signed round id. Throws when an argument is not 32 bytes or a root is not a canonical Pallas field element.
+
+# 8.1.1 - 2026-11-19
+
+## Fixed
+
+- A send mined while the Slipstream engine was stopped no longer reads as `ZcashTransaction.Overview.State.expired`
+  after the engine resumes. An unmined transaction is now `.expired` only once the wallet's fully
+  scanned height has reached its expiry height; the chain tip alone never decides, and neither does
+  the `expired_unmined` column (`isExpiredUmined`), which can be true while the block that mined the
+  transaction is still unscanned. `getState(for:scannedHeight:)` takes the scanned height; the
+  existing `getState(for:)` keeps judging against the height it is given. `SlipstreamSynchronizer`
+  also publishes `foundTransactions` again when the fully scanned height advances while an unmined,
+  unexpired transaction is stored, so a send whose mined height a scan just recorded, or one that
+  just expired, is re-read without waiting for a transaction-set change. Call sites need no change.
 - `SlipstreamSynchronizer.getLocalAccountBalances()` no longer starts a new read of the wallet
   database for each caller. A call made while another call's read is still running waits for that
   read and returns its result, or throws its error. The read takes seconds on a wallet with a long
@@ -81,14 +103,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the whole read, so other async work in the app keeps running. `SDKSynchronizer` does not
   share one read between concurrent callers; each call still reads the database. No change is
   needed at call sites.
-
-## Added
-
-- `VotingRustBackend.deriveRoundId(createdAtHeight:snapshotBlockhash:proposalsHash:voteEndTime:nullifierImtRoot:ncRoot:)`
-  recomputes a vote round id the way the vote chain derives it (Poseidon over the round's creation height,
-  snapshot blockhash, proposals hash, vote end time and the two tree roots) and returns the 32-byte id. A wallet
-  compares it with the round id a vote server reported, so a server cannot show different ballot content under a
-  signed round id. Throws when an argument is not 32 bytes or a root is not a canonical Pallas field element.
 
 # 8.1.0 - 2026-11-13
 
