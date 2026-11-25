@@ -137,6 +137,12 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     // changes the VISIBLE list with no engine write — is host-observed. Together with the
     // version compare this is the WHOLE emission rule.
     private var lastRevealRecovering = false
+    // The fully scanned height the last read was taken at, and whether that read held a
+    // transaction a later scan can still change (unmined, not yet expired). A scan that records
+    // the mined height of a stored send bumps no `txSetVersion`, so the tick also re-reads when the
+    // scan advances past the last read while such a row exists (`needsTransactionReadOnScanAdvance`).
+    private var lastReadScannedHeight: BlockHeight = 0
+    private var lastReadHadUnexpiredUnmined = false
 
     // [v2.1 Phase 2] The F2 boundary-refresh mirror and the [#1591] chain-tip-flag parity
     // machinery are GONE: the engine refreshes the unified summary at its own boundaries
@@ -1141,11 +1147,24 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // Reading first and re-validating with `isCurrent()` after means a wipe in that window is
         // caught before either the mirrors move or anything is emitted; the version comparison
         // below still alone decides whether this tick has anything to report.
-        if snap.txSetVersion != lastTxSetVersion || recovering != lastRevealRecovering {
+        // The third edge is the scan itself: the block that mines a send the wallet already stores
+        // only sets its mined height, which bumps no version, and a send that is never mined expires
+        // only as the scan passes its expiry height. Both change the published states, so the rows
+        // are read again when the fully scanned height has moved past the last read while that read
+        // still held an unmined, unexpired transaction.
+        let fullyScannedHeight = latestState.fullyScannedHeight
+        let scanAdvanced = Self.needsTransactionReadOnScanAdvance(
+            lastReadHadUnexpiredUnmined: lastReadHadUnexpiredUnmined,
+            lastReadScannedHeight: lastReadScannedHeight,
+            fullyScannedHeight: fullyScannedHeight
+        )
+        if snap.txSetVersion != lastTxSetVersion || recovering != lastRevealRecovering || scanAdvanced {
             let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
             guard isCurrent() else { return }
             lastTxSetVersion = snap.txSetVersion
             lastRevealRecovering = recovering
+            lastReadScannedHeight = fullyScannedHeight
+            lastReadHadUnexpiredUnmined = Self.hasUnexpiredUnmined(txs)
             eventSubject.send(.foundTransactions(txs, nil))
         }
     }
@@ -1314,6 +1333,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // otherwise the first tick of the new pass reads the reset `txSetVersion` as "unchanged".
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // Re-arm the log and the handle-lifetime clamp for the new pass, but KEEP the recovery
         // budget: it is what bounds this very restart, and a full re-arm would clear it.
         resetStallWatchdog(resetRecoveryBudget: false)
@@ -2297,10 +2319,14 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
     /// leaves `state == nil`, so without this Zashi maps an INCOMING tx via
     /// `transaction.state == .pending` → `nil == .pending` → false → ".received" — a 0-conf
     /// mempool tx then wrongly shows "received" instead of "receiving". Pure mapping lives in
-    /// `transactionsWithState`; here we just resolve the current chain height it needs.
+    /// `transactionsWithState`; here we just resolve the heights it needs: the chain tip for
+    /// confirmations, and the fully scanned height for expiry. The engine reports that height
+    /// through the wallet summary, so before the first summary it is 0 and no unmined transaction
+    /// is expired, which is the right answer for a wallet that has not told us what it scanned.
     private func enhanceWithState(_ raw: [ZcashTransaction.Overview]) async -> [ZcashTransaction.Overview] {
         let tip = latestState.latestBlockHeight
-        return Self.transactionsWithState(raw, currentHeight: tip != 0 ? tip : ((try? await initializer.rustBackend.maxScannedHeight()) ?? .zero))
+        let currentHeight = tip != 0 ? tip : ((try? await initializer.rustBackend.maxScannedHeight()) ?? .zero)
+        return Self.transactionsWithState(raw, currentHeight: currentHeight, scannedHeight: latestState.fullyScannedHeight)
     }
 
     public func getMemos(for rawID: Data) async throws -> [Memo] {
@@ -2618,6 +2644,8 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         //     destroyed, so the Rust-side monotonic counter restarts at 0 on next open().
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        lastReadHadUnexpiredUnmined = false
 
         // 3a-B4. Re-arm the stall watchdog: the handle is destroyed.
         resetStallWatchdog()
@@ -3037,6 +3065,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // Also reset the tx-set-version mirror: the new handle's counter starts from zero.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         // B4: re-arm the stall watchdog for the new handle.
         resetStallWatchdog()
 
@@ -3072,6 +3103,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         rebindEndpointServices(to: endpoint)
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog()
         pendingEndpointReconciliation = nil
     }
@@ -3159,6 +3193,9 @@ public actor SlipstreamSynchronizer: AwaitableStopSynchronizer {
         // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.
         lastTxSetVersion = 0
         lastRevealRecovering = false
+        lastReadScannedHeight = 0
+        // `lastReadHadUnexpiredUnmined` stays: it describes the rows last published, which a reopen
+        // does not change. Only `wipe` clears it. With the height at 0 the first tick reads once.
         resetStallWatchdog(resetRecoveryBudget: true)
 
         // `startImpl`, not the public `start()`: this operation is holding the queue, and a queued
